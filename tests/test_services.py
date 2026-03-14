@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import dataclasses
 
-from context_intelligence_server.services import GraphState, HookConfig, SessionCursors
+from context_intelligence_server.services import (
+    GraphState,
+    HookConfig,
+    HookStateService,
+    SessionCursors,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -149,3 +154,126 @@ def test_graph_state_no_graph_forest_name():
     state = GraphState()
     assert not hasattr(state, "graph_forest_name")
     assert not hasattr(state, "_graph_forest_name")
+
+
+# ---------------------------------------------------------------------------
+# HookStateService tests
+# ---------------------------------------------------------------------------
+
+
+class TestHookStateService:
+    """Tests for the server-side HookStateService (no coordinator dependency)."""
+
+    def test_construction_default_workspace(self):
+        """HookStateService defaults workspace to 'default' on the internal graph."""
+        svc = HookStateService()
+        assert svc.graph.workspace == "default"
+
+    def test_construction_sets_workspace_on_graph(self):
+        """HookStateService sets the provided workspace on the internal graph."""
+        svc = HookStateService(workspace="test-workspace")
+        assert svc.graph.workspace == "test-workspace"
+
+    def test_injected_graph_store_workspace_overwrite(self):
+        """When a graph_store is injected, its workspace is overwritten by the given workspace."""
+        injected = GraphState(workspace="old-workspace")
+        svc = HookStateService(workspace="new-workspace", graph_store=injected)
+        assert svc.graph is injected
+        assert svc.graph.workspace == "new-workspace"
+
+    def test_no_coordinator_attribute(self):
+        """HookStateService must not have coordinator or _forest_resolved attributes."""
+        svc = HookStateService()
+        assert not hasattr(svc, "coordinator")
+        assert not hasattr(svc, "_forest_resolved")
+
+    def test_blob_store_default_is_none(self):
+        """blob_store defaults to None when not provided."""
+        svc = HookStateService()
+        assert svc.blob_store is None
+
+    def test_blob_store_can_be_injected(self):
+        """blob_store can be provided as a keyword argument."""
+        sentinel = object()
+        svc = HookStateService(blob_store=sentinel)
+        assert svc.blob_store is sentinel
+
+    def test_get_cursors_lazy_creation(self):
+        """get_cursors creates a SessionCursors on first access."""
+        svc = HookStateService()
+        cursors = svc.get_cursors("session-1")
+        assert isinstance(cursors, SessionCursors)
+
+    def test_get_cursors_same_instance(self):
+        """get_cursors returns the same SessionCursors instance for the same session_id."""
+        svc = HookStateService()
+        c1 = svc.get_cursors("session-1")
+        c2 = svc.get_cursors("session-1")
+        assert c1 is c2
+
+    def test_get_cursors_different_sessions(self):
+        """get_cursors returns distinct SessionCursors for distinct session ids."""
+        svc = HookStateService()
+        c1 = svc.get_cursors("session-1")
+        c2 = svc.get_cursors("session-2")
+        assert c1 is not c2
+
+    def test_remove_cursors_resets(self):
+        """remove_cursors causes get_cursors to create a fresh instance on the next call."""
+        svc = HookStateService()
+        c1 = svc.get_cursors("session-1")
+        svc.remove_cursors("session-1")
+        c2 = svc.get_cursors("session-1")
+        assert c1 is not c2
+
+    def test_remove_cursors_safe_for_nonexistent(self):
+        """remove_cursors does not raise when session_id has no cursors entry."""
+        svc = HookStateService()
+        svc.remove_cursors("nonexistent-session")  # must not raise
+
+    async def test_ensure_session_node_creates_root(self):
+        """ensure_session_node creates a Session+Root node when no parent field is present."""
+        svc = HookStateService()
+        await svc.ensure_session_node("session-1", {"started_at": "2024-01-01T00:00:00"})
+        node = await svc.graph.get_node("session-1")
+        assert node is not None
+        assert "Session" in node["labels"]
+        assert "Root" in node["labels"]
+        assert node["status"] == "running"
+
+    async def test_ensure_session_node_is_idempotent(self):
+        """ensure_session_node is a no-op when session_id was already processed."""
+        svc = HookStateService()
+        await svc.ensure_session_node("session-1", {"started_at": "2024-01-01T00:00:00"})
+        # Manually modify the node after the first call
+        await svc.graph.upsert_node("session-1", {"status": "modified"})
+        # Second call must not overwrite the modified status
+        await svc.ensure_session_node("session-1", {"started_at": "2024-01-02T00:00:00"})
+        node = await svc.graph.get_node("session-1")
+        assert node is not None
+        assert node["status"] == "modified"
+
+    async def test_ensure_session_node_creates_subsession(self):
+        """ensure_session_node creates a Session+Subsession node when parent_id is present."""
+        svc = HookStateService()
+        await svc.ensure_session_node(
+            "session-2",
+            {"parent_id": "session-1", "started_at": "2024-01-01T00:00:00"},
+        )
+        node = await svc.graph.get_node("session-2")
+        assert node is not None
+        assert "Session" in node["labels"]
+        assert "Subsession" in node["labels"]
+        assert node["status"] == "running"
+
+    async def test_ensure_session_node_parent_field_creates_subsession(self):
+        """ensure_session_node treats 'parent' field as a parent indicator (no parent_id needed)."""
+        svc = HookStateService()
+        await svc.ensure_session_node(
+            "session-3",
+            {"parent": "session-1", "started_at": "2024-01-01T00:00:00"},
+        )
+        node = await svc.graph.get_node("session-3")
+        assert node is not None
+        assert "Session" in node["labels"]
+        assert "Subsession" in node["labels"]

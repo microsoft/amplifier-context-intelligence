@@ -1,8 +1,9 @@
-"""SessionCursors, HookConfig, and GraphState service primitives.
+"""SessionCursors, HookConfig, GraphState, and HookStateService primitives.
 
-- SessionCursors  — per-session cursor tracking (dataclass)
-- HookConfig      — event-exclusion configuration wrapper
-- GraphState      — in-memory property graph conforming to GraphStore protocol
+- SessionCursors   — per-session cursor tracking (dataclass)
+- HookConfig       — event-exclusion configuration wrapper
+- GraphState       — in-memory property graph conforming to GraphStore protocol
+- HookStateService — server-side hook state coordinator (no coordinator dependency)
 """
 
 from __future__ import annotations
@@ -150,3 +151,86 @@ class GraphState:
     async def close(self) -> None:
         """Call flush (no-op) before releasing — satisfies the GraphStore contract."""
         await self.flush()
+
+
+# ---------------------------------------------------------------------------
+# HookStateService
+# ---------------------------------------------------------------------------
+
+
+class HookStateService:
+    """Server-side hook state coordinator.
+
+    Owns the per-session cursor map, the graph store, and the set of already-seen
+    sessions.  Has no coordinator dependency and does not perform forest-name
+    resolution — the workspace is set directly at construction time.
+    """
+
+    def __init__(
+        self,
+        workspace: str = "default",
+        graph_store: Any | None = None,
+        *,
+        raw_config: dict[str, Any] | None = None,
+        blob_store: Any | None = None,
+    ) -> None:
+        self.config = HookConfig(raw_config or {})
+        if graph_store is not None:
+            self.graph = graph_store
+        else:
+            self.graph = GraphState()
+        self.graph.workspace = workspace
+        self.blob_store = blob_store
+        self._cursors: dict[str, SessionCursors] = {}
+        self._seen_sessions: set[str] = set()
+
+    # ------------------------------------------------------------------
+    # Cursor management
+    # ------------------------------------------------------------------
+
+    def get_cursors(self, session_id: str) -> SessionCursors:
+        """Return (creating if necessary) the SessionCursors for *session_id*.
+
+        The same instance is returned on every subsequent call for the same id.
+        """
+        if session_id not in self._cursors:
+            self._cursors[session_id] = SessionCursors()
+        return self._cursors[session_id]
+
+    def remove_cursors(self, session_id: str) -> None:
+        """Remove the SessionCursors entry for *session_id*.
+
+        Safe to call when *session_id* has no entry — this is a no-op in that
+        case.
+        """
+        self._cursors.pop(session_id, None)
+
+    # ------------------------------------------------------------------
+    # Session node management
+    # ------------------------------------------------------------------
+
+    async def ensure_session_node(self, session_id: str, data: dict[str, Any]) -> None:
+        """Idempotently create a Session node in the graph for *session_id*.
+
+        Skips silently when *session_id* has already been processed.  Labels the
+        node ``Session + Root`` when no parent is present, or
+        ``Session + Subsession`` when *data* contains a ``parent_id`` or
+        ``parent`` field.  Sets ``started_at`` (from *data* if provided) and
+        ``status = 'running'``.
+        """
+        if session_id in self._seen_sessions:
+            return
+
+        self._seen_sessions.add(session_id)
+
+        parent = data.get("parent_id") or data.get("parent")
+        labels = ["Session", "Subsession" if parent else "Root"]
+
+        node_data: dict[str, Any] = {
+            "labels": labels,
+            "status": "running",
+        }
+        if "started_at" in data:
+            node_data["started_at"] = data["started_at"]
+
+        await self.graph.upsert_node(session_id, node_data)

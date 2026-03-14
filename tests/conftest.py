@@ -6,6 +6,7 @@ import pytest
 import httpx
 
 from context_intelligence_server.main import app, registry
+from context_intelligence_server.services import HookStateService
 
 
 @pytest.fixture
@@ -32,3 +33,9 @@ async def client() -> AsyncGenerator[httpx.AsyncClient, None]:
         base_url="http://test",
     ) as c:
         yield c
+
+
+@pytest.fixture
+def services() -> HookStateService:
+    """Return a fresh HookStateService bound to the test workspace."""
+    return HookStateService(workspace="test-workspace")
