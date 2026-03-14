@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -258,6 +259,18 @@ async def test_get_edge_buffer_first_returns_buffered_data():
     assert result["weight"] == 5
 
 
+async def test_get_edge_returns_copy_not_reference():
+    """get_edge returns a copy; mutations to the copy do not affect the buffer."""
+    store = _make_store()
+    await store.upsert_edge("a", "b", {"weight": 5})
+    copy = await store.get_edge("a", "b")
+    assert copy is not None
+    copy["weight"] = 999  # Mutate the returned copy
+    fresh = await store.get_edge("a", "b")
+    assert fresh is not None
+    assert fresh["weight"] == 5  # Buffer must not be mutated
+
+
 async def test_get_edge_returns_none_for_missing_edge():
     """get_edge returns None when edge is absent from buffer and Neo4j has no data."""
     store = _make_store()
@@ -313,16 +326,12 @@ def test_sanitize_properties_keeps_primitives():
 
 def test_sanitize_properties_serializes_dicts():
     """_sanitize_properties JSON-serializes dict values."""
-    import json
-
     result = Neo4jGraphStore._sanitize_properties({"meta": {"nested": True}})
     assert result["meta"] == json.dumps({"nested": True})
 
 
 def test_sanitize_properties_serializes_complex_lists():
     """_sanitize_properties JSON-serializes lists that contain non-primitives."""
-    import json
-
     result = Neo4jGraphStore._sanitize_properties({"items": [{"a": 1}]})
     assert result["items"] == json.dumps([{"a": 1}])
 

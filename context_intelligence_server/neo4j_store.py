@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Any
 
 from neo4j import AsyncGraphDatabase
+from neo4j.exceptions import Neo4jError
 
 
 class Neo4jGraphStore:
@@ -45,8 +46,8 @@ class Neo4jGraphStore:
         self._driver = AsyncGraphDatabase.driver(uri, auth=auth)
         self._database = database
         self._workspace = workspace
-        self._node_buffer: dict[str, dict] = {}
-        self._edge_buffer: dict[tuple, dict] = {}
+        self._node_buffer: dict[str, dict[str, Any]] = {}
+        self._edge_buffer: dict[tuple, dict[str, Any]] = {}
         self._schema_initialized: bool = False
         self._closed: bool = False
         self._flush_task = None
@@ -138,9 +139,9 @@ class Neo4jGraphStore:
                 database_=self._database,
             )
             records = result.records
-            if records and len(records) > 0:
+            if records:
                 return dict(records[0]["props"])
-        except Exception:  # noqa: BLE001
+        except Neo4jError:
             pass
 
         return None
@@ -167,9 +168,9 @@ class Neo4jGraphStore:
                 database_=self._database,
             )
             records = result.records
-            if records and len(records) > 0:
+            if records:
                 return dict(records[0]["props"])
-        except Exception:  # noqa: BLE001
+        except Neo4jError:
             pass
 
         return None
