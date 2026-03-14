@@ -8,7 +8,11 @@ from typing import Any
 
 from context_intelligence_server.protocol import HookResult
 from context_intelligence_server.services import HookStateService
-from context_intelligence_server.utils import EventLogContext, HandlerLogger, make_node_id
+from context_intelligence_server.utils import (
+    EventLogContext,
+    HandlerLogger,
+    make_node_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +53,9 @@ class OrchestratorRunHandler:
 
         return HookResult(action="continue")
 
-    async def _handle_prompt_submit(self, data: dict[str, Any], log: EventLogContext) -> HookResult:
+    async def _handle_prompt_submit(
+        self, data: dict[str, Any], log: EventLogContext
+    ) -> HookResult:
         session_id = data.get("session_id")
         if not session_id:
             log.error("received event without session_id")
@@ -146,7 +152,9 @@ class OrchestratorRunHandler:
 
         return HookResult(action="continue")
 
-    async def _handle_execution_end(self, data: dict[str, Any], log: EventLogContext) -> HookResult:
+    async def _handle_execution_end(
+        self, data: dict[str, Any], log: EventLogContext
+    ) -> HookResult:
         session_id = data.get("session_id")
         if not session_id:
             log.error("received event without session_id")

@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from context_intelligence_server.handlers.orchestrator_run import (
     PREVIEW_MAX_LEN,
     OrchestratorRunHandler,
@@ -20,8 +18,14 @@ from context_intelligence_server.handlers.session import SessionHandler
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.utils import make_node_id
 
-# Verify _STATUS_MAP constant matches spec
-assert _STATUS_MAP == {"success": "complete", "cancelled": "cancelled", "error": "error"}
+
+def test_status_map_matches_spec() -> None:
+    assert _STATUS_MAP == {
+        "success": "complete",
+        "cancelled": "cancelled",
+        "error": "error",
+    }
+
 
 TIMESTAMP = "2026-03-06T01:00:00Z"
 EXPECTED_NODE_ID = "s1__prompt_submit__1772758800000"
@@ -86,7 +90,9 @@ class TestPromptSubmitHappyPath:
         assert node is not None
         assert node["prompt_preview"] == "Hello world"
 
-    async def test_preview_truncated_to_200_chars(self, services: HookStateService) -> None:
+    async def test_preview_truncated_to_200_chars(
+        self, services: HookStateService
+    ) -> None:
         await _seed_session(services)
         handler = OrchestratorRunHandler(services)
         long_prompt = "x" * 300
@@ -144,7 +150,9 @@ class TestPromptSubmitHappyPath:
         assert cursors.current_step_id == EXPECTED_NODE_ID  # set to new node
         assert cursors.prompt_preview == "Hello world"  # stored
 
-    async def test_node_id_matches_make_node_id(self, services: HookStateService) -> None:
+    async def test_node_id_matches_make_node_id(
+        self, services: HookStateService
+    ) -> None:
         await _seed_session(services)
         handler = OrchestratorRunHandler(services)
         await handler(
@@ -156,7 +164,9 @@ class TestPromptSubmitHappyPath:
         node = await services.graph.get_node(expected)
         assert node is not None
 
-    async def test_returns_hook_result_continue(self, services: HookStateService) -> None:
+    async def test_returns_hook_result_continue(
+        self, services: HookStateService
+    ) -> None:
         await _seed_session(services)
         handler = OrchestratorRunHandler(services)
         result = await handler(
@@ -170,7 +180,9 @@ class TestPromptSubmitHappyPath:
 
 
 class TestPromptSubmitErrorPaths:
-    async def test_missing_session_id_returns_continue(self, services: HookStateService) -> None:
+    async def test_missing_session_id_returns_continue(
+        self, services: HookStateService
+    ) -> None:
         handler = OrchestratorRunHandler(services)
         result = await handler(
             "prompt:submit",
@@ -178,7 +190,9 @@ class TestPromptSubmitErrorPaths:
         )
         assert result.action == "continue"
 
-    async def test_missing_session_id_creates_no_nodes(self, services: HookStateService) -> None:
+    async def test_missing_session_id_creates_no_nodes(
+        self, services: HookStateService
+    ) -> None:
         handler = OrchestratorRunHandler(services)
         await handler(
             "prompt:submit",
@@ -188,7 +202,9 @@ class TestPromptSubmitErrorPaths:
         node = await services.graph.get_node(EXPECTED_NODE_ID)
         assert node is None
 
-    async def test_session_not_found_returns_continue(self, services: HookStateService) -> None:
+    async def test_session_not_found_returns_continue(
+        self, services: HookStateService
+    ) -> None:
         handler = OrchestratorRunHandler(services)
         # session_id provided but no session node seeded
         result = await handler(
@@ -197,7 +213,9 @@ class TestPromptSubmitErrorPaths:
         )
         assert result.action == "continue"
 
-    async def test_session_not_found_creates_no_nodes(self, services: HookStateService) -> None:
+    async def test_session_not_found_creates_no_nodes(
+        self, services: HookStateService
+    ) -> None:
         handler = OrchestratorRunHandler(services)
         await handler(
             "prompt:submit",
@@ -275,7 +293,9 @@ class TestExecutionStartHappyPath:
         assert edge["seq"] == 1  # matches run_counter
         assert edge["occurred_at"] == EXEC_TIMESTAMP
 
-    async def test_has_step_edge_to_prompt_step(self, services: HookStateService) -> None:
+    async def test_has_step_edge_to_prompt_step(
+        self, services: HookStateService
+    ) -> None:
         await _seed_session_and_prompt(services)
         handler = OrchestratorRunHandler(services)
         # Grab current_step_id from cursors (set by prompt:submit)
@@ -316,7 +336,9 @@ class TestExecutionStartHappyPath:
 
 
 class TestExecutionStartErrorPaths:
-    async def test_missing_session_id_returns_continue(self, services: HookStateService) -> None:
+    async def test_missing_session_id_returns_continue(
+        self, services: HookStateService
+    ) -> None:
         handler = OrchestratorRunHandler(services)
         result = await handler(
             "execution:start",
@@ -384,7 +406,9 @@ class TestExecutionEnd:
         assert node is not None
         assert node["response_preview"] == "y" * PREVIEW_MAX_LEN
 
-    async def test_graceful_when_no_current_run(self, services: HookStateService) -> None:
+    async def test_graceful_when_no_current_run(
+        self, services: HookStateService
+    ) -> None:
         await _seed_session(services)
         handler = OrchestratorRunHandler(services)
         # No execution:start fired, so current_run_id is None
@@ -412,7 +436,9 @@ COMPLETE_TIMESTAMP = "2026-03-06T04:00:00Z"
 
 
 class TestOrchestratorComplete:
-    async def test_closes_with_complete_status(self, services: HookStateService) -> None:
+    async def test_closes_with_complete_status(
+        self, services: HookStateService
+    ) -> None:
         run_id = await _seed_full_run(services)
         handler = OrchestratorRunHandler(services)
         await handler(
@@ -429,7 +455,11 @@ class TestOrchestratorComplete:
         handler = OrchestratorRunHandler(services)
         await handler(
             "orchestrator:complete",
-            {"session_id": "s1", "timestamp": COMPLETE_TIMESTAMP, "status": "cancelled"},
+            {
+                "session_id": "s1",
+                "timestamp": COMPLETE_TIMESTAMP,
+                "status": "cancelled",
+            },
         )
         node = await services.graph.get_node(run_id)
         assert node is not None
@@ -486,7 +516,9 @@ class TestOrchestratorComplete:
         )
         assert cursors.tool_call_map == {}
 
-    async def test_graceful_when_no_current_run(self, services: HookStateService) -> None:
+    async def test_graceful_when_no_current_run(
+        self, services: HookStateService
+    ) -> None:
         await _seed_session(services)
         handler = OrchestratorRunHandler(services)
         # No execution:start fired, so current_run_id is None
@@ -504,7 +536,9 @@ class TestOrchestratorComplete:
         )
         assert result.action == "continue"
 
-    async def test_unknown_status_passes_through(self, services: HookStateService) -> None:
+    async def test_unknown_status_passes_through(
+        self, services: HookStateService
+    ) -> None:
         run_id = await _seed_full_run(services)
         handler = OrchestratorRunHandler(services)
         await handler(
@@ -539,7 +573,11 @@ class TestPromptSubmitDataProperty:
         """prompt:submit stores full event dict as 'data' JSON property."""
         await _seed_session(services)
         handler = OrchestratorRunHandler(services)
-        event_data = {"session_id": "s1", "timestamp": TIMESTAMP, "prompt": "Hello world"}
+        event_data = {
+            "session_id": "s1",
+            "timestamp": TIMESTAMP,
+            "prompt": "Hello world",
+        }
         await handler("prompt:submit", event_data)
         node = await services.graph.get_node(EXPECTED_NODE_ID)
         assert node is not None
@@ -547,7 +585,9 @@ class TestPromptSubmitDataProperty:
         assert stored_data["session_id"] == "s1"
         assert stored_data["prompt"] == "Hello world"
 
-    async def test_data_is_complete_event_clone(self, services: HookStateService) -> None:
+    async def test_data_is_complete_event_clone(
+        self, services: HookStateService
+    ) -> None:
         """data property preserves extra fields not otherwise used by the handler."""
         await _seed_session(services)
         handler = OrchestratorRunHandler(services)
@@ -579,11 +619,17 @@ class TestExecutionStartDataProperty:
 
 
 class TestExecutionEndDataProperty:
-    async def test_stores_data_execution_end_property(self, services: HookStateService) -> None:
+    async def test_stores_data_execution_end_property(
+        self, services: HookStateService
+    ) -> None:
         """execution:end enriches OrchestratorRun with 'data_execution_end' JSON property."""
         run_id = await _seed_full_run(services)
         handler = OrchestratorRunHandler(services)
-        event_data = {"session_id": "s1", "timestamp": END_TIMESTAMP, "response": "some response"}
+        event_data = {
+            "session_id": "s1",
+            "timestamp": END_TIMESTAMP,
+            "response": "some response",
+        }
         await handler("execution:end", event_data)
         node = await services.graph.get_node(run_id)
         assert node is not None
@@ -594,7 +640,9 @@ class TestExecutionEndDataProperty:
 
 
 class TestOrchestratorCompleteDataProperty:
-    async def test_stores_data_and_calls_flush(self, services: HookStateService) -> None:
+    async def test_stores_data_and_calls_flush(
+        self, services: HookStateService
+    ) -> None:
         """orchestrator:complete enriches with 'data_orchestrator_complete' and calls flush()."""
         run_id = await _seed_full_run(services)
         handler = OrchestratorRunHandler(services)
@@ -622,4 +670,6 @@ class TestOrchestratorCompleteDataProperty:
         stored_data = json.loads(node["data_orchestrator_complete"])
         assert stored_data["session_id"] == "s1"
         assert stored_data["status"] == "success"
-        assert flush_call_count == 1, "flush() must be called exactly once on orchestrator:complete"
+        assert flush_call_count == 1, (
+            "flush() must be called exactly once on orchestrator:complete"
+        )
