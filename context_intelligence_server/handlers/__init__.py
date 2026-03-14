@@ -1,7 +1,14 @@
 """Event handlers for the context-intelligence server.
 
-Stub implementations — full ports from the bundle will replace these
-when tasks 10-13 are completed.
+Seven handlers are registered in this package:
+
+- DefaultHandler        — catches all unclaimed, non-excluded events
+- OrchestratorRunHandler — owns orchestrator_run lifecycle events
+- RecipeHandler         — owns recipe lifecycle events
+- SessionHandler        — owns Session node lifecycle events (start/fork/end)
+- StepHandler           — owns step lifecycle events
+- SystemEventHandler    — owns known system events (compaction, cancellation)
+- ToolExecutionHandler  — owns tool_execution lifecycle events
 """
 
 from context_intelligence_server.handlers.default import DefaultHandler
