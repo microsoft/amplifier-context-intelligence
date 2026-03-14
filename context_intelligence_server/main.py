@@ -91,6 +91,50 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       font-size: 0.85em;
       padding: 8px 24px;
     }
+    #log-panel { margin-top: 32px; }
+    #log-controls { display: flex; gap: 12px; margin: 8px 0; align-items: center; }
+    #log-filter {
+      background: #16213e;
+      color: #e0e0e0;
+      border: 1px solid #2a2a4a;
+      border-radius: 4px;
+      padding: 4px 10px;
+      font-family: monospace;
+      font-size: 0.9em;
+      flex: 1;
+    }
+    #log-toggle {
+      background: #16213e;
+      color: #a0c4ff;
+      border: 1px solid #2a2a4a;
+      border-radius: 4px;
+      padding: 4px 14px;
+      cursor: pointer;
+      font-family: monospace;
+    }
+    #log-container {
+      background: #0d1117;
+      max-height: 400px;
+      overflow-y: auto;
+      border-radius: 6px;
+      padding: 8px 12px;
+      border: 1px solid #2a2a4a;
+    }
+    .log-line { white-space: pre-wrap; font-size: 0.82em; margin: 1px 0; }
+    .log-INFO  { color: #8b949e; }
+    .log-WARNING { color: #e3b341; }
+    .log-ERROR { color: #f85149; }
+    .log-DEBUG { color: #58a6ff; }
+    .log-error-badge {
+      display: none;
+      background: #c0392b;
+      color: #fff;
+      border-radius: 12px;
+      padding: 2px 10px;
+      font-size: 0.8em;
+      font-weight: bold;
+      margin-left: 10px;
+    }
   </style>
 </head>
 <body>
@@ -155,6 +199,15 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     </thead>
     <tbody id="events-body"></tbody>
   </table>
+
+  <div id="log-panel">
+    <h2>Server Logs <span id="log-error-badge" class="log-error-badge">0 errors</span></h2>
+    <div id="log-controls">
+      <input id="log-filter" type="text" placeholder="Filter logs..." oninput="filterLogs()" />
+      <button id="log-toggle" onclick="togglePause()">Pause</button>
+    </div>
+    <div id="log-container"></div>
+  </div>
 
   <script>
     function timeAgo(ts) {
@@ -261,6 +314,86 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     }
     refresh();
     setInterval(refresh, 3000);
+
+    // Log viewer
+    var logContainer = document.getElementById('log-container');
+    var logFilter = document.getElementById('log-filter');
+    var logToggle = document.getElementById('log-toggle');
+    var logErrorBadge = document.getElementById('log-error-badge');
+    var isPaused = false;
+    var pauseBuffer = [];
+    var autoScroll = true;
+    var logErrorCount = 0;
+
+    logContainer.addEventListener('scroll', function() {
+      var atBottom = logContainer.scrollHeight - logContainer.scrollTop - logContainer.clientHeight < 8;
+      autoScroll = atBottom;
+    });
+
+    function appendLogLine(text) {
+      var level = 'INFO';
+      try {
+        var parsed = JSON.parse(text);
+        if (parsed.level) { level = parsed.level; }
+        if (parsed.levelname) { level = parsed.levelname; }
+      } catch (e) { /* not JSON, use raw text */ }
+
+      if (level === 'ERROR') {
+        logErrorCount++;
+        logErrorBadge.textContent = logErrorCount + ' error' + (logErrorCount === 1 ? '' : 's');
+        logErrorBadge.style.display = 'inline';
+      }
+
+      var div = document.createElement('div');
+      div.className = 'log-line log-' + level;
+      div.textContent = text;
+
+      var filterText = logFilter.value.toLowerCase();
+      if (filterText && text.toLowerCase().indexOf(filterText) === -1) {
+        div.style.display = 'none';
+      }
+
+      logContainer.appendChild(div);
+
+      // Cap at 2000 lines
+      while (logContainer.children.length > 2000) {
+        logContainer.removeChild(logContainer.firstChild);
+      }
+
+      if (autoScroll) {
+        logContainer.scrollTop = logContainer.scrollHeight;
+      }
+    }
+
+    function filterLogs() {
+      var filterText = logFilter.value.toLowerCase();
+      var lines = logContainer.getElementsByClassName('log-line');
+      for (var i = 0; i < lines.length; i++) {
+        if (!filterText || lines[i].textContent.toLowerCase().indexOf(filterText) !== -1) {
+          lines[i].style.display = '';
+        } else {
+          lines[i].style.display = 'none';
+        }
+      }
+    }
+
+    function togglePause() {
+      isPaused = !isPaused;
+      logToggle.textContent = isPaused ? 'Resume' : 'Pause';
+      if (!isPaused) {
+        pauseBuffer.forEach(function(line) { appendLogLine(line); });
+        pauseBuffer = [];
+      }
+    }
+
+    var evtSource = new EventSource('/logs/stream');
+    evtSource.onmessage = function(e) {
+      if (isPaused) {
+        pauseBuffer.push(e.data);
+      } else {
+        appendLogLine(e.data);
+      }
+    };
   </script>
 </body>
 </html>"""

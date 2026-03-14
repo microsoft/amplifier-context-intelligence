@@ -449,6 +449,16 @@ async def test_logs_stream_backfills_existing_lines(
 # ---------------------------------------------------------------------------
 
 
+async def test_dashboard_html_includes_log_viewer(client: httpx.AsyncClient) -> None:
+    """GET / returns HTML with log viewer panel: log-container, EventSource, /logs/stream."""
+    response = await client.get("/")
+    assert response.status_code == 200
+    body = response.text
+    assert "log-container" in body
+    assert "EventSource" in body
+    assert "/logs/stream" in body
+
+
 async def test_lifespan_creates_and_closes_driver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
