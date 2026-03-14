@@ -58,7 +58,7 @@ class Neo4jGraphStore:
     def __init__(
         self,
         uri: str,
-        auth: tuple,
+        auth: tuple | None = None,
         database: str = "neo4j",
         workspace: str | None = None,
     ) -> None:
@@ -66,7 +66,7 @@ class Neo4jGraphStore:
 
         Args:
             uri:       Bolt/neo4j URI, e.g. ``bolt://localhost:7687``.
-            auth:      ``(username, password)`` tuple.
+            auth:      ``(username, password)`` tuple, or ``None`` for no-auth.
             database:  Target Neo4j database name (default: ``"neo4j"``).
             workspace: Workspace to scope writes to.  ``None`` resolves to
                        ``"default"`` via the ``workspace`` property.

@@ -26,10 +26,10 @@ services:
   neo4j:
     image: neo4j:5
     environment:
-      NEO4J_AUTH: neo4j/password
+      NEO4J_AUTH: none
     ports:
-      - "7474:7474"  # browser UI — debug/diagnostics only
-      # bolt 7687 is intentionally NOT exposed
+      - "7474:7474"  # browser UI — debug/diagnostics
+      - "7687:7687"  # bolt — exposed for Neo4j browser and direct queries
     volumes:
       - neo4j_data:/data
     restart: unless-stopped
