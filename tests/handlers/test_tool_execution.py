@@ -157,9 +157,7 @@ class TestToolPreHappyPath:
         edge = await services.graph.get_edge(step_id, EXPECTED_TE_ID)
         assert edge is not None
 
-    async def test_triggered_edge_occurred_at(
-        self, services: HookStateService
-    ) -> None:
+    async def test_triggered_edge_occurred_at(self, services: HookStateService) -> None:
         step_id = await _seed_step(services)
         handler = ToolExecutionHandler(services)
         await handler(

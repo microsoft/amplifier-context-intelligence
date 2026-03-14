@@ -120,8 +120,13 @@ class GraphState:
                 existing[key] = value
 
     async def get_node(self, node_id: str) -> dict[str, Any] | None:
-        """Return node data or ``None`` if the node does not exist."""
-        return self._nodes.get(node_id)
+        """Return a copy of node data or ``None`` if the node does not exist.
+
+        Returns a shallow copy to prevent callers from silently corrupting the
+        internal buffer by mutating the returned dict.
+        """
+        node = self._nodes.get(node_id)
+        return dict(node) if node is not None else None
 
     # ------------------------------------------------------------------
     # Edge operations
@@ -135,8 +140,13 @@ class GraphState:
         self._edges[key].update(data)
 
     async def get_edge(self, src_id: str, dst_id: str) -> dict[str, Any] | None:
-        """Return edge data or ``None`` if the edge does not exist."""
-        return self._edges.get((src_id, dst_id))
+        """Return a copy of edge data or ``None`` if the edge does not exist.
+
+        Returns a shallow copy to prevent callers from silently corrupting the
+        internal buffer by mutating the returned dict.
+        """
+        edge = self._edges.get((src_id, dst_id))
+        return dict(edge) if edge is not None else None
 
     # ------------------------------------------------------------------
     # Flush / close (no-ops for in-memory store)

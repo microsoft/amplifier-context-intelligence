@@ -390,3 +390,41 @@ class TestSessionResumeNotClaimed:
         assert "session:start" in SessionHandler.handled_events
         assert "session:fork" in SessionHandler.handled_events
         assert "session:end" in SessionHandler.handled_events
+
+
+class TestSessionEdgeTypes:
+    """Edges created by SessionHandler must carry explicit semantic 'type' keys."""
+
+    async def test_start_subsession_edge_type_is_child_of(
+        self, services: HookStateService
+    ) -> None:
+        """session:start child→parent edge must have type='CHILD_OF'."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        edge = await services.graph.get_edge("child", "parent")
+        assert edge is not None
+        assert edge.get("type") == "CHILD_OF"
+
+    async def test_fork_edge_type_is_forked_from(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork child→parent edge must have type='FORKED_FROM'."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "fork1",
+                "parent": "parent1",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        edge = await services.graph.get_edge("fork1", "parent1")
+        assert edge is not None
+        assert edge.get("type") == "FORKED_FROM"

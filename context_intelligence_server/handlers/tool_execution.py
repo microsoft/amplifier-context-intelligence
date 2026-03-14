@@ -8,7 +8,11 @@ from typing import Any
 
 from context_intelligence_server.protocol import HookResult
 from context_intelligence_server.services import HookStateService
-from context_intelligence_server.utils import EventLogContext, HandlerLogger, make_node_id
+from context_intelligence_server.utils import (
+    EventLogContext,
+    HandlerLogger,
+    make_node_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +53,9 @@ class ToolExecutionHandler:
         # delegate:context_inherited, delegate:session_resumed — no-op for v1
         return HookResult(action="continue")
 
-    async def _handle_tool_pre(self, data: dict[str, Any], log: EventLogContext) -> HookResult:
+    async def _handle_tool_pre(
+        self, data: dict[str, Any], log: EventLogContext
+    ) -> HookResult:
         session_id = data.get("session_id")
         if not session_id:
             log.error("received event without session_id")
@@ -91,7 +97,11 @@ class ToolExecutionHandler:
             await self.services.graph.upsert_edge(
                 step_id,
                 te_id,
-                {"type": "TRIGGERED", "seq": cursors.step_counter, "occurred_at": timestamp},
+                {
+                    "type": "TRIGGERED",
+                    "seq": cursors.step_counter,
+                    "occurred_at": timestamp,
+                },
             )
 
         # PARALLEL_WITH: link new TE to each existing TE in same parallel_group_id
@@ -118,7 +128,9 @@ class ToolExecutionHandler:
 
         return HookResult(action="continue")
 
-    async def _handle_tool_post(self, data: dict[str, Any], log: EventLogContext) -> HookResult:
+    async def _handle_tool_post(
+        self, data: dict[str, Any], log: EventLogContext
+    ) -> HookResult:
         session_id = data.get("session_id")
         if not session_id:
             log.error("received event without session_id")
@@ -148,7 +160,9 @@ class ToolExecutionHandler:
 
         return HookResult(action="continue")
 
-    async def _handle_tool_error(self, data: dict[str, Any], log: EventLogContext) -> HookResult:
+    async def _handle_tool_error(
+        self, data: dict[str, Any], log: EventLogContext
+    ) -> HookResult:
         session_id = data.get("session_id")
         if not session_id:
             log.error("received event without session_id")

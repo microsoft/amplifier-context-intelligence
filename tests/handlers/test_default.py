@@ -249,3 +249,21 @@ class TestDefaultHandlerRunAwareness:
         assert node is not None
         assert set(node["labels"]) == {"Event", "ArtifactRead"}
         assert node["event_name"] == "artifact:read"
+
+
+class TestDefaultHandlerEdgeType:
+    """DefaultHandler must attach a semantic 'type' key on its HAS_EVENT edges."""
+
+    async def test_has_event_edge_type_when_no_active_run(
+        self, services: HookStateService
+    ) -> None:
+        """Edge from session → event node must have type='HAS_EVENT'."""
+        handler = DefaultHandler(services)
+        await handler(
+            "session:resume",
+            {"session_id": "s1", "timestamp": "2026-01-01T02:00:00Z"},
+        )
+        event_id = make_node_id("s1", "session:resume", "2026-01-01T02:00:00Z")
+        edge = await services.graph.get_edge("s1", event_id)
+        assert edge is not None
+        assert edge.get("type") == "HAS_EVENT"

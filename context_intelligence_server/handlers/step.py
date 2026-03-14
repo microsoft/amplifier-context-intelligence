@@ -8,7 +8,11 @@ from typing import Any
 
 from context_intelligence_server.protocol import HookResult
 from context_intelligence_server.services import HookStateService
-from context_intelligence_server.utils import EventLogContext, HandlerLogger, make_node_id
+from context_intelligence_server.utils import (
+    EventLogContext,
+    HandlerLogger,
+    make_node_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +82,11 @@ class StepHandler:
             await self.services.graph.upsert_edge(
                 run_id,
                 step_id,
-                {"type": "HAS_STEP", "seq": cursors.step_counter, "occurred_at": timestamp},
+                {
+                    "type": "HAS_STEP",
+                    "seq": cursors.step_counter,
+                    "occurred_at": timestamp,
+                },
             )
 
         # Create NEXT edge: previous step → this step (only if previous step exists)
@@ -97,7 +105,9 @@ class StepHandler:
 
         return HookResult(action="continue")
 
-    async def _handle_llm_request(self, data: dict[str, Any], log: EventLogContext) -> HookResult:
+    async def _handle_llm_request(
+        self, data: dict[str, Any], log: EventLogContext
+    ) -> HookResult:
         session_id = data.get("session_id")
         if not session_id:
             log.error("received event without session_id")
@@ -121,7 +131,9 @@ class StepHandler:
 
         return HookResult(action="continue")
 
-    async def _handle_llm_response(self, data: dict[str, Any], log: EventLogContext) -> HookResult:
+    async def _handle_llm_response(
+        self, data: dict[str, Any], log: EventLogContext
+    ) -> HookResult:
         session_id = data.get("session_id")
         if not session_id:
             log.error("received event without session_id")

@@ -62,7 +62,7 @@ class DefaultHandler:
         await self.services.graph.upsert_edge(
             parent_id,
             event_node_id,
-            {"occurred_at": timestamp},
+            {"type": "HAS_EVENT", "occurred_at": timestamp},
         )
 
         return HookResult(action="continue")

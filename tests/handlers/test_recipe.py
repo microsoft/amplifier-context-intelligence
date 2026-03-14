@@ -498,3 +498,33 @@ class TestRecipeHandlerDataProperty:
             "plan_path": "/tmp/plan.md",
             "quality_approved": True,
         }
+
+
+class TestRecipeEdgeType:
+    """RecipeHandler._persist_event must attach type='HAS_EVENT' on session→node edges."""
+
+    async def test_recipe_start_edge_type_is_has_event(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:start edge from session to event node must have type='HAS_EVENT'."""
+        await _seed_session(services)
+        handler = RecipeHandler(services)
+        data = _lifecycle_data()
+        await handler("recipe:start", data)
+        node_id = make_node_id(SESSION_ID, "recipe:start", TIMESTAMP)
+        edge = await services.graph.get_edge(SESSION_ID, node_id)
+        assert edge is not None
+        assert edge.get("type") == "HAS_EVENT"
+
+    async def test_loop_event_edge_type_is_has_event(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_iteration edge from session to event node must have type='HAS_EVENT'."""
+        await _seed_session(services)
+        handler = RecipeHandler(services)
+        loop_data = _loop_iteration_data()
+        await handler("recipe:loop_iteration", loop_data)
+        node_id = make_node_id(SESSION_ID, "recipe:loop_iteration", TIMESTAMP)
+        edge = await services.graph.get_edge(SESSION_ID, node_id)
+        assert edge is not None
+        assert edge.get("type") == "HAS_EVENT"

@@ -156,6 +156,38 @@ def test_graph_state_no_graph_forest_name():
     assert not hasattr(state, "_graph_forest_name")
 
 
+async def test_graph_state_get_node_returns_copy():
+    """get_node returns a copy — assigning a key must not corrupt the internal buffer."""
+    state = GraphState()
+    await state.upsert_node("n1", {"name": "Alice", "labels": ["Person"]})
+    node = await state.get_node("n1")
+    assert node is not None
+    # Mutate the returned dict at the top level
+    node["name"] = "MUTATED"
+    node["injected"] = "should-not-appear"
+    # The buffer must be unaffected by top-level key reassignment
+    stored = await state.get_node("n1")
+    assert stored is not None
+    assert stored["name"] == "Alice"
+    assert "injected" not in stored
+
+
+async def test_graph_state_get_edge_returns_copy():
+    """get_edge returns a copy — mutating it must not corrupt the internal buffer."""
+    state = GraphState()
+    await state.upsert_edge("n1", "n2", {"type": "KNOWS", "weight": 1})
+    edge = await state.get_edge("n1", "n2")
+    assert edge is not None
+    # Mutate the returned dict
+    edge["type"] = "MUTATED"
+    edge["extra"] = "injected"
+    # The buffer must be unaffected
+    stored = await state.get_edge("n1", "n2")
+    assert stored is not None
+    assert stored["type"] == "KNOWS"
+    assert "extra" not in stored
+
+
 # ---------------------------------------------------------------------------
 # HookStateService tests
 # ---------------------------------------------------------------------------
@@ -234,7 +266,9 @@ class TestHookStateService:
     async def test_ensure_session_node_creates_root(self):
         """ensure_session_node creates a Session+Root node when no parent field is present."""
         svc = HookStateService()
-        await svc.ensure_session_node("session-1", {"started_at": "2024-01-01T00:00:00"})
+        await svc.ensure_session_node(
+            "session-1", {"started_at": "2024-01-01T00:00:00"}
+        )
         node = await svc.graph.get_node("session-1")
         assert node is not None
         assert "Session" in node["labels"]
@@ -244,11 +278,15 @@ class TestHookStateService:
     async def test_ensure_session_node_is_idempotent(self):
         """ensure_session_node is a no-op when session_id was already processed."""
         svc = HookStateService()
-        await svc.ensure_session_node("session-1", {"started_at": "2024-01-01T00:00:00"})
+        await svc.ensure_session_node(
+            "session-1", {"started_at": "2024-01-01T00:00:00"}
+        )
         # Manually modify the node after the first call
         await svc.graph.upsert_node("session-1", {"status": "modified"})
         # Second call must not overwrite the modified status
-        await svc.ensure_session_node("session-1", {"started_at": "2024-01-02T00:00:00"})
+        await svc.ensure_session_node(
+            "session-1", {"started_at": "2024-01-02T00:00:00"}
+        )
         node = await svc.graph.get_node("session-1")
         assert node is not None
         assert node["status"] == "modified"

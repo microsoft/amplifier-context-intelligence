@@ -157,6 +157,6 @@ class RecipeHandler:
         properties["data"] = json.dumps(data)
         await self.services.graph.upsert_node(node_id, properties)
         await self.services.graph.upsert_edge(
-            session_id, node_id, {"occurred_at": timestamp}
+            session_id, node_id, {"type": "HAS_EVENT", "occurred_at": timestamp}
         )
         log.info("Created %s node %s", derived, node_id)
