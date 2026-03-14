@@ -245,3 +245,91 @@ class TestPeriodicFlush:
 
         sig = inspect.signature(SessionRegistry.drain_worker)
         assert sig.parameters["flush_timeout"].default == 30.0
+
+
+class TestWorkerActivityTracking:
+    """SessionWorker tracks activity: last_event, last_event_time, events_processed."""
+
+    def test_worker_tracking_fields_initialized(self) -> None:
+        """New SessionWorker has zeroed tracking fields."""
+        worker = SessionWorker(
+            session_id="test-session",
+            workspace="/workspace/test",
+            services=HookStateService(workspace="/workspace/test"),
+        )
+
+        assert worker.last_event == ""
+        assert worker.last_event_time == 0.0
+        assert worker.events_processed == 0
+
+    @pytest.mark.asyncio
+    async def test_worker_tracking_updated_after_drain(self) -> None:
+        """Fields are updated after drain_worker processes an event."""
+        reg = SessionRegistry()
+        worker = SessionWorker(
+            session_id="test-session",
+            workspace="/workspace/test",
+            services=HookStateService(workspace="/workspace/test"),
+        )
+
+        event = "tool_call"
+        workspace = "/workspace/test"
+        data: dict[str, object] = {"session_id": "test-session", "tool": "bash"}
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+
+            # Enqueue the event tuple
+            await worker.queue.put((event, workspace, data))
+
+            # Yield control so the drain loop can process the item
+            await asyncio.sleep(0.05)
+
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert worker.last_event == event
+        assert worker.last_event_time > 0.0
+        assert worker.events_processed == 1
+
+    @pytest.mark.asyncio
+    async def test_worker_events_processed_increments(self) -> None:
+        """events_processed counter increments once per event."""
+        reg = SessionRegistry()
+        worker = SessionWorker(
+            session_id="test-session",
+            workspace="/workspace/test",
+            services=HookStateService(workspace="/workspace/test"),
+        )
+
+        event = "tool_call"
+        workspace = "/workspace/test"
+        data: dict[str, object] = {"session_id": "test-session", "tool": "bash"}
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+
+            # Enqueue three events
+            await worker.queue.put((event, workspace, data))
+            await worker.queue.put((event, workspace, data))
+            await worker.queue.put((event, workspace, data))
+
+            # Yield control so the drain loop can process all items
+            await asyncio.sleep(0.1)
+
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert worker.events_processed == 3

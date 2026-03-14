@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
@@ -19,6 +20,9 @@ class SessionWorker:
     services: HookStateService
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     task: asyncio.Task | None = None
+    last_event: str = ""
+    last_event_time: float = 0.0
+    events_processed: int = 0
 
 
 class SessionRegistry:
@@ -47,6 +51,9 @@ class SessionRegistry:
                 event, _workspace, data = event_tuple
                 try:
                     await process_event(worker, event, data, handlers)
+                    worker.last_event = event
+                    worker.last_event_time = time.time()
+                    worker.events_processed += 1
                 finally:
                     worker.queue.task_done()
 
