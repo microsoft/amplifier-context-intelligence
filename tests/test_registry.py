@@ -493,3 +493,86 @@ class TestRingBufferEmission:
         assert record.session_id == "test-session"
         assert record.workspace == "/workspace/test"
         assert record.result == "ok"
+
+
+class TestDeregister:
+    """_deregister removes the worker WITHOUT cancelling its asyncio task."""
+
+    @pytest.mark.asyncio
+    async def test_deregister_removes_from_workers(
+        self, registry: SessionRegistry
+    ) -> None:
+        """_deregister removes session from _workers; active_count goes to 0."""
+        worker = registry.get_or_create("session-1", "/workspace/a")
+        task = worker.task
+        assert registry.active_count() == 1
+
+        registry._deregister("session-1")
+        assert registry.active_count() == 0
+
+        # Cleanup orphaned task
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_deregister_does_not_cancel_task(
+        self, registry: SessionRegistry
+    ) -> None:
+        """Task is still running after _deregister (not cancelled)."""
+        worker = registry.get_or_create("session-1", "/workspace/a")
+        task = worker.task
+        assert task is not None
+
+        registry._deregister("session-1")
+
+        # Task should still be running — not done, no cancel request issued
+        assert not task.done()
+        assert task.cancelling() == 0
+
+        # Cleanup: cancel the orphaned task
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    @pytest.mark.asyncio
+    async def test_deregister_nonexistent_is_noop(
+        self, registry: SessionRegistry
+    ) -> None:
+        """_deregister on a nonexistent session_id does not raise."""
+        # Should not raise
+        registry._deregister("nonexistent-session")
+        assert registry.active_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_remove_cancels_task_but_deregister_does_not(
+        self, registry: SessionRegistry
+    ) -> None:
+        """remove() cancels the task; _deregister() leaves the task running."""
+        worker_a = registry.get_or_create("session-a", "/workspace/a")
+        worker_b = registry.get_or_create("session-b", "/workspace/b")
+        task_a = worker_a.task
+        task_b = worker_b.task
+        assert task_a is not None
+        assert task_b is not None
+
+        # remove() should issue a cancel request to the task
+        registry.remove("session-a")
+        assert task_a.cancelling() > 0
+
+        # _deregister() should NOT cancel the task
+        registry._deregister("session-b")
+        assert not task_b.done()
+        assert task_b.cancelling() == 0
+
+        # Cleanup: cancel the orphaned task_b
+        task_b.cancel()
+        try:
+            await task_b
+        except asyncio.CancelledError:
+            pass

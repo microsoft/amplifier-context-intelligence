@@ -137,6 +137,10 @@ class SessionRegistry:
         if worker and worker.task and not worker.task.done():
             worker.task.cancel()
 
+    def _deregister(self, session_id: str) -> None:
+        """Remove worker from registry WITHOUT cancelling its asyncio task."""
+        self._workers.pop(session_id, None)
+
     def completed_sessions(self) -> list[CompletedSession]:
         """Return a list copy of completed sessions from the ring buffer."""
         return list(self._completed)
