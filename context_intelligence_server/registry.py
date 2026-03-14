@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
@@ -25,11 +26,27 @@ class SessionWorker:
     last_event: str = ""
     last_event_time: float = 0.0
     events_processed: int = 0
+    started_at: float = field(default_factory=time.time)
+    error_count: int = 0
+
+
+@dataclass
+class CompletedSession:
+    """Snapshot of a finished session stored in the ring buffer."""
+
+    session_id: str
+    workspace: str
+    started_at: float
+    ended_at: float
+    events_processed: int
+    error_count: int
+    duration_seconds: float
 
 
 class SessionRegistry:
     def __init__(self) -> None:
         self._workers: dict[str, SessionWorker] = {}
+        self._completed: deque[CompletedSession] = deque(maxlen=100)
 
     async def drain_worker(
         self, worker: SessionWorker, flush_timeout: float = 30.0
@@ -119,6 +136,10 @@ class SessionRegistry:
         worker = self._workers.pop(session_id, None)
         if worker and worker.task and not worker.task.done():
             worker.task.cancel()
+
+    def completed_sessions(self) -> list[CompletedSession]:
+        """Return a list copy of completed sessions from the ring buffer."""
+        return list(self._completed)
 
     def workers(self) -> list[SessionWorker]:
         """Return the list of all active SessionWorker objects."""

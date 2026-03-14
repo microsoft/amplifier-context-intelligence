@@ -86,12 +86,16 @@ def anyio_backend() -> str:
 def reset_registry() -> Generator[None, None, None]:
     """Ensure each test starts with a clean session registry."""
     registry._workers.clear()
+    if hasattr(registry, "_completed"):
+        registry._completed.clear()
     yield
     # Explicitly cancel running drain tasks before clearing so teardown intent is clear
     for w in list(registry._workers.values()):
         if w.task and not w.task.done():
             w.task.cancel()
     registry._workers.clear()
+    if hasattr(registry, "_completed"):
+        registry._completed.clear()
 
 
 @pytest.fixture

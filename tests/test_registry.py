@@ -2,6 +2,8 @@
 
 import asyncio
 import dataclasses
+import time
+from collections import deque
 from pathlib import Path
 from unittest.mock import ANY, AsyncMock, patch
 
@@ -9,8 +11,110 @@ import pytest
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
-from context_intelligence_server.registry import SessionRegistry, SessionWorker
+from context_intelligence_server.registry import CompletedSession, SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
+
+
+# ---------------------------------------------------------------------------
+# Factory helper
+# ---------------------------------------------------------------------------
+
+
+def make_completed(
+    session_id: str = "session-x",
+    workspace: str = "/workspace/test",
+    started_at: float | None = None,
+    ended_at: float | None = None,
+    events_processed: int = 5,
+    error_count: int = 0,
+    duration_seconds: float = 1.0,
+) -> CompletedSession:
+    """Factory for CompletedSession test instances."""
+    now = time.time()
+    return CompletedSession(
+        session_id=session_id,
+        workspace=workspace,
+        started_at=started_at if started_at is not None else now - duration_seconds,
+        ended_at=ended_at if ended_at is not None else now,
+        events_processed=events_processed,
+        error_count=error_count,
+        duration_seconds=duration_seconds,
+    )
+
+
+# ---------------------------------------------------------------------------
+# TestCompletedSession
+# ---------------------------------------------------------------------------
+
+
+class TestCompletedSession:
+    def test_completed_session_is_dataclass(self) -> None:
+        """CompletedSession must be a dataclass with all 7 required fields."""
+        assert dataclasses.is_dataclass(CompletedSession)
+        field_names = {f.name for f in dataclasses.fields(CompletedSession)}
+        expected = {
+            "session_id",
+            "workspace",
+            "started_at",
+            "ended_at",
+            "events_processed",
+            "error_count",
+            "duration_seconds",
+        }
+        assert expected == field_names
+
+    def test_registry_has_completed_deque(self) -> None:
+        """SessionRegistry._completed is a deque with maxlen=100."""
+        reg = SessionRegistry()
+        assert hasattr(reg, "_completed")
+        assert isinstance(reg._completed, deque)
+        assert reg._completed.maxlen == 100
+
+    def test_completed_sessions_returns_list(self) -> None:
+        """completed_sessions() returns a list (not a deque)."""
+        reg = SessionRegistry()
+        result = reg.completed_sessions()
+        assert isinstance(result, list)
+
+    def test_completed_ring_overflow(self) -> None:
+        """Ring buffer retains at most 100 entries; oldest entry is evicted at 101."""
+        reg = SessionRegistry()
+
+        # Fill with 101 entries; first entry has session_id "session-0"
+        for i in range(101):
+            reg._completed.append(make_completed(session_id=f"session-{i}"))
+
+        sessions = reg.completed_sessions()
+        assert len(sessions) == 100
+        # Oldest entry (session-0) must have been evicted
+        ids = [s.session_id for s in sessions]
+        assert "session-0" not in ids
+        assert "session-1" in ids
+        assert "session-100" in ids
+
+    def test_session_worker_has_started_at_field(self) -> None:
+        """SessionWorker must have a started_at field defaulting to time.time()."""
+        field_names = {f.name for f in dataclasses.fields(SessionWorker)}
+        assert "started_at" in field_names
+        before = time.time()
+        worker = SessionWorker(
+            session_id="test",
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+        after = time.time()
+        assert before <= worker.started_at <= after
+
+    def test_session_worker_has_error_count_field(self) -> None:
+        """SessionWorker must have an error_count field defaulting to 0."""
+        field_names = {f.name for f in dataclasses.fields(SessionWorker)}
+        assert "error_count" in field_names
+        worker = SessionWorker(
+            session_id="test",
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+        assert worker.error_count == 0
 
 
 @pytest.fixture
