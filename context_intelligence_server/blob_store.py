@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 _SCHEME = "ci-blob://"
 
@@ -152,9 +152,13 @@ class AsyncDiskBlobStore:
         path = self._blob_path(session_id, key)
 
         def _read() -> dict[str, Any] | list[Any]:
-            if not path.exists():
+            try:
+                return cast(
+                    dict[str, Any] | list[Any],
+                    json.loads(path.read_text(encoding="utf-8")),
+                )
+            except FileNotFoundError:
                 raise FileNotFoundError(f"Blob not found: {uri!r} (path: {path})")
-            return json.loads(path.read_text(encoding="utf-8"))  # type: ignore[return-value]
 
         return await asyncio.to_thread(_read)
 
