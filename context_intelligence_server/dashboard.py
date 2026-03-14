@@ -1,11 +1,14 @@
 """Dashboard utilities: event ring buffer and status response builder."""
 
+from __future__ import annotations
+
 import dataclasses
 import time
 from collections import deque
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from context_intelligence_server.registry import SessionRegistry
+if TYPE_CHECKING:
+    from context_intelligence_server.registry import SessionRegistry
 
 
 # ---------------------------------------------------------------------------

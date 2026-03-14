@@ -333,3 +333,55 @@ class TestWorkerActivityTracking:
                 pass
 
         assert worker.events_processed == 3
+
+
+class TestRingBufferEmission:
+    """drain_worker emits an EventRecord to ring_buffer after each processed event."""
+
+    @pytest.mark.asyncio
+    async def test_ring_buffer_receives_record_after_event(self) -> None:
+        """After drain processes an event, ring_buffer contains an EventRecord
+        with the correct event, session_id, workspace, and result='ok'."""
+        from context_intelligence_server.dashboard import EventRingBuffer
+
+        reg = SessionRegistry()
+        worker = SessionWorker(
+            session_id="test-session",
+            workspace="/workspace/test",
+            services=HookStateService(workspace="/workspace/test"),
+        )
+
+        event = "tool_call"
+        workspace = "/workspace/test"
+        data: dict[str, object] = {"session_id": "test-session", "tool": "bash"}
+
+        fresh_buffer = EventRingBuffer()
+
+        with (
+            patch(
+                "context_intelligence_server.registry.process_event",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "context_intelligence_server.registry.ring_buffer",
+                fresh_buffer,
+            ),
+        ):
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+
+            await worker.queue.put((event, workspace, data))
+            await asyncio.sleep(0.05)
+
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        records = fresh_buffer.recent()
+        assert len(records) == 1
+        record = records[0]
+        assert record.event == event
+        assert record.session_id == "test-session"
+        assert record.workspace == "/workspace/test"
+        assert record.result == "ok"

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
+from context_intelligence_server.dashboard import EventRecord, ring_buffer
 from context_intelligence_server.pipeline import process_event, setup_handlers
 from context_intelligence_server.services import HookStateService
 
@@ -49,12 +50,28 @@ class SessionRegistry:
                     worker.queue.get(), timeout=flush_timeout
                 )
                 event, _workspace, data = event_tuple
+                result = "ok"
+                error = ""
                 try:
                     await process_event(worker, event, data, handlers)
                     worker.last_event = event
                     worker.last_event_time = time.time()
                     worker.events_processed += 1
+                except Exception as exc:
+                    result = "error"
+                    error = str(exc)
                 finally:
+                    if event:
+                        ring_buffer.add(
+                            EventRecord(
+                                timestamp=time.time(),
+                                event=event,
+                                session_id=data.get("session_id", ""),
+                                workspace=worker.workspace,
+                                result=result,
+                                error=error,
+                            )
+                        )
                     worker.queue.task_done()
 
             except asyncio.TimeoutError:
