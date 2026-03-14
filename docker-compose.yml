@@ -9,6 +9,7 @@ services:
       PYTHONUNBUFFERED: "1"
     volumes:
       - blob_data:/data/blobs
+      - log_data:/data/logs
     depends_on:
       neo4j:
         condition: service_healthy
@@ -47,6 +48,7 @@ services:
 volumes:
   blob_data:
   neo4j_data:
+  log_data:
 
 networks:
   context-intelligence:
