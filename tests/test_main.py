@@ -344,12 +344,12 @@ async def test_status_includes_error_count_last_hour(client: httpx.AsyncClient) 
 
 
 async def test_dashboard_returns_html(client: httpx.AsyncClient) -> None:
-    """GET / returns 200 with HTML dashboard containing polling JavaScript."""
+    """GET / returns 200 with HTML landing page containing polling JavaScript."""
     response = await client.get("/")
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
     body = response.text
-    assert "Context Intelligence Server" in body
+    assert "Context Intelligence" in body
     assert "setInterval" in body
 
 
@@ -361,19 +361,19 @@ async def test_dashboard_returns_html(client: httpx.AsyncClient) -> None:
 async def test_dashboard_html_includes_completed_sessions_section(
     client: httpx.AsyncClient,
 ) -> None:
-    """GET / returns HTML with Completed Sessions table body element."""
-    response = await client.get("/")
+    """GET /dashboard returns HTML with Completed Sessions table body element."""
+    response = await client.get("/dashboard")
     assert response.status_code == 200
     body = response.text
     assert "completed-body" in body
-    assert "Completed Sessions" in body
+    assert "Completed sessions" in body
 
 
 async def test_dashboard_html_includes_error_badge(
     client: httpx.AsyncClient,
 ) -> None:
-    """GET / returns HTML with error-badge element."""
-    response = await client.get("/")
+    """GET /dashboard returns HTML with error-badge element."""
+    response = await client.get("/dashboard")
     assert response.status_code == 200
     body = response.text
     assert "error-badge" in body
@@ -382,12 +382,13 @@ async def test_dashboard_html_includes_error_badge(
 async def test_dashboard_html_sessions_table_displays_event_name_not_timestamp(
     client: httpx.AsyncClient,
 ) -> None:
-    """Active sessions table must render s.last_event directly, not via timeAgo().
+    """Dashboard JS must render s.last_event directly, not via timeAgo().
 
     s.last_event is an event-name string (e.g. 'tool:pre'), not a Unix timestamp.
     Passing it to timeAgo() coerces the string to NaN and renders 'NaNs ago'.
+    JS logic is now in the external dashboard.js module.
     """
-    response = await client.get("/")
+    response = await client.get("/static/js/dashboard.js")
     assert response.status_code == 200
     body = response.text
     # Bug pattern must be absent
@@ -533,13 +534,17 @@ async def test_logs_stream_tail_lines_have_no_trailing_newline(
 
 
 async def test_dashboard_html_includes_log_viewer(client: httpx.AsyncClient) -> None:
-    """GET / returns HTML with log viewer panel: log-container, EventSource, /logs/stream."""
-    response = await client.get("/")
-    assert response.status_code == 200
-    body = response.text
-    assert "log-container" in body
-    assert "EventSource" in body
-    assert "/logs/stream" in body
+    """GET /dashboard returns HTML with log viewer panel; JS module wires up EventSource."""
+    # The dashboard HTML contains the DOM elements
+    html_response = await client.get("/dashboard")
+    assert html_response.status_code == 200
+    assert "log-container" in html_response.text
+    # EventSource and /logs/stream are in the external dashboard.js module
+    js_response = await client.get("/static/js/dashboard.js")
+    assert js_response.status_code == 200
+    js_body = js_response.text
+    assert "EventSource" in js_body
+    assert "/logs/stream" in js_body
 
 
 async def test_lifespan_creates_and_closes_driver(
