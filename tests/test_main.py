@@ -1,8 +1,11 @@
 """Tests for FastAPI app — GET /status and POST /events endpoints."""
 
 import asyncio
+import json
+from pathlib import Path
 
 import httpx
+import pytest
 
 from context_intelligence_server.main import registry
 
@@ -93,3 +96,43 @@ async def test_drain_loop_processes_event(client: httpx.AsyncClient) -> None:
     worker = registry.get_or_create("sess-drain", "/ws")
     await asyncio.wait_for(worker.queue.join(), timeout=5.0)
     assert worker.queue.empty()
+
+
+async def test_get_blob_returns_200_with_content(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /blobs/{session_id}/{key} returns 200 with blob content for existing blob."""
+    import context_intelligence_server.main as main_module
+
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+
+    session_id = "test-session"
+    key = "my-key"
+    blob_data = {"foo": "bar", "count": 42}
+
+    blob_dir = tmp_path / session_id / "blobs"
+    blob_dir.mkdir(parents=True, exist_ok=True)
+    (blob_dir / f"{key}.json").write_text(json.dumps(blob_data), encoding="utf-8")
+
+    response = await client.get(f"/blobs/{session_id}/{key}")
+    assert response.status_code == 200
+    assert response.json() == blob_data
+
+
+async def test_get_blob_returns_404_for_missing_blob(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /blobs/{session_id}/{key} returns 404 with 'not found' in detail for missing blob."""
+    import context_intelligence_server.main as main_module
+
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+
+    response = await client.get("/blobs/missing-session/missing-key")
+    assert response.status_code == 404
+    data = response.json()
+    assert "not found" in data["detail"].lower()
+    assert "ci-blob://" in data["detail"]

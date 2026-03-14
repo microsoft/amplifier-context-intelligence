@@ -3,8 +3,10 @@
 import logging
 import time
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
+from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.models import (
     EventRequest,
@@ -42,3 +44,14 @@ async def post_events(request: EventRequest) -> EventResponse:
     await worker.queue.put((request.event, request.workspace, request.data))
     logger.info("event_enqueued: event=%s session_id=%s", request.event, session_id)
     return EventResponse(status="queued", session_id=session_id or None)
+
+
+@app.get("/blobs/{session_id}/{key}")
+async def get_blob(session_id: str, key: str) -> JSONResponse:
+    blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
+    uri = f"ci-blob://{session_id}/{key}"
+    try:
+        content = await blob_store.read(uri)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Blob not found: {uri}")
+    return JSONResponse(content=content)
