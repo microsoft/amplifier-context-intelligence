@@ -15,10 +15,9 @@ from context_intelligence_server.registry import SessionRegistry
 
 _settings = get_settings()
 
-logging.basicConfig(
-    level=_settings.log_level,
-    format='{"time": "%(asctime)s", "level": "%(levelname)s", "logger": "%(name)s", "message": "%(message)s"}',
-)
+_LOG_FORMAT = '{"time": "%(asctime)s", "level": "%(levelname)s", "logger": "%(name)s", "message": "%(message)s"}'
+
+logging.basicConfig(level=_settings.log_level, format=_LOG_FORMAT)
 
 logger = logging.getLogger("context_intelligence_server")
 
