@@ -11,7 +11,11 @@ import pytest
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
-from context_intelligence_server.registry import CompletedSession, SessionRegistry, SessionWorker
+from context_intelligence_server.registry import (
+    CompletedSession,
+    SessionRegistry,
+    SessionWorker,
+)
 from context_intelligence_server.services import HookStateService
 
 
