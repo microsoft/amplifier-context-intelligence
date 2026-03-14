@@ -3,9 +3,12 @@
 import json
 import logging
 import time
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
+from neo4j import AsyncGraphDatabase
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
@@ -25,7 +28,23 @@ logging.basicConfig(level=_settings.log_level, format=_LOG_FORMAT)
 
 logger = logging.getLogger("context_intelligence_server")
 
-app = FastAPI(title="Context Intelligence Server")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Manage application lifespan: create and close the shared Neo4j driver."""
+    logger.info("lifespan_startup: creating Neo4j driver url=%s", _settings.neo4j_url)
+    app.state.neo4j_driver = AsyncGraphDatabase.driver(
+        _settings.neo4j_url,
+        auth=(_settings.neo4j_user, _settings.neo4j_password),
+    )
+    try:
+        yield
+    finally:
+        logger.info("lifespan_shutdown: closing Neo4j driver")
+        await app.state.neo4j_driver.close()
+
+
+app = FastAPI(title="Context Intelligence Server", lifespan=lifespan)
 _start_time = time.time()
 registry = SessionRegistry()
 

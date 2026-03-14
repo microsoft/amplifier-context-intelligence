@@ -284,3 +284,33 @@ async def test_cypher_neo4j_error_returns_500(
     assert response.status_code == 500
     data = response.json()
     assert "Connection refused" in data["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Lifespan tests
+# ---------------------------------------------------------------------------
+
+
+async def test_lifespan_creates_and_closes_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lifespan creates a Neo4j driver at startup and closes it at shutdown."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from context_intelligence_server.main import lifespan
+
+    mock_driver = MagicMock()
+    mock_driver.close = AsyncMock()
+
+    with patch(
+        "context_intelligence_server.main.AsyncGraphDatabase.driver",
+        return_value=mock_driver,
+    ) as mock_driver_factory:
+        async with lifespan(main_module.app):
+            # During lifespan: driver factory must have been called
+            mock_driver_factory.assert_called_once()
+            # The driver is accessible via app.state
+            assert main_module.app.state.neo4j_driver is mock_driver
+
+        # After lifespan exits: close() must have been called
+        mock_driver.close.assert_awaited_once()
