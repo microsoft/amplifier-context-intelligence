@@ -1,5 +1,7 @@
 """Tests for FastAPI app — GET /status and POST /events endpoints."""
 
+import asyncio
+
 import httpx
 
 
@@ -75,3 +77,19 @@ async def test_post_events_no_session_id_returns_null(
     assert response.status_code == 202
     data = response.json()
     assert data["session_id"] is None
+
+
+async def test_drain_loop_processes_event(client: httpx.AsyncClient) -> None:
+    from context_intelligence_server.main import registry
+
+    await client.post(
+        "/events",
+        json={
+            "event": "tool_use",
+            "workspace": "/ws",
+            "data": {"session_id": "sess-drain"},
+        },
+    )
+    worker = registry.get_or_create("sess-drain", "/ws")
+    await asyncio.wait_for(worker.queue.join(), timeout=5.0)
+    assert worker.queue.empty()

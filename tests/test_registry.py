@@ -21,7 +21,7 @@ async def test_get_or_create_new_worker(registry: SessionRegistry) -> None:
     assert worker.workspace == "/workspace/a"
     assert isinstance(worker.queue, asyncio.Queue)
     assert worker.queue.empty()
-    assert worker.task is None
+    assert isinstance(worker.task, asyncio.Task)
 
 
 @pytest.mark.asyncio
