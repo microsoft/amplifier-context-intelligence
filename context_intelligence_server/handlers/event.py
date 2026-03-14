@@ -1,7 +1,4 @@
-"""SystemEventHandler — owns known system events (compaction, cancellation).
-
-Stub implementation: full port from bundle task-13 will replace this.
-"""
+"""SystemEventHandler — owns known system events (compaction, cancellation)."""
 
 from __future__ import annotations
 
@@ -12,7 +9,11 @@ from context_intelligence_server.services import HookStateService
 
 
 class SystemEventHandler:
-    """Labels preserve full event scope: :Event:ContextCompaction, :Event:CancelRequested, etc."""
+    """Labels preserve full event scope: :Event:ContextCompaction, :Event:CancelRequested, etc.
+
+    This handler is a no-op sink: it claims these events to prevent DefaultHandler from
+    creating spurious Event nodes for them, but does not persist anything to the graph.
+    """
 
     handled_events: frozenset[str] = frozenset(
         {
