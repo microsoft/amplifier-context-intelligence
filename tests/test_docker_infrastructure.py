@@ -142,13 +142,9 @@ def test_compose_server_depends_on_neo4j(compose: dict) -> None:
     server = compose["services"]["context-intelligence-server"]
     depends = server.get("depends_on", [])
     if isinstance(depends, dict):
-        assert "neo4j" in depends, (
-            "context-intelligence-server must depend on neo4j"
-        )
+        assert "neo4j" in depends, "context-intelligence-server must depend on neo4j"
     else:
-        assert "neo4j" in depends, (
-            "context-intelligence-server must depend on neo4j"
-        )
+        assert "neo4j" in depends, "context-intelligence-server must depend on neo4j"
 
 
 def test_compose_server_has_healthcheck(compose: dict) -> None:

@@ -1,6 +1,6 @@
 """Pytest configuration and shared fixtures for the test suite."""
 
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
 
 import pytest
 import httpx
@@ -26,7 +26,7 @@ def reset_registry() -> Generator[None, None, None]:
 
 
 @pytest.fixture
-async def client() -> httpx.AsyncClient:
+async def client() -> AsyncGenerator[httpx.AsyncClient, None]:
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",

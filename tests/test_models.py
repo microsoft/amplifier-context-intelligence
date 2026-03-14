@@ -3,7 +3,11 @@
 import pytest
 from pydantic import ValidationError
 
-from context_intelligence_server.models import EventRequest, EventResponse, StatusResponse
+from context_intelligence_server.models import (
+    EventRequest,
+    EventResponse,
+    StatusResponse,
+)
 
 
 def test_event_request_valid():
@@ -21,13 +25,13 @@ def test_event_request_valid():
 def test_event_request_missing_event():
     """EventRequest raises ValidationError when event is missing."""
     with pytest.raises(ValidationError):
-        EventRequest(workspace="my-feature-branch", data={"session_id": "abc123"})
+        EventRequest(workspace="my-feature-branch", data={"session_id": "abc123"})  # type: ignore[call-arg]
 
 
 def test_event_request_missing_workspace():
     """EventRequest raises ValidationError when workspace is missing."""
     with pytest.raises(ValidationError):
-        EventRequest(event="tool:pre", data={"session_id": "abc123"})
+        EventRequest(event="tool:pre", data={"session_id": "abc123"})  # type: ignore[call-arg]
 
 
 def test_event_request_data_without_session_id():
