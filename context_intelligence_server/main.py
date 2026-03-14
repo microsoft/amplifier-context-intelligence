@@ -4,7 +4,11 @@ import time
 
 from fastapi import FastAPI
 
-from context_intelligence_server.models import StatusResponse
+from context_intelligence_server.models import (
+    EventRequest,
+    EventResponse,
+    StatusResponse,
+)
 from context_intelligence_server.registry import SessionRegistry
 
 app = FastAPI(title="Context Intelligence Server")
@@ -19,3 +23,11 @@ async def get_status() -> StatusResponse:
         uptime_seconds=time.time() - _start_time,
         active_sessions=registry.active_count(),
     )
+
+
+@app.post("/events", status_code=202, response_model=EventResponse)
+async def post_events(request: EventRequest) -> EventResponse:
+    session_id = request.data.get("session_id", "")
+    worker = registry.get_or_create(session_id, request.workspace)
+    await worker.queue.put((request.event, request.workspace, request.data))
+    return EventResponse(status="queued", session_id=session_id or None)
