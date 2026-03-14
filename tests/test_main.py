@@ -4,12 +4,13 @@ import asyncio
 import json
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
 import context_intelligence_server.main as main_module
-from context_intelligence_server.main import registry
+from context_intelligence_server.main import lifespan, registry
 from context_intelligence_server.models import CypherRequest
 from tests.conftest import MockNeo4jDriver
 
@@ -295,10 +296,6 @@ async def test_lifespan_creates_and_closes_driver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Lifespan creates a Neo4j driver at startup and closes it at shutdown."""
-    from unittest.mock import AsyncMock, MagicMock, patch
-
-    from context_intelligence_server.main import lifespan
-
     mock_driver = MagicMock()
     mock_driver.close = AsyncMock()
 
