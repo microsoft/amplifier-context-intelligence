@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.dashboard import EventRecord, ring_buffer
+from context_intelligence_server.neo4j_store import Neo4jGraphStore
 from context_intelligence_server.pipeline import process_event, setup_handlers
 from context_intelligence_server.services import HookStateService
 
@@ -93,10 +94,18 @@ class SessionRegistry:
         if session_id not in self._workers:
             settings = get_settings()
             blob_store = AsyncDiskBlobStore(root=settings.blob_path)
+            neo4j_store = Neo4jGraphStore(
+                uri=settings.neo4j_url,
+                auth=(settings.neo4j_user, settings.neo4j_password),
+            )
             self._workers[session_id] = SessionWorker(
                 session_id=session_id,
                 workspace=workspace,
-                services=HookStateService(workspace=workspace, blob_store=blob_store),
+                services=HookStateService(
+                    workspace=workspace,
+                    blob_store=blob_store,
+                    graph_store=neo4j_store,
+                ),
             )
             self.start_drain(self._workers[session_id])
         return self._workers[session_id]
