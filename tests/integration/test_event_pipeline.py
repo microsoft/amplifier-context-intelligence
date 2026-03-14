@@ -7,6 +7,8 @@ to graph state, covering:
 - TestHandlerErrorIsolation: bad timestamps don't crash pipeline
 - TestUnclaimedEventsFlowToDefault: session:resume via DefaultHandler
 - TestSystemEventsAreNoOp: context:compaction does not create Event nodes
+- TestSessionEndWorkerCleanup: session:end triggers worker removal and CompletedSession recording
+- TestStatusIncludesCompletedSessions: build_status_response includes completed sessions after drain
 """
 
 from __future__ import annotations
@@ -56,6 +58,27 @@ def _make_worker_and_services(
     services = HookStateService(workspace=workspace)
     worker = types.SimpleNamespace(services=services)
     return worker, services
+
+
+def _make_registry_and_worker(
+    workspace: str = WORKSPACE,
+    session_id: str = SESSION_ID,
+) -> tuple[SessionRegistry, SessionWorker]:
+    """Return a (registry, worker) pair for cleanup and status tests.
+
+    ``services.graph.close`` is mocked so the async cleanup in
+    ``SessionWorker`` does not attempt to close a real graph connection.
+    """
+    reg = SessionRegistry()
+    services = HookStateService(workspace=workspace)
+    services.graph.close = AsyncMock()  # type: ignore[method-assign]
+    worker = SessionWorker(
+        session_id=session_id,
+        workspace=workspace,
+        services=services,
+    )
+    reg._workers[session_id] = worker
+    return reg, worker
 
 
 # ===========================================================================
@@ -642,15 +665,7 @@ class TestSessionEndWorkerCleanup:
 
     async def test_session_end_removes_worker_from_registry(self) -> None:
         """After session:end is drained, the worker is removed from the registry."""
-        reg = SessionRegistry()
-        services = HookStateService(workspace=WORKSPACE)
-        services.graph.close = AsyncMock()  # type: ignore[method-assign]
-        worker = SessionWorker(
-            session_id=SESSION_ID,
-            workspace=WORKSPACE,
-            services=services,
-        )
-        reg._workers[SESSION_ID] = worker
+        reg, worker = _make_registry_and_worker()
 
         with patch(
             "context_intelligence_server.registry.process_event",
@@ -681,15 +696,7 @@ class TestSessionEndWorkerCleanup:
 
     async def test_session_end_populates_completed_ring(self) -> None:
         """After session:end the completed ring holds one CompletedSession."""
-        reg = SessionRegistry()
-        services = HookStateService(workspace=WORKSPACE)
-        services.graph.close = AsyncMock()  # type: ignore[method-assign]
-        worker = SessionWorker(
-            session_id=SESSION_ID,
-            workspace=WORKSPACE,
-            services=services,
-        )
-        reg._workers[SESSION_ID] = worker
+        reg, worker = _make_registry_and_worker()
 
         with patch(
             "context_intelligence_server.registry.process_event",
@@ -725,15 +732,7 @@ class TestStatusIncludesCompletedSessions:
 
     async def test_status_has_completed_sessions_after_drain(self) -> None:
         """build_status_response lists the completed session after drain."""
-        reg = SessionRegistry()
-        services = HookStateService(workspace=WORKSPACE)
-        services.graph.close = AsyncMock()  # type: ignore[method-assign]
-        worker = SessionWorker(
-            session_id=SESSION_ID,
-            workspace=WORKSPACE,
-            services=services,
-        )
-        reg._workers[SESSION_ID] = worker
+        reg, worker = _make_registry_and_worker()
 
         with patch(
             "context_intelligence_server.registry.process_event",
