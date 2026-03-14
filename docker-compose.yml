@@ -6,25 +6,48 @@ services:
     environment:
       CI_SERVER_NEO4J_URL: neo4j://neo4j:7687
       CI_SERVER_BLOB_PATH: /data/blobs
+      PYTHONUNBUFFERED: "1"
     volumes:
       - blob_data:/data/blobs
     depends_on:
-      - neo4j
+      neo4j:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/status"]
       interval: 10s
       timeout: 5s
       retries: 3
+    restart: unless-stopped
+    labels:
+      com.context-intelligence.component: server
+    networks:
+      - context-intelligence
 
   neo4j:
     image: neo4j:5
     environment:
       NEO4J_AUTH: neo4j/password
     ports:
-      - "7474:7474"
+      - "7474:7474"  # browser UI — debug/diagnostics only
+      # bolt 7687 is intentionally NOT exposed
     volumes:
       - neo4j_data:/data
+    restart: unless-stopped
+    labels:
+      com.context-intelligence.component: neo4j
+    healthcheck:
+      test: ["CMD", "wget", "-O", "-", "http://localhost:7474"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - context-intelligence
 
 volumes:
   blob_data:
   neo4j_data:
+
+networks:
+  context-intelligence:
+    driver: bridge
