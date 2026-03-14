@@ -3,6 +3,7 @@
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -240,7 +241,7 @@ async def test_cypher_workspace_injection(
     import context_intelligence_server.main as main_module
     from tests.conftest import MockNeo4jDriver
 
-    captured_params: dict = {}
+    captured_params: dict[str, Any] = {}
     monkeypatch.setattr(
         main_module.app.state,
         "neo4j_driver",
@@ -250,9 +251,16 @@ async def test_cypher_workspace_injection(
 
     await client.post(
         "/cypher",
-        json={"query": "MATCH (n) RETURN n", "workspace": "/my/ws"},
+        json={
+            "query": "MATCH (n) RETURN n",
+            "workspace": "/my/ws",
+            "params": {"id": 42},
+        },
     )
     assert captured_params.get("workspace") == "/my/ws"
+    assert (
+        captured_params.get("id") == 42
+    )  # user-supplied param preserved after injection
 
 
 async def test_cypher_star_workspace_not_injected(
@@ -263,7 +271,7 @@ async def test_cypher_star_workspace_not_injected(
     import context_intelligence_server.main as main_module
     from tests.conftest import MockNeo4jDriver
 
-    captured_params: dict = {}
+    captured_params: dict[str, Any] = {}
     monkeypatch.setattr(
         main_module.app.state,
         "neo4j_driver",
