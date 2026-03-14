@@ -51,8 +51,11 @@ class HookConfig:
 
         Patterns support ``fnmatch`` wildcards, e.g. ``session-naming:*``
         matches ``session-naming:foo``.
+
+        Iterates directly over the raw config list to avoid reconstructing
+        a set on every call (this method may be invoked on every hook event).
         """
-        for pattern in self.exclude_events:
+        for pattern in self._raw_config.get("exclude_events", []):
             if fnmatch.fnmatch(event, pattern):
                 return True
         return False
@@ -109,7 +112,7 @@ class GraphState:
         if "labels" in data:
             existing_labels: set[str] = set(existing.get("labels", []))
             new_labels: set[str] = set(data["labels"])
-            existing["labels"] = list(existing_labels | new_labels)
+            existing["labels"] = sorted(existing_labels | new_labels)
 
         for key, value in data.items():
             if key != "labels":

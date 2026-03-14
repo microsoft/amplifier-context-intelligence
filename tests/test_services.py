@@ -132,6 +132,18 @@ async def test_graph_state_get_nonexistent_returns_none():
     assert await state.get_edge("a", "b") is None
 
 
+async def test_graph_state_flush_close_noop():
+    """flush and close are awaitable no-ops — no exception, no state change."""
+    state = GraphState()
+    await state.upsert_node("n1", {"name": "Alice"})
+    await state.flush()  # must not raise
+    await state.close()  # must not raise; internally calls flush
+    # Node should still be accessible after flush/close (in-memory, no teardown)
+    node = await state.get_node("n1")
+    assert node is not None
+    assert node["name"] == "Alice"
+
+
 def test_graph_state_no_graph_forest_name():
     """GraphState must not expose graph_forest_name or _graph_forest_name."""
     state = GraphState()
