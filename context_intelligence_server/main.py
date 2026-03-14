@@ -1,14 +1,16 @@
 """FastAPI application entrypoint for the Context Intelligence Server."""
 
+import json
 import logging
 import time
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.models import (
+    CypherRequest,
     EventRequest,
     EventResponse,
     StatusResponse,
@@ -62,3 +64,22 @@ async def get_blob(session_id: str, key: str) -> JSONResponse:
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Blob not found: {uri}")
     return JSONResponse(content=content)
+
+
+@app.post("/cypher")
+async def post_cypher(body: CypherRequest, request: Request) -> Response:
+    """Proxy a Cypher query to Neo4j and return the results as JSON."""
+    driver = request.app.state.neo4j_driver
+    params = dict(body.params)
+    if body.workspace is not None and body.workspace != "*":
+        params["workspace"] = body.workspace
+    try:
+        async with driver.session() as session:
+            result = await session.run(body.query, params)
+            rows = []
+            async for record in result:
+                rows.append(dict(record))
+        serialized = json.dumps({"results": rows}, default=str)
+        return Response(content=serialized, media_type="application/json")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))

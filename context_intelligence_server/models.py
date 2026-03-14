@@ -26,3 +26,11 @@ class StatusResponse(BaseModel):
     status: str
     uptime_seconds: float
     active_sessions: int
+
+
+class CypherRequest(BaseModel):
+    """Request body for proxying a Cypher query to Neo4j."""
+
+    query: str
+    params: dict[str, Any] = {}
+    workspace: str | None = None
