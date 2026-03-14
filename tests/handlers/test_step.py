@@ -25,7 +25,9 @@ EXPECTED_RUN_NODE_ID = make_node_id("s1", "execution:start", EXEC_TIMESTAMP)
 async def _seed_session(services: HookStateService, session_id: str = "s1") -> None:
     """Create a Session node via SessionHandler."""
     handler = SessionHandler(services)
-    await handler("session:start", {"session_id": session_id, "timestamp": SESSION_TIMESTAMP})
+    await handler(
+        "session:start", {"session_id": session_id, "timestamp": SESSION_TIMESTAMP}
+    )
 
 
 async def _seed_run(services: HookStateService) -> str:
@@ -117,7 +119,7 @@ class TestProviderRequestHappyPath:
 
     async def test_no_next_edge_on_first_step(self, services: HookStateService) -> None:
         """First provider:request has no previous step — no NEXT edge created."""
-        run_id = await _seed_run(services)
+        await _seed_run(services)
         handler = StepHandler(services)
 
         # Clear current_step_id from execution:start effects
@@ -134,7 +136,7 @@ class TestProviderRequestHappyPath:
 
     async def test_next_edge_on_second_step(self, services: HookStateService) -> None:
         """Second provider:request creates NEXT edge from previous step."""
-        run_id = await _seed_run(services)
+        await _seed_run(services)
         handler = StepHandler(services)
 
         STEP2_TIMESTAMP = "2026-03-06T04:00:00Z"
@@ -239,9 +241,7 @@ class TestLlmResponseHappyPath:
             {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
         )
 
-    async def test_enriches_with_input_tokens(
-        self, services: HookStateService
-    ) -> None:
+    async def test_enriches_with_input_tokens(self, services: HookStateService) -> None:
         await self._seed_step(services)
         handler = StepHandler(services)
         await handler(

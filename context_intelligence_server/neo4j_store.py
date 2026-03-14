@@ -265,21 +265,24 @@ class Neo4jGraphStore:
                     # Primary-label groups
                     for label, rows in labeled_groups.items():
                         _validate_identifier(label, "label")
-                        await tx.run(
+                        node_merge_query = (  # type: ignore[assignment]
                             f"UNWIND $rows AS row "
                             f"MERGE (n:{label} {{node_id: row.node_id, workspace: row.props.workspace}}) "
-                            f"SET n += row.props",
-                            rows=rows,
+                            f"SET n += row.props"
                         )
+                        await tx.run(node_merge_query, rows=rows)  # type: ignore[arg-type]
 
                     # Second pass: set additional labels for multi-label nodes
                     for item in multi_label_rows:
                         for extra_label in item["extra_labels"]:
                             _validate_identifier(extra_label, "label")
                         labels_str = ":".join(item["extra_labels"])
-                        await tx.run(
+                        label_set_query = (  # type: ignore[assignment]
                             f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) "
-                            f"SET n:{labels_str}",
+                            f"SET n:{labels_str}"
+                        )
+                        await tx.run(
+                            label_set_query,  # type: ignore[arg-type]
                             node_id=item["node_id"],
                             workspace=self.workspace,
                         )
@@ -297,12 +300,15 @@ class Neo4jGraphStore:
 
                     for edge_type, rows in edge_groups.items():
                         _validate_identifier(edge_type, "edge_type")
-                        await tx.run(
+                        edge_merge_query = (  # type: ignore[assignment]
                             f"UNWIND $rows AS row "
                             f"MATCH (src {{node_id: row.src_id, workspace: $workspace}}) "
                             f"MATCH (dst {{node_id: row.dst_id, workspace: $workspace}}) "
                             f"MERGE (src)-[r:{edge_type}]->(dst) "
-                            f"SET r += row.props",
+                            f"SET r += row.props"
+                        )
+                        await tx.run(
+                            edge_merge_query,  # type: ignore[arg-type]
                             rows=rows,
                             workspace=self.workspace,
                         )
@@ -425,7 +431,7 @@ class Neo4jGraphStore:
             query_params["workspace"] = effective_workspace
 
         async with self._driver.session(database=self._database) as session:
-            result = await session.run(query, query_params)
+            result = await session.run(query, query_params)  # type: ignore[arg-type]
             data = await result.data()
             return [dict(record) for record in data]
 

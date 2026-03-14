@@ -3,7 +3,7 @@
 - SessionCursors   — per-session cursor tracking (dataclass)
 - HookConfig       — event-exclusion configuration wrapper
 - GraphState       — in-memory property graph conforming to GraphStore protocol
-- HookStateService — server-side hook state coordinator (no coordinator dependency)
+- HookStateService — server-side hook state service (no external dependencies)
 """
 
 from __future__ import annotations
@@ -73,8 +73,8 @@ class GraphState:
     All writes are buffered in memory.  ``flush`` and ``close`` are no-ops
     because there is no backing store — this implementation is purely in-memory.
 
-    The ``workspace`` attribute replaces the legacy ``graph_forest_name``
-    identifier and is both readable and settable.
+    The ``workspace`` attribute is the canonical scoping identifier and is
+    both readable and settable.
     """
 
     def __init__(self, workspace: str = "default") -> None:
@@ -159,11 +159,10 @@ class GraphState:
 
 
 class HookStateService:
-    """Server-side hook state coordinator.
+    """Server-side hook state service.
 
     Owns the per-session cursor map, the graph store, and the set of already-seen
-    sessions.  Has no coordinator dependency and does not perform forest-name
-    resolution — the workspace is set directly at construction time.
+    sessions.  The workspace is set directly at construction time.
     """
 
     def __init__(
