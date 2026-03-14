@@ -67,14 +67,30 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     }
     h1 { color: #a0c4ff; }
     h2 { color: #9fb3c8; margin-top: 24px; }
-    .metrics { display: flex; gap: 32px; margin: 16px 0; }
+    .metrics { display: flex; gap: 32px; margin: 16px 0; align-items: center; }
     .metric { background: #16213e; padding: 12px 20px; border-radius: 6px; }
     .metric-label { font-size: 0.8em; color: #888; }
     .metric-value { font-size: 1.4em; color: #a0c4ff; }
+    .error-badge {
+      display: none;
+      background: #c0392b;
+      color: #fff;
+      border-radius: 12px;
+      padding: 4px 12px;
+      font-size: 0.85em;
+      font-weight: bold;
+    }
     table { width: 100%; border-collapse: collapse; margin-top: 8px; }
     th { background: #16213e; padding: 8px 12px; text-align: left; color: #9fb3c8; }
     td { padding: 6px 12px; border-bottom: 1px solid #2a2a4a; }
     tr:hover td { background: #1e2a3a; }
+    tr.clickable { cursor: pointer; }
+    .detail-row td {
+      background: #0d1117;
+      color: #8b949e;
+      font-size: 0.85em;
+      padding: 8px 24px;
+    }
   </style>
 </head>
 <body>
@@ -87,6 +103,13 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="metric">
       <div class="metric-label">Active Sessions</div>
       <div class="metric-value"><span id="active_sessions">-</span></div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Errors (1h)</div>
+      <div class="metric-value">
+        <span id="error_count">0</span>
+        <span id="error-badge" class="error-badge">!</span>
+      </div>
     </div>
   </div>
 
@@ -104,6 +127,21 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <tbody id="sessions-body"></tbody>
   </table>
 
+  <h2>Completed Sessions</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Session</th>
+        <th>Workspace</th>
+        <th>Duration</th>
+        <th>Events</th>
+        <th>Errors</th>
+        <th>Ended</th>
+      </tr>
+    </thead>
+    <tbody id="completed-body"></tbody>
+  </table>
+
   <h2>Recent Events</h2>
   <table>
     <thead>
@@ -119,6 +157,55 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   </table>
 
   <script>
+    function timeAgo(ts) {
+      if (!ts) return '-';
+      const diff = Math.floor(Date.now() / 1000 - ts);
+      if (diff < 60) return diff + 's ago';
+      if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+      if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+      return Math.floor(diff / 86400) + 'd ago';
+    }
+
+    function truncate(s, n) {
+      if (!s) return '-';
+      return s.length > n ? s.slice(0, n) + '...' : s;
+    }
+
+    function toggleDetail(sessionId, workspace, row) {
+      const nextRow = row.nextElementSibling;
+      if (nextRow && nextRow.classList.contains('detail-row')) {
+        nextRow.remove();
+        return;
+      }
+      const detailRow = document.createElement('tr');
+      detailRow.className = 'detail-row';
+      const td = document.createElement('td');
+      td.colSpan = 6;
+      td.textContent = 'Loading Neo4j data...';
+      detailRow.appendChild(td);
+      row.parentNode.insertBefore(detailRow, row.nextSibling);
+
+      fetch('/cypher', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          query: 'MATCH (n {workspace: $workspace}) WHERE n.node_id CONTAINS $sid RETURN labels(n)[0] as type, count(n) as cnt ORDER BY cnt DESC',
+          params: {workspace: workspace, sid: sessionId},
+          workspace: '*'
+        })
+      })
+        .then(r => r.json())
+        .then(data => {
+          const rows = (data.results || []);
+          if (rows.length === 0) {
+            td.textContent = 'No Neo4j nodes found for this session.';
+          } else {
+            td.textContent = rows.map(r => r.type + ': ' + r.cnt).join(' | ');
+          }
+        })
+        .catch(() => { td.textContent = 'Neo4j query failed.'; });
+    }
+
     function refresh() {
       fetch('/status')
         .then(r => r.json())
@@ -126,18 +213,34 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
           document.getElementById('uptime').textContent = data.uptime_seconds.toFixed(1);
           document.getElementById('active_sessions').textContent = data.active_sessions;
 
+          const errorCount = data.error_count_last_hour || 0;
+          document.getElementById('error_count').textContent = errorCount;
+          const badge = document.getElementById('error-badge');
+          badge.style.display = errorCount > 0 ? 'inline' : 'none';
+
           const sb = document.getElementById('sessions-body');
           sb.innerHTML = (data.sessions || []).map(s =>
-            '<tr><td>' + s.session_id + '</td><td>' + s.workspace + '</td><td>' +
-            s.queue_depth + '</td><td>' + (s.last_event || '-') + '</td><td>' +
+            '<tr><td>' + truncate(s.session_id, 20) + '</td><td>' + truncate(s.workspace, 30) + '</td><td>' +
+            s.queue_depth + '</td><td>' + timeAgo(s.last_event) + '</td><td>' +
             s.events_processed + '</td></tr>'
           ).join('');
 
+          const cb = document.getElementById('completed-body');
+          cb.innerHTML = (data.completed_sessions || []).map(s => {
+            const duration = s.duration_seconds != null ? s.duration_seconds.toFixed(1) + 's' : '-';
+            return '<tr class="clickable" onclick="toggleDetail(\'' + s.session_id + '\', \'' +
+              s.workspace + '\', this)"><td>' + truncate(s.session_id, 20) + '</td><td>' +
+              truncate(s.workspace, 30) + '</td><td>' + duration + '</td><td>' +
+              (s.events_processed || 0) + '</td><td>' + (s.error_count || 0) + '</td><td>' +
+              timeAgo(s.ended_at) + '</td></tr>';
+          }).join('');
+
           const eb = document.getElementById('events-body');
           eb.innerHTML = (data.recent_events || []).map(e => {
-            const t = new Date(e.timestamp * 1000).toISOString();
+            const t = timeAgo(e.timestamp);
             return '<tr><td>' + t + '</td><td>' + e.event + '</td><td>' +
-              e.session_id + '</td><td>' + e.workspace + '</td><td>' + e.result + '</td></tr>';
+              truncate(e.session_id, 20) + '</td><td>' + truncate(e.workspace, 30) +
+              '</td><td>' + e.result + '</td></tr>';
           }).join('');
         });
     }

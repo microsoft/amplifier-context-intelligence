@@ -354,6 +354,32 @@ async def test_dashboard_returns_html(client: httpx.AsyncClient) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Dashboard HTML content tests
+# ---------------------------------------------------------------------------
+
+
+async def test_dashboard_html_includes_completed_sessions_section(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET / returns HTML with Completed Sessions table body element."""
+    response = await client.get("/")
+    assert response.status_code == 200
+    body = response.text
+    assert "completed-body" in body
+    assert "Completed Sessions" in body
+
+
+async def test_dashboard_html_includes_error_badge(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET / returns HTML with error-badge element."""
+    response = await client.get("/")
+    assert response.status_code == 200
+    body = response.text
+    assert "error-badge" in body
+
+
+# ---------------------------------------------------------------------------
 # Lifespan tests
 # ---------------------------------------------------------------------------
 
