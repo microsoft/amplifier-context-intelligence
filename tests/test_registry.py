@@ -76,5 +76,6 @@ async def test_queue_put_get(registry: SessionRegistry) -> None:
     event = ("tool_call", {"tool": "bash", "result": "ok"})
     await worker.queue.put(event)
 
+    # get() on a non-empty queue returns without yielding — drain task does not interpose
     retrieved = await worker.queue.get()
     assert retrieved == event

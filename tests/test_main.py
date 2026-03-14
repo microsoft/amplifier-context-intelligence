@@ -4,6 +4,8 @@ import asyncio
 
 import httpx
 
+from context_intelligence_server.main import registry
+
 
 async def test_status_returns_200(client: httpx.AsyncClient) -> None:
     response = await client.get("/status")
@@ -80,8 +82,6 @@ async def test_post_events_no_session_id_returns_null(
 
 
 async def test_drain_loop_processes_event(client: httpx.AsyncClient) -> None:
-    from context_intelligence_server.main import registry
-
     await client.post(
         "/events",
         json={
