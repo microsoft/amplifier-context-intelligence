@@ -4,6 +4,8 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 
+from context_intelligence_server.blob_store import AsyncDiskBlobStore
+from context_intelligence_server.config import get_settings
 from context_intelligence_server.pipeline import process_event, setup_handlers
 from context_intelligence_server.services import HookStateService
 
@@ -65,10 +67,12 @@ class SessionRegistry:
 
     def get_or_create(self, session_id: str, workspace: str) -> SessionWorker:
         if session_id not in self._workers:
+            settings = get_settings()
+            blob_store = AsyncDiskBlobStore(root=settings.blob_path)
             self._workers[session_id] = SessionWorker(
                 session_id=session_id,
                 workspace=workspace,
-                services=HookStateService(workspace=workspace),
+                services=HookStateService(workspace=workspace, blob_store=blob_store),
             )
             self.start_drain(self._workers[session_id])
         return self._workers[session_id]

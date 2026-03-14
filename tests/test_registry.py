@@ -2,10 +2,13 @@
 
 import asyncio
 import dataclasses
+from pathlib import Path
 from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 
+from context_intelligence_server.blob_store import AsyncDiskBlobStore
+from context_intelligence_server.config import get_settings
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
 
@@ -117,6 +120,27 @@ class TestSessionWorkerHasServices:
         worker = registry.get_or_create("session-1", workspace)
 
         assert worker.workspace == workspace
+
+    @pytest.mark.asyncio
+    async def test_worker_services_blob_store_is_async_disk_blob_store(
+        self, registry: SessionRegistry
+    ) -> None:
+        """worker.services.blob_store is an AsyncDiskBlobStore instance."""
+        worker = registry.get_or_create("session-1", "/workspace/test")
+
+        assert isinstance(worker.services.blob_store, AsyncDiskBlobStore)
+
+    @pytest.mark.asyncio
+    async def test_worker_services_blob_store_root_matches_settings_blob_path(
+        self, registry: SessionRegistry
+    ) -> None:
+        """worker.services.blob_store._root matches Settings.blob_path."""
+        worker = registry.get_or_create("session-1", "/workspace/test")
+
+        settings = get_settings()
+        blob_store = worker.services.blob_store
+        assert isinstance(blob_store, AsyncDiskBlobStore)
+        assert blob_store._root == Path(settings.blob_path)
 
 
 class TestDrainLoopCallsProcessEvent:
