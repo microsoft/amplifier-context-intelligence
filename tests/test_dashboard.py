@@ -11,7 +11,11 @@ from context_intelligence_server.dashboard import (
     error_count_last_hour,
     ring_buffer,
 )
-from context_intelligence_server.registry import CompletedSession, SessionRegistry, SessionWorker
+from context_intelligence_server.registry import (
+    CompletedSession,
+    SessionRegistry,
+    SessionWorker,
+)
 from context_intelligence_server.services import HookStateService
 
 

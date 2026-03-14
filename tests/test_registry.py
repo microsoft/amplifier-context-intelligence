@@ -682,7 +682,9 @@ class TestWorkerSelfTermination:
 
         processed_events: list[str] = []
 
-        async def mock_process(w: object, event: str, data: object, handlers: object) -> None:
+        async def mock_process(
+            w: object, event: str, data: object, handlers: object
+        ) -> None:
             processed_events.append(event)
 
         with patch(
@@ -742,7 +744,9 @@ class TestWorkerSelfTermination:
 
         call_count = 0
 
-        async def mock_process(w: object, event: str, data: object, handlers: object) -> None:
+        async def mock_process(
+            w: object, event: str, data: object, handlers: object
+        ) -> None:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
