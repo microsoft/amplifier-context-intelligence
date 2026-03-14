@@ -5,6 +5,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Any
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
@@ -48,6 +49,38 @@ class SessionRegistry:
         self._workers: dict[str, SessionWorker] = {}
         self._completed: deque[CompletedSession] = deque(maxlen=100)
 
+    async def _process_one(
+        self,
+        worker: SessionWorker,
+        event: str,
+        data: dict[str, Any],
+        handlers: dict[str, Any],
+    ) -> None:
+        """Dispatch one event, update worker stats, and record to the ring buffer."""
+        result = "ok"
+        error = ""
+        try:
+            await process_event(worker, event, data, handlers)
+            worker.last_event = event
+            worker.last_event_time = time.time()
+            worker.events_processed += 1
+        except Exception as exc:
+            result = "error"
+            error = str(exc)
+            worker.error_count += 1
+        finally:
+            ring_buffer.add(
+                EventRecord(
+                    timestamp=time.time(),
+                    event=event,
+                    session_id=data.get("session_id", ""),
+                    workspace=worker.workspace,
+                    result=result,
+                    error=error,
+                )
+            )
+            worker.queue.task_done()
+
     async def drain_worker(
         self, worker: SessionWorker, flush_timeout: float = 30.0
     ) -> None:
@@ -70,61 +103,16 @@ class SessionRegistry:
                     worker.queue.get(), timeout=flush_timeout
                 )
                 event, _workspace, data = event_tuple
-                result = "ok"
-                error = ""
-                try:
-                    await process_event(worker, event, data, handlers)
-                    worker.last_event = event
-                    worker.last_event_time = time.time()
-                    worker.events_processed += 1
-                except Exception as exc:
-                    result = "error"
-                    error = str(exc)
-                    worker.error_count += 1
-                finally:
-                    ring_buffer.add(
-                        EventRecord(
-                            timestamp=time.time(),
-                            event=event,
-                            session_id=data.get("session_id", ""),
-                            workspace=worker.workspace,
-                            result=result,
-                            error=error,
-                        )
-                    )
-                    worker.queue.task_done()
+                await self._process_one(worker, event, data, handlers)
 
                 if event == "session:end":
                     # Drain any tail events already in the queue
                     while True:
                         try:
-                            tail_tuple = worker.queue.get_nowait()
-                            tail_event, _tail_ws, tail_data = tail_tuple
-                            tail_result = "ok"
-                            tail_error = ""
-                            try:
-                                await process_event(
-                                    worker, tail_event, tail_data, handlers
-                                )
-                                worker.last_event = tail_event
-                                worker.last_event_time = time.time()
-                                worker.events_processed += 1
-                            except Exception as exc:
-                                tail_result = "error"
-                                tail_error = str(exc)
-                                worker.error_count += 1
-                            finally:
-                                ring_buffer.add(
-                                    EventRecord(
-                                        timestamp=time.time(),
-                                        event=tail_event,
-                                        session_id=tail_data.get("session_id", ""),
-                                        workspace=worker.workspace,
-                                        result=tail_result,
-                                        error=tail_error,
-                                    )
-                                )
-                                worker.queue.task_done()
+                            tail_event, _tail_ws, tail_data = worker.queue.get_nowait()
+                            await self._process_one(
+                                worker, tail_event, tail_data, handlers
+                            )
                         except asyncio.QueueEmpty:
                             break
 
