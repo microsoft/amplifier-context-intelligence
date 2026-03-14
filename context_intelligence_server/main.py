@@ -58,87 +58,125 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Context Intelligence Server</title>
   <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
     body {
-      background: #1a1a2e;
-      color: #e0e0e0;
-      font-family: monospace;
+      background: #0f0f0f;
+      color: #f0f0f0;
+      font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
       margin: 0;
       padding: 20px;
     }
-    h1 { color: #a0c4ff; }
-    h2 { color: #9fb3c8; margin-top: 24px; }
+    h1 { color: #34d399; }
+
+    /* Refined typography */
+    h2 {
+      font-size: 0.85em;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #6b7280;
+      margin-top: 32px;
+      margin-bottom: 8px;
+    }
     .metrics { display: flex; gap: 32px; margin: 16px 0; align-items: center; }
-    .metric { background: #16213e; padding: 12px 20px; border-radius: 6px; }
-    .metric-label { font-size: 0.8em; color: #888; }
-    .metric-value { font-size: 1.4em; color: #a0c4ff; }
+
+    /* Metric cards — subtle border instead of heavy bg */
+    .metric {
+      background: #171717;
+      border: 1px solid #262626;
+      padding: 12px 20px;
+      border-radius: 8px;
+    }
+    .metric-label { font-size: 0.72em; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; color: #6b7280; }
+    .metric-value { font-size: 1.5em; font-weight: 600; color: #34d399; }
+
+    /* Error badge */
+    .error-badge, .log-error-badge {
+      background: #7f1d1d;
+      color: #fca5a5;
+      border-radius: 10px;
+      font-size: 0.75em;
+    }
     .error-badge {
       display: none;
-      background: #c0392b;
-      color: #fff;
-      border-radius: 12px;
       padding: 4px 12px;
-      font-size: 0.85em;
       font-weight: bold;
     }
-    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
-    th { background: #16213e; padding: 8px 12px; text-align: left; color: #9fb3c8; }
-    td { padding: 6px 12px; border-bottom: 1px solid #2a2a4a; }
-    tr:hover td { background: #1e2a3a; }
+
+    /* Table refinements */
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.88em; }
+    th { background: transparent; padding: 8px 12px; text-align: left; color: #6b7280; font-size: 0.75em; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; border-bottom: 1px solid #262626; }
+    td { padding: 8px 12px; border-bottom: 1px solid #141414; color: #d1d5db; }
+    tr:hover td { background: #151515; }
     tr.clickable { cursor: pointer; }
     .detail-row td {
-      background: #0d1117;
+      background: #0a0a0a;
       color: #8b949e;
       font-size: 0.85em;
       padding: 8px 24px;
     }
     #log-panel { margin-top: 32px; }
     #log-controls { display: flex; gap: 12px; margin: 8px 0; align-items: center; }
+
+    /* Log panel */
+    #log-container {
+      background: #0a0a0a;
+      border: 1px solid #1f1f1f;
+      border-radius: 8px;
+      max-height: 400px;
+      overflow-y: auto;
+      padding: 8px 12px;
+    }
     #log-filter {
-      background: #16213e;
-      color: #e0e0e0;
-      border: 1px solid #2a2a4a;
-      border-radius: 4px;
+      background: #171717;
+      border: 1px solid #262626;
+      color: #f0f0f0;
+      border-radius: 6px;
       padding: 4px 10px;
       font-family: monospace;
       font-size: 0.9em;
       flex: 1;
     }
     #log-toggle {
-      background: #16213e;
-      color: #a0c4ff;
-      border: 1px solid #2a2a4a;
-      border-radius: 4px;
+      background: #171717;
+      border: 1px solid #262626;
+      color: #34d399;
+      border-radius: 6px;
       padding: 4px 14px;
       cursor: pointer;
       font-family: monospace;
+      font-weight: 500;
     }
-    #log-container {
-      background: #0d1117;
-      max-height: 400px;
-      overflow-y: auto;
-      border-radius: 6px;
-      padding: 8px 12px;
-      border: 1px solid #2a2a4a;
-    }
-    .log-line { white-space: pre-wrap; font-size: 0.82em; margin: 1px 0; }
+    #log-toggle:hover { background: #1f1f1f; }
+    .log-line { white-space: pre-wrap; font-size: 0.82em; margin: 1px 0; font-family: monospace; }
     .log-INFO  { color: #8b949e; }
     .log-WARNING { color: #e3b341; }
     .log-ERROR { color: #f85149; }
-    .log-DEBUG { color: #58a6ff; }
+    .log-DEBUG { color: #34d399; }
     .log-error-badge {
       display: none;
-      background: #c0392b;
-      color: #fff;
       border-radius: 12px;
       padding: 2px 10px;
-      font-size: 0.8em;
       font-weight: bold;
       margin-left: 10px;
     }
   </style>
 </head>
 <body>
-  <h1>Context Intelligence Server</h1>
+  <header style="display:flex;align-items:center;gap:14px;margin-bottom:8px;">
+    <img src="https://avatars.githubusercontent.com/u/240397093"
+         width="40" height="40"
+         style="border-radius:50%;flex-shrink:0;"
+         alt="Amplifier" />
+    <div>
+      <h1 style="margin:0;font-size:1.4em;font-weight:600;color:#f0f0f0;letter-spacing:-0.02em;">
+        Context Intelligence
+      </h1>
+      <p style="margin:0;font-size:0.78em;color:#6b7280;font-weight:400;">
+        Session graph server
+      </p>
+    </div>
+  </header>
   <div class="metrics">
     <div class="metric">
       <div class="metric-label">Uptime (s)</div>
