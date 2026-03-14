@@ -325,21 +325,6 @@ async def test_status_session_detail_after_event(client: httpx.AsyncClient) -> N
     assert "events_processed" in sess
 
 
-async def test_dashboard_returns_html(client: httpx.AsyncClient) -> None:
-    """GET / returns 200 with HTML dashboard containing polling JavaScript."""
-    response = await client.get("/")
-    assert response.status_code == 200
-    assert "text/html" in response.headers["content-type"]
-    body = response.text
-    assert "Context Intelligence Server" in body
-    assert "setInterval" in body
-
-
-# ---------------------------------------------------------------------------
-# Lifespan tests
-# ---------------------------------------------------------------------------
-
-
 async def test_status_includes_completed_sessions(client: httpx.AsyncClient) -> None:
     """GET /status response includes a 'completed_sessions' list field."""
     response = await client.get("/status")
@@ -356,6 +341,21 @@ async def test_status_includes_error_count_last_hour(client: httpx.AsyncClient) 
     data = response.json()
     assert "error_count_last_hour" in data
     assert isinstance(data["error_count_last_hour"], int)
+
+
+async def test_dashboard_returns_html(client: httpx.AsyncClient) -> None:
+    """GET / returns 200 with HTML dashboard containing polling JavaScript."""
+    response = await client.get("/")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    body = response.text
+    assert "Context Intelligence Server" in body
+    assert "setInterval" in body
+
+
+# ---------------------------------------------------------------------------
+# Lifespan tests
+# ---------------------------------------------------------------------------
 
 
 async def test_lifespan_creates_and_closes_driver(
@@ -375,7 +375,7 @@ async def test_lifespan_creates_and_closes_driver(
         ) as mock_driver_factory,
     ):
         async with lifespan(main_module.app):
-            # setup_logging() must have been called before driver creation
+            # setup_logging() is called once during startup
             mock_setup_logging.assert_called_once()
             # During lifespan: driver factory must have been called
             mock_driver_factory.assert_called_once()
