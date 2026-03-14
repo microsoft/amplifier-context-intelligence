@@ -25,7 +25,7 @@ services:
       - context-intelligence
 
   neo4j:
-    image: neo4j:5
+    image: neo4j:5.26.22-community
     environment:
       NEO4J_AUTH: none
     ports:
