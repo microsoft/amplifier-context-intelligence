@@ -98,6 +98,49 @@ async def test_drain_loop_processes_event(client: httpx.AsyncClient) -> None:
     assert worker.queue.empty()
 
 
+async def test_list_blobs_returns_empty_for_session_with_no_blobs(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /blobs/{session_id} returns 200 with empty blobs list for session with no blobs."""
+    import context_intelligence_server.main as main_module
+
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+
+    response = await client.get("/blobs/no-blobs-session")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["session_id"] == "no-blobs-session"
+    assert data["blobs"] == []
+
+
+async def test_list_blobs_returns_correct_uris_for_existing_blobs(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /blobs/{session_id} returns 200 with correct ci-blob:// URIs for existing blobs."""
+    import context_intelligence_server.main as main_module
+
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+
+    session_id = "blob-list-session"
+    blob_dir = tmp_path / session_id / "blobs"
+    blob_dir.mkdir(parents=True, exist_ok=True)
+    (blob_dir / "alpha.json").write_text("{}", encoding="utf-8")
+    (blob_dir / "beta.json").write_text("{}", encoding="utf-8")
+
+    response = await client.get(f"/blobs/{session_id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["session_id"] == session_id
+    assert data["blobs"] == [
+        f"ci-blob://{session_id}/alpha",
+        f"ci-blob://{session_id}/beta",
+    ]
+
+
 async def test_get_blob_returns_200_with_content(
     client: httpx.AsyncClient,
     tmp_path: Path,

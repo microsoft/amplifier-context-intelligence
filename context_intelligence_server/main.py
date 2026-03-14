@@ -46,6 +46,13 @@ async def post_events(request: EventRequest) -> EventResponse:
     return EventResponse(status="queued", session_id=session_id or None)
 
 
+@app.get("/blobs/{session_id}")
+async def list_blobs(session_id: str) -> JSONResponse:
+    blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
+    uris = await blob_store.list(session_id)
+    return JSONResponse(content={"session_id": session_id, "blobs": uris})
+
+
 @app.get("/blobs/{session_id}/{key}")
 async def get_blob(session_id: str, key: str) -> JSONResponse:
     blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
