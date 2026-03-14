@@ -13,6 +13,7 @@ from neo4j import AsyncGraphDatabase
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.dashboard import build_status_response
+from context_intelligence_server.logging_config import setup_logging
 from context_intelligence_server.models import (
     CypherRequest,
     EventRequest,
@@ -22,16 +23,13 @@ from context_intelligence_server.registry import SessionRegistry
 
 _settings = get_settings()
 
-_LOG_FORMAT = '{"time": "%(asctime)s", "level": "%(levelname)s", "logger": "%(name)s", "message": "%(message)s"}'
-
-logging.basicConfig(level=_settings.log_level, format=_LOG_FORMAT)
-
 logger = logging.getLogger("context_intelligence_server")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Manage application lifespan: create and close the shared Neo4j driver."""
+    """Manage application lifespan: configure logging and create shared Neo4j driver."""
+    setup_logging()
     logger.info("lifespan_startup: creating Neo4j driver url=%s", _settings.neo4j_url)
     app.state.neo4j_driver = AsyncGraphDatabase.driver(
         _settings.neo4j_url,
