@@ -1,0 +1,21 @@
+"""FastAPI application entrypoint for the Context Intelligence Server."""
+
+import time
+
+from fastapi import FastAPI
+
+from context_intelligence_server.models import StatusResponse
+from context_intelligence_server.registry import SessionRegistry
+
+app = FastAPI(title="Context Intelligence Server")
+_start_time = time.time()
+registry = SessionRegistry()
+
+
+@app.get("/status", response_model=StatusResponse)
+async def get_status() -> StatusResponse:
+    return StatusResponse(
+        status="ok",
+        uptime_seconds=time.time() - _start_time,
+        active_sessions=registry.active_count(),
+    )
