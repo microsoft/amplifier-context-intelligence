@@ -139,7 +139,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         <th>Ended</th>
       </tr>
     </thead>
-    <tbody id="completed-body"></tbody>
+    <tbody id="completed-body" onclick="handleCompletedClick(event)"></tbody>
   </table>
 
   <h2>Recent Events</h2>
@@ -169,6 +169,17 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     function truncate(s, n) {
       if (!s) return '-';
       return s.length > n ? s.slice(0, n) + '...' : s;
+    }
+
+    function escapeAttr(s) {
+      if (!s) return '';
+      return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function handleCompletedClick(event) {
+      const row = event.target.closest('tr.clickable');
+      if (!row) return;
+      toggleDetail(row.dataset.sessionId, row.dataset.workspace, row);
     }
 
     function toggleDetail(sessionId, workspace, row) {
@@ -228,8 +239,9 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
           const cb = document.getElementById('completed-body');
           cb.innerHTML = (data.completed_sessions || []).map(s => {
             const duration = s.duration_seconds != null ? s.duration_seconds.toFixed(1) + 's' : '-';
-            return '<tr class="clickable" onclick="toggleDetail(\'' + s.session_id + '\', \'' +
-              s.workspace + '\', this)"><td>' + truncate(s.session_id, 20) + '</td><td>' +
+            return '<tr class="clickable" data-session-id="' + escapeAttr(s.session_id) +
+              '" data-workspace="' + escapeAttr(s.workspace) + '"><td>' +
+              truncate(s.session_id, 20) + '</td><td>' +
               truncate(s.workspace, 30) + '</td><td>' + duration + '</td><td>' +
               (s.events_processed || 0) + '</td><td>' + (s.error_count || 0) + '</td><td>' +
               timeAgo(s.ended_at) + '</td></tr>';
@@ -242,6 +254,9 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
               truncate(e.session_id, 20) + '</td><td>' + truncate(e.workspace, 30) +
               '</td><td>' + e.result + '</td></tr>';
           }).join('');
+        })
+        .catch(err => {
+          console.error('Status refresh failed:', err);
         });
     }
     refresh();
