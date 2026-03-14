@@ -59,6 +59,8 @@ class SessionRegistry:
         - On TimeoutError (no events for flush_timeout seconds): calls graph.flush
           as a periodic fallback for disconnected sessions.
         - On CancelledError (shutdown): flushes once then exits cleanly.
+        - On session:end: drains tail events, creates CompletedSession,
+          calls graph.close, deregisters the worker, then exits.
         """
         handlers = setup_handlers(worker.services)
 
@@ -78,19 +80,77 @@ class SessionRegistry:
                 except Exception as exc:
                     result = "error"
                     error = str(exc)
+                    worker.error_count += 1
                 finally:
-                    if event:
-                        ring_buffer.add(
-                            EventRecord(
-                                timestamp=time.time(),
-                                event=event,
-                                session_id=data.get("session_id", ""),
-                                workspace=worker.workspace,
-                                result=result,
-                                error=error,
-                            )
+                    ring_buffer.add(
+                        EventRecord(
+                            timestamp=time.time(),
+                            event=event,
+                            session_id=data.get("session_id", ""),
+                            workspace=worker.workspace,
+                            result=result,
+                            error=error,
                         )
+                    )
                     worker.queue.task_done()
+
+                if event == "session:end":
+                    # Drain any tail events already in the queue
+                    while True:
+                        try:
+                            tail_tuple = worker.queue.get_nowait()
+                            tail_event, _tail_ws, tail_data = tail_tuple
+                            tail_result = "ok"
+                            tail_error = ""
+                            try:
+                                await process_event(
+                                    worker, tail_event, tail_data, handlers
+                                )
+                                worker.last_event = tail_event
+                                worker.last_event_time = time.time()
+                                worker.events_processed += 1
+                            except Exception as exc:
+                                tail_result = "error"
+                                tail_error = str(exc)
+                                worker.error_count += 1
+                            finally:
+                                ring_buffer.add(
+                                    EventRecord(
+                                        timestamp=time.time(),
+                                        event=tail_event,
+                                        session_id=tail_data.get("session_id", ""),
+                                        workspace=worker.workspace,
+                                        result=tail_result,
+                                        error=tail_error,
+                                    )
+                                )
+                                worker.queue.task_done()
+                        except asyncio.QueueEmpty:
+                            break
+
+                    # Record the completed session
+                    ended_at = time.time()
+                    self._completed.append(
+                        CompletedSession(
+                            session_id=worker.session_id,
+                            workspace=worker.workspace,
+                            started_at=worker.started_at,
+                            ended_at=ended_at,
+                            events_processed=worker.events_processed,
+                            error_count=worker.error_count,
+                            duration_seconds=ended_at - worker.started_at,
+                        )
+                    )
+
+                    try:
+                        await worker.services.graph.close()
+                    except Exception:
+                        logger.exception(
+                            "graph.close failed for session %s", worker.session_id
+                        )
+
+                    self._deregister(worker.session_id)
+                    break
 
             except asyncio.TimeoutError:
                 # Periodic fallback flush for disconnected sessions
