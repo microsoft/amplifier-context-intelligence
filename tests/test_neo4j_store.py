@@ -21,7 +21,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from context_intelligence_server.graph_store import GraphStore, QueryableStore
-from context_intelligence_server.neo4j_store import Neo4jGraphStore
+from context_intelligence_server.neo4j_store import (
+    Neo4jGraphStore,
+    _validate_identifier,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +296,9 @@ async def test_flush_empty_is_noop_no_driver_calls():
     """flush() on empty buffers must not invoke the driver at all."""
     store = _make_store()
     # Driver session should never be touched
-    store._driver.session = MagicMock(side_effect=AssertionError("should not call driver"))
+    store._driver.session = MagicMock(
+        side_effect=AssertionError("should not call driver")
+    )
     await store.flush()  # Should not raise or call driver
 
 
@@ -328,7 +333,9 @@ class TestFlushWritesWorkspace:
     async def test_flush_empty_is_noop(self):
         """flush() with empty buffers makes no driver calls."""
         store = _make_store()
-        store._driver.session = MagicMock(side_effect=AssertionError("driver must not be called"))
+        store._driver.session = MagicMock(
+            side_effect=AssertionError("driver must not be called")
+        )
         await store.flush()  # No exception expected
 
     async def test_flush_node_rows_contain_workspace(self):
@@ -347,7 +354,9 @@ class TestFlushWritesWorkspace:
             if "rows" in call.kwargs:
                 for row in call.kwargs["rows"]:
                     props = row.get("props", {})
-                    assert "workspace" in props, f"Expected 'workspace' in props, got: {props}"
+                    assert "workspace" in props, (
+                        f"Expected 'workspace' in props, got: {props}"
+                    )
                     assert props["workspace"] == "my-workspace"
                     assert "graph_forest_name" not in props
 
@@ -367,7 +376,9 @@ class TestFlushWritesWorkspace:
             if "rows" in call.kwargs:
                 for row in call.kwargs["rows"]:
                     props = row.get("props", {})
-                    assert "workspace" in props, f"Expected 'workspace' in edge props, got: {props}"
+                    assert "workspace" in props, (
+                        f"Expected 'workspace' in edge props, got: {props}"
+                    )
                     assert props["workspace"] == "edge-workspace"
                     assert "graph_forest_name" not in props
 
@@ -383,8 +394,12 @@ class TestFlushWritesWorkspace:
 
         await store.flush()
 
-        assert store._node_buffer == {}, "Node buffer should be cleared after successful flush"
-        assert store._edge_buffer == {}, "Edge buffer should be cleared after successful flush"
+        assert store._node_buffer == {}, (
+            "Node buffer should be cleared after successful flush"
+        )
+        assert store._edge_buffer == {}, (
+            "Edge buffer should be cleared after successful flush"
+        )
 
     async def test_flush_restores_buffers_on_failure(self):
         """flush() restores node and edge buffers when the transaction fails."""
@@ -401,8 +416,12 @@ class TestFlushWritesWorkspace:
             await store.flush()
 
         # Buffers must be restored
-        assert "n1" in store._node_buffer, "Node buffer should be restored after failed flush"
-        assert ("a", "b") in store._edge_buffer, "Edge buffer should be restored after failed flush"
+        assert "n1" in store._node_buffer, (
+            "Node buffer should be restored after failed flush"
+        )
+        assert ("a", "b") in store._edge_buffer, (
+            "Edge buffer should be restored after failed flush"
+        )
 
     async def test_flush_node_without_labels_uses_enrichment_path(self):
         """flush() routes unlabeled nodes to the enrichment (no-label) MERGE path."""
@@ -447,10 +466,16 @@ class TestSchemaIndexesWorkspace:
         await store._ensure_schema()
 
         assert mock_session.run.called, "Expected _ensure_schema to call session.run"
-        all_queries = [call.args[0] for call in mock_session.run.call_args_list if call.args]
+        all_queries = [
+            call.args[0] for call in mock_session.run.call_args_list if call.args
+        ]
         combined = " ".join(all_queries)
-        assert "workspace" in combined, "Expected 'workspace' to appear in schema queries"
-        assert "graph_forest_name" not in combined, "graph_forest_name must not appear in schema"
+        assert "workspace" in combined, (
+            "Expected 'workspace' to appear in schema queries"
+        )
+        assert "graph_forest_name" not in combined, (
+            "graph_forest_name must not appear in schema"
+        )
 
     async def test_schema_creates_node_id_indexes(self):
         """_ensure_schema() creates node_id indexes for all required labels."""
@@ -461,10 +486,14 @@ class TestSchemaIndexesWorkspace:
 
         await store._ensure_schema()
 
-        all_queries = [call.args[0] for call in mock_session.run.call_args_list if call.args]
+        all_queries = [
+            call.args[0] for call in mock_session.run.call_args_list if call.args
+        ]
         combined = " ".join(all_queries)
         for label in ("Session", "OrchestratorRun", "Step", "ToolExecution", "Event"):
-            assert label in combined, f"Expected index for label {label!r} in schema queries"
+            assert label in combined, (
+                f"Expected index for label {label!r} in schema queries"
+            )
 
     async def test_schema_sets_initialized_flag(self):
         """_ensure_schema() sets _schema_initialized = True after running."""
@@ -483,7 +512,9 @@ class TestSchemaIndexesWorkspace:
         store = _make_store()
         store._schema_initialized = True
         # If already initialized, driver must not be touched
-        store._driver.session = MagicMock(side_effect=AssertionError("must not call driver"))
+        store._driver.session = MagicMock(
+            side_effect=AssertionError("must not call driver")
+        )
         await store._ensure_schema()  # Should not raise
 
 
@@ -521,7 +552,9 @@ class TestExecuteQuery:
         call = mock_session.run.call_args
         # params is second positional arg
         params = call.args[1] if len(call.args) > 1 else {}
-        assert "workspace" in params, f"workspace should be injected into params, got: {params}"
+        assert "workspace" in params, (
+            f"workspace should be injected into params, got: {params}"
+        )
         assert params["workspace"] == "injected-ws"
         assert "graph_forest_name" not in params
 
@@ -535,7 +568,9 @@ class TestExecuteQuery:
 
         call = mock_session.run.call_args
         params = call.args[1] if len(call.args) > 1 else {}
-        assert "workspace" not in params, "workspace must NOT be injected when workspace='*'"
+        assert "workspace" not in params, (
+            "workspace must NOT be injected when workspace='*'"
+        )
 
     async def test_execute_query_unsupported_dialect_raises_value_error(self):
         """execute_query raises ValueError for unsupported dialects."""
@@ -554,7 +589,9 @@ class TestExecuteQuery:
     async def test_execute_query_returns_list_of_dicts(self):
         """execute_query returns a list of dict records."""
         store = _make_store()
-        _mock_result, mock_session = _make_execute_mocks(records=[{"n": "Alice"}, {"n": "Bob"}])
+        _mock_result, mock_session = _make_execute_mocks(
+            records=[{"n": "Alice"}, {"n": "Bob"}]
+        )
         store._driver.session = MagicMock(return_value=mock_session)
 
         result = await store.execute_query("MATCH (n) RETURN n")
@@ -647,3 +684,108 @@ def test_convert_timestamps_does_not_mutate_input():
     original = dict(props)
     Neo4jGraphStore._convert_timestamps(props)
     assert props == original  # Input not mutated
+
+
+# ---------------------------------------------------------------------------
+# _validate_identifier (Cypher injection guard)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_identifier_accepts_valid_label():
+    """_validate_identifier passes for valid Neo4j-style identifiers."""
+    _validate_identifier("Session", "label")  # should not raise
+    _validate_identifier("OrchestratorRun", "label")  # should not raise
+    _validate_identifier("MY_TYPE", "edge_type")  # should not raise
+
+
+def test_validate_identifier_rejects_special_characters():
+    """_validate_identifier raises ValueError for identifiers with special chars."""
+    with pytest.raises(ValueError, match="Invalid Neo4j label identifier"):
+        _validate_identifier("Session) DETACH DELETE (n) //", "label")
+
+
+def test_validate_identifier_rejects_hyphens():
+    """_validate_identifier raises ValueError for identifiers with hyphens."""
+    with pytest.raises(ValueError, match="Invalid Neo4j label identifier"):
+        _validate_identifier("bad-label", "label")
+
+
+def test_validate_identifier_rejects_digit_start():
+    """_validate_identifier raises ValueError for identifiers starting with a digit."""
+    with pytest.raises(ValueError, match="Invalid Neo4j edge_type identifier"):
+        _validate_identifier("1invalid", "edge_type")
+
+
+def test_validate_identifier_rejects_empty_string():
+    """_validate_identifier raises ValueError for empty string."""
+    with pytest.raises(ValueError, match="Invalid Neo4j label identifier"):
+        _validate_identifier("", "label")
+
+
+class TestFlushIdentifierValidation:
+    """flush() raises ValueError before writing when labels/edge types are invalid."""
+
+    async def test_flush_raises_for_invalid_label(self):
+        """flush() raises ValueError when a node label fails identifier validation."""
+        store = _make_store(workspace="test-ws")
+        await store.upsert_node("n1", {"labels": ["Bad-Label!"]})
+
+        mock_tx, mock_session = _make_flush_mocks()
+        store._driver.session = MagicMock(return_value=mock_session)
+        store._schema_initialized = True
+
+        with pytest.raises(ValueError, match="Invalid Neo4j label identifier"):
+            await store.flush()
+
+    async def test_flush_raises_for_invalid_edge_type(self):
+        """flush() raises ValueError when an edge type fails identifier validation."""
+        store = _make_store(workspace="test-ws")
+        await store.upsert_edge("a", "b", {"type": "INVALID-TYPE!"})
+
+        mock_tx, mock_session = _make_flush_mocks()
+        store._driver.session = MagicMock(return_value=mock_session)
+        store._schema_initialized = True
+
+        with pytest.raises(ValueError, match="Invalid Neo4j edge_type identifier"):
+            await store.flush()
+
+    async def test_flush_accepts_valid_label(self):
+        """flush() succeeds when node label passes identifier validation."""
+        store = _make_store(workspace="test-ws")
+        await store.upsert_node("n1", {"labels": ["ValidLabel"]})
+
+        mock_tx, mock_session = _make_flush_mocks()
+        store._driver.session = MagicMock(return_value=mock_session)
+        store._schema_initialized = True
+
+        await store.flush()  # should not raise
+
+    async def test_flush_accepts_valid_edge_type(self):
+        """flush() succeeds when edge type passes identifier validation."""
+        store = _make_store(workspace="test-ws")
+        await store.upsert_edge("a", "b", {"type": "KNOWS"})
+
+        mock_tx, mock_session = _make_flush_mocks()
+        store._driver.session = MagicMock(return_value=mock_session)
+        store._schema_initialized = True
+
+        await store.flush()  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# close() logs final flush exception (data-loss guard)
+# ---------------------------------------------------------------------------
+
+
+async def test_close_logs_final_flush_exception():
+    """close() logs (not silently swallows) when the final flush raises."""
+    store = _make_store()
+    # Make flush raise on the final call inside close()
+    store.flush = AsyncMock(side_effect=RuntimeError("flush failed"))
+
+    with patch("context_intelligence_server.neo4j_store._LOG") as mock_log:
+        await store.close()  # must not raise
+
+    mock_log.exception.assert_called_once()
+    logged_msg = mock_log.exception.call_args.args[0]
+    assert "flush" in logged_msg.lower() or "buffered" in logged_msg.lower()

@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Any
 
@@ -21,14 +22,37 @@ from neo4j.exceptions import Neo4jError
 
 _LOG = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Cypher identifier validation
+# ---------------------------------------------------------------------------
+
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_DEFAULT_EDGE_TYPE = "RELATED"
+
+
+def _validate_identifier(name: str, kind: str) -> None:
+    """Raise ``ValueError`` if *name* is not a safe Neo4j label / relationship-type identifier.
+
+    Accepts only ``[A-Za-z_][A-Za-z0-9_]*`` — i.e. no spaces, hyphens, parentheses,
+    or other characters that could be exploited for Cypher injection.
+
+    Args:
+        name: The identifier string to validate.
+        kind: Human-readable category used in the error message (e.g. ``"label"``).
+
+    Raises:
+        ValueError: If *name* contains unsafe characters.
+    """
+    if not _SAFE_IDENTIFIER_RE.match(name):
+        raise ValueError(f"Invalid Neo4j {kind} identifier: {name!r}")
+
 
 class Neo4jGraphStore:
     """Neo4j-backed implementation of the GraphStore and QueryableStore protocols.
 
-    Writes are buffered in memory (``_node_buffer``, ``_edge_buffer``) and
-    are immediately visible to subsequent ``get_node`` / ``get_edge`` calls.
-    ``flush`` and ``close`` are no-op placeholders until persistence is wired up.
-    ``execute_query`` raises ``NotImplementedError`` until query support is added.
+    Writes are buffered in memory (``_node_buffer``, ``_edge_buffer``) and flushed
+    to Neo4j via UNWIND-based batch Cypher. Workspace-scoped; schema indexes are
+    created idempotently on first flush.
     """
 
     def __init__(
@@ -240,6 +264,7 @@ class Neo4jGraphStore:
 
                     # Primary-label groups
                     for label, rows in labeled_groups.items():
+                        _validate_identifier(label, "label")
                         await tx.run(
                             f"UNWIND $rows AS row "
                             f"MERGE (n:{label} {{node_id: row.node_id, workspace: row.props.workspace}}) "
@@ -249,6 +274,8 @@ class Neo4jGraphStore:
 
                     # Second pass: set additional labels for multi-label nodes
                     for item in multi_label_rows:
+                        for extra_label in item["extra_labels"]:
+                            _validate_identifier(extra_label, "label")
                         labels_str = ":".join(item["extra_labels"])
                         await tx.run(
                             f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) "
@@ -260,7 +287,7 @@ class Neo4jGraphStore:
                     # ---- edges ----
                     edge_groups: dict[str, list[dict[str, Any]]] = {}
                     for (src_id, dst_id), data in edge_snapshot.items():
-                        edge_type: str = data.get("type", "RELATED")
+                        edge_type: str = data.get("type", _DEFAULT_EDGE_TYPE)
                         props = self._sanitize_properties(
                             {k: v for k, v in data.items() if k != "type"}
                         )
@@ -269,6 +296,7 @@ class Neo4jGraphStore:
                         edge_groups.setdefault(edge_type, []).append(row)
 
                     for edge_type, rows in edge_groups.items():
+                        _validate_identifier(edge_type, "edge_type")
                         await tx.run(
                             f"UNWIND $rows AS row "
                             f"MATCH (src {{node_id: row.src_id, workspace: $workspace}}) "
@@ -304,7 +332,13 @@ class Neo4jGraphStore:
             return
 
         async with self._driver.session(database=self._database) as session:
-            for label in ("Session", "OrchestratorRun", "Step", "ToolExecution", "Event"):
+            for label in (
+                "Session",
+                "OrchestratorRun",
+                "Step",
+                "ToolExecution",
+                "Event",
+            ):
                 await session.run(
                     f"CREATE INDEX IF NOT EXISTS FOR (n:{label}) ON (n.node_id)"
                 )
@@ -344,7 +378,9 @@ class Neo4jGraphStore:
         try:
             await self.flush()
         except Exception:
-            pass
+            _LOG.exception(
+                "Final flush failed during close; buffered writes may be lost"
+            )
 
         # Close the driver, ignoring event-loop mismatch errors
         try:
