@@ -127,20 +127,23 @@ async def process_event(
     that handler errors are *logged with structured context* but **never
     propagate** — the drain loop must continue regardless of per-event failures.
     """
+    session_id: str | None = None
     try:
-        session_id: str | None = (
-            data.get("session_id") if isinstance(data, dict) else None
-        )
+        session_id = data.get("session_id") if isinstance(data, dict) else None
 
         # Step 2 — ensure Session node exists for known sessions
         if session_id:
             await worker.services.ensure_session_node(session_id, data)
 
         # Step 2.5 — blob processing (after ensure_session_node, before handler dispatch)
-        timestamp: str | None = data.get("timestamp") if isinstance(data, dict) else None
+        timestamp: str | None = (
+            data.get("timestamp") if isinstance(data, dict) else None
+        )
         if session_id and timestamp and worker.services.blob_store:
             node_id = make_node_id(session_id, event, timestamp)
-            await process_event_data(data, worker.services.blob_store, session_id, node_id)
+            await process_event_data(
+                data, worker.services.blob_store, session_id, node_id
+            )
 
         # Step 3 — resolve handler
         handler = _find_handler(event, handlers)
@@ -157,8 +160,6 @@ async def process_event(
             "pipeline: unhandled error processing event",
             extra={
                 "event": event,
-                "session_id": (
-                    data.get("session_id") if isinstance(data, dict) else None
-                ),
+                "session_id": session_id,
             },
         )

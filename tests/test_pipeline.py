@@ -11,7 +11,7 @@ Test coverage:
 from __future__ import annotations
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from context_intelligence_server.protocol import HookResult
 
@@ -450,8 +450,6 @@ async def test_process_event_blob_processing_called_when_all_conditions_met(
     handlers: dict,
 ) -> None:
     """process_event_data is called when session_id, timestamp, and blob_store are all truthy."""
-    from unittest.mock import patch
-
     from context_intelligence_server.pipeline import process_event
 
     worker = MagicMock()
@@ -460,18 +458,26 @@ async def test_process_event_blob_processing_called_when_all_conditions_met(
     worker.services.graph.flush = AsyncMock()
     worker.services.blob_store = MagicMock()  # truthy blob_store
 
-    data = {"session_id": "sess-123", "timestamp": "2024-01-01T00:00:00Z", "raw": "big data"}
+    data = {
+        "session_id": "sess-123",
+        "timestamp": "2024-01-01T00:00:00Z",
+        "raw": "big data",
+    }
 
     with (
         patch(
-            "context_intelligence_server.pipeline.process_event_data", new_callable=AsyncMock
+            "context_intelligence_server.pipeline.process_event_data",
+            new_callable=AsyncMock,
         ) as mock_process,
         patch(
-            "context_intelligence_server.pipeline.make_node_id", return_value="test-node-id"
+            "context_intelligence_server.pipeline.make_node_id",
+            return_value="test-node-id",
         ) as mock_node_id,
     ):
         await process_event(worker, "session:start", data, handlers)
-        mock_node_id.assert_called_once_with("sess-123", "session:start", "2024-01-01T00:00:00Z")
+        mock_node_id.assert_called_once_with(
+            "sess-123", "session:start", "2024-01-01T00:00:00Z"
+        )
         mock_process.assert_called_once_with(
             data, worker.services.blob_store, "sess-123", "test-node-id"
         )
@@ -481,8 +487,6 @@ async def test_process_event_blob_processing_skipped_without_timestamp(
     handlers: dict,
 ) -> None:
     """process_event_data is NOT called when timestamp is missing from data."""
-    from unittest.mock import patch
-
     from context_intelligence_server.pipeline import process_event
 
     worker = MagicMock()
@@ -494,7 +498,8 @@ async def test_process_event_blob_processing_skipped_without_timestamp(
     data = {"session_id": "sess-123"}  # No timestamp
 
     with patch(
-        "context_intelligence_server.pipeline.process_event_data", new_callable=AsyncMock
+        "context_intelligence_server.pipeline.process_event_data",
+        new_callable=AsyncMock,
     ) as mock_process:
         await process_event(worker, "session:start", data, handlers)
         mock_process.assert_not_called()
@@ -504,8 +509,6 @@ async def test_process_event_blob_processing_skipped_without_session_id(
     handlers: dict,
 ) -> None:
     """process_event_data is NOT called when session_id is missing from data."""
-    from unittest.mock import patch
-
     from context_intelligence_server.pipeline import process_event
 
     worker = MagicMock()
@@ -517,7 +520,8 @@ async def test_process_event_blob_processing_skipped_without_session_id(
     data = {"timestamp": "2024-01-01T00:00:00Z"}  # No session_id
 
     with patch(
-        "context_intelligence_server.pipeline.process_event_data", new_callable=AsyncMock
+        "context_intelligence_server.pipeline.process_event_data",
+        new_callable=AsyncMock,
     ) as mock_process:
         await process_event(worker, "session:start", data, handlers)
         mock_process.assert_not_called()
@@ -527,8 +531,6 @@ async def test_process_event_handler_receives_mutated_data_with_blob_ref(
     handlers: dict,
 ) -> None:
     """Handler receives data with $blob_ref after blob processing mutates in-place."""
-    from unittest.mock import patch
-
     from context_intelligence_server.pipeline import process_event
 
     worker = MagicMock()
@@ -537,18 +539,28 @@ async def test_process_event_handler_receives_mutated_data_with_blob_ref(
     worker.services.graph.flush = AsyncMock()
     worker.services.blob_store = MagicMock()  # truthy blob_store
 
-    data = {"session_id": "sess-123", "timestamp": "2024-01-01T00:00:00Z", "raw": "big content"}
+    data = {
+        "session_id": "sess-123",
+        "timestamp": "2024-01-01T00:00:00Z",
+        "raw": "big content",
+    }
 
-    async def mutate_data(d: dict, blob_store: object, session_id: str, node_id: str) -> None:
+    async def mutate_data(
+        d: dict, blob_store: object, session_id: str, node_id: str
+    ) -> None:
         d["raw"] = {"$blob_ref": "ci-blob://sess-123/test-node-id__raw"}
 
     default_handler = handlers["default"]
 
     with (
         patch(
-            "context_intelligence_server.pipeline.process_event_data", side_effect=mutate_data
+            "context_intelligence_server.pipeline.process_event_data",
+            side_effect=mutate_data,
         ),
-        patch("context_intelligence_server.pipeline.make_node_id", return_value="test-node-id"),
+        patch(
+            "context_intelligence_server.pipeline.make_node_id",
+            return_value="test-node-id",
+        ),
     ):
         await process_event(worker, "unknown:event", data, handlers)
 
@@ -556,3 +568,25 @@ async def test_process_event_handler_receives_mutated_data_with_blob_ref(
     call_args = default_handler._mock_call.call_args
     passed_data = call_args[0][1]  # second positional arg
     assert passed_data["raw"] == {"$blob_ref": "ci-blob://sess-123/test-node-id__raw"}
+
+
+async def test_process_event_blob_processing_skipped_without_blob_store(
+    handlers: dict,
+) -> None:
+    """process_event_data is NOT called when blob_store is None/falsy."""
+    from context_intelligence_server.pipeline import process_event
+
+    worker = MagicMock()
+    worker.services.ensure_session_node = AsyncMock()
+    worker.services.graph = MagicMock()
+    worker.services.graph.flush = AsyncMock()
+    worker.services.blob_store = None  # falsy blob_store
+
+    data = {"session_id": "sess-123", "timestamp": "2024-01-01T00:00:00Z"}
+
+    with patch(
+        "context_intelligence_server.pipeline.process_event_data",
+        new_callable=AsyncMock,
+    ) as mock_process:
+        await process_event(worker, "session:start", data, handlers)
+        mock_process.assert_not_called()
