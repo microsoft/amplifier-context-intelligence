@@ -83,7 +83,7 @@ def build_status_response(
             "last_event_time": worker.last_event_time,
             "events_processed": worker.events_processed,
         }
-        for worker in registry._workers.values()
+        for worker in registry.workers()
     ]
 
     return {

@@ -106,6 +106,10 @@ class SessionRegistry:
         if worker and worker.task and not worker.task.done():
             worker.task.cancel()
 
+    def workers(self) -> list[SessionWorker]:
+        """Return the list of all active SessionWorker objects."""
+        return list(self._workers.values())
+
     def active_count(self) -> int:
         return len(self._workers)
 
