@@ -56,6 +56,17 @@ ring_buffer: EventRingBuffer = EventRingBuffer()
 
 
 # ---------------------------------------------------------------------------
+# error_count_last_hour
+# ---------------------------------------------------------------------------
+
+
+def error_count_last_hour(ring: EventRingBuffer) -> int:
+    """Count error records in *ring* that occurred within the last 3600 seconds."""
+    cutoff = time.time() - 3600
+    return sum(1 for r in ring.recent() if r.result == "error" and r.timestamp >= cutoff)
+
+
+# ---------------------------------------------------------------------------
 # build_status_response
 # ---------------------------------------------------------------------------
 
@@ -72,7 +83,7 @@ def build_status_response(
 
     Returns:
         A dict with keys: status, uptime_seconds, active_sessions, sessions,
-        recent_events.
+        recent_events, completed_sessions, error_count_last_hour.
     """
     sessions = [
         {
@@ -92,4 +103,6 @@ def build_status_response(
         "active_sessions": registry.active_count(),
         "sessions": sessions,
         "recent_events": [dataclasses.asdict(rec) for rec in ring_buffer.recent()],
+        "completed_sessions": [dataclasses.asdict(s) for s in registry.completed_sessions()],
+        "error_count_last_hour": error_count_last_hour(ring_buffer),
     }

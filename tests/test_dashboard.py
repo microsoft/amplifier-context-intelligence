@@ -8,9 +8,10 @@ from context_intelligence_server.dashboard import (
     EventRecord,
     EventRingBuffer,
     build_status_response,
+    error_count_last_hour,
     ring_buffer,
 )
-from context_intelligence_server.registry import SessionRegistry, SessionWorker
+from context_intelligence_server.registry import CompletedSession, SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
 
 
@@ -183,3 +184,89 @@ class TestBuildStatusResponse:
             assert "workspace" in evt
             assert "result" in evt
             assert "error" in evt
+
+
+# ---------------------------------------------------------------------------
+# TestErrorCountLastHour
+# ---------------------------------------------------------------------------
+
+
+class TestErrorCountLastHour:
+    def test_no_errors_returns_zero(self) -> None:
+        """Buffer with only ok records returns 0."""
+        buf = EventRingBuffer()
+        buf.add(make_record(result="ok"))
+        buf.add(make_record(result="ok"))
+        assert error_count_last_hour(buf) == 0
+
+    def test_counts_recent_errors(self) -> None:
+        """2 recent errors + 1 ok record returns 2."""
+        buf = EventRingBuffer()
+        buf.add(make_record(result="error"))
+        buf.add(make_record(result="error"))
+        buf.add(make_record(result="ok"))
+        assert error_count_last_hour(buf) == 2
+
+    def test_ignores_old_errors(self) -> None:
+        """Old error (2 hours ago) is ignored; only recent error is counted."""
+        buf = EventRingBuffer()
+        old_ts = time.time() - 7200  # 2 hours ago
+        buf.add(make_record(result="error", timestamp=old_ts))
+        buf.add(make_record(result="error"))  # recent
+        assert error_count_last_hour(buf) == 1
+
+    def test_empty_buffer_returns_zero(self) -> None:
+        """Empty buffer returns 0."""
+        buf = EventRingBuffer()
+        assert error_count_last_hour(buf) == 0
+
+
+# ---------------------------------------------------------------------------
+# TestBuildStatusResponseWithCompleted
+# ---------------------------------------------------------------------------
+
+
+class TestBuildStatusResponseWithCompleted:
+    def setup_method(self) -> None:
+        """Clear the module-level ring_buffer before each test."""
+        ring_buffer._buffer.clear()
+
+    def test_includes_completed_sessions_key(self) -> None:
+        """Response includes 'completed_sessions' key as a list."""
+        registry = SessionRegistry()
+        start_time = time.time()
+        response = build_status_response(registry, start_time)
+        assert "completed_sessions" in response
+        assert isinstance(response["completed_sessions"], list)
+
+    def test_includes_error_count_last_hour_key(self) -> None:
+        """Response includes 'error_count_last_hour' key as an int."""
+        registry = SessionRegistry()
+        start_time = time.time()
+        response = build_status_response(registry, start_time)
+        assert "error_count_last_hour" in response
+        assert isinstance(response["error_count_last_hour"], int)
+
+    def test_completed_sessions_populated(self) -> None:
+        """Completed sessions appended to registry._completed appear in response."""
+        registry = SessionRegistry()
+        now = time.time()
+        session = CompletedSession(
+            session_id="sess-done",
+            workspace="/ws",
+            started_at=now - 60,
+            ended_at=now,
+            events_processed=10,
+            error_count=2,
+            duration_seconds=60.0,
+        )
+        registry._completed.append(session)
+
+        start_time = time.time()
+        response = build_status_response(registry, start_time)
+
+        completed = response["completed_sessions"]
+        assert len(completed) == 1
+        assert completed[0]["session_id"] == "sess-done"
+        assert completed[0]["events_processed"] == 10
+        assert completed[0]["error_count"] == 2
