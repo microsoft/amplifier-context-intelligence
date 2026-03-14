@@ -73,13 +73,13 @@ async def post_cypher(body: CypherRequest, request: Request) -> Response:
     params = dict(body.params)
     if body.workspace is not None and body.workspace != "*":
         params["workspace"] = body.workspace
+    rows: list[dict] = []
     try:
         async with driver.session() as session:
             result = await session.run(body.query, params)
-            rows = []
             async for record in result:
                 rows.append(dict(record))
         serialized = json.dumps({"results": rows}, default=str)
         return Response(content=serialized, media_type="application/json")
-    except Exception as exc:
+    except Exception as exc:  # catch all Neo4j and serialization errors
         raise HTTPException(status_code=500, detail=str(exc))

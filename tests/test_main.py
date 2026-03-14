@@ -8,7 +8,10 @@ from typing import Any
 import httpx
 import pytest
 
+import context_intelligence_server.main as main_module
 from context_intelligence_server.main import registry
+from context_intelligence_server.models import CypherRequest
+from tests.conftest import MockNeo4jDriver
 
 
 async def test_status_returns_200(client: httpx.AsyncClient) -> None:
@@ -105,8 +108,6 @@ async def test_list_blobs_returns_empty_for_session_with_no_blobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /blobs/{session_id} returns 200 with empty blobs list for session with no blobs."""
-    import context_intelligence_server.main as main_module
-
     monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
 
     response = await client.get("/blobs/no-blobs-session")
@@ -122,8 +123,6 @@ async def test_list_blobs_returns_correct_uris_for_existing_blobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /blobs/{session_id} returns 200 with correct ci-blob:// URIs for existing blobs."""
-    import context_intelligence_server.main as main_module
-
     monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
 
     session_id = "blob-list-session"
@@ -148,8 +147,6 @@ async def test_get_blob_returns_200_with_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /blobs/{session_id}/{key} returns 200 with blob content for existing blob."""
-    import context_intelligence_server.main as main_module
-
     monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
 
     session_id = "test-session"
@@ -171,8 +168,6 @@ async def test_get_blob_returns_404_for_missing_blob(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /blobs/{session_id}/{key} returns 404 with 'not found' in detail for missing blob."""
-    import context_intelligence_server.main as main_module
-
     monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
 
     response = await client.get("/blobs/missing-session/missing-key")
@@ -189,8 +184,6 @@ async def test_get_blob_returns_404_for_missing_blob(
 
 async def test_cypher_request_model_validation() -> None:
     """CypherRequest model validates correctly with required fields and defaults."""
-    from context_intelligence_server.models import CypherRequest
-
     req = CypherRequest(query="MATCH (n) RETURN n")
     assert req.query == "MATCH (n) RETURN n"
     assert req.params == {}
@@ -199,8 +192,6 @@ async def test_cypher_request_model_validation() -> None:
 
 async def test_cypher_request_model_with_workspace() -> None:
     """CypherRequest model accepts workspace and params."""
-    from context_intelligence_server.models import CypherRequest
-
     req = CypherRequest(
         query="MATCH (n) RETURN n",
         params={"key": "value"},
@@ -215,9 +206,6 @@ async def test_cypher_proxy_returns_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """POST /cypher returns 200 with {results: [...]} from Neo4j."""
-    import context_intelligence_server.main as main_module
-    from tests.conftest import MockNeo4jDriver
-
     mock_row = {"name": "Alice"}
     monkeypatch.setattr(
         main_module.app.state,
@@ -238,9 +226,6 @@ async def test_cypher_workspace_injection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """POST /cypher injects workspace into params when workspace is not None or '*'."""
-    import context_intelligence_server.main as main_module
-    from tests.conftest import MockNeo4jDriver
-
     captured_params: dict[str, Any] = {}
     monkeypatch.setattr(
         main_module.app.state,
@@ -268,9 +253,6 @@ async def test_cypher_star_workspace_not_injected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """POST /cypher does NOT inject workspace when workspace='*' (cross-workspace)."""
-    import context_intelligence_server.main as main_module
-    from tests.conftest import MockNeo4jDriver
-
     captured_params: dict[str, Any] = {}
     monkeypatch.setattr(
         main_module.app.state,
@@ -291,9 +273,6 @@ async def test_cypher_neo4j_error_returns_500(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """POST /cypher returns 500 with error detail when Neo4j raises an exception."""
-    import context_intelligence_server.main as main_module
-    from tests.conftest import MockNeo4jDriver
-
     monkeypatch.setattr(
         main_module.app.state,
         "neo4j_driver",
