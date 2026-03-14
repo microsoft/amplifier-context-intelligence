@@ -1,6 +1,7 @@
 """Tests for SessionRegistry and SessionWorker."""
 
 import asyncio
+import dataclasses
 
 import pytest
 
@@ -84,14 +85,13 @@ async def test_queue_put_get(registry: SessionRegistry) -> None:
 
 class TestSessionWorkerHasServices:
     def test_worker_has_services_attribute(self) -> None:
-        import dataclasses
-
         field_names = {f.name for f in dataclasses.fields(SessionWorker)}
         assert "services" in field_names
 
     @pytest.mark.asyncio
-    async def test_worker_services_is_hook_state_service(self) -> None:
-        registry = SessionRegistry()
+    async def test_worker_services_is_hook_state_service(
+        self, registry: SessionRegistry
+    ) -> None:
         worker = registry.get_or_create("session-1", "/workspace/test")
 
         assert hasattr(worker, "services")
@@ -100,16 +100,18 @@ class TestSessionWorkerHasServices:
     @pytest.mark.asyncio
     async def test_worker_services_graph_workspace_matches_passed_workspace(
         self,
+        registry: SessionRegistry,
     ) -> None:
-        registry = SessionRegistry()
         workspace = "/workspace/my-project"
         worker = registry.get_or_create("session-1", workspace)
 
         assert worker.services.graph.workspace == workspace
 
     @pytest.mark.asyncio
-    async def test_worker_has_workspace_attribute(self) -> None:
-        registry = SessionRegistry()
+    # confirms workspace field added in this task (complements test_get_or_create_new_worker)
+    async def test_worker_has_workspace_attribute(
+        self, registry: SessionRegistry
+    ) -> None:
         workspace = "/workspace/foo"
         worker = registry.get_or_create("session-1", workspace)
 
