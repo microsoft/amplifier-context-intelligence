@@ -91,12 +91,13 @@ async def test_blob_ref_substitution_on_successful_write() -> None:
         "result": {"answer": 42},
     }
     blob_store = AsyncMock()
-    blob_store.write = AsyncMock(
-        side_effect=[
-            "ci-blob://sess/node__raw",
-            "ci-blob://sess/node__result",
-        ]
-    )
+
+    # Use a function-based side_effect so the returned URI always matches
+    # the actual key argument, regardless of BLOB_FIELDS frozenset iteration order.
+    async def _write(session_id: str, key: str, value: object) -> str:
+        return f"ci-blob://{session_id}/{key}"
+
+    blob_store.write = AsyncMock(side_effect=_write)
 
     await process_event_data(data, blob_store, "sess", "node")
 
