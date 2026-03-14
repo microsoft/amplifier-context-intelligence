@@ -4,6 +4,8 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 
+from context_intelligence_server.services import HookStateService
+
 logger = logging.getLogger("context_intelligence_server")
 
 
@@ -11,6 +13,7 @@ logger = logging.getLogger("context_intelligence_server")
 class SessionWorker:
     session_id: str
     workspace: str
+    services: HookStateService
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     task: asyncio.Task | None = None
 
@@ -49,6 +52,7 @@ class SessionRegistry:
             self._workers[session_id] = SessionWorker(
                 session_id=session_id,
                 workspace=workspace,
+                services=HookStateService(workspace=workspace),
             )
             self.start_drain(self._workers[session_id])
         return self._workers[session_id]

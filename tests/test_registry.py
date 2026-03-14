@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
+from context_intelligence_server.services import HookStateService
 
 
 @pytest.fixture
@@ -79,3 +80,37 @@ async def test_queue_put_get(registry: SessionRegistry) -> None:
     # get() on a non-empty queue returns without yielding — drain task does not interpose
     retrieved = await worker.queue.get()
     assert retrieved == event
+
+
+class TestSessionWorkerHasServices:
+    def test_worker_has_services_attribute(self) -> None:
+        import dataclasses
+
+        field_names = {f.name for f in dataclasses.fields(SessionWorker)}
+        assert "services" in field_names
+
+    @pytest.mark.asyncio
+    async def test_worker_services_is_hook_state_service(self) -> None:
+        registry = SessionRegistry()
+        worker = registry.get_or_create("session-1", "/workspace/test")
+
+        assert hasattr(worker, "services")
+        assert isinstance(worker.services, HookStateService)
+
+    @pytest.mark.asyncio
+    async def test_worker_services_graph_workspace_matches_passed_workspace(
+        self,
+    ) -> None:
+        registry = SessionRegistry()
+        workspace = "/workspace/my-project"
+        worker = registry.get_or_create("session-1", workspace)
+
+        assert worker.services.graph.workspace == workspace
+
+    @pytest.mark.asyncio
+    async def test_worker_has_workspace_attribute(self) -> None:
+        registry = SessionRegistry()
+        workspace = "/workspace/foo"
+        worker = registry.get_or_create("session-1", workspace)
+
+        assert worker.workspace == workspace
