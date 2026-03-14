@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     neo4j_password: str = "password"
     blob_path: str = "/data/blobs"
     log_level: str = "INFO"
+    log_path: str = "/data/logs/server.jsonl"
 
 
 @lru_cache

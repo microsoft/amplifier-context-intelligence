@@ -44,3 +44,11 @@ def test_get_settings_returns_instance():
     settings = get_settings()
     assert isinstance(settings, Settings)
     assert settings.server_host == "0.0.0.0"
+
+
+def test_settings_log_path_default():
+    """Settings should have /data/logs/server.jsonl as the default log_path."""
+    from context_intelligence_server.config import Settings
+
+    s = Settings()
+    assert s.log_path == "/data/logs/server.jsonl"
