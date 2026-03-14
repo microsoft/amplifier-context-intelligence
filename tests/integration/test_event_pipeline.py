@@ -11,10 +11,14 @@ to graph state, covering:
 
 from __future__ import annotations
 
+import time
 import types
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
+from context_intelligence_server.dashboard import build_status_response
 from context_intelligence_server.pipeline import process_event, setup_handlers
+from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.utils import make_node_id
 
@@ -626,3 +630,131 @@ class TestSystemEventsAreNoOp:
         event_node_id = make_node_id(SESSION_ID, "cancel:requested", T0)
         event_node = await services.graph.get_node(event_node_id)
         assert event_node is None
+
+
+# ===========================================================================
+# TestSessionEndWorkerCleanup
+# ===========================================================================
+
+
+class TestSessionEndWorkerCleanup:
+    """session:end triggers worker removal and CompletedSession recording."""
+
+    async def test_session_end_removes_worker_from_registry(self) -> None:
+        """After session:end is drained, the worker is removed from the registry."""
+        reg = SessionRegistry()
+        services = HookStateService(workspace=WORKSPACE)
+        services.graph.close = AsyncMock()  # type: ignore[method-assign]
+        worker = SessionWorker(
+            session_id=SESSION_ID,
+            workspace=WORKSPACE,
+            services=services,
+        )
+        reg._workers[SESSION_ID] = worker
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            reg.start_drain(worker)
+            await worker.queue.put(
+                (
+                    "session:start",
+                    WORKSPACE,
+                    {"session_id": SESSION_ID, "timestamp": T0},
+                )
+            )
+            await worker.queue.put(
+                (
+                    "prompt:submit",
+                    WORKSPACE,
+                    {"session_id": SESSION_ID, "timestamp": T1, "prompt": "Hello"},
+                )
+            )
+            await worker.queue.put(
+                ("session:end", WORKSPACE, {"session_id": SESSION_ID, "timestamp": T6})
+            )
+            assert worker.task is not None
+            await worker.task
+
+        assert reg.active_count() == 0
+
+    async def test_session_end_populates_completed_ring(self) -> None:
+        """After session:end the completed ring holds one CompletedSession."""
+        reg = SessionRegistry()
+        services = HookStateService(workspace=WORKSPACE)
+        services.graph.close = AsyncMock()  # type: ignore[method-assign]
+        worker = SessionWorker(
+            session_id=SESSION_ID,
+            workspace=WORKSPACE,
+            services=services,
+        )
+        reg._workers[SESSION_ID] = worker
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            reg.start_drain(worker)
+            await worker.queue.put(
+                (
+                    "session:start",
+                    WORKSPACE,
+                    {"session_id": SESSION_ID, "timestamp": T0},
+                )
+            )
+            await worker.queue.put(
+                ("session:end", WORKSPACE, {"session_id": SESSION_ID, "timestamp": T6})
+            )
+            assert worker.task is not None
+            await worker.task
+
+        completed = reg.completed_sessions()
+        assert len(completed) == 1
+        assert completed[0].session_id == SESSION_ID
+        assert completed[0].events_processed > 0
+
+
+# ===========================================================================
+# TestStatusIncludesCompletedSessions
+# ===========================================================================
+
+
+class TestStatusIncludesCompletedSessions:
+    """build_status_response includes completed sessions after drain."""
+
+    async def test_status_has_completed_sessions_after_drain(self) -> None:
+        """build_status_response lists the completed session after drain."""
+        reg = SessionRegistry()
+        services = HookStateService(workspace=WORKSPACE)
+        services.graph.close = AsyncMock()  # type: ignore[method-assign]
+        worker = SessionWorker(
+            session_id=SESSION_ID,
+            workspace=WORKSPACE,
+            services=services,
+        )
+        reg._workers[SESSION_ID] = worker
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            reg.start_drain(worker)
+            await worker.queue.put(
+                (
+                    "session:start",
+                    WORKSPACE,
+                    {"session_id": SESSION_ID, "timestamp": T0},
+                )
+            )
+            await worker.queue.put(
+                ("session:end", WORKSPACE, {"session_id": SESSION_ID, "timestamp": T6})
+            )
+            assert worker.task is not None
+            await worker.task
+
+        response = build_status_response(reg, time.time() - 60)
+        assert "completed_sessions" in response
+        assert len(response["completed_sessions"]) == 1
+        assert response["completed_sessions"][0]["session_id"] == SESSION_ID
+        assert response["completed_sessions"][0]["events_processed"] > 0
