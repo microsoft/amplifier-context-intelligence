@@ -1,14 +1,17 @@
 """FastAPI application entrypoint for the Context Intelligence Server."""
 
+import asyncio
 import json
 import logging
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
+import aiofiles
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from neo4j import AsyncGraphDatabase
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
@@ -180,6 +183,39 @@ async def get_blob(session_id: str, key: str) -> JSONResponse:
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Blob not found: {uri}")
     return JSONResponse(content=content)
+
+
+@app.get("/logs/stream")
+async def stream_logs(request: Request) -> StreamingResponse:
+    """Stream server log lines as Server-Sent Events."""
+    log_path = Path(_settings.log_path)
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        # Backfill last 200 lines
+        lines = log_path.read_text().splitlines()[-200:]
+        for line in lines:
+            yield f"data: {line}\n\n"
+
+        # Tail new lines
+        async with aiofiles.open(log_path, mode="r") as f:
+            await f.seek(0, 2)
+            while True:
+                if await request.is_disconnected():
+                    break
+                line = await f.readline()
+                if not line:
+                    await asyncio.sleep(0.2)
+                else:
+                    yield f"data: {line}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/cypher")

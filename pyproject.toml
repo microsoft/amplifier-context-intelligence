@@ -12,6 +12,7 @@ dependencies = [
     "uvicorn[standard]>=0.30.0",
     "pydantic-settings>=2.0.0",
     "neo4j>=5.0",
+    "aiofiles>=24.0.0",
 ]
 
 [project.optional-dependencies]
