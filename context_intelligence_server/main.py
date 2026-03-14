@@ -5,6 +5,7 @@ import logging
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -150,7 +151,7 @@ async def dashboard() -> HTMLResponse:
 
 
 @app.get("/status")
-async def get_status() -> dict:
+async def get_status() -> dict[str, Any]:
     return build_status_response(registry, _start_time)
 
 
