@@ -7,13 +7,15 @@ URI scheme:
     ci-blob://<session-id>/<key>
 
 All filesystem I/O is wrapped with ``asyncio.to_thread`` to keep the event
-loop non-blocking.  ``dump()`` is stubbed for Task 2.
+loop non-blocking.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
@@ -48,10 +50,20 @@ class BlobStore(Protocol):
         """Return all blob URIs for *session_id*, sorted lexicographically."""
         ...
 
-    async def dump(self, session_id: str) -> dict[str, Any]:
-        """Return all blobs for *session_id* as a dict keyed by URI.
+    async def dump(self, uri: str, dest_dir: Path | str | None = None) -> str:
+        """Copy the blob file addressed by *uri* to *dest_dir*.
 
-        .. note:: Not yet implemented — reserved for Task 2.
+        Args:
+            uri: ``ci-blob://`` URI identifying the blob to copy.
+            dest_dir: Destination directory.  Defaults to
+                ``Path(tempfile.gettempdir()) / 'ci-blobs'``.
+
+        Returns:
+            The destination file path as a string.
+
+        Raises:
+            ValueError: If *uri* is not a valid ``ci-blob://`` URI.
+            FileNotFoundError: If no blob exists at the resolved path.
         """
         ...
 
@@ -177,12 +189,33 @@ class AsyncDiskBlobStore:
 
         return await asyncio.to_thread(_list)
 
-    async def dump(self, session_id: str) -> dict[str, Any]:
-        """Return all blobs for *session_id* as a dict keyed by URI.
+    async def dump(self, uri: str, dest_dir: Path | str | None = None) -> str:
+        """Copy the blob file addressed by *uri* to *dest_dir*.
 
-        .. note:: Not yet implemented — reserved for Task 2.
+        Args:
+            uri: ``ci-blob://`` URI identifying the blob to copy.
+            dest_dir: Destination directory.  Defaults to
+                ``Path(tempfile.gettempdir()) / 'ci-blobs'``.
+
+        Returns:
+            The destination file path as a string.
 
         Raises:
-            NotImplementedError: Always.
+            ValueError: If *uri* is not a valid ``ci-blob://`` URI.
+            FileNotFoundError: If no blob exists at the resolved path.
         """
-        raise NotImplementedError("dump() is not yet implemented — see Task 2")
+        session_id, key = self._parse_uri(uri)
+        src = self._blob_path(session_id, key)
+
+        if dest_dir is None:
+            dest_dir_path = Path(tempfile.gettempdir()) / "ci-blobs"
+        else:
+            dest_dir_path = Path(dest_dir)
+
+        def _copy() -> str:
+            if not src.exists():
+                raise FileNotFoundError(f"Blob not found: {uri!r}")
+            dest_dir_path.mkdir(parents=True, exist_ok=True)
+            return str(shutil.copy2(src, dest_dir_path))
+
+        return await asyncio.to_thread(_copy)

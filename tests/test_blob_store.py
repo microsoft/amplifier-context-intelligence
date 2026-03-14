@@ -1,6 +1,6 @@
-"""Tests for AsyncDiskBlobStore — Write, Read, List.
+"""Tests for AsyncDiskBlobStore — Write, Read, List, Dump.
 
-11 tests covering:
+15 tests covering:
 1.  write/read roundtrip
 2.  URI format
 3.  directory structure creation
@@ -11,7 +11,11 @@
 8.  correct URI listing
 9.  session isolation
 10. asyncio.to_thread delegation verification
-11. dump() raises NotImplementedError
+11. dump() copies blob to specified dest_dir
+12. dump() uses default dest_dir (tempdir/ci-blobs)
+13. dump() missing blob raises FileNotFoundError
+14. dump() delegates copy2 via asyncio.to_thread
+15. BlobStore protocol conformance
 """
 
 from __future__ import annotations
@@ -205,14 +209,91 @@ async def test_asyncio_to_thread_delegation(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 11. dump() raises NotImplementedError
+# 11. dump() copies blob to specified dest_dir
 # ---------------------------------------------------------------------------
 
 
-async def test_dump_raises_not_implemented(store: AsyncDiskBlobStore) -> None:
-    """dump() is stubbed and raises NotImplementedError (to be implemented in Task 2)."""
-    with pytest.raises(NotImplementedError):
-        await store.dump("session-any")
+async def test_dump_copy_to_specified_dest_dir(
+    store: AsyncDiskBlobStore, tmp_path: Path
+) -> None:
+    """dump() copies the blob file to the specified dest_dir and returns the path."""
+    session_id = "session-dump-copy"
+    key = "blob_to_copy"
+    payload = {"copy": "me"}
+    uri = await store.write(session_id, key, payload)
+
+    dest_dir = tmp_path / "my_dest"
+    result = await store.dump(uri, dest_dir=dest_dir)
+
+    result_path = Path(result)
+    assert result_path.exists()
+    assert result_path.parent == dest_dir
+    assert json.loads(result_path.read_text()) == payload
+
+
+# ---------------------------------------------------------------------------
+# 12. dump() uses default dest_dir (tempdir/ci-blobs)
+# ---------------------------------------------------------------------------
+
+
+async def test_dump_default_dest_dir(store: AsyncDiskBlobStore) -> None:
+    """dump() uses Path(tempfile.gettempdir()) / 'ci-blobs' when dest_dir is None."""
+    import tempfile
+
+    session_id = "session-dump-default"
+    key = "default_blob"
+    uri = await store.write(session_id, key, {"default": True})
+
+    result = await store.dump(uri)
+
+    expected_dir = Path(tempfile.gettempdir()) / "ci-blobs"
+    result_path = Path(result)
+    assert result_path.parent == expected_dir
+    assert result_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# 13. dump() missing blob raises FileNotFoundError
+# ---------------------------------------------------------------------------
+
+
+async def test_dump_missing_blob_raises_file_not_found(
+    store: AsyncDiskBlobStore,
+) -> None:
+    """dump() raises FileNotFoundError with 'Blob not found' message for missing blob."""
+    uri = "ci-blob://session-nonexistent/missing_blob"
+    with pytest.raises(FileNotFoundError, match="Blob not found"):
+        await store.dump(uri)
+
+
+# ---------------------------------------------------------------------------
+# 14. dump() delegates shutil.copy2 via asyncio.to_thread
+# ---------------------------------------------------------------------------
+
+
+async def test_dump_uses_asyncio_to_thread_for_copy2(
+    store: AsyncDiskBlobStore, tmp_path: Path
+) -> None:
+    """dump() delegates shutil.copy2 to asyncio.to_thread for non-blocking I/O."""
+    session_id = "session-dump-thread"
+    key = "thread_blob"
+    uri = await store.write(session_id, key, {"thread": True})
+    dest_dir = tmp_path / "thread_dest"
+
+    to_thread_calls: list[str] = []
+    original_to_thread = asyncio.to_thread
+
+    async def tracking_to_thread(func, *args, **kwargs):  # type: ignore[no-untyped-def]
+        to_thread_calls.append(getattr(func, "__name__", str(func)))
+        return await original_to_thread(func, *args, **kwargs)
+
+    with patch("asyncio.to_thread", side_effect=tracking_to_thread):
+        await store.dump(uri, dest_dir=dest_dir)
+
+    assert len(to_thread_calls) >= 1, (
+        f"Expected at least 1 asyncio.to_thread call for dump(), "
+        f"got {len(to_thread_calls)}: {to_thread_calls}"
+    )
 
 
 # ---------------------------------------------------------------------------
