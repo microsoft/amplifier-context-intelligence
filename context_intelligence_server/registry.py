@@ -189,6 +189,14 @@ class SessionRegistry:
         """Remove worker from registry WITHOUT cancelling its asyncio task."""
         self._workers.pop(session_id, None)
 
+    def _register_for_test(self, worker: SessionWorker) -> None:
+        """Insert a pre-built worker into the registry — for use in tests only.
+
+        Avoids direct access to the private ``_workers`` dict in test helpers
+        while keeping the public API uncluttered.
+        """
+        self._workers[worker.session_id] = worker
+
     def completed_sessions(self) -> list[CompletedSession]:
         """Return a list copy of completed sessions from the ring buffer."""
         return list(self._completed)

@@ -77,7 +77,7 @@ def _make_registry_and_worker(
         workspace=workspace,
         services=services,
     )
-    reg._workers[session_id] = worker
+    reg._register_for_test(worker)
     return reg, worker
 
 
