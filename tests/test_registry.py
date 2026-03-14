@@ -570,6 +570,12 @@ class TestDeregister:
         assert not task_b.done()
         assert task_b.cancelling() == 0
 
+        # Cleanup: await task_a (already cancelling via remove — cancel() is idempotent)
+        task_a.cancel()
+        try:
+            await task_a
+        except asyncio.CancelledError:
+            pass
         # Cleanup: cancel the orphaned task_b
         task_b.cancel()
         try:
