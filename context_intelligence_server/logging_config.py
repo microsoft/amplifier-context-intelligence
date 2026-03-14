@@ -17,6 +17,10 @@ def setup_logging() -> None:
 
     Reads log_path and log_level from get_settings(). Creates the parent
     directory of log_path if it does not already exist.
+
+    Idempotent: if the root logger already has handlers attached (e.g. because
+    the application lifespan is exercised multiple times in tests) this function
+    returns immediately without adding duplicate handlers.
     """
     settings = get_settings()
     log_path = Path(settings.log_path)
@@ -29,6 +33,15 @@ def setup_logging() -> None:
 
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
+
+    # Guard: skip handler registration if our RotatingFileHandler is already present.
+    # Checking for a RotatingFileHandler (rather than any handler) avoids false
+    # positives from pytest's log-capture handler which is always present during tests.
+    if any(
+        isinstance(h, logging.handlers.RotatingFileHandler)
+        for h in root_logger.handlers
+    ):
+        return
 
     # stdout stream handler
     stream_handler = logging.StreamHandler(sys.stdout)

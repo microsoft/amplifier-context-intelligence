@@ -379,6 +379,23 @@ async def test_dashboard_html_includes_error_badge(
     assert "error-badge" in body
 
 
+async def test_dashboard_html_sessions_table_displays_event_name_not_timestamp(
+    client: httpx.AsyncClient,
+) -> None:
+    """Active sessions table must render s.last_event directly, not via timeAgo().
+
+    s.last_event is an event-name string (e.g. 'tool:pre'), not a Unix timestamp.
+    Passing it to timeAgo() coerces the string to NaN and renders 'NaNs ago'.
+    """
+    response = await client.get("/")
+    assert response.status_code == 200
+    body = response.text
+    # Bug pattern must be absent
+    assert "timeAgo(s.last_event)" not in body
+    # Fix pattern must be present
+    assert "(s.last_event || '-')" in body
+
+
 # ---------------------------------------------------------------------------
 # Lifespan tests
 # ---------------------------------------------------------------------------
@@ -442,6 +459,72 @@ async def test_logs_stream_backfills_existing_lines(
     assert len(data_lines) == 5
     for i, content in enumerate(data_lines):
         assert content == lines[i]
+
+
+async def test_logs_stream_absent_log_file_returns_empty_stream(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /logs/stream returns 200 with no data lines when log file does not exist.
+
+    Previously crashed with FileNotFoundError (500) when log_path was absent.
+    """
+    from starlette.requests import Request as StarletteRequest
+
+    absent_file = tmp_path / "nonexistent.jsonl"
+    # Deliberately do NOT create the file
+    assert not absent_file.exists()
+    monkeypatch.setattr(main_module._settings, "log_path", str(absent_file))
+
+    async def mock_is_disconnected(self: StarletteRequest) -> bool:  # noqa: ARG001
+        return True
+
+    monkeypatch.setattr(StarletteRequest, "is_disconnected", mock_is_disconnected)
+
+    data_lines: list[str] = []
+    async with client.stream("GET", "/logs/stream") as response:
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        async for line in response.aiter_lines():
+            if line.startswith("data: "):
+                data_lines.append(line[len("data: ") :])
+
+    assert data_lines == []
+
+
+async def test_logs_stream_tail_lines_have_no_trailing_newline(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SSE frames from backfill must not contain trailing newlines in the data field.
+
+    Previously, splitlines() in backfill was correct, but the tail path used
+    f.readline() which includes the trailing '\\n', producing triple-newline frames.
+    This test covers the backfill path (splitlines strips correctly).
+    """
+    from starlette.requests import Request as StarletteRequest
+
+    log_file = tmp_path / "server.jsonl"
+    log_file.write_text('{"level": "INFO", "msg": "hello"}\n')
+    monkeypatch.setattr(main_module._settings, "log_path", str(log_file))
+
+    async def mock_is_disconnected(self: StarletteRequest) -> bool:  # noqa: ARG001
+        return True
+
+    monkeypatch.setattr(StarletteRequest, "is_disconnected", mock_is_disconnected)
+
+    data_lines: list[str] = []
+    async with client.stream("GET", "/logs/stream") as response:
+        async for line in response.aiter_lines():
+            if line.startswith("data: "):
+                data_lines.append(line[len("data: ") :])
+
+    assert len(data_lines) == 1
+    assert not data_lines[0].endswith("\n"), (
+        "data field must not contain trailing newline"
+    )
 
 
 # ---------------------------------------------------------------------------

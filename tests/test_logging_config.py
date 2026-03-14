@@ -12,12 +12,29 @@ from unittest.mock import MagicMock, patch
 class TestSetupLogging:
     """Tests for setup_logging() function."""
 
+    def setup_method(self) -> None:
+        """Save and remove all existing root logger handlers before each test.
+
+        This ensures setup_logging() encounters a clean logger even when pytest's
+        own logging plugin has already attached handlers to the root logger, which
+        would otherwise trigger the idempotency guard and prevent our handlers
+        from being registered.
+        """
+        root_logger = logging.getLogger()
+        self._saved_handlers: list[logging.Handler] = list(root_logger.handlers)
+        self._saved_level: int = root_logger.level
+        for handler in self._saved_handlers:
+            root_logger.removeHandler(handler)
+
     def teardown_method(self) -> None:
-        """Remove all handlers added to root logger by setup_logging() calls."""
+        """Remove handlers added by setup_logging() and restore original handlers."""
         root_logger = logging.getLogger()
         for handler in list(root_logger.handlers):
             handler.close()
             root_logger.removeHandler(handler)
+        for handler in self._saved_handlers:
+            root_logger.addHandler(handler)
+        root_logger.setLevel(self._saved_level)
 
     def _make_mock_settings(self, log_path: str, log_level: str = "INFO") -> MagicMock:
         """Create a mock settings object."""
@@ -162,4 +179,33 @@ class TestSetupLogging:
             assert "level" in parsed, f"JSON log should have 'level' key, got: {parsed}"
             assert "message" in parsed, (
                 f"JSON log should have 'message' key, got: {parsed}"
+            )
+
+    def test_setup_logging_is_idempotent(self) -> None:
+        """Calling setup_logging() twice must not add duplicate handlers.
+
+        Duplicate handlers cause every log record to be written multiple times.
+        The guard checks for an existing RotatingFileHandler so that calling
+        setup_logging() a second time (e.g. in tests that exercise lifespan
+        multiple times) is a no-op.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = str(Path(tmpdir) / "server.jsonl")
+            mock_settings = self._make_mock_settings(log_path)
+
+            with patch(
+                "context_intelligence_server.logging_config.get_settings",
+                return_value=mock_settings,
+            ):
+                from context_intelligence_server.logging_config import setup_logging
+
+                setup_logging()
+                handler_count_after_first = len(logging.getLogger().handlers)
+
+                setup_logging()  # second call — must be a no-op
+                handler_count_after_second = len(logging.getLogger().handlers)
+
+            assert handler_count_after_second == handler_count_after_first, (
+                f"Second setup_logging() call added handlers: "
+                f"before={handler_count_after_first}, after={handler_count_after_second}"
             )

@@ -285,7 +285,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
           const sb = document.getElementById('sessions-body');
           sb.innerHTML = (data.sessions || []).map(s =>
             '<tr><td>' + truncate(s.session_id, 20) + '</td><td>' + truncate(s.workspace, 30) + '</td><td>' +
-            s.queue_depth + '</td><td>' + timeAgo(s.last_event) + '</td><td>' +
+            s.queue_depth + '</td><td>' + (s.last_event || '-') + '</td><td>' +
             s.events_processed + '</td></tr>'
           ).join('');
 
@@ -442,12 +442,14 @@ async def stream_logs(request: Request) -> StreamingResponse:
     log_path = Path(_settings.log_path)
 
     async def event_generator() -> AsyncGenerator[str, None]:
-        # Backfill last 200 lines
-        lines = log_path.read_text().splitlines()[-200:]
-        for line in lines:
-            yield f"data: {line}\n\n"
+        # Backfill last 200 lines (skip if log file does not yet exist)
+        if log_path.exists():
+            for line in log_path.read_text().splitlines()[-200:]:
+                yield f"data: {line}\n\n"
 
-        # Tail new lines
+        # Tail new lines (return early if log file still does not exist)
+        if not log_path.exists():
+            return
         async with aiofiles.open(log_path, mode="r") as f:
             await f.seek(0, 2)
             while True:
@@ -457,7 +459,7 @@ async def stream_logs(request: Request) -> StreamingResponse:
                 if not line:
                     await asyncio.sleep(0.2)
                 else:
-                    yield f"data: {line}\n\n"
+                    yield f"data: {line.rstrip()}\n\n"
 
     return StreamingResponse(
         event_generator(),
