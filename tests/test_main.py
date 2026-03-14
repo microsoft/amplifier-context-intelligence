@@ -288,6 +288,54 @@ async def test_cypher_neo4j_error_returns_500(
 
 
 # ---------------------------------------------------------------------------
+# Enriched /status tests
+# ---------------------------------------------------------------------------
+
+
+async def test_status_includes_sessions_list(client: httpx.AsyncClient) -> None:
+    """GET /status returns dict with sessions and recent_events list fields."""
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert "sessions" in data
+    assert isinstance(data["sessions"], list)
+    assert "recent_events" in data
+    assert isinstance(data["recent_events"], list)
+
+
+async def test_status_session_detail_after_event(client: httpx.AsyncClient) -> None:
+    """After posting an event, /status sessions list includes session detail."""
+    await client.post(
+        "/events",
+        json={
+            "event": "tool_use",
+            "workspace": "/ws-detail",
+            "data": {"session_id": "sess-detail"},
+        },
+    )
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["active_sessions"] >= 1
+    session_ids = [s["session_id"] for s in data["sessions"]]
+    assert "sess-detail" in session_ids
+    sess = next(s for s in data["sessions"] if s["session_id"] == "sess-detail")
+    assert sess["workspace"] == "/ws-detail"
+    assert "queue_depth" in sess
+    assert "events_processed" in sess
+
+
+async def test_dashboard_returns_html(client: httpx.AsyncClient) -> None:
+    """GET / returns 200 with HTML dashboard containing polling JavaScript."""
+    response = await client.get("/")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    body = response.text
+    assert "Context Intelligence Server" in body
+    assert "setInterval" in body
+
+
+# ---------------------------------------------------------------------------
 # Lifespan tests
 # ---------------------------------------------------------------------------
 

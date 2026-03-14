@@ -7,16 +7,16 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from neo4j import AsyncGraphDatabase
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
+from context_intelligence_server.dashboard import build_status_response
 from context_intelligence_server.models import (
     CypherRequest,
     EventRequest,
     EventResponse,
-    StatusResponse,
 )
 from context_intelligence_server.registry import SessionRegistry
 
@@ -49,13 +49,111 @@ _start_time = time.time()
 registry = SessionRegistry()
 
 
-@app.get("/status", response_model=StatusResponse)
-async def get_status() -> StatusResponse:
-    return StatusResponse(
-        status="ok",
-        uptime_seconds=time.time() - _start_time,
-        active_sessions=registry.active_count(),
-    )
+_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Context Intelligence Server</title>
+  <style>
+    body {
+      background: #1a1a2e;
+      color: #e0e0e0;
+      font-family: monospace;
+      margin: 0;
+      padding: 20px;
+    }
+    h1 { color: #a0c4ff; }
+    h2 { color: #9fb3c8; margin-top: 24px; }
+    .metrics { display: flex; gap: 32px; margin: 16px 0; }
+    .metric { background: #16213e; padding: 12px 20px; border-radius: 6px; }
+    .metric-label { font-size: 0.8em; color: #888; }
+    .metric-value { font-size: 1.4em; color: #a0c4ff; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th { background: #16213e; padding: 8px 12px; text-align: left; color: #9fb3c8; }
+    td { padding: 6px 12px; border-bottom: 1px solid #2a2a4a; }
+    tr:hover td { background: #1e2a3a; }
+  </style>
+</head>
+<body>
+  <h1>Context Intelligence Server</h1>
+  <div class="metrics">
+    <div class="metric">
+      <div class="metric-label">Uptime (s)</div>
+      <div class="metric-value"><span id="uptime">-</span></div>
+    </div>
+    <div class="metric">
+      <div class="metric-label">Active Sessions</div>
+      <div class="metric-value"><span id="active_sessions">-</span></div>
+    </div>
+  </div>
+
+  <h2>Sessions</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Session</th>
+        <th>Workspace</th>
+        <th>Queue</th>
+        <th>Last Event</th>
+        <th>Processed</th>
+      </tr>
+    </thead>
+    <tbody id="sessions-body"></tbody>
+  </table>
+
+  <h2>Recent Events</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Event</th>
+        <th>Session</th>
+        <th>Workspace</th>
+        <th>Result</th>
+      </tr>
+    </thead>
+    <tbody id="events-body"></tbody>
+  </table>
+
+  <script>
+    function refresh() {
+      fetch('/status')
+        .then(r => r.json())
+        .then(data => {
+          document.getElementById('uptime').textContent = data.uptime_seconds.toFixed(1);
+          document.getElementById('active_sessions').textContent = data.active_sessions;
+
+          const sb = document.getElementById('sessions-body');
+          sb.innerHTML = (data.sessions || []).map(s =>
+            '<tr><td>' + s.session_id + '</td><td>' + s.workspace + '</td><td>' +
+            s.queue_depth + '</td><td>' + (s.last_event || '-') + '</td><td>' +
+            s.events_processed + '</td></tr>'
+          ).join('');
+
+          const eb = document.getElementById('events-body');
+          eb.innerHTML = (data.recent_events || []).map(e => {
+            const t = new Date(e.timestamp * 1000).toISOString();
+            return '<tr><td>' + t + '</td><td>' + e.event + '</td><td>' +
+              e.session_id + '</td><td>' + e.workspace + '</td><td>' + e.result + '</td></tr>';
+          }).join('');
+        });
+    }
+    refresh();
+    setInterval(refresh, 3000);
+  </script>
+</body>
+</html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard() -> HTMLResponse:
+    return HTMLResponse(content=_DASHBOARD_HTML)
+
+
+@app.get("/status")
+async def get_status() -> dict:
+    return build_status_response(registry, _start_time)
 
 
 @app.post("/events", status_code=202, response_model=EventResponse)
