@@ -127,7 +127,7 @@ class QueryableStore(GraphStore, Protocol):
         self,
         query: str,
         params: dict[str, Any] | None = None,
-        dialect: str = "cypher",
+        dialect: str = "cypher",  # protocol default; implementations may override
         workspace: str | None = None,
     ) -> list[dict[str, Any]]:
         """Execute a query against the store.

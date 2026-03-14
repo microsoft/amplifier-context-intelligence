@@ -174,17 +174,21 @@ def test_graph_store_only_class_not_queryable_store():
 
 
 def test_graph_store_exported():
-    """GraphStore is exported from graph_store module."""
-    import context_intelligence_server.graph_store as m
+    """GraphStore is exported from graph_store module.
 
-    assert hasattr(m, "GraphStore")
+    The top-level import at the head of this file would raise ``ImportError``
+    if ``GraphStore`` were missing; this assertion makes the intent explicit.
+    """
+    assert GraphStore is not None
 
 
 def test_queryable_store_exported():
-    """QueryableStore is exported from graph_store module."""
-    import context_intelligence_server.graph_store as m
+    """QueryableStore is exported from graph_store module.
 
-    assert hasattr(m, "QueryableStore")
+    The top-level import at the head of this file would raise ``ImportError``
+    if ``QueryableStore`` were missing; this assertion makes the intent explicit.
+    """
+    assert QueryableStore is not None
 
 
 def test_no_graph_forest_name_references():
