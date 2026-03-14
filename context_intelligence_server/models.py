@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class EventRequest(BaseModel):
@@ -32,5 +32,5 @@ class CypherRequest(BaseModel):
     """Request body for proxying a Cypher query to Neo4j."""
 
     query: str
-    params: dict[str, Any] = {}
+    params: dict[str, Any] = Field(default_factory=dict)
     workspace: str | None = None

@@ -215,36 +215,14 @@ async def test_cypher_proxy_returns_results(
 ) -> None:
     """POST /cypher returns 200 with {results: [...]} from Neo4j."""
     import context_intelligence_server.main as main_module
+    from tests.conftest import MockNeo4jDriver
 
     mock_row = {"name": "Alice"}
-
-    class MockResult:
-        def __aiter__(self) -> "MockResult":
-            self._sent = False
-            return self
-
-        async def __anext__(self) -> dict:
-            if not self._sent:
-                self._sent = True
-                return mock_row
-            raise StopAsyncIteration
-
-    class MockSession:
-        async def run(self, query: str, params: dict) -> MockResult:
-            return MockResult()
-
-        async def __aenter__(self) -> "MockSession":
-            return self
-
-        async def __aexit__(self, *args: object) -> None:
-            pass
-
-    class MockDriver:
-        def session(self) -> MockSession:
-            return MockSession()
-
     monkeypatch.setattr(
-        main_module.app.state, "neo4j_driver", MockDriver(), raising=False
+        main_module.app.state,
+        "neo4j_driver",
+        MockNeo4jDriver(rows=[mock_row]),
+        raising=False,
     )
 
     response = await client.post("/cypher", json={"query": "MATCH (n) RETURN n"})
@@ -260,33 +238,14 @@ async def test_cypher_workspace_injection(
 ) -> None:
     """POST /cypher injects workspace into params when workspace is not None or '*'."""
     import context_intelligence_server.main as main_module
+    from tests.conftest import MockNeo4jDriver
 
     captured_params: dict = {}
-
-    class MockResult:
-        def __aiter__(self) -> "MockResult":
-            return self
-
-        async def __anext__(self) -> dict:
-            raise StopAsyncIteration
-
-    class MockSession:
-        async def run(self, query: str, params: dict) -> MockResult:
-            captured_params.update(params)
-            return MockResult()
-
-        async def __aenter__(self) -> "MockSession":
-            return self
-
-        async def __aexit__(self, *args: object) -> None:
-            pass
-
-    class MockDriver:
-        def session(self) -> MockSession:
-            return MockSession()
-
     monkeypatch.setattr(
-        main_module.app.state, "neo4j_driver", MockDriver(), raising=False
+        main_module.app.state,
+        "neo4j_driver",
+        MockNeo4jDriver(captured=captured_params),
+        raising=False,
     )
 
     await client.post(
@@ -296,29 +255,42 @@ async def test_cypher_workspace_injection(
     assert captured_params.get("workspace") == "/my/ws"
 
 
+async def test_cypher_star_workspace_not_injected(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /cypher does NOT inject workspace when workspace='*' (cross-workspace)."""
+    import context_intelligence_server.main as main_module
+    from tests.conftest import MockNeo4jDriver
+
+    captured_params: dict = {}
+    monkeypatch.setattr(
+        main_module.app.state,
+        "neo4j_driver",
+        MockNeo4jDriver(captured=captured_params),
+        raising=False,
+    )
+
+    await client.post(
+        "/cypher",
+        json={"query": "MATCH (n) RETURN n", "workspace": "*"},
+    )
+    assert "workspace" not in captured_params
+
+
 async def test_cypher_neo4j_error_returns_500(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """POST /cypher returns 500 with error detail when Neo4j raises an exception."""
     import context_intelligence_server.main as main_module
-
-    class MockSession:
-        async def run(self, query: str, params: dict) -> None:
-            raise RuntimeError("Connection refused")
-
-        async def __aenter__(self) -> "MockSession":
-            return self
-
-        async def __aexit__(self, *args: object) -> None:
-            pass
-
-    class MockDriver:
-        def session(self) -> MockSession:
-            return MockSession()
+    from tests.conftest import MockNeo4jDriver
 
     monkeypatch.setattr(
-        main_module.app.state, "neo4j_driver", MockDriver(), raising=False
+        main_module.app.state,
+        "neo4j_driver",
+        MockNeo4jDriver(exc=RuntimeError("Connection refused")),
+        raising=False,
     )
 
     response = await client.post("/cypher", json={"query": "MATCH (n) RETURN n"})
