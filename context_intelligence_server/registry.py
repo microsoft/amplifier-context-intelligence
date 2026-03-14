@@ -4,6 +4,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 
+from context_intelligence_server.pipeline import process_event, setup_handlers
 from context_intelligence_server.services import HookStateService
 
 logger = logging.getLogger("context_intelligence_server")
@@ -18,33 +19,48 @@ class SessionWorker:
     task: asyncio.Task | None = None
 
 
-async def drain_worker(worker: SessionWorker) -> None:
-    """Background coroutine that drains the session's event queue."""
-    while True:
-        event_tuple = await worker.queue.get()
-        try:
-            event, workspace, data = event_tuple
-            session_id = data.get("session_id", "") if isinstance(data, dict) else ""
-            logger.info(
-                "drain_worker: event=%s session_id=%s workspace=%s",
-                event,
-                session_id,
-                workspace,
-            )
-        except Exception:
-            logger.exception("drain_worker: error processing event")
-        finally:
-            worker.queue.task_done()
-
-
 class SessionRegistry:
     def __init__(self) -> None:
         self._workers: dict[str, SessionWorker] = {}
 
+    async def drain_worker(
+        self, worker: SessionWorker, flush_timeout: float = 30.0
+    ) -> None:
+        """Background coroutine that drains the session's event queue.
+
+        Initializes handlers once, then loops:
+        - Dequeues events with a timeout of *flush_timeout* seconds.
+        - Dispatches each event via process_event.
+        - On TimeoutError (no events for flush_timeout seconds): calls graph.flush
+          as a periodic fallback for disconnected sessions.
+        - On CancelledError (shutdown): flushes once then exits cleanly.
+        """
+        handlers = setup_handlers(worker.services)
+
+        while True:
+            try:
+                event_tuple = await asyncio.wait_for(
+                    worker.queue.get(), timeout=flush_timeout
+                )
+                event, _workspace, data = event_tuple
+                try:
+                    await process_event(worker, event, data, handlers)
+                finally:
+                    worker.queue.task_done()
+
+            except asyncio.TimeoutError:
+                # Periodic fallback flush for disconnected sessions
+                await worker.services.graph.flush()
+
+            except asyncio.CancelledError:
+                # Shutdown: flush any buffered writes before exiting
+                await worker.services.graph.flush()
+                break
+
     def start_drain(self, worker: SessionWorker) -> None:
         if worker.task is None or worker.task.done():
             worker.task = asyncio.create_task(
-                drain_worker(worker), name=f"drain-{worker.session_id}"
+                self.drain_worker(worker), name=f"drain-{worker.session_id}"
             )
 
     def get_or_create(self, session_id: str, workspace: str) -> SessionWorker:

@@ -2,6 +2,7 @@
 
 import asyncio
 import dataclasses
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 
@@ -116,3 +117,107 @@ class TestSessionWorkerHasServices:
         worker = registry.get_or_create("session-1", workspace)
 
         assert worker.workspace == workspace
+
+
+class TestDrainLoopCallsProcessEvent:
+    """drain_worker calls process_event for each dequeued item."""
+
+    @pytest.mark.asyncio
+    async def test_queued_event_is_processed(self) -> None:
+        """process_event is called with (worker, event, data, handlers) when an event is enqueued."""
+        reg = SessionRegistry()
+        worker = SessionWorker(
+            session_id="test-session",
+            workspace="/workspace/test",
+            services=HookStateService(workspace="/workspace/test"),
+        )
+
+        event = "tool_call"
+        workspace = "/workspace/test"
+        data: dict[str, object] = {"session_id": "test-session", "tool": "bash"}
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ) as mock_process:
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+
+            # Enqueue the event tuple
+            await worker.queue.put((event, workspace, data))
+
+            # Yield control so the drain loop can process the item
+            await asyncio.sleep(0.05)
+
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+            mock_process.assert_called_once_with(worker, event, data, ANY)
+
+    @pytest.mark.asyncio
+    async def test_drain_worker_is_method_on_registry(self) -> None:
+        """drain_worker must be an instance method on SessionRegistry."""
+        import inspect
+
+        assert hasattr(SessionRegistry, "drain_worker")
+        assert inspect.iscoroutinefunction(SessionRegistry.drain_worker)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_flush_on_cancelled_error(self) -> None:
+        """graph.flush is called when the task is cancelled (shutdown flush)."""
+        reg = SessionRegistry()
+        worker = SessionWorker(
+            session_id="test-session",
+            workspace="/workspace/test",
+            services=HookStateService(workspace="/workspace/test"),
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+
+        task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+        await asyncio.sleep(0.02)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        worker.services.graph.flush.assert_called()
+
+
+class TestPeriodicFlush:
+    """drain_worker calls graph.flush periodically when no events arrive."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_triggers_flush(self) -> None:
+        """graph.flush is called after flush_timeout elapses with no events."""
+        reg = SessionRegistry()
+        worker = SessionWorker(
+            session_id="test-session",
+            workspace="/workspace/test",
+            services=HookStateService(workspace="/workspace/test"),
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+
+        # Very short timeout so the flush fires quickly
+        task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
+
+        # Wait longer than the timeout to ensure at least one flush cycle fires
+        await asyncio.sleep(0.2)
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert worker.services.graph.flush.call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_flush_timeout_default_is_30s(self) -> None:
+        """drain_worker default flush_timeout is 30 seconds."""
+        import inspect
+
+        sig = inspect.signature(SessionRegistry.drain_worker)
+        assert sig.parameters["flush_timeout"].default == 30.0
