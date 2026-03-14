@@ -23,6 +23,7 @@ from typing import Any, TYPE_CHECKING
 if TYPE_CHECKING:
     from context_intelligence_server.registry import SessionWorker
 
+from context_intelligence_server.blob_processor import process_event_data
 from context_intelligence_server.handlers.default import DefaultHandler
 from context_intelligence_server.handlers.event import SystemEventHandler
 from context_intelligence_server.handlers.orchestrator_run import OrchestratorRunHandler
@@ -31,6 +32,7 @@ from context_intelligence_server.handlers.session import SessionHandler
 from context_intelligence_server.handlers.step import StepHandler
 from context_intelligence_server.handlers.tool_execution import ToolExecutionHandler
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +135,12 @@ async def process_event(
         # Step 2 — ensure Session node exists for known sessions
         if session_id:
             await worker.services.ensure_session_node(session_id, data)
+
+        # Step 2.5 — blob processing (after ensure_session_node, before handler dispatch)
+        timestamp: str | None = data.get("timestamp") if isinstance(data, dict) else None
+        if session_id and timestamp and worker.services.blob_store:
+            node_id = make_node_id(session_id, event, timestamp)
+            await process_event_data(data, worker.services.blob_store, session_id, node_id)
 
         # Step 3 — resolve handler
         handler = _find_handler(event, handlers)
