@@ -18,9 +18,45 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+      start_period: 30s
     restart: unless-stopped
     labels:
       com.context-intelligence.component: server
+    networks:
+      - context-intelligence
+
+  intelligence-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.intelligence
+    ports:
+      - "8100:8100"
+    depends_on:
+      context-intelligence-server:
+        condition: service_healthy
+    volumes:
+      - context_intelligence_service_data:/data/context-intelligence-service
+      - blob_data:/data/blobs:ro
+    env_file:
+      - config/secrets.env
+    environment:
+      AMPLIFIER_HOME: /data/context-intelligence-service
+      BUNDLE_PATH: /app/bundles/context-intelligence-server/bundle.md
+      ROUTING_MATRIX: balanced
+      INTEL_SERVICE_INGESTION_URL: http://context-intelligence-server:8000
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 180s
+    restart: unless-stopped
+    labels:
+      com.context-intelligence.component: intelligence-service
     networks:
       - context-intelligence
 
@@ -49,6 +85,7 @@ volumes:
   blob_data:
   neo4j_data:
   log_data:
+  context_intelligence_service_data:
 
 networks:
   context-intelligence:
