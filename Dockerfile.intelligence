@@ -1,0 +1,23 @@
+FROM python:3.13-slim
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Layer caching: install dependencies before copying source
+COPY intelligence_service/pyproject.toml pyproject.toml
+COPY intelligence_service/ intelligence_service/
+
+RUN uv pip install --system .
+
+COPY entrypoint-intelligence.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 8100
+
+ENTRYPOINT ["/entrypoint.sh"]
