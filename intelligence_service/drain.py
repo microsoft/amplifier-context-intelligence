@@ -30,10 +30,6 @@ class DrainManager:
     """
 
     def __init__(self, *, timeout_seconds: int = 30) -> None:
-        # Stored for use by a future SIGTERM handler that calls start_drain()
-        # automatically.  start_drain() currently requires a caller-supplied
-        # timeout, but this value will become its default when signal handling
-        # is added.
         self._timeout_seconds: int = timeout_seconds
         self._accepting: bool = True
         self._active: set[str] = set()
@@ -82,23 +78,25 @@ class DrainManager:
     # Drain
     # ------------------------------------------------------------------
 
-    async def start_drain(self, *, timeout: float) -> bool:
+    async def start_drain(self, *, timeout: float | None = None) -> bool:
         """Stop accepting new connections and wait for active sessions to finish.
 
         Args:
             timeout: Maximum seconds to wait for all sessions to unregister.
+                Defaults to the ``timeout_seconds`` value supplied at construction.
 
         Returns:
             ``True`` if all sessions drained within *timeout*,
             ``False`` if the timeout expired with sessions still active.
         """
         self._accepting = False
+        effective_timeout = float(self._timeout_seconds) if timeout is None else timeout
 
         if not self._active:
             return True
 
         try:
-            await asyncio.wait_for(self._drained.wait(), timeout=timeout)
+            await asyncio.wait_for(self._drained.wait(), timeout=effective_timeout)
             return True
         except asyncio.TimeoutError:
             return False
