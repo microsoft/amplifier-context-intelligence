@@ -11,7 +11,7 @@ def test_settings_defaults() -> None:
 
     assert settings.server_host == "0.0.0.0"
     assert settings.server_port == 8100
-    assert settings.ingestion_server_url == "http://context-intelligence-server:8000"
+    assert settings.ingestion_url == "http://context-intelligence-server:8000"
     assert settings.bundle_name == "context-intelligence-server"
     assert settings.drain_timeout_seconds == 30
     assert settings.max_sessions == 50
@@ -85,3 +85,10 @@ def test_settings_amplifier_env_override(monkeypatch: pytest.MonkeyPatch) -> Non
     assert settings.bundle_path == "/custom/bundle"
     assert settings.routing_matrix == "performance"
     assert settings.workspace == "my-workspace"
+
+
+def test_settings_ingestion_url_field_name() -> None:
+    """Config field is 'ingestion_url' (maps to INTEL_SERVICE_INGESTION_URL)."""
+    settings = Settings()
+    assert hasattr(settings, "ingestion_url")
+    assert settings.ingestion_url == "http://context-intelligence-server:8000"

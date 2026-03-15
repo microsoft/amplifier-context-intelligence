@@ -16,7 +16,7 @@ class Settings(BaseSettings):
 
     server_host: str = "0.0.0.0"
     server_port: int = 8100
-    ingestion_server_url: str = "http://context-intelligence-server:8000"
+    ingestion_url: str = "http://context-intelligence-server:8000"
     bundle_name: str = "context-intelligence-server"
     drain_timeout_seconds: int = 30
     max_sessions: int = 50
