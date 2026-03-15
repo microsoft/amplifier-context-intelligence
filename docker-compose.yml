@@ -41,6 +41,8 @@ services:
       - config/secrets.env
     environment:
       AMPLIFIER_HOME: /data/context-intelligence-service
+      BUNDLE_PATH: /app/bundles/context-intelligence-server/bundle.md
+      ROUTING_MATRIX: balanced
       INTEL_SERVICE_AMPLIFIER_HOME: /data/context-intelligence-service
       INTEL_SERVICE_BUNDLE_PATH: /app/bundles/context-intelligence-server/bundle.md
       INTEL_SERVICE_ROUTING_MATRIX: balanced
