@@ -129,3 +129,26 @@ def test_ws_disconnect_unregisters_from_drain() -> None:
             ws.receive_json()  # consume session_created
         # After disconnect the finally block must unregister the session ID.
         assert drain.active_count == 0
+
+
+def test_ws_execute_error_sends_error_and_keeps_connection() -> None:
+    """When execute() raises, the client receives an error message and the WS stays open."""
+    from unittest.mock import AsyncMock, patch
+
+    with TestClient(app) as client:
+        with patch.object(
+            app.state.session_manager,
+            "execute",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("LLM timeout"),
+        ):
+            with client.websocket_connect("/ws") as ws:
+                ws.receive_json()  # consume session_created
+                ws.send_json({"type": "message", "text": "hello"})
+                data = ws.receive_json()
+                assert data["type"] == "error"
+                assert "LLM timeout" in data["message"]
+                # WS is still open — send another message
+                ws.send_json({"type": "action", "componentId": "test-1"})
+                ack = ws.receive_json()
+                assert ack["type"] == "action_ack"

@@ -122,10 +122,20 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
             elif msg.msg_type == "message":
                 text = msg.payload.get("text", "")
-                result = await session_manager.execute(session_id, text)  # type: ignore[attr-defined]
-                await websocket.send_json(format_response(session_id, result["text"]))
-                for a2ui_msg in result.get("a2ui", []):
-                    await websocket.send_json(a2ui_msg)
+                try:
+                    result = await session_manager.execute(session_id, text)  # type: ignore[attr-defined]
+                    await websocket.send_json(
+                        format_response(session_id, result["text"])
+                    )
+                    for a2ui_msg in result.get("a2ui", []):
+                        await websocket.send_json(a2ui_msg)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "execute failed for session %s", session_id
+                    )
+                    await websocket.send_json(
+                        format_error(session_id, str(exc))
+                    )
 
             elif msg.msg_type == "action":
                 component_id = msg.payload.get("componentId", "")
