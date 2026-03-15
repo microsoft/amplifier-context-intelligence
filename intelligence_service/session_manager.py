@@ -29,6 +29,8 @@ class SessionManager(Protocol):
         """Destroy *session_id* and create a replacement session.
 
         Returns the new session ID.  The active_count remains unchanged.
+        Behaviour for unknown *session_id* is implementation-defined;
+        ``StubSessionManager`` silently creates a new session.
         """
         ...
 
