@@ -41,12 +41,12 @@ class AmplifierApp:
         self._prepared = None
 
     @property
-    def prepared(self):
+    def prepared(self) -> Any:
         """Return the current PreparedBundle or None."""
         return self._prepared
 
-    async def startup(self) -> None:
-        """Load, compose, and prepare the bundle."""
+    async def _load_and_prepare(self) -> Any:
+        """Load the bundle, compose the routing overlay, and prepare it."""
         loaded = await load_bundle(self._bundle_path)
         routing_overlay = Bundle(
             name="routing-config",
@@ -57,8 +57,11 @@ class AmplifierApp:
                 }
             ],
         )
-        composed = loaded.compose(routing_overlay)
-        self._prepared = await composed.prepare()
+        return await loaded.compose(routing_overlay).prepare()
+
+    async def startup(self) -> None:
+        """Load, compose, and prepare the bundle."""
+        self._prepared = await self._load_and_prepare()
 
     async def reload(self) -> None:
         """Reload the bundle, atomically swapping the PreparedBundle on success.
@@ -68,18 +71,7 @@ class AmplifierApp:
         """
         old_prepared = self._prepared
         try:
-            loaded = await load_bundle(self._bundle_path)
-            routing_overlay = Bundle(
-                name="routing-config",
-                hooks=[
-                    {
-                        "module": "hooks-routing",
-                        "config": {"default_matrix": self._routing_matrix},
-                    }
-                ],
-            )
-            composed = loaded.compose(routing_overlay)
-            self._prepared = await composed.prepare()
+            self._prepared = await self._load_and_prepare()
         except Exception:
             self._prepared = old_prepared
             raise
