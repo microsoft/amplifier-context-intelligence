@@ -37,10 +37,10 @@ def compose() -> dict:
 # ---------------------------------------------------------------------------
 
 
-def test_compose_has_exactly_three_services(compose: dict) -> None:
+def test_compose_has_exactly_four_services(compose: dict) -> None:
     services = compose.get("services", {})
-    assert len(services) == 3, (
-        f"docker-compose.yml must have exactly 3 services, found: {list(services.keys())}"
+    assert len(services) == 4, (
+        f"docker-compose.yml must have exactly 4 services, found: {list(services.keys())}"
     )
 
 
@@ -51,10 +51,10 @@ def test_compose_has_intelligence_service(compose: dict) -> None:
     )
 
 
-def test_compose_no_frontend_service(compose: dict) -> None:
+def test_compose_has_frontend_service(compose: dict) -> None:
     services = compose.get("services", {})
-    assert "frontend" not in services, (
-        "frontend service must NOT be in docker-compose.yml (handled in separate phase)"
+    assert "frontend" in services, (
+        "docker-compose.yml must define frontend service"
     )
 
 
@@ -70,8 +70,8 @@ def test_intelligence_service_build_from_dockerfile_intelligence(compose: dict) 
         dockerfile = None
     else:
         dockerfile = build.get("dockerfile", "")
-    assert dockerfile == "Dockerfile.intelligence", (
-        "intelligence-service must build from Dockerfile.intelligence"
+    assert dockerfile == "amplifier-context-intelligence/Dockerfile.intelligence", (
+        "intelligence-service must build from amplifier-context-intelligence/Dockerfile.intelligence"
     )
 
 

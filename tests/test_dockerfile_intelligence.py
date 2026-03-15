@@ -147,11 +147,14 @@ def test_no_uv_tool_install_amplifier() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_no_entrypoint_script() -> None:
+def test_has_entrypoint_script() -> None:
     content = _content()
-    assert "entrypoint" not in content.lower(), (
-        "Dockerfile.intelligence must NOT use an entrypoint.sh script "
-        "(pure Python startup via CMD)"
+    assert "entrypoint" in content.lower(), (
+        "Dockerfile.intelligence must use an entrypoint.sh script "
+        "(configures git auth for private repo access before starting uvicorn)"
+    )
+    assert 'ENTRYPOINT ["/app/entrypoint.sh"]' in content, (
+        "Dockerfile.intelligence must set ENTRYPOINT to /app/entrypoint.sh"
     )
 
 
