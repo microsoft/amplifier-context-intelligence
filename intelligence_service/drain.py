@@ -29,7 +29,8 @@ class DrainManager:
         clean = await dm.start_drain(timeout=30)
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, timeout_seconds: int = 30) -> None:
+        self._timeout_seconds: int = timeout_seconds
         self._accepting: bool = True
         self._active: set[str] = set()
         # Event is *set* when there are no active sessions (drained state).
