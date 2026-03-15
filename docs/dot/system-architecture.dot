@@ -1,0 +1,87 @@
+digraph system_architecture {
+    rankdir=TB
+    graph [fontname="Helvetica" fontsize=12 splines=ortho nodesep=0.8 ranksep=1.2]
+    node  [fontname="Helvetica" fontsize=11 shape=box style="rounded,filled"]
+    edge  [fontname="Helvetica" fontsize=10]
+
+    // ── Services ──────────────────────────────────────────────────────────────
+
+    subgraph cluster_ingestion {
+        label="Ingestion Server"
+        style="rounded,filled"
+        fillcolor="#ddeeff"
+        color="#336699"
+
+        ingestion [
+            label="Ingestion Server\n:8000\n─────────────────\nGET  /\nGET  /dashboard\nGET  /status\nGET  /logs/stream  (SSE)\nPOST /cypher\nPOST /events"
+            fillcolor="#b3d1ff"
+            shape=box
+        ]
+    }
+
+    subgraph cluster_intelligence {
+        label="Intelligence Service"
+        style="rounded,filled"
+        fillcolor="#ddf2dd"
+        color="#336633"
+
+        intelligence [
+            label="Intelligence Service\n:8100\n─────────────────\nWS   /ws\nGET  /health\nGET  /admin/reload-bundle\n─────────────────\nAmplifier + bundle\nWebSocket bridge"
+            fillcolor="#b3e6b3"
+            shape=box
+        ]
+    }
+
+    subgraph cluster_frontend {
+        label="Frontend"
+        style="rounded,filled"
+        fillcolor="#fff2cc"
+        color="#996600"
+
+        frontend [
+            label="Frontend nginx\n:3000\n─────────────────\nA2UI SPA\nLit renderer\nCustom viz catalog\nWebSocket → :8100"
+            fillcolor="#ffe599"
+            shape=box
+        ]
+    }
+
+    subgraph cluster_neo4j {
+        label="Neo4j"
+        style="rounded,filled"
+        fillcolor="#f2dddd"
+        color="#990000"
+
+        neo4j [
+            label="Neo4j\n:7474  browser\n:7687  bolt"
+            fillcolor="#f4b8b8"
+            shape=cylinder
+        ]
+    }
+
+    // ── Volumes ───────────────────────────────────────────────────────────────
+
+    blob_data  [label="blob_data\n(shared volume)\ningestion rw\nintelligence ro" shape=folder fillcolor="#f5f5f5"]
+    neo4j_data [label="neo4j_data\n(named volume)"                              shape=folder fillcolor="#f5f5f5"]
+    projects   [label="projects\n(shared volume, ro)"                           shape=folder fillcolor="#f5f5f5"]
+    config     [label="config\n(bind mount, ro)"                                shape=folder fillcolor="#f5f5f5"]
+
+    // ── Service dependencies (depends_on healthy) ─────────────────────────────
+
+    intelligence -> ingestion   [label="depends_on\nhealthy" style=dashed color="#555555"]
+    frontend     -> intelligence [label="depends_on\nhealthy" style=dashed color="#555555"]
+    ingestion    -> neo4j        [label="depends_on\nhealthy" style=dashed color="#555555"]
+
+    // ── Volume mounts ─────────────────────────────────────────────────────────
+
+    ingestion   -> blob_data  [label="rw" style=dotted color="#999999"]
+    intelligence -> blob_data [label="ro" style=dotted color="#999999"]
+
+    ingestion   -> neo4j_data [label="rw" style=dotted color="#999999"]
+    neo4j       -> neo4j_data [label="rw" style=dotted color="#999999"]
+
+    intelligence -> projects  [label="ro" style=dotted color="#999999"]
+    ingestion    -> projects  [label="ro" style=dotted color="#999999"]
+
+    intelligence -> config    [label="ro" style=dotted color="#999999"]
+    ingestion    -> config    [label="ro" style=dotted color="#999999"]
+}

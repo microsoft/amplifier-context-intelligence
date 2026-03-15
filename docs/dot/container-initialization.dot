@@ -1,0 +1,78 @@
+digraph container_initialization {
+    rankdir=TB
+    graph [fontname="Helvetica" fontsize=12 splines=ortho nodesep=0.6 ranksep=0.9
+           label="Intelligence Service — Container Initialization" labelloc=t fontsize=14]
+    node  [fontname="Helvetica" fontsize=11 shape=box style="rounded,filled" fillcolor="#ddeeff"]
+    edge  [fontname="Helvetica" fontsize=10]
+
+    // ── Happy-path nodes ──────────────────────────────────────────────────────
+
+    container_start [
+        label="Container Start"
+        shape=oval
+        fillcolor="#b3d1ff"
+    ]
+
+    config_overlay [
+        label="Config Overlay\ncp -n /config/* /data/\n(no-overwrite)"
+        fillcolor="#ddeeff"
+    ]
+
+    apply_settings [
+        label="Apply Settings\namplifier settings apply\n7 providers · routing matrix"
+        fillcolor="#ddeeff"
+    ]
+
+    install_bundle [
+        label="Install Bundle\namplifier bundle add\n(pre-baked image, local file:// refs)"
+        fillcolor="#ddeeff"
+    ]
+
+    start_bridge [
+        label="Start Bridge\npython -m intelligence_service\nuvicorn :8100"
+        fillcolor="#ddeeff"
+    ]
+
+    health_ready [
+        label="Health Ready\nGET /health → 200"
+        fillcolor="#b3e6b3"
+    ]
+
+    accepting_connections [
+        label="Accepting Connections"
+        shape=oval
+        fillcolor="#b3e6b3"
+    ]
+
+    // ── Error-path nodes ──────────────────────────────────────────────────────
+
+    startup_error [
+        label="Startup Error"
+        shape=diamond
+        fillcolor="#f4b8b8"
+        color="#990000"
+    ]
+
+    docker_restart [
+        label="Docker restart\n(start_period: 120s)"
+        shape=oval
+        fillcolor="#f4b8b8"
+        color="#990000"
+    ]
+
+    // ── Happy-path edges ──────────────────────────────────────────────────────
+
+    container_start   -> config_overlay
+    config_overlay    -> apply_settings
+    apply_settings    -> install_bundle    [label="success"]
+    install_bundle    -> start_bridge      [label="success"]
+    start_bridge      -> health_ready
+    health_ready      -> accepting_connections
+
+    // ── Error-path edges ──────────────────────────────────────────────────────
+
+    apply_settings  -> startup_error [label="failure" color="#cc0000" style=dashed]
+    install_bundle  -> startup_error [label="failure" color="#cc0000" style=dashed]
+    startup_error   -> docker_restart                [color="#cc0000" style=dashed]
+    docker_restart  -> container_start               [color="#cc0000" style=dashed label="retry"]
+}
