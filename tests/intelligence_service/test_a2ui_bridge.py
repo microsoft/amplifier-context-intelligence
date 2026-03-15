@@ -1,6 +1,7 @@
 """Tests for the A2UI message bridge module."""
 
 from intelligence_service.a2ui_bridge import (
+    extract_a2ui_from_response,
     format_action_ack,
     format_error,
     format_response,
@@ -86,3 +87,24 @@ def test_format_error() -> None:
     assert result["type"] == "error"
     assert result["session_id"] == "abc-123"
     assert result["message"] == "Something went wrong."
+
+
+def test_extract_a2ui_from_string_response_returns_empty_list() -> None:
+    """extract_a2ui_from_response returns [] when given a plain string."""
+    result = extract_a2ui_from_response("some plain string response")
+
+    assert result == []
+
+
+def test_extract_a2ui_from_none_returns_empty_list() -> None:
+    """extract_a2ui_from_response returns [] when given None."""
+    result = extract_a2ui_from_response(None)
+
+    assert result == []
+
+
+def test_extract_a2ui_return_type_is_list() -> None:
+    """extract_a2ui_from_response always returns a list."""
+    result = extract_a2ui_from_response("anything")
+
+    assert isinstance(result, list)
