@@ -19,15 +19,14 @@ from intelligence_service.session_manager import SessionManager, StubSessionMana
 
 logger = logging.getLogger(__name__)
 
-_settings = get_settings()
-
 
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application startup and shutdown lifecycle."""
+    settings = get_settings()
     logger.info("Intelligence Service starting up")
     application.state.drain = DrainManager(
-        timeout_seconds=_settings.drain_timeout_seconds
+        timeout_seconds=settings.drain_timeout_seconds
     )
     application.state.session_manager = StubSessionManager()
     yield

@@ -1,7 +1,7 @@
 """Tests for the Intelligence Service FastAPI application."""
 
 import httpx
-from starlette.testclient import TestClient
+from fastapi.testclient import TestClient
 
 from intelligence_service.app import app
 
