@@ -61,3 +61,11 @@ def format_error(session_id: str, message: str) -> dict[str, Any]:
         "session_id": session_id,
         "message": message,
     }
+
+
+def extract_a2ui_from_response(response: Any) -> list[dict[str, Any]]:
+    """Extract A2UI messages from an Amplifier session response.
+
+    Stub implementation — returns an empty list.
+    """
+    return []
