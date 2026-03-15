@@ -63,6 +63,21 @@ services:
     networks:
       - context-intelligence
 
+  frontend:
+    build:
+      context: ..
+      dockerfile: amplifier-context-intelligence/Dockerfile.frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      intelligence-service:
+        condition: service_healthy
+    restart: unless-stopped
+    labels:
+      com.context-intelligence.component: frontend
+    networks:
+      - context-intelligence
+
   neo4j:
     image: neo4j:5.26.22-community
     environment:
