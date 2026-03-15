@@ -97,3 +97,22 @@ def test_ws_unknown_type_receives_error() -> None:
 
     assert data["type"] == "error"
     assert "invalid_type" in data["message"]
+
+
+def test_ws_new_session_no_drain_leak() -> None:
+    """After new_session and disconnect, drain has zero active sessions.
+
+    Regression: the old session_id must be unregistered from drain when a
+    new_session reset occurs.  Without the fix the old ID is stranded in
+    drain._active, active_count stays 1 after disconnect, and start_drain()
+    would always time-out after any session reset.
+    """
+    with TestClient(app) as client:
+        drain = app.state.drain
+        with client.websocket_connect("/ws") as ws:
+            ws.receive_json()  # initial session_created
+            ws.send_json({"type": "new_session"})
+            ws.receive_json()  # new session_created
+        # After disconnect the finally block must unregister the *new* ID;
+        # the *old* ID must have been unregistered at reset time.
+        assert drain.active_count == 0

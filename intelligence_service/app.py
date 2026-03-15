@@ -75,7 +75,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             msg = parse_incoming(data)
 
             if msg.msg_type == "new_session":
-                session_id = await session_manager.reset_session(session_id)
+                old_session_id = session_id
+                session_id = await session_manager.reset_session(old_session_id)
+                drain.unregister(old_session_id)
+                drain.register(session_id)
                 await websocket.send_json(format_session_created(session_id))
 
             elif msg.msg_type == "message":
