@@ -28,9 +28,44 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     application.state.drain = DrainManager(
         timeout_seconds=settings.drain_timeout_seconds
     )
-    application.state.session_manager = StubSessionManager()
+
+    if settings.bundle_path:
+        # Lazy imports — only needed when bundle_path is configured so that
+        # dev/test mode never requires amplifier packages to be installed.
+        from intelligence_service.amplifier_app import AmplifierApp  # noqa: PLC0415
+        from intelligence_service.amplifier_session_manager import (  # noqa: PLC0415
+            AmplifierSessionManager,
+        )
+
+        amplifier_app = AmplifierApp(
+            bundle_path=settings.bundle_path,
+            routing_matrix=settings.routing_matrix,
+            amplifier_home=settings.amplifier_home,
+        )
+        await amplifier_app.startup()
+        application.state.amplifier_app = amplifier_app
+        application.state.session_manager = AmplifierSessionManager(
+            amplifier_app=amplifier_app,
+            workspace=settings.workspace,
+        )
+    else:
+        application.state.amplifier_app = None
+        application.state.session_manager = StubSessionManager()
+
     yield
+
     logger.info("Intelligence Service shutting down")
+    drain: DrainManager = application.state.drain
+    await drain.start_drain()
+
+    session_manager = application.state.session_manager
+    close_all = getattr(session_manager, "close_all", None)
+    if close_all is not None:
+        close_all()
+
+    amplifier_app = application.state.amplifier_app
+    if amplifier_app is not None:
+        await amplifier_app.close()
 
 
 app = FastAPI(title="Intelligence Service", lifespan=lifespan)
@@ -42,13 +77,17 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/admin/reload-bundle")
+@app.post("/admin/reload-bundle")
 async def reload_bundle() -> dict[str, str]:
-    """Stub endpoint for bundle reload (not yet implemented)."""
-    return {
-        "status": "reload_not_implemented",
-        "message": "Bundle reload will be available when agent integration is complete.",
-    }
+    """Reload the Amplifier bundle, or return skipped in stub mode."""
+    amplifier_app = app.state.amplifier_app
+    if amplifier_app is None:
+        return {"status": "skipped"}
+    try:
+        await amplifier_app.reload()
+        return {"status": "reloaded"}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "message": str(exc)}
 
 
 @app.websocket("/ws")
@@ -82,7 +121,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
             elif msg.msg_type == "message":
                 text = msg.payload.get("text", "")
-                await websocket.send_json(format_response(session_id, text))
+                execute = getattr(session_manager, "execute", None)
+                if execute is not None:
+                    result = await execute(session_id, text)
+                    await websocket.send_json(
+                        format_response(session_id, result["text"])
+                    )
+                    for a2ui_msg in result.get("a2ui", []):
+                        await websocket.send_json(a2ui_msg)
+                else:
+                    await websocket.send_json(format_response(session_id, text))
 
             elif msg.msg_type == "action":
                 component_id = msg.payload.get("componentId", "")
