@@ -6,17 +6,11 @@ dispatches prompts to real Amplifier sessions.
 
 from __future__ import annotations
 
-import inspect
 import uuid
 from typing import Any
 
+from intelligence_service._async_utils import close_if_async
 from intelligence_service.a2ui_bridge import extract_a2ui_from_response
-
-
-async def _close_if_async(obj: Any) -> None:
-    """Call obj.close() if it is an async coroutine method."""
-    if inspect.iscoroutinefunction(getattr(obj, "close", None)):
-        await obj.close()
 
 
 class AmplifierSessionManager:
@@ -62,7 +56,7 @@ class AmplifierSessionManager:
         """Remove the session with *session_id*.  No-op if not found."""
         session = self._sessions.pop(session_id, None)
         if session is not None:
-            await _close_if_async(session)
+            await close_if_async(session)
 
     async def reset_session(self, session_id: str) -> str:
         """Destroy *session_id* and create a replacement; return new ID."""

@@ -6,9 +6,10 @@ Encapsulates the entire PreparedBundle lifecycle:
 
 from __future__ import annotations
 
-import inspect
 import os
 from typing import Any
+
+from intelligence_service._async_utils import close_if_async
 
 try:
     from amplifier_foundation import Bundle, load_bundle  # type: ignore[import]
@@ -25,12 +26,6 @@ except ImportError:
     async def load_bundle(path: str) -> Any:  # type: ignore[misc]
         """Fallback load_bundle stub for environments without amplifier_foundation."""
         raise NotImplementedError("amplifier_foundation is not installed")
-
-
-async def _close_if_async(obj: Any) -> None:
-    """Call obj.close() if it is an async coroutine method."""
-    if inspect.iscoroutinefunction(getattr(obj, "close", None)):
-        await obj.close()
 
 
 class AmplifierApp:
@@ -87,10 +82,10 @@ class AmplifierApp:
             self._prepared = old_prepared
             raise
         if old_prepared is not None:
-            await _close_if_async(old_prepared)
+            await close_if_async(old_prepared)
 
     async def close(self) -> None:
         """Close and clear the prepared bundle."""
         if self._prepared is not None:
-            await _close_if_async(self._prepared)
+            await close_if_async(self._prepared)
         self._prepared = None
