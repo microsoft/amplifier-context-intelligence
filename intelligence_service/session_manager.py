@@ -5,7 +5,7 @@ satisfy, plus a StubSessionManager for use in tests and local development.
 """
 
 import uuid
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -86,3 +86,10 @@ class StubSessionManager:
         """
         record = self._sessions.get(session_id)
         return dict(record) if record is not None else None
+
+    async def execute(self, session_id: str, prompt: str) -> dict[str, Any]:
+        """Execute *prompt* in *session_id* and return the result.
+
+        Stub implementation — echoes the prompt back with an empty A2UI list.
+        """
+        return {"text": prompt, "a2ui": []}

@@ -1,5 +1,6 @@
 """Tests for the AmplifierApp bundle lifecycle manager."""
 
+from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -8,6 +9,37 @@ from intelligence_service.amplifier_app import AmplifierApp
 
 # Patch target
 PATCH_TARGET = "intelligence_service.amplifier_app.load_bundle"
+
+
+# ---------------------------------------------------------------------------
+# Shared fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mock_load_bundle() -> Iterator[AsyncMock]:
+    """Patch load_bundle for the duration of a test."""
+    with patch(PATCH_TARGET, new_callable=AsyncMock) as m:
+        yield m
+
+
+@pytest.fixture
+def mock_bundle_chain(mock_load_bundle: AsyncMock) -> tuple:
+    """Set up a standard mock bundle chain: load → compose → prepare."""
+    mock_loaded, mock_composed, mock_prepared = MagicMock(), MagicMock(), MagicMock()
+    mock_load_bundle.return_value = mock_loaded
+    mock_loaded.compose.return_value = mock_composed
+    mock_composed.prepare = AsyncMock(return_value=mock_prepared)
+    return mock_load_bundle, mock_loaded, mock_composed, mock_prepared
+
+
+def make_app() -> AmplifierApp:
+    """Return an AmplifierApp with standard test configuration."""
+    return AmplifierApp(
+        bundle_path="/path/to/bundle",
+        routing_matrix="balanced",
+        amplifier_home="/data/home",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -34,22 +66,13 @@ def test_construction_stores_config_and_prepared_is_none() -> None:
 # ---------------------------------------------------------------------------
 
 
-@patch(PATCH_TARGET, new_callable=AsyncMock)
-async def test_startup_calls_load_bundle_with_path(mock_load_bundle: AsyncMock) -> None:
+async def test_startup_calls_load_bundle_with_path(
+    mock_bundle_chain: tuple,
+) -> None:
     """startup() calls load_bundle with the configured bundle_path."""
-    mock_loaded = MagicMock()
-    mock_composed = MagicMock()
-    mock_prepared = MagicMock()
+    mock_load_bundle, _, _, _ = mock_bundle_chain
 
-    mock_load_bundle.return_value = mock_loaded
-    mock_loaded.compose.return_value = mock_composed
-    mock_composed.prepare = AsyncMock(return_value=mock_prepared)
-
-    app = AmplifierApp(
-        bundle_path="/path/to/bundle",
-        routing_matrix="balanced",
-        amplifier_home="/data/home",
-    )
+    app = make_app()
     await app.startup()
 
     mock_load_bundle.assert_called_once_with("/path/to/bundle")
@@ -60,22 +83,13 @@ async def test_startup_calls_load_bundle_with_path(mock_load_bundle: AsyncMock) 
 # ---------------------------------------------------------------------------
 
 
-@patch(PATCH_TARGET, new_callable=AsyncMock)
-async def test_startup_composes_routing_overlay(mock_load_bundle: AsyncMock) -> None:
+async def test_startup_composes_routing_overlay(
+    mock_bundle_chain: tuple,
+) -> None:
     """startup() composes a routing overlay with name == 'routing-config'."""
-    mock_loaded = MagicMock()
-    mock_composed = MagicMock()
-    mock_prepared = MagicMock()
+    _, mock_loaded, _, _ = mock_bundle_chain
 
-    mock_load_bundle.return_value = mock_loaded
-    mock_loaded.compose.return_value = mock_composed
-    mock_composed.prepare = AsyncMock(return_value=mock_prepared)
-
-    app = AmplifierApp(
-        bundle_path="/path/to/bundle",
-        routing_matrix="balanced",
-        amplifier_home="/data/home",
-    )
+    app = make_app()
     await app.startup()
 
     assert mock_loaded.compose.call_count == 1
@@ -88,24 +102,13 @@ async def test_startup_composes_routing_overlay(mock_load_bundle: AsyncMock) -> 
 # ---------------------------------------------------------------------------
 
 
-@patch(PATCH_TARGET, new_callable=AsyncMock)
 async def test_startup_calls_prepare_and_sets_prepared(
-    mock_load_bundle: AsyncMock,
+    mock_bundle_chain: tuple,
 ) -> None:
     """startup() calls prepare() on the composed bundle and sets the prepared property."""
-    mock_loaded = MagicMock()
-    mock_composed = MagicMock()
-    mock_prepared = MagicMock()
+    _, _, mock_composed, mock_prepared = mock_bundle_chain
 
-    mock_load_bundle.return_value = mock_loaded
-    mock_loaded.compose.return_value = mock_composed
-    mock_composed.prepare = AsyncMock(return_value=mock_prepared)
-
-    app = AmplifierApp(
-        bundle_path="/path/to/bundle",
-        routing_matrix="balanced",
-        amplifier_home="/data/home",
-    )
+    app = make_app()
     await app.startup()
 
     mock_composed.prepare.assert_called_once()
@@ -117,23 +120,15 @@ async def test_startup_calls_prepare_and_sets_prepared(
 # ---------------------------------------------------------------------------
 
 
-@patch(PATCH_TARGET, new_callable=AsyncMock)
-async def test_reload_swaps_prepared_bundle(mock_load_bundle: AsyncMock) -> None:
+async def test_reload_swaps_prepared_bundle(
+    mock_bundle_chain: tuple,
+) -> None:
     """reload() replaces the prepared bundle with a newly prepared one."""
-    mock_loaded = MagicMock()
-    mock_composed = MagicMock()
-    first_prepared = MagicMock()
+    _, _, mock_composed, first_prepared = mock_bundle_chain
     second_prepared = MagicMock()
-
-    mock_load_bundle.return_value = mock_loaded
-    mock_loaded.compose.return_value = mock_composed
     mock_composed.prepare = AsyncMock(side_effect=[first_prepared, second_prepared])
 
-    app = AmplifierApp(
-        bundle_path="/path/to/bundle",
-        routing_matrix="balanced",
-        amplifier_home="/data/home",
-    )
+    app = make_app()
     await app.startup()
     assert app.prepared is first_prepared
 
@@ -147,26 +142,16 @@ async def test_reload_swaps_prepared_bundle(mock_load_bundle: AsyncMock) -> None
 # ---------------------------------------------------------------------------
 
 
-@patch(PATCH_TARGET, new_callable=AsyncMock)
 async def test_reload_keeps_old_prepared_on_failure(
-    mock_load_bundle: AsyncMock,
+    mock_bundle_chain: tuple,
 ) -> None:
     """reload() keeps the old PreparedBundle when an error occurs during reload."""
-    mock_loaded = MagicMock()
-    mock_composed = MagicMock()
-    first_prepared = MagicMock()
-
-    mock_load_bundle.return_value = mock_loaded
-    mock_loaded.compose.return_value = mock_composed
+    _, _, mock_composed, first_prepared = mock_bundle_chain
     mock_composed.prepare = AsyncMock(
         side_effect=[first_prepared, RuntimeError("prepare failed")]
     )
 
-    app = AmplifierApp(
-        bundle_path="/path/to/bundle",
-        routing_matrix="balanced",
-        amplifier_home="/data/home",
-    )
+    app = make_app()
     await app.startup()
     assert app.prepared is first_prepared
 
@@ -181,22 +166,13 @@ async def test_reload_keeps_old_prepared_on_failure(
 # ---------------------------------------------------------------------------
 
 
-@patch(PATCH_TARGET, new_callable=AsyncMock)
-async def test_close_clears_prepared(mock_load_bundle: AsyncMock) -> None:
+async def test_close_clears_prepared(
+    mock_bundle_chain: tuple,
+) -> None:
     """close() sets prepared to None."""
-    mock_loaded = MagicMock()
-    mock_composed = MagicMock()
-    mock_prepared = MagicMock()
+    _, _, _, mock_prepared = mock_bundle_chain
 
-    mock_load_bundle.return_value = mock_loaded
-    mock_loaded.compose.return_value = mock_composed
-    mock_composed.prepare = AsyncMock(return_value=mock_prepared)
-
-    app = AmplifierApp(
-        bundle_path="/path/to/bundle",
-        routing_matrix="balanced",
-        amplifier_home="/data/home",
-    )
+    app = make_app()
     await app.startup()
     assert app.prepared is mock_prepared
 

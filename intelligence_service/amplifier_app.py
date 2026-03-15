@@ -37,7 +37,9 @@ class AmplifierApp:
     ) -> None:
         self._bundle_path = bundle_path
         self._routing_matrix = routing_matrix
-        self._amplifier_home = amplifier_home
+        self._amplifier_home = (
+            amplifier_home  # reserved for amplifier_foundation.configure(home=...)
+        )
         self._prepared = None
 
     @property

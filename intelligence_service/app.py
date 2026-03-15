@@ -121,16 +121,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
             elif msg.msg_type == "message":
                 text = msg.payload.get("text", "")
-                execute = getattr(session_manager, "execute", None)
-                if execute is not None:
-                    result = await execute(session_id, text)
-                    await websocket.send_json(
-                        format_response(session_id, result["text"])
-                    )
-                    for a2ui_msg in result.get("a2ui", []):
-                        await websocket.send_json(a2ui_msg)
-                else:
-                    await websocket.send_json(format_response(session_id, text))
+                result = await session_manager.execute(session_id, text)  # type: ignore[attr-defined]
+                await websocket.send_json(format_response(session_id, result["text"]))
+                for a2ui_msg in result.get("a2ui", []):
+                    await websocket.send_json(a2ui_msg)
 
             elif msg.msg_type == "action":
                 component_id = msg.payload.get("componentId", "")
