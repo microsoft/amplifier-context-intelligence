@@ -7,6 +7,7 @@ Encapsulates the entire PreparedBundle lifecycle:
 from __future__ import annotations
 
 from typing import Any
+import os
 
 try:
     from amplifier_foundation import Bundle, load_bundle  # type: ignore[import]
@@ -63,6 +64,7 @@ class AmplifierApp:
 
     async def startup(self) -> None:
         """Load, compose, and prepare the bundle."""
+        os.environ["AMPLIFIER_HOME"] = self._amplifier_home
         self._prepared = await self._load_and_prepare()
 
     async def reload(self) -> None:

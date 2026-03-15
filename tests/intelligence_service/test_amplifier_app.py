@@ -1,5 +1,6 @@
 """Tests for the AmplifierApp bundle lifecycle manager."""
 
+import os
 from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -179,3 +180,17 @@ async def test_close_clears_prepared(
     await app.close()
 
     assert app.prepared is None
+
+
+# ---------------------------------------------------------------------------
+# Test 8: startup sets AMPLIFIER_HOME env var
+# ---------------------------------------------------------------------------
+
+
+async def test_startup_sets_amplifier_home_env_var(
+    mock_bundle_chain: tuple,
+) -> None:
+    """startup() sets AMPLIFIER_HOME env var before loading the bundle."""
+    app = make_app()
+    await app.startup()
+    assert os.environ.get("AMPLIFIER_HOME") == "/data/home"
