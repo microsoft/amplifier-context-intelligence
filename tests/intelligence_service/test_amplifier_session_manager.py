@@ -17,7 +17,9 @@ def test_protocol_conformance() -> None:
     from intelligence_service.amplifier_session_manager import AmplifierSessionManager
 
     mock_app = MagicMock()
-    manager = AmplifierSessionManager(amplifier_app=mock_app, workspace="myproject")
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
 
     assert isinstance(manager, SessionManager)
 
@@ -33,7 +35,9 @@ async def test_create_session_returns_string_id() -> None:
 
     mock_app = MagicMock()
     mock_app.prepared.create_session = AsyncMock(return_value=MagicMock())
-    manager = AmplifierSessionManager(amplifier_app=mock_app, workspace="myproject")
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
 
     session_id = await manager.create_session()
 
@@ -54,12 +58,14 @@ async def test_create_session_delegates_to_prepared() -> None:
     mock_session = MagicMock()
     mock_app.prepared.create_session = AsyncMock(return_value=mock_session)
 
-    manager = AmplifierSessionManager(amplifier_app=mock_app, workspace="myproject")
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
     session_id = await manager.create_session()
 
     mock_app.prepared.create_session.assert_called_once_with(
         session_id=session_id,
-        session_cwd="/data/workspace/myproject",
+        session_cwd="/data/home/myproject",
     )
 
 
@@ -75,7 +81,9 @@ async def test_create_session_increments_active_count() -> None:
     mock_app = MagicMock()
     mock_app.prepared.create_session = AsyncMock(return_value=MagicMock())
 
-    manager = AmplifierSessionManager(amplifier_app=mock_app, workspace="myproject")
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
 
     assert manager.active_count == 0
     await manager.create_session()
@@ -96,7 +104,9 @@ async def test_destroy_session_decrements_count() -> None:
     mock_app = MagicMock()
     mock_app.prepared.create_session = AsyncMock(return_value=MagicMock())
 
-    manager = AmplifierSessionManager(amplifier_app=mock_app, workspace="myproject")
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
     session_id = await manager.create_session()
     assert manager.active_count == 1
 
@@ -114,7 +124,9 @@ async def test_destroy_nonexistent_session_is_noop() -> None:
     from intelligence_service.amplifier_session_manager import AmplifierSessionManager
 
     mock_app = MagicMock()
-    manager = AmplifierSessionManager(amplifier_app=mock_app, workspace="myproject")
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
 
     # Should not raise
     await manager.destroy_session("nonexistent-id")
@@ -134,7 +146,9 @@ async def test_reset_session_returns_new_id_with_same_count() -> None:
     mock_app = MagicMock()
     mock_app.prepared.create_session = AsyncMock(return_value=MagicMock())
 
-    manager = AmplifierSessionManager(amplifier_app=mock_app, workspace="myproject")
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
     old_id = await manager.create_session()
     assert manager.active_count == 1
 
@@ -156,7 +170,9 @@ async def test_get_session_returns_metadata() -> None:
     mock_app = MagicMock()
     mock_app.prepared.create_session = AsyncMock(return_value=MagicMock())
 
-    manager = AmplifierSessionManager(amplifier_app=mock_app, workspace="myproject")
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
     session_id = await manager.create_session()
 
     metadata = await manager.get_session(session_id)
@@ -176,7 +192,9 @@ async def test_get_session_returns_none_for_unknown() -> None:
     from intelligence_service.amplifier_session_manager import AmplifierSessionManager
 
     mock_app = MagicMock()
-    manager = AmplifierSessionManager(amplifier_app=mock_app, workspace="myproject")
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
 
     result = await manager.get_session("unknown-session-id")
 
@@ -198,7 +216,9 @@ async def test_execute_calls_session_execute() -> None:
     mock_app = MagicMock()
     mock_app.prepared.create_session = AsyncMock(return_value=mock_session)
 
-    manager = AmplifierSessionManager(amplifier_app=mock_app, workspace="myproject")
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
     session_id = await manager.create_session()
 
     await manager.execute(session_id, "hello")
@@ -221,7 +241,9 @@ async def test_execute_returns_text_and_a2ui() -> None:
     mock_app = MagicMock()
     mock_app.prepared.create_session = AsyncMock(return_value=mock_session)
 
-    manager = AmplifierSessionManager(amplifier_app=mock_app, workspace="myproject")
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
     session_id = await manager.create_session()
 
     result = await manager.execute(session_id, "what is 2+2?")
@@ -239,7 +261,9 @@ async def test_execute_unknown_session_raises_key_error() -> None:
     from intelligence_service.amplifier_session_manager import AmplifierSessionManager
 
     mock_app = MagicMock()
-    manager = AmplifierSessionManager(amplifier_app=mock_app, workspace="myproject")
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
 
     with pytest.raises(KeyError):
         await manager.execute("nonexistent-id", "some prompt")
@@ -257,7 +281,9 @@ async def test_close_all_clears_all_sessions() -> None:
     mock_app = MagicMock()
     mock_app.prepared.create_session = AsyncMock(return_value=MagicMock())
 
-    manager = AmplifierSessionManager(amplifier_app=mock_app, workspace="myproject")
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
     await manager.create_session()
     await manager.create_session()
     await manager.create_session()
@@ -266,3 +292,29 @@ async def test_close_all_clears_all_sessions() -> None:
     manager.close_all()
 
     assert manager.active_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 14: create_session uses amplifier_home for cwd
+# ---------------------------------------------------------------------------
+
+
+async def test_create_session_uses_amplifier_home_for_cwd() -> None:
+    """create_session() builds session_cwd from amplifier_home, not a hardcoded path."""
+    from intelligence_service.amplifier_session_manager import AmplifierSessionManager
+
+    mock_app = MagicMock()
+    mock_session = MagicMock()
+    mock_app.prepared.create_session = AsyncMock(return_value=mock_session)
+
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app,
+        workspace="myproject",
+        amplifier_home="/custom/data/dir",
+    )
+    session_id = await manager.create_session()
+
+    mock_app.prepared.create_session.assert_called_once_with(
+        session_id=session_id,
+        session_cwd="/custom/data/dir/myproject",
+    )

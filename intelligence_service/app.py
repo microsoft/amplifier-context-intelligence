@@ -47,6 +47,7 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
         application.state.session_manager = AmplifierSessionManager(
             amplifier_app=amplifier_app,
             workspace=settings.workspace,
+            amplifier_home=settings.amplifier_home,
         )
     else:
         application.state.amplifier_app = None

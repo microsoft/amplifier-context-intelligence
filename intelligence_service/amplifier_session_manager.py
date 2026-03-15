@@ -11,9 +11,6 @@ from typing import Any
 
 from intelligence_service.a2ui_bridge import extract_a2ui_from_response
 
-_WORKSPACE_ROOT = "/data/workspace"
-
-
 class AmplifierSessionManager:
     """Session manager that delegates to a live Amplifier PreparedBundle.
 
@@ -27,9 +24,11 @@ class AmplifierSessionManager:
         *,
         amplifier_app: Any,
         workspace: str,
+        amplifier_home: str,
     ) -> None:
         self._amplifier_app = amplifier_app
         self._workspace = workspace
+        self._amplifier_home = amplifier_home
         self._sessions: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
@@ -46,7 +45,7 @@ class AmplifierSessionManager:
         session_id = str(uuid.uuid4())
         session = await self._amplifier_app.prepared.create_session(
             session_id=session_id,
-            session_cwd=f"{_WORKSPACE_ROOT}/{self._workspace}",
+            session_cwd=f"{self._amplifier_home}/{self._workspace}",
         )
         self._sessions[session_id] = session
         return session_id
