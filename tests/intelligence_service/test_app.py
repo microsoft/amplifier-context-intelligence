@@ -35,6 +35,7 @@ async def test_reload_bundle_get_not_allowed(client: httpx.AsyncClient) -> None:
 
 # ---------------------------------------------------------------------------
 # WebSocket tests — use Starlette TestClient (sync) for WS support
+# Each WS test owns its client to keep state isolated
 # ---------------------------------------------------------------------------
 
 

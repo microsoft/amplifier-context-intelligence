@@ -15,6 +15,7 @@ async def client() -> AsyncGenerator[httpx.AsyncClient, None]:
     Runs the app's lifespan (startup/shutdown) so that app.state is fully
     populated before any request handler runs.
     """
+    # Starlette internal — recommended pattern for ASGI lifespan in httpx tests
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
