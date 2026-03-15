@@ -15,7 +15,7 @@ from intelligence_service.a2ui_bridge import (
 )
 from intelligence_service.config import get_settings
 from intelligence_service.drain import DrainManager
-from intelligence_service.session_manager import StubSessionManager
+from intelligence_service.session_manager import SessionManager, StubSessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ async def reload_bundle() -> dict[str, str]:
 async def websocket_endpoint(websocket: WebSocket) -> None:
     """WebSocket endpoint wiring together session manager, A2UI bridge, and drain manager."""
     drain: DrainManager = websocket.app.state.drain
-    session_manager: StubSessionManager = websocket.app.state.session_manager
+    session_manager: SessionManager = websocket.app.state.session_manager
 
     if not drain.accepting:
         await websocket.close(code=1013)

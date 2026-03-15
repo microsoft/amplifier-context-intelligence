@@ -30,6 +30,10 @@ class DrainManager:
     """
 
     def __init__(self, *, timeout_seconds: int = 30) -> None:
+        # Stored for use by a future SIGTERM handler that calls start_drain()
+        # automatically.  start_drain() currently requires a caller-supplied
+        # timeout, but this value will become its default when signal handling
+        # is added.
         self._timeout_seconds: int = timeout_seconds
         self._accepting: bool = True
         self._active: set[str] = set()
