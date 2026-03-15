@@ -232,3 +232,38 @@ async def test_reload_closes_old_prepared(
     await app.reload()
     first_prepared.close.assert_called_once()
     assert app.prepared is second_prepared
+
+
+# ---------------------------------------------------------------------------
+# Test 11: routing overlay hook has correct module and config content
+# ---------------------------------------------------------------------------
+
+
+async def test_startup_routing_overlay_has_correct_hook_content(
+    mock_bundle_chain: tuple,
+) -> None:
+    """Routing overlay hook has module='hooks-routing' and config with the matrix."""
+    _, mock_loaded, _, _ = mock_bundle_chain
+    app = make_app()
+    await app.startup()
+    overlay = mock_loaded.compose.call_args[0][0]
+    assert len(overlay.hooks) == 1
+    hook = overlay.hooks[0]
+    assert hook["module"] == "hooks-routing"
+    assert hook["config"]["default_matrix"] == "balanced"
+
+
+# ---------------------------------------------------------------------------
+# Test 12: startup failure leaves prepared as None
+# ---------------------------------------------------------------------------
+
+
+async def test_startup_failure_leaves_prepared_none(
+    mock_load_bundle: AsyncMock,
+) -> None:
+    """When load_bundle raises during startup, prepared remains None."""
+    mock_load_bundle.side_effect = RuntimeError("bundle not found")
+    app = make_app()
+    with pytest.raises(RuntimeError, match="bundle not found"):
+        await app.startup()
+    assert app.prepared is None

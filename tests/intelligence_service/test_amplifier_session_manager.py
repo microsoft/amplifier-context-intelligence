@@ -372,3 +372,42 @@ async def test_close_all_closes_each_session() -> None:
     mock_session_a.close.assert_called_once()
     mock_session_b.close.assert_called_once()
     assert manager.active_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 17: create_session when prepared is None raises AttributeError
+# ---------------------------------------------------------------------------
+
+
+async def test_create_session_when_prepared_is_none_raises() -> None:
+    """create_session() raises AttributeError when prepared is None."""
+    from intelligence_service.amplifier_session_manager import AmplifierSessionManager
+
+    mock_app = MagicMock()
+    mock_app.prepared = None
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
+    with pytest.raises(AttributeError):
+        await manager.create_session()
+
+
+# ---------------------------------------------------------------------------
+# Test 18: execute propagates errors from the underlying session
+# ---------------------------------------------------------------------------
+
+
+async def test_execute_propagates_session_error() -> None:
+    """When the underlying session.execute() raises, the error propagates."""
+    from intelligence_service.amplifier_session_manager import AmplifierSessionManager
+
+    mock_session = MagicMock()
+    mock_session.execute = AsyncMock(side_effect=RuntimeError("LLM timeout"))
+    mock_app = MagicMock()
+    mock_app.prepared.create_session = AsyncMock(return_value=mock_session)
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
+    session_id = await manager.create_session()
+    with pytest.raises(RuntimeError, match="LLM timeout"):
+        await manager.execute(session_id, "hello")
