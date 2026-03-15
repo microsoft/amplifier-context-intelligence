@@ -28,12 +28,13 @@ COPY amplifier-bundle-context-intelligence-server/ /app/bundles/context-intellig
 ENV AMPLIFIER_HOME=/data/context-intelligence-service \
     INTEL_SERVICE_AMPLIFIER_HOME=/data/context-intelligence-service \
     INTEL_SERVICE_BUNDLE_PATH=/app/bundles/context-intelligence-server/bundle.md \
-    INTEL_SERVICE_ROUTING_MATRIX=balanced
+    INTEL_SERVICE_ROUTING_MATRIX=balanced \
+    PYTHONUNBUFFERED=1
 
 EXPOSE 8100
 
 # Healthcheck — long start-period because prepare downloads Amplifier modules on cold start
 HEALTHCHECK --interval=10s --timeout=5s --start-period=180s --retries=60 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8100/status')"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"
 
 CMD ["uv", "run", "uvicorn", "intelligence_service.app:app", "--host", "0.0.0.0", "--port", "8100"]
