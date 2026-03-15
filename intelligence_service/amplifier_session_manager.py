@@ -12,6 +12,13 @@ from typing import Any
 
 from intelligence_service.a2ui_bridge import extract_a2ui_from_response
 
+
+async def _close_if_async(obj: Any) -> None:
+    """Call obj.close() if it is an async coroutine method."""
+    if inspect.iscoroutinefunction(getattr(obj, "close", None)):
+        await obj.close()
+
+
 class AmplifierSessionManager:
     """Session manager that delegates to a live Amplifier PreparedBundle.
 
@@ -54,10 +61,8 @@ class AmplifierSessionManager:
     async def destroy_session(self, session_id: str) -> None:
         """Remove the session with *session_id*.  No-op if not found."""
         session = self._sessions.pop(session_id, None)
-        if session is not None and inspect.iscoroutinefunction(
-            getattr(session, "close", None)
-        ):
-            await session.close()
+        if session is not None:
+            await _close_if_async(session)
 
     async def reset_session(self, session_id: str) -> str:
         """Destroy *session_id* and create a replacement; return new ID."""
@@ -88,6 +93,7 @@ class AmplifierSessionManager:
         a2ui_messages = extract_a2ui_from_response(response)
         return {"text": response, "a2ui": a2ui_messages}
 
-    def close_all(self) -> None:
-        """Clear all sessions from the registry."""
-        self._sessions.clear()
+    async def close_all(self) -> None:
+        """Close and remove all sessions from the registry."""
+        for session_id in list(self._sessions.keys()):
+            await self.destroy_session(session_id)

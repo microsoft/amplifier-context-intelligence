@@ -27,6 +27,12 @@ except ImportError:
         raise NotImplementedError("amplifier_foundation is not installed")
 
 
+async def _close_if_async(obj: Any) -> None:
+    """Call obj.close() if it is an async coroutine method."""
+    if inspect.iscoroutinefunction(getattr(obj, "close", None)):
+        await obj.close()
+
+
 class AmplifierApp:
     """Manages the PreparedBundle lifecycle for the Intelligence Service."""
 
@@ -80,15 +86,11 @@ class AmplifierApp:
         except Exception:
             self._prepared = old_prepared
             raise
-        if old_prepared is not None and inspect.iscoroutinefunction(
-            getattr(old_prepared, "close", None)
-        ):
-            await old_prepared.close()
+        if old_prepared is not None:
+            await _close_if_async(old_prepared)
 
     async def close(self) -> None:
         """Close and clear the prepared bundle."""
-        if self._prepared is not None and inspect.iscoroutinefunction(
-            getattr(self._prepared, "close", None)
-        ):
-            await self._prepared.close()
+        if self._prepared is not None:
+            await _close_if_async(self._prepared)
         self._prepared = None

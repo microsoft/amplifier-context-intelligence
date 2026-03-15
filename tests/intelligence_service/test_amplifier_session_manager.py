@@ -289,7 +289,7 @@ async def test_close_all_clears_all_sessions() -> None:
     await manager.create_session()
     assert manager.active_count == 3
 
-    manager.close_all()
+    await manager.close_all()
 
     assert manager.active_count == 0
 
@@ -339,3 +339,36 @@ async def test_destroy_session_closes_amplifier_session() -> None:
     session_id = await manager.create_session()
     await manager.destroy_session(session_id)
     mock_session.close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Test 16: close_all() closes each session before clearing
+# ---------------------------------------------------------------------------
+
+
+async def test_close_all_closes_each_session() -> None:
+    """close_all() calls close() on every registered session."""
+    from intelligence_service.amplifier_session_manager import AmplifierSessionManager
+
+    mock_session_a = MagicMock()
+    mock_session_a.close = AsyncMock()
+    mock_session_b = MagicMock()
+    mock_session_b.close = AsyncMock()
+
+    mock_app = MagicMock()
+    mock_app.prepared.create_session = AsyncMock(
+        side_effect=[mock_session_a, mock_session_b]
+    )
+
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
+    await manager.create_session()
+    await manager.create_session()
+    assert manager.active_count == 2
+
+    await manager.close_all()
+
+    mock_session_a.close.assert_called_once()
+    mock_session_b.close.assert_called_once()
+    assert manager.active_count == 0
