@@ -189,11 +189,14 @@ async def test_close_clears_prepared(
 
 async def test_startup_sets_amplifier_home_env_var(
     mock_bundle_chain: tuple,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """startup() sets AMPLIFIER_HOME env var before loading the bundle."""
+    monkeypatch.delenv("AMPLIFIER_HOME", raising=False)  # start clean
     app = make_app()
     await app.startup()
     assert os.environ.get("AMPLIFIER_HOME") == "/data/home"
+    # monkeypatch automatically restores the original value at test teardown
 
 
 # ---------------------------------------------------------------------------

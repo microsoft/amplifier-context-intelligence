@@ -16,6 +16,7 @@ class Settings(BaseSettings):
 
     server_host: str = "0.0.0.0"
     server_port: int = 8100
+    # Used by the event-ingestion forwarding path (not yet wired in app.py)
     ingestion_url: str = "http://context-intelligence-server:8000"
     bundle_name: str = "context-intelligence-server"
     drain_timeout_seconds: int = 30

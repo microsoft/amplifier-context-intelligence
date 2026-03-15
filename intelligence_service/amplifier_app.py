@@ -41,7 +41,7 @@ class AmplifierApp:
         self._bundle_path = bundle_path
         self._routing_matrix = routing_matrix
         self._amplifier_home = (
-            amplifier_home  # reserved for amplifier_foundation.configure(home=...)
+            amplifier_home  # used to set os.environ["AMPLIFIER_HOME"] at startup
         )
         self._prepared = None
 
