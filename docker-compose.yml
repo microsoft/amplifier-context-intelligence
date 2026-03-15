@@ -27,8 +27,8 @@ services:
 
   intelligence-service:
     build:
-      context: .
-      dockerfile: Dockerfile.intelligence
+      context: ..
+      dockerfile: amplifier-context-intelligence/Dockerfile.intelligence
     ports:
       - "8100:8100"
     depends_on:

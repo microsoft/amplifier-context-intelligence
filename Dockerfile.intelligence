@@ -14,11 +14,12 @@ WORKDIR /app
 
 # Two-stage uv sync for layer caching:
 # Stage 1 — copy lock files only and install dependencies (no project source)
-COPY pyproject.toml uv.lock ./
+COPY amplifier-context-intelligence/intelligence_service/pyproject.toml ./
+COPY amplifier-context-intelligence/intelligence_service/uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 # Stage 2 — copy project source and install project
-COPY intelligence_service/ intelligence_service/
+COPY amplifier-context-intelligence/intelligence_service/ intelligence_service/
 RUN uv sync --frozen --no-dev
 
 # Pre-bake server bundle (avoids network fetch on cold start)
