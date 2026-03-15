@@ -66,7 +66,9 @@ async def test_reload_bundle_post_returns_error_when_amplifier_app_raises(
 ) -> None:
     """POST /admin/reload-bundle returns {'status': 'error', 'message': ...} when reload() raises."""
     mock_amplifier_app = AsyncMock()
-    mock_amplifier_app.reload = AsyncMock(side_effect=RuntimeError("bundle reload failed"))
+    mock_amplifier_app.reload = AsyncMock(
+        side_effect=RuntimeError("bundle reload failed")
+    )
 
     original = app.state.amplifier_app
     app.state.amplifier_app = mock_amplifier_app
@@ -103,7 +105,9 @@ def test_ws_message_dispatches_via_execute_when_available() -> None:
 
             assert data["type"] == "response"
             assert data["content"] == "amplifier says hello"
-            mock_sm.execute.assert_awaited_once_with("fixed-session-id", "ping from test")
+            mock_sm.execute.assert_awaited_once_with(
+                "fixed-session-id", "ping from test"
+            )
         finally:
             app.state.session_manager = original_sm
 
