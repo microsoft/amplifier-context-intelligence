@@ -97,14 +97,9 @@ def test_intelligence_service_port_8100(compose: dict) -> None:
 def test_intelligence_service_depends_on_server(compose: dict) -> None:
     svc = compose["services"]["intelligence-service"]
     depends = svc.get("depends_on", {})
-    if isinstance(depends, list):
-        assert "context-intelligence-server" in depends, (
-            "intelligence-service must depend on context-intelligence-server"
-        )
-    else:
-        assert "context-intelligence-server" in depends, (
-            "intelligence-service must depend on context-intelligence-server"
-        )
+    assert "context-intelligence-server" in depends, (
+        "intelligence-service must depend on context-intelligence-server"
+    )
 
 
 def test_intelligence_service_depends_on_server_healthy(compose: dict) -> None:
@@ -137,9 +132,7 @@ def test_intelligence_service_has_blob_data_readonly(compose: dict) -> None:
     svc = compose["services"]["intelligence-service"]
     volumes = svc.get("volumes", [])
     vol_str = "\n".join(str(v) for v in volumes)
-    assert "blob_data" in vol_str, (
-        "intelligence-service must mount blob_data volume"
-    )
+    assert "blob_data" in vol_str, "intelligence-service must mount blob_data volume"
     # Check for read-only mount
     assert ":ro" in vol_str or "read_only" in str(svc), (
         "intelligence-service blob_data volume must be read-only (:ro)"
@@ -218,7 +211,9 @@ def test_intelligence_service_env_ingestion_url(compose: dict) -> None:
     assert "INTEL_SERVICE_INGESTION_URL" in env, (
         "intelligence-service must set INTEL_SERVICE_INGESTION_URL environment variable"
     )
-    assert "context-intelligence-server:8000" in str(env["INTEL_SERVICE_INGESTION_URL"]), (
+    assert "context-intelligence-server:8000" in str(
+        env["INTEL_SERVICE_INGESTION_URL"]
+    ), (
         "INTEL_SERVICE_INGESTION_URL must point to http://context-intelligence-server:8000"
     )
 
@@ -255,7 +250,7 @@ def test_intelligence_service_healthcheck_start_period_180s(compose: dict) -> No
     svc = compose["services"]["intelligence-service"]
     hc = svc.get("healthcheck", {})
     start_period = str(hc.get("start_period", ""))
-    assert "180s" in start_period or start_period == "180s", (
+    assert "180s" in start_period, (
         "intelligence-service healthcheck start_period must be 180s"
     )
 
@@ -309,9 +304,7 @@ def test_compose_network_is_bridge(compose: dict) -> None:
     networks = compose.get("networks", {})
     network = networks.get("context-intelligence", {})
     driver = (network or {}).get("driver", "bridge")  # default is bridge
-    assert driver == "bridge", (
-        "context-intelligence network must use bridge driver"
-    )
+    assert driver == "bridge", "context-intelligence network must use bridge driver"
 
 
 # ---------------------------------------------------------------------------
