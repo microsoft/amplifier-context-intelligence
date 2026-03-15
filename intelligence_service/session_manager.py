@@ -70,10 +70,17 @@ class StubSessionManager:
         self._sessions.pop(session_id, None)
 
     async def reset_session(self, session_id: str) -> str:
-        """Replace *session_id* with a fresh session and return the new ID."""
+        """Replace *session_id* with a fresh session and return the new ID.
+
+        If *session_id* is not found, a new session is still created.
+        """
         await self.destroy_session(session_id)
         return await self.create_session()
 
     async def get_session(self, session_id: str) -> dict[str, str] | None:
-        """Return the session record for *session_id*, or None if not found."""
-        return self._sessions.get(session_id)
+        """Return a copy of the session record for *session_id*, or None if not found.
+
+        A copy is returned so callers cannot accidentally mutate internal state.
+        """
+        record = self._sessions.get(session_id)
+        return dict(record) if record is not None else None

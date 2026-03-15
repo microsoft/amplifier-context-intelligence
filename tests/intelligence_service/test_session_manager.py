@@ -117,3 +117,27 @@ async def test_reset_session_returns_new_id() -> None:
     assert manager.active_count == 1
     assert await manager.get_session(old_id) is None
     assert await manager.get_session(new_id) is not None
+
+
+# ---------------------------------------------------------------------------
+# Test 8: get_session returns an isolated copy — mutations don't affect state
+# ---------------------------------------------------------------------------
+
+
+async def test_get_session_returns_isolated_copy() -> None:
+    """Mutating the dict returned by get_session does not corrupt internal state."""
+    manager = StubSessionManager()
+
+    session_id = await manager.create_session()
+    metadata = await manager.get_session(session_id)
+
+    assert metadata is not None
+    # Mutate the returned dict
+    metadata["status"] = "corrupted"
+    metadata["injected"] = "evil"
+
+    # A fresh call should still see the original data
+    fresh = await manager.get_session(session_id)
+    assert fresh is not None
+    assert fresh["status"] == "active"
+    assert "injected" not in fresh
