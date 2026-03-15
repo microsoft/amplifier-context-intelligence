@@ -55,6 +55,10 @@ class TestSystemArchitectureDot:
         assert "/cypher" in content
         assert "/events" in content
 
+    def test_contains_logs_stream_endpoint(self):
+        content = _load_dot("system-architecture.dot")
+        assert "/logs/stream" in content
+
     def test_contains_intelligence_service(self):
         content = _load_dot("system-architecture.dot")
         assert "Intelligence" in content or "intelligence" in content
@@ -124,21 +128,16 @@ class TestContainerInitializationDot:
     def test_contains_install_bundle(self):
         content = _load_dot("container-initialization.dot")
         assert "Bundle" in content or "bundle" in content
-        assert "Install" in content or "install" in content or "add" in content
+        assert "Install Bundle" in content or "install_bundle" in content
 
     def test_contains_bridge_start(self):
         content = _load_dot("container-initialization.dot")
-        assert (
-            "Bridge" in content
-            or "bridge" in content
-            or "uvicorn" in content
-            or "8100" in content
-        )
+        assert "Bridge" in content or "bridge" in content or "uvicorn" in content
 
     def test_contains_health_ready(self):
         content = _load_dot("container-initialization.dot")
         assert "Health" in content or "health" in content
-        assert "Ready" in content or "ready" in content or "200" in content
+        assert "Ready" in content or "ready" in content
 
     def test_contains_error_path(self):
         content = _load_dot("container-initialization.dot")
@@ -148,6 +147,22 @@ class TestContainerInitializationDot:
     def test_contains_directed_edges(self):
         content = _load_dot("container-initialization.dot")
         assert "->" in content
+
+    def test_happy_path_sequence_order(self):
+        content = _load_dot("container-initialization.dot")
+        nodes = [
+            "container_start",
+            "config_overlay",
+            "apply_settings",
+            "install_bundle",
+            "start_bridge",
+            "health_ready",
+            "accepting_connections",
+        ]
+        for a, b in zip(nodes, nodes[1:]):
+            assert re.search(rf"{a}\s*->.*{b}", content), (
+                f"Expected edge {a} -> {b} in container-initialization.dot"
+            )
 
 
 # ---------------------------------------------------------------------------
