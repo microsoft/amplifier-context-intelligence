@@ -15,13 +15,22 @@ async def test_health_returns_200_with_status_ok(client: httpx.AsyncClient) -> N
     assert data["status"] == "ok"
 
 
-async def test_reload_bundle_returns_stub_response(client: httpx.AsyncClient) -> None:
-    """GET /admin/reload-bundle returns 200 with data['status']=='reload_not_implemented'."""
-    response = await client.get("/admin/reload-bundle")
+async def test_reload_bundle_stub_mode_returns_skipped(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /admin/reload-bundle returns {'status': 'skipped'} in stub mode."""
+    response = await client.post("/admin/reload-bundle")
 
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "reload_not_implemented"
+    assert data["status"] == "skipped"
+
+
+async def test_reload_bundle_get_not_allowed(client: httpx.AsyncClient) -> None:
+    """GET /admin/reload-bundle returns 405 Method Not Allowed."""
+    response = await client.get("/admin/reload-bundle")
+
+    assert response.status_code == 405
 
 
 # ---------------------------------------------------------------------------
@@ -104,4 +113,18 @@ def test_ws_new_session_no_drain_leak() -> None:
             ws.receive_json()  # new session_created
         # After disconnect the finally block must unregister the *new* ID;
         # the *old* ID must have been unregistered at reset time.
+        assert drain.active_count == 0
+
+
+def test_ws_disconnect_unregisters_from_drain() -> None:
+    """After a plain connect and disconnect (no new_session), drain has zero active sessions.
+
+    Verifies that the finally block in the WebSocket endpoint always unregisters
+    the session from drain, even when no session reset occurs.
+    """
+    with TestClient(app) as client:
+        drain = app.state.drain
+        with client.websocket_connect("/ws") as ws:
+            ws.receive_json()  # consume session_created
+        # After disconnect the finally block must unregister the session ID.
         assert drain.active_count == 0
