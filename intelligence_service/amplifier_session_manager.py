@@ -6,6 +6,7 @@ dispatches prompts to real Amplifier sessions.
 
 from __future__ import annotations
 
+import inspect
 import uuid
 from typing import Any
 
@@ -52,7 +53,11 @@ class AmplifierSessionManager:
 
     async def destroy_session(self, session_id: str) -> None:
         """Remove the session with *session_id*.  No-op if not found."""
-        self._sessions.pop(session_id, None)
+        session = self._sessions.pop(session_id, None)
+        if session is not None and inspect.iscoroutinefunction(
+            getattr(session, "close", None)
+        ):
+            await session.close()
 
     async def reset_session(self, session_id: str) -> str:
         """Destroy *session_id* and create a replacement; return new ID."""

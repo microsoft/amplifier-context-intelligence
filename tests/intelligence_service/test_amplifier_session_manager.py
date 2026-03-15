@@ -318,3 +318,24 @@ async def test_create_session_uses_amplifier_home_for_cwd() -> None:
         session_id=session_id,
         session_cwd="/custom/data/dir/myproject",
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 15: destroy_session() closes the Amplifier session
+# ---------------------------------------------------------------------------
+
+
+async def test_destroy_session_closes_amplifier_session() -> None:
+    """destroy_session() calls close() on the Amplifier session if available."""
+    from intelligence_service.amplifier_session_manager import AmplifierSessionManager
+
+    mock_session = MagicMock()
+    mock_session.close = AsyncMock()
+    mock_app = MagicMock()
+    mock_app.prepared.create_session = AsyncMock(return_value=mock_session)
+    manager = AmplifierSessionManager(
+        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+    )
+    session_id = await manager.create_session()
+    await manager.destroy_session(session_id)
+    mock_session.close.assert_called_once()

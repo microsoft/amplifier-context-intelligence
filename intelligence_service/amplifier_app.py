@@ -6,8 +6,9 @@ Encapsulates the entire PreparedBundle lifecycle:
 
 from __future__ import annotations
 
-from typing import Any
+import inspect
 import os
+from typing import Any
 
 try:
     from amplifier_foundation import Bundle, load_bundle  # type: ignore[import]
@@ -71,7 +72,7 @@ class AmplifierApp:
         """Reload the bundle, atomically swapping the PreparedBundle on success.
 
         If loading or preparation fails, the old PreparedBundle remains active
-        and the exception is re-raised.
+        and the exception is re-raised.  On success the old bundle is closed.
         """
         old_prepared = self._prepared
         try:
@@ -79,7 +80,15 @@ class AmplifierApp:
         except Exception:
             self._prepared = old_prepared
             raise
+        if old_prepared is not None and inspect.iscoroutinefunction(
+            getattr(old_prepared, "close", None)
+        ):
+            await old_prepared.close()
 
     async def close(self) -> None:
-        """Clear the prepared bundle."""
+        """Close and clear the prepared bundle."""
+        if self._prepared is not None and inspect.iscoroutinefunction(
+            getattr(self._prepared, "close", None)
+        ):
+            await self._prepared.close()
         self._prepared = None

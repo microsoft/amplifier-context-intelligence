@@ -194,3 +194,41 @@ async def test_startup_sets_amplifier_home_env_var(
     app = make_app()
     await app.startup()
     assert os.environ.get("AMPLIFIER_HOME") == "/data/home"
+
+
+# ---------------------------------------------------------------------------
+# Test 9: close() calls prepared.close()
+# ---------------------------------------------------------------------------
+
+
+async def test_close_calls_prepared_close(
+    mock_bundle_chain: tuple,
+) -> None:
+    """close() calls close() on the PreparedBundle if it has one."""
+    _, _, _, mock_prepared = mock_bundle_chain
+    mock_prepared.close = AsyncMock()
+    app = make_app()
+    await app.startup()
+    await app.close()
+    mock_prepared.close.assert_called_once()
+    assert app.prepared is None
+
+
+# ---------------------------------------------------------------------------
+# Test 10: reload() closes old prepared after successful swap
+# ---------------------------------------------------------------------------
+
+
+async def test_reload_closes_old_prepared(
+    mock_bundle_chain: tuple,
+) -> None:
+    """reload() closes the old PreparedBundle after successful swap."""
+    _, _, mock_composed, first_prepared = mock_bundle_chain
+    first_prepared.close = AsyncMock()
+    second_prepared = MagicMock()
+    mock_composed.prepare = AsyncMock(side_effect=[first_prepared, second_prepared])
+    app = make_app()
+    await app.startup()
+    await app.reload()
+    first_prepared.close.assert_called_once()
+    assert app.prepared is second_prepared
