@@ -2,6 +2,7 @@
 
 import httpx
 from fastapi.testclient import TestClient
+from unittest.mock import AsyncMock, patch
 
 from intelligence_service.app import app
 
@@ -133,8 +134,6 @@ def test_ws_disconnect_unregisters_from_drain() -> None:
 
 def test_ws_execute_error_sends_error_and_keeps_connection() -> None:
     """When execute() raises, the client receives an error message and the WS stays open."""
-    from unittest.mock import AsyncMock, patch
-
     with TestClient(app) as client:
         with patch.object(
             app.state.session_manager,

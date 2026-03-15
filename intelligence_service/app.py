@@ -130,12 +130,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     for a2ui_msg in result.get("a2ui", []):
                         await websocket.send_json(a2ui_msg)
                 except Exception as exc:  # noqa: BLE001
-                    logger.exception(
-                        "execute failed for session %s", session_id
-                    )
-                    await websocket.send_json(
-                        format_error(session_id, str(exc))
-                    )
+                    logger.exception("execute failed for session %s", session_id)
+                    await websocket.send_json(format_error(session_id, str(exc)))
 
             elif msg.msg_type == "action":
                 component_id = msg.payload.get("componentId", "")
