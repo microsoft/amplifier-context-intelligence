@@ -1,0 +1,149 @@
+{
+  "catalogId": "context-intelligence",
+  "components": {
+    "MetricCard": {
+      "type": "object",
+      "description": "Displays a single KPI metric with label, value, optional unit, and optional trend indicator. Dispatches a ci-action CustomEvent on click.",
+      "properties": {
+        "componentId": {
+          "type": "BoundValue",
+          "description": "Unique identifier for the component instance, echoed back in ci-action events."
+        },
+        "label": {
+          "type": "BoundValue",
+          "description": "Metric label displayed in uppercase above the value (e.g. 'Total Sessions')."
+        },
+        "value": {
+          "type": "BoundValue",
+          "description": "Primary metric value to display (string or number)."
+        },
+        "unit": {
+          "type": "BoundValue",
+          "description": "Optional unit suffix displayed next to the value (e.g. 'ms', '%')."
+        },
+        "trend": {
+          "type": "BoundValue",
+          "description": "Optional trend direction: 'up', 'down', 'flat', or '' (none)."
+        },
+        "trendLabel": {
+          "type": "BoundValue",
+          "description": "Optional text displayed inside the trend pill (e.g. '+12%')."
+        },
+        "onCiAction": {
+          "type": "BoundValue",
+          "description": "Event handler called when the component dispatches a ci-action event. Receives the CustomEvent as its argument."
+        }
+      }
+    },
+    "DataTable": {
+      "type": "object",
+      "description": "Sortable paginated data table. Supports ascending/descending sort on any column marked sortable. Dispatches a ci-action CustomEvent on row click.",
+      "properties": {
+        "componentId": {
+          "type": "BoundValue",
+          "description": "Unique identifier for the component instance, echoed back in ci-action events."
+        },
+        "columns": {
+          "type": "BoundValue",
+          "description": "Array of column definitions. Each entry: { key: string, label: string, sortable?: boolean }."
+        },
+        "rows": {
+          "type": "BoundValue",
+          "description": "Array of row data objects. Each object's keys should match the column key values."
+        },
+        "pageSize": {
+          "type": "BoundValue",
+          "description": "Maximum number of rows to display at once (default 50)."
+        },
+        "onCiAction": {
+          "type": "BoundValue",
+          "description": "Event handler called when the component dispatches a ci-action event. Receives the CustomEvent as its argument."
+        }
+      }
+    },
+    "DotDiagram": {
+      "type": "object",
+      "description": "Renders a Graphviz DOT source string to SVG using @hpcc-js/wasm-graphviz. WASM is loaded lazily on first render.",
+      "properties": {
+        "componentId": {
+          "type": "BoundValue",
+          "description": "Unique identifier for the component instance."
+        },
+        "source": {
+          "type": "BoundValue",
+          "description": "Graphviz DOT language source string to render (e.g. 'digraph G { a -> b; }')."
+        },
+        "engine": {
+          "type": "BoundValue",
+          "description": "Graphviz layout engine to use (default 'dot'). Options: dot, neato, fdp, sfdp, twopi, circo."
+        }
+      }
+    },
+    "StatChart": {
+      "type": "object",
+      "description": "Renders bar charts, pie charts, and histograms using Plotly.js. Plotly is loaded lazily on first render. Dispatches a ci-action CustomEvent on plot click.",
+      "properties": {
+        "componentId": {
+          "type": "BoundValue",
+          "description": "Unique identifier for the component instance, echoed back in ci-action events."
+        },
+        "traces": {
+          "type": "BoundValue",
+          "description": "Array of Plotly trace objects. Each trace defines type ('bar', 'pie', 'histogram'), x/y data arrays, and other Plotly trace properties."
+        },
+        "layout": {
+          "type": "BoundValue",
+          "description": "Plotly layout object for chart titles, axis labels, legend, and other display options. Dark theme defaults are applied automatically."
+        },
+        "onCiAction": {
+          "type": "BoundValue",
+          "description": "Event handler called when the component dispatches a ci-action event. Receives the CustomEvent as its argument."
+        }
+      }
+    },
+    "TimeseriesChart": {
+      "type": "object",
+      "description": "Renders time-based line/scatter charts using Plotly.js with WebGL traces for large datasets. Plotly is loaded lazily on first render. Dispatches a ci-action CustomEvent on plot click.",
+      "properties": {
+        "componentId": {
+          "type": "BoundValue",
+          "description": "Unique identifier for the component instance, echoed back in ci-action events."
+        },
+        "traces": {
+          "type": "BoundValue",
+          "description": "Array of Plotly trace objects. Trace types are automatically mapped to WebGL equivalents (scatter → scattergl) for performance. Each trace should include x (timestamps) and y (values) arrays."
+        },
+        "layout": {
+          "type": "BoundValue",
+          "description": "Plotly layout object. xaxis.type defaults to 'date'. Dark theme defaults and gridlines are applied automatically."
+        },
+        "onCiAction": {
+          "type": "BoundValue",
+          "description": "Event handler called when the component dispatches a ci-action event. Receives the CustomEvent as its argument."
+        }
+      }
+    },
+    "NetworkGraph": {
+      "type": "object",
+      "description": "Renders an interactive network graph using Cytoscape.js. Cytoscape is loaded lazily on first render. Dispatches a ci-action CustomEvent on node click.",
+      "properties": {
+        "componentId": {
+          "type": "BoundValue",
+          "description": "Unique identifier for the component instance, echoed back in ci-action events."
+        },
+        "elements": {
+          "type": "BoundValue",
+          "description": "Graph elements object with shape { nodes: Array<{ data: Record<string,unknown>, classes?: string }>, edges: Array<{ data: Record<string,unknown>, classes?: string }> }. Node data should include 'id' and optionally 'label'."
+        },
+        "layout": {
+          "type": "BoundValue",
+          "description": "Cytoscape layout algorithm name (default 'cose'). Options include: cose, circle, grid, breadthfirst, concentric, dagre."
+        },
+        "onCiAction": {
+          "type": "BoundValue",
+          "description": "Event handler called when the component dispatches a ci-action event. Receives the CustomEvent as its argument."
+        }
+      }
+    }
+  }
+}
