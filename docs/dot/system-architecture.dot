@@ -1,3 +1,4 @@
+// encoding: utf-8
 digraph system_architecture {
     rankdir=TB
     graph [fontname="Helvetica" fontsize=12 splines=ortho nodesep=0.8 ranksep=1.2]

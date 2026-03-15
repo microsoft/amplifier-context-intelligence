@@ -85,12 +85,15 @@ class TestSystemArchitectureDot:
         assert "blob_data" in content
         assert "neo4j_data" in content
         assert "projects" in content
+        assert "config" in content
 
     def test_contains_service_dependencies(self):
         content = _load_dot("system-architecture.dot")
-        # Intelligence depends on ingestion, frontend depends on intelligence
-        # These should be represented as edges in the graph
-        assert "->" in content  # must have directed edges
+        # Intelligence depends on ingestion, frontend depends on intelligence,
+        # ingestion depends on neo4j — all three must be present as directed edges.
+        assert re.search(r"intelligence\s*->\s*ingestion", content)
+        assert re.search(r"frontend\s*->\s*intelligence", content)
+        assert re.search(r"ingestion\s*->\s*neo4j", content)
 
 
 # ---------------------------------------------------------------------------
@@ -108,21 +111,15 @@ class TestContainerInitializationDot:
 
     def test_contains_container_start(self):
         content = _load_dot("container-initialization.dot")
-        assert (
-            "Container Start" in content
-            or "container_start" in content
-            or "start" in content.lower()
-        )
+        assert "Container Start" in content or "container_start" in content
 
     def test_contains_config_overlay(self):
         content = _load_dot("container-initialization.dot")
-        assert "Config" in content or "config" in content
-        assert "Overlay" in content or "overlay" in content or "cp" in content
+        assert "Config Overlay" in content or "config_overlay" in content
 
     def test_contains_apply_settings(self):
         content = _load_dot("container-initialization.dot")
-        assert "Settings" in content or "settings" in content
-        assert "Apply" in content or "apply" in content or "amplifier" in content
+        assert "Apply Settings" in content or "apply_settings" in content
 
     def test_contains_install_bundle(self):
         content = _load_dot("container-initialization.dot")

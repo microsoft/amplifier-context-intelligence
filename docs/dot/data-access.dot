@@ -1,3 +1,4 @@
+// encoding: utf-8
 digraph data_access {
     rankdir=LR
     graph [fontname="Helvetica" fontsize=12 splines=ortho nodesep=0.8 ranksep=1.2

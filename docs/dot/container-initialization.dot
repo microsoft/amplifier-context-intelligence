@@ -1,3 +1,4 @@
+// encoding: utf-8
 digraph container_initialization {
     rankdir=TB
     graph [fontname="Helvetica" fontsize=12 splines=ortho nodesep=0.6 ranksep=0.9
