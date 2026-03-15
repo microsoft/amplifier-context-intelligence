@@ -132,6 +132,28 @@ def test_ws_disconnect_unregisters_from_drain() -> None:
         assert drain.active_count == 0
 
 
+def test_lifespan_shutdown_awaits_close_all() -> None:
+    """Lifespan shutdown must await close_all() on the session manager.
+
+    Regression: close_all() was called without await, silently discarding the
+    coroutine object and leaving all active Amplifier sessions unclosed on
+    service teardown.  AsyncMock distinguishes call_count from await_count so
+    assert_awaited_once() is only satisfied when the coroutine is actually
+    driven to completion.
+    """
+    close_all_mock = AsyncMock()
+
+    with TestClient(app) as client:
+        # Inject an async close_all into the already-running session manager.
+        # The lifespan shutdown path uses getattr() so setting the attribute
+        # here is sufficient to exercise the branch.
+        app.state.session_manager.close_all = close_all_mock
+        _ = client  # keep the client alive until context exit triggers shutdown
+
+    # Shutdown has now run.  The mock must have been awaited, not merely called.
+    close_all_mock.assert_awaited_once()
+
+
 def test_ws_execute_error_sends_error_and_keeps_connection() -> None:
     """When execute() raises, the client receives an error message and the WS stays open."""
     with TestClient(app) as client:

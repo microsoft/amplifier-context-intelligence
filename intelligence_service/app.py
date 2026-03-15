@@ -62,7 +62,7 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     session_manager = application.state.session_manager
     close_all = getattr(session_manager, "close_all", None)
     if close_all is not None:
-        close_all()
+        await close_all()
 
     amplifier_app = application.state.amplifier_app
     if amplifier_app is not None:
