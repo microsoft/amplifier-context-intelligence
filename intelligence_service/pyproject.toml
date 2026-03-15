@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "intelligence-service"
+name = "context-intelligence-service"
 version = "0.1.0"
 description = "Intelligence Service for Amplifier"
 requires-python = ">=3.11"
@@ -11,9 +11,21 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
     "pydantic-settings>=2.0.0",
+    "websockets>=13.0",
+    "amplifier-core @ git+https://github.com/microsoft/amplifier-core@main",
+    "amplifier-foundation @ git+https://github.com/microsoft/amplifier-foundation@main",
+    "provider-anthropic @ git+https://github.com/microsoft/amplifier-provider-anthropic@main",
+    "provider-openai @ git+https://github.com/microsoft/amplifier-provider-openai@main",
+    "provider-gemini @ git+https://github.com/microsoft/amplifier-provider-gemini@main",
+    "provider-azure-openai @ git+https://github.com/microsoft/amplifier-provider-azure-openai@main",
+    "provider-github-copilot @ git+https://github.com/microsoft/amplifier-provider-github-copilot@main",
+    "provider-ollama @ git+https://github.com/microsoft/amplifier-provider-ollama@main",
+    "provider-vllm @ git+https://github.com/microsoft/amplifier-provider-vllm@main",
+    "loop-basic @ git+https://github.com/microsoft/amplifier-loop-basic@main",
+    "context-simple @ git+https://github.com/microsoft/amplifier-context-simple@main",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
@@ -22,6 +34,9 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 include = ["intelligence_service/**"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
