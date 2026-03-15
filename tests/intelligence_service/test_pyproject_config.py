@@ -7,10 +7,13 @@ and follows the expected structure (dependency-groups for dev deps, etc.).
 import tomllib
 from pathlib import Path
 
+import pytest
+
 PYPROJECT_PATH = (
     Path(__file__).parent.parent.parent / "intelligence_service" / "pyproject.toml"
 )
 
+# All Amplifier packages that must appear as git+https dependencies.
 AMPLIFIER_PACKAGES = [
     "amplifier-core",
     "amplifier-foundation",
@@ -46,64 +49,14 @@ def test_websockets_dependency_present() -> None:
     )
 
 
-def test_amplifier_core_dependency_present() -> None:
-    """amplifier-core must be listed as a git+https dependency."""
+@pytest.mark.parametrize("package", AMPLIFIER_PACKAGES)
+def test_amplifier_package_present(package: str) -> None:
+    """Each Amplifier package must appear in project dependencies as a git+https source."""
     config = _load_config()
     deps = config["project"]["dependencies"]
-    assert any("amplifier-core" in dep for dep in deps), (
-        f"amplifier-core not found in dependencies: {deps}"
-    )
-    assert any("git+https" in dep for dep in deps if "amplifier-core" in dep), (
-        "amplifier-core must be a git+https dependency"
-    )
-
-
-def test_amplifier_foundation_dependency_present() -> None:
-    """amplifier-foundation must be listed as a git+https dependency."""
-    config = _load_config()
-    deps = config["project"]["dependencies"]
-    assert any("amplifier-foundation" in dep for dep in deps), (
-        f"amplifier-foundation not found in dependencies: {deps}"
-    )
-    assert any("git+https" in dep for dep in deps if "amplifier-foundation" in dep), (
-        "amplifier-foundation must be a git+https dependency"
-    )
-
-
-def test_all_seven_providers_present() -> None:
-    """All 7 providers must be listed as dependencies."""
-    config = _load_config()
-    deps = config["project"]["dependencies"]
-    providers = [
-        "provider-anthropic",
-        "provider-openai",
-        "provider-gemini",
-        "provider-azure-openai",
-        "provider-github-copilot",
-        "provider-ollama",
-        "provider-vllm",
-    ]
-    for provider in providers:
-        assert any(provider in dep for dep in deps), (
-            f"{provider} not found in dependencies: {deps}"
-        )
-
-
-def test_loop_basic_orchestrator_present() -> None:
-    """loop-basic orchestrator must be listed as a git+https dependency."""
-    config = _load_config()
-    deps = config["project"]["dependencies"]
-    assert any("loop-basic" in dep for dep in deps), (
-        f"loop-basic not found in dependencies: {deps}"
-    )
-
-
-def test_context_simple_module_present() -> None:
-    """context-simple context module must be listed as a git+https dependency."""
-    config = _load_config()
-    deps = config["project"]["dependencies"]
-    assert any("context-simple" in dep for dep in deps), (
-        f"context-simple not found in dependencies: {deps}"
+    assert any(package in dep for dep in deps), f"{package} not found in: {deps}"
+    assert any("git+https" in dep for dep in deps if package in dep), (
+        f"{package} must be a git+https dependency"
     )
 
 
