@@ -25,8 +25,8 @@ RUN uv sync --frozen --no-dev
 COPY amplifier-bundle-context-intelligence-server/ /app/bundles/context-intelligence-server/
 
 # Runtime environment
-ENV AMPLIFIER_HOME=/data/context-intelligence-service
-ENV BUNDLE_PATH=/app/bundles/context-intelligence-server/bundle.md
+ENV AMPLIFIER_HOME=/data/context-intelligence-service \
+    BUNDLE_PATH=/app/bundles/context-intelligence-server/bundle.md
 
 EXPOSE 8100
 
@@ -34,4 +34,4 @@ EXPOSE 8100
 HEALTHCHECK --interval=10s --timeout=5s --start-period=180s --retries=60 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8100/status')"
 
-CMD uv run uvicorn intelligence_service.app:app --host 0.0.0.0 --port 8100
+CMD ["uv", "run", "uvicorn", "intelligence_service.app:app", "--host", "0.0.0.0", "--port", "8100"]

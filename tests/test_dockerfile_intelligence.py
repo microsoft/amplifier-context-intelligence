@@ -81,9 +81,9 @@ def test_installs_build_tools() -> None:
 
 def test_installs_git() -> None:
     content = _content()
-    assert "git" in content, (
-        "Dockerfile.intelligence must install git (for git+https dependencies)"
-    )
+    assert "    git " in content or (
+        "apt-get install" in content and "git" in content
+    ), "Dockerfile.intelligence must install git (for git+https dependencies)"
 
 
 # ---------------------------------------------------------------------------
@@ -103,8 +103,15 @@ def test_uv_sync_deps_only_stage() -> None:
 def test_uv_sync_full_stage() -> None:
     """Second stage: copy source and install project."""
     content = _content()
-    assert "uv sync --frozen --no-dev" in content, (
-        "Dockerfile.intelligence must run 'uv sync --frozen --no-dev' to install the project"
+    lines = content.splitlines()
+    full_sync_lines = [
+        line
+        for line in lines
+        if "uv sync --frozen --no-dev" in line and "--no-install-project" not in line
+    ]
+    assert full_sync_lines, (
+        "Dockerfile.intelligence must run 'uv sync --frozen --no-dev' (without --no-install-project) "
+        "to install the project in the second stage"
     )
 
 
@@ -226,9 +233,7 @@ def test_healthcheck_uses_python_urllib() -> None:
     assert "urllib" in content, (
         "HEALTHCHECK must use python urllib for the health check"
     )
-    assert "curl" not in content.lower() or "HEALTHCHECK" not in content, (
-        "HEALTHCHECK should use python urllib, not curl"
-    )
+    assert "curl" not in content.lower(), "HEALTHCHECK must not use curl"
 
 
 def test_healthcheck_checks_port_8100() -> None:
@@ -252,9 +257,10 @@ def test_healthcheck_checks_port_8100() -> None:
 
 def test_cmd_uses_uv_run_uvicorn() -> None:
     content = _content()
-    assert "uv run uvicorn" in content, (
-        "CMD must use 'uv run uvicorn' to start the service"
-    )
+    # Accepts both shell form ("uv run uvicorn") and exec form (["uv", "run", "uvicorn", ...])
+    assert "uv run uvicorn" in content or (
+        '"uv"' in content and '"run"' in content and '"uvicorn"' in content
+    ), "CMD must use 'uv run uvicorn' to start the service"
 
 
 def test_cmd_points_to_intelligence_service_app() -> None:
@@ -266,9 +272,15 @@ def test_cmd_points_to_intelligence_service_app() -> None:
 
 def test_cmd_binds_to_all_interfaces() -> None:
     content = _content()
-    assert "--host 0.0.0.0" in content, "CMD must bind uvicorn to 0.0.0.0"
+    # Accepts both shell form ("--host 0.0.0.0") and exec form ("--host", "0.0.0.0")
+    assert "--host 0.0.0.0" in content or (
+        '"--host"' in content and '"0.0.0.0"' in content
+    ), "CMD must bind uvicorn to 0.0.0.0"
 
 
 def test_cmd_uses_port_8100() -> None:
     content = _content()
-    assert "--port 8100" in content, "CMD must use port 8100"
+    # Accepts both shell form ("--port 8100") and exec form ("--port", "8100")
+    assert "--port 8100" in content or (
+        '"--port"' in content and '"8100"' in content
+    ), "CMD must use port 8100"
