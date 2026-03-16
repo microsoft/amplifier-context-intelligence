@@ -7,6 +7,7 @@ dispatches prompts to real Amplifier sessions.
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from typing import Any
 
 from intelligence_service._async_utils import close_if_async
@@ -47,7 +48,7 @@ class AmplifierSessionManager:
         session_id = str(uuid.uuid4())
         session = await self._amplifier_app.prepared.create_session(
             session_id=session_id,
-            session_cwd=f"{self._amplifier_home}/{self._workspace}",
+            session_cwd=Path(f"{self._amplifier_home}/{self._workspace}"),
         )
         self._sessions[session_id] = session
         return session_id

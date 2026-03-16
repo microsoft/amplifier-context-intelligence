@@ -1,5 +1,6 @@
 """Tests for AmplifierSessionManager."""
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -61,7 +62,7 @@ async def test_create_session_delegates_to_prepared() -> None:
 
     mock_app.prepared.create_session.assert_called_once_with(
         session_id=session_id,
-        session_cwd="/data/home/myproject",
+        session_cwd=Path("/data/home/myproject"),
     )
 
 
@@ -270,7 +271,7 @@ async def test_create_session_uses_amplifier_home_for_cwd() -> None:
 
     mock_app.prepared.create_session.assert_called_once_with(
         session_id=session_id,
-        session_cwd="/custom/data/dir/myproject",
+        session_cwd=Path("/custom/data/dir/myproject"),
     )
 
 
