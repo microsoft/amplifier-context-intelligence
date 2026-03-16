@@ -55,6 +55,43 @@ WELL_KNOWN_BUNDLES: dict[str, str] = {
 _logger = logging.getLogger("intelligence_service.runtime")
 
 # ---------------------------------------------------------------------------
+# Provider registry (canonical, keyed by short name)
+# ---------------------------------------------------------------------------
+PROVIDERS: dict[str, dict[str, str]] = {
+    "anthropic": {
+        "env_var": "ANTHROPIC_API_KEY",
+        "module": "provider-anthropic",
+        "source": "git+https://github.com/microsoft/amplifier-module-provider-anthropic@main",
+    },
+    "gemini": {
+        "env_var": "GOOGLE_API_KEY",
+        "module": "provider-gemini",
+        "source": "git+https://github.com/microsoft/amplifier-module-provider-gemini@main",
+    },
+    "openai": {
+        "env_var": "OPENAI_API_KEY",
+        "module": "provider-openai",
+        "source": "git+https://github.com/microsoft/amplifier-module-provider-openai@main",
+    },
+    "azure-openai": {
+        "env_var": "AZURE_OPENAI_API_KEY",
+        "module": "provider-azure-openai",
+        "source": "git+https://github.com/microsoft/amplifier-module-provider-azure-openai@main",
+    },
+    "github-copilot": {
+        "env_var": "GITHUB_TOKEN",
+        "module": "provider-github-copilot",
+        "source": "git+https://github.com/microsoft/amplifier-module-provider-github-copilot@main",
+    },
+}
+
+
+def _get_available_providers() -> set[str]:
+    """Return the set of provider short names whose env var is set and non-empty."""
+    return {name for name, info in PROVIDERS.items() if os.environ.get(info["env_var"])}
+
+
+# ---------------------------------------------------------------------------
 # Provider detection from environment
 # ---------------------------------------------------------------------------
 _PROVIDER_MAP: list[tuple[str, str, str, str]] = [
