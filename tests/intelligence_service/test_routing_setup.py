@@ -173,6 +173,9 @@ class TestModelSuffix:
                 "gemini-2.0-flash-preview-image-generation",
                 "flash-preview-image-generation",
             ),
+            # Fallback path: no pure-alpha segment found after stripping prefix;
+            # the stripped model string is returned as-is.
+            ("gpt-4o", "4o"),
         ],
     )
     def test_extracts_correct_suffix(self, model: str, expected: str) -> None:

@@ -94,6 +94,8 @@ def _get_available_providers() -> set[str]:
 # ---------------------------------------------------------------------------
 # Routing roles: maps each model role to an ordered list of provider candidates
 # ---------------------------------------------------------------------------
+# Multiple roles intentionally share the same candidate (anthropic/claude-sonnet-*);
+# per-role differentiation is reserved for future routing logic.
 ROUTING_ROLES: dict[str, list[dict[str, Any]]] = {
     "general": [
         {
@@ -188,6 +190,15 @@ ROUTING_ROLES: dict[str, list[dict[str, Any]]] = {
 }
 
 
+def _is_version(seg: str) -> bool:
+    """True when a segment is a plain integer or decimal version number."""
+    try:
+        float(seg)
+        return True
+    except ValueError:
+        return False
+
+
 def _model_suffix(model: str) -> str:
     """Extract a short suffix from a model name for use in instance IDs.
 
@@ -201,6 +212,7 @@ def _model_suffix(model: str) -> str:
         claude-haiku-4-5                           -> haiku
         gemini-2.5-flash                           -> flash
         gemini-2.0-flash-preview-image-generation  -> flash-preview-image-generation
+        gpt-4o                                     -> 4o  (fallback: no pure-alpha segment)
     """
     # Strip a known model-family prefix
     for prefix in ("claude-", "gemini-", "gpt-"):
@@ -209,14 +221,6 @@ def _model_suffix(model: str) -> str:
             break
 
     segments = model.split("-")
-
-    def _is_version(seg: str) -> bool:
-        """True when a segment is a plain integer or decimal version number."""
-        try:
-            float(seg)
-            return True
-        except ValueError:
-            return False
 
     # Skip any leading version segments (e.g. "2.5", "4")
     i = 0
