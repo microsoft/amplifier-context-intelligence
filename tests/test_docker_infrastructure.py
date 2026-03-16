@@ -115,12 +115,12 @@ def test_compose_server_neo4j_url_env(compose: dict) -> None:
     # environment can be dict or list
     if isinstance(env, list):
         env_str = "\n".join(env)
-        assert "CI_SERVER_NEO4J_URL" in env_str, (
-            "context-intelligence-server must set CI_SERVER_NEO4J_URL"
+        assert "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL" in env_str, (
+            "context-intelligence-server must set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL"
         )
     else:
-        assert "CI_SERVER_NEO4J_URL" in env, (
-            "context-intelligence-server must set CI_SERVER_NEO4J_URL"
+        assert "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL" in env, (
+            "context-intelligence-server must set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL"
         )
 
 
@@ -129,12 +129,12 @@ def test_compose_server_blob_path_env(compose: dict) -> None:
     env = server.get("environment", {})
     if isinstance(env, list):
         env_str = "\n".join(env)
-        assert "CI_SERVER_BLOB_PATH" in env_str, (
-            "context-intelligence-server must set CI_SERVER_BLOB_PATH"
+        assert "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH" in env_str, (
+            "context-intelligence-server must set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH"
         )
     else:
-        assert "CI_SERVER_BLOB_PATH" in env, (
-            "context-intelligence-server must set CI_SERVER_BLOB_PATH"
+        assert "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH" in env, (
+            "context-intelligence-server must set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH"
         )
 
 

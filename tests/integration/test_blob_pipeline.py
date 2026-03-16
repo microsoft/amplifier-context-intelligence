@@ -33,7 +33,7 @@ async def integration_env(
     """Override blob_path to tmp_path and create AsyncClient with ASGITransport.
 
     - Clears the get_settings LRU cache so the fresh call picks up the
-      overridden CI_SERVER_BLOB_PATH environment variable.
+      overridden AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH environment variable.
     - Patches the module-level ``_settings`` object in main.py so the
       /blobs/* route handlers also see the new blob root.
     - Yields an AsyncClient backed by ASGITransport (no real server needed).
@@ -45,7 +45,7 @@ async def integration_env(
 
     # Reset cached settings so the env-var override takes effect
     get_settings.cache_clear()
-    monkeypatch.setenv("CI_SERVER_BLOB_PATH", str(blob_dir))
+    monkeypatch.setenv("AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH", str(blob_dir))
 
     # Build fresh settings with the overridden blob_path
     new_settings = get_settings()

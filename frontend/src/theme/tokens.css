@@ -1,0 +1,91 @@
+/* Context Intelligence Explorer — Design Tokens
+ *
+ * OKLCH colour tokens for both light and dark modes.
+ * Dark mode is the default appearance for the explorer.
+ *
+ * Font imports: Outfit (UI text) + JetBrains Mono (code / data).
+ */
+
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;0,700;1,400&display=swap');
+
+/* ── CSS Reset ───────────────────────────────────────────────────────────────── */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100%;
+  font-family: 'Outfit', system-ui, sans-serif;
+  font-feature-settings: 'liga' 1, 'calt' 1, 'kern' 1;
+}
+
+/* ── Light mode tokens (:root base) ─────────────────────────────────────────── */
+
+/* light-mode values — activated by removing .dark from <html>
+ * (the `:root, .dark` block below overrides :root so dark mode loads by default) */
+:root {
+  /* Surface — matched to ingestion server light theme */
+  --background:  oklch(0.984 0.006  95);
+  --foreground:  oklch(0.215 0.015 255);
+  --card:        oklch(0.996 0.004  95 / 88%);
+
+  /* Brand — teal/green accent (hue 162), consistent with ingestion server */
+  --primary:     oklch(0.59  0.12  161);
+  --secondary:   oklch(0.968 0.01  205);
+
+  /* Neutral */
+  --muted:       oklch(0.95  0.008 220);
+  --accent:      oklch(0.95  0.014 165);
+
+  /* Semantic */
+  --destructive: oklch(0.63  0.2    25);
+  --success:     oklch(0.55  0.18  145);
+  --warning:     oklch(0.68  0.18   75);
+  --error:       oklch(0.63  0.2    25); /* intentional alias — same red family as --destructive */
+
+  /* Chrome */
+  --border:      oklch(0.89  0.01  235 / 72%);
+  --input:       oklch(0.89  0.01  235 / 72%);
+  --ring:        oklch(0.68  0.08  161);
+}
+
+/* ── Dark mode tokens ─────────────────────────────────────────────────────────
+ *
+ * Applied only when the .dark class is present on <html>.
+ * The index.html theme-detection script sets this class on first load
+ * based on localStorage or system preference (prefers-color-scheme: dark).
+ */
+
+.dark {
+  /* Surface — matched to ingestion server theme */
+  --background:  oklch(0.145 0.005 255);
+  --foreground:  oklch(0.985 0.002 255);
+  --card:        oklch(0.18 0.007 255 / 88%);
+
+  /* Brand — teal/green accent (hue 162), consistent with ingestion server */
+  --primary:     oklch(0.696 0.17  162);
+  --secondary:   oklch(0.245 0.008 255);
+
+  /* Neutral */
+  --muted:       oklch(0.245 0.008 255);
+  --accent:      oklch(0.27 0.028 165);
+
+  /* Semantic */
+  --destructive: oklch(0.5  0.2    25);
+  --success:     oklch(0.65 0.18  145);
+  --warning:     oklch(0.75 0.18   75);
+  --error:       oklch(0.5  0.2    25); /* intentional alias — same red family as --destructive */
+
+  /* Chrome */
+  --border:      oklch(0.3  0.006 255);
+  --input:       oklch(0.3  0.006 255);
+  --ring:        oklch(0.696 0.17  162);
+}

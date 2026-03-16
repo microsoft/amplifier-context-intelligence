@@ -8,7 +8,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
-    model_config = SettingsConfigDict(env_prefix="CI_SERVER_")
+    model_config = SettingsConfigDict(
+        env_prefix="AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_"
+    )
 
     server_host: str = "0.0.0.0"
     server_port: int = 8000

@@ -1,0 +1,129 @@
+// encoding: utf-8
+digraph container_initialization {
+    rankdir=TB
+    graph [fontname="Helvetica" fontsize=12 splines=ortho nodesep=0.6 ranksep=0.9
+           label="Intelligence Service — Container Initialization" labelloc=t fontsize=14]
+    node  [fontname="Helvetica" fontsize=11 shape=box style="rounded,filled" fillcolor="#ddeeff"]
+    edge  [fontname="Helvetica" fontsize=10]
+
+    // ── Entrypoint phase ────────────────────────────────────────────────────
+
+    container_start [
+        label="Container Start\n(Docker restart policy: unless-stopped)"
+        shape=oval
+        fillcolor="#b3d1ff"
+    ]
+
+    entrypoint [
+        label="entrypoint-intelligence.sh\n─────────────────────────\nmkdir -p /data\ncp config/* /data/\ngit config (if GH_TOKEN set)\nexec \"$@\""
+        fillcolor="#ddeeff"
+    ]
+
+    // ── uvicorn / lifespan phase ─────────────────────────────────────────────
+
+    uvicorn_start [
+        label="uv run uvicorn\napp:app  :8100"
+        fillcolor="#ddeeff"
+    ]
+
+    lifespan_startup [
+        label="Lifespan startup\n─────────────────────────\nget_settings()\nDrainManager created\ncheck bundle_path"
+        fillcolor="#ddeeff"
+    ]
+
+    // ── Conditional: production vs stub ──────────────────────────────────────
+
+    bundle_check [
+        label="bundle_path set?"
+        shape=diamond
+        fillcolor="#fff2cc"
+        color="#996600"
+    ]
+
+    // ── Production path ──────────────────────────────────────────────────────
+
+    amplifier_startup [
+        label="AmplifierApp.startup()\n─────────────────────────\nset AMPLIFIER_HOME env\nload_bundle()\ncompose(routing_overlay)\nprepare()"
+        fillcolor="#ddeeff"
+    ]
+
+    prepared_bundle [
+        label="PreparedBundle ready"
+        fillcolor="#d4edda"
+    ]
+
+    amplifier_session_mgr [
+        label="AmplifierSessionManager\ncreated"
+        fillcolor="#b3e6b3"
+    ]
+
+    // ── Stub path ────────────────────────────────────────────────────────────
+
+    stub_session_mgr [
+        label="StubSessionManager\ncreated"
+        fillcolor="#e6d9f5"
+    ]
+
+    // ── Ready ────────────────────────────────────────────────────────────────
+
+    health_ready [
+        label="GET /health → {\"status\": \"ok\"}"
+        fillcolor="#b3e6b3"
+    ]
+
+    accepting_connections [
+        label="Accepting Connections\n(WS /ws  ready)"
+        shape=oval
+        fillcolor="#b3e6b3"
+    ]
+
+    // ── Shutdown path ────────────────────────────────────────────────────────
+
+    shutdown [
+        label="Shutdown signal\n─────────────────────────\ndrain.start_drain()\nsession_manager.close_all()\namplifier_app.close()"
+        fillcolor="#f5e6cc"
+        color="#996600"
+    ]
+
+    // ── Error path ───────────────────────────────────────────────────────────
+
+    startup_error [
+        label="Startup Error"
+        shape=diamond
+        fillcolor="#f4b8b8"
+        color="#990000"
+    ]
+
+    docker_restart [
+        label="Docker restart\n(start_period: 180s  retries: 60)"
+        shape=oval
+        fillcolor="#f4b8b8"
+        color="#990000"
+    ]
+
+    // ── Happy-path edges ──────────────────────────────────────────────────────
+
+    container_start  -> entrypoint
+    entrypoint       -> uvicorn_start     [label="exec uvicorn"]
+    uvicorn_start    -> lifespan_startup
+    lifespan_startup -> bundle_check
+
+    bundle_check     -> amplifier_startup [label="yes (production)"]
+    bundle_check     -> stub_session_mgr  [label="no (stub)"]
+
+    amplifier_startup -> prepared_bundle
+    prepared_bundle   -> amplifier_session_mgr
+    amplifier_session_mgr -> health_ready
+
+    stub_session_mgr  -> health_ready
+
+    health_ready      -> accepting_connections
+
+    accepting_connections -> shutdown [label="SIGTERM" style=dashed color="#996600"]
+
+    // ── Error-path edges ───────────────────────────────────────────────────────
+
+    amplifier_startup -> startup_error [label="failure" color="#cc0000" style=dashed]
+    startup_error     -> docker_restart               [color="#cc0000" style=dashed]
+    docker_restart    -> container_start              [color="#cc0000" style=dashed label="retry"]
+}

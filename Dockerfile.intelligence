@@ -1,0 +1,45 @@
+FROM python:3.13-slim
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+# Install build tools required for amplifier-core Rust bindings
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Two-stage uv sync for layer caching:
+# Stage 1 — copy lock files only and install dependencies (no project source)
+COPY amplifier-context-intelligence/intelligence_service/pyproject.toml ./
+COPY amplifier-context-intelligence/intelligence_service/uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+# Stage 2 — copy project source and install project
+COPY amplifier-context-intelligence/intelligence_service/ intelligence_service/
+RUN uv sync --frozen --no-dev
+
+# Pre-bake server bundle (avoids network fetch on cold start)
+COPY amplifier-bundle-context-intelligence-server/ /app/bundles/context-intelligence-server/
+
+# Runtime environment
+ENV AMPLIFIER_HOME=/data/context-intelligence-service \
+    AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_AMPLIFIER_HOME=/data/context-intelligence-service \
+    AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_BUNDLE_PATH=/app/bundles/context-intelligence-server/bundle.md \
+    AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX=balanced \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 8100
+
+# Healthcheck — long start-period because prepare downloads Amplifier modules on cold start
+HEALTHCHECK --interval=10s --timeout=5s --start-period=180s --retries=60 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"
+
+COPY amplifier-context-intelligence/entrypoint-intelligence.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["uv", "run", "uvicorn", "intelligence_service.app:app", "--host", "0.0.0.0", "--port", "8100"]

@@ -71,6 +71,11 @@ async def dashboard() -> FileResponse:
     return FileResponse(_WEB_DIR / "dashboard.html")
 
 
+@app.get("/explorer", response_class=HTMLResponse)
+async def explorer() -> FileResponse:
+    return FileResponse(_WEB_DIR / "explorer.html")
+
+
 @app.get("/status")
 async def get_status() -> dict[str, Any]:
     return build_status_response(registry, _start_time)

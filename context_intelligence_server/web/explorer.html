@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Explorer &middot; Context Intelligence</title>
+  <link rel="icon" href="https://avatars.githubusercontent.com/u/240397093" />
+  <link rel="stylesheet" href="/static/css/theme.css" />
+  <script src="/static/js/theme.js"></script>
+  <style>
+    html, body { height: 100dvh; overflow: hidden; margin: 0; }
+    body { display: flex; flex-direction: column; background: var(--background); }
+    .nav-wrap { padding: 0.5rem 1.5rem; flex-shrink: 0; border-bottom: 1px solid var(--border); }
+    .nav-wrap .topnav { margin-bottom: 0; }
+    .embed-frame { flex: 1; border: none; width: 100%; min-height: 0; display: block; }
+  </style>
+</head>
+<body>
+  <div class="nav-wrap">
+    <nav class="topnav">
+      <div class="brand">
+        <img src="https://avatars.githubusercontent.com/u/240397093" alt="Amplifier" />
+        <span class="brand-name">Context Intelligence</span>
+      </div>
+      <a href="/">Home</a>
+      <a href="/dashboard">Dashboard</a>
+      <a href="/docs" target="_blank">API</a>
+      <a href="/explorer" class="active">Explorer</a>
+      <a href="http://localhost:7474" target="_blank">Neo4j</a>
+      <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()">&#x263E;</button>
+    </nav>
+  </div>
+
+  <iframe class="embed-frame" src="http://localhost:3000/" title="Exploration UI"></iframe>
+
+  <script>
+    const btn = document.getElementById('theme-toggle');
+    if (btn) btn.textContent = document.documentElement.classList.contains('dark') ? '\u2600' : '\u263e';
+  </script>
+</body>
+</html>

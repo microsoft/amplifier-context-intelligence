@@ -4,8 +4,8 @@ services:
     ports:
       - "8000:8000"
     environment:
-      CI_SERVER_NEO4J_URL: neo4j://neo4j:7687
-      CI_SERVER_BLOB_PATH: /data/blobs
+      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL: neo4j://neo4j:7687
+      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH: /data/blobs
       PYTHONUNBUFFERED: "1"
     volumes:
       - blob_data:/data/blobs
@@ -18,9 +18,63 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+      start_period: 30s
     restart: unless-stopped
     labels:
       com.context-intelligence.component: server
+    networks:
+      - context-intelligence
+
+  intelligence-service:
+    build:
+      context: ..
+      dockerfile: amplifier-context-intelligence/Dockerfile.intelligence
+    ports:
+      - "8100:8100"
+    depends_on:
+      context-intelligence-server:
+        condition: service_healthy
+    volumes:
+      - context_intelligence_service_data:/data/context-intelligence-service
+      - blob_data:/data/blobs:ro
+    env_file:
+      - config/secrets.env
+    environment:
+      AMPLIFIER_HOME: /data/context-intelligence-service
+      BUNDLE_PATH: /app/bundles/context-intelligence-server/bundle.md
+      ROUTING_MATRIX: balanced
+      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_AMPLIFIER_HOME: /data/context-intelligence-service
+      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_BUNDLE_PATH: /app/bundles/context-intelligence-server/bundle.md
+      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX: balanced
+      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_INGESTION_URL: http://context-intelligence-server:8000
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 180s
+    restart: unless-stopped
+    labels:
+      com.context-intelligence.component: intelligence-service
+    networks:
+      - context-intelligence
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: amplifier-context-intelligence/Dockerfile.frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      intelligence-service:
+        condition: service_healthy
+    restart: unless-stopped
+    labels:
+      com.context-intelligence.component: frontend
     networks:
       - context-intelligence
 
@@ -49,6 +103,7 @@ volumes:
   blob_data:
   neo4j_data:
   log_data:
+  context_intelligence_service_data:
 
 networks:
   context-intelligence:
