@@ -31,7 +31,26 @@
     </nav>
   </div>
 
-  <iframe class="embed-frame" src="http://localhost:7474/" title="Neo4j Browser"></iframe>
+  <div style="flex:1; display:flex; align-items:center; justify-content:center; padding:2rem;">
+    <div style="max-width:480px; text-align:center; color:var(--foreground);">
+      <div style="font-size:3rem; margin-bottom:1rem;">&#x25C8;</div>
+      <h2 style="margin:0 0 0.75rem; font-family:var(--font-sans,'Outfit',system-ui,sans-serif); font-weight:600;">Neo4j Browser</h2>
+      <p style="color:var(--muted-foreground); line-height:1.6; margin:0 0 1.5rem;">
+        Query the session property graph directly with Cypher.
+        Neo4j Browser runs on its own origin and cannot be embedded.
+      </p>
+      <div style="display:flex; flex-direction:column; gap:0.75rem; align-items:center;">
+        <a href="http://localhost:7474/browser/" target="_blank"
+           style="display:inline-block; padding:0.6rem 1.5rem; background:var(--primary); color:var(--primary-foreground,#fff); border-radius:8px; text-decoration:none; font-weight:500; font-family:var(--font-sans,'Outfit',system-ui,sans-serif); transition:opacity 0.15s;">
+          Open Neo4j Browser &rarr;
+        </a>
+        <p style="color:var(--muted-foreground); font-size:0.8rem; margin:0;">
+          Bolt: <code style="font-family:var(--font-mono,'JetBrains Mono',monospace); background:var(--muted); padding:2px 6px; border-radius:4px;">bolt://localhost:7687</code>
+          &nbsp;&middot;&nbsp; Auth: <code style="font-family:var(--font-mono,'JetBrains Mono',monospace); background:var(--muted); padding:2px 6px; border-radius:4px;">none</code>
+        </p>
+      </div>
+    </div>
+  </div>
 
   <script>
     const btn = document.getElementById('theme-toggle');
