@@ -92,6 +92,201 @@ def _get_available_providers() -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Routing roles: maps each model role to an ordered list of provider candidates
+# ---------------------------------------------------------------------------
+ROUTING_ROLES: dict[str, list[dict[str, Any]]] = {
+    "general": [
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-*",
+            "default_model": "claude-sonnet-4-5",
+        },
+    ],
+    "fast": [
+        {
+            "provider": "gemini",
+            "model": "gemini-*-flash",
+            "default_model": "gemini-2.5-flash",
+        },
+        {
+            "provider": "anthropic",
+            "model": "claude-haiku-*",
+            "default_model": "claude-haiku-4-5",
+        },
+    ],
+    "coding": [
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-*",
+            "default_model": "claude-sonnet-4-5",
+        },
+    ],
+    "reasoning": [
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-*",
+            "default_model": "claude-sonnet-4-5",
+            "config": {"reasoning_effort": "high"},
+        },
+    ],
+    "critique": [
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-*",
+            "default_model": "claude-sonnet-4-5",
+            "config": {"reasoning_effort": "high"},
+        },
+    ],
+    "creative": [
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-*",
+            "default_model": "claude-sonnet-4-5",
+        },
+    ],
+    "writing": [
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-*",
+            "default_model": "claude-sonnet-4-5",
+        },
+    ],
+    "research": [
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-*",
+            "default_model": "claude-sonnet-4-5",
+        },
+    ],
+    "vision": [
+        {
+            "provider": "gemini",
+            "model": "gemini-*-flash",
+            "default_model": "gemini-2.5-flash",
+        },
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-*",
+            "default_model": "claude-sonnet-4-5",
+        },
+    ],
+    "image-gen": [
+        {
+            "provider": "gemini",
+            "model": "gemini-2.0-flash-preview-image-generation",
+            "default_model": "gemini-2.0-flash-preview-image-generation",
+        },
+    ],
+    "critical-ops": [
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-*",
+            "default_model": "claude-sonnet-4-5",
+        },
+    ],
+}
+
+
+def _model_suffix(model: str) -> str:
+    """Extract a short suffix from a model name for use in instance IDs.
+
+    Strips known prefixes (claude-, gemini-, gpt-), skips leading version
+    segments (e.g. ``2.5``, ``4``), keeps consecutive alphabetic segments,
+    and stops when a trailing version segment is encountered.
+
+    Examples::
+
+        claude-sonnet-4-5                          -> sonnet
+        claude-haiku-4-5                           -> haiku
+        gemini-2.5-flash                           -> flash
+        gemini-2.0-flash-preview-image-generation  -> flash-preview-image-generation
+    """
+    # Strip a known model-family prefix
+    for prefix in ("claude-", "gemini-", "gpt-"):
+        if model.startswith(prefix):
+            model = model[len(prefix) :]
+            break
+
+    segments = model.split("-")
+
+    def _is_version(seg: str) -> bool:
+        """True when a segment is a plain integer or decimal version number."""
+        try:
+            float(seg)
+            return True
+        except ValueError:
+            return False
+
+    # Skip any leading version segments (e.g. "2.5", "4")
+    i = 0
+    while i < len(segments) and _is_version(segments[i]):
+        i += 1
+
+    # Collect consecutive alphabetic segments; stop at the first version segment
+    result: list[str] = []
+    while i < len(segments):
+        seg = segments[i]
+        if seg.isalpha():
+            result.append(seg)
+        else:
+            break
+        i += 1
+
+    return "-".join(result) if result else model
+
+
+def _build_provider_instances(available: set[str]) -> list[dict[str, Any]]:
+    """Build deduplicated provider instance configs from ROUTING_ROLES.
+
+    Walks every role in ROUTING_ROLES, collects unique ``(provider,
+    default_model)`` pairs, filters to providers present in *available*, and
+    returns a list of instance dicts ready for bundle composition.
+
+    Each returned dict has the keys:
+        * ``module``      – the provider module ID (from PROVIDERS)
+        * ``instance_id`` – ``"{provider}-{suffix}"`` (lowercase, no spaces)
+        * ``source``      – the provider source URL (from PROVIDERS)
+        * ``config``      – ``{"default_model": <default_model>}``
+
+    Args:
+        available: Set of provider short names that have a valid API key.
+
+    Returns:
+        Deduplicated list of provider instance config dicts.
+    """
+    seen: set[tuple[str, str]] = set()
+    instances: list[dict[str, Any]] = []
+
+    for _role, candidates in ROUTING_ROLES.items():
+        for candidate in candidates:
+            provider = candidate["provider"]
+            default_model = candidate["default_model"]
+
+            if provider not in available:
+                continue
+
+            key = (provider, default_model)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            provider_info = PROVIDERS[provider]
+            suffix = _model_suffix(default_model)
+            instance_id = f"{provider}-{suffix}"
+
+            instances.append(
+                {
+                    "module": provider_info["module"],
+                    "instance_id": instance_id,
+                    "source": provider_info["source"],
+                    "config": {"default_model": default_model},
+                }
+            )
+
+    return instances
+
+
+# ---------------------------------------------------------------------------
 # Provider detection from environment
 # ---------------------------------------------------------------------------
 _PROVIDER_MAP: list[tuple[str, str, str, str]] = [
