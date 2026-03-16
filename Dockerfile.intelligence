@@ -22,19 +22,14 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY amplifier-context-intelligence/intelligence_service/ intelligence_service/
 RUN uv sync --frozen --no-dev
 
-# Pre-bake server bundle (avoids network fetch on cold start)
-COPY amplifier-bundle-context-intelligence-server/ /app/bundles/context-intelligence-server/
-
 # Runtime environment
-ENV AMPLIFIER_HOME=/data/context-intelligence-service \
-    AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_AMPLIFIER_HOME=/data/context-intelligence-service \
-    AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_BUNDLE_PATH=/app/bundles/context-intelligence-server/bundle.md \
+ENV AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_RUNTIME_STATE_PATH=/data/intelligence-runtime \
     AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX=balanced \
     PYTHONUNBUFFERED=1
 
 EXPOSE 8100
 
-# Healthcheck — long start-period because prepare downloads Amplifier modules on cold start
+# Healthcheck — long start-period for service initialisation
 HEALTHCHECK --interval=10s --timeout=5s --start-period=180s --retries=60 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"
 

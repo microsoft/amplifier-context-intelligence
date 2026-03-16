@@ -1,27 +1,30 @@
 """Tests for Dockerfile.intelligence — programmatic Amplifier service container.
 
-TDD phase: These tests FAIL before the Dockerfile is updated.
+TDD phase: These tests define the NEW required state of Dockerfile.intelligence.
 
 Spec requirements:
 - Base: python:3.13-slim
 - Install uv from ghcr.io/astral-sh/uv:latest
 - Install build tools: git, build-essential, pkg-config, libssl-dev (Rust bindings)
 - Two-stage uv sync for layer caching
-- Pre-bake server bundle to /app/bundles/context-intelligence-server/
-- ENV: AMPLIFIER_HOME, BUNDLE_PATH
+- NO pre-baked server bundle (no amplifier-bundle-context-intelligence-server or /app/bundles/)
+- ENV: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_RUNTIME_STATE_PATH, AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX
+- NO AMPLIFIER_HOME= or BUNDLE_PATH= env vars
 - EXPOSE 8100
 - HEALTHCHECK with --start-period=180s, --retries=60, python urllib
+- ENTRYPOINT ["/app/entrypoint.sh"]
 - CMD: uv run uvicorn intelligence_service.app:app --host 0.0.0.0 --port 8100
 - No CLI installation (no 'uv tool install amplifier')
-- No entrypoint.sh script
 """
 
+import functools
 import pathlib
 
 PROJECT_ROOT = pathlib.Path(__file__).parent.parent
 DOCKERFILE = PROJECT_ROOT / "Dockerfile.intelligence"
 
 
+@functools.lru_cache(maxsize=1)
 def _content() -> str:
     return DOCKERFILE.read_text()
 
@@ -81,9 +84,9 @@ def test_installs_build_tools() -> None:
 
 def test_installs_git() -> None:
     content = _content()
-    assert "    git " in content or (
-        "apt-get install" in content and "git" in content
-    ), "Dockerfile.intelligence must install git (for git+https dependencies)"
+    assert "    git \\" in content or "    git " in content, (
+        "Dockerfile.intelligence must install git (for git+https dependencies)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +146,7 @@ def test_no_uv_tool_install_amplifier() -> None:
 
 
 # ---------------------------------------------------------------------------
-# No entrypoint shell script
+# Entrypoint shell script
 # ---------------------------------------------------------------------------
 
 
@@ -159,18 +162,19 @@ def test_has_entrypoint_script() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pre-baked server bundle
+# No pre-baked server bundle
 # ---------------------------------------------------------------------------
 
 
-def test_pre_bakes_server_bundle() -> None:
+def test_no_pre_baked_server_bundle() -> None:
     content = _content()
-    assert "amplifier-bundle-context-intelligence-server" in content, (
-        "Dockerfile.intelligence must COPY the amplifier-bundle-context-intelligence-server "
-        "directory into the image"
+    assert "amplifier-bundle-context-intelligence-server" not in content, (
+        "Dockerfile.intelligence must NOT copy the pre-baked server bundle "
+        "(bundle is no longer needed in programmatic runtime mode)"
     )
-    assert "/app/bundles/context-intelligence-server" in content, (
-        "Bundle must be copied to /app/bundles/context-intelligence-server/"
+    assert "/app/bundles/" not in content, (
+        "Dockerfile.intelligence must NOT reference /app/bundles/ "
+        "(no pre-baked bundle directory)"
     )
 
 
@@ -179,21 +183,51 @@ def test_pre_bakes_server_bundle() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_env_amplifier_home() -> None:
-    content = _content()
-    assert "AMPLIFIER_HOME=/data/context-intelligence-service" in content, (
-        "Dockerfile.intelligence must set AMPLIFIER_HOME=/data/context-intelligence-service"
-    )
-
-
-def test_env_bundle_path() -> None:
+def test_env_runtime_state_path() -> None:
     content = _content()
     assert (
-        "BUNDLE_PATH=/app/bundles/context-intelligence-server/bundle.md" in content
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_RUNTIME_STATE_PATH=/data/intelligence-runtime"
+        in content
     ), (
         "Dockerfile.intelligence must set "
-        "BUNDLE_PATH=/app/bundles/context-intelligence-server/bundle.md"
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_RUNTIME_STATE_PATH=/data/intelligence-runtime"
     )
+
+
+def test_env_routing_matrix() -> None:
+    content = _content()
+    assert (
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX=balanced" in content
+    ), (
+        "Dockerfile.intelligence must set "
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX=balanced"
+    )
+
+
+def test_no_env_amplifier_home() -> None:
+    content = _content()
+    # Must not have a bare AMPLIFIER_HOME= assignment
+    lines = content.splitlines()
+    for line in lines:
+        stripped = line.strip()
+        assert not (
+            stripped.startswith("AMPLIFIER_HOME=") or "AMPLIFIER_HOME=" in stripped
+        ), (
+            "Dockerfile.intelligence must NOT set AMPLIFIER_HOME= "
+            "(removed in new runtime composition)"
+        )
+
+
+def test_no_env_bundle_path() -> None:
+    content = _content()
+    # Must not have any BUNDLE_PATH= assignment
+    lines = content.splitlines()
+    for line in lines:
+        stripped = line.strip()
+        assert "BUNDLE_PATH=" not in stripped, (
+            "Dockerfile.intelligence must NOT set BUNDLE_PATH= "
+            "(no pre-baked bundle in new runtime composition)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +254,7 @@ def test_healthcheck_start_period_180s() -> None:
     content = _content()
     assert "--start-period=180s" in content, (
         "HEALTHCHECK must have --start-period=180s (cold start takes up to 3 minutes "
-        "while prepare downloads modules)"
+        "while service initialises)"
     )
 
 
@@ -231,11 +265,11 @@ def test_healthcheck_retries_60() -> None:
 
 def test_healthcheck_uses_python_urllib() -> None:
     content = _content()
-    # The healthcheck must use python -c with urllib (not curl or wget)
-    assert "python" in content.lower(), "HEALTHCHECK must use python urllib (not curl)"
-    assert "urllib" in content, (
-        "HEALTHCHECK must use python urllib for the health check"
-    )
+    lines = content.splitlines()
+    # Find the CMD line of the HEALTHCHECK — it contains "urllib" directly
+    hc_cmd_line = next((l for l in lines if "urllib" in l), "")
+    assert hc_cmd_line, "HEALTHCHECK must use python urllib for the health check"
+    assert "python" in hc_cmd_line, "HEALTHCHECK must use python urllib (not curl)"
     assert "curl" not in content.lower(), "HEALTHCHECK must not use curl"
 
 

@@ -25,10 +25,9 @@ class Settings(BaseSettings):
     max_sessions: int = 50
     blob_path: str = "/data/blobs"
     log_level: str = "INFO"
-    amplifier_home: str = "/data/context-intelligence-service"
-    bundle_path: str = ""
+    runtime_state_path: str = "/data/intelligence-runtime"
+    workspace_path: str = "/data/intelligence-runtime/workspace"
     routing_matrix: str = "balanced"
-    workspace: str = "context-intelligence-service"
 
 
 @lru_cache

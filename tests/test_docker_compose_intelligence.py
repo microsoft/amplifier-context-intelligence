@@ -1,19 +1,21 @@
-"""Tests for docker-compose.yml intelligence-service additions.
+"""Tests for docker-compose.yml intelligence-service configuration.
 
-TDD phase: These tests FAIL before docker-compose.yml is updated.
-
-Spec requirements:
-- Three services: context-intelligence-server, intelligence-service, neo4j
+TDD phase: These tests define the EXPECTED state after the docker-compose.yml update.
+Tests cover:
+- Four services: context-intelligence-server, intelligence-service, frontend, neo4j
 - intelligence-service: builds from Dockerfile.intelligence, port 8100
 - intelligence-service: depends_on context-intelligence-server (healthy)
-- intelligence-service: volumes context_intelligence_service_data + blob_data:ro
+- intelligence-service: volumes intelligence_runtime_state:/data/intelligence-runtime + blob_data:ro
 - intelligence-service: env_file config/secrets.env
-- intelligence-service: environment AMPLIFIER_HOME, BUNDLE_PATH, ROUTING_MATRIX=balanced,
-  AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_INGESTION_URL=http://context-intelligence-server:8000
+- intelligence-service: environment with AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ prefix
+  - AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_RUNTIME_STATE_PATH=/data/intelligence-runtime
+  - AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX=balanced
+  - AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_INGESTION_URL=http://context-intelligence-server:8000
+  - NO bare AMPLIFIER_HOME, BUNDLE_PATH, ROUTING_MATRIX, or prefixed AMPLIFIER_HOME/BUNDLE_PATH
 - intelligence-service: healthcheck python urllib on /health, 180s start_period, 60 retries
-- Four named volumes: blob_data, neo4j_data, log_data, context_intelligence_service_data
+- Four named volumes: blob_data, neo4j_data, log_data, intelligence_runtime_state
+  - NO context_intelligence_service_data volume
 - Network: context-intelligence (bridge)
-- Frontend NOT present
 """
 
 import pathlib
@@ -113,16 +115,19 @@ def test_intelligence_service_depends_on_server_healthy(compose: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# intelligence-service: volumes
+# intelligence-service: volumes (new naming)
 # ---------------------------------------------------------------------------
 
 
-def test_intelligence_service_has_service_data_volume(compose: dict) -> None:
+def test_intelligence_service_has_runtime_state_volume(compose: dict) -> None:
     svc = compose["services"]["intelligence-service"]
     volumes = svc.get("volumes", [])
     vol_str = "\n".join(str(v) for v in volumes)
-    assert "context_intelligence_service_data" in vol_str, (
-        "intelligence-service must mount context_intelligence_service_data volume"
+    assert "intelligence_runtime_state" in vol_str, (
+        "intelligence-service must mount intelligence_runtime_state volume"
+    )
+    assert "/data/intelligence-runtime" in vol_str, (
+        "intelligence_runtime_state must be mounted at /data/intelligence-runtime"
     )
 
 
@@ -134,6 +139,15 @@ def test_intelligence_service_has_blob_data_readonly(compose: dict) -> None:
     # Check for read-only mount
     assert ":ro" in vol_str or "read_only" in str(svc), (
         "intelligence-service blob_data volume must be read-only (:ro)"
+    )
+
+
+def test_intelligence_service_no_old_volume(compose: dict) -> None:
+    svc = compose["services"]["intelligence-service"]
+    volumes = svc.get("volumes", [])
+    vol_str = "\n".join(str(v) for v in volumes)
+    assert "context_intelligence_service_data" not in vol_str, (
+        "intelligence-service must NOT mount old context_intelligence_service_data volume"
     )
 
 
@@ -176,30 +190,28 @@ def _get_env_dict(svc: dict) -> dict:
     return env or {}
 
 
-def test_intelligence_service_env_amplifier_home(compose: dict) -> None:
+def test_intelligence_service_env_runtime_state_path(compose: dict) -> None:
     svc = compose["services"]["intelligence-service"]
     env = _get_env_dict(svc)
-    assert "AMPLIFIER_HOME" in env, (
-        "intelligence-service must set AMPLIFIER_HOME environment variable"
+    assert "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_RUNTIME_STATE_PATH" in env, (
+        "intelligence-service must set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_RUNTIME_STATE_PATH"
     )
-
-
-def test_intelligence_service_env_bundle_path(compose: dict) -> None:
-    svc = compose["services"]["intelligence-service"]
-    env = _get_env_dict(svc)
-    assert "BUNDLE_PATH" in env, (
-        "intelligence-service must set BUNDLE_PATH environment variable"
+    assert (
+        env["AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_RUNTIME_STATE_PATH"]
+        == "/data/intelligence-runtime"
+    ), (
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_RUNTIME_STATE_PATH must be /data/intelligence-runtime"
     )
 
 
 def test_intelligence_service_env_routing_matrix_balanced(compose: dict) -> None:
     svc = compose["services"]["intelligence-service"]
     env = _get_env_dict(svc)
-    assert "ROUTING_MATRIX" in env, (
-        "intelligence-service must set ROUTING_MATRIX environment variable"
+    assert "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX" in env, (
+        "intelligence-service must set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX"
     )
-    assert env["ROUTING_MATRIX"] == "balanced", (
-        "intelligence-service ROUTING_MATRIX must be set to 'balanced'"
+    assert env["AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX"] == "balanced", (
+        "intelligence-service AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX must be 'balanced'"
     )
 
 
@@ -214,6 +226,50 @@ def test_intelligence_service_env_ingestion_url(compose: dict) -> None:
     ), (
         "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_INGESTION_URL must point to http://context-intelligence-server:8000"
     )
+
+
+def test_intelligence_service_env_ci_server_url(compose: dict) -> None:
+    """intelligence-service must set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL for the telemetry hook."""
+    svc = compose["services"]["intelligence-service"]
+    env = _get_env_dict(svc)
+    assert "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL" in env, (
+        "intelligence-service must set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL "
+        "so the context-intelligence hook can POST events to the ingestion server"
+    )
+    assert "context-intelligence-server:8000" in str(
+        env["AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL"]
+    ), (
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL must point to "
+        "http://context-intelligence-server:8000"
+    )
+
+
+def test_intelligence_service_env_ci_workspace(compose: dict) -> None:
+    """intelligence-service must set AMPLIFIER_CONTEXT_INTELLIGENCE_WORKSPACE for graph scoping."""
+    svc = compose["services"]["intelligence-service"]
+    env = _get_env_dict(svc)
+    assert "AMPLIFIER_CONTEXT_INTELLIGENCE_WORKSPACE" in env, (
+        "intelligence-service must set AMPLIFIER_CONTEXT_INTELLIGENCE_WORKSPACE "
+        "to scope telemetry data in the graph"
+    )
+    assert env["AMPLIFIER_CONTEXT_INTELLIGENCE_WORKSPACE"] == "intelligence-runtime", (
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_WORKSPACE must be 'intelligence-runtime'"
+    )
+
+
+def test_intelligence_service_env_no_old_vars(compose: dict) -> None:
+    """Verify old/disallowed env vars are NOT present."""
+    svc = compose["services"]["intelligence-service"]
+    env = _get_env_dict(svc)
+    forbidden = [
+        "AMPLIFIER_HOME",
+        "BUNDLE_PATH",
+        "ROUTING_MATRIX",
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_AMPLIFIER_HOME",
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_BUNDLE_PATH",
+    ]
+    found = [k for k in forbidden if k in env]
+    assert not found, f"intelligence-service must NOT set these env vars: {found}"
 
 
 # ---------------------------------------------------------------------------
@@ -274,10 +330,17 @@ def test_compose_four_named_volumes(compose: dict) -> None:
     )
 
 
-def test_compose_volume_context_intelligence_service_data(compose: dict) -> None:
+def test_compose_volume_intelligence_runtime_state(compose: dict) -> None:
     volumes = compose.get("volumes", {})
-    assert "context_intelligence_service_data" in volumes, (
-        "docker-compose.yml must declare context_intelligence_service_data volume"
+    assert "intelligence_runtime_state" in volumes, (
+        "docker-compose.yml must declare intelligence_runtime_state volume"
+    )
+
+
+def test_compose_no_old_volume(compose: dict) -> None:
+    volumes = compose.get("volumes", {})
+    assert "context_intelligence_service_data" not in volumes, (
+        "docker-compose.yml must NOT declare old context_intelligence_service_data volume"
     )
 
 

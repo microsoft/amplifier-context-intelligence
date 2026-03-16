@@ -86,6 +86,8 @@ This starts 4 services:
 | **Frontend** | :3000 | A2UI SPA (embedded at :8000/explorer) |
 | **Neo4j** | [localhost:7474](http://localhost:7474) | Property graph (bolt on :7687, no auth) |
 
+All services are configured with `restart: unless-stopped` -- they automatically restart on crash or Docker daemon restart. They only stay down if you explicitly stop them with `docker compose stop` or `docker compose down`.
+
 The intelligence service has a 180-second startup period on first boot while it downloads and prepares Amplifier modules.
 
 ### 4. Access the dashboard
@@ -235,9 +237,9 @@ All settings use the `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_` prefix:
 |----------|---------|-------------|
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_BUNDLE_PATH` | *(empty)* | Path to bundle.md (empty = stub mode) |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX` | `balanced` | Provider routing strategy |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_AMPLIFIER_HOME` | `/data/context-intelligence-service` | Amplifier data root |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_RUNTIME_STATE_PATH` | `/data/intelligence-runtime` | Runtime state root |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_INGESTION_URL` | `http://context-intelligence-server:8000` | Ingestion server URL |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_WORKSPACE` | `context-intelligence-service` | Session workspace name |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_WORKSPACE` | `intelligence-runtime` | Session workspace name |
 
 ---
 
@@ -250,7 +252,7 @@ The stack uses Docker named volumes for all persistent data:
 | `neo4j_data` | `/data` (neo4j) | Graph database |
 | `blob_data` | `/data/blobs` (ingestion server, rw) | Event blob JSON files |
 | `log_data` | `/data/logs` (ingestion server) | Rotating JSONL log files |
-| `context_intelligence_service_data` | `/data/context-intelligence-service` (intelligence service) | Amplifier module cache |
+| `intelligence_runtime_state` | `/data/intelligence-runtime` (intelligence service) | Amplifier module cache and runtime state |
 
 Graph data and blob data survive container rebuilds and restarts. The ingestion server's in-memory counters (completed sessions, recent events) reset on process restart -- the Neo4j graph is the durable record.
 

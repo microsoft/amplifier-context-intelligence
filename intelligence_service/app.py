@@ -15,7 +15,7 @@ from intelligence_service.a2ui_bridge import (
 )
 from intelligence_service.config import get_settings
 from intelligence_service.drain import DrainManager
-from intelligence_service.session_manager import SessionManager, StubSessionManager
+from intelligence_service.session_manager import StubSessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -29,29 +29,36 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
         timeout_seconds=settings.drain_timeout_seconds
     )
 
-    if settings.bundle_path:
-        # Lazy imports — only needed when bundle_path is configured so that
+    try:
+        # Lazy imports — only needed for real Amplifier runtime so that
         # dev/test mode never requires amplifier packages to be installed.
-        from intelligence_service.amplifier_app import AmplifierApp  # noqa: PLC0415
+        from intelligence_service.amplifier_intelligence_runtime import (  # noqa: PLC0415
+            AmplifierIntelligenceRuntime,
+        )
         from intelligence_service.amplifier_session_manager import (  # noqa: PLC0415
             AmplifierSessionManager,
         )
 
-        amplifier_app = AmplifierApp(
-            bundle_path=settings.bundle_path,
+        runtime = AmplifierIntelligenceRuntime(
             routing_matrix=settings.routing_matrix,
-            amplifier_home=settings.amplifier_home,
+            runtime_state_path=settings.runtime_state_path,
         )
-        await amplifier_app.startup()
-        application.state.amplifier_app = amplifier_app
+        await runtime.startup()
+        application.state.amplifier_app = runtime
         application.state.session_manager = AmplifierSessionManager(
-            amplifier_app=amplifier_app,
-            workspace=settings.workspace,
-            amplifier_home=settings.amplifier_home,
+            amplifier_app=runtime,
+            workspace_path=settings.workspace_path,
         )
-    else:
+        application.state.runtime_connected = True
+    except Exception:  # noqa: BLE001
+        logger.exception("Runtime startup failed")
+        logger.error(
+            "SERVICE DEGRADED: Amplifier runtime is not connected. "
+            "AI sessions are unavailable. Check GH_TOKEN and network."
+        )
         application.state.amplifier_app = None
         application.state.session_manager = StubSessionManager()
+        application.state.runtime_connected = False
 
     yield
 
@@ -75,27 +82,16 @@ app = FastAPI(title="Intelligence Service", lifespan=lifespan)
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Return service health status."""
-    return {"status": "ok"}
-
-
-@app.post("/admin/reload-bundle")
-async def reload_bundle() -> dict[str, str]:
-    """Reload the Amplifier bundle, or return skipped in stub mode."""
-    amplifier_app = app.state.amplifier_app
-    if amplifier_app is None:
-        return {"status": "skipped"}
-    try:
-        await amplifier_app.reload()
-        return {"status": "reloaded"}
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "error", "message": str(exc)}
+    if getattr(app.state, "runtime_connected", False):
+        return {"status": "ok"}
+    return {"status": "disconnected"}
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     """WebSocket endpoint wiring together session manager, A2UI bridge, and drain manager."""
     drain: DrainManager = websocket.app.state.drain
-    session_manager: SessionManager = websocket.app.state.session_manager
+    session_manager = websocket.app.state.session_manager
 
     if not drain.accepting:
         await websocket.close(code=1013)
@@ -122,6 +118,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
             elif msg.msg_type == "message":
                 text = msg.payload.get("text", "")
+                if not getattr(websocket.app.state, "runtime_connected", False):
+                    await websocket.send_json(
+                        format_error(
+                            session_id,
+                            "Service is disconnected — Amplifier runtime failed to start. "
+                            "Check server logs for details.",
+                        )
+                    )
+                    continue
                 try:
                     result = await session_manager.execute(session_id, text)  # type: ignore[attr-defined]
                     await websocket.send_json(

@@ -26,12 +26,10 @@ class AmplifierSessionManager:
         self,
         *,
         amplifier_app: Any,
-        workspace: str,
-        amplifier_home: str,
+        workspace_path: str,
     ) -> None:
         self._amplifier_app = amplifier_app
-        self._workspace = workspace
-        self._amplifier_home = amplifier_home
+        self._workspace_path = workspace_path
         self._sessions: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
@@ -48,7 +46,7 @@ class AmplifierSessionManager:
         session_id = str(uuid.uuid4())
         session = await self._amplifier_app.prepared.create_session(
             session_id=session_id,
-            session_cwd=Path(f"{self._amplifier_home}/{self._workspace}"),
+            session_cwd=Path(self._workspace_path),
         )
         self._sessions[session_id] = session
         return session_id

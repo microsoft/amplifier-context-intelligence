@@ -7,31 +7,32 @@ from unittest.mock import AsyncMock, patch
 from intelligence_service.app import app
 
 
-async def test_health_returns_200_with_status_ok(client: httpx.AsyncClient) -> None:
-    """GET /health returns 200 with {'status': 'ok'}."""
+async def test_health_returns_disconnected_in_stub_mode(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /health returns 200 with {'status': 'disconnected'} when runtime failed to start.
+
+    In test environments amplifier_foundation is not installed, so the lifespan
+    catches the startup failure and falls back to stub/disconnected mode.
+    """
     response = await client.get("/health")
 
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "ok"
+    assert data["status"] == "disconnected"
 
 
-async def test_reload_bundle_stub_mode_returns_skipped(
+async def test_health_returns_ok_when_runtime_connected(
     client: httpx.AsyncClient,
 ) -> None:
-    """POST /admin/reload-bundle returns {'status': 'skipped'} in stub mode."""
-    response = await client.post("/admin/reload-bundle")
-
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "skipped"
-
-
-async def test_reload_bundle_get_not_allowed(client: httpx.AsyncClient) -> None:
-    """GET /admin/reload-bundle returns 405 Method Not Allowed."""
-    response = await client.get("/admin/reload-bundle")
-
-    assert response.status_code == 405
+    """GET /health returns {'status': 'ok'} when runtime_connected flag is True."""
+    app.state.runtime_connected = True
+    try:
+        response = await client.get("/health")
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+    finally:
+        app.state.runtime_connected = False
 
 
 # ---------------------------------------------------------------------------
@@ -50,16 +51,20 @@ def test_ws_connect_receives_session_created() -> None:
     assert "session_id" in data
 
 
-def test_ws_message_receives_response() -> None:
-    """Sending a message yields a response message whose content echoes the text."""
+def test_ws_message_receives_disconnected_error_in_stub_mode() -> None:
+    """Sending a message when disconnected yields an error about the service being disconnected.
+
+    In test environments amplifier_foundation is not installed, so the lifespan
+    catches the startup failure and the service is in disconnected mode.
+    """
     with TestClient(app) as client:
         with client.websocket_connect("/ws") as ws:
             ws.receive_json()  # consume session_created
             ws.send_json({"type": "message", "text": "hello"})
             data = ws.receive_json()
 
-    assert data["type"] == "response"
-    assert "hello" in data["content"]
+    assert data["type"] == "error"
+    assert "disconnected" in data["message"].lower()
 
 
 def test_ws_new_session_returns_different_id() -> None:
@@ -157,19 +162,24 @@ def test_lifespan_shutdown_awaits_close_all() -> None:
 def test_ws_execute_error_sends_error_and_keeps_connection() -> None:
     """When execute() raises, the client receives an error message and the WS stays open."""
     with TestClient(app) as client:
-        with patch.object(
-            app.state.session_manager,
-            "execute",
-            new_callable=AsyncMock,
-            side_effect=RuntimeError("LLM timeout"),
-        ):
-            with client.websocket_connect("/ws") as ws:
-                ws.receive_json()  # consume session_created
-                ws.send_json({"type": "message", "text": "hello"})
-                data = ws.receive_json()
-                assert data["type"] == "error"
-                assert "LLM timeout" in data["message"]
-                # WS is still open — send another message
-                ws.send_json({"type": "action", "componentId": "test-1"})
-                ack = ws.receive_json()
-                assert ack["type"] == "action_ack"
+        # runtime_connected must be True so the handler reaches execute()
+        app.state.runtime_connected = True
+        try:
+            with patch.object(
+                app.state.session_manager,
+                "execute",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("LLM timeout"),
+            ):
+                with client.websocket_connect("/ws") as ws:
+                    ws.receive_json()  # consume session_created
+                    ws.send_json({"type": "message", "text": "hello"})
+                    data = ws.receive_json()
+                    assert data["type"] == "error"
+                    assert "LLM timeout" in data["message"]
+                    # WS is still open — send another message
+                    ws.send_json({"type": "action", "componentId": "test-1"})
+                    ack = ws.receive_json()
+                    assert ack["type"] == "action_ack"
+        finally:
+            app.state.runtime_connected = False

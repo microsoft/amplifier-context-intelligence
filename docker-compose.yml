@@ -35,18 +35,16 @@ services:
       context-intelligence-server:
         condition: service_healthy
     volumes:
-      - context_intelligence_service_data:/data/context-intelligence-service
+      - intelligence_runtime_state:/data/intelligence-runtime
       - blob_data:/data/blobs:ro
     env_file:
       - config/secrets.env
     environment:
-      AMPLIFIER_HOME: /data/context-intelligence-service
-      BUNDLE_PATH: /app/bundles/context-intelligence-server/bundle.md
-      ROUTING_MATRIX: balanced
-      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_AMPLIFIER_HOME: /data/context-intelligence-service
-      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_BUNDLE_PATH: /app/bundles/context-intelligence-server/bundle.md
+      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_RUNTIME_STATE_PATH: /data/intelligence-runtime
       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX: balanced
       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_INGESTION_URL: http://context-intelligence-server:8000
+      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL: http://context-intelligence-server:8000
+      AMPLIFIER_CONTEXT_INTELLIGENCE_WORKSPACE: intelligence-runtime
     healthcheck:
       test:
         - "CMD"
@@ -103,7 +101,7 @@ volumes:
   blob_data:
   neo4j_data:
   log_data:
-  context_intelligence_service_data:
+  intelligence_runtime_state:
 
 networks:
   context-intelligence:

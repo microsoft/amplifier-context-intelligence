@@ -89,7 +89,7 @@ class TestSystemArchitectureDot:
         assert "blob_data" in content
         assert "neo4j_data" in content
         assert "log_data" in content
-        assert "context_intelligence_service_data" in content
+        assert "intelligence_runtime_state" in content
 
     def test_contains_service_dependencies(self):
         content = _load_dot("system-architecture.dot")

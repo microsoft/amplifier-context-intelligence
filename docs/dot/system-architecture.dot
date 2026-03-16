@@ -41,7 +41,7 @@ digraph system_architecture {
         color="#336633"
 
         intelligence [
-            label="intelligence-service\n:8100\n─────────────────\nGET  /health\nPOST /admin/reload-bundle\nWS   /ws\n─────────────────\nvol: context_intelligence_service_data:/data/context-intelligence-service (rw)\nvol: blob_data:/data/blobs (ro)\nenv_file: config/secrets.env\nhealthcheck: python urllib :8100/health\nstart_period: 180s  retries: 60"
+            label="intelligence-service\n:8100\n─────────────────\nGET  /health\nPOST /admin/reload-bundle\nWS   /ws\n─────────────────\nvol: intelligence_runtime_state:/data/intelligence-runtime (rw)\nvol: blob_data:/data/blobs (ro)\nenv_file: config/secrets.env\nhealthcheck: python urllib :8100/health\nstart_period: 180s  retries: 60"
             fillcolor="#b3e6b3"
             shape=box
         ]
@@ -65,7 +65,7 @@ digraph system_architecture {
     blob_data    [label="blob_data\n(named volume)"                          shape=folder fillcolor="#f5f5f5"]
     neo4j_data   [label="neo4j_data\n(named volume)"                         shape=folder fillcolor="#f5f5f5"]
     log_data     [label="log_data\n(named volume)"                           shape=folder fillcolor="#f5f5f5"]
-    ci_svc_data  [label="context_intelligence_service_data\n(named volume)"  shape=folder fillcolor="#f5f5f5"]
+    ci_svc_data  [label="intelligence_runtime_state\n(named volume)"  shape=folder fillcolor="#f5f5f5"]
 
     // ── External actors ─────────────────────────────────────────────────────
 

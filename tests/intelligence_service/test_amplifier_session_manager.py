@@ -12,7 +12,8 @@ from intelligence_service.session_manager import SessionManager
 def make_manager(mock_app: MagicMock) -> AmplifierSessionManager:
     """Return an AmplifierSessionManager with standard test configuration."""
     return AmplifierSessionManager(
-        amplifier_app=mock_app, workspace="myproject", amplifier_home="/data/home"
+        amplifier_app=mock_app,
+        workspace_path="/data/runtime/workspace",
     )
 
 
@@ -62,7 +63,7 @@ async def test_create_session_delegates_to_prepared() -> None:
 
     mock_app.prepared.create_session.assert_called_once_with(
         session_id=session_id,
-        session_cwd=Path("/data/home/myproject"),
+        session_cwd=Path("/data/runtime/workspace"),
     )
 
 
@@ -252,26 +253,25 @@ async def test_close_all_clears_all_sessions() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 14: create_session uses amplifier_home for cwd
+# Test 14: create_session uses workspace_path directly
 # ---------------------------------------------------------------------------
 
 
-async def test_create_session_uses_amplifier_home_for_cwd() -> None:
-    """create_session() builds session_cwd from amplifier_home, not a hardcoded path."""
+async def test_create_session_uses_workspace_path_directly() -> None:
+    """create_session() uses workspace_path directly as session_cwd."""
     mock_app = MagicMock()
     mock_session = MagicMock()
     mock_app.prepared.create_session = AsyncMock(return_value=mock_session)
 
     manager = AmplifierSessionManager(
         amplifier_app=mock_app,
-        workspace="myproject",
-        amplifier_home="/custom/data/dir",
+        workspace_path="/custom/workspace/dir",
     )
     session_id = await manager.create_session()
 
     mock_app.prepared.create_session.assert_called_once_with(
         session_id=session_id,
-        session_cwd=Path("/custom/data/dir/myproject"),
+        session_cwd=Path("/custom/workspace/dir"),
     )
 
 
