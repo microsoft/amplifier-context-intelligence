@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,7 @@ except ImportError:
         """Fallback Bundle stub for environments without amplifier_foundation."""
 
         name: str = ""
+        providers: list = _field(default_factory=list)
         hooks: list = _field(default_factory=list)
 
     @dataclass
@@ -51,6 +53,70 @@ WELL_KNOWN_BUNDLES: dict[str, str] = {
 }
 
 _logger = logging.getLogger("intelligence_service.runtime")
+
+# ---------------------------------------------------------------------------
+# Provider detection from environment
+# ---------------------------------------------------------------------------
+_PROVIDER_MAP: list[tuple[str, str, str]] = [
+    # (env_var, module_id, default_model)
+    ("GOOGLE_API_KEY", "provider-gemini", "gemini-2.0-flash"),
+    ("ANTHROPIC_API_KEY", "provider-anthropic", "claude-sonnet-4-5"),
+    ("OPENAI_API_KEY", "provider-openai", "gpt-4o"),
+    ("AZURE_OPENAI_API_KEY", "provider-azure-openai", "gpt-4o"),
+    ("GITHUB_TOKEN", "provider-github-copilot", "gpt-4o"),
+]
+
+
+def _detect_providers() -> list[dict[str, Any]]:
+    """Build provider configs for each API key found in the environment."""
+    providers: list[dict[str, Any]] = []
+    for env_var, module_id, default_model in _PROVIDER_MAP:
+        if os.environ.get(env_var):
+            providers.append(
+                {
+                    "module": module_id,
+                    "config": {"default_model": default_model},
+                }
+            )
+    return providers
+
+
+# ---------------------------------------------------------------------------
+# Env-var expansion (replicates amplifier_app_cli expand_env_vars logic)
+# ---------------------------------------------------------------------------
+_ENV_PATTERN = re.compile(r"\$\{([^}:]+)(?::([^}]*))?\}")
+
+
+def _expand_env_vars(value: Any) -> Any:
+    """Expand ``${VAR}`` and ``${VAR:default}`` in nested config values.
+
+    The Amplifier CLI normally handles this during config loading, but the
+    intelligence service uses ``amplifier_foundation`` directly (bypassing
+    the CLI layer), so we replicate the expansion here.
+    """
+    if isinstance(value, str):
+
+        def _replace(m: re.Match[str]) -> str:
+            var_name = m.group(1)
+            default = m.group(2)
+            return os.environ.get(var_name, default if default is not None else "")
+
+        return _ENV_PATTERN.sub(_replace, value)
+    if isinstance(value, dict):
+        return {k: _expand_env_vars(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_env_vars(item) for item in value]
+    return value
+
+
+def _expand_bundle_hook_configs(bundle: Any) -> None:
+    """Expand env-var templates in a bundle's hook configs in-place."""
+    hooks = getattr(bundle, "hooks", None)
+    if not hooks:
+        return
+    for hook in hooks:
+        if isinstance(hook, dict) and "config" in hook:
+            hook["config"] = _expand_env_vars(hook["config"])
 
 
 class AmplifierIntelligenceRuntime:
@@ -105,16 +171,29 @@ class AmplifierIntelligenceRuntime:
         server_bundle = await load_bundle(
             "context-intelligence-server", registry=registry
         )
+        _expand_bundle_hook_configs(server_bundle)
         composed_with_server = base_bundle.compose(server_bundle)
 
         # Phase 4: Load context-intelligence (telemetry hook)
         _logger.debug("Loading context-intelligence bundle (telemetry)")
         telemetry_bundle = await load_bundle("context-intelligence", registry=registry)
+        _expand_bundle_hook_configs(telemetry_bundle)
         composed_with_telemetry = composed_with_server.compose(telemetry_bundle)
 
-        # Phase 5: Create runtime-config Bundle with hooks-routing and compose
+        # Phase 5: Create runtime-config Bundle with providers + hooks-routing
+        providers = _detect_providers()
+        if providers:
+            _logger.info(
+                "Detected %d provider(s): %s",
+                len(providers),
+                ", ".join(p["module"] for p in providers),
+            )
+        else:
+            _logger.warning("No provider API keys found in environment")
+
         runtime_config = Bundle(
             name="runtime-config",
+            providers=providers,
             hooks=[
                 {
                     "module": "hooks-routing",
