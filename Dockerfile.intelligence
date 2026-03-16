@@ -27,9 +27,9 @@ COPY amplifier-bundle-context-intelligence-server/ /app/bundles/context-intellig
 
 # Runtime environment
 ENV AMPLIFIER_HOME=/data/context-intelligence-service \
-    INTEL_SERVICE_AMPLIFIER_HOME=/data/context-intelligence-service \
-    INTEL_SERVICE_BUNDLE_PATH=/app/bundles/context-intelligence-server/bundle.md \
-    INTEL_SERVICE_ROUTING_MATRIX=balanced \
+    AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_AMPLIFIER_HOME=/data/context-intelligence-service \
+    AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_BUNDLE_PATH=/app/bundles/context-intelligence-server/bundle.md \
+    AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX=balanced \
     PYTHONUNBUFFERED=1
 
 EXPOSE 8100
