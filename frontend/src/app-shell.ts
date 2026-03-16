@@ -28,7 +28,7 @@ export class AppShell extends LitElement {
       padding: 0 1rem;
       box-sizing: border-box;
       color: var(--foreground, oklch(0.93 0.010 250));
-      background: var(--background, oklch(0.13 0.012 260));
+      background: var(--background, oklch(0.145 0.005 255));
       font-family: 'Outfit', system-ui, sans-serif;
     }
 
@@ -55,13 +55,13 @@ export class AppShell extends LitElement {
       width: 28px;
       height: 28px;
       border-radius: 6px;
-      background: var(--primary, oklch(0.68 0.18 265));
+      background: var(--primary, oklch(0.696 0.17 162));
       display: flex;
       align-items: center;
       justify-content: center;
       font-size: 1rem;
       font-weight: 700;
-      color: oklch(0.13 0.012 260);
+      color: oklch(0.145 0.005 255);
       flex-shrink: 0;
     }
 
@@ -192,8 +192,8 @@ export class AppShell extends LitElement {
       padding: 0.375rem 0.875rem;
       border-radius: 6px;
       border: none;
-      background: var(--primary, oklch(0.68 0.18 265));
-      color: oklch(0.13 0.012 260);
+      background: var(--primary, oklch(0.696 0.17 162));
+      color: oklch(0.145 0.005 255);
       font-family: 'Outfit', system-ui, sans-serif;
       font-size: 0.82rem;
       font-weight: 600;

@@ -57,9 +57,9 @@ export class SessionControls extends LitElement {
     .new-session-btn {
       padding: 0.375rem 0.75rem;
       border-radius: 6px;
-      border: 1px solid var(--primary, oklch(0.68 0.18 265));
-      background: color-mix(in oklch, var(--primary, oklch(0.68 0.18 265)) 12%, transparent);
-      color: var(--primary, oklch(0.68 0.18 265));
+      border: 1px solid var(--primary, oklch(0.696 0.17 162));
+      background: color-mix(in oklch, var(--primary, oklch(0.696 0.17 162)) 12%, transparent);
+      color: var(--primary, oklch(0.696 0.17 162));
       font-size: 0.8rem;
       font-family: inherit;
       cursor: pointer;
@@ -67,7 +67,7 @@ export class SessionControls extends LitElement {
     }
 
     .new-session-btn:hover:not(:disabled) {
-      background: color-mix(in oklch, var(--primary, oklch(0.68 0.18 265)) 22%, transparent);
+      background: color-mix(in oklch, var(--primary, oklch(0.696 0.17 162)) 22%, transparent);
     }
 
     .new-session-btn:disabled {
