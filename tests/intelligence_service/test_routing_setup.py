@@ -13,6 +13,7 @@ from intelligence_service.amplifier_intelligence_runtime import (
     ROUTING_ROLES,
     _build_provider_instances,
     _get_available_providers,
+    _model_suffix,
 )
 
 
@@ -157,6 +158,29 @@ class TestRoutingRoles:
                     f"not found in PROVIDERS dict. "
                     f"Known providers: {set(PROVIDERS.keys())}"
                 )
+
+
+class TestModelSuffix:
+    """Tests for the _model_suffix() helper function."""
+
+    @pytest.mark.parametrize(
+        "model,expected",
+        [
+            ("claude-sonnet-4-5", "sonnet"),
+            ("claude-haiku-4-5", "haiku"),
+            ("gemini-2.5-flash", "flash"),
+            (
+                "gemini-2.0-flash-preview-image-generation",
+                "flash-preview-image-generation",
+            ),
+        ],
+    )
+    def test_extracts_correct_suffix(self, model: str, expected: str) -> None:
+        """_model_suffix returns the expected suffix for known model names."""
+        assert _model_suffix(model) == expected, (
+            f"_model_suffix({model!r}) expected {expected!r}, "
+            f"got {_model_suffix(model)!r}"
+        )
 
 
 class TestBuildProviderInstances:

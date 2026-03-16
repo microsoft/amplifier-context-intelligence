@@ -173,6 +173,7 @@ ROUTING_ROLES: dict[str, list[dict[str, Any]]] = {
     "image-gen": [
         {
             "provider": "gemini",
+            # exact match — no wildcard variants exist for image generation
             "model": "gemini-2.0-flash-preview-image-generation",
             "default_model": "gemini-2.0-flash-preview-image-generation",
         },
@@ -257,7 +258,7 @@ def _build_provider_instances(available: set[str]) -> list[dict[str, Any]]:
     seen: set[tuple[str, str]] = set()
     instances: list[dict[str, Any]] = []
 
-    for _role, candidates in ROUTING_ROLES.items():
+    for candidates in ROUTING_ROLES.values():
         for candidate in candidates:
             provider = candidate["provider"]
             default_model = candidate["default_model"]
