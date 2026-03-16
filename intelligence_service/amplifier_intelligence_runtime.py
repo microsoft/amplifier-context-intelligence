@@ -63,7 +63,7 @@ _PROVIDER_MAP: list[tuple[str, str, str, str]] = [
         "GOOGLE_API_KEY",
         "provider-gemini",
         "git+https://github.com/microsoft/amplifier-module-provider-gemini@main",
-        "gemini-2.0-flash",
+        "gemini-2.5-flash",
     ),
     (
         "ANTHROPIC_API_KEY",

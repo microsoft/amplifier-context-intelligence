@@ -25,6 +25,8 @@ dependencies = [
     "amplifier-module-context-simple @ git+https://github.com/microsoft/amplifier-module-context-simple@main",
     "aiohttp>=3.9.0",
     "rich>=13.0.0",
+    "beautifulsoup4>=4.12.0",
+    "mcp>=1.0.0",
 ]
 
 [dependency-groups]
