@@ -21,6 +21,7 @@ except ImportError:
         """Fallback Bundle stub for environments without amplifier_foundation."""
 
         name: str = ""
+        session: dict = _field(default_factory=dict)
         hooks: list = _field(default_factory=list)
 
     async def load_bundle(path: str) -> Any:  # type: ignore[misc]
@@ -55,6 +56,16 @@ class AmplifierApp:
         loaded = await load_bundle(self._bundle_path)
         routing_overlay = Bundle(
             name="routing-config",
+            session={
+                "orchestrator": {
+                    "module": "loop-basic",
+                    "source": "git+https://github.com/microsoft/amplifier-module-loop-basic@main",
+                },
+                "context": {
+                    "module": "context-simple",
+                    "source": "git+https://github.com/microsoft/amplifier-module-context-simple@main",
+                },
+            },
             hooks=[
                 {
                     "module": "hooks-routing",
