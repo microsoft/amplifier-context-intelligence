@@ -55,14 +55,21 @@ export class AppShell extends LitElement {
       width: 28px;
       height: 28px;
       border-radius: 6px;
-      background: var(--primary, oklch(0.696 0.17 162));
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 1rem;
-      font-weight: 700;
-      color: oklch(0.145 0.005 255);
       flex-shrink: 0;
+    }
+
+    .theme-toggle {
+      background: none;
+      border: 1px solid var(--border, oklch(0.3 0.006 255));
+      color: var(--foreground, oklch(0.985 0.002 255));
+      border-radius: 6px;
+      padding: 4px 8px;
+      cursor: pointer;
+      font-size: 1rem;
+      transition: background 0.15s ease;
+    }
+    .theme-toggle:hover {
+      background: var(--muted, oklch(0.245 0.008 255));
     }
 
     .brand-text {
@@ -230,6 +237,7 @@ export class AppShell extends LitElement {
   @state() private sessionId: string | undefined;
   @state() private bridgeResponse: unknown = null;
   @state() private hasSurfaces: boolean = false;
+  @state() private isDark = document.documentElement.classList.contains('dark');
 
   // ── DOM references ──────────────────────────────────────────────────────────
 
@@ -321,6 +329,12 @@ export class AppShell extends LitElement {
     this.client.sendAction(sourceComponentId, name, context);
   }
 
+  private toggleTheme(): void {
+    const isDark = document.documentElement.classList.toggle('dark');
+    localStorage.setItem('theme', isDark ? 'dark' : 'light');
+    this.isDark = isDark;
+  }
+
   // ── Render ──────────────────────────────────────────────────────────────────
 
   override render() {
@@ -329,7 +343,7 @@ export class AppShell extends LitElement {
     return html`
       <nav class="header">
         <a class="brand" href="/">
-          <div class="brand-logo">CI</div>
+          <img class="brand-logo" src="https://avatars.githubusercontent.com/u/240397093" alt="Amplifier" />
           <div class="brand-text">
             <span class="brand-name">Context Intelligence</span>
             <span class="brand-sub">Explorer</span>
@@ -338,6 +352,7 @@ export class AppShell extends LitElement {
         <div class="nav-links">
           <a href="/dashboard">Dashboard</a>
           <a href="/api">API</a>
+          <button class="theme-toggle" @click=${this.toggleTheme}>${this.isDark ? '☀' : '☾'}</button>
         </div>
       </nav>
 

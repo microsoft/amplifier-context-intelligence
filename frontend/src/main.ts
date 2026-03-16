@@ -1,8 +1,8 @@
 // Context Intelligence Explorer - Main Entry Point
 // Registers all custom elements as side effects
 
-// Catalog components
-// (catalog components will be imported here as they are created)
+// Global design tokens (light/dark mode CSS custom properties)
+import './theme/tokens.css';
 
 // App components
 import './app-shell.js';

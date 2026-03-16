@@ -59,12 +59,11 @@ body {
 
 /* ── Dark mode tokens ─────────────────────────────────────────────────────────
  *
- * Dark mode is the default theme for the explorer.
- * Applied via class on <html>/.dark, and also as :root override so that
- * the explorer loads in dark mode without requiring a class toggle.
+ * Applied only when the .dark class is present on <html>.
+ * The index.html theme-detection script sets this class on first load
+ * based on localStorage or system preference (prefers-color-scheme: dark).
  */
 
-:root,
 .dark {
   /* Surface — matched to ingestion server theme */
   --background:  oklch(0.145 0.005 255);
