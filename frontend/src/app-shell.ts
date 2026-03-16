@@ -32,6 +32,11 @@ export class AppShell extends LitElement {
       font-family: 'Outfit', system-ui, sans-serif;
     }
 
+    :host([in-iframe]) {
+      max-width: 100%;
+      margin: 0;
+    }
+
     /* ── Header ─────────────────────────────────────────────────────────── */
 
     .header {
@@ -298,6 +303,7 @@ export class AppShell extends LitElement {
 
   override connectedCallback(): void {
     super.connectedCallback();
+    if (this.inIframe) this.setAttribute('in-iframe', '');
     this.client.connect();
   }
 

@@ -47,8 +47,8 @@ def test_ws_connect_receives_session_created() -> None:
         with client.websocket_connect("/ws") as ws:
             data = ws.receive_json()
 
-    assert data["type"] == "session_created"
-    assert "session_id" in data
+    assert data["type"] == "sessionCreated"
+    assert "sessionId" in data
 
 
 def test_ws_message_receives_disconnected_error_in_stub_mode() -> None:
@@ -71,13 +71,13 @@ def test_ws_new_session_returns_different_id() -> None:
     """Sending new_session yields a session_created with a different session_id."""
     with TestClient(app) as client:
         with client.websocket_connect("/ws") as ws:
-            first = ws.receive_json()  # initial session_created
-            original_id = first["session_id"]
+            first = ws.receive_json()  # initial sessionCreated
+            original_id = first["sessionId"]
             ws.send_json({"type": "new_session"})
             data = ws.receive_json()
 
-    assert data["type"] == "session_created"
-    assert data["session_id"] != original_id
+    assert data["type"] == "sessionCreated"
+    assert data["sessionId"] != original_id
 
 
 def test_ws_action_receives_ack() -> None:
@@ -88,8 +88,8 @@ def test_ws_action_receives_ack() -> None:
             ws.send_json({"type": "action", "componentId": "graph-1"})
             data = ws.receive_json()
 
-    assert data["type"] == "action_ack"
-    assert data["component_id"] == "graph-1"
+    assert data["type"] == "actionAck"
+    assert data["actionId"] == "graph-1"
 
 
 def test_ws_unknown_type_receives_error() -> None:
@@ -180,6 +180,6 @@ def test_ws_execute_error_sends_error_and_keeps_connection() -> None:
                     # WS is still open — send another message
                     ws.send_json({"type": "action", "componentId": "test-1"})
                     ack = ws.receive_json()
-                    assert ack["type"] == "action_ack"
+                    assert ack["type"] == "actionAck"
         finally:
             app.state.runtime_connected = False

@@ -25,6 +25,7 @@ body {
   min-height: 100%;
   font-family: 'Outfit', system-ui, sans-serif;
   font-feature-settings: 'liga' 1, 'calt' 1, 'kern' 1;
+  background: var(--background);
 }
 
 /* ── Light mode tokens (:root base) ─────────────────────────────────────────── */

@@ -50,7 +50,7 @@ def test_ws_message_dispatches_via_execute_when_available() -> None:
                 data = ws.receive_json()
 
             assert data["type"] == "response"
-            assert data["content"] == "amplifier says hello"
+            assert data["payload"] == "amplifier says hello"
             mock_sm.execute.assert_awaited_once_with(
                 "fixed-session-id", "ping from test"
             )

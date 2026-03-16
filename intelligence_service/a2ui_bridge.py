@@ -28,10 +28,10 @@ def format_session_created(
     session_id: str,
     message: str = "Session created.",
 ) -> dict[str, Any]:
-    """Return a session_created outbound message."""
+    """Return a sessionCreated outbound message."""
     return {
-        "type": "session_created",
-        "session_id": session_id,
+        "type": "sessionCreated",
+        "sessionId": session_id,
         "message": message,
     }
 
@@ -40,17 +40,17 @@ def format_response(session_id: str, content: str) -> dict[str, Any]:
     """Return a response outbound message."""
     return {
         "type": "response",
-        "session_id": session_id,
-        "content": content,
+        "sessionId": session_id,
+        "payload": content,
     }
 
 
 def format_action_ack(session_id: str, component_id: str) -> dict[str, Any]:
-    """Return an action_ack outbound message."""
+    """Return an actionAck outbound message."""
     return {
-        "type": "action_ack",
-        "session_id": session_id,
-        "component_id": component_id,
+        "type": "actionAck",
+        "sessionId": session_id,
+        "actionId": component_id,
     }
 
 

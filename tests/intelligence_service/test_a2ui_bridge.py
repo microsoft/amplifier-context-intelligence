@@ -45,11 +45,11 @@ def test_parse_incoming_preserves_full_payload() -> None:
 
 
 def test_format_session_created() -> None:
-    """format_session_created returns dict with type, session_id, and message."""
+    """format_session_created returns dict with camelCase keys matching frontend contract."""
     result = format_session_created(session_id="abc-123", message="Welcome!")
 
-    assert result["type"] == "session_created"
-    assert result["session_id"] == "abc-123"
+    assert result["type"] == "sessionCreated"
+    assert result["sessionId"] == "abc-123"
     assert result["message"] == "Welcome!"
 
 
@@ -57,27 +57,27 @@ def test_format_session_created_default_message() -> None:
     """format_session_created uses 'Session created.' when message is omitted."""
     result = format_session_created(session_id="abc-123")
 
-    assert result["type"] == "session_created"
-    assert result["session_id"] == "abc-123"
+    assert result["type"] == "sessionCreated"
+    assert result["sessionId"] == "abc-123"
     assert result["message"] == "Session created."
 
 
 def test_format_response() -> None:
-    """format_response returns dict with type='response', session_id, and content."""
+    """format_response returns dict with camelCase keys matching frontend contract."""
     result = format_response(session_id="abc-123", content="Here is the answer.")
 
     assert result["type"] == "response"
-    assert result["session_id"] == "abc-123"
-    assert result["content"] == "Here is the answer."
+    assert result["sessionId"] == "abc-123"
+    assert result["payload"] == "Here is the answer."
 
 
 def test_format_action_ack() -> None:
-    """format_action_ack returns dict with type='action_ack', session_id, and component_id."""
+    """format_action_ack returns dict with camelCase keys matching frontend contract."""
     result = format_action_ack(session_id="abc-123", component_id="btn-submit")
 
-    assert result["type"] == "action_ack"
-    assert result["session_id"] == "abc-123"
-    assert result["component_id"] == "btn-submit"
+    assert result["type"] == "actionAck"
+    assert result["sessionId"] == "abc-123"
+    assert result["actionId"] == "btn-submit"
 
 
 def test_format_error() -> None:
