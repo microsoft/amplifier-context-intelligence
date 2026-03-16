@@ -57,24 +57,50 @@ _logger = logging.getLogger("intelligence_service.runtime")
 # ---------------------------------------------------------------------------
 # Provider detection from environment
 # ---------------------------------------------------------------------------
-_PROVIDER_MAP: list[tuple[str, str, str]] = [
-    # (env_var, module_id, default_model)
-    ("GOOGLE_API_KEY", "provider-gemini", "gemini-2.0-flash"),
-    ("ANTHROPIC_API_KEY", "provider-anthropic", "claude-sonnet-4-5"),
-    ("OPENAI_API_KEY", "provider-openai", "gpt-4o"),
-    ("AZURE_OPENAI_API_KEY", "provider-azure-openai", "gpt-4o"),
-    ("GITHUB_TOKEN", "provider-github-copilot", "gpt-4o"),
+_PROVIDER_MAP: list[tuple[str, str, str, str]] = [
+    # (env_var, module_id, source, default_model)
+    (
+        "GOOGLE_API_KEY",
+        "provider-gemini",
+        "git+https://github.com/microsoft/amplifier-module-provider-gemini@main",
+        "gemini-2.0-flash",
+    ),
+    (
+        "ANTHROPIC_API_KEY",
+        "provider-anthropic",
+        "git+https://github.com/microsoft/amplifier-module-provider-anthropic@main",
+        "claude-sonnet-4-5",
+    ),
+    (
+        "OPENAI_API_KEY",
+        "provider-openai",
+        "git+https://github.com/microsoft/amplifier-module-provider-openai@main",
+        "gpt-4o",
+    ),
+    (
+        "AZURE_OPENAI_API_KEY",
+        "provider-azure-openai",
+        "git+https://github.com/microsoft/amplifier-module-provider-azure-openai@main",
+        "gpt-4o",
+    ),
+    (
+        "GITHUB_TOKEN",
+        "provider-github-copilot",
+        "git+https://github.com/microsoft/amplifier-module-provider-github-copilot@main",
+        "gpt-4o",
+    ),
 ]
 
 
 def _detect_providers() -> list[dict[str, Any]]:
     """Build provider configs for each API key found in the environment."""
     providers: list[dict[str, Any]] = []
-    for env_var, module_id, default_model in _PROVIDER_MAP:
+    for env_var, module_id, source, default_model in _PROVIDER_MAP:
         if os.environ.get(env_var):
             providers.append(
                 {
                     "module": module_id,
+                    "source": source,
                     "config": {"default_model": default_model},
                 }
             )
