@@ -239,6 +239,8 @@ export class AppShell extends LitElement {
   @state() private hasSurfaces: boolean = false;
   @state() private isDark = document.documentElement.classList.contains('dark');
 
+  private readonly inIframe = window.self !== window.top;
+
   // ── DOM references ──────────────────────────────────────────────────────────
 
   @query('ci-a2ui-renderer') private renderer!: A2UIRenderer;
@@ -341,6 +343,7 @@ export class AppShell extends LitElement {
     const isConnected = this.connectionState === ConnectionState.CONNECTED;
 
     return html`
+      ${this.inIframe ? nothing : html`
       <nav class="header">
         <a class="brand" href="/">
           <img class="brand-logo" src="https://avatars.githubusercontent.com/u/240397093" alt="Amplifier" />
@@ -350,11 +353,12 @@ export class AppShell extends LitElement {
           </div>
         </a>
         <div class="nav-links">
-          <a href="/dashboard">Dashboard</a>
-          <a href="/api">API</a>
+          <a href="http://localhost:8000/dashboard">Dashboard</a>
+          <a href="http://localhost:8000/docs">API</a>
           <button class="theme-toggle" @click=${this.toggleTheme}>${this.isDark ? '☀' : '☾'}</button>
         </div>
       </nav>
+      `}
 
       <div class="surface-area">
         ${this.bridgeResponse
