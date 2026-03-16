@@ -76,11 +76,6 @@ async def explorer() -> FileResponse:
     return FileResponse(_WEB_DIR / "explorer.html")
 
 
-@app.get("/neo4j", response_class=HTMLResponse)
-async def neo4j_browser() -> FileResponse:
-    return FileResponse(_WEB_DIR / "neo4j.html")
-
-
 @app.get("/status")
 async def get_status() -> dict[str, Any]:
     return build_status_response(registry, _start_time)

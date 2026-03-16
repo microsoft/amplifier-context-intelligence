@@ -4,8 +4,8 @@ services:
     ports:
       - "8000:8000"
     environment:
-      CI_SERVER_NEO4J_URL: neo4j://neo4j:7687
-      CI_SERVER_BLOB_PATH: /data/blobs
+      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL: neo4j://neo4j:7687
+      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH: /data/blobs
       PYTHONUNBUFFERED: "1"
     volumes:
       - blob_data:/data/blobs
@@ -43,10 +43,10 @@ services:
       AMPLIFIER_HOME: /data/context-intelligence-service
       BUNDLE_PATH: /app/bundles/context-intelligence-server/bundle.md
       ROUTING_MATRIX: balanced
-      INTEL_SERVICE_AMPLIFIER_HOME: /data/context-intelligence-service
-      INTEL_SERVICE_BUNDLE_PATH: /app/bundles/context-intelligence-server/bundle.md
-      INTEL_SERVICE_ROUTING_MATRIX: balanced
-      INTEL_SERVICE_INGESTION_URL: http://context-intelligence-server:8000
+      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_AMPLIFIER_HOME: /data/context-intelligence-service
+      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_BUNDLE_PATH: /app/bundles/context-intelligence-server/bundle.md
+      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX: balanced
+      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_INGESTION_URL: http://context-intelligence-server:8000
     healthcheck:
       test:
         - "CMD"

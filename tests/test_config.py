@@ -23,9 +23,9 @@ def test_settings_defaults():
 
 
 def test_settings_env_override(monkeypatch):
-    """Environment variables with CI_SERVER_ prefix should override defaults."""
-    monkeypatch.setenv("CI_SERVER_SERVER_PORT", "9999")
-    monkeypatch.setenv("CI_SERVER_LOG_LEVEL", "DEBUG")
+    """Environment variables with AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ prefix should override defaults."""
+    monkeypatch.setenv("AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVER_PORT", "9999")
+    monkeypatch.setenv("AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_LEVEL", "DEBUG")
 
     from context_intelligence_server.config import Settings
 

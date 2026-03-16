@@ -24,9 +24,9 @@ def test_settings_defaults() -> None:
 
 
 def test_settings_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify environment variables with INTEL_SERVICE_ prefix override defaults."""
-    monkeypatch.setenv("INTEL_SERVICE_SERVER_PORT", "9999")
-    monkeypatch.setenv("INTEL_SERVICE_LOG_LEVEL", "DEBUG")
+    """Verify environment variables with AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ prefix override defaults."""
+    monkeypatch.setenv("AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_SERVER_PORT", "9999")
+    monkeypatch.setenv("AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_LOG_LEVEL", "DEBUG")
 
     settings = Settings()
 
@@ -73,11 +73,19 @@ def test_settings_workspace_default() -> None:
 
 
 def test_settings_amplifier_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify INTEL_SERVICE_ prefixed env vars override all 4 new settings."""
-    monkeypatch.setenv("INTEL_SERVICE_AMPLIFIER_HOME", "/custom/home")
-    monkeypatch.setenv("INTEL_SERVICE_BUNDLE_PATH", "/custom/bundle")
-    monkeypatch.setenv("INTEL_SERVICE_ROUTING_MATRIX", "performance")
-    monkeypatch.setenv("INTEL_SERVICE_WORKSPACE", "my-workspace")
+    """Verify AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ prefixed env vars override all 4 new settings."""
+    monkeypatch.setenv(
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_AMPLIFIER_HOME", "/custom/home"
+    )
+    monkeypatch.setenv(
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_BUNDLE_PATH", "/custom/bundle"
+    )
+    monkeypatch.setenv(
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX", "performance"
+    )
+    monkeypatch.setenv(
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_WORKSPACE", "my-workspace"
+    )
 
     settings = Settings()
 
@@ -88,7 +96,7 @@ def test_settings_amplifier_env_override(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_settings_ingestion_url_field_name() -> None:
-    """Config field is 'ingestion_url' (maps to INTEL_SERVICE_INGESTION_URL)."""
+    """Config field is 'ingestion_url' (maps to AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_INGESTION_URL)."""
     settings = Settings()
     assert hasattr(settings, "ingestion_url")
     assert settings.ingestion_url == "http://context-intelligence-server:8000"

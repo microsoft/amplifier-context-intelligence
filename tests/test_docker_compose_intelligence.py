@@ -9,7 +9,7 @@ Spec requirements:
 - intelligence-service: volumes context_intelligence_service_data + blob_data:ro
 - intelligence-service: env_file config/secrets.env
 - intelligence-service: environment AMPLIFIER_HOME, BUNDLE_PATH, ROUTING_MATRIX=balanced,
-  INTEL_SERVICE_INGESTION_URL=http://context-intelligence-server:8000
+  AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_INGESTION_URL=http://context-intelligence-server:8000
 - intelligence-service: healthcheck python urllib on /health, 180s start_period, 60 retries
 - Four named volumes: blob_data, neo4j_data, log_data, context_intelligence_service_data
 - Network: context-intelligence (bridge)
@@ -53,9 +53,7 @@ def test_compose_has_intelligence_service(compose: dict) -> None:
 
 def test_compose_has_frontend_service(compose: dict) -> None:
     services = compose.get("services", {})
-    assert "frontend" in services, (
-        "docker-compose.yml must define frontend service"
-    )
+    assert "frontend" in services, "docker-compose.yml must define frontend service"
 
 
 # ---------------------------------------------------------------------------
@@ -208,13 +206,13 @@ def test_intelligence_service_env_routing_matrix_balanced(compose: dict) -> None
 def test_intelligence_service_env_ingestion_url(compose: dict) -> None:
     svc = compose["services"]["intelligence-service"]
     env = _get_env_dict(svc)
-    assert "INTEL_SERVICE_INGESTION_URL" in env, (
-        "intelligence-service must set INTEL_SERVICE_INGESTION_URL environment variable"
+    assert "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_INGESTION_URL" in env, (
+        "intelligence-service must set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_INGESTION_URL environment variable"
     )
     assert "context-intelligence-server:8000" in str(
-        env["INTEL_SERVICE_INGESTION_URL"]
+        env["AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_INGESTION_URL"]
     ), (
-        "INTEL_SERVICE_INGESTION_URL must point to http://context-intelligence-server:8000"
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_INGESTION_URL must point to http://context-intelligence-server:8000"
     )
 
 

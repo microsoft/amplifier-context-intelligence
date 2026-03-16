@@ -1,6 +1,6 @@
 """Configuration module for the Intelligence Service.
 
-Settings are loaded from environment variables with the INTEL_SERVICE_ prefix.
+Settings are loaded from environment variables with the AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ prefix.
 Use get_settings() to obtain the singleton Settings instance.
 """
 
@@ -12,7 +12,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Intelligence Service configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="INTEL_SERVICE_")
+    model_config = SettingsConfigDict(
+        env_prefix="AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_"
+    )
 
     server_host: str = "0.0.0.0"
     server_port: int = 8100
