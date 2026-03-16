@@ -198,8 +198,8 @@ class SessionRegistry:
         self._workers[worker.session_id] = worker
 
     def completed_sessions(self) -> list[CompletedSession]:
-        """Return a list copy of completed sessions from the ring buffer."""
-        return list(self._completed)
+        """Return completed sessions sorted by most recently ended first."""
+        return sorted(self._completed, key=lambda s: s.ended_at, reverse=True)
 
     def workers(self) -> list[SessionWorker]:
         """Return the list of all active SessionWorker objects."""
