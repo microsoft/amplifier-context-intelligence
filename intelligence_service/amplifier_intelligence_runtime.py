@@ -291,6 +291,50 @@ def _build_provider_instances(available: set[str]) -> list[dict[str, Any]]:
     return instances
 
 
+def _build_matrix_dict(available: set[str]) -> dict[str, Any]:
+    """Build a routing matrix dict for the intelligence service.
+
+    Walks ROUTING_ROLES, filters candidates to available providers, and returns
+    a dict matching the standard matrix YAML schema.
+
+    Roles with zero available candidates are omitted entirely.  Within each
+    role, only candidates whose provider is in *available* are kept, preserving
+    their order from ROUTING_ROLES.  The ``config`` key is included in a
+    candidate entry only when present in the ROUTING_ROLES entry.
+
+    Args:
+        available: Set of provider short names that have a valid API key.
+
+    Returns:
+        Dict with keys: name, description, updated, roles.
+    """
+    from datetime import date
+
+    roles: dict[str, Any] = {}
+
+    for role_name, candidates in ROUTING_ROLES.items():
+        filtered: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if candidate["provider"] not in available:
+                continue
+            entry: dict[str, Any] = {
+                "provider": candidate["provider"],
+                "model": candidate["model"],
+            }
+            if "config" in candidate:
+                entry["config"] = candidate["config"]
+            filtered.append(entry)
+        if filtered:
+            roles[role_name] = {"candidates": filtered}
+
+    return {
+        "name": "intelligence-service",
+        "description": "Auto-generated routing matrix for the intelligence service.",
+        "updated": str(date.today()),
+        "roles": roles,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Provider detection from environment
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ import pytest
 from intelligence_service.amplifier_intelligence_runtime import (
     PROVIDERS,
     ROUTING_ROLES,
+    _build_matrix_dict,
     _build_provider_instances,
     _get_available_providers,
     _model_suffix,
@@ -275,3 +276,84 @@ class TestBuildProviderInstances:
                         f"instance_id '{instance_id}' has empty suffix after provider '{p}'"
                     )
                     break
+
+
+class TestBuildMatrixDict:
+    """Tests for the _build_matrix_dict() function."""
+
+    def test_has_top_level_keys(self) -> None:
+        """Result must have name, description, updated, and roles keys with correct values."""
+        result = _build_matrix_dict({"anthropic"})
+        assert set(result.keys()) == {"name", "description", "updated", "roles"}
+        assert result["name"] == "intelligence-service"
+        assert (
+            result["description"]
+            == "Auto-generated routing matrix for the intelligence service."
+        )
+        assert isinstance(result["updated"], str)
+        assert isinstance(result["roles"], dict)
+
+    def test_roles_filtered_to_available_providers(self) -> None:
+        """Roles whose candidates are all from unavailable providers are omitted."""
+        # Only gemini available — roles with only anthropic candidates must be absent
+        result = _build_matrix_dict({"gemini"})
+        roles = result["roles"]
+        # "general" role has only anthropic → must be omitted
+        assert "general" not in roles
+        # "image-gen" has only gemini → must be present
+        assert "image-gen" in roles
+
+    def test_candidates_filtered_within_role(self) -> None:
+        """Within a role that has multi-provider candidates, only available ones remain."""
+        # Only anthropic available; "fast" has [gemini, anthropic]
+        result = _build_matrix_dict({"anthropic"})
+        fast_candidates = result["roles"]["fast"]["candidates"]
+        assert len(fast_candidates) == 1
+        assert fast_candidates[0]["provider"] == "anthropic"
+
+    def test_candidate_has_provider_and_model(self) -> None:
+        """Every candidate dict in the result must have provider and model keys."""
+        result = _build_matrix_dict({"anthropic", "gemini"})
+        for _role, role_data in result["roles"].items():
+            for candidate in role_data["candidates"]:
+                assert "provider" in candidate, (
+                    f"candidate missing 'provider': {candidate}"
+                )
+                assert "model" in candidate, f"candidate missing 'model': {candidate}"
+
+    def test_candidate_config_included_when_present(self) -> None:
+        """Config dict is included in candidate when present in ROUTING_ROLES entry."""
+        result = _build_matrix_dict({"anthropic"})
+        # "reasoning" role has config: {reasoning_effort: high}
+        reasoning_candidates = result["roles"]["reasoning"]["candidates"]
+        assert len(reasoning_candidates) == 1
+        assert "config" in reasoning_candidates[0], (
+            "Expected 'config' key in reasoning candidate"
+        )
+        assert reasoning_candidates[0]["config"] == {"reasoning_effort": "high"}
+
+    def test_candidate_config_absent_when_not_specified(self) -> None:
+        """Config key is absent from candidate when not present in ROUTING_ROLES entry."""
+        result = _build_matrix_dict({"anthropic"})
+        # "general" role has no config in ROUTING_ROLES
+        general_candidates = result["roles"]["general"]["candidates"]
+        assert len(general_candidates) == 1
+        assert "config" not in general_candidates[0], (
+            f"Unexpected 'config' key in general candidate: {general_candidates[0]}"
+        )
+
+    def test_both_providers_full_matrix(self) -> None:
+        """When both anthropic and gemini are available, all 11 roles appear."""
+        result = _build_matrix_dict({"anthropic", "gemini"})
+        roles = result["roles"]
+        assert len(roles) == 11
+        # "fast" role has gemini first, then anthropic — order must be preserved
+        fast_candidates = roles["fast"]["candidates"]
+        assert len(fast_candidates) == 2
+        assert fast_candidates[0]["provider"] == "gemini"
+        assert fast_candidates[1]["provider"] == "anthropic"
+
+    def test_empty_available_returns_empty_roles(self) -> None:
+        """An empty available set must return an empty roles dict."""
+        result = _build_matrix_dict(set())
+        assert result["roles"] == {}
