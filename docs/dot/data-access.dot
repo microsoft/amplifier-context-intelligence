@@ -1,20 +1,20 @@
 // encoding: utf-8
 digraph data_access {
     rankdir=LR
-    graph [fontname="Helvetica" fontsize=12 splines=ortho nodesep=0.8 ranksep=1.2
-           label="Data Access Paths" labelloc=t fontsize=14]
+    graph [fontname="Helvetica" fontsize=12 splines=ortho nodesep=0.8 ranksep=1.3
+           label="Intelligence Service — Data Access Paths" labelloc=t fontsize=14]
     node  [fontname="Helvetica" fontsize=11 shape=box style="rounded,filled"]
     edge  [fontname="Helvetica" fontsize=10]
 
-    // ── Path 1: Graph Query ───────────────────────────────────────────────────
+    // ── Path 1: Graph Query ──────────────────────────────────────────────────
 
     graph_query [
-        label="graph_query"
+        label="agent tool\n(graph_query)"
         fillcolor="#b3d1ff"
     ]
 
     ingestion_cypher [
-        label="Ingestion Server\nPOST /cypher"
+        label="context-intelligence-server\nPOST /cypher\n:8000"
         fillcolor="#ddeeff"
     ]
 
@@ -24,47 +24,65 @@ digraph data_access {
         fillcolor="#f4b8b8"
     ]
 
-    // ── Path 2: Blob Reader ───────────────────────────────────────────────────
+    // ── Path 2: Blob Read ────────────────────────────────────────────────────
 
     blob_reader [
-        label="blob_reader"
+        label="agent tool\n(blob_reader)"
         fillcolor="#b3d1ff"
     ]
 
     blob_data_vol [
-        label="blob_data volume\n(filesystem read)"
+        label="blob_data volume\nmounted ro at /data/blobs\n(AsyncDiskBlobStore)"
         shape=folder
         fillcolor="#f5f5f5"
     ]
 
-    // ── Path 3: Session Tools ─────────────────────────────────────────────────
+    // ── Path 3: Event Ingestion (inbound) ────────────────────────────────────
 
-    session_tools [
-        label="Session Tools\n(CI bundle)\njq / sed / grep"
-        fillcolor="#b3d1ff"
+    bundle_hook [
+        label="amplifier-bundle-\ncontext-intelligence\nhook"
+        shape=oval
+        fillcolor="#eeeeee"
     ]
 
-    projects_vol [
-        label="projects volume\nevents.jsonl"
-        shape=folder
-        fillcolor="#f5f5f5"
+    ingestion_events [
+        label="context-intelligence-server\nPOST /events\n:8000"
+        fillcolor="#ddeeff"
     ]
 
-    // ── Forward edges (solid) ─────────────────────────────────────────────────
+    event_queue [
+        label="event queue\n(asyncio.Queue)"
+        fillcolor="#fff2cc"
+    ]
 
-    graph_query  -> ingestion_cypher [label="query"]
-    ingestion_cypher -> neo4j_bolt   [label="Bolt protocol"]
+    handler_dispatch [
+        label="handler dispatch\n(fnmatch priority order)"
+        fillcolor="#fff2cc"
+    ]
 
-    blob_reader  -> blob_data_vol    [label="read"]
+    neo4j_bolt_ingest [
+        label="Neo4j\nBolt :7687"
+        shape=cylinder
+        fillcolor="#f4b8b8"
+    ]
 
-    session_tools -> projects_vol    [label="read"]
+    // ── Path 1 edges: Graph Query (solid forward, dashed return) ─────────────
 
-    // ── Return / response edges (dashed) ──────────────────────────────────────
+    graph_query     -> ingestion_cypher [label="POST /cypher\n{query, params}"]
+    ingestion_cypher -> neo4j_bolt      [label="Bolt protocol"]
 
-    neo4j_bolt      -> ingestion_cypher [label="result rows" style=dashed color="#555555"]
+    neo4j_bolt       -> ingestion_cypher [label="result rows" style=dashed color="#555555"]
     ingestion_cypher -> graph_query      [label="JSON response" style=dashed color="#555555"]
 
-    blob_data_vol   -> blob_reader       [label="bytes" style=dashed color="#555555"]
+    // ── Path 2 edges: Blob Read ───────────────────────────────────────────────
 
-    projects_vol    -> session_tools     [label="event lines" style=dashed color="#555555"]
+    blob_reader  -> blob_data_vol   [label="filesystem read"]
+    blob_data_vol -> blob_reader    [label="bytes" style=dashed color="#555555"]
+
+    // ── Path 3 edges: Event Ingestion ─────────────────────────────────────────
+
+    bundle_hook      -> ingestion_events [label="POST /events\n{event,workspace,data}" color="#cc6600"]
+    ingestion_events -> event_queue      [label="202 Accepted\nenqueue" color="#336699"]
+    event_queue      -> handler_dispatch [label="drain_worker\n(background task)"]
+    handler_dispatch -> neo4j_bolt_ingest [label="UNWIND Cypher\nupsert_node/edge"]
 }

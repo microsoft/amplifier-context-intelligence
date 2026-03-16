@@ -88,8 +88,8 @@ class TestSystemArchitectureDot:
         content = _load_dot("system-architecture.dot")
         assert "blob_data" in content
         assert "neo4j_data" in content
-        assert "projects" in content
-        assert "config" in content
+        assert "log_data" in content
+        assert "context_intelligence_service_data" in content
 
     def test_contains_service_dependencies(self):
         content = _load_dot("system-architecture.dot")
@@ -118,17 +118,34 @@ class TestContainerInitializationDot:
         assert "Container Start" in content or "container_start" in content
 
     def test_contains_config_overlay(self):
+        # entrypoint.sh copies config into /data — represented as entrypoint node
         content = _load_dot("container-initialization.dot")
-        assert "Config Overlay" in content or "config_overlay" in content
+        assert (
+            "entrypoint" in content
+            or "Config Overlay" in content
+            or "config_overlay" in content
+        )
 
     def test_contains_apply_settings(self):
+        # lifespan startup calls get_settings() — replaces old "apply_settings" step
         content = _load_dot("container-initialization.dot")
-        assert "Apply Settings" in content or "apply_settings" in content
+        assert (
+            "get_settings" in content
+            or "lifespan" in content.lower()
+            or "Apply Settings" in content
+            or "apply_settings" in content
+        )
 
     def test_contains_install_bundle(self):
+        # Bundle loading now done via AmplifierApp.startup() / load_bundle()
         content = _load_dot("container-initialization.dot")
         assert "Bundle" in content or "bundle" in content
-        assert "Install Bundle" in content or "install_bundle" in content
+        assert (
+            "load_bundle" in content
+            or "amplifier_startup" in content
+            or "Install Bundle" in content
+            or "install_bundle" in content
+        )
 
     def test_contains_bridge_start(self):
         content = _load_dot("container-initialization.dot")
@@ -149,20 +166,24 @@ class TestContainerInitializationDot:
         assert "->" in content
 
     def test_happy_path_sequence_order(self):
+        # Verified sequence: entrypoint → uvicorn → lifespan → bundle check →
+        # amplifier_startup → prepared_bundle → session_mgr → health_ready → accepting
         content = _load_dot("container-initialization.dot")
+        # Check the new verified node chain
         nodes = [
             "container_start",
-            "config_overlay",
-            "apply_settings",
-            "install_bundle",
-            "start_bridge",
-            "health_ready",
-            "accepting_connections",
+            "entrypoint",
+            "uvicorn_start",
+            "lifespan_startup",
         ]
         for a, b in zip(nodes, nodes[1:]):
             assert re.search(rf"{a}\s*->.*{b}", content), (
                 f"Expected edge {a} -> {b} in container-initialization.dot"
             )
+        # Health and accepting_connections must still be present and connected
+        assert re.search(r"health_ready\s*->.*accepting_connections", content), (
+            "Expected edge health_ready -> accepting_connections"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -200,11 +221,16 @@ class TestDataAccessDot:
         assert "blob_reader" in content or "blob reader" in content.lower()
         assert "blob_data" in content
 
-    def test_contains_session_tools_path(self):
+    def test_contains_event_ingestion_path(self):
+        # Third path is inbound event ingestion (hook → POST /events → queue → Neo4j).
+        # There is NO projects volume in the verified system.
         content = _load_dot("data-access.dot")
-        assert "Session" in content or "session" in content
-        assert "projects" in content
-        assert "events.jsonl" in content or "events" in content
+        assert "/events" in content or "events" in content.lower()
+        assert (
+            "queue" in content.lower()
+            or "handler" in content.lower()
+            or "drain" in content.lower()
+        )
 
     def test_contains_return_paths(self):
         content = _load_dot("data-access.dot")

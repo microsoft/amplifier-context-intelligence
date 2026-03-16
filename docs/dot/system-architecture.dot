@@ -1,88 +1,104 @@
 // encoding: utf-8
 digraph system_architecture {
     rankdir=TB
-    graph [fontname="Helvetica" fontsize=12 splines=ortho nodesep=0.8 ranksep=1.2]
+    graph [fontname="Helvetica" fontsize=12 splines=ortho nodesep=0.8 ranksep=1.4
+           label="Context Intelligence — Docker Compose Stack" labelloc=t fontsize=14]
     node  [fontname="Helvetica" fontsize=11 shape=box style="rounded,filled"]
     edge  [fontname="Helvetica" fontsize=10]
 
-    // ── Services ──────────────────────────────────────────────────────────────
+    // ── Services ────────────────────────────────────────────────────────────
+
+    subgraph cluster_neo4j {
+        label="Neo4j  (neo4j:5.26.22-community)"
+        style="rounded,filled"
+        fillcolor="#f2dddd"
+        color="#990000"
+
+        neo4j [
+            label="neo4j\n:7474  browser\n:7687  bolt\n─────────────────\nNEO4J_AUTH=none\nvol: neo4j_data:/data\nhealthcheck: wget :7474"
+            fillcolor="#f4b8b8"
+            shape=cylinder
+        ]
+    }
 
     subgraph cluster_ingestion {
-        label="Ingestion Server"
+        label="context-intelligence-server  (built: Dockerfile)"
         style="rounded,filled"
         fillcolor="#ddeeff"
         color="#336699"
 
         ingestion [
-            label="Ingestion Server\n:8000\n─────────────────\nGET  /\nGET  /dashboard\nGET  /status\nGET  /logs/stream  (SSE)\nPOST /cypher\nPOST /events"
+            label="context-intelligence-server\n:8000\n─────────────────\nGET  /\nGET  /dashboard\nGET  /status\nPOST /events\nGET  /blobs/{session_id}\nGET  /blobs/{session_id}/{key}\nGET  /logs/stream  (SSE)\nPOST /cypher\nGET  /docs  (Swagger)\n─────────────────\nvol: blob_data:/data/blobs (rw)\nvol: log_data:/data/logs   (rw)\nNEO4J_URL=neo4j://neo4j:7687\nhealthcheck: curl :8000/status"
             fillcolor="#b3d1ff"
             shape=box
         ]
     }
 
     subgraph cluster_intelligence {
-        label="Intelligence Service"
+        label="intelligence-service  (built: Dockerfile.intelligence)"
         style="rounded,filled"
         fillcolor="#ddf2dd"
         color="#336633"
 
         intelligence [
-            label="Intelligence Service\n:8100\n─────────────────\nWS   /ws\nGET  /health\nGET  /admin/reload-bundle\n─────────────────\nAmplifier + bundle\nWebSocket bridge"
+            label="intelligence-service\n:8100\n─────────────────\nGET  /health\nPOST /admin/reload-bundle\nWS   /ws\n─────────────────\nvol: context_intelligence_service_data:/data/context-intelligence-service (rw)\nvol: blob_data:/data/blobs (ro)\nenv_file: config/secrets.env\nhealthcheck: python urllib :8100/health\nstart_period: 180s  retries: 60"
             fillcolor="#b3e6b3"
             shape=box
         ]
     }
 
     subgraph cluster_frontend {
-        label="Frontend"
+        label="frontend  (built: Dockerfile.frontend, multi-stage Node→nginx)"
         style="rounded,filled"
         fillcolor="#fff2cc"
         color="#996600"
 
         frontend [
-            label="Frontend nginx\n:3000\n─────────────────\nA2UI SPA\nLit renderer\nCustom viz catalog\nWebSocket → :8100"
+            label="frontend  nginx\n:3000→:80\n─────────────────\nServes SPA\nWebSocket proxy\n  → intelligence-service:8100/ws"
             fillcolor="#ffe599"
             shape=box
         ]
     }
 
-    subgraph cluster_neo4j {
-        label="Neo4j"
-        style="rounded,filled"
-        fillcolor="#f2dddd"
-        color="#990000"
+    // ── Named volumes ───────────────────────────────────────────────────────
 
-        neo4j [
-            label="Neo4j\n:7474  browser\n:7687  bolt"
-            fillcolor="#f4b8b8"
-            shape=cylinder
-        ]
-    }
+    blob_data    [label="blob_data\n(named volume)"                          shape=folder fillcolor="#f5f5f5"]
+    neo4j_data   [label="neo4j_data\n(named volume)"                         shape=folder fillcolor="#f5f5f5"]
+    log_data     [label="log_data\n(named volume)"                           shape=folder fillcolor="#f5f5f5"]
+    ci_svc_data  [label="context_intelligence_service_data\n(named volume)"  shape=folder fillcolor="#f5f5f5"]
 
-    // ── Volumes ───────────────────────────────────────────────────────────────
+    // ── External actors ─────────────────────────────────────────────────────
 
-    blob_data  [label="blob_data\n(shared volume)\ningestion rw\nintelligence ro" shape=folder fillcolor="#f5f5f5"]
-    neo4j_data [label="neo4j_data\n(named volume)"                              shape=folder fillcolor="#f5f5f5"]
-    projects   [label="projects\n(shared volume, ro)"                           shape=folder fillcolor="#f5f5f5"]
-    config     [label="config\n(bind mount, ro)"                                shape=folder fillcolor="#f5f5f5"]
+    bundle_hook [
+        label="amplifier-bundle-\ncontext-intelligence\nhook"
+        shape=oval
+        fillcolor="#eeeeee"
+    ]
 
-    // ── Service dependencies (depends_on healthy) ─────────────────────────────
+    user_browser [
+        label="User / Browser"
+        shape=oval
+        fillcolor="#eeeeee"
+    ]
 
-    intelligence -> ingestion   [label="depends_on\nhealthy" style=dashed color="#555555"]
-    frontend     -> intelligence [label="depends_on\nhealthy" style=dashed color="#555555"]
-    ingestion    -> neo4j        [label="depends_on\nhealthy" style=dashed color="#555555"]
+    // ── Service dependency chain (depends_on: healthy) ───────────────────────
 
-    // ── Volume mounts ─────────────────────────────────────────────────────────
+    ingestion    -> neo4j        [label="depends_on: healthy" style=dashed color="#555555"]
+    intelligence -> ingestion    [label="depends_on: healthy" style=dashed color="#555555"]
+    frontend     -> intelligence [label="depends_on: healthy" style=dashed color="#555555"]
 
-    ingestion   -> blob_data  [label="rw" style=dotted color="#999999"]
-    intelligence -> blob_data [label="ro" style=dotted color="#999999"]
+    // ── Volume mounts ────────────────────────────────────────────────────────
 
-    ingestion   -> neo4j_data [label="rw" style=dotted color="#999999"]
-    neo4j       -> neo4j_data [label="rw" style=dotted color="#999999"]
+    ingestion    -> blob_data   [label="rw  /data/blobs"   style=dotted color="#999999"]
+    intelligence -> blob_data   [label="ro  /data/blobs"   style=dotted color="#999999"]
+    ingestion    -> log_data    [label="rw  /data/logs"    style=dotted color="#999999"]
+    neo4j        -> neo4j_data  [label="rw  /data"         style=dotted color="#999999"]
+    intelligence -> ci_svc_data [label="rw  /data/context-intelligence-service" style=dotted color="#999999"]
 
-    intelligence -> projects  [label="ro" style=dotted color="#999999"]
-    ingestion    -> projects  [label="ro" style=dotted color="#999999"]
+    // ── External access ──────────────────────────────────────────────────────
 
-    intelligence -> config    [label="ro" style=dotted color="#999999"]
-    ingestion    -> config    [label="ro" style=dotted color="#999999"]
+    bundle_hook  -> ingestion   [label="POST /events" color="#cc6600"]
+    user_browser -> frontend    [label=":3000  (explorer)" color="#336600"]
+    user_browser -> ingestion   [label=":8000  (dashboard)" color="#336699"]
+    user_browser -> neo4j       [label=":7474  (Neo4j browser)" color="#990000"]
 }

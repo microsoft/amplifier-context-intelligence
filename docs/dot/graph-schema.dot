@@ -1,0 +1,87 @@
+// encoding: utf-8
+digraph graph_schema {
+    rankdir=TB
+    graph [fontname="Helvetica" fontsize=12 splines=ortho nodesep=1.0 ranksep=1.4
+           label="Context Intelligence — Neo4j Property Graph Schema" labelloc=t fontsize=14]
+    node  [fontname="Helvetica" fontsize=11 shape=box style="rounded,filled"]
+    edge  [fontname="Helvetica" fontsize=10]
+
+    // ── Node types ────────────────────────────────────────────────────────────
+
+    subgraph cluster_nodes {
+        label="Node Types"
+        style="rounded,filled"
+        fillcolor="#f0f4ff"
+        color="#336699"
+
+        Session [
+            label="Session\n(:Root | :Subsession | :ForkedSession)\n─────────────────────\nsession_id\nworkspace\nstatus\nstarted_at\nended_at"
+            fillcolor="#b3d1ff"
+        ]
+
+        OrchestratorRun [
+            label="OrchestratorRun\n─────────────────────\nrun_number\nstarted_at\nended_at\nstatus"
+            fillcolor="#b3e6b3"
+        ]
+
+        Step [
+            label="Step\n(:PromptStep | :AssistantStep)\n─────────────────────\niteration\nprovider\nmodel\ninput_tokens\noutput_tokens"
+            fillcolor="#ffe599"
+        ]
+
+        ToolExecution [
+            label="ToolExecution\n(:Delegation  when child_session_id set)\n─────────────────────\ntool_name\ntool_call_id\nstatus\nstarted_at\nended_at"
+            fillcolor="#f5c6a0"
+        ]
+
+        Event [
+            label="Event\n(sub-label: PascalCase of event name)\n─────────────────────\nevent_name\noccurred_at"
+            fillcolor="#e6d9f5"
+        ]
+    }
+
+    // ── Edge types ────────────────────────────────────────────────────────────
+
+    subgraph cluster_edges {
+        label="Edge Types"
+        style="rounded,filled"
+        fillcolor="#fffaf0"
+        color="#996600"
+
+        e_has_run      [label="HAS_RUN"         shape=plaintext fillcolor="#ffffff"]
+        e_has_step     [label="HAS_STEP\n(seq)" shape=plaintext fillcolor="#ffffff"]
+        e_next         [label="NEXT"            shape=plaintext fillcolor="#ffffff"]
+        e_triggered    [label="TRIGGERED\n(seq)" shape=plaintext fillcolor="#ffffff"]
+        e_parallel     [label="PARALLEL_WITH"   shape=plaintext fillcolor="#ffffff"]
+        e_spawned      [label="SPAWNED"         shape=plaintext fillcolor="#ffffff"]
+        e_child_of     [label="CHILD_OF /\nFORKED_FROM" shape=plaintext fillcolor="#ffffff"]
+        e_has_event    [label="HAS_EVENT"       shape=plaintext fillcolor="#ffffff"]
+    }
+
+    // ── Edges showing graph relationships ─────────────────────────────────────
+
+    // HAS_RUN: Session → OrchestratorRun
+    Session        -> OrchestratorRun  [label="HAS_RUN"          color="#336699"  fontcolor="#336699"]
+
+    // HAS_STEP: OrchestratorRun → Step
+    OrchestratorRun -> Step            [label="HAS_STEP  (seq)"  color="#336633"  fontcolor="#336633"]
+
+    // NEXT: Step → Step (sequential ordering)
+    Step           -> Step             [label="NEXT"             color="#996600"  fontcolor="#996600"]
+
+    // TRIGGERED: Step → ToolExecution
+    Step           -> ToolExecution    [label="TRIGGERED  (seq)" color="#cc6600"  fontcolor="#cc6600"]
+
+    // PARALLEL_WITH: ToolExecution ↔ ToolExecution
+    ToolExecution  -> ToolExecution    [label="PARALLEL_WITH"    color="#993399"  fontcolor="#993399" dir=both]
+
+    // SPAWNED: ToolExecution:Delegation → Session:Child
+    ToolExecution  -> Session          [label="SPAWNED\n(Delegation→Child)" color="#990000" fontcolor="#990000"]
+
+    // CHILD_OF / FORKED_FROM: Session → Session
+    Session        -> Session          [label="CHILD_OF /\nFORKED_FROM" color="#555599" fontcolor="#555599"]
+
+    // HAS_EVENT: Session|OrchestratorRun → Event
+    Session        -> Event            [label="HAS_EVENT"        color="#669966"  fontcolor="#669966"]
+    OrchestratorRun -> Event           [label="HAS_EVENT"        color="#669966"  fontcolor="#669966"]
+}
