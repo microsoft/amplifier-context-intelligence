@@ -76,7 +76,7 @@ class SessionHandler:
             await self.services.graph.upsert_edge(
                 session_id,
                 parent_id,
-                {"type": "CHILD_OF", "occurred_at": timestamp},
+                {"type": "SUBSESSION_OF", "occurred_at": timestamp},
             )
 
     async def _handle_fork(
@@ -111,7 +111,7 @@ class SessionHandler:
             await self.services.graph.upsert_edge(
                 session_id,
                 parent,
-                {"type": "FORKED_FROM", "occurred_at": timestamp},
+                {"type": "SUBSESSION_OF", "occurred_at": timestamp},
             )
 
     async def _handle_end(

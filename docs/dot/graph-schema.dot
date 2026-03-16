@@ -54,7 +54,7 @@ digraph graph_schema {
         e_triggered    [label="TRIGGERED\n(seq)" shape=plaintext fillcolor="#ffffff"]
         e_parallel     [label="PARALLEL_WITH"   shape=plaintext fillcolor="#ffffff"]
         e_spawned      [label="SPAWNED"         shape=plaintext fillcolor="#ffffff"]
-        e_child_of     [label="CHILD_OF /\nFORKED_FROM" shape=plaintext fillcolor="#ffffff"]
+        e_subsession   [label="SUBSESSION_OF" shape=plaintext fillcolor="#ffffff"]
         e_has_event    [label="HAS_EVENT"       shape=plaintext fillcolor="#ffffff"]
     }
 
@@ -78,8 +78,8 @@ digraph graph_schema {
     // SPAWNED: ToolExecution:Delegation → Session:Child
     ToolExecution  -> Session          [label="SPAWNED\n(Delegation→Child)" color="#990000" fontcolor="#990000"]
 
-    // CHILD_OF / FORKED_FROM: Session → Session
-    Session        -> Session          [label="CHILD_OF /\nFORKED_FROM" color="#555599" fontcolor="#555599"]
+    // SUBSESSION_OF: Session → Session (child → parent)
+    Session        -> Session          [label="SUBSESSION_OF" color="#555599" fontcolor="#555599"]
 
     // HAS_EVENT: Session|OrchestratorRun → Event
     Session        -> Event            [label="HAS_EVENT"        color="#669966"  fontcolor="#669966"]

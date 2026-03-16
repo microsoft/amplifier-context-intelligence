@@ -284,7 +284,7 @@ All nodes carry a `workspace` property for multi-workspace isolation.
 
 ### Edge types
 
-`HAS_RUN` | `HAS_STEP` | `NEXT` | `TRIGGERED` | `PARALLEL_WITH` | `SPAWNED` | `CHILD_OF` | `HAS_EVENT`
+`HAS_RUN` | `HAS_STEP` | `NEXT` | `TRIGGERED` | `PARALLEL_WITH` | `SPAWNED` | `SUBSESSION_OF` | `HAS_EVENT`
 
 ### Example queries
 
