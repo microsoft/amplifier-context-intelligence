@@ -6,6 +6,7 @@ import json
 import logging
 from typing import Any
 
+from context_intelligence_server.ownership import check_ownership
 from context_intelligence_server.protocol import HookResult
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.utils import (
@@ -94,13 +95,17 @@ class ToolExecutionHandler:
         # Create TRIGGERED edge: current_step → ToolExecution (only if step exists)
         step_id = cursors.current_step_id
         if step_id:
+            await check_ownership(self.services.graph, te_id, "TRIGGERED", step_id)
+            triggered_edge_data: dict[str, Any] = {
+                "type": "TRIGGERED",
+                "occurred_at": timestamp,
+            }
+            # Explicitly exclude any legacy seq field from TRIGGERED edge data
+            triggered_edge_data.pop("seq", None)
             await self.services.graph.upsert_edge(
                 step_id,
                 te_id,
-                {
-                    "type": "TRIGGERED",
-                    "occurred_at": timestamp,
-                },
+                triggered_edge_data,
             )
 
         # PARALLEL_WITH: link new TE to each existing TE in same parallel_group_id

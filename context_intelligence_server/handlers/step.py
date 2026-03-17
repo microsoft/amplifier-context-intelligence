@@ -6,6 +6,7 @@ import json
 import logging
 from typing import Any
 
+from context_intelligence_server.ownership import check_ownership
 from context_intelligence_server.protocol import HookResult
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.utils import (
@@ -82,6 +83,7 @@ class StepHandler:
         # Create HAS_STEP edge: OrchestratorRun → AssistantStep (only if run exists)
         run_id = cursors.current_run_id
         if run_id:
+            await check_ownership(self.services.graph, step_id, "HAS_STEP", run_id)
             await self.services.graph.upsert_edge(
                 run_id,
                 step_id,

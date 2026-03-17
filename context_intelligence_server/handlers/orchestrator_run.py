@@ -6,6 +6,7 @@ import json
 import logging
 from typing import Any
 
+from context_intelligence_server.ownership import check_ownership
 from context_intelligence_server.protocol import HookResult
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.utils import (
@@ -128,6 +129,7 @@ class OrchestratorRunHandler:
         await self.services.graph.upsert_node(run_id, properties)
 
         # Create HAS_RUN edge: Session → OrchestratorRun
+        await check_ownership(self.services.graph, run_id, "HAS_RUN", session_id)
         await self.services.graph.upsert_edge(
             session_id,
             run_id,
@@ -136,6 +138,9 @@ class OrchestratorRunHandler:
 
         # Create HAS_STEP edge: OrchestratorRun → PromptStep (if prompt step exists)
         if cursors.current_step_id:
+            await check_ownership(
+                self.services.graph, cursors.current_step_id, "HAS_STEP", run_id
+            )
             await self.services.graph.upsert_edge(
                 run_id,
                 cursors.current_step_id,
