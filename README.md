@@ -1,6 +1,6 @@
 # Context Intelligence Server
 
-An event-driven telemetry platform for [Amplifier](https://github.com/microsoft/amplifier) sessions. Captures session events as structured data, builds a property graph in Neo4j, and provides an AI-driven exploration interface.
+An event-driven telemetry platform for [Amplifier](https://github.com/microsoft/amplifier) sessions. Captures session events as structured data and builds a property graph in Neo4j.
 
 ## How It Works
 
@@ -17,24 +17,6 @@ Amplifier CLI sessions
 | - Dashboard + API docs                   |        | 8 edge types      |
 | - Cypher proxy                           |        +-------------------+
 +------------------------------------------+
-       |
-       | iframe at /explorer
-       v
-+------------------------------------------+
-| Intelligence Service (:8100)             |
-| - Amplifier-powered AI sessions          |
-| - WebSocket A2UI protocol                |
-| - Graph query + blob reader tools        |
-+------------------------------------------+
-       |
-       | WebSocket /ws (proxied by nginx)
-       v
-+------------------------------------------+
-| Frontend (:3000)                         |
-| - Lit 3 SPA with 6 A2UI components      |
-| - Cytoscape.js, Plotly, Graphviz         |
-| - Embedded at :8000/explorer via iframe  |
-+------------------------------------------+
 ```
 
 ---
@@ -42,8 +24,6 @@ Amplifier CLI sessions
 ## Prerequisites
 
 - Docker and Docker Compose
-- A GitHub personal access token with repo scope (for private bundle repos)
-- At least one LLM provider API key (Anthropic, OpenAI, or Google)
 
 ---
 
@@ -56,49 +36,29 @@ git clone https://github.com/colombod/amplifier-context-intelligence.git
 cd amplifier-context-intelligence
 ```
 
-### 2. Configure secrets
-
-Create `config/secrets.env` with your API keys and GitHub token:
-
-```bash
-cat > config/secrets.env << 'EOF'
-ANTHROPIC_API_KEY=sk-ant-...
-OPENAI_API_KEY=sk-...
-GOOGLE_API_KEY=AI...
-GH_TOKEN=ghp_...
-EOF
-```
-
-The `GH_TOKEN` is required for the intelligence service to clone private bundle repos during startup. Provider API keys enable the AI-powered exploration features.
-
-### 3. Start the stack
+### 2. Start the stack
 
 ```bash
 docker compose up -d
 ```
 
-This starts 4 services:
+This starts 2 services:
 
 | Service | Port | Description |
 |---------|------|-------------|
 | **Ingestion server** | [localhost:8000](http://localhost:8000) | Event processing, dashboard, API |
-| **Intelligence service** | :8100 | Amplifier AI sessions (WebSocket) |
-| **Frontend** | :3000 | A2UI SPA (embedded at :8000/explorer) |
 | **Neo4j** | [localhost:7474](http://localhost:7474) | Property graph (bolt on :7687, no auth) |
 
 All services are configured with `restart: unless-stopped` -- they automatically restart on crash or Docker daemon restart. They only stay down if you explicitly stop them with `docker compose stop` or `docker compose down`.
 
-The intelligence service has a 180-second startup period on first boot while it downloads and prepares Amplifier modules.
+### 3. Access the dashboard
 
-### 4. Access the dashboard
-
-Open [http://localhost:8000](http://localhost:8000) -- this is the single navigation hub for the entire system.
+Open [http://localhost:8000](http://localhost:8000) -- this is the single navigation hub for the system.
 
 | Route | Content |
 |-------|---------|
 | `/` | Landing page with navigation cards |
 | `/dashboard` | Live session monitoring, event history, log stream |
-| `/explorer` | AI-driven graph exploration (iframe embedding the frontend) |
 | `/docs` | Swagger API documentation |
 
 Neo4j browser is linked directly from the navigation bar (it cannot be iframed due to its Content-Security-Policy).
@@ -153,21 +113,6 @@ The local JSONL is the durable record. The server dispatch is best-effort and ne
 
 ---
 
-## Server Bundle Dependency
-
-The intelligence service loads [amplifier-bundle-context-intelligence-server](https://github.com/colombod/amplifier-bundle-context-intelligence-server) at startup. This bundle provides the AI agent's tools for graph exploration:
-
-| Tool | Description |
-|------|-------------|
-| `graph_query` | Execute Cypher queries against the Neo4j property graph |
-| `blob_reader` | Read event blob data from disk storage |
-| `render_surface` | Render interactive A2UI visualizations to the frontend |
-| `update_viz` | Incrementally update live visualizations |
-
-The server bundle is pre-baked into the intelligence service Docker image at build time (`COPY amplifier-bundle-context-intelligence-server/` in `Dockerfile.intelligence`). No runtime download is needed for the bundle itself, but its transitive dependencies (the CI bundle, foundation, providers) are resolved on first startup.
-
----
-
 ## API Reference
 
 | Method | Path | Description |
@@ -176,7 +121,6 @@ The server bundle is pre-baked into the intelligence service Docker image at bui
 | `GET` | `/status` | Server health, active sessions, completed history, error counts |
 | `GET` | `/` | Landing page with navigation cards |
 | `GET` | `/dashboard` | Live monitoring dashboard |
-| `GET` | `/explorer` | Exploration UI (iframe) |
 | `GET` | `/docs` | Swagger API docs |
 | `GET` | `/logs/stream` | Server-Sent Events -- live structured log tail |
 | `GET` | `/blobs/{session_id}` | List all blob URIs for a session |
@@ -229,18 +173,6 @@ All settings use the `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_` prefix:
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVER_HOST` | `0.0.0.0` | Bind host |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVER_PORT` | `8000` | Bind port |
 
-### Intelligence service
-
-All settings use the `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_` prefix:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_BUNDLE_PATH` | *(empty)* | Path to bundle.md (empty = stub mode) |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX` | `balanced` | Provider routing strategy |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_RUNTIME_STATE_PATH` | `/data/intelligence-runtime` | Runtime state root |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_INGESTION_URL` | `http://context-intelligence-server:8000` | Ingestion server URL |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_WORKSPACE` | `intelligence-runtime` | Session workspace name |
-
 ---
 
 ## Data Persistence
@@ -252,7 +184,6 @@ The stack uses Docker named volumes for all persistent data:
 | `neo4j_data` | `/data` (neo4j) | Graph database |
 | `blob_data` | `/data/blobs` (ingestion server, rw) | Event blob JSON files |
 | `log_data` | `/data/logs` (ingestion server) | Rotating JSONL log files |
-| `intelligence_runtime_state` | `/data/intelligence-runtime` (intelligence service) | Amplifier module cache and runtime state |
 
 Graph data and blob data survive container rebuilds and restarts. The ingestion server's in-memory counters (completed sessions, recent events) reset on process restart -- the Neo4j graph is the durable record.
 
@@ -317,7 +248,6 @@ RETURN r.node_id,
 - Python 3.11+
 - [uv](https://github.com/astral-sh/uv)
 - Docker and Docker Compose
-- Node.js 22+ (for frontend development)
 
 ### Setup
 
@@ -331,17 +261,7 @@ uv sync
 ### Run tests
 
 ```bash
-# Ingestion server (612 tests)
-.venv/bin/pytest tests/ --ignore=tests/intelligence_service -v
-
-# Intelligence service (101 tests)
-.venv/bin/pytest tests/intelligence_service/ -v
-
-# Frontend (70 tests)
-cd frontend && npx vitest run
-
-# All Python tests
-.venv/bin/pytest tests/ -v
+uv run pytest tests/ -q
 ```
 
 ### Run locally without Docker
@@ -369,43 +289,13 @@ amplifier-context-intelligence/
 │   ├── blob_store.py                    # AsyncDiskBlobStore
 │   ├── handlers/                        # 7 event handlers
 │   └── web/                             # Dashboard HTML + static assets
-├── intelligence_service/                # Intelligence service (FastAPI + WebSocket)
-│   ├── app.py                           # Routes, WebSocket endpoint, lifespan
-│   ├── config.py                        # Pydantic Settings
-│   ├── amplifier_app.py                 # Bundle lifecycle manager
-│   ├── amplifier_session_manager.py     # Session management
-│   └── a2ui_bridge.py                   # A2UI wire format codec
-├── frontend/                            # Exploration UI (Lit 3 SPA)
-│   ├── src/app-shell.ts                 # Main application component
-│   ├── src/a2ui-client.ts               # WebSocket client
-│   ├── src/a2ui-renderer.ts             # A2UI surface renderer
-│   ├── src/catalog/                     # 6 visualization components
-│   └── nginx.conf                       # Production proxy config
-├── docs/dot/                            # Architecture diagrams (Graphviz DOT)
-├── docker-compose.yml                   # 4-service stack
-├── Dockerfile                           # Ingestion server image
-├── Dockerfile.intelligence              # Intelligence service image
-└── Dockerfile.frontend                  # Frontend image (Node -> nginx)
+├── docker-compose.yml                   # 2-service stack
+└── Dockerfile                           # Ingestion server image
 ```
-
----
-
-## Architecture Diagrams
-
-DOT diagrams in `docs/dot/`:
-
-| File | Description |
-|------|-------------|
-| `system-architecture.dot` | Full 4-service Docker Compose stack |
-| `container-initialization.dot` | Intelligence service startup sequence |
-| `data-access.dot` | Data access paths (graph query, blob read, event ingestion) |
-| `event-pipeline.dot` | POST /events -> handler dispatch -> Neo4j |
-| `graph-schema.dot` | Neo4j property graph schema |
 
 ---
 
 ## Related
 
 - [amplifier-bundle-context-intelligence](https://github.com/colombod/amplifier-bundle-context-intelligence) -- Amplifier bundle that forwards session events to this server
-- [amplifier-bundle-context-intelligence-server](https://github.com/colombod/amplifier-bundle-context-intelligence-server) -- Server-side bundle with graph query and visualization tools
 - [amplifier](https://github.com/microsoft/amplifier) -- The Amplifier framework

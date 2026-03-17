@@ -9,7 +9,9 @@ from collections import OrderedDict
 class EventIdempotencyCache:
     """Bounded in-memory cache of recently seen event idempotency keys."""
 
-    def __init__(self, ttl_seconds: float = 7 * 24 * 60 * 60, max_entries: int = 100_000) -> None:
+    def __init__(
+        self, ttl_seconds: float = 7 * 24 * 60 * 60, max_entries: int = 100_000
+    ) -> None:
         self._ttl_seconds = ttl_seconds
         self._max_entries = max_entries
         self._seen: OrderedDict[str, float] = OrderedDict()
