@@ -13,3 +13,6 @@ config/secrets.env
 # Frontend (Lit + Vite SPA)
 frontend/node_modules/
 frontend/dist/
+
+# Test artifacts
+MagicMock/
