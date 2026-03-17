@@ -99,7 +99,6 @@ class ToolExecutionHandler:
                 te_id,
                 {
                     "type": "TRIGGERED",
-                    "seq": cursors.step_counter,
                     "occurred_at": timestamp,
                 },
             )
