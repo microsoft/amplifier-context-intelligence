@@ -2,11 +2,11 @@
 digraph event_pipeline {
     rankdir=TB
     graph [fontname="Helvetica" fontsize=12 splines=ortho nodesep=0.7 ranksep=1.1
-           label="Context Intelligence Server — Event Processing Pipeline" labelloc=t fontsize=14]
+           label="Context Intelligence Server — Event Processing Pipeline\n(v2: timestamp-ordered, replay-safe)" labelloc=t fontsize=14]
     node  [fontname="Helvetica" fontsize=11 shape=box style="rounded,filled"]
     edge  [fontname="Helvetica" fontsize=10]
 
-    // ── Ingestion entrypoint ─────────────────────────────────────────────────
+    // ── Ingestion entrypoint ──────────────────────────────────────────────
 
     http_post [
         label="POST /events\n{event, workspace, data}"
@@ -35,7 +35,7 @@ digraph event_pipeline {
         fillcolor="#b3e6b3"
     ]
 
-    // ── Background drain worker ───────────────────────────────────────────────
+    // ── Background drain worker ───────────────────────────────────────────
 
     subgraph cluster_drain_worker {
         label="Background drain_worker loop"
@@ -53,7 +53,7 @@ digraph event_pipeline {
             fillcolor="#ddeeff"
         ]
 
-        // ── process_event steps ──────────────────────────────────────────────
+        // ── process_event steps ──────────────────────────────────────────
 
         subgraph cluster_process_steps {
             label="process_event() steps"
@@ -61,10 +61,10 @@ digraph event_pipeline {
             fillcolor="#e8f0ff"
             color="#6688bb"
 
-            step1 [label="Step 1\nextract session_id"          fillcolor="#ddeeff"]
-            step2 [label="Step 2\nensure_session_node (idempotent)" fillcolor="#ddeeff"]
+            step1 [label="Step 1\nextract session_id"                      fillcolor="#ddeeff"]
+            step2 [label="Step 2\nensure_session_node\n(graph-backed _seen_sessions)" fillcolor="#ddeeff"]
             step25 [
-                label="Step 2.5\nblob_processor.process_event_data()\n────────────────────\nlift raw fields\noffload large data to disk\n(AsyncDiskBlobStore)"
+                label="Step 2.5\nblob_processor.process_event_data()\n────────────────────\nlift raw fields (idempotent)\noffload to disk (deterministic keys)\n(AsyncDiskBlobStore)"
                 fillcolor="#ddeeff"
             ]
             step3 [
@@ -72,7 +72,7 @@ digraph event_pipeline {
                 fillcolor="#fff2cc"
             ]
             step4 [
-                label="Step 4\nhandler(event, data)\n→ graph.upsert_node/edge\n(in-memory buffer)"
+                label="Step 4\nhandler(event, data)\n→ graph.upsert_node/edge\n(pointer cursors only, no counters)\n(edges: occurred_at for ordering)"
                 fillcolor="#ddeeff"
             ]
             step5 [
@@ -105,22 +105,44 @@ digraph event_pipeline {
             color="#996600"
         ]
 
+        stale_check [
+            label="idle > 5 days?\n(stale session reaper)"
+            shape=diamond
+            fillcolor="#ffcccc"
+            color="#990000"
+        ]
+
+        stale_reap [
+            label="persist cursors\ngraph.close()\n_deregister(session_id)\nbreak"
+            fillcolor="#f4b8b8"
+            color="#990000"
+        ]
+
+        idle_flush [
+            label="30s idle timeout\ngraph.flush()"
+            fillcolor="#ddeeff"
+        ]
+
         loop_back [
             label="loop: next event"
             shape=oval
             fillcolor="#ddeeff"
         ]
 
-        queue_get   -> process_event
+        queue_get     -> process_event  [label="event received"]
+        queue_get     -> idle_flush     [label="TimeoutError\n(30s)" style=dashed]
         process_event -> step1
-        step5       -> ring_buffer
-        ring_buffer -> terminal_check
-        terminal_check -> drain_tail [label="yes" color="#cc0000"]
-        terminal_check -> loop_back  [label="no"]
-        loop_back   -> queue_get
+        step5         -> ring_buffer
+        ring_buffer   -> terminal_check
+        terminal_check -> drain_tail    [label="yes" color="#cc0000"]
+        terminal_check -> loop_back     [label="no"]
+        idle_flush    -> stale_check
+        stale_check   -> stale_reap     [label="yes" color="#cc0000"]
+        stale_check   -> loop_back      [label="no"]
+        loop_back     -> queue_get
     }
 
-    // ── Neo4j persistence ────────────────────────────────────────────────────
+    // ── Neo4j persistence ─────────────────────────────────────────────────
 
     neo4j [
         label="Neo4j\nBolt :7687"
@@ -128,7 +150,7 @@ digraph event_pipeline {
         fillcolor="#f4b8b8"
     ]
 
-    // ── Top-level flow ────────────────────────────────────────────────────────
+    // ── Top-level flow ────────────────────────────────────────────────────
 
     http_post   -> post_events
     post_events -> registry

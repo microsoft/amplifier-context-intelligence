@@ -2,11 +2,11 @@
 digraph system_architecture {
     rankdir=TB
     graph [fontname="Helvetica" fontsize=12 splines=ortho nodesep=0.8 ranksep=1.4
-           label="Context Intelligence — Docker Compose Stack" labelloc=t fontsize=14]
+           label="Context Intelligence — Docker Compose Stack\n(v2: with stale session reaper)" labelloc=t fontsize=14]
     node  [fontname="Helvetica" fontsize=11 shape=box style="rounded,filled"]
     edge  [fontname="Helvetica" fontsize=10]
 
-    // ── Services ────────────────────────────────────────────────────────────
+    // ── Services ──────────────────────────────────────────────────────────
 
     subgraph cluster_neo4j {
         label="Neo4j  (neo4j:5.26.22-community)"
@@ -28,7 +28,7 @@ digraph system_architecture {
         color="#336699"
 
         ingestion [
-            label="context-intelligence-server\n:8000\n─────────────────\nGET  /\nGET  /dashboard\nGET  /status\nPOST /events\nGET  /blobs/{session_id}\nGET  /blobs/{session_id}/{key}\nGET  /logs/stream  (SSE)\nPOST /cypher\nGET  /docs  (Swagger)\n─────────────────\nvol: blob_data:/data/blobs (rw)\nvol: log_data:/data/logs   (rw)\nNEO4J_URL=neo4j://neo4j:7687\nhealthcheck: curl :8000/status"
+            label="context-intelligence-server\n:8000\n─────────────────\nGET  /\nGET  /dashboard\nGET  /status\nPOST /events\nGET  /blobs/{session_id}\nGET  /blobs/{session_id}/{key}\nGET  /logs/stream  (SSE)\nPOST /cypher\nDELETE /sessions/{id}/cursors\nDELETE /sessions/cursors\nGET  /docs  (Swagger)\n─────────────────\nThree-tier Session Lifecycle:\n  Dashboard visibility: 30 min\n  Worker reap: 5 days\n  Cursor persist: 6 months\n─────────────────\nvol: blob_data:/data/blobs (rw)\nvol: cursor_data:/data/cursors (rw)\nvol: log_data:/data/logs   (rw)\nNEO4J_URL=neo4j://neo4j:7687\nhealthcheck: curl :8000/status"
             fillcolor="#b3d1ff"
             shape=box
         ]
@@ -60,19 +60,25 @@ digraph system_architecture {
         ]
     }
 
-    // ── Named volumes ───────────────────────────────────────────────────────
+    // ── Named volumes ─────────────────────────────────────────────────────
 
     blob_data    [label="blob_data\n(named volume)"                          shape=folder fillcolor="#f5f5f5"]
     neo4j_data   [label="neo4j_data\n(named volume)"                         shape=folder fillcolor="#f5f5f5"]
     log_data     [label="log_data\n(named volume)"                           shape=folder fillcolor="#f5f5f5"]
     ci_svc_data  [label="intelligence_runtime_state\n(named volume)"  shape=folder fillcolor="#f5f5f5"]
 
-    // ── External actors ─────────────────────────────────────────────────────
+    // ── External actors ───────────────────────────────────────────────────
 
     bundle_hook [
         label="amplifier-bundle-\ncontext-intelligence\nhook"
         shape=oval
         fillcolor="#eeeeee"
+    ]
+
+    replay_script [
+        label="JSONL replay script\n(same POST /events path)"
+        shape=oval
+        fillcolor="#ccffcc"
     ]
 
     user_browser [
@@ -81,13 +87,13 @@ digraph system_architecture {
         fillcolor="#eeeeee"
     ]
 
-    // ── Service dependency chain (depends_on: healthy) ───────────────────────
+    // ── Service dependency chain (depends_on: healthy) ────────────────────
 
     ingestion    -> neo4j        [label="depends_on: healthy" style=dashed color="#555555"]
     intelligence -> ingestion    [label="depends_on: healthy" style=dashed color="#555555"]
     frontend     -> intelligence [label="depends_on: healthy" style=dashed color="#555555"]
 
-    // ── Volume mounts ────────────────────────────────────────────────────────
+    // ── Volume mounts ─────────────────────────────────────────────────────
 
     ingestion    -> blob_data   [label="rw  /data/blobs"   style=dotted color="#999999"]
     intelligence -> blob_data   [label="ro  /data/blobs"   style=dotted color="#999999"]
@@ -95,10 +101,11 @@ digraph system_architecture {
     neo4j        -> neo4j_data  [label="rw  /data"         style=dotted color="#999999"]
     intelligence -> ci_svc_data [label="rw  /data/context-intelligence-service" style=dotted color="#999999"]
 
-    // ── External access ──────────────────────────────────────────────────────
+    // ── External access ───────────────────────────────────────────────────
 
-    bundle_hook  -> ingestion   [label="POST /events" color="#cc6600"]
-    user_browser -> frontend    [label=":3000  (explorer)" color="#336600"]
-    user_browser -> ingestion   [label=":8000  (dashboard)" color="#336699"]
-    user_browser -> neo4j       [label=":7474  (Neo4j browser)" color="#990000"]
+    bundle_hook    -> ingestion   [label="POST /events" color="#cc6600"]
+    replay_script  -> ingestion   [label="POST /events\n(same path)" color="#339933"]
+    user_browser   -> frontend    [label=":3000  (explorer)" color="#336600"]
+    user_browser   -> ingestion   [label=":8000  (dashboard)" color="#336699"]
+    user_browser   -> neo4j       [label=":7474  (Neo4j browser)" color="#990000"]
 }

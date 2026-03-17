@@ -1,0 +1,154 @@
+// encoding: utf-8
+digraph event_replay {
+    rankdir=TB
+    graph [fontname="Helvetica" fontsize=12 splines=ortho nodesep=0.8 ranksep=1.2
+           label="Context Intelligence — Event Replay Data Flow\nIdempotency Guarantees at Each Stage" labelloc=t fontsize=14]
+    node  [fontname="Helvetica" fontsize=11 shape=box style="rounded,filled"]
+    edge  [fontname="Helvetica" fontsize=10]
+
+    // ── Source of truth ───────────────────────────────────────────────────
+
+    jsonl [
+        label="JSONL on disk\n(source of truth)\n─────────────────────\nOne line per event\nTime-ordered within session\nContains all event data"
+        shape=cylinder
+        fillcolor="#ccffcc"
+    ]
+
+    // ── Single ingestion path ─────────────────────────────────────────────
+
+    post_events [
+        label="POST /events\n(same path for live + replay)"
+        shape=oval
+        fillcolor="#b3d1ff"
+    ]
+
+    // ── Session node guarantee ────────────────────────────────────────────
+
+    subgraph cluster_ensure_session {
+        label="ensure_session_node (graph-aware)"
+        style="rounded,filled"
+        fillcolor="#f0f4ff"
+        color="#336699"
+
+        check_cache [
+            label="session_id in _seen_sessions?"
+            shape=diamond
+            fillcolor="#ddeeff"
+        ]
+
+        query_graph [
+            label="graph.get_node(session_id)\n(query Neo4j)"
+            fillcolor="#ddeeff"
+        ]
+
+        node_exists [
+            label="Node exists in graph?"
+            shape=diamond
+            fillcolor="#ddeeff"
+        ]
+
+        repopulate [
+            label="Add to _seen_sessions\n(repopulate cache)\nskip creation"
+            fillcolor="#b3e6b3"
+        ]
+
+        create_node [
+            label="MERGE Session node\n(Root or Subsession)\nAdd to _seen_sessions"
+            fillcolor="#ffe599"
+        ]
+
+        skip [
+            label="Skip\n(fast path)"
+            fillcolor="#b3e6b3"
+        ]
+
+        check_cache -> skip         [label="yes\n(cached)"]
+        check_cache -> query_graph  [label="no"]
+        query_graph -> node_exists
+        node_exists -> repopulate   [label="yes\n(exists)"]
+        node_exists -> create_node  [label="no\n(new)"]
+    }
+
+    // ── Late parent discovery ─────────────────────────────────────────────
+
+    subgraph cluster_late_parent {
+        label="Late Parent Discovery\n(SessionHandler: session:start / session:fork)"
+        style="rounded,filled"
+        fillcolor="#fff0f0"
+        color="#993333"
+
+        has_parent [
+            label="parent_id present?"
+            shape=diamond
+            fillcolor="#ffdddd"
+        ]
+
+        ensure_parent [
+            label="ensure_session_node(parent_id)\n→ creates stub if missing\n→ repopulates cache if exists"
+            fillcolor="#ffdddd"
+        ]
+
+        merge_edge [
+            label="MERGE SUBSESSION_OF\nchild → parent\n(idempotent)"
+            fillcolor="#ffdddd"
+        ]
+
+        fix_labels [
+            label="Child: Root → Subsession\n(upsert_node label merge)"
+            fillcolor="#ffdddd"
+        ]
+
+        no_parent [
+            label="Continue\n(no parent work)"
+            fillcolor="#b3e6b3"
+        ]
+
+        has_parent    -> ensure_parent [label="yes"]
+        has_parent    -> no_parent     [label="no"]
+        ensure_parent -> merge_edge
+        merge_edge    -> fix_labels
+    }
+
+    // ── Blob processing ───────────────────────────────────────────────────
+
+    blob_proc [
+        label="blob_processor.process_event_data()\n─────────────────────\n_lift_raw_fields (idempotent: only if not present)\nkey = {node_id}__{field_name}\n  node_id = make_node_id(session_id, event, ts[, tool_call_id])\nblob_store.write() → unconditional overwrite\n\nGUARANTEE: same event → same key → same content"
+        fillcolor="#e6d9f5"
+    ]
+
+    // ── Handler dispatch ──────────────────────────────────────────────────
+
+    handler [
+        label="handler(event, data)\n─────────────────────\ngraph.upsert_node → MERGE (node_id + workspace)\ngraph.upsert_edge → MERGE (src, dst, type)\n\nNo seq counters anywhere\nAll edges carry occurred_at\nPointer cursors only (current_run_id, current_step_id)"
+        fillcolor="#ddeeff"
+    ]
+
+    // ── Neo4j ─────────────────────────────────────────────────────────────
+
+    neo4j [
+        label="Neo4j\n─────────────────────\nMERGE = create-or-update\nReplay = no-op or enrichment\n\nIDENTICAL GRAPH\nregardless of:\n  first load vs re-load\n  live vs replay"
+        shape=cylinder
+        fillcolor="#f4b8b8"
+    ]
+
+    // ── Flow ──────────────────────────────────────────────────────────────
+
+    jsonl       -> post_events    [label="replay script\nreads lines, POSTs each"]
+    post_events -> check_cache    [label="Step 2: ensure session"]
+    repopulate  -> has_parent
+    create_node -> has_parent
+    skip        -> has_parent     [label="(for session:start/fork)"]
+    fix_labels  -> blob_proc
+    no_parent   -> blob_proc
+    blob_proc   -> handler        [label="Step 3-4"]
+    handler     -> neo4j          [label="UNWIND Cypher\n(MERGE writes)"]
+
+    // ── Idempotency legend ────────────────────────────────────────────────
+
+    legend [
+        label="IDEMPOTENCY GUARANTEES\n══════════════════════════════\n✓ Node writes: MERGE on node_id + workspace\n✓ Edge writes: MERGE on (src, dst, type)\n✓ Blob writes: deterministic key, overwrite\n✓ _lift_raw_fields: promote only if absent\n✓ _seen_sessions: backed by graph query\n✓ Late parent: MERGE edge, label union-merge\n✓ Cursors: pointer-only, no accumulators"
+        shape=note
+        fillcolor="#ffffcc"
+        color="#999900"
+    ]
+}
