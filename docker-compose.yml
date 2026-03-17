@@ -25,59 +25,6 @@ services:
     networks:
       - context-intelligence
 
-  intelligence-service:
-    build:
-      context: ..
-      dockerfile: amplifier-context-intelligence/Dockerfile.intelligence
-    ports:
-      - "8100:8100"
-    depends_on:
-      context-intelligence-server:
-        condition: service_healthy
-    volumes:
-      - ${HOME}/amplifier-context-intelligence-server-data-store/intelligence-runtime:/data/intelligence-runtime
-      - ${HOME}/amplifier-context-intelligence-server-data-store/blobs:/data/blobs:ro
-    environment:
-      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
-      GH_TOKEN: ${GH_TOKEN:-}
-      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_RUNTIME_STATE_PATH: /data/intelligence-runtime
-      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX: intelligence-service
-      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_INGESTION_URL: http://context-intelligence-server:8000
-      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL: http://context-intelligence-server:8000
-      AMPLIFIER_CONTEXT_INTELLIGENCE_WORKSPACE: intelligence-runtime
-    healthcheck:
-      test:
-        - "CMD"
-        - "python"
-        - "-c"
-        - "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"
-      interval: 10s
-      timeout: 5s
-      retries: 60
-      start_period: 180s
-    restart: unless-stopped
-    labels:
-      com.context-intelligence.component: intelligence-service
-    networks:
-      - context-intelligence
-
-  frontend:
-    build:
-      context: ..
-      dockerfile: amplifier-context-intelligence/Dockerfile.frontend
-    ports:
-      - "3000:80"
-    depends_on:
-      intelligence-service:
-        condition: service_healthy
-    restart: unless-stopped
-    labels:
-      com.context-intelligence.component: frontend
-    networks:
-      - context-intelligence
 
   neo4j:
     image: neo4j:5.26.22-community
