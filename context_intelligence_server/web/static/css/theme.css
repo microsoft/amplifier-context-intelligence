@@ -366,3 +366,9 @@ a, button { transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1); }
 /* ── Result chip (ok / error) ── */
 .result-ok    { color: var(--primary); font-weight: 500; }
 .result-error { color: var(--destructive); font-weight: 500; }
+
+/* -- Active sessions scroll container -- */
+.sessions-scroll-container {
+  max-height: 480px;
+  overflow-y: auto;
+}

@@ -48,7 +48,7 @@
 
     <!-- Active sessions -->
     <p class="section-label">Active sessions</p>
-    <div class="card" style="padding:0;overflow:hidden;">
+    <div class="card sessions-scroll-container" style="padding:0;overflow:hidden;">
       <table class="data-table">
         <thead><tr>
           <th>Session</th><th>Workspace</th><th>Queue</th><th>Last Event</th><th>Processed</th>
@@ -59,7 +59,7 @@
 
     <!-- Completed sessions -->
     <p class="section-label">Completed sessions <span style="font-size:0.7em;color:var(--muted-foreground);font-weight:400;text-transform:none;letter-spacing:0;">(click to expand Neo4j graph)</span></p>
-    <div class="card" style="padding:0;overflow:hidden;">
+    <div class="card" style="padding:0;overflow:hidden;max-height:20rem;overflow-y:auto;">
       <table class="data-table">
         <thead><tr>
           <th>Session</th><th>Workspace</th><th>Duration</th><th>Events</th><th>Errors</th><th>Ended</th>
@@ -70,7 +70,7 @@
 
     <!-- Recent events -->
     <p class="section-label">Recent events</p>
-    <div class="card" style="padding:0;overflow:hidden;">
+    <div class="card" style="padding:0;overflow:hidden;max-height:24rem;overflow-y:auto;">
       <table class="data-table">
         <thead><tr>
           <th>Time</th><th>Event</th><th>Session</th><th>Workspace</th><th>Result</th>
