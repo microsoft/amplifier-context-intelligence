@@ -8,8 +8,8 @@ services:
       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH: /data/blobs
       PYTHONUNBUFFERED: "1"
     volumes:
-      - blob_data:/data/blobs
-      - log_data:/data/logs
+      - ${HOME}/amplifier-context-intelligence-server-data-store/blobs:/data/blobs
+      - ${HOME}/amplifier-context-intelligence-server-data-store/logs:/data/logs
     depends_on:
       neo4j:
         condition: service_healthy
@@ -35,13 +35,16 @@ services:
       context-intelligence-server:
         condition: service_healthy
     volumes:
-      - intelligence_runtime_state:/data/intelligence-runtime
-      - blob_data:/data/blobs:ro
-    env_file:
-      - config/secrets.env
+      - ${HOME}/amplifier-context-intelligence-server-data-store/intelligence-runtime:/data/intelligence-runtime
+      - ${HOME}/amplifier-context-intelligence-server-data-store/blobs:/data/blobs:ro
     environment:
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      GH_TOKEN: ${GH_TOKEN:-}
       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_RUNTIME_STATE_PATH: /data/intelligence-runtime
-      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX: balanced
+      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX: intelligence-service
       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_INGESTION_URL: http://context-intelligence-server:8000
       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL: http://context-intelligence-server:8000
       AMPLIFIER_CONTEXT_INTELLIGENCE_WORKSPACE: intelligence-runtime
@@ -84,7 +87,7 @@ services:
       - "7474:7474"  # browser UI — debug/diagnostics
       - "7687:7687"  # bolt — exposed for Neo4j browser and direct queries
     volumes:
-      - neo4j_data:/data
+      - ${HOME}/amplifier-context-intelligence-server-data-store/neo4j:/data
     restart: unless-stopped
     labels:
       com.context-intelligence.component: neo4j
@@ -96,12 +99,6 @@ services:
       start_period: 15s
     networks:
       - context-intelligence
-
-volumes:
-  blob_data:
-  neo4j_data:
-  log_data:
-  intelligence_runtime_state:
 
 networks:
   context-intelligence:
