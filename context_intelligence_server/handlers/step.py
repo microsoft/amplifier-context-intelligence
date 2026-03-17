@@ -55,8 +55,7 @@ class StepHandler:
         timestamp = data.get("timestamp", "")
         cursors = self.services.get_cursors(session_id)
 
-        # Increment step_counter and clear parallel_groups
-        cursors.step_counter += 1
+        # Clear parallel_groups for new step
         cursors.parallel_groups.clear()
 
         # Generate deterministic step ID
@@ -65,13 +64,17 @@ class StepHandler:
         # Build AssistantStep node properties
         properties: dict[str, Any] = {
             "labels": ["Step", "AssistantStep"],
-            "iteration": data.get("iteration", cursors.step_counter),
             "provider": data.get("provider", ""),
             "request_at": timestamp,
             "occurred_at": timestamp,
             "session_id": session_id,
             "data": json.dumps(data),
         }
+
+        # Only store iteration when present in event data — no counter fallback
+        iteration = data.get("iteration")
+        if iteration is not None:
+            properties["iteration"] = iteration
 
         # Create AssistantStep node
         await self.services.graph.upsert_node(step_id, properties)
@@ -84,7 +87,6 @@ class StepHandler:
                 step_id,
                 {
                     "type": "HAS_STEP",
-                    "seq": cursors.step_counter,
                     "occurred_at": timestamp,
                 },
             )

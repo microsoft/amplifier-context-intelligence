@@ -94,7 +94,7 @@ class TestProviderRequestHappyPath:
         edge = await services.graph.get_edge(run_id, EXPECTED_STEP_NODE_ID)
         assert edge is not None
 
-    async def test_has_step_edge_seq(self, services: HookStateService) -> None:
+    async def test_has_step_edge_no_seq(self, services: HookStateService) -> None:
         run_id = await _seed_run(services)
         handler = StepHandler(services)
         await handler(
@@ -103,8 +103,8 @@ class TestProviderRequestHappyPath:
         )
         edge = await services.graph.get_edge(run_id, EXPECTED_STEP_NODE_ID)
         assert edge is not None
-        # first step edge in this run
-        assert edge["seq"] == 1
+        # seq should NOT be present — counter-based sequencing removed
+        assert "seq" not in edge
 
     async def test_has_step_edge_occurred_at(self, services: HookStateService) -> None:
         run_id = await _seed_run(services)
@@ -192,6 +192,35 @@ class TestProviderRequestHappyPath:
         node = await services.graph.get_node(EXPECTED_STEP_NODE_ID)
         assert node is not None
         # No run_id means no HAS_STEP edge possible
+
+    async def test_iteration_from_event_data_only(
+        self, services: HookStateService
+    ) -> None:
+        """iteration is NOT stored when absent from event data — no counter fallback."""
+        await _seed_run(services)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+            # no 'iteration' key in event data
+        )
+        node = await services.graph.get_node(EXPECTED_STEP_NODE_ID)
+        assert node is not None
+        assert "iteration" not in node
+
+    async def test_iteration_stored_when_present(
+        self, services: HookStateService
+    ) -> None:
+        """iteration IS stored when present in event data."""
+        await _seed_run(services)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP, "iteration": 3},
+        )
+        node = await services.graph.get_node(EXPECTED_STEP_NODE_ID)
+        assert node is not None
+        assert node["iteration"] == 3
 
 
 # ── provider:request error-path ───────────────────────────────────────────────
