@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from unittest.mock import MagicMock, patch
 
 
 from context_intelligence_server.dashboard import (
@@ -128,6 +129,9 @@ class TestBuildStatusResponse:
         """Sessions list includes per-session dicts with correct fields."""
         registry = SessionRegistry()
 
+        # Use a recent timestamp so the worker passes the inactive timeout filter
+        recent_time = time.time()
+
         # Inject a worker directly into the internal dict (no async setup needed)
         queue: asyncio.Queue[object] = asyncio.Queue()
         worker = SessionWorker(
@@ -136,7 +140,7 @@ class TestBuildStatusResponse:
             services=HookStateService(workspace="/home/user/project"),
             queue=queue,
             last_event="tool_call",
-            last_event_time=1234567890.0,
+            last_event_time=recent_time,
             events_processed=42,
         )
         registry._workers["sess-abc"] = worker
@@ -152,7 +156,7 @@ class TestBuildStatusResponse:
         assert sess["workspace"] == "/home/user/project"
         assert sess["queue_depth"] == 0
         assert sess["last_event"] == "tool_call"
-        assert sess["last_event_time"] == 1234567890.0
+        assert sess["last_event_time"] == recent_time
         assert sess["events_processed"] == 42
 
     def test_includes_recent_events(self) -> None:
@@ -274,3 +278,108 @@ class TestBuildStatusResponseWithCompleted:
         assert completed[0]["session_id"] == "sess-done"
         assert completed[0]["events_processed"] == 10
         assert completed[0]["error_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# TestSessionOrdering
+# ---------------------------------------------------------------------------
+
+
+def _make_worker(session_id: str, last_event_time: float) -> SessionWorker:
+    """Helper: create a minimal SessionWorker with the given session_id and last_event_time."""
+    return SessionWorker(
+        session_id=session_id,
+        workspace="/ws",
+        services=HookStateService(workspace="/ws"),
+        queue=asyncio.Queue(),
+        last_event_time=last_event_time,
+    )
+
+
+class TestSessionOrdering:
+    def setup_method(self) -> None:
+        ring_buffer._buffer.clear()
+
+    def test_sessions_sorted_most_recent_first(self) -> None:
+        """Sessions are ordered by last_event_time descending (most recent first).
+
+        Three workers with times 1000, 3000, 2000 — expected order: new (3000),
+        mid (2000), old (1000).
+        """
+        registry = SessionRegistry()
+        registry._workers["old"] = _make_worker("old", last_event_time=1000.0)
+        registry._workers["new"] = _make_worker("new", last_event_time=3000.0)
+        registry._workers["mid"] = _make_worker("mid", last_event_time=2000.0)
+
+        # Use a very large timeout so all workers are visible regardless of age
+        mock_settings = MagicMock()
+        mock_settings.dashboard_inactive_timeout = 9_999_999_999.0
+
+        with patch(
+            "context_intelligence_server.dashboard.get_settings",
+            return_value=mock_settings,
+        ):
+            response = build_status_response(registry, time.time())
+
+        sessions = response["sessions"]
+        assert len(sessions) == 3
+        assert sessions[0]["session_id"] == "new"  # 3000 — most recent
+        assert sessions[1]["session_id"] == "mid"  # 2000
+        assert sessions[2]["session_id"] == "old"  # 1000 — oldest
+
+
+# ---------------------------------------------------------------------------
+# TestDashboardVisibilityFiltering
+# ---------------------------------------------------------------------------
+
+
+class TestDashboardVisibilityFiltering:
+    def setup_method(self) -> None:
+        ring_buffer._buffer.clear()
+
+    def test_inactive_sessions_hidden(self) -> None:
+        """Workers inactive longer than dashboard_inactive_timeout are hidden.
+
+        active worker (5 min = 300 s ago) → visible
+        inactive worker (2 hours = 7200 s ago) → hidden (> 1800 s timeout)
+        active_sessions count reflects only visible workers.
+        """
+        registry = SessionRegistry()
+        now = time.time()
+
+        registry._workers["active"] = _make_worker("active", last_event_time=now - 300)
+        registry._workers["inactive"] = _make_worker(
+            "inactive", last_event_time=now - 7200
+        )
+
+        mock_settings = MagicMock()
+        mock_settings.dashboard_inactive_timeout = 1800.0
+
+        with patch(
+            "context_intelligence_server.dashboard.get_settings",
+            return_value=mock_settings,
+        ):
+            response = build_status_response(registry, time.time())
+
+        assert response["active_sessions"] == 1
+        assert len(response["sessions"]) == 1
+        assert response["sessions"][0]["session_id"] == "active"
+
+    def test_new_worker_no_events_is_visible(self) -> None:
+        """Workers with last_event_time == 0.0 are always shown (never received an event)."""
+        registry = SessionRegistry()
+
+        registry._workers["fresh"] = _make_worker("fresh", last_event_time=0.0)
+
+        mock_settings = MagicMock()
+        mock_settings.dashboard_inactive_timeout = 1800.0
+
+        with patch(
+            "context_intelligence_server.dashboard.get_settings",
+            return_value=mock_settings,
+        ):
+            response = build_status_response(registry, time.time())
+
+        assert len(response["sessions"]) == 1
+        assert response["sessions"][0]["session_id"] == "fresh"
+        assert response["active_sessions"] == 1

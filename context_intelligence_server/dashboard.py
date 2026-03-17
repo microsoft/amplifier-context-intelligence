@@ -7,6 +7,8 @@ import time
 from collections import deque
 from typing import TYPE_CHECKING, Any
 
+from context_intelligence_server.config import get_settings
+
 if TYPE_CHECKING:
     from context_intelligence_server.registry import SessionRegistry
 
@@ -87,6 +89,21 @@ def build_status_response(
         A dict with keys: status, uptime_seconds, active_sessions, sessions,
         recent_events, completed_sessions, error_count_last_hour.
     """
+    settings = get_settings()
+    now = time.time()
+    timeout = settings.dashboard_inactive_timeout
+
+    # Filter: always show workers that have never received an event (last_event_time == 0.0).
+    # Hide workers that have been inactive longer than the configured timeout.
+    visible_workers = [
+        worker
+        for worker in registry.workers()
+        if worker.last_event_time == 0.0 or (now - worker.last_event_time) <= timeout
+    ]
+
+    # Sort by last_event_time descending (most recent first).
+    visible_workers.sort(key=lambda w: w.last_event_time, reverse=True)
+
     sessions = [
         {
             "session_id": worker.session_id,
@@ -96,13 +113,13 @@ def build_status_response(
             "last_event_time": worker.last_event_time,
             "events_processed": worker.events_processed,
         }
-        for worker in registry.workers()
+        for worker in visible_workers
     ]
 
     return {
         "status": "ok",
         "uptime_seconds": time.time() - start_time,
-        "active_sessions": registry.active_count(),
+        "active_sessions": len(visible_workers),
         "sessions": sessions,
         "recent_events": [dataclasses.asdict(rec) for rec in ring_buffer.recent()],
         "completed_sessions": [
