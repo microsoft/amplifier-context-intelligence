@@ -283,6 +283,7 @@ class TestHookStateService:
         )
         svc.set_cursors("session-1", cursors)
         restored = svc.get_cursors("session-1")
+        assert restored is cursors
         assert restored.current_run_id == "run-123"
         assert restored.current_step_id == "step-456"
         assert restored.prompt_preview == "hello"
