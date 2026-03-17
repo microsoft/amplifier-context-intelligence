@@ -20,6 +20,18 @@ def test_event_request_valid():
     assert req.event == "tool:pre"
     assert req.workspace == "my-feature-branch"
     assert req.data["session_id"] == "abc123"
+    assert req.idempotency_key is None
+
+
+def test_event_request_accepts_idempotency_key():
+    """EventRequest accepts an optional top-level idempotency_key."""
+    req = EventRequest(
+        event="tool:pre",
+        workspace="my-feature-branch",
+        idempotency_key="aci-event-v1:abc123",
+        data={"session_id": "abc123", "tool": "bash"},
+    )
+    assert req.idempotency_key == "aci-event-v1:abc123"
 
 
 def test_event_request_missing_event():

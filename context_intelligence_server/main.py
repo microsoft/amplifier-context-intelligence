@@ -24,6 +24,7 @@ from neo4j import AsyncGraphDatabase
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.dashboard import build_status_response
+from context_intelligence_server.idempotency import EventIdempotencyCache
 from context_intelligence_server.logging_config import setup_logging
 from context_intelligence_server.models import (
     CypherRequest,
@@ -56,6 +57,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(title="Context Intelligence Server", lifespan=lifespan)
 _start_time = time.time()
 registry = SessionRegistry()
+idempotency_cache = EventIdempotencyCache()
 
 _WEB_DIR = Path(__file__).parent / "web"
 app.mount("/static", StaticFiles(directory=_WEB_DIR / "static"), name="static")
@@ -84,6 +86,15 @@ async def get_status() -> dict[str, Any]:
 @app.post("/events", status_code=202, response_model=EventResponse)
 async def post_events(request: EventRequest, replay: bool = False) -> EventResponse:
     session_id = request.data.get("session_id", "")
+    if request.idempotency_key and not replay:
+        is_new = idempotency_cache.check_and_store(request.idempotency_key)
+        if not is_new:
+            logger.info(
+                "event_duplicate_skipped: event=%s session_id=%s",
+                request.event,
+                session_id,
+            )
+            return EventResponse(status="duplicate", session_id=session_id or None)
     worker = registry.get_or_create(session_id, request.workspace, replay=replay)
     await worker.queue.put((request.event, request.workspace, request.data))
     logger.info("event_enqueued: event=%s session_id=%s", request.event, session_id)

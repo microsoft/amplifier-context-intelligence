@@ -10,6 +10,7 @@ class EventRequest(BaseModel):
 
     event: str
     workspace: str
+    idempotency_key: str | None = None
     data: dict[str, Any]
 
 

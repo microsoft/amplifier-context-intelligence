@@ -16,6 +16,11 @@ from context_intelligence_server.models import CypherRequest
 from tests.conftest import MockNeo4jDriver
 
 
+@pytest.fixture(autouse=True)
+def _clear_idempotency_cache() -> None:
+    main_module.idempotency_cache.clear()
+
+
 def _neo4j_reachable() -> bool:
     """Return True if Neo4j is reachable at neo4j:7687 (only resolves inside Docker)."""
     try:
@@ -62,6 +67,55 @@ async def test_post_events_body(client: httpx.AsyncClient) -> None:
     data = response.json()
     assert data["status"] == "queued"
     assert data["session_id"] == "sess-1"
+
+
+async def test_post_events_duplicate_idempotency_key_skips_enqueue(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = MagicMock()
+    worker.queue = AsyncMock()
+    monkeypatch.setattr(main_module.registry, "get_or_create", lambda *args, **kwargs: worker)
+
+    payload = {
+        "event": "tool_use",
+        "workspace": "/ws",
+        "idempotency_key": "aci-event-v1:test-key",
+        "data": {"session_id": "sess-dupe"},
+    }
+
+    first = await client.post("/events", json=payload)
+    second = await client.post("/events", json=payload)
+
+    assert first.status_code == 202
+    assert first.json()["status"] == "queued"
+    assert second.status_code == 202
+    assert second.json()["status"] == "duplicate"
+    assert worker.queue.put.await_count == 1
+
+
+async def test_post_events_replay_bypasses_idempotency_guard(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = MagicMock()
+    worker.queue = AsyncMock()
+    monkeypatch.setattr(main_module.registry, "get_or_create", lambda *args, **kwargs: worker)
+
+    payload = {
+        "event": "tool_use",
+        "workspace": "/ws",
+        "idempotency_key": "aci-event-v1:test-key",
+        "data": {"session_id": "sess-replay"},
+    }
+
+    first = await client.post("/events", json=payload)
+    replay = await client.post("/events?replay=true", json=payload)
+
+    assert first.status_code == 202
+    assert replay.status_code == 202
+    assert replay.json()["status"] == "queued"
+    assert worker.queue.put.await_count == 2
 
 
 async def test_post_events_increments_active_sessions(
