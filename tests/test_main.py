@@ -609,6 +609,40 @@ class TestCursorPurgeEndpoints:
         for cursor_file in cursor_files:
             assert not cursor_file.exists()
 
+    async def test_purge_single_session_cursors_when_no_file_returns_ok(
+        self,
+        client: httpx.AsyncClient,
+    ) -> None:
+        """DELETE /sessions/{session_id}/cursors returns 200 even when no cursor file exists.
+
+        Verifies the idempotent contract: calling delete on a session with no
+        cursor file is not an error.
+        """
+        response = await client.delete("/sessions/nonexistent-session/cursors")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["session_id"] == "nonexistent-session"
+
+    async def test_purge_all_session_cursors_when_empty_returns_ok(
+        self,
+        client: httpx.AsyncClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """DELETE /sessions/cursors returns 200 with purged=0 when no cursor files exist.
+
+        Verifies the idempotent contract: calling delete-all with no files to
+        remove is not an error and accurately reports zero deletions.
+        """
+        monkeypatch.setattr(main_module._settings, "cursor_path", str(tmp_path))
+
+        response = await client.delete("/sessions/cursors")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["purged"] == 0
+
 
 # ---------------------------------------------------------------------------
 # replay flag tests
@@ -620,8 +654,6 @@ async def test_post_events_replay_flag_passes_to_get_or_create(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """POST /events?replay=true calls get_or_create with replay=True."""
-    from unittest.mock import patch
-
     captured_kwargs: dict = {}
 
     original = registry.get_or_create

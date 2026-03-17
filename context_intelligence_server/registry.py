@@ -282,6 +282,22 @@ class SessionRegistry:
         """Delete the persisted cursor file for a single session."""
         self._delete_persisted_cursors(session_id)
 
+    def purge_all_cursors(self, cursor_path: str | None = None) -> int:
+        """Delete all cursor files under *cursor_path*.
+
+        Returns the number of files deleted.
+        """
+        if cursor_path is None:
+            cursor_path = get_settings().cursor_path
+
+        cursor_root = Path(cursor_path)
+        count = 0
+        if cursor_root.exists():
+            for cursor_file in cursor_root.glob("*/cursors.json"):
+                cursor_file.unlink()
+                count += 1
+        return count
+
     # ------------------------------------------------------------------
     # Cursor persistence
     # ------------------------------------------------------------------

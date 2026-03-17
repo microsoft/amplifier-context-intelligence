@@ -1127,3 +1127,38 @@ class TestCursorPersistence:
         # In-memory cursors should be empty (not restored from deleted file)
         cursors = worker.services.get_cursors("session-replay")
         assert cursors.current_run_id is None
+
+    def test_purge_all_cursors_deletes_all_files_and_returns_count(
+        self, tmp_path: Path
+    ) -> None:
+        """purge_all_cursors() removes all cursors.json files and returns the count."""
+        import json
+
+        reg = SessionRegistry()
+        sessions = ["sess-x", "sess-y", "sess-z"]
+        cursor_files = []
+        for sid in sessions:
+            session_dir = tmp_path / sid
+            session_dir.mkdir()
+            cursor_file = session_dir / "cursors.json"
+            cursor_file.write_text(
+                json.dumps(
+                    {
+                        "last_updated": "2024-01-01T00:00:00Z",
+                        "cursors": {},
+                    }
+                )
+            )
+            cursor_files.append(cursor_file)
+
+        count = reg.purge_all_cursors(cursor_path=str(tmp_path))
+
+        assert count == len(sessions)
+        for cursor_file in cursor_files:
+            assert not cursor_file.exists()
+
+    def test_purge_all_cursors_returns_zero_when_empty(self, tmp_path: Path) -> None:
+        """purge_all_cursors() returns 0 when no cursor files exist (idempotent)."""
+        reg = SessionRegistry()
+        count = reg.purge_all_cursors(cursor_path=str(tmp_path))
+        assert count == 0

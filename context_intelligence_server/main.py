@@ -96,17 +96,7 @@ async def purge_all_cursors() -> dict[str, Any]:
 
     Returns ``{status: 'ok', purged: <count>}``.
     """
-
-    def _purge_sync() -> int:
-        cursor_root = Path(_settings.cursor_path)
-        count = 0
-        if cursor_root.exists():
-            for cursor_file in cursor_root.glob("*/cursors.json"):
-                cursor_file.unlink()
-                count += 1
-        return count
-
-    purged = await asyncio.to_thread(_purge_sync)
+    purged = await asyncio.to_thread(registry.purge_all_cursors)
     return {"status": "ok", "purged": purged}
 
 
