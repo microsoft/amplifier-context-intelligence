@@ -222,15 +222,29 @@ class HookStateService:
     async def ensure_session_node(self, session_id: str, data: dict[str, Any]) -> None:
         """Idempotently create a Session node in the graph for *session_id*.
 
-        Skips silently when *session_id* has already been processed.  Labels the
-        node ``Session + Root`` when no parent is present, or
-        ``Session + Subsession`` when *data* contains a ``parent_id`` or
-        ``parent`` field.  Sets ``started_at`` (from *data* if provided) and
-        ``status = 'running'``.
+        Uses a two-tier lookup for replay resilience:
+
+        1. Fast path — if *session_id* is already in the in-memory
+           ``_seen_sessions`` cache, return immediately.
+        2. Graph query — call ``graph.get_node(session_id)``.  If the node
+           already exists (e.g. from a previous run), repopulate the cache and
+           return without overwriting any data.  If the node is absent, create
+           it with the appropriate labels (``Session + Root`` when no parent is
+           present, ``Session + Subsession`` when *data* contains a
+           ``parent_id`` or ``parent`` field) and set ``status = 'running'``.
         """
+        # Tier 1: fast path — warm cache hit
         if session_id in self._seen_sessions:
             return
 
+        # Tier 2: graph query — check durable state
+        existing = await self.graph.get_node(session_id)
+        if existing is not None:
+            # Node already in graph; repopulate cache and skip creation
+            self._seen_sessions.add(session_id)
+            return
+
+        # Node absent from both cache and graph — create it
         self._seen_sessions.add(session_id)
 
         parent = data.get("parent_id") or data.get("parent")

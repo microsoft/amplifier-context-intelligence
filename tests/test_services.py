@@ -325,3 +325,70 @@ class TestHookStateService:
         assert node is not None
         assert "Session" in node["labels"]
         assert "Subsession" in node["labels"]
+
+    async def test_ensure_session_node_graph_backed_repopulates_cache(self):
+        """When session node already exists in graph but not in _seen_sessions cache,
+        the cache is repopulated and the original node data (started_at) is NOT overwritten."""
+        svc = HookStateService()
+        # Pre-populate graph with a session node (simulating a restart / replay scenario)
+        await svc.graph.upsert_node(
+            "session-replay",
+            {
+                "labels": ["Session", "Root"],
+                "status": "running",
+                "started_at": "2024-01-01T00:00:00",
+            },
+        )
+        # Confirm _seen_sessions cache is empty before the call
+        assert "session-replay" not in svc._seen_sessions
+
+        # Call ensure_session_node — should detect existing node and skip creation
+        await svc.ensure_session_node(
+            "session-replay", {"started_at": "2024-01-02T00:00:00"}
+        )
+
+        # Cache must now contain the session id
+        assert "session-replay" in svc._seen_sessions
+
+        # Original started_at must NOT be overwritten
+        node = await svc.graph.get_node("session-replay")
+        assert node is not None
+        assert node["started_at"] == "2024-01-01T00:00:00"
+
+    async def test_ensure_session_node_graph_backed_creates_when_absent(self):
+        """ensure_session_node creates a Root node when the session is absent from both
+        _seen_sessions cache and the graph."""
+        svc = HookStateService()
+        # Both graph and cache are empty — node should be created
+        await svc.ensure_session_node(
+            "session-new", {"started_at": "2024-01-01T00:00:00"}
+        )
+
+        node = await svc.graph.get_node("session-new")
+        assert node is not None
+        assert "Root" in node["labels"]
+        assert "session-new" in svc._seen_sessions
+
+    async def test_ensure_session_node_no_label_change_on_existing(self):
+        """When a Subsession node already exists in the graph, ensure_session_node must NOT
+        add a Root label to it — labels on existing nodes are never changed."""
+        svc = HookStateService()
+        # Pre-create a Subsession node (e.g. already stored from a previous run)
+        await svc.graph.upsert_node(
+            "session-sub",
+            {
+                "labels": ["Session", "Subsession"],
+                "status": "running",
+                "started_at": "2024-01-01T00:00:00",
+            },
+        )
+
+        # Call without a parent field — a naive implementation would add a Root label
+        await svc.ensure_session_node("session-sub", {})
+
+        node = await svc.graph.get_node("session-sub")
+        assert node is not None
+        # Root must NOT have been added to an existing Subsession node
+        assert "Root" not in node["labels"]
+        # Subsession label must still be present
+        assert "Subsession" in node["labels"]
