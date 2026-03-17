@@ -587,6 +587,9 @@ class TestCursorPurgeEndpoints:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """DELETE /sessions/cursors returns 200 and removes all cursor files."""
+        # The purge-all endpoint reads cursor_path directly from main_module._settings
+        # (not via registry.get_settings()), so the autouse safe_cursor_path conftest
+        # fixture alone is insufficient here — we must patch _settings directly.
         monkeypatch.setattr(main_module._settings, "cursor_path", str(tmp_path))
 
         sessions = ["session-a", "session-b", "session-c"]
