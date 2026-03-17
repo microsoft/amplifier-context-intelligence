@@ -414,3 +414,116 @@ class TestWriteRoutingMatrix:
         assert not unexpected.exists(), (
             "Should not create matrix.yaml for name='custom-name'"
         )
+
+
+class TestConfigDefaults:
+    """Tests for config.py default values."""
+
+    def test_routing_matrix_default_is_intelligence_service(self) -> None:
+        """The routing_matrix default must be 'intelligence-service'."""
+        from intelligence_service.config import Settings
+
+        settings = Settings()
+        assert settings.routing_matrix == "intelligence-service", (
+            f"Expected routing_matrix default 'intelligence-service', "
+            f"got '{settings.routing_matrix}'"
+        )
+
+
+class TestPhase5Integration:
+    """Integration test for the full Phase 5 flow (four helper functions in sequence)."""
+
+    def test_end_to_end_produces_valid_artifacts(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Full Phase 5 flow with anthropic+gemini produces correct artifacts.
+
+        Calls all four functions in sequence and verifies:
+        - available set contains exactly anthropic and gemini
+        - instance_ids include expected provider-model suffixes
+        - matrix YAML file is written with correct content and role ordering
+        """
+        # Set up: only anthropic and gemini API keys present
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-anthropic")
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+        for name, info in PROVIDERS.items():
+            if name not in ("anthropic", "gemini"):
+                monkeypatch.delenv(info["env_var"], raising=False)
+
+        # Step 5a: _get_available_providers()
+        available = _get_available_providers()
+
+        assert isinstance(available, set), "available must be a set"
+        assert available == {"anthropic", "gemini"}, (
+            f"Expected {{'anthropic', 'gemini'}}, got {available}"
+        )
+
+        # Step 5b: _build_provider_instances(available)
+        provider_instances = _build_provider_instances(available)
+
+        instance_ids = {inst["instance_id"] for inst in provider_instances}
+        assert "anthropic-sonnet" in instance_ids, (
+            f"Expected 'anthropic-sonnet' in instance_ids, got {instance_ids}"
+        )
+        assert "anthropic-haiku" in instance_ids, (
+            f"Expected 'anthropic-haiku' in instance_ids, got {instance_ids}"
+        )
+        assert "gemini-flash" in instance_ids, (
+            f"Expected 'gemini-flash' in instance_ids, got {instance_ids}"
+        )
+        assert "gemini-flash-preview-image-generation" in instance_ids, (
+            f"Expected 'gemini-flash-preview-image-generation' in instance_ids, "
+            f"got {instance_ids}"
+        )
+        # Exactly 4 unique instances
+        assert len(provider_instances) == 4, (
+            f"Expected 4 provider instances, got {len(provider_instances)}: {instance_ids}"
+        )
+
+        # Step 5c: _build_matrix_dict(available) then _write_routing_matrix(...)
+        matrix = _build_matrix_dict(available)
+        _write_routing_matrix(matrix, tmp_path, "intelligence-service")
+
+        # Verify YAML file exists at expected path
+        yaml_file = tmp_path / "routing" / "intelligence-service.yaml"
+        assert yaml_file.exists(), f"Expected YAML file at {yaml_file}"
+
+        with yaml_file.open() as f:
+            written = yaml.safe_load(f)
+
+        # Verify top-level fields
+        assert written["name"] == "intelligence-service"
+        assert (
+            written["description"]
+            == "Auto-generated routing matrix for the intelligence service."
+        )
+        assert "roles" in written
+
+        # All 11 roles must be present when both providers available
+        assert len(written["roles"]) == 11, (
+            f"Expected 11 roles, got {len(written['roles'])}: {set(written['roles'].keys())}"
+        )
+
+        # Verify role ordering: "fast" has gemini first, then anthropic
+        fast_candidates = written["roles"]["fast"]["candidates"]
+        assert len(fast_candidates) == 2, (
+            f"Expected 2 fast candidates, got {len(fast_candidates)}"
+        )
+        assert fast_candidates[0]["provider"] == "gemini", (
+            f"Expected gemini first in fast, got {fast_candidates[0]['provider']}"
+        )
+        assert fast_candidates[1]["provider"] == "anthropic", (
+            f"Expected anthropic second in fast, got {fast_candidates[1]['provider']}"
+        )
+
+        # Verify role ordering: "vision" has gemini first, then anthropic
+        vision_candidates = written["roles"]["vision"]["candidates"]
+        assert len(vision_candidates) == 2, (
+            f"Expected 2 vision candidates, got {len(vision_candidates)}"
+        )
+        assert vision_candidates[0]["provider"] == "gemini", (
+            f"Expected gemini first in vision, got {vision_candidates[0]['provider']}"
+        )
+        assert vision_candidates[1]["provider"] == "anthropic", (
+            f"Expected anthropic second in vision, got {vision_candidates[1]['provider']}"
+        )

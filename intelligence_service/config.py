@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     runtime_state_path: str = "/data/intelligence-runtime"
     workspace_path: str = "/data/intelligence-runtime/workspace"
-    routing_matrix: str = "balanced"
+    routing_matrix: str = "intelligence-service"
 
 
 @lru_cache
