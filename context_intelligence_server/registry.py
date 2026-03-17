@@ -199,7 +199,9 @@ class SessionRegistry:
                 self.drain_worker(worker), name=f"drain-{worker.session_id}"
             )
 
-    def get_or_create(self, session_id: str, workspace: str) -> SessionWorker:
+    def get_or_create(
+        self, session_id: str, workspace: str, replay: bool = False
+    ) -> SessionWorker:
         if session_id not in self._workers:
             settings = get_settings()
             blob_store = AsyncDiskBlobStore(root=settings.blob_path)
@@ -221,6 +223,23 @@ class SessionRegistry:
                     graph_store=neo4j_store,
                 ),
             )
+            if replay:
+                # Replay mode: delete any persisted cursors so processing starts fresh
+                self._delete_persisted_cursors(session_id)
+                logger.info(
+                    "replay_mode: deleted persisted cursors for session %s", session_id
+                )
+            else:
+                # Normal mode: restore persisted cursors if available
+                persisted = self._load_persisted_cursors(session_id)
+                if persisted is not None:
+                    self._workers[session_id].services.set_cursors(
+                        session_id, persisted
+                    )
+                    logger.info(
+                        "cursor_restored: session %s restored from persisted state",
+                        session_id,
+                    )
             self.start_drain(self._workers[session_id])
         return self._workers[session_id]
 

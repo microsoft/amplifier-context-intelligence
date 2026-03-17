@@ -1063,3 +1063,67 @@ class TestCursorPersistence:
         registry._delete_persisted_cursors("test-session", cursor_path=str(tmp_path))
 
         assert not cursor_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_restores_cursors_when_not_replay(
+        self, tmp_path: Path
+    ) -> None:
+        """get_or_create loads and restores persisted cursors when replay=False."""
+        import json
+        from datetime import datetime, timezone
+
+        cursor_data = {
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "cursors": {
+                "current_run_id": "run-restored",
+                "current_step_id": "step-restored",
+                "prompt_preview": "restored preview",
+                "parallel_groups": {},
+                "tool_call_map": {},
+            },
+        }
+        # safe_cursor_path fixture patches get_settings().cursor_path → tmp_path
+        session_dir = tmp_path / "session-restore"
+        session_dir.mkdir()
+        (session_dir / "cursors.json").write_text(json.dumps(cursor_data))
+
+        reg = SessionRegistry()
+        worker = reg.get_or_create("session-restore", "/ws", replay=False)
+
+        cursors = worker.services.get_cursors("session-restore")
+        assert cursors.current_run_id == "run-restored"
+        assert cursors.current_step_id == "step-restored"
+        assert cursors.prompt_preview == "restored preview"
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_deletes_cursors_when_replay(
+        self, tmp_path: Path
+    ) -> None:
+        """get_or_create deletes persisted cursors when replay=True."""
+        import json
+
+        cursor_data = {
+            "last_updated": "2024-01-01T00:00:00+00:00",
+            "cursors": {
+                "current_run_id": "run-old",
+                "current_step_id": "step-old",
+                "prompt_preview": "",
+                "parallel_groups": {},
+                "tool_call_map": {},
+            },
+        }
+        # safe_cursor_path fixture patches get_settings().cursor_path → tmp_path
+        session_dir = tmp_path / "session-replay"
+        session_dir.mkdir()
+        cursor_file = session_dir / "cursors.json"
+        cursor_file.write_text(json.dumps(cursor_data))
+        assert cursor_file.exists()
+
+        reg = SessionRegistry()
+        worker = reg.get_or_create("session-replay", "/ws", replay=True)
+
+        # Cursor file should be deleted
+        assert not cursor_file.exists()
+        # In-memory cursors should be empty (not restored from deleted file)
+        cursors = worker.services.get_cursors("session-replay")
+        assert cursors.current_run_id is None

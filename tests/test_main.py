@@ -547,6 +547,105 @@ async def test_dashboard_html_includes_log_viewer(client: httpx.AsyncClient) -> 
     assert "/logs/stream" in js_body
 
 
+# ---------------------------------------------------------------------------
+# TestCursorPurgeEndpoints
+# ---------------------------------------------------------------------------
+
+
+class TestCursorPurgeEndpoints:
+    """Tests for DELETE /sessions/{session_id}/cursors and DELETE /sessions/cursors."""
+
+    async def test_purge_single_session_cursors(
+        self,
+        client: httpx.AsyncClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """DELETE /sessions/{session_id}/cursors returns 200 and removes cursor file."""
+        # safe_cursor_path fixture already patches registry.get_settings to use tmp_path,
+        # so registry._delete_persisted_cursors will find cursors in tmp_path.
+        session_id = "test-session-purge"
+        session_dir = tmp_path / session_id
+        session_dir.mkdir()
+        cursor_file = session_dir / "cursors.json"
+        cursor_file.write_text(
+            '{"last_updated": "2024-01-01T00:00:00Z", "cursors": {}}',
+            encoding="utf-8",
+        )
+        assert cursor_file.exists()
+
+        response = await client.delete(f"/sessions/{session_id}/cursors")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["session_id"] == session_id
+        assert not cursor_file.exists()
+
+    async def test_purge_all_session_cursors(
+        self,
+        client: httpx.AsyncClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """DELETE /sessions/cursors returns 200 and removes all cursor files."""
+        monkeypatch.setattr(main_module._settings, "cursor_path", str(tmp_path))
+
+        sessions = ["session-a", "session-b", "session-c"]
+        cursor_files: list[Path] = []
+        for sid in sessions:
+            session_dir = tmp_path / sid
+            session_dir.mkdir()
+            cursor_file = session_dir / "cursors.json"
+            cursor_file.write_text(
+                '{"last_updated": "2024-01-01T00:00:00Z", "cursors": {}}',
+                encoding="utf-8",
+            )
+            cursor_files.append(cursor_file)
+
+        response = await client.delete("/sessions/cursors")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["purged"] == len(sessions)
+        for cursor_file in cursor_files:
+            assert not cursor_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# replay flag tests
+# ---------------------------------------------------------------------------
+
+
+async def test_post_events_replay_flag_passes_to_get_or_create(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /events?replay=true calls get_or_create with replay=True."""
+    from unittest.mock import patch
+
+    captured_kwargs: dict = {}
+
+    original = registry.get_or_create
+
+    def capturing_get_or_create(
+        session_id: str, workspace: str, replay: bool = False
+    ) -> Any:
+        captured_kwargs["replay"] = replay
+        return original(session_id, workspace, replay=replay)
+
+    with patch.object(registry, "get_or_create", side_effect=capturing_get_or_create):
+        response = await client.post(
+            "/events?replay=true",
+            json={
+                "event": "tool_use",
+                "workspace": "/ws",
+                "data": {"session_id": "sess-replay-flag"},
+            },
+        )
+    assert response.status_code == 202
+    assert captured_kwargs["replay"] is True
+
+
 async def test_lifespan_creates_and_closes_driver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

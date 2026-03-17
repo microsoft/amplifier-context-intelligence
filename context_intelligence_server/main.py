@@ -82,12 +82,37 @@ async def get_status() -> dict[str, Any]:
 
 
 @app.post("/events", status_code=202, response_model=EventResponse)
-async def post_events(request: EventRequest) -> EventResponse:
+async def post_events(request: EventRequest, replay: bool = False) -> EventResponse:
     session_id = request.data.get("session_id", "")
-    worker = registry.get_or_create(session_id, request.workspace)
+    worker = registry.get_or_create(session_id, request.workspace, replay=replay)
     await worker.queue.put((request.event, request.workspace, request.data))
     logger.info("event_enqueued: event=%s session_id=%s", request.event, session_id)
     return EventResponse(status="queued", session_id=session_id or None)
+
+
+@app.delete("/sessions/cursors")
+async def purge_all_cursors() -> dict[str, Any]:
+    """Delete all cursor files under cursor_path.
+
+    Returns ``{status: 'ok', purged: <count>}``.
+    """
+    cursor_root = Path(_settings.cursor_path)
+    purged = 0
+    if cursor_root.exists():
+        for cursor_file in cursor_root.glob("*/cursors.json"):
+            cursor_file.unlink()
+            purged += 1
+    return {"status": "ok", "purged": purged}
+
+
+@app.delete("/sessions/{session_id}/cursors")
+async def purge_session_cursors(session_id: str) -> dict[str, Any]:
+    """Delete the cursor file for a single session.
+
+    Returns ``{status: 'ok', session_id: <session_id>}``.
+    """
+    registry._delete_persisted_cursors(session_id)
+    return {"status": "ok", "session_id": session_id}
 
 
 @app.get("/blobs/{session_id}")
