@@ -12,6 +12,8 @@ import pytest
 from intelligence_service.amplifier_intelligence_runtime import (
     WELL_KNOWN_BUNDLES,
     AmplifierIntelligenceRuntime,
+    _expand_bundle_hook_configs,
+    _expand_env_vars,
 )
 
 # Patch targets
@@ -64,6 +66,7 @@ def mock_composition_chain(mock_registry_and_load: tuple) -> tuple:
     mock_registry_cls, mock_registry, mock_load = mock_registry_and_load
 
     base_bundle = MagicMock()
+    base_bundle.base_path = None
     server_bundle = MagicMock()
     telemetry_bundle = MagicMock()
     composed_with_server = MagicMock()
@@ -221,8 +224,16 @@ async def test_startup_composes_telemetry_bundle(
 
 async def test_startup_composes_runtime_config_with_hooks_routing(
     mock_composition_chain: tuple,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """startup() composes runtime-config Bundle with hooks-routing hook onto composed_with_telemetry."""
+    # Clear provider env vars to prevent env leakage into provider detection
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("AZURE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
     *_, composed_with_telemetry, _, _ = mock_composition_chain
 
     runtime = make_runtime()
@@ -358,3 +369,169 @@ async def test_startup_adds_file_handler(
 
     # Clean up to avoid polluting other tests
     await runtime.close()
+
+
+# ===========================================================================
+# Env-var expansion tests
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Test 15: _expand_env_vars resolves a set env var
+# ---------------------------------------------------------------------------
+
+
+class TestExpandEnvVars:
+    """Unit tests for the _expand_env_vars helper function."""
+
+    def test_resolves_set_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """${VAR} is replaced by the env var value when set."""
+        monkeypatch.setenv("MY_TEST_VAR", "http://server:8000")
+        result = _expand_env_vars("${MY_TEST_VAR:}")
+        assert result == "http://server:8000"
+
+    def test_uses_default_when_env_var_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """${VAR:default} uses the default when the env var is not set."""
+        monkeypatch.delenv("MY_TEST_VAR", raising=False)
+        result = _expand_env_vars("${MY_TEST_VAR:fallback-value}")
+        assert result == "fallback-value"
+
+    def test_empty_default_when_env_var_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """${VAR:} resolves to empty string when env var is not set."""
+        monkeypatch.delenv("MY_TEST_VAR", raising=False)
+        result = _expand_env_vars("${MY_TEST_VAR:}")
+        assert result == ""
+
+    def test_no_default_resolves_to_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """${VAR} (no colon) resolves to empty string when env var is not set."""
+        monkeypatch.delenv("MY_TEST_VAR", raising=False)
+        result = _expand_env_vars("${MY_TEST_VAR}")
+        assert result == ""
+
+    def test_env_var_overrides_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When env var is set, its value takes precedence over the default."""
+        monkeypatch.setenv("MY_TEST_VAR", "actual-value")
+        result = _expand_env_vars("${MY_TEST_VAR:ignored-default}")
+        assert result == "actual-value"
+
+    def test_recurses_into_dicts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Expansion walks into nested dict values."""
+        monkeypatch.setenv("URL_VAR", "http://host:8000")
+        config = {"url": "${URL_VAR:}", "nested": {"level": "${URL_VAR:}"}}
+        result = _expand_env_vars(config)
+        assert result == {
+            "url": "http://host:8000",
+            "nested": {"level": "http://host:8000"},
+        }
+
+    def test_recurses_into_lists(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Expansion walks into list items."""
+        monkeypatch.setenv("ITEM_VAR", "resolved")
+        result = _expand_env_vars(["${ITEM_VAR:}", "literal"])
+        assert result == ["resolved", "literal"]
+
+    def test_leaves_non_strings_untouched(self) -> None:
+        """Integers, booleans, and None pass through unchanged."""
+        assert _expand_env_vars(42) == 42
+        assert _expand_env_vars(True) is True
+        assert _expand_env_vars(None) is None
+
+    def test_multiple_vars_in_one_string(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Multiple ${VAR} references in a single string are all expanded."""
+        monkeypatch.setenv("HOST", "localhost")
+        monkeypatch.setenv("PORT", "7687")
+        result = _expand_env_vars("bolt://${HOST:}:${PORT:}")
+        assert result == "bolt://localhost:7687"
+
+
+# ---------------------------------------------------------------------------
+# Test 16: _expand_bundle_hook_configs mutates hook configs in-place
+# ---------------------------------------------------------------------------
+
+
+class TestExpandBundleHookConfigs:
+    """Unit tests for the _expand_bundle_hook_configs helper."""
+
+    def test_expands_hook_configs_on_bundle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hook config values containing ${VAR:} are expanded in-place."""
+        monkeypatch.setenv(
+            "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL",
+            "http://context-intelligence-server:8000",
+        )
+        bundle = MagicMock()
+        bundle.hooks = [
+            {
+                "module": "hook-context-intelligence",
+                "config": {
+                    "context_intelligence_server_url": "${AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL:}",
+                    "log_level": "${AMPLIFIER_CONTEXT_INTELLIGENCE_LOG_LEVEL:INFO}",
+                },
+            }
+        ]
+
+        _expand_bundle_hook_configs(bundle)
+
+        assert bundle.hooks[0]["config"]["context_intelligence_server_url"] == (
+            "http://context-intelligence-server:8000"
+        )
+        assert bundle.hooks[0]["config"]["log_level"] == "INFO"
+
+    def test_noop_when_bundle_has_no_hooks(self) -> None:
+        """Bundles without a hooks attribute are silently skipped."""
+        bundle = MagicMock(spec=[])  # no attributes at all
+        _expand_bundle_hook_configs(bundle)  # should not raise
+
+    def test_noop_when_hooks_is_empty(self) -> None:
+        """Bundles with an empty hooks list are silently skipped."""
+        bundle = MagicMock()
+        bundle.hooks = []
+        _expand_bundle_hook_configs(bundle)  # should not raise
+
+    def test_skips_hooks_without_config_key(self) -> None:
+        """Hook dicts that lack a 'config' key are left alone."""
+        bundle = MagicMock()
+        bundle.hooks = [{"module": "some-hook"}]
+        _expand_bundle_hook_configs(bundle)
+        assert bundle.hooks[0] == {"module": "some-hook"}
+
+
+# ---------------------------------------------------------------------------
+# Test 17: startup() expands env vars in loaded bundles
+# ---------------------------------------------------------------------------
+
+
+async def test_startup_expands_env_vars_in_telemetry_bundle(
+    mock_composition_chain: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """startup() expands ${VAR:} templates in the telemetry bundle's hook configs."""
+    monkeypatch.setenv(
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL",
+        "http://context-intelligence-server:8000",
+    )
+    _, _, _, _, _, telemetry_bundle, *_ = mock_composition_chain
+
+    # Give the mock telemetry bundle a hooks list with unexpanded config
+    telemetry_bundle.hooks = [
+        {
+            "module": "hook-context-intelligence",
+            "config": {
+                "context_intelligence_server_url": "${AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL:}",
+            },
+        }
+    ]
+
+    runtime = make_runtime()
+    await runtime.startup()
+
+    assert telemetry_bundle.hooks[0]["config"]["context_intelligence_server_url"] == (
+        "http://context-intelligence-server:8000"
+    )

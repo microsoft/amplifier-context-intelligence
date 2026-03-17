@@ -19,7 +19,7 @@ def test_settings_defaults() -> None:
     assert settings.log_level == "INFO"
     assert settings.runtime_state_path == "/data/intelligence-runtime"
     assert settings.workspace_path == "/data/intelligence-runtime/workspace"
-    assert settings.routing_matrix == "balanced"
+    assert settings.routing_matrix == "intelligence-service"
 
 
 def test_settings_removed_fields_do_not_exist() -> None:
@@ -67,10 +67,10 @@ def test_settings_workspace_path_default() -> None:
 
 
 def test_settings_routing_matrix_default() -> None:
-    """Verify routing_matrix defaults to 'balanced'."""
+    """Verify routing_matrix defaults to 'intelligence-service'."""
     settings = Settings()
 
-    assert settings.routing_matrix == "balanced"
+    assert settings.routing_matrix == "intelligence-service"
 
 
 def test_settings_runtime_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
