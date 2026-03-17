@@ -1,12 +1,15 @@
 """Tests for PROVIDERS dict, _get_available_providers(), ROUTING_ROLES,
-_model_suffix(), and _build_provider_instances() functions.
+_model_suffix(), _build_provider_instances(), and _write_routing_matrix() functions.
 
 TDD: These tests were written BEFORE the implementation.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+import yaml
 
 from intelligence_service.amplifier_intelligence_runtime import (
     PROVIDERS,
@@ -15,6 +18,7 @@ from intelligence_service.amplifier_intelligence_runtime import (
     _build_provider_instances,
     _get_available_providers,
     _model_suffix,
+    _write_routing_matrix,
 )
 
 
@@ -357,3 +361,56 @@ class TestBuildMatrixDict:
         """An empty available set must return an empty roles dict."""
         result = _build_matrix_dict(set())
         assert result["roles"] == {}
+
+
+class TestWriteRoutingMatrix:
+    """Tests for the _write_routing_matrix() function."""
+
+    _SAMPLE_MATRIX: dict = {
+        "name": "intelligence-service",
+        "description": "Test matrix.",
+        "updated": "2026-01-01",
+        "roles": {
+            "general": {
+                "candidates": [{"provider": "anthropic", "model": "claude-sonnet-*"}]
+            }
+        },
+    }
+
+    def test_creates_yaml_file(self, tmp_path: Path) -> None:
+        """_write_routing_matrix creates {bundle_root}/routing/{name}.yaml."""
+        _write_routing_matrix(self._SAMPLE_MATRIX, tmp_path, "matrix")
+        expected = tmp_path / "routing" / "matrix.yaml"
+        assert expected.exists(), f"Expected file not found: {expected}"
+
+    def test_creates_routing_directory(self, tmp_path: Path) -> None:
+        """routing/ directory is created if it doesn't exist."""
+        routing_dir = tmp_path / "routing"
+        assert not routing_dir.exists(), "routing/ should not exist before the call"
+        _write_routing_matrix(self._SAMPLE_MATRIX, tmp_path, "matrix")
+        assert routing_dir.is_dir(), "routing/ directory should be created"
+
+    def test_written_file_is_valid_yaml(self, tmp_path: Path) -> None:
+        """Written YAML can be parsed back and matches the input dict."""
+        _write_routing_matrix(self._SAMPLE_MATRIX, tmp_path, "matrix")
+        file_path = tmp_path / "routing" / "matrix.yaml"
+        with file_path.open() as f:
+            parsed = yaml.safe_load(f)
+        assert parsed == self._SAMPLE_MATRIX
+
+    def test_routing_dir_already_exists(self, tmp_path: Path) -> None:
+        """Does not fail if routing/ directory already exists."""
+        (tmp_path / "routing").mkdir()
+        # Should not raise
+        _write_routing_matrix(self._SAMPLE_MATRIX, tmp_path, "matrix")
+        assert (tmp_path / "routing" / "matrix.yaml").exists()
+
+    def test_uses_name_parameter_for_filename(self, tmp_path: Path) -> None:
+        """The name parameter controls the output filename."""
+        _write_routing_matrix(self._SAMPLE_MATRIX, tmp_path, "custom-name")
+        expected = tmp_path / "routing" / "custom-name.yaml"
+        assert expected.exists(), f"Expected file at: {expected}"
+        unexpected = tmp_path / "routing" / "matrix.yaml"
+        assert not unexpected.exists(), (
+            "Should not create matrix.yaml for name='custom-name'"
+        )

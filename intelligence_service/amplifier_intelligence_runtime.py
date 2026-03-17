@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import yaml
 from pathlib import Path
 from typing import Any
 
@@ -333,6 +334,21 @@ def _build_matrix_dict(available: set[str]) -> dict[str, Any]:
         "updated": str(date.today()),
         "roles": roles,
     }
+
+
+def _write_routing_matrix(matrix: dict[str, Any], bundle_root: Path, name: str) -> None:
+    """Serialize a routing matrix dict to {bundle_root}/routing/{name}.yaml.
+
+    Args:
+        matrix: The routing matrix dict to serialize.
+        bundle_root: Root path of the bundle directory.
+        name: Base filename (without extension) for the output YAML file.
+    """
+    routing_dir = bundle_root / "routing"
+    routing_dir.mkdir(parents=True, exist_ok=True)
+    output_path = routing_dir / f"{name}.yaml"
+    with output_path.open("w") as f:
+        yaml.dump(matrix, f, default_flow_style=False, sort_keys=False)
 
 
 # ---------------------------------------------------------------------------
