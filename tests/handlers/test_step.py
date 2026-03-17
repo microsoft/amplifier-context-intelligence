@@ -170,18 +170,6 @@ class TestProviderRequestHappyPath:
         cursors = services.get_cursors("s1")
         assert cursors.current_step_id == EXPECTED_STEP_NODE_ID
 
-    async def test_increments_step_counter(self, services: HookStateService) -> None:
-        await _seed_run(services)
-        handler = StepHandler(services)
-        cursors = services.get_cursors("s1")
-        initial_counter = cursors.step_counter
-
-        await handler(
-            "provider:request",
-            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
-        )
-        assert cursors.step_counter == initial_counter + 1
-
     async def test_returns_continue(self, services: HookStateService) -> None:
         await _seed_run(services)
         handler = StepHandler(services)

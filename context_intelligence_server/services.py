@@ -20,12 +20,13 @@ from typing import Any
 
 @dataclasses.dataclass
 class SessionCursors:
-    """Per-session cursor state shared across hook handlers."""
+    """Pointer-only state — no accumulators.
+
+    All fields are reconstructable from ordered event replay.
+    """
 
     current_run_id: str | None = None
     current_step_id: str | None = None
-    run_counter: int = 0
-    step_counter: int = 0
     prompt_preview: str = ""
     parallel_groups: dict[str, list[str]] = dataclasses.field(default_factory=dict)
     tool_call_map: dict[str, str] = dataclasses.field(default_factory=dict)

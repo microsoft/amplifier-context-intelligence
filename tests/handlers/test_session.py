@@ -351,7 +351,7 @@ class TestSessionEnd:
         handler = SessionHandler(services)
         # Prime cursors and mutate to prove they existed
         cursors = services.get_cursors("s1")
-        cursors.run_counter = 5
+        cursors.prompt_preview = "some preview"
 
         await handler(
             "session:end",
@@ -361,7 +361,7 @@ class TestSessionEnd:
         # After session:end, cursors should have been removed;
         # a fresh get_cursors returns default values
         fresh = services.get_cursors("s1")
-        assert fresh.run_counter == 0
+        assert fresh.prompt_preview == ""
 
     async def test_session_end_status_from_data(
         self, services: HookStateService

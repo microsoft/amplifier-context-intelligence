@@ -134,8 +134,6 @@ class TestPromptSubmitHappyPath:
         handler = OrchestratorRunHandler(services)
         # Set initial cursor state to verify changes
         cursors = services.get_cursors("s1")
-        cursors.run_counter = 2
-        cursors.step_counter = 5
         cursors.current_step_id = "old_step"
         cursors.prompt_preview = "old preview"
 
@@ -145,8 +143,6 @@ class TestPromptSubmitHappyPath:
         )
 
         cursors = services.get_cursors("s1")
-        assert cursors.run_counter == 3  # incremented
-        assert cursors.step_counter == 0  # reset
         assert cursors.current_step_id == EXPECTED_NODE_ID  # set to new node
         assert cursors.prompt_preview == "Hello world"  # stored
 

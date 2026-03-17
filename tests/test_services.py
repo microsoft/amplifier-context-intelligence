@@ -50,25 +50,35 @@ def test_hook_config_is_excluded_wildcard():
 
 
 def test_session_cursors_defaults():
-    """SessionCursors initialises with correct default values."""
+    """SessionCursors initialises with correct default values for remaining fields."""
     sc = SessionCursors()
     assert sc.current_run_id is None
     assert sc.current_step_id is None
-    assert sc.run_counter == 0
-    assert sc.step_counter == 0
     assert sc.prompt_preview == ""
     assert sc.parallel_groups == {}
     assert sc.tool_call_map == {}
 
 
 def test_session_cursors_is_dataclass():
-    """SessionCursors must be a proper dataclass."""
+    """SessionCursors must be a proper dataclass with exactly the 5 pointer fields."""
     assert dataclasses.is_dataclass(SessionCursors)
     # Verify all expected fields are present via dataclasses.fields
     field_names = {f.name for f in dataclasses.fields(SessionCursors)}
     assert "current_run_id" in field_names
+    assert "current_step_id" in field_names
+    assert "prompt_preview" in field_names
     assert "parallel_groups" in field_names
     assert "tool_call_map" in field_names
+    # Counters must NOT be present — they are ephemeral accumulators
+    assert "run_counter" not in field_names
+    assert "step_counter" not in field_names
+
+
+def test_session_cursors_no_counter_fields():
+    """SessionCursors must not expose run_counter or step_counter attributes."""
+    sc = SessionCursors()
+    assert not hasattr(sc, "run_counter")
+    assert not hasattr(sc, "step_counter")
 
 
 # ---------------------------------------------------------------------------
