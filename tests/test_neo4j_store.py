@@ -507,7 +507,7 @@ class TestSchemaIndexesWorkspace:
 
         assert store._schema_initialized is True
 
-    async def test_schema_is_idempotent(self):
+    async def test_schema_skips_when_already_initialized(self):
         """_ensure_schema() is a no-op when _schema_initialized is already True."""
         store = _make_store()
         store._schema_initialized = True
@@ -516,6 +516,34 @@ class TestSchemaIndexesWorkspace:
             side_effect=AssertionError("must not call driver")
         )
         await store._ensure_schema()  # Should not raise
+
+    async def test_schema_is_idempotent(self):
+        """Every CREATE INDEX query in _ensure_schema() must use IF NOT EXISTS.
+
+        The Docker Compose stack uses a persistent neo4j_data volume.  When the
+        container restarts the Python process starts fresh (_schema_initialized
+        resets to False) but the indexes already exist in Neo4j.  Without
+        IF NOT EXISTS every restart raises
+        Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists, which
+        propagates out of flush() and causes the "Final flush failed during
+        close" data-loss path.
+        """
+        store = _make_store()
+        mock_session = self._make_schema_session()
+        store._driver.session = MagicMock(return_value=mock_session)
+
+        await store._ensure_schema()
+
+        all_queries = [
+            call.args[0] for call in mock_session.run.call_args_list if call.args
+        ]
+        assert all_queries, "_ensure_schema must issue at least one query"
+        for query in all_queries:
+            assert "IF NOT EXISTS" in query.upper(), (
+                f"Every schema CREATE INDEX must use IF NOT EXISTS so that "
+                f"container restarts on a persistent volume do not raise "
+                f"EquivalentSchemaRuleAlreadyExists.  Offending query: {query!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -789,3 +817,25 @@ async def test_close_logs_final_flush_exception():
     mock_log.exception.assert_called_once()
     logged_msg = mock_log.exception.call_args.args[0]
     assert "flush" in logged_msg.lower() or "buffered" in logged_msg.lower()
+
+
+# ---------------------------------------------------------------------------
+# TestRemoveEdge
+# ---------------------------------------------------------------------------
+
+
+class TestRemoveEdge:
+    """Tests for Neo4jGraphStore.remove_edge."""
+
+    async def test_remove_edge_from_buffer(self):
+        """remove_edge removes a buffered edge from _edge_buffer."""
+        store = _make_store()
+        await store.upsert_edge("src", "dst", {"type": "KNOWS"})
+        assert ("src", "dst") in store._edge_buffer
+        store.remove_edge("src", "dst")
+        assert ("src", "dst") not in store._edge_buffer
+
+    async def test_remove_edge_nonexistent_is_noop(self):
+        """remove_edge on a nonexistent edge must not raise an error."""
+        store = _make_store()
+        store.remove_edge("does-not-exist", "also-missing")  # must not raise

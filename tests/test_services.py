@@ -392,3 +392,35 @@ class TestHookStateService:
         assert "Root" not in node["labels"]
         # Subsession label must still be present
         assert "Subsession" in node["labels"]
+
+
+# ---------------------------------------------------------------------------
+# GraphState.remove_edge tests
+# ---------------------------------------------------------------------------
+
+
+class TestGraphState:
+    """Tests for GraphState.remove_edge."""
+
+    async def test_remove_edge_existing(self):
+        """remove_edge removes an existing edge; get_edge returns None afterwards."""
+        state = GraphState()
+        await state.upsert_edge("n1", "n2", {"type": "KNOWS"})
+        state.remove_edge("n1", "n2")
+        assert await state.get_edge("n1", "n2") is None
+
+    async def test_remove_edge_nonexistent_is_noop(self):
+        """remove_edge on a nonexistent edge must not raise an error."""
+        state = GraphState()
+        state.remove_edge("does-not-exist", "also-missing")  # must not raise
+
+    async def test_remove_edge_does_not_affect_other_edges(self):
+        """Removing one edge must not affect other edges in the graph."""
+        state = GraphState()
+        await state.upsert_edge("n1", "n2", {"type": "KNOWS"})
+        await state.upsert_edge("n2", "n3", {"type": "LIKES"})
+        state.remove_edge("n1", "n2")
+        # The other edge must still be present
+        remaining = await state.get_edge("n2", "n3")
+        assert remaining is not None
+        assert remaining["type"] == "LIKES"

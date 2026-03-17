@@ -149,6 +149,13 @@ class GraphState:
         edge = self._edges.get((src_id, dst_id))
         return dict(edge) if edge is not None else None
 
+    def remove_edge(self, src_id: str, dst_id: str) -> None:
+        """Remove an edge from the in-memory store.
+
+        No-op if the edge does not exist.
+        """
+        self._edges.pop((src_id, dst_id), None)
+
     # ------------------------------------------------------------------
     # Flush / close (no-ops for in-memory store)
     # ------------------------------------------------------------------

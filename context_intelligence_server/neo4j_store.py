@@ -203,6 +203,15 @@ class Neo4jGraphStore:
 
         return None
 
+    def remove_edge(self, src_id: str, dst_id: str) -> None:
+        """Remove a buffered edge from the edge buffer.
+
+        No-op if the edge does not exist in the buffer.
+        Note: edges already flushed to Neo4j are handled separately by the
+        ownership integrity checker via explicit Cypher DELETE queries.
+        """
+        self._edge_buffer.pop((src_id, dst_id), None)
+
     # ------------------------------------------------------------------
     # Persistence methods
     # ------------------------------------------------------------------
