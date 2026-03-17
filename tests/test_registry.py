@@ -867,6 +867,45 @@ class TestStaleSessionReaping:
 
         assert "stale-session" not in reg._workers
 
+    @pytest.mark.asyncio
+    async def test_stale_reap_persist_error_still_closes_and_deregisters(
+        self, tmp_path: Path
+    ) -> None:
+        """If _persist_cursors_sync raises during stale reaping,
+        graph.close is still called and the worker is still deregistered."""
+        from unittest.mock import MagicMock
+
+        reg = SessionRegistry()
+        worker = SessionWorker(
+            session_id="stale-session",
+            workspace="/workspace/test",
+            services=HookStateService(workspace="/workspace/test"),
+        )
+        worker.last_event_time = time.time() - (5.8 * 24 * 3600)
+        reg._register_for_test(worker)
+        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
+
+        mock_settings = MagicMock()
+        mock_settings.stale_session_timeout = 432000.0  # 5 days
+        mock_settings.cursor_path = str(tmp_path)
+
+        with (
+            patch(
+                "context_intelligence_server.registry.get_settings",
+                return_value=mock_settings,
+            ),
+            patch.object(
+                reg,
+                "_persist_cursors_sync",
+                side_effect=OSError("disk full"),
+            ),
+        ):
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
+            await asyncio.wait_for(task, timeout=2.0)
+
+        worker.services.graph.close.assert_awaited_once()
+        assert "stale-session" not in reg._workers
+
 
 class TestCancelledErrorCallsClose:
     """CancelledError causes graph.close() (not just flush) to be called."""

@@ -158,7 +158,13 @@ class SessionRegistry:
                         worker.session_id,
                         settings.stale_session_timeout,
                     )
-                    self._persist_cursors_sync(worker)
+                    try:
+                        self._persist_cursors_sync(worker)
+                    except Exception:
+                        logger.exception(
+                            "cursor persist failed on stale reap for session %s",
+                            worker.session_id,
+                        )
                     try:
                         await worker.services.graph.close()
                     except Exception:
