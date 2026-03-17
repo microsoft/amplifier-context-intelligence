@@ -72,19 +72,14 @@ The server receives events from [amplifier-bundle-context-intelligence](https://
 ### Install the bundle
 
 ```bash
-amplifier bundle add git+https://github.com/colombod/amplifier-bundle-context-intelligence@main --name context-intelligence
-amplifier bundle use context-intelligence
+amplifier bundle add git+https://github.com/colombod/amplifier-bundle-context-intelligence@main --name context-intelligence --app
 ```
+
+The `--app` flag makes the bundle always active across all sessions -- no need to run `amplifier bundle use`.
 
 ### Configure the server URL
 
-Set the environment variable before running Amplifier:
-
-```bash
-export AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL=http://localhost:8000
-```
-
-Or configure it in `~/.amplifier/settings.yaml`:
+Add the hook configuration to `~/.amplifier/settings.yaml`:
 
 ```yaml
 overrides:
@@ -95,7 +90,7 @@ overrides:
 
 ### How it works
 
-When `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL` is set, the hook:
+When `context_intelligence_server_url` is configured, the hook:
 
 1. Writes every event to local JSONL (always, regardless of server)
 2. Fire-and-forgets `POST /events` to the server for each event (5s timeout, failures logged as warnings)
@@ -103,13 +98,14 @@ When `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL` is set, the hook:
 
 The local JSONL is the durable record. The server dispatch is best-effort and never blocks the Amplifier session. If the server is down, the session continues unaffected.
 
-### Environment variables
+### Hook settings
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL` | *(empty -- disabled)* | Server URL to forward events to |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_WORKSPACE` | *(auto-resolved)* | Workspace scope for graph data |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_LOG_LEVEL` | `INFO` | Hook log level |
+All settings live in `~/.amplifier/settings.yaml` under `overrides.hook-context-intelligence.config`:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `context_intelligence_server_url` | *(empty -- disabled)* | Server URL to forward events to |
+| `workspace` | *(auto-resolved)* | Workspace scope for graph data |
 
 ---
 
