@@ -164,8 +164,8 @@ def test_compose_server_blob_volume(compose: dict) -> None:
     server = compose["services"]["context-intelligence-server"]
     volumes = server.get("volumes", [])
     vol_str = "\n".join(str(v) for v in volumes)
-    assert "blob_data" in vol_str, (
-        "context-intelligence-server must mount blob_data volume"
+    assert "/data/blobs" in vol_str, (
+        "context-intelligence-server must mount a volume at /data/blobs"
     )
 
 
@@ -194,9 +194,22 @@ def test_compose_neo4j_ports(compose: dict) -> None:
 
 
 def test_compose_top_level_volumes(compose: dict) -> None:
-    volumes = compose.get("volumes", {})
-    assert "blob_data" in volumes, "docker-compose.yml must declare blob_data volume"
-    assert "neo4j_data" in volumes, "docker-compose.yml must declare neo4j_data volume"
+    """All storage uses bind mounts instead of named volumes.
+
+    Verify that /data/blobs is mounted in context-intelligence-server
+    and /data is mounted in neo4j.
+    """
+    server_vols = "\n".join(
+        str(v)
+        for v in compose["services"]["context-intelligence-server"].get("volumes", [])
+    )
+    assert "/data/blobs" in server_vols, (
+        "context-intelligence-server must have a bind mount to /data/blobs"
+    )
+    neo4j_vols = "\n".join(
+        str(v) for v in compose["services"]["neo4j"].get("volumes", [])
+    )
+    assert "/data" in neo4j_vols, "neo4j must have a bind mount to /data"
 
 
 def test_compose_docker_command_available() -> None:

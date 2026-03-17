@@ -11,6 +11,7 @@ Verifies the complete blob offloading flow:
 from __future__ import annotations
 
 import asyncio
+import socket
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
@@ -19,6 +20,15 @@ import pytest
 
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.main import app, registry
+
+
+def _neo4j_reachable() -> bool:
+    """Return True if Neo4j is reachable at neo4j:7687 (only resolves inside Docker)."""
+    try:
+        with socket.create_connection(("neo4j", 7687), timeout=1):
+            return True
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +101,9 @@ class TestBlobPipelineEndToEnd:
         )
         assert response.status_code == 202
 
+    @pytest.mark.skipif(
+        not _neo4j_reachable(), reason="Neo4j not reachable at neo4j:7687"
+    )
     async def test_drain_loop_processes_event_within_timeout(
         self, integration_env: httpx.AsyncClient
     ) -> None:
@@ -116,6 +129,9 @@ class TestBlobPipelineEndToEnd:
         # Must complete within 10 seconds (timeout raises asyncio.TimeoutError)
         await asyncio.wait_for(worker.queue.join(), timeout=10.0)
 
+    @pytest.mark.skipif(
+        not _neo4j_reachable(), reason="Neo4j not reachable at neo4j:7687"
+    )
     async def test_blob_pipeline_full_flow(
         self, integration_env: httpx.AsyncClient
     ) -> None:

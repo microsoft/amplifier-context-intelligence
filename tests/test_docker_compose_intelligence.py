@@ -123,11 +123,8 @@ def test_intelligence_service_has_runtime_state_volume(compose: dict) -> None:
     svc = compose["services"]["intelligence-service"]
     volumes = svc.get("volumes", [])
     vol_str = "\n".join(str(v) for v in volumes)
-    assert "intelligence_runtime_state" in vol_str, (
-        "intelligence-service must mount intelligence_runtime_state volume"
-    )
     assert "/data/intelligence-runtime" in vol_str, (
-        "intelligence_runtime_state must be mounted at /data/intelligence-runtime"
+        "intelligence-service must have a bind mount to /data/intelligence-runtime"
     )
 
 
@@ -135,10 +132,12 @@ def test_intelligence_service_has_blob_data_readonly(compose: dict) -> None:
     svc = compose["services"]["intelligence-service"]
     volumes = svc.get("volumes", [])
     vol_str = "\n".join(str(v) for v in volumes)
-    assert "blob_data" in vol_str, "intelligence-service must mount blob_data volume"
+    assert "/data/blobs" in vol_str, (
+        "intelligence-service must have a bind mount to /data/blobs"
+    )
     # Check for read-only mount
     assert ":ro" in vol_str or "read_only" in str(svc), (
-        "intelligence-service blob_data volume must be read-only (:ro)"
+        "intelligence-service blob volume must be read-only (:ro)"
     )
 
 
@@ -156,18 +155,14 @@ def test_intelligence_service_no_old_volume(compose: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_intelligence_service_env_file(compose: dict) -> None:
+def test_intelligence_service_api_keys_in_environment(compose: dict) -> None:
+    """API keys are passed via direct environment variables, not env_file."""
     svc = compose["services"]["intelligence-service"]
-    env_file = svc.get("env_file", [])
-    if isinstance(env_file, str):
-        env_file_str = env_file
-    elif isinstance(env_file, list):
-        env_file_str = "\n".join(str(e) for e in env_file)
-    else:
-        env_file_str = ""
-    assert "config/secrets.env" in env_file_str, (
-        "intelligence-service must reference env_file: config/secrets.env"
-    )
+    env = _get_env_dict(svc)
+    for key in ("GOOGLE_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        assert key in env, (
+            f"intelligence-service must pass {key} via the environment block"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -210,8 +205,11 @@ def test_intelligence_service_env_routing_matrix_balanced(compose: dict) -> None
     assert "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX" in env, (
         "intelligence-service must set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX"
     )
-    assert env["AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX"] == "balanced", (
-        "intelligence-service AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX must be 'balanced'"
+    assert (
+        env["AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX"]
+        == "intelligence-service"
+    ), (
+        "intelligence-service AMPLIFIER_CONTEXT_INTELLIGENCE_SERVICE_ROUTING_MATRIX must be 'intelligence-service'"
     )
 
 
@@ -324,16 +322,20 @@ def test_intelligence_service_healthcheck_retries_60(compose: dict) -> None:
 
 
 def test_compose_four_named_volumes(compose: dict) -> None:
-    volumes = compose.get("volumes", {})
-    assert len(volumes) == 4, (
-        f"docker-compose.yml must declare exactly 4 named volumes, found: {list(volumes.keys())}"
+    """All storage uses bind mounts; no top-level named volumes section should exist."""
+    volumes = compose.get("volumes")
+    assert not volumes, (
+        f"docker-compose.yml must NOT declare top-level named volumes (uses bind mounts instead), "
+        f"found: {list((volumes or {}).keys())}"
     )
 
 
 def test_compose_volume_intelligence_runtime_state(compose: dict) -> None:
-    volumes = compose.get("volumes", {})
-    assert "intelligence_runtime_state" in volumes, (
-        "docker-compose.yml must declare intelligence_runtime_state volume"
+    """intelligence-service uses a bind mount to /data/intelligence-runtime (no named volume)."""
+    svc = compose["services"]["intelligence-service"]
+    vol_str = "\n".join(str(v) for v in svc.get("volumes", []))
+    assert "/data/intelligence-runtime" in vol_str, (
+        "intelligence-service must have a bind mount to /data/intelligence-runtime"
     )
 
 
@@ -345,8 +347,12 @@ def test_compose_no_old_volume(compose: dict) -> None:
 
 
 def test_compose_volume_log_data(compose: dict) -> None:
-    volumes = compose.get("volumes", {})
-    assert "log_data" in volumes, "docker-compose.yml must declare log_data volume"
+    """context-intelligence-server uses a bind mount to /data/logs (no named volume)."""
+    svc = compose["services"]["context-intelligence-server"]
+    vol_str = "\n".join(str(v) for v in svc.get("volumes", []))
+    assert "/data/logs" in vol_str, (
+        "context-intelligence-server must have a bind mount to /data/logs"
+    )
 
 
 # ---------------------------------------------------------------------------

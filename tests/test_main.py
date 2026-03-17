@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import socket
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -13,6 +14,15 @@ import context_intelligence_server.main as main_module
 from context_intelligence_server.main import lifespan, registry
 from context_intelligence_server.models import CypherRequest
 from tests.conftest import MockNeo4jDriver
+
+
+def _neo4j_reachable() -> bool:
+    """Return True if Neo4j is reachable at neo4j:7687 (only resolves inside Docker)."""
+    try:
+        with socket.create_connection(("neo4j", 7687), timeout=1):
+            return True
+    except OSError:
+        return False
 
 
 async def test_status_returns_200(client: httpx.AsyncClient) -> None:
@@ -89,6 +99,7 @@ async def test_post_events_no_session_id_returns_null(
     assert data["session_id"] is None
 
 
+@pytest.mark.skipif(not _neo4j_reachable(), reason="Neo4j not reachable at neo4j:7687")
 async def test_drain_loop_processes_event(client: httpx.AsyncClient) -> None:
     await client.post(
         "/events",
