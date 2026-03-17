@@ -16,7 +16,7 @@ from context_intelligence_server.registry import (
     SessionRegistry,
     SessionWorker,
 )
-from context_intelligence_server.services import HookStateService
+from context_intelligence_server.services import HookStateService, SessionCursors
 
 
 # ---------------------------------------------------------------------------
@@ -768,3 +768,135 @@ class TestWorkerSelfTermination:
         assert worker.error_count == 1
         assert len(reg._completed) == 1
         assert reg._completed[0].error_count == 1
+
+
+class TestCursorPersistence:
+    """SessionRegistry cursor persistence: _persist_cursors_sync, _load_persisted_cursors,
+    _delete_persisted_cursors."""
+
+    def test_persist_cursors_creates_file(self, tmp_path: Path) -> None:
+        """_persist_cursors_sync writes JSON at {cursor_path}/{session_id}/cursors.json
+        with last_updated (ISO-8601) and cursor fields."""
+        import json
+
+        registry = SessionRegistry()
+        worker = SessionWorker(
+            session_id="test-session",
+            workspace="/workspace/test",
+            services=HookStateService(workspace="/workspace/test"),
+        )
+        cursors = worker.services.get_cursors("test-session")
+        cursors.current_run_id = "run-1"
+        cursors.current_step_id = "step-1"
+        cursors.prompt_preview = "Hello, World!"
+        cursors.parallel_groups = {"g1": ["a", "b"]}
+        cursors.tool_call_map = {"call1": "result1"}
+
+        registry._persist_cursors_sync(worker, cursor_path=str(tmp_path))
+
+        expected_path = tmp_path / "test-session" / "cursors.json"
+        assert expected_path.exists()
+
+        data = json.loads(expected_path.read_text())
+        assert "last_updated" in data
+        assert "cursors" in data
+        assert data["cursors"]["current_run_id"] == "run-1"
+        assert data["cursors"]["current_step_id"] == "step-1"
+        assert data["cursors"]["prompt_preview"] == "Hello, World!"
+        assert data["cursors"]["parallel_groups"] == {"g1": ["a", "b"]}
+        assert data["cursors"]["tool_call_map"] == {"call1": "result1"}
+
+    def test_load_persisted_cursors_restores(self, tmp_path: Path) -> None:
+        """_load_persisted_cursors restores SessionCursors from disk with correct fields."""
+        import json
+        from datetime import datetime, timezone
+
+        registry = SessionRegistry()
+        cursor_data = {
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "cursors": {
+                "current_run_id": "run-abc",
+                "current_step_id": "step-xyz",
+                "prompt_preview": "Test prompt",
+                "parallel_groups": {"group1": ["a", "b"]},
+                "tool_call_map": {"call1": "result1"},
+            },
+        }
+        session_dir = tmp_path / "test-session"
+        session_dir.mkdir()
+        (session_dir / "cursors.json").write_text(json.dumps(cursor_data))
+
+        result = registry._load_persisted_cursors(
+            "test-session", cursor_path=str(tmp_path)
+        )
+
+        assert result is not None
+        assert isinstance(result, SessionCursors)
+        assert result.current_run_id == "run-abc"
+        assert result.current_step_id == "step-xyz"
+        assert result.prompt_preview == "Test prompt"
+        assert result.parallel_groups == {"group1": ["a", "b"]}
+        assert result.tool_call_map == {"call1": "result1"}
+
+    def test_load_persisted_cursors_returns_none_when_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """_load_persisted_cursors returns None when cursor file does not exist."""
+        registry = SessionRegistry()
+        result = registry._load_persisted_cursors(
+            "nonexistent-session", cursor_path=str(tmp_path)
+        )
+        assert result is None
+
+    def test_load_persisted_cursors_returns_none_when_expired(
+        self, tmp_path: Path
+    ) -> None:
+        """_load_persisted_cursors returns None when last_updated exceeds TTL
+        (2020-01-01 timestamp is far in the past)."""
+        import json
+
+        registry = SessionRegistry()
+        cursor_data = {
+            "last_updated": "2020-01-01T00:00:00+00:00",
+            "cursors": {
+                "current_run_id": "run-old",
+                "current_step_id": "step-old",
+                "prompt_preview": "",
+                "parallel_groups": {},
+                "tool_call_map": {},
+            },
+        }
+        session_dir = tmp_path / "test-session"
+        session_dir.mkdir()
+        (session_dir / "cursors.json").write_text(json.dumps(cursor_data))
+
+        # TTL of 1 second — 2020-01-01 is far past that
+        result = registry._load_persisted_cursors(
+            "test-session", cursor_path=str(tmp_path), ttl=1.0
+        )
+        assert result is None
+
+    def test_delete_persisted_cursors(self, tmp_path: Path) -> None:
+        """_delete_persisted_cursors removes the cursor file when it exists."""
+        import json
+
+        registry = SessionRegistry()
+        cursor_data = {
+            "last_updated": "2024-01-01T00:00:00+00:00",
+            "cursors": {
+                "current_run_id": None,
+                "current_step_id": None,
+                "prompt_preview": "",
+                "parallel_groups": {},
+                "tool_call_map": {},
+            },
+        }
+        session_dir = tmp_path / "test-session"
+        session_dir.mkdir()
+        cursor_file = session_dir / "cursors.json"
+        cursor_file.write_text(json.dumps(cursor_data))
+        assert cursor_file.exists()
+
+        registry._delete_persisted_cursors("test-session", cursor_path=str(tmp_path))
+
+        assert not cursor_file.exists()
