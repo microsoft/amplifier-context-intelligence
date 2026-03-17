@@ -271,7 +271,7 @@ class TestExecutionStartHappyPath:
         )
         node = await services.graph.get_node(EXPECTED_RUN_NODE_ID)
         assert node is not None
-        assert node["run_number"] == 1  # first run in this session
+        assert "run_number" not in node  # seq/run_number removed from handler
         assert node["started_at"] == EXEC_TIMESTAMP
         assert node["status"] == "in_progress"
         assert node["prompt_preview"] == "Hello world"
@@ -286,7 +286,7 @@ class TestExecutionStartHappyPath:
         )
         edge = await services.graph.get_edge("s1", EXPECTED_RUN_NODE_ID)
         assert edge is not None
-        assert edge["seq"] == 1  # first run edge in this session
+        assert "seq" not in edge  # seq removed from HAS_RUN edge
         assert edge["occurred_at"] == EXEC_TIMESTAMP
 
     async def test_has_step_edge_to_prompt_step(
@@ -305,7 +305,7 @@ class TestExecutionStartHappyPath:
         )
         edge = await services.graph.get_edge(EXPECTED_RUN_NODE_ID, prompt_step_id)
         assert edge is not None
-        assert edge["seq"] == 0
+        assert "seq" not in edge  # seq removed from HAS_STEP edge
         assert edge["occurred_at"] == EXEC_TIMESTAMP
 
     async def test_updates_current_run_id(self, services: HookStateService) -> None:

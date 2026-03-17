@@ -91,8 +91,6 @@ class OrchestratorRunHandler:
 
         # Update cursor state
         cursors = self.services.get_cursors(session_id)
-        cursors.run_counter += 1
-        cursors.step_counter = 0
         cursors.current_step_id = node_id
         cursors.prompt_preview = prompt_preview
 
@@ -119,7 +117,6 @@ class OrchestratorRunHandler:
         # Build OrchestratorRun node properties
         properties: dict[str, Any] = {
             "labels": ["OrchestratorRun"],
-            "run_number": cursors.run_counter,
             "started_at": timestamp,
             "status": "in_progress",
             "prompt_preview": cursors.prompt_preview,
@@ -134,7 +131,7 @@ class OrchestratorRunHandler:
         await self.services.graph.upsert_edge(
             session_id,
             run_id,
-            {"type": "HAS_RUN", "seq": cursors.run_counter, "occurred_at": timestamp},
+            {"type": "HAS_RUN", "occurred_at": timestamp},
         )
 
         # Create HAS_STEP edge: OrchestratorRun → PromptStep (if prompt step exists)
@@ -142,7 +139,7 @@ class OrchestratorRunHandler:
             await self.services.graph.upsert_edge(
                 run_id,
                 cursors.current_step_id,
-                {"type": "HAS_STEP", "seq": 0, "occurred_at": timestamp},
+                {"type": "HAS_STEP", "occurred_at": timestamp},
             )
 
         # Update cursor state
