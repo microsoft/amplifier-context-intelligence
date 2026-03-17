@@ -214,6 +214,13 @@ class HookStateService:
             self._cursors[session_id] = SessionCursors()
         return self._cursors[session_id]
 
+    def set_cursors(self, session_id: str, cursors: SessionCursors) -> None:
+        """Replace the SessionCursors entry for *session_id* with *cursors*.
+
+        Used to restore persisted cursor state into a freshly-created worker.
+        """
+        self._cursors[session_id] = cursors
+
     def remove_cursors(self, session_id: str) -> None:
         """Remove the SessionCursors entry for *session_id*.
 

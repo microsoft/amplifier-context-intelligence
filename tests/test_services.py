@@ -273,6 +273,20 @@ class TestHookStateService:
         svc = HookStateService()
         svc.remove_cursors("nonexistent-session")  # must not raise
 
+    def test_set_cursors_restores_state(self):
+        """set_cursors replaces the cursor entry; get_cursors returns the injected instance."""
+        svc = HookStateService()
+        cursors = SessionCursors(
+            current_run_id="run-123",
+            current_step_id="step-456",
+            prompt_preview="hello",
+        )
+        svc.set_cursors("session-1", cursors)
+        restored = svc.get_cursors("session-1")
+        assert restored.current_run_id == "run-123"
+        assert restored.current_step_id == "step-456"
+        assert restored.prompt_preview == "hello"
+
     async def test_ensure_session_node_creates_root(self):
         """ensure_session_node creates a Session+Root node when no parent field is present."""
         svc = HookStateService()
