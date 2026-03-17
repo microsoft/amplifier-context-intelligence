@@ -8,6 +8,7 @@ __pycache__/
 dist/
 build/
 .env
+config/secrets.env
 
 # Frontend (Lit + Vite SPA)
 frontend/node_modules/
