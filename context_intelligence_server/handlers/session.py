@@ -73,6 +73,7 @@ class SessionHandler:
         )
 
         if parent_id:
+            await self.services.ensure_session_node(parent_id, {})
             await self.services.graph.upsert_edge(
                 session_id,
                 parent_id,
@@ -108,6 +109,7 @@ class SessionHandler:
         )
 
         if parent:
+            await self.services.ensure_session_node(parent, {})
             await self.services.graph.upsert_edge(
                 session_id,
                 parent,

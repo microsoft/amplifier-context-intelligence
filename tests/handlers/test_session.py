@@ -428,3 +428,100 @@ class TestSessionEdgeTypes:
         edge = await services.graph.get_edge("fork1", "parent1")
         assert edge is not None
         assert edge.get("type") == "SUBSESSION_OF"
+
+
+class TestLateParentDiscovery:
+    """Late parent discovery creates stub parent nodes when parent doesn't exist yet."""
+
+    async def test_parent_stub_created_when_missing(
+        self, services: HookStateService
+    ) -> None:
+        """session:start with parent_id creates stub parent with Session+Root labels."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        parent_node = await services.graph.get_node("parent")
+        assert parent_node is not None
+        assert "Session" in parent_node["labels"]
+        assert "Root" in parent_node["labels"]
+
+    async def test_parent_already_exists_no_duplicate(
+        self, services: HookStateService
+    ) -> None:
+        """Existing parent's metadata is preserved (not overwritten)."""
+        # Pre-create parent node with metadata
+        await services.graph.upsert_node(
+            "parent",
+            {
+                "labels": ["Session", "Root"],
+                "status": "running",
+                "metadata": {"original": "data"},
+            },
+        )
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        parent_node = await services.graph.get_node("parent")
+        assert parent_node is not None
+        assert parent_node["metadata"] == {"original": "data"}
+
+    async def test_child_label_flipped_to_subsession(
+        self, services: HookStateService
+    ) -> None:
+        """Child gets Subsession label (not Root) when parent_id present."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        child_node = await services.graph.get_node("child")
+        assert child_node is not None
+        assert "Subsession" in child_node["labels"]
+        assert "Root" not in child_node["labels"]
+
+    async def test_fork_parent_stub_created(self, services: HookStateService) -> None:
+        """session:fork with parent creates stub parent node."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "forked",
+                "parent": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        parent_node = await services.graph.get_node("parent")
+        assert parent_node is not None
+        assert "Session" in parent_node["labels"]
+        assert "Root" in parent_node["labels"]
+
+    async def test_subsession_of_edge_created(self, services: HookStateService) -> None:
+        """SUBSESSION_OF edge exists from child to parent with correct type."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        edge = await services.graph.get_edge("child", "parent")
+        assert edge is not None
+        assert edge.get("type") == "SUBSESSION_OF"
