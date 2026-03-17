@@ -94,7 +94,7 @@ class SessionRegistry:
         - Dispatches each event via process_event.
         - On TimeoutError (no events for flush_timeout seconds): calls graph.flush
           as a periodic fallback for disconnected sessions.
-        - On CancelledError (shutdown): flushes once then exits cleanly.
+        - On CancelledError (shutdown): persists cursors, calls graph.close, then exits cleanly.
         - On session:end: drains tail events, creates CompletedSession,
           calls graph.close, deregisters the worker, then exits.
         """
@@ -154,7 +154,7 @@ class SessionRegistry:
                     > settings.stale_session_timeout
                 ):
                     logger.info(
-                        "Reaping stale session %s (idle > %ss)",
+                        "Reaping stale session %s (idle > %s seconds)",
                         worker.session_id,
                         settings.stale_session_timeout,
                     )
@@ -171,8 +171,20 @@ class SessionRegistry:
 
             except asyncio.CancelledError:
                 # Shutdown: persist cursors and close graph before exiting
-                self._persist_cursors_sync(worker)
-                await worker.services.graph.close()
+                try:
+                    self._persist_cursors_sync(worker)
+                except Exception:
+                    logger.exception(
+                        "cursor persist failed on cancel for session %s",
+                        worker.session_id,
+                    )
+                try:
+                    await worker.services.graph.close()
+                except Exception:
+                    logger.exception(
+                        "graph.close failed on cancel for session %s",
+                        worker.session_id,
+                    )
                 break
 
     def start_drain(self, worker: SessionWorker) -> None:

@@ -298,24 +298,25 @@ class TestDrainLoopCallsProcessEvent:
 
     @pytest.mark.asyncio
     async def test_shutdown_flush_on_cancelled_error(self) -> None:
-        """graph.flush is called when the task is cancelled (shutdown flush)."""
+        """graph.close is called when the task is cancelled (shutdown close)."""
         reg = SessionRegistry()
         worker = SessionWorker(
             session_id="test-session",
             workspace="/workspace/test",
             services=HookStateService(workspace="/workspace/test"),
         )
-        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
 
-        task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
-        await asyncio.sleep(0.02)
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        with patch.object(reg, "_persist_cursors_sync"):
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            await asyncio.sleep(0.02)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
-        worker.services.graph.flush.assert_called()
+        worker.services.graph.close.assert_awaited_once()
 
 
 class TestPeriodicFlush:
