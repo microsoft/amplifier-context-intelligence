@@ -146,10 +146,27 @@ class SessionRegistry:
             except asyncio.TimeoutError:
                 # Periodic fallback flush for disconnected sessions
                 await worker.services.graph.flush()
+                # Stale session reaping
+                settings = get_settings()
+                if (
+                    worker.last_event_time > 0
+                    and time.time() - worker.last_event_time
+                    > settings.stale_session_timeout
+                ):
+                    logger.info(
+                        "Reaping stale session %s (idle > %ss)",
+                        worker.session_id,
+                        settings.stale_session_timeout,
+                    )
+                    self._persist_cursors_sync(worker)
+                    await worker.services.graph.close()
+                    self._deregister(worker.session_id)
+                    break
 
             except asyncio.CancelledError:
-                # Shutdown: flush any buffered writes before exiting
-                await worker.services.graph.flush()
+                # Shutdown: persist cursors and close graph before exiting
+                self._persist_cursors_sync(worker)
+                await worker.services.graph.close()
                 break
 
     def start_drain(self, worker: SessionWorker) -> None:

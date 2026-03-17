@@ -770,6 +770,97 @@ class TestWorkerSelfTermination:
         assert reg._completed[0].error_count == 1
 
 
+class TestStaleSessionReaping:
+    """Stale sessions are reaped when idle > stale_session_timeout."""
+
+    @pytest.mark.asyncio
+    async def test_stale_worker_reaped_after_timeout(self, tmp_path: Path) -> None:
+        """Worker with last_event_time ~5.8 days ago gets cursors persisted,
+        graph.close called, deregistered, and cursor file exists."""
+        from unittest.mock import MagicMock
+
+        reg = SessionRegistry()
+        worker = SessionWorker(
+            session_id="stale-session",
+            workspace="/workspace/test",
+            services=HookStateService(workspace="/workspace/test"),
+        )
+        # 5.8 days ago > default stale_session_timeout of 5 days (432000 s)
+        worker.last_event_time = time.time() - (5.8 * 24 * 3600)
+        reg._register_for_test(worker)
+        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
+
+        mock_settings = MagicMock()
+        mock_settings.stale_session_timeout = 432000.0  # 5 days
+        mock_settings.cursor_path = str(tmp_path)
+
+        with patch(
+            "context_intelligence_server.registry.get_settings",
+            return_value=mock_settings,
+        ):
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
+            await asyncio.wait_for(task, timeout=2.0)
+
+        assert "stale-session" not in reg._workers
+        worker.services.graph.close.assert_awaited_once()
+        cursor_file = tmp_path / "stale-session" / "cursors.json"
+        assert cursor_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_stale_session_not_added_to_completed(self, tmp_path: Path) -> None:
+        """Reaped stale sessions are NOT added to the _completed deque."""
+        from unittest.mock import MagicMock
+
+        reg = SessionRegistry()
+        worker = SessionWorker(
+            session_id="stale-session",
+            workspace="/workspace/test",
+            services=HookStateService(workspace="/workspace/test"),
+        )
+        worker.last_event_time = time.time() - (5.8 * 24 * 3600)
+        reg._register_for_test(worker)
+        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
+
+        mock_settings = MagicMock()
+        mock_settings.stale_session_timeout = 432000.0
+        mock_settings.cursor_path = str(tmp_path)
+
+        with patch(
+            "context_intelligence_server.registry.get_settings",
+            return_value=mock_settings,
+        ):
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
+            await asyncio.wait_for(task, timeout=2.0)
+
+        assert len(reg._completed) == 0
+
+
+class TestCancelledErrorCallsClose:
+    """CancelledError causes graph.close() (not just flush) to be called."""
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_calls_close(self) -> None:
+        """graph.close is called when the drain task is cancelled."""
+        reg = SessionRegistry()
+        worker = SessionWorker(
+            session_id="test-session",
+            workspace="/workspace/test",
+            services=HookStateService(workspace="/workspace/test"),
+        )
+        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
+
+        with patch.object(reg, "_persist_cursors_sync"):
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            await asyncio.sleep(0.02)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        worker.services.graph.close.assert_awaited_once()
+
+
 class TestCursorPersistence:
     """SessionRegistry cursor persistence: _persist_cursors_sync, _load_persisted_cursors,
     _delete_persisted_cursors."""
