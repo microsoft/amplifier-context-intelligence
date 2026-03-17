@@ -271,7 +271,7 @@ class TestExecutionStartHappyPath:
         )
         node = await services.graph.get_node(EXPECTED_RUN_NODE_ID)
         assert node is not None
-        assert node["run_number"] == 1  # run_counter set by prompt:submit
+        assert node["run_number"] == 1  # first run in this session
         assert node["started_at"] == EXEC_TIMESTAMP
         assert node["status"] == "in_progress"
         assert node["prompt_preview"] == "Hello world"
@@ -286,7 +286,7 @@ class TestExecutionStartHappyPath:
         )
         edge = await services.graph.get_edge("s1", EXPECTED_RUN_NODE_ID)
         assert edge is not None
-        assert edge["seq"] == 1  # matches run_counter
+        assert edge["seq"] == 1  # first run edge in this session
         assert edge["occurred_at"] == EXEC_TIMESTAMP
 
     async def test_has_step_edge_to_prompt_step(

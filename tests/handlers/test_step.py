@@ -103,7 +103,7 @@ class TestProviderRequestHappyPath:
         )
         edge = await services.graph.get_edge(run_id, EXPECTED_STEP_NODE_ID)
         assert edge is not None
-        # step_counter incremented to 1 before first provider:request
+        # first step edge in this run
         assert edge["seq"] == 1
 
     async def test_has_step_edge_occurred_at(self, services: HookStateService) -> None:
