@@ -159,7 +159,13 @@ class SessionRegistry:
                         settings.stale_session_timeout,
                     )
                     self._persist_cursors_sync(worker)
-                    await worker.services.graph.close()
+                    try:
+                        await worker.services.graph.close()
+                    except Exception:
+                        logger.exception(
+                            "graph.close failed for stale session %s",
+                            worker.session_id,
+                        )
                     self._deregister(worker.session_id)
                     break
 
