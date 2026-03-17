@@ -52,3 +52,14 @@ def test_settings_log_path_default():
 
     s = Settings()
     assert s.log_path == "/data/logs/server.jsonl"
+
+
+def test_three_tier_timeout_defaults():
+    """Settings should have correct defaults for three-tier session lifecycle timeouts and cursor path."""
+    from context_intelligence_server.config import Settings
+
+    s = Settings()
+    assert s.dashboard_inactive_timeout == 1800.0
+    assert s.stale_session_timeout == 432000.0
+    assert s.cursor_persist_ttl == 15552000.0
+    assert s.cursor_path == "/data/cursors"

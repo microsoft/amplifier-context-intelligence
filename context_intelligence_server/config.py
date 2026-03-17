@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     blob_path: str = "/data/blobs"
     log_level: str = "INFO"
     log_path: str = "/data/logs/server.jsonl"
+    dashboard_inactive_timeout: float = 1800.0
+    stale_session_timeout: float = 432000.0
+    cursor_persist_ttl: float = 15552000.0
+    cursor_path: str = "/data/cursors"
 
 
 @lru_cache
