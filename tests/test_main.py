@@ -559,11 +559,10 @@ class TestCursorPurgeEndpoints:
         self,
         client: httpx.AsyncClient,
         tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """DELETE /sessions/{session_id}/cursors returns 200 and removes cursor file."""
-        # safe_cursor_path fixture already patches registry.get_settings to use tmp_path,
-        # so registry._delete_persisted_cursors will find cursors in tmp_path.
+        # The autouse safe_cursor_path fixture in conftest.py patches
+        # registry.get_settings() → cursor_path=tmp_path for all tests.
         session_id = "test-session-purge"
         session_dir = tmp_path / session_id
         session_dir.mkdir()

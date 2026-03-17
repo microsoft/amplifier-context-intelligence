@@ -241,6 +241,10 @@ class SessionRegistry:
                         session_id,
                     )
             self.start_drain(self._workers[session_id])
+        else:
+            # Session already active — replay flag has no effect on existing workers.
+            if replay:
+                logger.debug("replay_ignored: session %s already active", session_id)
         return self._workers[session_id]
 
     def remove(self, session_id: str) -> None:
@@ -273,6 +277,10 @@ class SessionRegistry:
 
     def active_sessions(self) -> list[str]:
         return sorted(self._workers.keys())
+
+    def purge_session_cursors(self, session_id: str) -> None:
+        """Delete the persisted cursor file for a single session."""
+        self._delete_persisted_cursors(session_id)
 
     # ------------------------------------------------------------------
     # Cursor persistence
