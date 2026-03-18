@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
+    "gunicorn>=23.0.0",
     "pydantic-settings>=2.0.0",
     "neo4j>=5.0",
     "aiofiles>=24.0.0",

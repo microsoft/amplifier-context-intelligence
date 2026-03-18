@@ -189,12 +189,22 @@ async def post_cypher(body: CypherRequest, request: Request) -> Response:
 
 
 def run() -> None:
-    """Start the server using uvicorn with settings from the module-level singleton."""
-    import uvicorn
+    """Start the server using gunicorn + uvicorn worker for graceful SIGTERM shutdown."""
+    from gunicorn.app.base import BaseApplication
 
-    uvicorn.run(
-        "context_intelligence_server.main:app",
-        host=_settings.server_host,
-        port=_settings.server_port,
-        log_level=_settings.log_level.lower(),
-    )
+    class _App(BaseApplication):
+        def load_config(self) -> None:
+            for key, value in {
+                "bind": f"{_settings.server_host}:{_settings.server_port}",
+                "workers": 1,
+                "worker_class": "uvicorn.workers.UvicornWorker",
+                "timeout": 30,
+                "graceful_timeout": 10,
+                "loglevel": _settings.log_level.lower(),
+            }.items():
+                self.cfg.set(key, value)
+
+        def load(self):
+            return app
+
+    _App().run()
