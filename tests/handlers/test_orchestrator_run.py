@@ -209,16 +209,32 @@ class TestPromptSubmitErrorPaths:
         )
         assert result.action == "continue"
 
-    async def test_session_not_found_creates_no_nodes(
+    async def test_session_not_found_creates_stub_and_prompt_step(
         self, services: HookStateService
     ) -> None:
+        """D-06 fix: session not found → stub session node created, processing continues.
+
+        Previously this returned early and created no nodes.  The fix calls
+        ensure_session_node() to create a stub Session node, then continues to
+        create the PromptStep node so graph topology is preserved.
+        """
         handler = OrchestratorRunHandler(services)
         await handler(
             "prompt:submit",
             {"session_id": "s1", "timestamp": TIMESTAMP, "prompt": "Hi"},
         )
+        # PromptStep node MUST now be created (not dropped)
         node = await services.graph.get_node(EXPECTED_NODE_ID)
-        assert node is None
+        assert node is not None, (
+            "PromptStep node must be created even when session:start was missed"
+        )
+        # A stub Session node must exist for s1
+        session_node = await services.graph.get_node("s1")
+        assert session_node is not None, "Stub Session node must be created for s1"
+        assert "Session" in session_node.get("labels", [])
+        # cursor must reflect the new step
+        cursors = services.get_cursors("s1")
+        assert cursors.current_step_id == EXPECTED_NODE_ID
 
 
 # ── execution:start constants ─────────────────────────────────────────────────

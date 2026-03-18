@@ -64,11 +64,20 @@ class OrchestratorRunHandler:
 
         timestamp = data.get("timestamp", "")
 
-        # Validate session exists in graph
+        # Validate session exists in graph — if missing, recover with a stub node so
+        # that graph topology is preserved for all downstream events in this prompt cycle.
+        # This handles: server restart with unflushed buffer, hook enabled mid-session,
+        # or any dropped session:start POST.
         session_node = await self.services.graph.get_node(session_id)
         if session_node is None:
-            log.error("Session node not found")
-            return HookResult(action="continue")
+            log.error(
+                "Session node not found — creating stub session node to preserve graph continuity"
+            )
+            await self.services.ensure_session_node(session_id, {})
+            log.info(
+                "Created stub Session node for %s (session:start may have been missed)",
+                session_id,
+            )
 
         # Generate deterministic node ID
         node_id = make_node_id(session_id, "prompt:submit", timestamp)
