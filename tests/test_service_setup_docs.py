@@ -113,7 +113,10 @@ def test_prerequisites_uv_install_command():
 
 def test_prerequisites_uv_tool_install_command():
     """Prerequisites section must include the uv tool install command."""
-    assert "uv tool install git+https://github.com/colombod/amplifier-context-intelligence" in _content()
+    assert (
+        "uv tool install git+https://github.com/colombod/amplifier-context-intelligence"
+        in _content()
+    )
 
 
 def test_prerequisites_binary_path():
@@ -177,7 +180,10 @@ def test_configuration_cursor_path_persistence_note():
 
 def test_configuration_storage_dirs_creation():
     """Must include mkdir for storage directories with brace expansion."""
-    assert "mkdir -p ~/.local/share/context-intelligence/{blobs,logs,cursors}" in _content()
+    assert (
+        "mkdir -p ~/.local/share/context-intelligence/{blobs,logs,cursors}"
+        in _content()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +219,10 @@ def test_systemd_exec_start():
 def test_systemd_environment_config():
     """Environment must include config file path with %h specifier."""
     content = _content()
-    assert "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE=%h/.config/context-intelligence/server-config.yaml" in content
+    assert (
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE=%h/.config/context-intelligence/server-config.yaml"
+        in content
+    )
 
 
 def test_systemd_restart_on_failure():
@@ -354,12 +363,18 @@ def test_troubleshooting_neo4j_connection():
     content = _content()
     assert "Neo4j" in content or "neo4j" in content
     # Service starts then stops
-    assert "immediately stops" in content or "immediately stop" in content or "neo4j_url" in content
+    assert (
+        "immediately stops" in content
+        or "immediately stop" in content
+        or "neo4j_url" in content
+    )
 
 
 def test_troubleshooting_permission_denied():
     """Must address permission denied issue."""
-    assert "Permission denied" in _content() or "permission denied" in _content().lower()
+    assert (
+        "Permission denied" in _content() or "permission denied" in _content().lower()
+    )
 
 
 def test_troubleshooting_port_in_use():

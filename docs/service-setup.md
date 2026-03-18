@@ -25,6 +25,7 @@ uv tool install git+https://github.com/colombod/amplifier-context-intelligence
 ```
 
 This places a `context-intelligence-server` binary at `~/.local/bin/context-intelligence-server`.
+Ensure `~/.local/bin` is in your `PATH` (e.g. add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile).
 
 ### Upgrade later
 
