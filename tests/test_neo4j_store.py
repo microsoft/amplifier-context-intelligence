@@ -933,3 +933,47 @@ async def test_flush_edge_rows_contain_src_dst_ids():
                     f"Expected dst_id='dst-node', got {props['dst_id']!r}"
                 )
     assert found_edge_rows, "Expected at least one edge row to be written during flush"
+
+
+# ---------------------------------------------------------------------------
+# Bug D-05 regression — get_edge() must scope Neo4j fallback by workspace
+# ---------------------------------------------------------------------------
+
+
+async def test_get_edge_neo4j_fallback_includes_workspace_filter():
+    """get_edge Neo4j fallback query must scope edges by workspace (bug D-05).
+
+    Previously the query had no workspace filter, allowing cross-workspace edge
+    leakage when two sessions in different workspaces happened to share the same
+    src_id / dst_id pair.
+    """
+    store = _make_store(workspace="my-workspace")
+    mock_result = MagicMock()
+    mock_result.records = []
+    store._driver.execute_query = AsyncMock(return_value=mock_result)  # type: ignore[attr-defined]
+
+    await store.get_edge("src-1", "dst-1")
+
+    call_args = store._driver.execute_query.call_args
+    query: str = call_args[0][0]
+    params: dict = call_args[0][1]
+
+    assert "workspace" in query.lower(), (
+        "get_edge fallback query must filter by workspace"
+    )
+    assert params.get("workspace") == "my-workspace", (
+        f"workspace param must match store workspace, got {params!r}"
+    )
+
+
+async def test_get_edge_neo4j_fallback_uses_store_workspace_value():
+    """get_edge fallback passes the *current* store workspace, not a hardcoded string."""
+    store = _make_store(workspace="workspace-alpha")
+    mock_result = MagicMock()
+    mock_result.records = []
+    store._driver.execute_query = AsyncMock(return_value=mock_result)  # type: ignore[attr-defined]
+
+    await store.get_edge("a", "b")
+
+    params = store._driver.execute_query.call_args[0][1]
+    assert params.get("workspace") == "workspace-alpha"

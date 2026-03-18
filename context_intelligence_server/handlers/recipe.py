@@ -156,7 +156,13 @@ class RecipeHandler:
         properties["labels"] = ["Event", derived]
         properties["data"] = json.dumps(data)
         await self.services.graph.upsert_node(node_id, properties)
+
+        # Attach to the active OrchestratorRun when one exists, otherwise to
+        # the Session — mirrors DefaultHandler behaviour (bug D-03 fix).
+        cursors = self.services.get_cursors(session_id)
+        parent_id = cursors.current_run_id if cursors.current_run_id else session_id
+
         await self.services.graph.upsert_edge(
-            session_id, node_id, {"type": "HAS_EVENT", "occurred_at": timestamp}
+            parent_id, node_id, {"type": "HAS_EVENT", "occurred_at": timestamp}
         )
         log.info("Created %s node %s", derived, node_id)

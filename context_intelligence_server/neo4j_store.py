@@ -191,8 +191,9 @@ class Neo4jGraphStore:
             result = await self._driver.execute_query(
                 "MATCH ()-[r]->() "
                 "WHERE r.src_id = $src_id AND r.dst_id = $dst_id "
+                "AND r.workspace = $workspace "
                 "RETURN properties(r) AS props",
-                {"src_id": src_id, "dst_id": dst_id},
+                {"src_id": src_id, "dst_id": dst_id, "workspace": self.workspace},
                 database_=self._database,
             )
             records = result.records
