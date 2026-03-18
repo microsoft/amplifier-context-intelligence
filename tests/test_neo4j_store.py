@@ -839,3 +839,97 @@ class TestRemoveEdge:
         """remove_edge on a nonexistent edge must not raise an error."""
         store = _make_store()
         store.remove_edge("does-not-exist", "also-missing")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Bug 1 — get_node fallback must query by n.node_id (not n.id)
+# ---------------------------------------------------------------------------
+
+
+async def test_get_node_fallback_queries_by_node_id_property():
+    """Post-flush fallback must issue a query using n.node_id, not n.id.
+
+    Nodes are persisted in Neo4j via flush() with MERGE {node_id: row.node_id, ...}.
+    The property stored on the node is therefore ``node_id``, NOT ``id``.
+    A fallback query filtering on ``n.id`` will never match any node and will
+    silently return None, causing production misses after every flush.
+
+    This test:
+    1. Clears the buffer to simulate post-flush state.
+    2. Captures the Cypher query sent to the driver.
+    3. Asserts the query uses ``n.node_id``, not ``n.id``.
+
+    FAILS before fix  → query string contains "n.id" (wrong property name)
+    PASSES after fix  → query string contains "n.node_id"
+    """
+    store = _make_store()
+    store._node_buffer = {}  # simulate post-flush: buffer is empty
+
+    mock_result = MagicMock()
+    mock_result.records = []
+    mock_execute = AsyncMock(return_value=mock_result)
+    store._driver.execute_query = mock_execute  # type: ignore[attr-defined]
+
+    await store.get_node("session-123")
+
+    assert mock_execute.called, (
+        "Expected driver.execute_query to be called for Neo4j fallback"
+    )
+    query: str = mock_execute.call_args[0][0]
+    assert "n.node_id" in query, (
+        f"Fallback query must filter on 'n.node_id' (the property flush stores on nodes), "
+        f"but the issued query was: {query!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bug 2 — flush() must store src_id/dst_id on edge props so get_edge fallback works
+# ---------------------------------------------------------------------------
+
+
+async def test_flush_edge_rows_contain_src_dst_ids():
+    """flush() must store src_id and dst_id in edge relationship props.
+
+    The get_edge() Neo4j fallback query filters on:
+        WHERE r.src_id = $src_id AND r.dst_id = $dst_id
+
+    For that query to match any rows, the values must actually be stored as
+    properties on the relationship during flush().  Currently flush() builds
+    row.props from sanitized edge data + workspace only — src_id/dst_id are
+    used only to match the endpoint nodes and are never SET on the relationship
+    itself.  As a result, every post-flush get_edge() call returns None.
+
+    FAILS before fix  → props dict lacks 'src_id' and 'dst_id'
+    PASSES after fix  → props dict contains both, matching the fallback query
+    """
+    store = _make_store(workspace="test-ws")
+    await store.upsert_edge("src-node", "dst-node", {"type": "KNOWS", "weight": 1})
+
+    mock_tx, mock_session = _make_flush_mocks()
+    store._driver.session = MagicMock(return_value=mock_session)
+    store._schema_initialized = True
+
+    await store.flush()
+
+    assert mock_tx.run.called, "Expected flush to call tx.run for edge writes"
+    found_edge_rows = False
+    for call in mock_tx.run.call_args_list:
+        if "rows" in call.kwargs:
+            for row in call.kwargs["rows"]:
+                props = row.get("props", {})
+                found_edge_rows = True
+                assert "src_id" in props, (
+                    f"Edge props must contain 'src_id' so the get_edge fallback query "
+                    f"(WHERE r.src_id = ...) can find the relationship. Got: {props}"
+                )
+                assert "dst_id" in props, (
+                    f"Edge props must contain 'dst_id' so the get_edge fallback query "
+                    f"(WHERE r.dst_id = ...) can find the relationship. Got: {props}"
+                )
+                assert props["src_id"] == "src-node", (
+                    f"Expected src_id='src-node', got {props['src_id']!r}"
+                )
+                assert props["dst_id"] == "dst-node", (
+                    f"Expected dst_id='dst-node', got {props['dst_id']!r}"
+                )
+    assert found_edge_rows, "Expected at least one edge row to be written during flush"

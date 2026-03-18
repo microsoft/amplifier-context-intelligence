@@ -161,7 +161,7 @@ class Neo4jGraphStore:
         # Neo4j fallback
         try:
             result = await self._driver.execute_query(
-                "MATCH (n) WHERE n.id = $id AND n.workspace = $workspace "
+                "MATCH (n) WHERE n.node_id = $id AND n.workspace = $workspace "
                 "RETURN properties(n) AS props",
                 {"id": node_id, "workspace": self.workspace},
                 database_=self._database,
@@ -304,6 +304,11 @@ class Neo4jGraphStore:
                             {k: v for k, v in data.items() if k != "type"}
                         )
                         props["workspace"] = self.workspace
+                        # Store src_id/dst_id on the relationship so the
+                        # get_edge() fallback query (WHERE r.src_id = $src_id
+                        # AND r.dst_id = $dst_id) can locate it after a flush.
+                        props["src_id"] = src_id
+                        props["dst_id"] = dst_id
                         row = {"src_id": src_id, "dst_id": dst_id, "props": props}
                         edge_groups.setdefault(edge_type, []).append(row)
 
