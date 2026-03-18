@@ -78,8 +78,7 @@ def test_substituted_content_is_valid_xml():
     """After substitution, the content must be well-formed XML."""
     result = _substituted()
     # xml.dom.minidom.parseString raises if XML is not well-formed
-    doc = xml.dom.minidom.parseString(result.encode("utf-8"))
-    assert doc is not None
+    xml.dom.minidom.parseString(result.encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
