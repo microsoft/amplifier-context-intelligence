@@ -3,6 +3,7 @@
 from unittest.mock import patch
 
 from context_intelligence_server.config import get_settings
+from context_intelligence_server.main import run
 
 
 def test_run_calls_uvicorn_with_settings() -> None:
@@ -10,8 +11,6 @@ def test_run_calls_uvicorn_with_settings() -> None:
     settings = get_settings()
 
     with patch("uvicorn.run") as mock_run:
-        from context_intelligence_server.main import run
-
         run()
 
         mock_run.assert_called_once_with(
