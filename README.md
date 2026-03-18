@@ -181,6 +181,13 @@ Open [http://localhost:8000](http://localhost:8000) to confirm the server is run
 
 ---
 
+## Running as a System Service
+
+To run the server as an auto-starting background service on Linux (systemd)
+or macOS (launchd), see [docs/service-setup.md](docs/service-setup.md).
+
+---
+
 ## Feeding Events into the Server
 
 The server receives events from [amplifier-bundle-context-intelligence](https://github.com/colombod/amplifier-bundle-context-intelligence) — a thin-forwarder hook that captures every Amplifier session event and dispatches it to the server over HTTP.
