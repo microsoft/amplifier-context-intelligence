@@ -137,6 +137,19 @@ To start the service on system boot (even without logging in):
 loginctl enable-linger $USER
 ```
 
+### Restarting the service
+
+> **Note:** The server does not respond to SIGTERM gracefully (a known limitation of the current release). This means `systemctl --user restart` and `systemctl --user stop` will appear to hang for up to 90 seconds while systemd waits for the process to exit before sending SIGKILL.
+>
+> Use this workaround for immediate restarts:
+
+```bash
+kill -9 $(pgrep -f context-intelligence-server) \
+  && systemctl --user start context-intelligence-server
+```
+
+This is safe — no in-flight state is lost that would not also be lost on a normal SIGKILL.
+
 ---
 
 ## 4. macOS — launchd User Agent
@@ -217,3 +230,5 @@ open http://localhost:8000
 | Port 8000 already in use | Conflict with another process | Change `server_port` in config, update unit/plist accordingly |
 | Linux: service doesn't start on boot | Lingering not enabled | `loginctl enable-linger $USER` |
 | macOS: plist loaded but service not running | launchd silently failed | Check `server.stderr.log` for startup errors |
+| `systemctl --user restart` or `stop` hangs ~90s | Server ignores SIGTERM (known limitation) | Force-kill: `kill -9 $(pgrep -f context-intelligence-server) && systemctl --user start context-intelligence-server` |
+| Service stops unexpectedly after `uv tool install --force` | Old process was SIGKILL'd mid-flight | Check Neo4j is still reachable, then start the service: `systemctl --user start context-intelligence-server` |
