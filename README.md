@@ -21,13 +21,11 @@ Amplifier CLI sessions
 
 ---
 
-## Prerequisites
+## Running with Docker Compose
+
+### Prerequisites
 
 - Docker and Docker Compose
-
----
-
-## Setup
 
 ### 1. Clone the repository
 
@@ -49,14 +47,14 @@ This starts 2 services:
 | **Ingestion server** | [localhost:8000](http://localhost:8000) | Event processing, dashboard, API |
 | **Neo4j** | [localhost:7474](http://localhost:7474) | Property graph (bolt on :7687, no auth) |
 
-All services are configured with `restart: unless-stopped` -- they automatically restart on crash or Docker daemon restart. They only stay down if you explicitly stop them with `docker compose stop` or `docker compose down`.
+All services are configured with `restart: unless-stopped` — they automatically restart on crash or Docker daemon restart. They only stay down if you explicitly stop them with `docker compose stop` or `docker compose down`.
 
 ### 3. Access the dashboard
 
-Open [http://localhost:8000](http://localhost:8000) -- this is the single navigation hub for the system.
+Open [http://localhost:8000](http://localhost:8000) — this is the single navigation hub for the system.
 
 | Route | Content |
-|-------|---------|
+|-------|---------| 
 | `/` | Landing page with navigation cards |
 | `/dashboard` | Live session monitoring, event history, log stream |
 | `/docs` | Swagger API documentation |
@@ -65,9 +63,127 @@ Neo4j browser is linked directly from the navigation bar (it cannot be iframed d
 
 ---
 
+## Running Without Docker
+
+Run the server as a plain Python process against any Neo4j instance — useful for local development, custom deployments, or environments where Docker is unavailable.
+
+### Prerequisites
+
+- Python 3.11+
+- [uv](https://github.com/astral-sh/uv)
+- A running Neo4j instance (see below)
+
+### 1. Install dependencies
+
+```bash
+git clone https://github.com/colombod/amplifier-context-intelligence.git
+cd amplifier-context-intelligence
+uv sync
+```
+
+### 2. Start a Neo4j instance
+
+**Option A — Docker (easiest):**
+
+```bash
+docker run -d --name neo4j-ci \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=none \
+  neo4j:5.26.22-community
+```
+
+**Option B — Neo4j Desktop / existing instance:**
+
+Use any Neo4j 5.x instance. Note the bolt URL, username, and password — you will need them in the next step.
+
+### 3. Configure the server
+
+The server accepts configuration from a **YAML file**, **environment variables**, or both. Environment variables always take precedence over the YAML file.
+
+#### Option A — YAML configuration file (recommended)
+
+Copy the example file and edit it:
+
+```bash
+cp server-config.example.yaml server-config.yaml
+```
+
+Edit `server-config.yaml`:
+
+```yaml
+# Neo4j connection
+neo4j_url: neo4j://localhost:7687
+neo4j_user: neo4j
+neo4j_password: ""          # empty string for NEO4J_AUTH=none instances
+
+# Storage — directories are created automatically
+blob_path: /home/you/.local/share/ci-server/blobs
+log_path:  /home/you/.local/share/ci-server/logs/server.jsonl
+cursor_path: /home/you/.local/share/ci-server/cursors
+
+# Server bind address
+server_host: 127.0.0.1
+server_port: 8000
+```
+
+The server looks for `server-config.yaml` in the **working directory** by default. To use a file at a different path, set the `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE` environment variable:
+
+```bash
+AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE=/etc/ci-server/config.yaml \
+  uvicorn context_intelligence_server.main:app
+```
+
+#### Option B — Environment variables
+
+Pass settings directly on the command line or export them in your shell:
+
+```bash
+AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL=neo4j://localhost:7687 \
+AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD="" \
+AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH=/tmp/ci-blobs \
+AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_PATH=/tmp/ci-logs/server.jsonl \
+AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CURSOR_PATH=/tmp/ci-cursors \
+  uvicorn context_intelligence_server.main:app --reload
+```
+
+#### Option C — Mix both
+
+YAML provides the baseline; environment variables override individual values at runtime. This is handy for secrets or per-machine overrides:
+
+```yaml
+# server-config.yaml — checked into version control
+neo4j_url: neo4j://localhost:7687
+blob_path: /data/ci-blobs
+log_path:  /data/ci-logs/server.jsonl
+cursor_path: /data/ci-cursors
+```
+
+```bash
+# Override only the password at runtime (e.g. from a secrets manager)
+AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD=hunter2 \
+  uvicorn context_intelligence_server.main:app
+```
+
+### 4. Start the server
+
+```bash
+# With auto-reload (development)
+uvicorn context_intelligence_server.main:app --reload
+
+# Production — bind explicitly
+uvicorn context_intelligence_server.main:app \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --workers 1
+```
+
+Open [http://localhost:8000](http://localhost:8000) to confirm the server is running.
+
+---
+
 ## Feeding Events into the Server
 
-The server receives events from [amplifier-bundle-context-intelligence](https://github.com/colombod/amplifier-bundle-context-intelligence) -- a thin-forwarder hook that captures every Amplifier session event and dispatches it to the server over HTTP.
+The server receives events from [amplifier-bundle-context-intelligence](https://github.com/colombod/amplifier-bundle-context-intelligence) — a thin-forwarder hook that captures every Amplifier session event and dispatches it to the server over HTTP.
 
 ### Install the bundle
 
@@ -75,7 +191,7 @@ The server receives events from [amplifier-bundle-context-intelligence](https://
 amplifier bundle add git+https://github.com/colombod/amplifier-bundle-context-intelligence@main --name context-intelligence --app
 ```
 
-The `--app` flag makes the bundle always active across all sessions -- no need to run `amplifier bundle use`.
+The `--app` flag makes the bundle always active across all sessions — no need to run `amplifier bundle use`.
 
 ### Configure the server URL
 
@@ -104,7 +220,7 @@ All settings live in `~/.amplifier/settings.yaml` under `overrides.hook-context-
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `context_intelligence_server_url` | *(empty -- disabled)* | Server URL to forward events to |
+| `context_intelligence_server_url` | *(empty — disabled)* | Server URL to forward events to |
 | `workspace` | *(auto-resolved)* | Workspace scope for graph data |
 
 ---
@@ -118,7 +234,7 @@ All settings live in `~/.amplifier/settings.yaml` under `overrides.hook-context-
 | `GET` | `/` | Landing page with navigation cards |
 | `GET` | `/dashboard` | Live monitoring dashboard |
 | `GET` | `/docs` | Swagger API docs |
-| `GET` | `/logs/stream` | Server-Sent Events -- live structured log tail |
+| `GET` | `/logs/stream` | Server-Sent Events — live structured log tail |
 | `GET` | `/blobs/{session_id}` | List all blob URIs for a session |
 | `GET` | `/blobs/{session_id}/{key}` | Retrieve a stored blob |
 | `POST` | `/cypher` | Proxy a Cypher query to Neo4j |
@@ -154,34 +270,48 @@ Use `"workspace": "*"` to query across all workspaces.
 
 ## Configuration
 
-### Ingestion server
+### Settings resolution order
 
-All settings use the `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_` prefix:
+Values are resolved with this priority (highest first):
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL` | `neo4j://neo4j:7687` | Neo4j bolt URI |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_USER` | `neo4j` | Neo4j username |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD` | *(empty)* | Neo4j password |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH` | `/data/blobs` | Blob storage root |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_PATH` | `/data/logs/server.jsonl` | Structured log file |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_LEVEL` | `INFO` | Log level |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVER_HOST` | `0.0.0.0` | Bind host |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVER_PORT` | `8000` | Bind port |
+1. **Environment variables** — `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_*`
+2. **YAML configuration file** — `server-config.yaml` in the working directory, or the path in `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE`
+3. **Built-in defaults**
+
+### All settings
+
+| Environment variable | YAML key | Default | Description |
+|----------------------|----------|---------|-------------|
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE` | *(env only)* | `server-config.yaml` | Path to the YAML config file |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL` | `neo4j_url` | `neo4j://neo4j:7687` | Neo4j bolt URI |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_USER` | `neo4j_user` | `neo4j` | Neo4j username |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD` | `neo4j_password` | `password` | Neo4j password |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH` | `blob_path` | `/data/blobs` | Blob storage root directory |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_PATH` | `log_path` | `/data/logs/server.jsonl` | Structured log file path |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_LEVEL` | `log_level` | `INFO` | Log level (`DEBUG`/`INFO`/`WARNING`/`ERROR`) |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CURSOR_PATH` | `cursor_path` | `/data/cursors` | Cursor persistence root directory |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVER_HOST` | `server_host` | `0.0.0.0` | Bind host |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVER_PORT` | `server_port` | `8000` | Bind port |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_DASHBOARD_INACTIVE_TIMEOUT` | `dashboard_inactive_timeout` | `1800.0` | Seconds before a session is hidden from the dashboard (30 min) |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_STALE_SESSION_TIMEOUT` | `stale_session_timeout` | `432000.0` | Seconds before a session worker is reaped and cursors persisted (5 days) |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CURSOR_PERSIST_TTL` | `cursor_persist_ttl` | `15552000.0` | Seconds before cursor files are deleted from disk (180 days) |
+
+> **Note:** `CONFIG_FILE` is resolved before any other setting and cannot itself be set from the YAML file — only from the environment.
 
 ---
 
 ## Data Persistence
 
-The stack uses Docker named volumes for all persistent data:
+The Docker Compose stack uses bind mounts under `$HOME/amplifier-context-intelligence-server-data-store/` for all persistent data. When running without Docker, the paths are whatever you configure.
 
-| Volume | Mount | Contains |
-|--------|-------|----------|
-| `neo4j_data` | `/data` (neo4j) | Graph database |
-| `blob_data` | `/data/blobs` (ingestion server, rw) | Event blob JSON files |
-| `log_data` | `/data/logs` (ingestion server) | Rotating JSONL log files |
+| Data | Docker Compose path | Description |
+|------|--------------------| ------------|
+| Neo4j graph | `~/amplifier-context-intelligence-server-data-store/neo4j` | Property graph database |
+| Blobs | `~/amplifier-context-intelligence-server-data-store/blobs` | Event blob JSON files |
+| Logs | `~/amplifier-context-intelligence-server-data-store/logs` | Rotating JSONL log files |
+| Cursors | `~/amplifier-context-intelligence-server-data-store/cursors` | Session cursor state |
 
-Graph data and blob data survive container rebuilds and restarts. The ingestion server's in-memory counters (completed sessions, recent events) reset on process restart -- the Neo4j graph is the durable record.
+Graph data and blob data survive container rebuilds and restarts. The ingestion server's in-memory counters (completed sessions, recent events) reset on process restart — the Neo4j graph is the durable record.
 
 **Safe operations:**
 ```bash
@@ -243,14 +373,13 @@ RETURN r.node_id,
 
 - Python 3.11+
 - [uv](https://github.com/astral-sh/uv)
-- Docker and Docker Compose
+- Docker (for running Neo4j during tests, or the full stack)
 
 ### Setup
 
 ```bash
 git clone https://github.com/colombod/amplifier-context-intelligence.git
 cd amplifier-context-intelligence
-uv venv && source .venv/bin/activate
 uv sync
 ```
 
@@ -260,31 +389,19 @@ uv sync
 uv run pytest tests/ -q
 ```
 
-### Run locally without Docker
-
-```bash
-# Start Neo4j
-docker run -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=none neo4j:5.26.22-community
-
-# Start the ingestion server
-AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL=neo4j://localhost:7687 \
-AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH=/tmp/ci-blobs \
-AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_PATH=/tmp/ci-logs/server.jsonl \
-uvicorn context_intelligence_server.main:app --reload
-```
-
 ### Project structure
 
 ```
 amplifier-context-intelligence/
 ├── context_intelligence_server/         # Ingestion server (FastAPI)
 │   ├── main.py                          # Routes, lifespan, static files
-│   ├── config.py                        # Pydantic Settings
+│   ├── config.py                        # Pydantic Settings + YAML source
 │   ├── pipeline.py                      # Event dispatch pipeline
 │   ├── neo4j_store.py                   # Neo4jGraphStore (buffered writes)
 │   ├── blob_store.py                    # AsyncDiskBlobStore
 │   ├── handlers/                        # 7 event handlers
 │   └── web/                             # Dashboard HTML + static assets
+├── server-config.example.yaml           # Configuration file template
 ├── docker-compose.yml                   # 2-service stack
 └── Dockerfile                           # Ingestion server image
 ```
@@ -293,5 +410,5 @@ amplifier-context-intelligence/
 
 ## Related
 
-- [amplifier-bundle-context-intelligence](https://github.com/colombod/amplifier-bundle-context-intelligence) -- Amplifier bundle that forwards session events to this server
-- [amplifier](https://github.com/microsoft/amplifier) -- The Amplifier framework
+- [amplifier-bundle-context-intelligence](https://github.com/colombod/amplifier-bundle-context-intelligence) — Amplifier bundle that forwards session events to this server
+- [amplifier](https://github.com/microsoft/amplifier) — The Amplifier framework

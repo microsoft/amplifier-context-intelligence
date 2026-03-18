@@ -1,0 +1,43 @@
+# Context Intelligence Server — configuration file
+#
+# Copy this file to server-config.yaml and edit as needed.
+# The server looks for server-config.yaml in the working directory, or you can
+# point it at any path via:
+#
+#   AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE=/path/to/your-config.yaml
+#
+# Environment variables always override values set here.
+# All fields are optional — omitted fields fall back to their built-in defaults.
+#
+# -----------------------------------------------------------------------------
+# Neo4j connection
+# -----------------------------------------------------------------------------
+neo4j_url: neo4j://localhost:7687
+neo4j_user: neo4j
+neo4j_password: ""          # Leave empty for Neo4j instances started with NEO4J_AUTH=none
+
+# -----------------------------------------------------------------------------
+# Storage paths
+# All three directories are created automatically on first start.
+# -----------------------------------------------------------------------------
+blob_path: /home/user/.local/share/ci-server/blobs
+log_path:  /home/user/.local/share/ci-server/logs/server.jsonl
+cursor_path: /home/user/.local/share/ci-server/cursors
+
+# -----------------------------------------------------------------------------
+# Server bind address
+# -----------------------------------------------------------------------------
+server_host: 127.0.0.1      # Use 0.0.0.0 to accept connections from other machines
+server_port: 8000
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+log_level: INFO              # DEBUG | INFO | WARNING | ERROR
+
+# -----------------------------------------------------------------------------
+# Session lifecycle timeouts (seconds)
+# -----------------------------------------------------------------------------
+dashboard_inactive_timeout: 1800.0    # 30 min  — hide session from dashboard
+stale_session_timeout: 432000.0       # 5 days  — reap worker, persist cursors
+cursor_persist_ttl: 15552000.0        # 180 days — delete cursor files from disk
