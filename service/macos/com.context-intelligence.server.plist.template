@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.context-intelligence.server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>HOME_DIR/.local/bin/context-intelligence-server</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- launchd does not inherit the user shell environment; HOME must be set explicitly -->
+        <key>HOME</key>
+        <string>HOME_DIR</string>
+        <key>AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE</key>
+        <string>HOME_DIR/.config/context-intelligence/server-config.yaml</string>
+    </dict>
+
+    <!-- launchd does not inherit the user shell environment; working directory must be set explicitly -->
+    <key>WorkingDirectory</key>
+    <string>HOME_DIR</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>HOME_DIR/.local/share/context-intelligence/logs/server.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>HOME_DIR/.local/share/context-intelligence/logs/server.stderr.log</string>
+</dict>
+</plist>

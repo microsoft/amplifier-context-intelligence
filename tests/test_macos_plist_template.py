@@ -11,8 +11,8 @@ Validates that the template file:
 import xml.dom.minidom
 from pathlib import Path
 
-# tests/ -> amplifier-context-intelligence/ -> repo root
-REPO_ROOT = Path(__file__).parent.parent.parent
+# tests/ -> repo root (submodule)
+REPO_ROOT = Path(__file__).parent.parent
 TEMPLATE_PATH = (
     REPO_ROOT / "service" / "macos" / "com.context-intelligence.server.plist.template"
 )
