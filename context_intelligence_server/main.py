@@ -186,3 +186,15 @@ async def post_cypher(body: CypherRequest, request: Request) -> Response:
         return Response(content=serialized, media_type="application/json")
     except Exception as exc:  # catch all Neo4j and serialization errors
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+def run() -> None:
+    """Start the server using uvicorn with settings from the module-level singleton."""
+    import uvicorn
+
+    uvicorn.run(
+        "context_intelligence_server.main:app",
+        host=_settings.server_host,
+        port=_settings.server_port,
+        log_level=_settings.log_level.lower(),
+    )

@@ -23,6 +23,9 @@ dev = [
     "httpx>=0.27.0",
 ]
 
+[project.scripts]
+context-intelligence-server = "context_intelligence_server.main:run"
+
 [tool.hatch.build.targets.wheel]
 include = ["context_intelligence_server/**"]
 
