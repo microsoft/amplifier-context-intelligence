@@ -11,12 +11,15 @@ Validates that the template file:
 import xml.dom.minidom
 from pathlib import Path
 
-# Path relative to the repo root (this file is in amplifier-context-intelligence/tests/)
+# tests/ -> amplifier-context-intelligence/ -> repo root
 REPO_ROOT = Path(__file__).parent.parent.parent
 TEMPLATE_PATH = (
     REPO_ROOT / "service" / "macos" / "com.context-intelligence.server.plist.template"
 )
 FAKE_HOME = "/home/testuser"
+
+# Enough chars to reach <true/> after the key tag and surrounding whitespace
+_PLIST_KEY_LOOKAHEAD = 100
 
 
 def _substituted() -> str:
@@ -109,7 +112,7 @@ def test_plist_run_at_load():
     assert "<key>RunAtLoad</key>" in result
     # In plist XML <true/> follows RunAtLoad key
     idx = result.index("<key>RunAtLoad</key>")
-    assert "<true/>" in result[idx : idx + 100]
+    assert "<true/>" in result[idx : idx + _PLIST_KEY_LOOKAHEAD]
 
 
 def test_plist_keep_alive():
@@ -117,7 +120,7 @@ def test_plist_keep_alive():
     result = _substituted()
     assert "<key>KeepAlive</key>" in result
     idx = result.index("<key>KeepAlive</key>")
-    assert "<true/>" in result[idx : idx + 100]
+    assert "<true/>" in result[idx : idx + _PLIST_KEY_LOOKAHEAD]
 
 
 def test_plist_standard_out_path():
