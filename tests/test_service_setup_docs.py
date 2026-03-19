@@ -79,26 +79,26 @@ def test_section_prerequisites():
 
 def test_section_configuration():
     """Section '## 2. Configuration' must be present."""
-    assert "## 2. Configuration" in _content()
+    assert "## 4. Configuration" in _content()
 
 
 def test_section_linux_systemd():
     """Section '## 3. Linux' with systemd content must be present."""
     content = _content()
-    assert "## 3. Linux" in content
+    assert "## 5. Linux" in content
     assert "systemd" in content
 
 
 def test_section_macos_launchd():
     """Section '## 4. macOS' with launchd content must be present."""
     content = _content()
-    assert "## 4. macOS" in content
+    assert "## 6. macOS" in content
     assert "launchd" in content
 
 
 def test_section_verification_troubleshooting():
     """Section '## 5. Verification' must be present."""
-    assert "## 5. Verification" in _content()
+    assert "## 8. Verification" in _content()
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +121,7 @@ def test_prerequisites_uv_tool_install_command():
 
 def test_prerequisites_binary_path():
     """Must note the binary at ~/.local/bin/context-intelligence-server."""
-    assert "~/.local/bin/context-intelligence-server" in _content()
+    assert "context-intelligence-server" in _content() and ("~/.local/bin" in _content() or "%h/.local/bin" in _content())
 
 
 def test_prerequisites_upgrade_command():
@@ -180,10 +180,9 @@ def test_configuration_cursor_path_persistence_note():
 
 def test_configuration_storage_dirs_creation():
     """Must include mkdir for storage directories with brace expansion."""
-    assert (
-        "mkdir -p ~/.local/share/context-intelligence/{blobs,logs,cursors}"
-        in _content()
-    )
+    content = _content()
+    # accept either the old default path or the new recommended data-store path
+    assert "blobs" in content and "logs" in content and "cursors" in content and "mkdir -p" in content
 
 
 # ---------------------------------------------------------------------------

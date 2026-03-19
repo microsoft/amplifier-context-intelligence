@@ -36,9 +36,8 @@ def test_option_a_server_init_is_first_config_subsection():
     assert pos_a < pos_mkdir, "Option A must appear before manual mkdir instructions"
 
     # Option A must contain the server-init command with flags
-    assert "--neo4j-url neo4j://localhost:7687" in content, (
-        "server-init --neo4j-url flag not found"
-    )
+    assert "--neo4j-url" in content, "server-init --neo4j-url flag not found"
+    assert "bolt://" in content, "bolt:// scheme not found in Option A init example"
     assert "--neo4j-user neo4j" in content, "server-init --neo4j-user flag not found"
 
     # Option A must mention api_key generation

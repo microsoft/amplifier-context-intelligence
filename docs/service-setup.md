@@ -1,12 +1,8 @@
 # Running as a System Service
 
-How to run the `context-intelligence-server` as a persistent background
-service on **Linux (systemd)** or **macOS (launchd)** — auto-starting on
-boot and restarting on crash.
-
-> **Scope:** This guide covers the Python server only.
-> Neo4j is assumed to be already running separately
-> (Docker, Homebrew service, or native install).
+How to run `context-intelligence-server` and `Neo4j` as persistent services on
+**Linux (systemd)** or **macOS (launchd)**, with full authentication, and
+integrated with the Amplifier CLI so sessions are automatically captured.
 
 ---
 
@@ -18,16 +14,78 @@ boot and restarting on crash.
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-### Install the server
+Ensure `~/.local/bin` is in your `PATH`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"   # add to ~/.bashrc or ~/.zshrc
+```
+
+### Install Docker
+
+Neo4j runs as a Docker container. Install [Docker Desktop](https://docs.docker.com/desktop/)
+or Docker Engine before continuing.
+
+---
+
+## 2. Start Neo4j
+
+Run Neo4j as a standalone Docker container. Use **non-standard ports** to
+avoid conflicts with any existing Neo4j installation. Authentication is
+**always required** — the server refuses to connect to an unauthenticated
+Neo4j instance.
+
+```bash
+# Adjust these three values before running
+NEO4J_HTTP_PORT=37474      # browser UI  (standard would be 7474)
+NEO4J_BOLT_PORT=37687      # bolt driver (standard would be 7687)
+NEO4J_PASSWORD="<your-strong-password>"
+
+DATA_DIR="$HOME/amplifier-context-intelligence-server-data-store"
+mkdir -p "${DATA_DIR}/neo4j"
+
+docker run -d \
+  --name amplifier-context-intelligence-neo4j \
+  --restart unless-stopped \
+  -p ${NEO4J_HTTP_PORT}:7474 \
+  -p ${NEO4J_BOLT_PORT}:7687 \
+  -e NEO4J_AUTH=neo4j/${NEO4J_PASSWORD} \
+  -v "${DATA_DIR}/neo4j:/data" \
+  neo4j:5.26.22-community
+```
+
+**Wait for Neo4j to be ready** (usually 15–30 seconds):
+
+```bash
+until curl -s -o /dev/null -w "%{http_code}" \
+    -u "neo4j:${NEO4J_PASSWORD}" \
+    http://localhost:${NEO4J_HTTP_PORT}/db/neo4j/tx \
+    -H "Content-Type: application/json" \
+    -d '{"statements":[{"statement":"RETURN 1"}]}' | grep -q 201; do
+  echo "Waiting for Neo4j..."; sleep 3
+done
+echo "Neo4j ready."
+```
+
+> **Important:** use `bolt://` (not `neo4j://`) for the server connection URL.
+> The routing protocol (`neo4j://`) fails on Community Edition single-node installs.
+> Set `neo4j_url` to `bolt://localhost:${NEO4J_BOLT_PORT}` in your config.
+
+---
+
+## 3. Install the Server
 
 ```bash
 uv tool install git+https://github.com/colombod/amplifier-context-intelligence
 ```
 
-This places a `context-intelligence-server` binary at `~/.local/bin/context-intelligence-server`.
-Ensure `~/.local/bin` is in your `PATH` (e.g. add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile).
+Two binaries are placed at `~/.local/bin`:
 
-### Upgrade later
+| Binary | Purpose |
+|--------|---------|
+| `context-intelligence-server` | Runs the FastAPI server |
+| `context-intelligence-server-init` | One-time first-run configuration |
+
+**Upgrade later:**
 
 ```bash
 uv tool upgrade context-intelligence-server
@@ -35,19 +93,44 @@ uv tool upgrade context-intelligence-server
 
 ---
 
-## 2. Configuration
+## 4. Configuration
 
 ### Option A — Generate config with `context-intelligence-server-init` (recommended)
 
+Run `context-intelligence-server-init` **once** to generate the server config
+with all required settings. Do not run it again after the server is in use
+— it regenerates `api_key`, which must then be updated everywhere.
+
 ```bash
+DATA_DIR="$HOME/amplifier-context-intelligence-server-data-store"
+mkdir -p "${DATA_DIR}/blobs" "${DATA_DIR}/logs" "${DATA_DIR}/cursors"
+
 context-intelligence-server-init \
-  --neo4j-url neo4j://localhost:7687 \
-  --neo4j-user neo4j
+  --config-path ~/.config/context-intelligence/server-config.yaml \
+  --neo4j-url  bolt://localhost:37687 \
+  --neo4j-user neo4j \
+  --neo4j-password "<your-neo4j-password>" \
+  --blob-path    "${DATA_DIR}/blobs" \
+  --log-path     "${DATA_DIR}/logs/server.jsonl" \
+  --cursor-path  "${DATA_DIR}/cursors" \
+  --server-host  0.0.0.0 \
+  --server-port  8000
 ```
 
-You will be prompted for the Neo4j password. The command writes `server-config.yaml` to `~/.config/context-intelligence/` with all required fields including a generated `api_key`.
+Replace `37687` with your `NEO4J_BOLT_PORT` from Step 2.
 
-Copy the printed API key — you will need it in your bundle config as `context_intelligence_api_key`.
+The command prints:
+
+```
+Config written to: /home/<you>/.config/context-intelligence/server-config.yaml
+API key: <generated-token>
+```
+
+**Copy the API key** — you need it in Step 7 (Amplifier settings).
+
+The `--neo4j-url` must use the `bolt://` scheme and the non-standard port you
+chose in Step 2. All parameters and their defaults are described in the
+settings tables below.
 
 ### Option B — Manual config (advanced)
 
@@ -57,15 +140,16 @@ curl -o ~/.config/context-intelligence/server-config.yaml \
   https://raw.githubusercontent.com/colombod/amplifier-context-intelligence/main/server-config.example.yaml
 ```
 
-Edit `~/.config/context-intelligence/server-config.yaml` and set values
-appropriate for your machine. The configuration keys are grouped into
-three categories:
+Edit the file and set values for your machine. Configuration keys are
+grouped into three categories below.
+
+---
 
 ### Server settings
 
 | Key | Example | Purpose |
 |-----|---------|---------|
-| `server_host` | `127.0.0.1` | Bind address (`0.0.0.0` to expose on network) |
+| `server_host` | `0.0.0.0` | Bind address. `0.0.0.0` = all interfaces; `127.0.0.1` = localhost only |
 | `server_port` | `8000` | Listen port |
 | `log_level` | `INFO` | Verbosity (`DEBUG` / `INFO` / `WARNING` / `ERROR`) |
 | `api_key` | *(generated)* | Bearer token for API auth. All endpoints except `/status` and static routes require `Authorization: Bearer <value>`. Generate with `context-intelligence-server-init`. |
@@ -74,31 +158,28 @@ three categories:
 
 | Key | Example | Purpose |
 |-----|---------|---------|
-| `neo4j_url` | `neo4j://localhost:7687` | Bolt connection URL |
+| `neo4j_url` | `bolt://localhost:37687` | Bolt connection URL. Use `bolt://` scheme. Port must match `NEO4J_BOLT_PORT` from Step 2. |
 | `neo4j_user` | `neo4j` | Auth username |
-| `neo4j_password` | `password` | Auth password. Always required for Docker deployments. For local dev-only Neo4j with `NEO4J_AUTH=none`, may be left empty. |
+| `neo4j_password` | *(your password)* | Auth password. Always required for Docker deployments. Must match the password passed to `NEO4J_AUTH` when the container was created. |
 
 ### Storage settings
 
 | Key | Example | Purpose |
 |-----|---------|---------|
-| `blob_path` | `~/.local/share/context-intelligence/blobs` | Event payload storage |
-| `log_path` | `~/.local/share/context-intelligence/logs/server.jsonl` | Structured log file |
-| `cursor_path` | `~/.local/share/context-intelligence/cursors` | Session cursor state |
-
-> **Note:** The standalone service setup persists cursors by default via
-> `cursor_path`. This is an improvement over the Docker Compose setup
-> where cursors are ephemeral.
+| `blob_path` | `~/amplifier-context-intelligence-server-data-store/blobs` | Event payload storage (binary blobs from tool outputs) |
+| `log_path` | `~/amplifier-context-intelligence-server-data-store/logs/server.jsonl` | Structured JSONL server log |
+| `cursor_path` | `~/amplifier-context-intelligence-server-data-store/cursors` | Session cursor state (enables resumption of event replay) |
 
 ### Create storage directories
 
 ```bash
-mkdir -p ~/.local/share/context-intelligence/{blobs,logs,cursors}
+DATA_DIR="$HOME/amplifier-context-intelligence-server-data-store"
+mkdir -p "${DATA_DIR}/blobs" "${DATA_DIR}/logs" "${DATA_DIR}/cursors"
 ```
 
 ---
 
-## 3. Linux — systemd User Service
+## 5. Linux — systemd User Service
 
 ### Create the unit file
 
@@ -123,8 +204,7 @@ WantedBy=default.target
 EOF
 ```
 
-`%h` is systemd's specifier for the user's home directory — no hardcoded
-paths needed.
+`%h` is systemd's specifier for the user home directory — no hardcoded paths.
 
 ### Enable and start
 
@@ -134,6 +214,12 @@ systemctl --user enable context-intelligence-server
 systemctl --user start context-intelligence-server
 ```
 
+### Auto-start on boot
+
+```bash
+loginctl enable-linger $USER
+```
+
 ### Check status and logs
 
 ```bash
@@ -141,95 +227,132 @@ systemctl --user status context-intelligence-server
 journalctl --user -u context-intelligence-server -f
 ```
 
-### Auto-start on boot
-
-By default, systemd user services only run when a login session is active.
-To start the service on system boot (even without logging in):
-
-```bash
-loginctl enable-linger $USER
-```
-
 ---
 
-## 4. macOS — launchd User Agent
-
-### Install from template
+## 6. macOS — launchd User Agent
 
 The repository ships a plist template at
-`service/macos/com.context-intelligence.server.plist.template` with
-`HOME_DIR` as a placeholder token. Expand it at install time with `sed`:
+`service/macos/com.context-intelligence.server.plist.template`. Expand it
+with `sed` (launchd does not expand `~` in paths):
 
 ```bash
 mkdir -p ~/Library/LaunchAgents
 sed "s|HOME_DIR|$HOME|g" \
   /path/to/repo/service/macos/com.context-intelligence.server.plist.template \
   > ~/Library/LaunchAgents/com.context-intelligence.server.plist
-```
 
-Replace `/path/to/repo` with the actual path to your clone of the
-`amplifier-context-intelligence` repository.
-
-> **Why not `~`?** launchd plist files do **not** expand `~` or shell
-> variables — every path must be absolute. The `sed` substitution handles
-> this.
-
-### Load and start
-
-```bash
 launchctl load ~/Library/LaunchAgents/com.context-intelligence.server.plist
 ```
 
-### Check status
-
 ```bash
+# Check status
 launchctl list | grep context-intelligence
-```
 
-### Stop and unload
-
-```bash
+# Stop
 launchctl unload ~/Library/LaunchAgents/com.context-intelligence.server.plist
-```
 
-### View logs
-
-```bash
+# Logs
 tail -f ~/.local/share/context-intelligence/logs/server.stdout.log
 tail -f ~/.local/share/context-intelligence/logs/server.stderr.log
 ```
 
 ---
 
-## 5. Verification & Troubleshooting
+## 7. Install the Amplifier Bundle and Configure settings.yaml
 
-### Health check (same on both platforms)
+The `amplifier-bundle-context-intelligence` bundle hooks into the Amplifier
+CLI and forwards all session events to the server in real time.
 
-```bash
-curl http://localhost:8000/status
-# → {"status": "ok", ...}
+### Add the bundle
 
-# Open the dashboard
-open http://localhost:8000
+Add it to the `app` list in `~/.amplifier/settings.yaml`:
+
+```yaml
+bundle:
+  app:
+    - git+https://github.com/colombod/amplifier-bundle-context-intelligence@main
 ```
 
-### Log locations
+Or use the CLI:
 
-| Platform | How to view logs |
-|----------|-----------------|
-| Linux | `journalctl --user -u context-intelligence-server -f` |
-| macOS | `tail -f ~/.local/share/context-intelligence/logs/server.stdout.log` |
+```bash
+amplifier bundle add git+https://github.com/colombod/amplifier-bundle-context-intelligence@main
+```
 
-### Common issues
+### Configure the hook
+
+Add the server URL and the API key (printed by `context-intelligence-server-init`
+in Step 4) to `~/.amplifier/settings.yaml`:
+
+```yaml
+overrides:
+  hook-context-intelligence:
+    config:
+      context_intelligence_server_url: "http://localhost:8000"
+      context_intelligence_api_key: "<api-key-from-step-4>"
+```
+
+### What the config keys do
+
+| Key | What it does |
+|-----|-------------|
+| `context_intelligence_server_url` | URL of the running server. The hook POSTs all session events here. |
+| `context_intelligence_api_key` | Bearer token. Must match `api_key` in `server-config.yaml`. If this key is missing or wrong, the hook logs a warning once and disables HTTP dispatch for the session. |
+
+### Complete `~/.amplifier/settings.yaml` example
+
+```yaml
+bundle:
+  active: <your-active-bundle>
+  app:
+    - git+https://github.com/colombod/amplifier-bundle-context-intelligence@main
+    # ... other bundles ...
+
+overrides:
+  hook-context-intelligence:
+    config:
+      context_intelligence_server_url: "http://localhost:8000"
+      context_intelligence_api_key: "<api-key-from-step-4>"
+```
+
+---
+
+## 8. Verification
+
+```bash
+# Health check (always unauthenticated)
+curl http://localhost:8000/status
+# → {"status":"ok","neo4j_connected":true,...}
+
+# Confirm auth is enforced — must return 401
+curl -s -o /dev/null -w "%{http_code}" \
+  -X POST http://localhost:8000/events \
+  -H "Content-Type: application/json" -d '{}'
+# → 401
+```
+
+If `neo4j_connected` is `false`, check:
+1. Container is running: `docker ps | grep amplifier-context-intelligence-neo4j`
+2. Bolt port in `server-config.yaml` matches the port exposed by Docker (`NEO4J_BOLT_PORT`)
+3. Neo4j password in config matches what was passed to `NEO4J_AUTH` when creating the container
+
+**Dashboard:** open `http://localhost:8000` — enter the API key from Step 4
+when prompted. If the prompt does not appear, hard-refresh (Ctrl+Shift+R) to
+bypass the browser cache.
+
+---
+
+## 9. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `command not found: context-intelligence-server` | `~/.local/bin` not in `PATH` | Add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile |
-| Service starts then immediately stops | Can't reach Neo4j | Check `neo4j_url` in config; verify Neo4j is running |
-| `Permission denied` on blob/log path | Directories don't exist | `mkdir -p ~/.local/share/context-intelligence/{blobs,logs,cursors}` |
-| Port 8000 already in use | Conflict with another process | Change `server_port` in config, update unit/plist accordingly |
+| `neo4j_connected: false` | Bolt port mismatch or wrong scheme | Set `neo4j_url` to `bolt://localhost:<NEO4J_BOLT_PORT>` in config |
+| `neo4j_connected: false` (connection refused) | Neo4j container not running | `docker ps` to check; `docker start amplifier-context-intelligence-neo4j` to restart |
+| Service starts then immediately stops | Config file missing or bad path | `journalctl --user -u context-intelligence-server` to see the error |
+| `Permission denied` on blob/log path | Directories don't exist | `mkdir -p` the paths listed in your config |
+| Port 8000 already in use | Conflict with another process | Change `server_port` in config and update the systemd unit |
 | Linux: service doesn't start on boot | Lingering not enabled | `loginctl enable-linger $USER` |
 | macOS: plist loaded but service not running | launchd silently failed | Check `server.stderr.log` for startup errors |
-| Events stop dispatching, circuit breaker tripped | `api_key` set on server but `context_intelligence_api_key` missing from bundle config | Add `context_intelligence_api_key: "<your-key>"` to bundle config |
+| Events stop dispatching, circuit breaker tripped | `context_intelligence_api_key` missing from `~/.amplifier/settings.yaml` | Add `context_intelligence_api_key: "<key>"` under `overrides.hook-context-intelligence.config` |
 | Dashboard shows "Enter your API key" and won't load | API key prompt is active | Open `server-config.yaml`, find `api_key:`, paste it into the dashboard prompt |
-
