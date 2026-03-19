@@ -628,3 +628,69 @@ class TestRecipeStepLabel:
         cursors = services.get_cursors("s1")
         assert cursors.step_content.block_count == 0
         assert cursors.step_content.has_thinking is False
+
+
+# ── llm:request model accumulation ────────────────────────────────────────────
+
+
+class TestLlmRequestModelAccumulation:
+    async def _seed_step(self, services: HookStateService) -> None:
+        """Seed run + provider:request so current_step_id is set."""
+        await _seed_run(services)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+
+    async def test_model_added_to_models_used(self, services: HookStateService) -> None:
+        """Valid model string is added to run_tokens.models_used."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:request",
+            {"session_id": "s1", "model": "claude-3-5-sonnet-20241022"},
+        )
+        cursors = services.get_cursors("s1")
+        assert "claude-3-5-sonnet-20241022" in cursors.run_tokens.models_used
+
+    async def test_missing_model_key_does_not_add_empty_string(
+        self, services: HookStateService
+    ) -> None:
+        """Missing model key must not add empty string to models_used (set stays empty)."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:request",
+            {"session_id": "s1"},  # no 'model' key
+        )
+        cursors = services.get_cursors("s1")
+        assert len(cursors.run_tokens.models_used) == 0
+
+    async def test_explicit_none_model_does_not_add_to_set(
+        self, services: HookStateService
+    ) -> None:
+        """Explicit model=None must not add anything to models_used."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:request",
+            {"session_id": "s1", "model": None},
+        )
+        cursors = services.get_cursors("s1")
+        assert len(cursors.run_tokens.models_used) == 0
+
+    async def test_duplicate_model_is_deduplicated(
+        self, services: HookStateService
+    ) -> None:
+        """Three identical llm:request events with same model result in set size 1."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        for _ in range(3):
+            await handler(
+                "llm:request",
+                {"session_id": "s1", "model": "claude-3-5-sonnet-20241022"},
+            )
+        cursors = services.get_cursors("s1")
+        assert len(cursors.run_tokens.models_used) == 1
+        assert "claude-3-5-sonnet-20241022" in cursors.run_tokens.models_used

@@ -156,9 +156,11 @@ class StepHandler:
 
         # Enrich AssistantStep with model
         properties: dict[str, Any] = {}
-        model = data.get("model")
-        if model is not None:
+        model = data.get("model") or ""
+        if model:
             properties["model"] = model
+            # G-N2: accumulate model name in run_tokens.models_used (set deduplicates)
+            cursors.run_tokens.models_used.add(model)
 
         properties["data_llm_request"] = json.dumps(data)
         await self.services.graph.upsert_node(step_id, properties)
