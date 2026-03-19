@@ -7,6 +7,8 @@ key, no edge_type param in get_edge).
 
 from __future__ import annotations
 
+import logging
+
 from context_intelligence_server.handlers.orchestrator_run import OrchestratorRunHandler
 from context_intelligence_server.handlers.session import SessionHandler
 from context_intelligence_server.handlers.step import StepHandler
@@ -547,3 +549,41 @@ class TestNoOpEvents:
             {"session_id": "s1", "timestamp": TOOL_TIMESTAMP},
         )
         assert result.action == "continue"
+
+
+# ── tool:error log level ───────────────────────────────────────────────────────
+
+
+class TestToolErrorLogLevel:
+    """T-1: tool:error must log at WARNING (not INFO) and include the error message."""
+
+    async def test_tool_error_logs_at_warning(self, services, caplog):
+        await _seed_step(services)
+        handler = ToolExecutionHandler(services)
+        await handler(
+            "tool:pre",
+            {
+                "session_id": "s1",
+                "timestamp": TOOL_TIMESTAMP,
+                "tool_call_id": TOOL_CALL_ID,
+                "tool_name": "bash",
+            },
+        )
+        error_timestamp = "2026-03-06T05:00:00Z"
+        with caplog.at_level(logging.WARNING):
+            await handler(
+                "tool:error",
+                {
+                    "session_id": "s1",
+                    "timestamp": error_timestamp,
+                    "tool_call_id": TOOL_CALL_ID,
+                    "error": "command timed out",
+                },
+            )
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) >= 1, (
+            f"Expected WARNING log, got: {[r.levelname for r in caplog.records]}"
+        )
+        warning_text = " ".join(r.message for r in warning_records)
+        assert "Errored ToolExecution" in warning_text
+        assert "command timed out" in warning_text

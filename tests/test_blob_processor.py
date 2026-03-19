@@ -22,6 +22,8 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+
 from context_intelligence_server.blob_processor import (
     BLOB_FIELDS,
     _lift_raw_fields,
@@ -280,3 +282,23 @@ def test_lift_raw_fields_usage_existing_keys_win() -> None:
     assert data["usage"]["output_tokens"] == 5
     # cache_tokens was only in existing
     assert data["usage"]["cache_tokens"] == 7
+
+
+# ---------------------------------------------------------------------------
+# 15. blob write failure emits WARNING log
+# ---------------------------------------------------------------------------
+
+
+async def test_blob_write_failure_logs_warning(caplog: pytest.LogCaptureFixture) -> None:
+    """Failed blob writes must emit a WARNING log with session_id, field_name, and node_id."""
+    import logging
+    data: dict[str, Any] = {"messages": [{"role": "user", "content": "hi"}]}
+    blob_store = AsyncMock()
+    blob_store.write = AsyncMock(side_effect=OSError("disk full"))
+    with caplog.at_level(logging.WARNING):
+        await process_event_data(data, blob_store, "sess-abc", "node-xyz")
+    assert "blob_offload_failed" in caplog.text
+    assert "sess-abc" in caplog.text
+    assert "messages" in caplog.text
+    assert "node-xyz" in caplog.text
+    assert "disk full" in caplog.text

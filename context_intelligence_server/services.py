@@ -259,8 +259,6 @@ class HookStateService:
             return
 
         # Node absent from both cache and graph — create it
-        self._seen_sessions.add(session_id)
-
         parent = data.get("parent_id") or data.get("parent")
         labels = ["Session", "Subsession" if parent else "Root"]
 
@@ -272,3 +270,4 @@ class HookStateService:
             node_data["started_at"] = data["started_at"]
 
         await self.graph.upsert_node(session_id, node_data)
+        self._seen_sessions.add(session_id)  # only cache after successful write

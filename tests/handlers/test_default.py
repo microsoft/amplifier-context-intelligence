@@ -267,3 +267,21 @@ class TestDefaultHandlerEdgeType:
         edge = await services.graph.get_edge("s1", event_id)
         assert edge is not None
         assert edge.get("type") == "HAS_EVENT"
+
+
+class TestDefaultHandlerDroppedEventLogging:
+    """D-1: DefaultHandler must log at WARNING (not DEBUG) when dropping events without session_id."""
+
+    async def test_missing_session_id_logs_warning(self, services, caplog):
+        import logging
+
+        handler = DefaultHandler(services)
+        with caplog.at_level(logging.WARNING):
+            result = await handler(
+                "session:resume", {"timestamp": "2026-01-01T02:00:00Z"}
+            )
+        assert result.action == "continue"
+        assert "DefaultHandler" in caplog.text
+        assert "session:resume" in caplog.text
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) >= 1

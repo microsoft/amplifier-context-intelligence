@@ -144,6 +144,12 @@ async def process_event(
             await process_event_data(
                 data, worker.services.blob_store, session_id, node_id
             )
+        elif session_id and worker.services.blob_store and not timestamp:
+            logger.warning(
+                "blob_processing_skipped session=%s event=%s: missing timestamp",
+                session_id,
+                event,
+            )
 
         # Step 3 — resolve handler
         handler = _find_handler(event, handlers)

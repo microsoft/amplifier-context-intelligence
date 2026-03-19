@@ -68,6 +68,9 @@ class SessionRegistry:
             worker.last_event_time = time.time()
             worker.events_processed += 1
         except Exception as exc:
+            logger.exception(
+                "process_one_failed session=%s event=%s", worker.session_id, event
+            )
             result = "error"
             error = str(exc)
             worker.error_count += 1
@@ -145,7 +148,12 @@ class SessionRegistry:
 
             except asyncio.TimeoutError:
                 # Periodic fallback flush for disconnected sessions
-                await worker.services.graph.flush()
+                try:
+                    await worker.services.graph.flush()
+                except Exception:
+                    logger.exception(
+                        "periodic_flush_failed for session %s", worker.session_id
+                    )
                 # Stale session reaping
                 settings = get_settings()
                 if (
@@ -363,7 +371,13 @@ class SessionRegistry:
 
         try:
             data = json.loads(cursor_file.read_text())
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(
+                "cursor_load_failed session=%s path=%s: %s",
+                session_id,
+                cursor_file,
+                exc,
+            )
             return None
 
         if ttl is not None:
@@ -372,7 +386,10 @@ class SessionRegistry:
                 age = (datetime.now(timezone.utc) - last_updated).total_seconds()
                 if age > ttl:
                     return None
-            except (KeyError, ValueError):
+            except (KeyError, ValueError) as exc:
+                logger.warning(
+                    "cursor_ttl_check_failed session=%s: %s", session_id, exc
+                )
                 return None
 
         try:
@@ -384,7 +401,8 @@ class SessionRegistry:
                 parallel_groups=cursors_data.get("parallel_groups", {}),
                 tool_call_map=cursors_data.get("tool_call_map", {}),
             )
-        except (KeyError, TypeError):
+        except (KeyError, TypeError) as exc:
+            logger.warning("cursor_deserialize_failed session=%s: %s", session_id, exc)
             return None
 
     def _delete_persisted_cursors(

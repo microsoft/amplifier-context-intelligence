@@ -355,6 +355,55 @@ class TestPeriodicFlush:
         sig = inspect.signature(SessionRegistry.drain_worker)
         assert sig.parameters["flush_timeout"].default == 30.0
 
+    @pytest.mark.asyncio
+    async def test_flush_exception_does_not_kill_drain_worker(self) -> None:
+        """An exception from graph.flush must not kill the drain worker coroutine.
+
+        If flush() raises (e.g. OSError("disk full")), the drain loop should
+        catch the exception, log it, and continue processing events.  The
+        session:end event enqueued after the failing flush must still be
+        consumed and the task must complete normally.
+        """
+        reg = SessionRegistry()
+        worker = SessionWorker(
+            session_id="test-session",
+            workspace="/workspace/test",
+            services=HookStateService(workspace="/workspace/test"),
+        )
+        # First flush call raises, second succeeds
+        worker.services.graph.flush = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[OSError("disk full"), None]
+        )
+        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
+
+            # Wait long enough for the flush timeout cycle to fire (the raising one)
+            await asyncio.sleep(0.15)
+
+            # Enqueue session:end — if the drain loop survived it will process this
+            await worker.queue.put(
+                ("session:end", "/workspace/test", {"session_id": "test-session"})
+            )
+
+            # If the drain loop was killed by the OSError, wait_for will timeout
+            try:
+                await asyncio.wait_for(task, timeout=2.0)
+            except asyncio.TimeoutError:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                pytest.fail(
+                    "drain_worker was killed by the OSError raised from flush(); "
+                    "the exception must be caught inside the TimeoutError handler."
+                )
+
 
 class TestWorkerActivityTracking:
     """SessionWorker tracks activity: last_event, last_event_time, events_processed."""
@@ -1162,3 +1211,108 @@ class TestCursorPersistence:
         reg = SessionRegistry()
         count = reg.purge_all_cursors(cursor_path=str(tmp_path))
         assert count == 0
+
+
+class TestProcessOneLogsException:
+    """R-1: _process_one must log at ERROR level when process_event raises."""
+
+    @pytest.mark.asyncio
+    async def test_process_one_exception_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """When process_event raises, _process_one must emit a logger.exception call
+        containing the session_id and event name."""
+        import logging
+
+        reg = SessionRegistry()
+        worker = SessionWorker(
+            session_id="test-session",
+            workspace="/workspace/test",
+            services=HookStateService(workspace="/workspace/test"),
+        )
+
+        async def mock_process(w, event, data, handlers):
+            raise ValueError("handler exploded")
+
+        with (
+            patch(
+                "context_intelligence_server.registry.process_event",
+                side_effect=mock_process,
+            ),
+            caplog.at_level(logging.ERROR, logger="context_intelligence_server"),
+        ):
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            await worker.queue.put(
+                ("tool_call", "/workspace/test", {"session_id": "test-session"})
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        assert "process_one_failed" in caplog.text
+        assert "test-session" in caplog.text
+        assert "tool_call" in caplog.text
+
+
+class TestCursorLoadLogging:
+    """R-2, R-3, R-4: _load_persisted_cursors logs warnings on corrupt/invalid data."""
+
+    def test_corrupt_json_logs_warning(self, tmp_path, caplog):
+        import logging
+
+        session_dir = tmp_path / "sess-corrupt"
+        session_dir.mkdir()
+        (session_dir / "cursors.json").write_text("{corrupt json!!!}")
+        registry = SessionRegistry()
+        with caplog.at_level(logging.WARNING, logger="context_intelligence_server"):
+            result = registry._load_persisted_cursors(
+                "sess-corrupt", cursor_path=str(tmp_path)
+            )
+        assert result is None
+        assert "cursor_load_failed" in caplog.text
+        assert "sess-corrupt" in caplog.text
+
+    def test_bad_last_updated_logs_warning(self, tmp_path, caplog):
+        import json
+        import logging
+
+        session_dir = tmp_path / "sess-bad-ts"
+        session_dir.mkdir()
+        cursor_data = {
+            "last_updated": "not-a-timestamp",
+            "cursors": {
+                "current_run_id": None,
+                "current_step_id": None,
+                "prompt_preview": "",
+                "parallel_groups": {},
+                "tool_call_map": {},
+            },
+        }
+        (session_dir / "cursors.json").write_text(json.dumps(cursor_data))
+        registry = SessionRegistry()
+        with caplog.at_level(logging.WARNING, logger="context_intelligence_server"):
+            result = registry._load_persisted_cursors(
+                "sess-bad-ts", cursor_path=str(tmp_path), ttl=1.0
+            )
+        assert result is None
+        assert "cursor_ttl_check_failed" in caplog.text
+        assert "sess-bad-ts" in caplog.text
+
+    def test_missing_cursors_key_logs_warning(self, tmp_path, caplog):
+        import json
+        import logging
+
+        session_dir = tmp_path / "sess-no-key"
+        session_dir.mkdir()
+        cursor_data = {"last_updated": "2026-01-01T00:00:00+00:00"}
+        (session_dir / "cursors.json").write_text(json.dumps(cursor_data))
+        registry = SessionRegistry()
+        with caplog.at_level(logging.WARNING, logger="context_intelligence_server"):
+            result = registry._load_persisted_cursors(
+                "sess-no-key", cursor_path=str(tmp_path)
+            )
+        assert result is None
+        assert "cursor_deserialize_failed" in caplog.text
+        assert "sess-no-key" in caplog.text

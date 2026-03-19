@@ -73,7 +73,7 @@ class RecipeHandler:
         properties: dict[str, Any] = {
             "event_name": event,
             "occurred_at": timestamp,
-            "recipe_name": data.get("recipe_name", ""),
+            "recipe_name": data.get("name", ""),
             "description": data.get("description", ""),
             "total_steps": data.get("total_steps", 0),
             "status": data.get("status", ""),
@@ -93,7 +93,7 @@ class RecipeHandler:
         elif event == "recipe:approval":
             properties["stage_name"] = data.get("stage_name", "")
             properties["current_step"] = data.get("current_step", 0)
-            prompt = data.get("approval_prompt", "")
+            prompt = data.get("prompt", "")
             properties["approval_prompt"] = prompt[:_APPROVAL_PROMPT_MAX_LEN]
 
         await self._persist_event(

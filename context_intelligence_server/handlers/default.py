@@ -37,7 +37,7 @@ class DefaultHandler:
     async def __call__(self, event: str, data: dict[str, Any]) -> HookResult:
         session_id = data.get("session_id")
         if not session_id:
-            logger.debug("DefaultHandler: no session_id in %s, skipping", event)
+            logger.warning("DefaultHandler: dropping event %s — no session_id", event)
             return HookResult(action="continue")
 
         timestamp = data.get("timestamp", "")

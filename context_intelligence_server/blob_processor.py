@@ -9,10 +9,13 @@ object exclusively, so in-place mutation is safe and avoids extra allocation.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from context_intelligence_server.blob_store import BlobStore
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -96,4 +99,8 @@ async def process_event_data(
             uri = await blob_store.write(session_id, key, value)
             data[field_name] = {"$blob_ref": uri}
         except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "blob_offload_failed session=%s field=%s node=%s: %s",
+                session_id, field_name, node_id, exc,
+            )
             data[field_name] = {"$blob_error": f"write failed: {exc}"}

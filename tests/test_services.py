@@ -410,6 +410,52 @@ class TestHookStateService:
 
 
 # ---------------------------------------------------------------------------
+# TestEnsureSessionNodeWriteFailure tests
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureSessionNodeWriteFailure:
+    """Tests that ensure_session_node does not cache a session ID when upsert_node fails."""
+
+    async def test_failed_upsert_does_not_cache_session(self):
+        """If upsert_node raises, session_id must NOT be added to _seen_sessions so
+        a subsequent call can retry and succeed."""
+        from unittest.mock import AsyncMock
+
+        svc = HookStateService()
+
+        # Save the original upsert_node method
+        original_upsert_node = svc.graph.upsert_node
+
+        # Replace with a failing mock
+        svc.graph.upsert_node = AsyncMock(side_effect=OSError("write failed"))
+
+        # Call ensure_session_node — expect the OSError to propagate
+        try:
+            await svc.ensure_session_node(
+                "session-fail", {"started_at": "2024-01-01T00:00:00"}
+            )
+        except OSError:
+            pass
+
+        # The session id must NOT have been cached because the write failed
+        assert "session-fail" not in svc._seen_sessions
+
+        # Restore original upsert_node
+        svc.graph.upsert_node = original_upsert_node
+
+        # Retry — should succeed now
+        await svc.ensure_session_node(
+            "session-fail", {"started_at": "2024-01-01T00:00:00"}
+        )
+
+        # Node must exist and cache must be populated
+        node = await svc.graph.get_node("session-fail")
+        assert node is not None
+        assert "session-fail" in svc._seen_sessions
+
+
+# ---------------------------------------------------------------------------
 # GraphState.remove_edge tests
 # ---------------------------------------------------------------------------
 

@@ -190,7 +190,7 @@ class ToolExecutionHandler:
         properties["data_tool_error"] = json.dumps(data)
 
         await self.services.graph.upsert_node(te_id, properties)
-        log.info("Errored ToolExecution %s", te_id)
+        log.warning("Errored ToolExecution %s error=%r", te_id, error_message)
 
         return HookResult(action="continue")
 

@@ -10,6 +10,8 @@ Test coverage:
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -590,3 +592,24 @@ async def test_process_event_blob_processing_skipped_without_blob_store(
     ) as mock_process:
         await process_event(worker, "session:start", data, handlers)
         mock_process.assert_not_called()
+
+
+async def test_process_event_blob_skip_missing_timestamp_logs_warning(
+    handlers: dict, caplog: pytest.LogCaptureFixture
+) -> None:
+    """P-1: When session_id and blob_store are present but timestamp is missing,
+    blob processing is skipped AND a WARNING log is emitted."""
+    from context_intelligence_server.pipeline import process_event
+
+    worker = MagicMock()
+    worker.services.ensure_session_node = AsyncMock()
+    worker.services.graph = MagicMock()
+    worker.services.graph.flush = AsyncMock()
+    worker.services.blob_store = MagicMock()  # truthy blob_store
+    data = {"session_id": "sess-123"}  # No timestamp
+    with caplog.at_level(logging.WARNING):
+        await process_event(worker, "tool_call", data, handlers)
+    assert "blob_processing_skipped" in caplog.text
+    assert "sess-123" in caplog.text
+    assert "tool_call" in caplog.text
+    assert "missing timestamp" in caplog.text

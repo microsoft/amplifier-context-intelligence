@@ -56,7 +56,7 @@ def _lifecycle_data(
     return {
         "session_id": session_id,
         "timestamp": timestamp,
-        "recipe_name": recipe_name,
+        "name": recipe_name,
         "description": description,
         "total_steps": total_steps,
         "status": status,
@@ -64,7 +64,7 @@ def _lifecycle_data(
         "steps": steps,
         "success": success,
         "stage_name": stage_name,
-        "approval_prompt": approval_prompt,
+        "prompt": approval_prompt,
     }
 
 
@@ -460,7 +460,7 @@ class TestRecipeHandlerDataProperty:
         assert node is not None
         assert "data" in node
         parsed = json.loads(node["data"])
-        assert parsed["recipe_name"] == "my-recipe"
+        assert parsed["name"] == "my-recipe"
         assert parsed["session_id"] == SESSION_ID
 
     async def test_loop_event_stores_data(self, services: HookStateService) -> None:
