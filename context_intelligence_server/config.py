@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Tuple, Type
 
 import yaml
+from pydantic import field_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import (
     BaseSettings,
@@ -96,6 +97,17 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     server_host: str = "0.0.0.0"
     server_port: int = 8000
+
+    # -------------------------------------------------------------------------
+    # Authentication
+    # -------------------------------------------------------------------------
+    api_key: str | None = None
+
+    @field_validator("api_key", mode="before")
+    @classmethod
+    def _normalize_api_key(cls, v: str | None) -> str | None:
+        """Normalize empty string to None so that api_key: '' in config disables auth."""
+        return None if v == "" else v
 
     # -------------------------------------------------------------------------
     # Neo4j

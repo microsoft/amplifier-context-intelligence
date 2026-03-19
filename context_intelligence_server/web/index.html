@@ -57,12 +57,12 @@
         <div class="nav-card-desc">Interactive Swagger UI &mdash; POST /events, GET /blobs, POST /cypher, GET /logs/stream.</div>
         <div class="nav-card-arrow">Open API docs &rarr;</div>
       </a>
-      <a class="nav-card" href="http://localhost:7474" target="_blank">
+      <div class="nav-card" style="cursor:default;">
         <div class="nav-card-icon">&#x25C8;</div>
-        <div class="nav-card-title">Neo4j Browser</div>
-        <div class="nav-card-desc">Query the session graph directly with Cypher. Connect to bolt://localhost:7687, no auth.</div>
-        <div class="nav-card-arrow">Open Neo4j browser &rarr;</div>
-      </a>
+        <div class="nav-card-title">Neo4j</div>
+        <div id="neo4j-status-desc">Checking connection...</div>
+        <div id="neo4j-status-badge" style="font-weight:600;">&mdash;</div>
+      </div>
     </div>
 
     <!-- Quick stats from /status -->
@@ -86,6 +86,17 @@
         document.getElementById('ls-active').textContent = d.active_sessions ?? '—';
         document.getElementById('ls-completed').textContent = (d.completed_sessions || []).length;
         document.getElementById('ls-errors').textContent = d.error_count_last_hour ?? 0;
+        const neo4jDesc = document.getElementById('neo4j-status-desc');
+        const neo4jBadge = document.getElementById('neo4j-status-badge');
+        if (d.neo4j_connected) {
+          neo4jDesc.textContent = 'Connected to Neo4j graph database.';
+          neo4jBadge.textContent = '\u25cf Connected';
+          neo4jBadge.style.color = 'var(--primary)';
+        } else {
+          neo4jDesc.textContent = 'Neo4j is not reachable.';
+          neo4jBadge.textContent = '\u25cb Disconnected';
+          neo4jBadge.style.color = 'var(--destructive)';
+        }
         const themeBtn = document.getElementById('theme-toggle');
         if (themeBtn) themeBtn.textContent = document.documentElement.classList.contains('dark') ? '☀' : '☾';
       } catch { /* server may be starting */ }

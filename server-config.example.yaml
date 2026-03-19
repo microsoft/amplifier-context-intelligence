@@ -14,7 +14,18 @@
 # -----------------------------------------------------------------------------
 neo4j_url: neo4j://localhost:7687
 neo4j_user: neo4j
-neo4j_password: ""          # Leave empty for Neo4j instances started with NEO4J_AUTH=none
+neo4j_password: ""          # Empty only for local Neo4j with NEO4J_AUTH=none (dev only).
+                             # Docker and production deployments always use a password.
+                             # Run: context-intelligence-server-init to generate one.
+
+# -----------------------------------------------------------------------------
+# Authentication
+# Generate with: context-intelligence-server-init
+# When set, all API endpoints (except /status) require:
+#   Authorization: Bearer <api_key>
+# When absent or empty, no authentication is required (local dev only).
+# -----------------------------------------------------------------------------
+api_key: ""                 # Empty or absent = auth disabled (local dev). Set to a non-empty secret to enable auth.
 
 # -----------------------------------------------------------------------------
 # Storage paths

@@ -1,9 +1,11 @@
 """Tests for FastAPI app — GET /status and POST /events endpoints."""
 
 import asyncio
+import contextlib
 import json
 import socket
 from pathlib import Path
+from collections.abc import AsyncGenerator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,7 +13,8 @@ import httpx
 import pytest
 
 import context_intelligence_server.main as main_module
-from context_intelligence_server.main import lifespan, registry
+from context_intelligence_server.auth import BearerTokenMiddleware
+from context_intelligence_server.main import app, lifespan, registry
 from context_intelligence_server.models import CypherRequest
 from tests.conftest import MockNeo4jDriver
 
@@ -75,7 +78,9 @@ async def test_post_events_duplicate_idempotency_key_skips_enqueue(
 ) -> None:
     worker = MagicMock()
     worker.queue = AsyncMock()
-    monkeypatch.setattr(main_module.registry, "get_or_create", lambda *args, **kwargs: worker)
+    monkeypatch.setattr(
+        main_module.registry, "get_or_create", lambda *args, **kwargs: worker
+    )
 
     payload = {
         "event": "tool_use",
@@ -100,7 +105,9 @@ async def test_post_events_replay_bypasses_idempotency_guard(
 ) -> None:
     worker = MagicMock()
     worker.queue = AsyncMock()
-    monkeypatch.setattr(main_module.registry, "get_or_create", lambda *args, **kwargs: worker)
+    monkeypatch.setattr(
+        main_module.registry, "get_or_create", lambda *args, **kwargs: worker
+    )
 
     payload = {
         "event": "tool_use",
@@ -416,6 +423,38 @@ async def test_dashboard_returns_html(client: httpx.AsyncClient) -> None:
     body = response.text
     assert "Context Intelligence" in body
     assert "setInterval" in body
+
+
+# ---------------------------------------------------------------------------
+# Index page Neo4j status indicator tests
+# ---------------------------------------------------------------------------
+
+
+async def test_index_no_neo4j_browser_link(client: httpx.AsyncClient) -> None:
+    """GET / must NOT contain a link to localhost:7474 (Neo4j Browser)."""
+    response = await client.get("/")
+    assert response.status_code == 200
+    body = response.text
+    assert "localhost:7474" not in body
+
+
+async def test_index_has_neo4j_status_elements(client: httpx.AsyncClient) -> None:
+    """GET / must contain neo4j-status-desc and neo4j-status-badge elements."""
+    response = await client.get("/")
+    assert response.status_code == 200
+    body = response.text
+    assert 'id="neo4j-status-desc"' in body
+    assert 'id="neo4j-status-badge"' in body
+
+
+async def test_index_js_reads_neo4j_connected(client: httpx.AsyncClient) -> None:
+    """GET / inline JS must read neo4j_connected from status response and update elements."""
+    response = await client.get("/")
+    assert response.status_code == 200
+    body = response.text
+    assert "neo4j_connected" in body
+    assert "neo4j-status-desc" in body
+    assert "neo4j-status-badge" in body
 
 
 # ---------------------------------------------------------------------------
@@ -745,6 +784,81 @@ async def test_post_events_replay_flag_passes_to_get_or_create(
     assert captured_kwargs["replay"] is True
 
 
+# ---------------------------------------------------------------------------
+# Auth middleware integration tests
+# ---------------------------------------------------------------------------
+
+
+@contextlib.asynccontextmanager
+async def _auth_client(
+    api_key: str = "test-secret",
+) -> AsyncGenerator[httpx.AsyncClient, None]:
+    """Yield an AsyncClient pre-wrapped with BearerTokenMiddleware."""
+    wrapped = BearerTokenMiddleware(app, api_key=api_key)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=wrapped),
+        base_url="http://test",
+    ) as c:
+        yield c
+
+
+class TestAuthMiddleware:
+    """Bearer token middleware integration tests against the real app."""
+
+    async def test_status_accessible_without_token(self) -> None:
+        """/status is always accessible through middleware, even when api_key is set."""
+        async with _auth_client() as c:
+            response = await c.get("/status")
+        assert response.status_code == 200
+
+    async def test_events_returns_401_without_token_when_api_key_set(self) -> None:
+        """POST /events returns 401 when api_key is configured and no token sent."""
+        async with _auth_client() as c:
+            response = await c.post(
+                "/events",
+                json={
+                    "event": "tool_use",
+                    "workspace": "/ws",
+                    "data": {"session_id": "s1"},
+                },
+            )
+        assert response.status_code == 401
+
+    async def test_events_returns_202_with_valid_token(self) -> None:
+        """POST /events returns 202 when correct bearer token is provided."""
+        async with _auth_client() as c:
+            response = await c.post(
+                "/events",
+                json={
+                    "event": "tool_use",
+                    "workspace": "/ws",
+                    "data": {"session_id": "s1"},
+                },
+                headers={"Authorization": "Bearer test-secret"},
+            )
+        assert response.status_code == 202
+
+    async def test_cypher_returns_401_without_token(self) -> None:
+        """POST /cypher returns 401 when api_key is configured and no token sent."""
+        async with _auth_client() as c:
+            response = await c.post("/cypher", json={"query": "MATCH (n) RETURN n"})
+        assert response.status_code == 401
+
+    async def test_no_auth_when_api_key_is_none(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """When api_key is None (default), no auth is required — backward compat."""
+        response = await client.post(
+            "/events",
+            json={
+                "event": "tool_use",
+                "workspace": "/ws",
+                "data": {"session_id": "s1"},
+            },
+        )
+        assert response.status_code == 202
+
+
 async def test_lifespan_creates_and_closes_driver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -771,3 +885,52 @@ async def test_lifespan_creates_and_closes_driver(
 
         # After lifespan exits: close() must have been called
         mock_driver.close.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# /status neo4j_connected field tests
+# ---------------------------------------------------------------------------
+
+
+async def test_status_includes_neo4j_connected_true(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/status includes neo4j_connected: true when driver.verify_connectivity() succeeds."""
+    mock_driver = AsyncMock()
+    mock_driver.verify_connectivity = AsyncMock(return_value=None)
+    monkeypatch.setattr(main_module.app.state, "neo4j_driver", mock_driver, raising=False)
+
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["neo4j_connected"] is True
+
+
+async def test_status_includes_neo4j_connected_false_on_error(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/status includes neo4j_connected: false when driver.verify_connectivity() raises."""
+    mock_driver = AsyncMock()
+    mock_driver.verify_connectivity = AsyncMock(side_effect=Exception("connection refused"))
+    monkeypatch.setattr(main_module.app.state, "neo4j_driver", mock_driver, raising=False)
+
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["neo4j_connected"] is False
+
+
+async def test_status_includes_neo4j_connected_false_when_no_driver(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/status includes neo4j_connected: false when neo4j_driver is not set on app.state."""
+    if hasattr(main_module.app.state, "neo4j_driver"):
+        monkeypatch.delattr(main_module.app.state, "neo4j_driver", raising=False)
+
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["neo4j_connected"] is False

@@ -6,8 +6,10 @@ services:
     environment:
       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL: neo4j://neo4j:7687
       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH: /data/blobs
+      AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE: /data/credentials.yaml
       PYTHONUNBUFFERED: "1"
     volumes:
+      - ${HOME}/amplifier-context-intelligence-server-data-store:/data
       - ${HOME}/amplifier-context-intelligence-server-data-store/blobs:/data/blobs
       - ${HOME}/amplifier-context-intelligence-server-data-store/logs:/data/logs
     depends_on:
@@ -25,25 +27,24 @@ services:
     networks:
       - context-intelligence
 
-
   neo4j:
     image: neo4j:5.26.22-community
-    environment:
-      NEO4J_AUTH: none
+    env_file:
+      - ${HOME}/amplifier-context-intelligence-server-data-store/neo4j-auth.env
     ports:
-      - "7474:7474"  # browser UI — debug/diagnostics
-      - "7687:7687"  # bolt — exposed for Neo4j browser and direct queries
+      - "7474:7474"
+      - "7687:7687"
     volumes:
       - ${HOME}/amplifier-context-intelligence-server-data-store/neo4j:/data
-    restart: unless-stopped
-    labels:
-      com.context-intelligence.component: neo4j
     healthcheck:
       test: ["CMD", "wget", "-O", "-", "http://localhost:7474"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 15s
+    restart: unless-stopped
+    labels:
+      com.context-intelligence.component: neo4j
     networks:
       - context-intelligence
 

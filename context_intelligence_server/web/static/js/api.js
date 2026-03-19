@@ -1,15 +1,22 @@
-export async function fetchStatus() {
-  const r = await fetch('/status');
-  if (!r.ok) throw new Error('Status fetch failed: ' + r.status);
-  return r.json();
+function authHeaders() {
+  const token = localStorage.getItem('ci_api_key');
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  return headers;
 }
 
-export async function postCypher(query, params, workspace) {
-  const r = await fetch('/cypher', {
+export async function fetchStatus() {
+  const response = await fetch('/status');
+  if (!response.ok) throw new Error('Status fetch failed: ' + response.status);
+  return response.json();
+}
+
+export async function postCypher(query, params = {}, workspace = '*') {
+  const response = await fetch('/cypher', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, params: params || {}, workspace: workspace || '*' })
+    headers: authHeaders(),
+    body: JSON.stringify({ query, params, workspace })
   });
-  if (!r.ok) throw new Error('Cypher failed: ' + r.status);
-  return r.json();
+  if (!response.ok) throw new Error('Cypher failed: ' + response.status);
+  return response.json();
 }

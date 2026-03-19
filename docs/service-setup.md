@@ -37,7 +37,19 @@ uv tool upgrade context-intelligence-server
 
 ## 2. Configuration
 
-### Create config directory and download the example config
+### Option A — Generate config with `context-intelligence-server-init` (recommended)
+
+```bash
+context-intelligence-server-init \
+  --neo4j-url neo4j://localhost:7687 \
+  --neo4j-user neo4j
+```
+
+You will be prompted for the Neo4j password. The command writes `server-config.yaml` to `~/.config/context-intelligence/` with all required fields including a generated `api_key`.
+
+Copy the printed API key — you will need it in your bundle config as `context_intelligence_api_key`.
+
+### Option B — Manual config (advanced)
 
 ```bash
 mkdir -p ~/.config/context-intelligence
@@ -52,10 +64,11 @@ three categories:
 ### Server settings
 
 | Key | Example | Purpose |
-|-----|---------|---------| 
+|-----|---------|---------|
 | `server_host` | `127.0.0.1` | Bind address (`0.0.0.0` to expose on network) |
 | `server_port` | `8000` | Listen port |
 | `log_level` | `INFO` | Verbosity (`DEBUG` / `INFO` / `WARNING` / `ERROR`) |
+| `api_key` | *(generated)* | Bearer token for API auth. All endpoints except `/status` and static routes require `Authorization: Bearer <value>`. Generate with `context-intelligence-server-init`. |
 
 ### Neo4j settings
 
@@ -63,7 +76,7 @@ three categories:
 |-----|---------|---------|
 | `neo4j_url` | `neo4j://localhost:7687` | Bolt connection URL |
 | `neo4j_user` | `neo4j` | Auth username |
-| `neo4j_password` | `password` | Auth password (leave empty for `NEO4J_AUTH=none`) |
+| `neo4j_password` | `password` | Auth password. Always required for Docker deployments. For local dev-only Neo4j with `NEO4J_AUTH=none`, may be left empty. |
 
 ### Storage settings
 
@@ -203,7 +216,7 @@ open http://localhost:8000
 ### Log locations
 
 | Platform | How to view logs |
-|----------|-----------------| 
+|----------|-----------------|
 | Linux | `journalctl --user -u context-intelligence-server -f` |
 | macOS | `tail -f ~/.local/share/context-intelligence/logs/server.stdout.log` |
 
@@ -217,3 +230,6 @@ open http://localhost:8000
 | Port 8000 already in use | Conflict with another process | Change `server_port` in config, update unit/plist accordingly |
 | Linux: service doesn't start on boot | Lingering not enabled | `loginctl enable-linger $USER` |
 | macOS: plist loaded but service not running | launchd silently failed | Check `server.stderr.log` for startup errors |
+| Events stop dispatching, circuit breaker tripped | `api_key` set on server but `context_intelligence_api_key` missing from bundle config | Add `context_intelligence_api_key: "<your-key>"` to bundle config |
+| Dashboard shows "Enter your API key" and won't load | API key prompt is active | Open `server-config.yaml`, find `api_key:`, paste it into the dashboard prompt |
+

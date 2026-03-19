@@ -64,6 +64,17 @@ async function refresh() {
     const badge = document.getElementById('error-badge');
     if (badge) badge.style.display = ec > 0 ? 'inline' : 'none';
 
+    const neo4jStatus = document.getElementById('neo4j-status');
+    if (neo4jStatus) {
+      if (data.neo4j_connected) {
+        neo4jStatus.textContent = '\u25cf Connected';
+        neo4jStatus.style.color = 'var(--primary)';
+      } else {
+        neo4jStatus.textContent = '\u25cb Disconnected';
+        neo4jStatus.style.color = 'var(--destructive)';
+      }
+    }
+
     const sb = document.getElementById('sessions-body');
     if (sb) sb.innerHTML = (data.sessions || []).map(s =>
       `<tr><td>${truncate(s.session_id, 20)}</td><td>${truncate(s.workspace, 28)}</td>` +

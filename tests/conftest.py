@@ -3,8 +3,8 @@
 from collections.abc import AsyncGenerator, Generator
 from typing import Any
 
-import pytest
 import httpx
+import pytest
 
 from context_intelligence_server.main import app, registry
 from context_intelligence_server.services import HookStateService
@@ -137,6 +137,21 @@ def reset_registry() -> Generator[None, None, None]:
 async def client() -> AsyncGenerator[httpx.AsyncClient, None]:
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as c:
+        yield c
+
+
+@pytest.fixture
+async def auth_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncGenerator[httpx.AsyncClient, None]:
+    """Client routed through asgi_app (auth middleware applied) with a test API key set."""
+    from context_intelligence_server.main import asgi_app  # noqa: PLC0415
+
+    monkeypatch.setattr(asgi_app, "api_key", "test-secret")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=asgi_app),
         base_url="http://test",
     ) as c:
         yield c

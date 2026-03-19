@@ -26,6 +26,7 @@ dev = [
 
 [project.scripts]
 context-intelligence-server = "context_intelligence_server.main:run"
+context-intelligence-server-init = "context_intelligence_server.init_command:main"
 
 [tool.hatch.build.targets.wheel]
 include = ["context_intelligence_server/**"]

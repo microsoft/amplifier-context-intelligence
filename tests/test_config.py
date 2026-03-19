@@ -190,6 +190,66 @@ def test_yaml_empty_file_uses_defaults(tmp_path: Path, monkeypatch):
     assert s.server_port == 8000
 
 
+def test_api_key_defaults_to_none():
+    """api_key should default to None when not configured."""
+    from context_intelligence_server.config import Settings
+
+    s = Settings()
+    assert s.api_key is None
+
+
+def test_api_key_from_yaml(tmp_path: Path, monkeypatch):
+    """api_key should be loadable from YAML config."""
+    config_file = tmp_path / "server-config.yaml"
+    config_file.write_text("api_key: test-secret-token-123\n")
+
+    monkeypatch.setenv(
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE", str(config_file)
+    )
+
+    from context_intelligence_server.config import Settings
+
+    s = Settings()
+    assert s.api_key == "test-secret-token-123"
+
+
+def test_api_key_from_env(monkeypatch):
+    """api_key should be settable via environment variable."""
+    monkeypatch.setenv("AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY", "env-token-456")
+
+    from context_intelligence_server.config import Settings
+
+    s = Settings()
+    assert s.api_key == "env-token-456"
+
+
+def test_api_key_empty_string_treated_as_none():
+    """api_key='' (empty string) should be normalized to None — disabling auth.
+
+    A user copying server-config.example.yaml verbatim gets api_key: "" which
+    must behave identically to omitting api_key entirely (auth disabled).
+    """
+    from context_intelligence_server.config import Settings
+
+    s = Settings(api_key="")
+    assert s.api_key is None
+
+
+def test_api_key_empty_string_from_yaml_treated_as_none(tmp_path: Path, monkeypatch):
+    """api_key: '' in a YAML config file should be normalized to None."""
+    config_file = tmp_path / "server-config.yaml"
+    config_file.write_text('api_key: ""\n')
+
+    monkeypatch.setenv(
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE", str(config_file)
+    )
+
+    from context_intelligence_server.config import Settings
+
+    s = Settings()
+    assert s.api_key is None
+
+
 @pytest.mark.parametrize(
     "field,yaml_value,expected",
     [

@@ -34,18 +34,38 @@ git clone https://github.com/colombod/amplifier-context-intelligence.git
 cd amplifier-context-intelligence
 ```
 
-### 2. Start the stack
+### 2. Start the stack (first run)
+
+On first run, use the `start.sh` script to generate credentials and start the stack:
+
+```bash
+./start.sh
+```
+
+This generates credentials (`credentials.yaml` + `neo4j-auth.env`), then calls `docker compose up -d` to start the services.
+
+To retrieve your API key after the first run:
+
+```bash
+grep api_key ~/amplifier-context-intelligence-server-data-store/credentials.yaml
+```
+
+### 2a. Restart the stack (subsequent runs)
+
+On subsequent restarts, the credentials already exist, so you can use `docker compose` directly:
 
 ```bash
 docker compose up -d
 ```
 
-This starts 2 services:
+### Services
+
+The stack runs 2 services:
 
 | Service | Port | Description |
 |---------|------|-------------|
 | **Ingestion server** | [localhost:8000](http://localhost:8000) | Event processing, dashboard, API |
-| **Neo4j** | [localhost:7474](http://localhost:7474) | Property graph (bolt on :7687, no auth) |
+| **Neo4j** | [localhost:7474](http://localhost:7474) | Property graph (bolt on :7687, auth enabled) |
 
 All services are configured with `restart: unless-stopped` — they automatically restart on crash or Docker daemon restart. They only stay down if you explicitly stop them with `docker compose stop` or `docker compose down`.
 
@@ -59,7 +79,21 @@ Open [http://localhost:8000](http://localhost:8000) — this is the single navig
 | `/dashboard` | Live session monitoring, event history, log stream |
 | `/docs` | Swagger API documentation |
 
-Neo4j browser is linked directly from the navigation bar (it cannot be iframed due to its Content-Security-Policy).
+The dashboard shows a Neo4j status chip (Connected/Disconnected). When `api_key` is configured, the dashboard shows an API key prompt on first visit — enter the key from `credentials.yaml`.
+
+---
+
+## First-Run Setup (Standalone)
+
+Before starting the server for the first time outside Docker, run the init command to generate credentials:
+
+```bash
+context-intelligence-server-init \
+  --neo4j-url neo4j://localhost:7687 \
+  --neo4j-user neo4j
+```
+
+You will be prompted for the Neo4j password. The command writes `server-config.yaml` with all required fields including a generated `api_key`. The generated API key is printed to stdout — copy it to your bundle config as `context_intelligence_api_key`.
 
 ---
 
@@ -228,6 +262,7 @@ All settings live in `~/.amplifier/settings.yaml` under `overrides.hook-context-
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `context_intelligence_server_url` | *(empty — disabled)* | Server URL to forward events to |
+| `context_intelligence_api_key` | *(empty)* | Bearer token for server auth. Must match the server's `api_key`. |
 | `workspace` | *(auto-resolved)* | Workspace scope for graph data |
 
 ---
@@ -290,6 +325,7 @@ Values are resolved with this priority (highest first):
 | Environment variable | YAML key | Default | Description |
 |----------------------|----------|---------|-------------|
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE` | *(env only)* | `server-config.yaml` | Path to the YAML config file |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY` | `api_key` | *(empty — auth disabled)* | Bearer token. When set, all API endpoints except `/status` and static routes require `Authorization: Bearer <value>`. Generate with `context-intelligence-server-init`. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL` | `neo4j_url` | `neo4j://neo4j:7687` | Neo4j bolt URI |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_USER` | `neo4j_user` | `neo4j` | Neo4j username |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD` | `neo4j_password` | `password` | Neo4j password |
@@ -409,7 +445,7 @@ amplifier-context-intelligence/
 │   ├── handlers/                        # 7 event handlers
 │   └── web/                             # Dashboard HTML + static assets
 ├── server-config.example.yaml           # Configuration file template
-├── docker-compose.yml                   # 2-service stack
+├── docker-compose.yml                   # 2-service stack (server + neo4j)
 └── Dockerfile                           # Ingestion server image
 ```
 

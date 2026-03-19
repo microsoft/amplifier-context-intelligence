@@ -6,9 +6,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf 
 
 COPY pyproject.toml .
 COPY context_intelligence_server/ context_intelligence_server/
+COPY docker-entrypoint.sh .
+RUN chmod +x docker-entrypoint.sh
 
 RUN pip install --no-cache-dir .
 
 EXPOSE 8000
 
-CMD ["gunicorn", "context_intelligence_server.main:app", "--worker-class", "uvicorn.workers.UvicornWorker", "--workers", "1", "--bind", "0.0.0.0:8000", "--timeout", "30", "--graceful-timeout", "10"]
+CMD ["gunicorn", "context_intelligence_server.main:asgi_app", "--worker-class", "uvicorn.workers.UvicornWorker", "--workers", "1", "--bind", "0.0.0.0:8000", "--timeout", "30", "--graceful-timeout", "10"]

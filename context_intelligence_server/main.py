@@ -21,6 +21,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from neo4j import AsyncGraphDatabase
 
+from context_intelligence_server.auth import BearerTokenMiddleware
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.dashboard import build_status_response
@@ -63,6 +64,16 @@ _WEB_DIR = Path(__file__).parent / "web"
 app.mount("/static", StaticFiles(directory=_WEB_DIR / "static"), name="static")
 
 
+def create_asgi_app() -> BearerTokenMiddleware:
+    """Return the ASGI app wrapped with auth middleware."""
+    return BearerTokenMiddleware(app, api_key=_settings.api_key)
+
+
+# Module-level ASGI app used by Gunicorn: context_intelligence_server.main:asgi_app
+# The raw `app` is kept for internal use and testing against un-authed routes.
+asgi_app: BearerTokenMiddleware = create_asgi_app()
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> FileResponse:
     return FileResponse(_WEB_DIR / "index.html")
@@ -74,8 +85,22 @@ async def dashboard() -> FileResponse:
 
 
 @app.get("/status")
-async def get_status() -> dict[str, Any]:
-    return build_status_response(registry, _start_time)
+async def get_status(request: Request) -> dict[str, Any]:
+    response = build_status_response(registry, _start_time)
+    response["neo4j_connected"] = await _check_neo4j_connected(request.app)
+    return response
+
+
+async def _check_neo4j_connected(app_instance: FastAPI) -> bool:
+    """Check Neo4j connectivity via the driver's verify_connectivity method."""
+    driver = getattr(app_instance.state, "neo4j_driver", None)
+    if driver is None:
+        return False
+    try:
+        await driver.verify_connectivity()
+        return True
+    except Exception:
+        return False
 
 
 @app.post("/events", status_code=202, response_model=EventResponse)
@@ -204,7 +229,7 @@ def run() -> None:
             }.items():
                 self.cfg.set(key, value)
 
-        def load(self):
-            return app
+        def load(self) -> Any:
+            return asgi_app
 
     _App().run()
