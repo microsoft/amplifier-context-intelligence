@@ -14,6 +14,9 @@ from typing import Any
 import yaml
 
 _DEFAULT_CONFIG_PATH = Path("server-config.yaml")
+_DEFAULT_BLOB_PATH = "~/.local/share/context-intelligence/blobs"
+_DEFAULT_LOG_PATH = "~/.local/share/context-intelligence/logs/server.jsonl"
+_DEFAULT_CURSOR_PATH = "~/.local/share/context-intelligence/cursors"
 
 
 def run_init(
@@ -22,11 +25,17 @@ def run_init(
     neo4j_url: str,
     neo4j_user: str,
     neo4j_password: str,
+    blob_path: str | None = None,
+    log_path: str | None = None,
+    cursor_path: str | None = None,
+    server_host: str | None = None,
+    server_port: int | None = None,
 ) -> dict[str, str]:
     """Write server config with Neo4j credentials and a generated API key.
 
     If *config_path* already exists, existing keys are preserved and only
-    the Neo4j + auth keys are overwritten.
+    the provided keys are overwritten.  Optional path/host/port params are
+    only written when explicitly supplied (not ``None``).
 
     Returns a dict with the generated ``api_key`` (and all written keys).
     """
@@ -42,6 +51,17 @@ def run_init(
     existing["neo4j_user"] = neo4j_user
     existing["neo4j_password"] = neo4j_password
     existing["api_key"] = api_key
+
+    if blob_path is not None:
+        existing["blob_path"] = str(Path(blob_path).expanduser())
+    if log_path is not None:
+        existing["log_path"] = str(Path(log_path).expanduser())
+    if cursor_path is not None:
+        existing["cursor_path"] = str(Path(cursor_path).expanduser())
+    if server_host is not None:
+        existing["server_host"] = server_host
+    if server_port is not None:
+        existing["server_port"] = server_port
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
@@ -65,8 +85,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--neo4j-url",
         type=str,
-        default="neo4j://localhost:7687",
-        help="Neo4j bolt URL (default: neo4j://localhost:7687).",
+        default="bolt://localhost:7687",
+        help="Neo4j bolt URL (default: bolt://localhost:7687).",
     )
     parser.add_argument(
         "--neo4j-user",
@@ -79,6 +99,36 @@ def main(argv: list[str] | None = None) -> None:
         type=str,
         default=None,
         help="Neo4j password. If omitted, you will be prompted interactively.",
+    )
+    parser.add_argument(
+        "--blob-path",
+        type=str,
+        default=_DEFAULT_BLOB_PATH,
+        help=f"Path for blob storage (default: {_DEFAULT_BLOB_PATH}).",
+    )
+    parser.add_argument(
+        "--log-path",
+        type=str,
+        default=_DEFAULT_LOG_PATH,
+        help=f"Path for server log file (default: {_DEFAULT_LOG_PATH}).",
+    )
+    parser.add_argument(
+        "--cursor-path",
+        type=str,
+        default=_DEFAULT_CURSOR_PATH,
+        help=f"Path for cursor storage (default: {_DEFAULT_CURSOR_PATH}).",
+    )
+    parser.add_argument(
+        "--server-host",
+        type=str,
+        default="0.0.0.0",
+        help="Server bind host (default: 0.0.0.0).",
+    )
+    parser.add_argument(
+        "--server-port",
+        type=int,
+        default=8000,
+        help="Server bind port (default: 8000).",
     )
 
     args = parser.parse_args(argv)
@@ -96,6 +146,11 @@ def main(argv: list[str] | None = None) -> None:
         neo4j_url=args.neo4j_url,
         neo4j_user=args.neo4j_user,
         neo4j_password=neo4j_password,
+        blob_path=args.blob_path,
+        log_path=args.log_path,
+        cursor_path=args.cursor_path,
+        server_host=args.server_host,
+        server_port=args.server_port,
     )
 
     print(f"Config written to: {result['config_path']}")

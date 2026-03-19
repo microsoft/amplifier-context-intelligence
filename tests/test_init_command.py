@@ -108,6 +108,132 @@ class TestRunInit:
         assert "api_key" in data
 
 
+class TestRunInitNewParams:
+    def test_blob_path_written_and_expanded(self, tmp_path: Path) -> None:
+        """--blob-path is written to config with ~ expanded."""
+        config_path = tmp_path / "server-config.yaml"
+        run_init(
+            config_path=config_path,
+            neo4j_url="bolt://localhost:7687",
+            neo4j_user="neo4j",
+            neo4j_password="pw",
+            blob_path="~/.local/share/context-intelligence/blobs",
+            log_path="~/.local/share/context-intelligence/logs/server.jsonl",
+            cursor_path="~/.local/share/context-intelligence/cursors",
+            server_host="0.0.0.0",
+            server_port=8000,
+        )
+
+        data = yaml.safe_load(config_path.read_text())
+        # ~ should be expanded to the actual home directory
+        assert "blob_path" in data
+        assert "~" not in data["blob_path"]
+        assert data["blob_path"].endswith("context-intelligence/blobs")
+
+    def test_log_path_written(self, tmp_path: Path) -> None:
+        """--log-path is written to config."""
+        config_path = tmp_path / "server-config.yaml"
+        run_init(
+            config_path=config_path,
+            neo4j_url="bolt://localhost:7687",
+            neo4j_user="neo4j",
+            neo4j_password="pw",
+            blob_path="/tmp/blobs",
+            log_path="~/.local/share/context-intelligence/logs/server.jsonl",
+            cursor_path="/tmp/cursors",
+            server_host="0.0.0.0",
+            server_port=8000,
+        )
+
+        data = yaml.safe_load(config_path.read_text())
+        assert "log_path" in data
+        assert "~" not in data["log_path"]
+        assert data["log_path"].endswith("logs/server.jsonl")
+
+    def test_cursor_path_written(self, tmp_path: Path) -> None:
+        """--cursor-path is written to config."""
+        config_path = tmp_path / "server-config.yaml"
+        run_init(
+            config_path=config_path,
+            neo4j_url="bolt://localhost:7687",
+            neo4j_user="neo4j",
+            neo4j_password="pw",
+            blob_path="/tmp/blobs",
+            log_path="/tmp/server.jsonl",
+            cursor_path="~/.local/share/context-intelligence/cursors",
+            server_host="0.0.0.0",
+            server_port=8000,
+        )
+
+        data = yaml.safe_load(config_path.read_text())
+        assert "cursor_path" in data
+        assert "~" not in data["cursor_path"]
+        assert data["cursor_path"].endswith("context-intelligence/cursors")
+
+    def test_server_host_written(self, tmp_path: Path) -> None:
+        """--server-host is written to config."""
+        config_path = tmp_path / "server-config.yaml"
+        run_init(
+            config_path=config_path,
+            neo4j_url="bolt://localhost:7687",
+            neo4j_user="neo4j",
+            neo4j_password="pw",
+            blob_path="/tmp/blobs",
+            log_path="/tmp/server.jsonl",
+            cursor_path="/tmp/cursors",
+            server_host="127.0.0.1",
+            server_port=8000,
+        )
+
+        data = yaml.safe_load(config_path.read_text())
+        assert data["server_host"] == "127.0.0.1"
+
+    def test_server_port_written_as_int(self, tmp_path: Path) -> None:
+        """--server-port is written to config as an integer."""
+        config_path = tmp_path / "server-config.yaml"
+        run_init(
+            config_path=config_path,
+            neo4j_url="bolt://localhost:7687",
+            neo4j_user="neo4j",
+            neo4j_password="pw",
+            blob_path="/tmp/blobs",
+            log_path="/tmp/server.jsonl",
+            cursor_path="/tmp/cursors",
+            server_host="0.0.0.0",
+            server_port=9090,
+        )
+
+        data = yaml.safe_load(config_path.read_text())
+        assert data["server_port"] == 9090
+        assert isinstance(data["server_port"], int)
+
+    def test_all_flags_produce_complete_config(self, tmp_path: Path) -> None:
+        """Providing all flags at once produces a complete config with all keys."""
+        config_path = tmp_path / "server-config.yaml"
+        run_init(
+            config_path=config_path,
+            neo4j_url="bolt://localhost:7687",
+            neo4j_user="admin",
+            neo4j_password="secret",
+            blob_path="/data/blobs",
+            log_path="/data/logs/server.jsonl",
+            cursor_path="/data/cursors",
+            server_host="0.0.0.0",
+            server_port=8080,
+        )
+
+        data = yaml.safe_load(config_path.read_text())
+        assert data["neo4j_url"] == "bolt://localhost:7687"
+        assert data["neo4j_user"] == "admin"
+        assert data["neo4j_password"] == "secret"
+        assert "api_key" in data
+        assert data["blob_path"] == "/data/blobs"
+        assert data["log_path"] == "/data/logs/server.jsonl"
+        assert data["cursor_path"] == "/data/cursors"
+        assert data["server_host"] == "0.0.0.0"
+        assert data["server_port"] == 8080
+
+
 class TestCliEntryPoint:
     def test_cli_with_flags(self, tmp_path: Path) -> None:
         """CLI entry point accepts --neo4j-url, --neo4j-user, --neo4j-password flags."""
@@ -137,3 +263,69 @@ class TestCliEntryPoint:
         assert result.returncode == 0
         assert config_path.exists()
         assert "api_key" in result.stdout or "config" in result.stdout.lower()
+
+    def test_default_neo4j_url_is_bolt(self, tmp_path: Path) -> None:
+        """Default --neo4j-url uses bolt:// not neo4j:// (Community Edition compat)."""
+        import subprocess
+        import sys
+
+        config_path = tmp_path / "server-config.yaml"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "context_intelligence_server.init_command",
+                "--config-path",
+                str(config_path),
+                "--neo4j-password",
+                "pw",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).parent.parent),
+        )
+
+        assert result.returncode == 0
+        data = yaml.safe_load(config_path.read_text())
+        assert data["neo4j_url"] == "bolt://localhost:7687"
+        assert not data["neo4j_url"].startswith("neo4j://")
+
+    def test_cli_accepts_all_new_flags(self, tmp_path: Path) -> None:
+        """CLI accepts --blob-path, --log-path, --cursor-path, --server-host, --server-port."""
+        import subprocess
+        import sys
+
+        config_path = tmp_path / "server-config.yaml"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "context_intelligence_server.init_command",
+                "--config-path",
+                str(config_path),
+                "--neo4j-password",
+                "pw",
+                "--blob-path",
+                "/data/blobs",
+                "--log-path",
+                "/data/logs/server.jsonl",
+                "--cursor-path",
+                "/data/cursors",
+                "--server-host",
+                "127.0.0.1",
+                "--server-port",
+                "9000",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).parent.parent),
+        )
+
+        assert result.returncode == 0
+        data = yaml.safe_load(config_path.read_text())
+        assert data["blob_path"] == "/data/blobs"
+        assert data["log_path"] == "/data/logs/server.jsonl"
+        assert data["cursor_path"] == "/data/cursors"
+        assert data["server_host"] == "127.0.0.1"
+        assert data["server_port"] == 9000
+        assert isinstance(data["server_port"], int)
