@@ -55,7 +55,10 @@ def run_init(
     if blob_path is not None:
         existing["blob_path"] = str(Path(blob_path).expanduser())
     if log_path is not None:
-        existing["log_path"] = str(Path(log_path).expanduser())
+        _lp = Path(log_path).expanduser()
+        if not _lp.suffix:
+            _lp = _lp / "server.jsonl"
+        existing["log_path"] = str(_lp)
     if cursor_path is not None:
         existing["cursor_path"] = str(Path(cursor_path).expanduser())
     if server_host is not None:

@@ -24,6 +24,9 @@ def setup_logging() -> None:
     """
     settings = get_settings()
     log_path = Path(settings.log_path)
+    # If the user supplied a directory path (no suffix), default to server.jsonl
+    if not log_path.suffix:
+        log_path = log_path / "server.jsonl"
     log_level = settings.log_level
 
     # Ensure parent directory exists

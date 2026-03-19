@@ -234,6 +234,41 @@ class TestRunInitNewParams:
         assert data["server_port"] == 8080
 
 
+class TestLogPathDirectoryNormalisation:
+    def test_directory_log_path_appends_server_jsonl(self, tmp_path: Path) -> None:
+        """When log_path has no file extension (a directory), config stores <dir>/server.jsonl."""
+        config_path = tmp_path / "server-config.yaml"
+        log_dir = "/some/dir"  # no extension → treated as directory
+
+        run_init(
+            config_path=config_path,
+            neo4j_url="bolt://localhost:7687",
+            neo4j_user="neo4j",
+            neo4j_password="pw",
+            log_path=log_dir,
+        )
+
+        data = yaml.safe_load(config_path.read_text())
+        assert data["log_path"] == "/some/dir/server.jsonl", (
+            f"Expected /some/dir/server.jsonl, got: {data['log_path']}"
+        )
+
+    def test_full_log_path_with_extension_unchanged(self, tmp_path: Path) -> None:
+        """When log_path already has a .jsonl extension, it is stored as-is."""
+        config_path = tmp_path / "server-config.yaml"
+
+        run_init(
+            config_path=config_path,
+            neo4j_url="bolt://localhost:7687",
+            neo4j_user="neo4j",
+            neo4j_password="pw",
+            log_path="/some/dir/server.jsonl",
+        )
+
+        data = yaml.safe_load(config_path.read_text())
+        assert data["log_path"] == "/some/dir/server.jsonl"
+
+
 class TestCliEntryPoint:
     def test_cli_with_flags(self, tmp_path: Path) -> None:
         """CLI entry point accepts --neo4j-url, --neo4j-user, --neo4j-password flags."""

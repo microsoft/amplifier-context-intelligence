@@ -181,6 +181,37 @@ class TestSetupLogging:
                 f"JSON log should have 'message' key, got: {parsed}"
             )
 
+    def test_directory_log_path_auto_appends_server_jsonl(self) -> None:
+        """When log_path has no extension (directory), setup_logging() uses <dir>/server.jsonl."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Pass a directory path with no file extension
+            dir_log_path = str(Path(tmpdir) / "ci_logs")
+            mock_settings = self._make_mock_settings(dir_log_path)
+
+            with patch(
+                "context_intelligence_server.logging_config.get_settings",
+                return_value=mock_settings,
+            ):
+                from context_intelligence_server.logging_config import setup_logging
+
+                setup_logging()
+
+            root_logger = logging.getLogger()
+            rotating_handlers = [
+                h
+                for h in root_logger.handlers
+                if isinstance(h, logging.handlers.RotatingFileHandler)
+            ]
+            assert len(rotating_handlers) >= 1
+            # The actual file used must be server.jsonl inside the directory
+            handler = rotating_handlers[0]
+            assert handler.baseFilename.endswith("server.jsonl"), (
+                f"Expected handler to write to .../server.jsonl, got: {handler.baseFilename}"
+            )
+            assert "ci_logs" in handler.baseFilename, (
+                f"Expected ci_logs directory in path, got: {handler.baseFilename}"
+            )
+
     def test_setup_logging_is_idempotent(self) -> None:
         """Calling setup_logging() twice must not add duplicate handlers.
 
