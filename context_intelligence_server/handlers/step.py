@@ -251,6 +251,12 @@ class StepHandler:
         await self.services.graph.upsert_node(step_id, properties)
         log.info("Enriched AssistantStep %s with response data", step_id)
 
+        # G-N2: accumulate token counts into run_tokens
+        cursors.run_tokens.input_tokens += properties.get("input_tokens") or 0
+        cursors.run_tokens.output_tokens += properties.get("output_tokens") or 0
+        cursors.run_tokens.cached_tokens += properties.get("cached_tokens") or 0
+        cursors.run_tokens.reasoning_tokens += properties.get("reasoning_tokens") or 0
+
         # G-N3 flush: write non-default step_content values to the Step node
         extra: dict[str, Any] = {}
         if cursors.step_content.block_count > 0:

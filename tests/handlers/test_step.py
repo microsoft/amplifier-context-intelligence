@@ -630,6 +630,159 @@ class TestRecipeStepLabel:
         assert cursors.step_content.has_thinking is False
 
 
+# ── llm:response token accumulation ────────────────────────────────────────────────────────
+
+
+class TestLlmResponseTokenAccumulation:
+    """G-N2: token counts accumulate into run_tokens at each llm:response event."""
+
+    async def _seed_step(self, services: HookStateService) -> None:
+        """Seed run + provider:request so current_step_id is set."""
+        await _seed_run(services)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+
+    async def test_input_tokens_accumulated(self, services: HookStateService) -> None:
+        """input_tokens from usage are accumulated into run_tokens.input_tokens."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": STEP_TIMESTAMP,
+                "usage": {"input_tokens": 120, "output_tokens": 30},
+            },
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens.input_tokens == 120
+
+    async def test_output_tokens_accumulated(self, services: HookStateService) -> None:
+        """output_tokens from usage are accumulated into run_tokens.output_tokens."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": STEP_TIMESTAMP,
+                "usage": {"input_tokens": 120, "output_tokens": 30},
+            },
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens.output_tokens == 30
+
+    async def test_cached_tokens_accumulated_from_cache_read_input_tokens(
+        self, services: HookStateService
+    ) -> None:
+        """cached_tokens accumulated via cache_read_input_tokens key in usage."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": STEP_TIMESTAMP,
+                "usage": {
+                    "input_tokens": 50,
+                    "output_tokens": 10,
+                    "cache_read_input_tokens": 80,
+                },
+            },
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens.cached_tokens == 80
+
+    async def test_reasoning_tokens_accumulated(
+        self, services: HookStateService
+    ) -> None:
+        """reasoning_tokens from usage are accumulated into run_tokens.reasoning_tokens."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": STEP_TIMESTAMP,
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "reasoning_tokens": 45,
+                },
+            },
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens.reasoning_tokens == 45
+
+    async def test_tokens_accumulate_additively_across_multiple_steps(
+        self, services: HookStateService
+    ) -> None:
+        """Two llm:response events sum token counts additively."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+
+        # First llm:response
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": STEP_TIMESTAMP,
+                "usage": {"input_tokens": 100, "output_tokens": 20},
+            },
+        )
+        # Second llm:response (same step id is fine -- tokens still add up)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": STEP_TIMESTAMP,
+                "usage": {"input_tokens": 50, "output_tokens": 10},
+            },
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens.input_tokens == 150
+        assert cursors.run_tokens.output_tokens == 30
+
+    async def test_missing_usage_dict_does_not_raise_and_leaves_tokens_at_zero(
+        self, services: HookStateService
+    ) -> None:
+        """Missing usage key does not raise and leaves all run_tokens counters at 0."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:response",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},  # no 'usage' key
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens.input_tokens == 0
+        assert cursors.run_tokens.output_tokens == 0
+        assert cursors.run_tokens.cached_tokens == 0
+        assert cursors.run_tokens.reasoning_tokens == 0
+
+    async def test_partial_usage_accumulates_present_tokens_only(
+        self, services: HookStateService
+    ) -> None:
+        """Usage dict with only some keys: present tokens accumulate, absent stay at 0."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": STEP_TIMESTAMP,
+                "usage": {"input_tokens": 200},  # only input_tokens present
+            },
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens.input_tokens == 200
+        assert cursors.run_tokens.output_tokens == 0
+        assert cursors.run_tokens.cached_tokens == 0
+        assert cursors.run_tokens.reasoning_tokens == 0
+
+
 # ── llm:request model accumulation ────────────────────────────────────────────
 
 
