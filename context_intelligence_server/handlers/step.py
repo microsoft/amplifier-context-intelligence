@@ -8,7 +8,7 @@ from typing import Any
 
 from context_intelligence_server.ownership import check_ownership
 from context_intelligence_server.protocol import HookResult
-from context_intelligence_server.services import HookStateService
+from context_intelligence_server.services import HookStateService, StepContent
 from context_intelligence_server.utils import (
     EventLogContext,
     HandlerLogger,
@@ -59,12 +59,19 @@ class StepHandler:
         # Clear parallel_groups for new step
         cursors.parallel_groups.clear()
 
+        # Reset step_content for new step
+        cursors.step_content = StepContent()
+
         # Generate deterministic step ID
         step_id = make_node_id(session_id, "provider:request", timestamp)
 
-        # Build AssistantStep node properties
+        # Build AssistantStep node properties — add RecipeStep label for recipe sessions
+        labels = ["Step", "AssistantStep"]
+        if cursors.is_recipe_session:
+            labels.append("RecipeStep")
+
         properties: dict[str, Any] = {
-            "labels": ["Step", "AssistantStep"],
+            "labels": labels,
             "provider": data.get("provider", ""),
             "request_at": timestamp,
             "occurred_at": timestamp,

@@ -394,3 +394,99 @@ class TestContentBlockNoOp:
             {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
         )
         assert result.action == "continue"
+
+
+# ── RecipeStep label ───────────────────────────────────────────────────────────
+
+
+async def _seed_recipe_session(
+    services: HookStateService, session_id: str = "s1"
+) -> None:
+    """Create a Session node with recipe_name metadata via SessionHandler."""
+    handler = SessionHandler(services)
+    await handler(
+        "session:start",
+        {
+            "session_id": session_id,
+            "timestamp": SESSION_TIMESTAMP,
+            "metadata": {"recipe_name": "code-review"},
+        },
+    )
+
+
+async def _seed_recipe_run(services: HookStateService) -> str:
+    """Seed recipe session + prompt:submit + execution:start, return run node ID."""
+    await _seed_recipe_session(services)
+    run_handler = OrchestratorRunHandler(services)
+    await run_handler(
+        "prompt:submit",
+        {"session_id": "s1", "timestamp": PROMPT_TIMESTAMP, "prompt": "Hello"},
+    )
+    await run_handler(
+        "execution:start",
+        {"session_id": "s1", "timestamp": EXEC_TIMESTAMP},
+    )
+    return EXPECTED_RUN_NODE_ID
+
+
+class TestRecipeStepLabel:
+    async def test_recipe_session_has_recipe_step_label(
+        self, services: HookStateService
+    ) -> None:
+        """Recipe session step node has the RecipeStep label."""
+        await _seed_recipe_run(services)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+        node = await services.graph.get_node(EXPECTED_STEP_NODE_ID)
+        assert node is not None
+        assert "RecipeStep" in node["labels"]
+
+    async def test_recipe_session_has_all_three_labels(
+        self, services: HookStateService
+    ) -> None:
+        """Recipe session step node has exactly {Step, AssistantStep, RecipeStep}."""
+        await _seed_recipe_run(services)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+        node = await services.graph.get_node(EXPECTED_STEP_NODE_ID)
+        assert node is not None
+        assert set(node["labels"]) == {"Step", "AssistantStep", "RecipeStep"}
+
+    async def test_non_recipe_session_does_not_have_recipe_step_label(
+        self, services: HookStateService
+    ) -> None:
+        """Non-recipe session step node has only {Step, AssistantStep}."""
+        await _seed_run(services)  # non-recipe session (no recipe_name metadata)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+        node = await services.graph.get_node(EXPECTED_STEP_NODE_ID)
+        assert node is not None
+        assert set(node["labels"]) == {"Step", "AssistantStep"}
+
+    async def test_step_content_reset_on_provider_request(
+        self, services: HookStateService
+    ) -> None:
+        """step_content is atomically reset at provider:request (block_count=0, has_thinking=False)."""
+        await _seed_recipe_run(services)
+        # Dirty up the step_content to simulate prior step activity
+        cursors = services.get_cursors("s1")
+        cursors.step_content.block_count = 5
+        cursors.step_content.has_thinking = True
+
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.step_content.block_count == 0
+        assert cursors.step_content.has_thinking is False
