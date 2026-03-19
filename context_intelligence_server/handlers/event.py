@@ -9,7 +9,7 @@ from typing import Any
 from context_intelligence_server.handlers.default import DefaultHandler
 from context_intelligence_server.protocol import HookResult
 from context_intelligence_server.services import HookStateService
-from context_intelligence_server.utils import make_node_id
+from context_intelligence_server.utils import HandlerLogger, make_node_id
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,7 @@ class SystemEventHandler:
 
     def __init__(self, services: HookStateService) -> None:
         self.services = services
+        self._log = HandlerLogger("SystemEventHandler", logger)
 
     async def __call__(self, event: str, data: dict[str, Any]) -> HookResult:
         if event == "context:compaction":
@@ -94,6 +95,10 @@ class SystemEventHandler:
             {"type": "HAS_EVENT", "occurred_at": timestamp},
         )
 
+        log = self._log.with_event("context:compaction", data)
+        log.info(
+            "Created ContextCompaction event node %s (scope: %s)", node_id, scope_id
+        )
         return HookResult(action="continue")
 
     # ------------------------------------------------------------------
@@ -135,6 +140,8 @@ class SystemEventHandler:
             {"type": "HAS_EVENT", "occurred_at": timestamp},
         )
 
+        log = self._log.with_event("cancel:requested", data)
+        log.info("Created CancelRequested event node %s (scope: %s)", node_id, scope_id)
         return HookResult(action="continue")
 
     # ------------------------------------------------------------------
@@ -173,4 +180,6 @@ class SystemEventHandler:
             {"type": "HAS_EVENT", "occurred_at": timestamp},
         )
 
+        log = self._log.with_event("cancel:completed", data)
+        log.info("Created CancelCompleted event node %s (scope: %s)", node_id, scope_id)
         return HookResult(action="continue")
