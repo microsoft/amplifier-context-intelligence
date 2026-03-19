@@ -42,7 +42,31 @@ class StepHandler:
         if event == "llm:response":
             return await self._handle_llm_response(data, log)
 
-        # content_block:* — claimed but no-op for v1
+        # content_block:* — route to handler
+        return await self._handle_content_block(event, data, log)
+
+    async def _handle_content_block(
+        self, event: str, data: dict[str, Any], log: EventLogContext
+    ) -> HookResult:
+        # Only content_block:start carries tracking data; ignore all other sub-events
+        if event != "content_block:start":
+            return HookResult(action="continue")
+
+        session_id = data.get("session_id")
+        if not session_id:
+            log.error("received event without session_id")
+            return HookResult(action="continue")
+
+        cursors = self.services.get_cursors(session_id)
+        if not cursors.current_step_id:
+            # No active step — skip cleanly
+            return HookResult(action="continue")
+
+        cursors.step_content.block_count += 1
+
+        if (data.get("type") or "") == "thinking":
+            cursors.step_content.has_thinking = True
+
         return HookResult(action="continue")
 
     async def _handle_provider_request(
@@ -224,5 +248,14 @@ class StepHandler:
         properties["data_llm_response"] = json.dumps(data)
         await self.services.graph.upsert_node(step_id, properties)
         log.info("Enriched AssistantStep %s with response data", step_id)
+
+        # G-N3 flush: write non-default step_content values to the Step node
+        extra: dict[str, Any] = {}
+        if cursors.step_content.block_count > 0:
+            extra["content_block_count"] = cursors.step_content.block_count
+        if cursors.step_content.has_thinking:
+            extra["has_thinking"] = True
+        if extra:
+            await self.services.graph.upsert_node(step_id, extra)
 
         return HookResult(action="continue")

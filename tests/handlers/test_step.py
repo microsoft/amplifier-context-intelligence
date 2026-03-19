@@ -371,29 +371,167 @@ class TestLlmResponseHappyPath:
         assert result.action == "continue"
 
 
-# ── content_block:* no-op ─────────────────────────────────────────────────────
+# ── content_block:* tracking ─────────────────────────────────────────────────────────────────────────────
 
 
-class TestContentBlockNoOp:
-    async def test_content_block_returns_continue(
+class TestContentBlockTracking:
+    async def _seed_step(self, services: HookStateService) -> None:
+        await _seed_run(services)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+
+    async def test_block_count_increments_on_content_block_start(
         self, services: HookStateService
     ) -> None:
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "content_block:start",
+            {"session_id": "s1", "type": "text"},
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.step_content.block_count == 1
+
+    async def test_multiple_blocks_accumulate(self, services: HookStateService) -> None:
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        for _ in range(3):
+            await handler(
+                "content_block:start",
+                {"session_id": "s1", "type": "text"},
+            )
+        cursors = services.get_cursors("s1")
+        assert cursors.step_content.block_count == 3
+
+    async def test_thinking_type_sets_has_thinking(
+        self, services: HookStateService
+    ) -> None:
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "content_block:start",
+            {"session_id": "s1", "type": "thinking"},
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.step_content.has_thinking is True
+
+    async def test_text_type_does_not_set_has_thinking(
+        self, services: HookStateService
+    ) -> None:
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "content_block:start",
+            {"session_id": "s1", "type": "text"},
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.step_content.has_thinking is False
+
+    async def test_content_block_end_is_ignored(
+        self, services: HookStateService
+    ) -> None:
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "content_block:end",
+            {"session_id": "s1"},
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.step_content.block_count == 0
+
+    async def test_content_block_without_active_step_is_safe_noop(
+        self, services: HookStateService
+    ) -> None:
+        """content_block:start with no current_step_id should return continue safely."""
+        await _seed_session(services)
         handler = StepHandler(services)
         result = await handler(
             "content_block:start",
-            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+            {"session_id": "s1", "type": "text"},
         )
         assert result.action == "continue"
 
-    async def test_content_block_delta_returns_continue(
-        self, services: HookStateService
-    ) -> None:
+    async def test_returns_continue(self, services: HookStateService) -> None:
+        await self._seed_step(services)
         handler = StepHandler(services)
         result = await handler(
-            "content_block:delta",
-            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+            "content_block:start",
+            {"session_id": "s1", "type": "text"},
         )
         assert result.action == "continue"
+
+
+# ── content_block flush on llm:response ───────────────────────────────────────────────────────────────────
+
+
+class TestContentBlockFlushOnLlmResponse:
+    async def _seed_step_with_blocks(
+        self,
+        services: HookStateService,
+        *,
+        block_count: int = 1,
+        thinking: bool = False,
+    ) -> None:
+        await _seed_run(services)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+        for _ in range(block_count):
+            block_type = "thinking" if thinking else "text"
+            await handler(
+                "content_block:start",
+                {"session_id": "s1", "type": block_type},
+            )
+
+    async def test_content_block_count_written_to_step_node(
+        self, services: HookStateService
+    ) -> None:
+        await self._seed_step_with_blocks(services, block_count=2)
+        handler = StepHandler(services)
+        await handler(
+            "llm:response",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP, "usage": {}},
+        )
+        node = await services.graph.get_node(EXPECTED_STEP_NODE_ID)
+        assert node is not None
+        assert node["content_block_count"] == 2
+
+    async def test_has_thinking_written_to_step_node(
+        self, services: HookStateService
+    ) -> None:
+        await self._seed_step_with_blocks(services, block_count=1, thinking=True)
+        handler = StepHandler(services)
+        await handler(
+            "llm:response",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP, "usage": {}},
+        )
+        node = await services.graph.get_node(EXPECTED_STEP_NODE_ID)
+        assert node is not None
+        assert node["has_thinking"] is True
+
+    async def test_zero_blocks_no_extra_properties(
+        self, services: HookStateService
+    ) -> None:
+        """Zero blocks means no content_block_count or has_thinking written to node."""
+        await _seed_run(services)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+        await handler(
+            "llm:response",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP, "usage": {}},
+        )
+        node = await services.graph.get_node(EXPECTED_STEP_NODE_ID)
+        assert node is not None
+        assert "content_block_count" not in node
+        assert "has_thinking" not in node
 
 
 # ── RecipeStep label ───────────────────────────────────────────────────────────
