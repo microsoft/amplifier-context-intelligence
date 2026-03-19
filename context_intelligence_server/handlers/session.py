@@ -72,6 +72,11 @@ class SessionHandler:
             },
         )
 
+        cursors = self.services.get_cursors(session_id)
+        metadata = data.get("metadata") or {}
+        if metadata.get("recipe_name"):
+            cursors.is_recipe_session = True
+
         if parent_id:
             await self.services.ensure_session_node(parent_id, {})
             await self.services.graph.upsert_edge(
@@ -107,6 +112,11 @@ class SessionHandler:
                 "data": json.dumps(data),
             },
         )
+
+        cursors = self.services.get_cursors(session_id)
+        metadata = data.get("metadata") or {}
+        if metadata.get("recipe_name"):
+            cursors.is_recipe_session = True
 
         if parent:
             await self.services.ensure_session_node(parent, {})
