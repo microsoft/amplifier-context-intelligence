@@ -525,3 +525,103 @@ class TestLateParentDiscovery:
         edge = await services.graph.get_edge("child", "parent")
         assert edge is not None
         assert edge.get("type") == "SUBSESSION_OF"
+
+
+class TestRecipeSessionFlag:
+    """is_recipe_session cursor flag is set only when metadata.recipe_name is non-empty."""
+
+    async def test_start_with_recipe_name_sets_flag(
+        self, services: HookStateService
+    ) -> None:
+        """session:start with metadata.recipe_name sets is_recipe_session=True."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {"recipe_name": "my-recipe"},
+            },
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.is_recipe_session is True
+
+    async def test_start_without_metadata_leaves_flag_false(
+        self, services: HookStateService
+    ) -> None:
+        """session:start without metadata key leaves is_recipe_session=False."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.is_recipe_session is False
+
+    async def test_start_with_metadata_no_recipe_name_leaves_flag_false(
+        self, services: HookStateService
+    ) -> None:
+        """session:start with metadata but no recipe_name leaves is_recipe_session=False."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {"other_key": "value"},
+            },
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.is_recipe_session is False
+
+    async def test_start_with_empty_recipe_name_leaves_flag_false(
+        self, services: HookStateService
+    ) -> None:
+        """session:start with empty string recipe_name leaves is_recipe_session=False."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {"recipe_name": ""},
+            },
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.is_recipe_session is False
+
+    async def test_fork_with_recipe_name_sets_flag(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork with metadata.recipe_name sets is_recipe_session=True."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "f1",
+                "parent": "p1",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {"recipe_name": "my-recipe"},
+            },
+        )
+        cursors = services.get_cursors("f1")
+        assert cursors.is_recipe_session is True
+
+    async def test_fork_without_recipe_name_leaves_flag_false(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork without recipe_name leaves is_recipe_session=False."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "f1",
+                "parent": "p1",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        cursors = services.get_cursors("f1")
+        assert cursors.is_recipe_session is False

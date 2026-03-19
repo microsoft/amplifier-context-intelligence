@@ -1,6 +1,10 @@
 """SessionCursors, HookConfig, GraphState, and HookStateService primitives.
 
-- SessionCursors   — per-session cursor tracking (dataclass)
+- RunTokens        — per-run token accumulator sub-dataclass (reset at execution:start)
+- StepContent      — per-step content tracker sub-dataclass (reset at provider:request)
+- RecipeContext    — recipe metadata sub-dataclass (set at recipe:start)
+- SessionCursors   — per-session cursor tracking (dataclass); owns RunTokens,
+                     StepContent, and RecipeContext via atomic-replaceable fields
 - HookConfig       — event-exclusion configuration wrapper
 - GraphState       — in-memory property graph conforming to GraphStore protocol
 - HookStateService — server-side hook state service (no external dependencies)
@@ -14,15 +18,65 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
+# SessionCursors sub-dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class RunTokens:
+    """Per-run token accumulator.
+
+    Reset atomically at execution:start by replacing the instance wholesale
+    (e.g. ``cursors.run_tokens = RunTokens()``).  Flushed at
+    orchestrator:complete.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
+    reasoning_tokens: int = 0
+    models_used: set[str] = dataclasses.field(default_factory=set)
+
+
+@dataclasses.dataclass
+class StepContent:
+    """Per-step content tracker.
+
+    Reset atomically at provider:request by replacing the instance wholesale
+    (e.g. ``cursors.step_content = StepContent()``).  Flushed at
+    llm:response.
+    """
+
+    block_count: int = 0
+    has_thinking: bool = False
+
+
+@dataclasses.dataclass
+class RecipeContext:
+    """Recipe metadata.
+
+    Written once at recipe:start and held for the duration of the recipe
+    session.
+    """
+
+    name: str = ""
+    description: str = ""
+    total_steps: int = 0
+    status: str = ""
+
+
+# ---------------------------------------------------------------------------
 # SessionCursors
 # ---------------------------------------------------------------------------
 
 
 @dataclasses.dataclass
 class SessionCursors:
-    """Pointer-only state — no accumulators.
+    """Pointer-only state and lightweight accumulators.
 
-    All fields are reconstructable from ordered event replay.
+    Pointer fields are reconstructable from ordered event replay.
+    Sub-dataclass fields (run_tokens, step_content, recipe_context) support
+    atomic reset by wholesale replacement, e.g. ``sc.run_tokens = RunTokens()``.
     """
 
     current_run_id: str | None = None
@@ -30,6 +84,10 @@ class SessionCursors:
     prompt_preview: str = ""
     parallel_groups: dict[str, list[str]] = dataclasses.field(default_factory=dict)
     tool_call_map: dict[str, str] = dataclasses.field(default_factory=dict)
+    is_recipe_session: bool = False
+    run_tokens: RunTokens = dataclasses.field(default_factory=RunTokens)
+    step_content: StepContent = dataclasses.field(default_factory=StepContent)
+    recipe_context: RecipeContext = dataclasses.field(default_factory=RecipeContext)
 
 
 # ---------------------------------------------------------------------------

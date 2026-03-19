@@ -371,26 +371,479 @@ class TestLlmResponseHappyPath:
         assert result.action == "continue"
 
 
-# ── content_block:* no-op ─────────────────────────────────────────────────────
+# ── content_block:* tracking ─────────────────────────────────────────────────────────────────────────────
 
 
-class TestContentBlockNoOp:
-    async def test_content_block_returns_continue(
+class TestContentBlockTracking:
+    async def _seed_step(self, services: HookStateService) -> None:
+        await _seed_run(services)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+
+    async def test_block_count_increments_on_content_block_start(
         self, services: HookStateService
     ) -> None:
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "content_block:start",
+            {"session_id": "s1", "type": "text"},
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.step_content.block_count == 1
+
+    async def test_multiple_blocks_accumulate(self, services: HookStateService) -> None:
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        for _ in range(3):
+            await handler(
+                "content_block:start",
+                {"session_id": "s1", "type": "text"},
+            )
+        cursors = services.get_cursors("s1")
+        assert cursors.step_content.block_count == 3
+
+    async def test_thinking_type_sets_has_thinking(
+        self, services: HookStateService
+    ) -> None:
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "content_block:start",
+            {"session_id": "s1", "type": "thinking"},
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.step_content.has_thinking is True
+
+    async def test_text_type_does_not_set_has_thinking(
+        self, services: HookStateService
+    ) -> None:
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "content_block:start",
+            {"session_id": "s1", "type": "text"},
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.step_content.has_thinking is False
+
+    async def test_content_block_end_is_ignored(
+        self, services: HookStateService
+    ) -> None:
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "content_block:end",
+            {"session_id": "s1"},
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.step_content.block_count == 0
+
+    async def test_content_block_without_active_step_is_safe_noop(
+        self, services: HookStateService
+    ) -> None:
+        """content_block:start with no current_step_id should return continue safely."""
+        await _seed_session(services)
         handler = StepHandler(services)
         result = await handler(
             "content_block:start",
-            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+            {"session_id": "s1", "type": "text"},
         )
         assert result.action == "continue"
 
-    async def test_content_block_delta_returns_continue(
-        self, services: HookStateService
-    ) -> None:
+    async def test_returns_continue(self, services: HookStateService) -> None:
+        await self._seed_step(services)
         handler = StepHandler(services)
         result = await handler(
-            "content_block:delta",
-            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+            "content_block:start",
+            {"session_id": "s1", "type": "text"},
         )
         assert result.action == "continue"
+
+
+# ── content_block flush on llm:response ───────────────────────────────────────────────────────────────────
+
+
+class TestContentBlockFlushOnLlmResponse:
+    async def _seed_step_with_blocks(
+        self,
+        services: HookStateService,
+        *,
+        block_count: int = 1,
+        thinking: bool = False,
+    ) -> None:
+        await _seed_run(services)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+        for _ in range(block_count):
+            block_type = "thinking" if thinking else "text"
+            await handler(
+                "content_block:start",
+                {"session_id": "s1", "type": block_type},
+            )
+
+    async def test_content_block_count_written_to_step_node(
+        self, services: HookStateService
+    ) -> None:
+        await self._seed_step_with_blocks(services, block_count=2)
+        handler = StepHandler(services)
+        await handler(
+            "llm:response",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP, "usage": {}},
+        )
+        node = await services.graph.get_node(EXPECTED_STEP_NODE_ID)
+        assert node is not None
+        assert node["content_block_count"] == 2
+
+    async def test_has_thinking_written_to_step_node(
+        self, services: HookStateService
+    ) -> None:
+        await self._seed_step_with_blocks(services, block_count=1, thinking=True)
+        handler = StepHandler(services)
+        await handler(
+            "llm:response",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP, "usage": {}},
+        )
+        node = await services.graph.get_node(EXPECTED_STEP_NODE_ID)
+        assert node is not None
+        assert node["has_thinking"] is True
+
+    async def test_zero_blocks_no_extra_properties(
+        self, services: HookStateService
+    ) -> None:
+        """Zero blocks means no content_block_count or has_thinking written to node."""
+        await _seed_run(services)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+        await handler(
+            "llm:response",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP, "usage": {}},
+        )
+        node = await services.graph.get_node(EXPECTED_STEP_NODE_ID)
+        assert node is not None
+        assert "content_block_count" not in node
+        assert "has_thinking" not in node
+
+
+# ── RecipeStep label ───────────────────────────────────────────────────────────
+
+
+async def _seed_recipe_session(
+    services: HookStateService, session_id: str = "s1"
+) -> None:
+    """Create a Session node with recipe_name metadata via SessionHandler."""
+    handler = SessionHandler(services)
+    await handler(
+        "session:start",
+        {
+            "session_id": session_id,
+            "timestamp": SESSION_TIMESTAMP,
+            "metadata": {"recipe_name": "code-review"},
+        },
+    )
+
+
+async def _seed_recipe_run(services: HookStateService) -> str:
+    """Seed recipe session + prompt:submit + execution:start, return run node ID."""
+    await _seed_recipe_session(services)
+    run_handler = OrchestratorRunHandler(services)
+    await run_handler(
+        "prompt:submit",
+        {"session_id": "s1", "timestamp": PROMPT_TIMESTAMP, "prompt": "Hello"},
+    )
+    await run_handler(
+        "execution:start",
+        {"session_id": "s1", "timestamp": EXEC_TIMESTAMP},
+    )
+    return EXPECTED_RUN_NODE_ID
+
+
+class TestRecipeStepLabel:
+    async def test_recipe_session_has_recipe_step_label(
+        self, services: HookStateService
+    ) -> None:
+        """Recipe session step node has the RecipeStep label."""
+        await _seed_recipe_run(services)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+        node = await services.graph.get_node(EXPECTED_STEP_NODE_ID)
+        assert node is not None
+        assert "RecipeStep" in node["labels"]
+
+    async def test_recipe_session_has_all_three_labels(
+        self, services: HookStateService
+    ) -> None:
+        """Recipe session step node has exactly {Step, AssistantStep, RecipeStep}."""
+        await _seed_recipe_run(services)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+        node = await services.graph.get_node(EXPECTED_STEP_NODE_ID)
+        assert node is not None
+        assert set(node["labels"]) == {"Step", "AssistantStep", "RecipeStep"}
+
+    async def test_non_recipe_session_does_not_have_recipe_step_label(
+        self, services: HookStateService
+    ) -> None:
+        """Non-recipe session step node has only {Step, AssistantStep}."""
+        await _seed_run(services)  # non-recipe session (no recipe_name metadata)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+        node = await services.graph.get_node(EXPECTED_STEP_NODE_ID)
+        assert node is not None
+        assert set(node["labels"]) == {"Step", "AssistantStep"}
+
+    async def test_step_content_reset_on_provider_request(
+        self, services: HookStateService
+    ) -> None:
+        """step_content is atomically reset at provider:request (block_count=0, has_thinking=False)."""
+        await _seed_recipe_run(services)
+        # Dirty up the step_content to simulate prior step activity
+        cursors = services.get_cursors("s1")
+        cursors.step_content.block_count = 5
+        cursors.step_content.has_thinking = True
+
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.step_content.block_count == 0
+        assert cursors.step_content.has_thinking is False
+
+
+# ── llm:response token accumulation ────────────────────────────────────────────────────────
+
+
+class TestLlmResponseTokenAccumulation:
+    """G-N2: token counts accumulate into run_tokens at each llm:response event."""
+
+    async def _seed_step(self, services: HookStateService) -> None:
+        """Seed run + provider:request so current_step_id is set."""
+        await _seed_run(services)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+
+    async def test_input_tokens_accumulated(self, services: HookStateService) -> None:
+        """input_tokens from usage are accumulated into run_tokens.input_tokens."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": STEP_TIMESTAMP,
+                "usage": {"input_tokens": 120, "output_tokens": 30},
+            },
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens.input_tokens == 120
+
+    async def test_output_tokens_accumulated(self, services: HookStateService) -> None:
+        """output_tokens from usage are accumulated into run_tokens.output_tokens."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": STEP_TIMESTAMP,
+                "usage": {"input_tokens": 120, "output_tokens": 30},
+            },
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens.output_tokens == 30
+
+    async def test_cached_tokens_accumulated_from_cache_read_input_tokens(
+        self, services: HookStateService
+    ) -> None:
+        """cached_tokens accumulated via cache_read_input_tokens key in usage."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": STEP_TIMESTAMP,
+                "usage": {
+                    "input_tokens": 50,
+                    "output_tokens": 10,
+                    "cache_read_input_tokens": 80,
+                },
+            },
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens.cached_tokens == 80
+
+    async def test_reasoning_tokens_accumulated(
+        self, services: HookStateService
+    ) -> None:
+        """reasoning_tokens from usage are accumulated into run_tokens.reasoning_tokens."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": STEP_TIMESTAMP,
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "reasoning_tokens": 45,
+                },
+            },
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens.reasoning_tokens == 45
+
+    async def test_tokens_accumulate_additively_across_multiple_steps(
+        self, services: HookStateService
+    ) -> None:
+        """Two llm:response events sum token counts additively."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+
+        # First llm:response
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": STEP_TIMESTAMP,
+                "usage": {"input_tokens": 100, "output_tokens": 20},
+            },
+        )
+        # Second llm:response (same step id is fine -- tokens still add up)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": STEP_TIMESTAMP,
+                "usage": {"input_tokens": 50, "output_tokens": 10},
+            },
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens.input_tokens == 150
+        assert cursors.run_tokens.output_tokens == 30
+
+    async def test_missing_usage_dict_does_not_raise_and_leaves_tokens_at_zero(
+        self, services: HookStateService
+    ) -> None:
+        """Missing usage key does not raise and leaves all run_tokens counters at 0."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:response",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},  # no 'usage' key
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens.input_tokens == 0
+        assert cursors.run_tokens.output_tokens == 0
+        assert cursors.run_tokens.cached_tokens == 0
+        assert cursors.run_tokens.reasoning_tokens == 0
+
+    async def test_partial_usage_accumulates_present_tokens_only(
+        self, services: HookStateService
+    ) -> None:
+        """Usage dict with only some keys: present tokens accumulate, absent stay at 0."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": STEP_TIMESTAMP,
+                "usage": {"input_tokens": 200},  # only input_tokens present
+            },
+        )
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens.input_tokens == 200
+        assert cursors.run_tokens.output_tokens == 0
+        assert cursors.run_tokens.cached_tokens == 0
+        assert cursors.run_tokens.reasoning_tokens == 0
+
+
+# ── llm:request model accumulation ────────────────────────────────────────────
+
+
+class TestLlmRequestModelAccumulation:
+    async def _seed_step(self, services: HookStateService) -> None:
+        """Seed run + provider:request so current_step_id is set."""
+        await _seed_run(services)
+        handler = StepHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": STEP_TIMESTAMP},
+        )
+
+    async def test_model_added_to_models_used(self, services: HookStateService) -> None:
+        """Valid model string is added to run_tokens.models_used."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:request",
+            {"session_id": "s1", "model": "claude-3-5-sonnet-20241022"},
+        )
+        cursors = services.get_cursors("s1")
+        assert "claude-3-5-sonnet-20241022" in cursors.run_tokens.models_used
+
+    async def test_missing_model_key_does_not_add_empty_string(
+        self, services: HookStateService
+    ) -> None:
+        """Missing model key must not add empty string to models_used (set stays empty)."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:request",
+            {"session_id": "s1"},  # no 'model' key
+        )
+        cursors = services.get_cursors("s1")
+        assert len(cursors.run_tokens.models_used) == 0
+
+    async def test_explicit_none_model_does_not_add_to_set(
+        self, services: HookStateService
+    ) -> None:
+        """Explicit model=None must not add anything to models_used."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        await handler(
+            "llm:request",
+            {"session_id": "s1", "model": None},
+        )
+        cursors = services.get_cursors("s1")
+        assert len(cursors.run_tokens.models_used) == 0
+
+    async def test_duplicate_model_is_deduplicated(
+        self, services: HookStateService
+    ) -> None:
+        """Three identical llm:request events with same model result in set size 1."""
+        await self._seed_step(services)
+        handler = StepHandler(services)
+        for _ in range(3):
+            await handler(
+                "llm:request",
+                {"session_id": "s1", "model": "claude-3-5-sonnet-20241022"},
+            )
+        cursors = services.get_cursors("s1")
+        assert len(cursors.run_tokens.models_used) == 1
+        assert "claude-3-5-sonnet-20241022" in cursors.run_tokens.models_used

@@ -6,7 +6,7 @@ to graph state, covering:
 - TestWorkspaceSetCorrectly: workspace propagated to graph
 - TestHandlerErrorIsolation: bad timestamps don't crash pipeline
 - TestUnclaimedEventsFlowToDefault: session:resume via DefaultHandler
-- TestSystemEventsAreNoOp: context:compaction does not create Event nodes
+- TestSystemEventsCreateNodes: context:compaction and cancel events create Event nodes
 - TestSessionEndWorkerCleanup: session:end triggers worker removal and CompletedSession recording
 - TestStatusIncludesCompletedSessions: build_status_response includes completed sessions after drain
 """
@@ -588,20 +588,21 @@ class TestUnclaimedEventsFlowToDefault:
 
 
 # ===========================================================================
-# TestSystemEventsAreNoOp
+# TestSystemEventsCreateNodes
 # ===========================================================================
 
 
-class TestSystemEventsAreNoOp:
-    """SystemEventHandler claims system events but creates no graph nodes.
+class TestSystemEventsCreateNodes:
+    """SystemEventHandler claims system events and creates :Event:{DerivedLabel} nodes.
 
-    context:compaction (and cancel:requested, cancel:completed) are absorbed
-    by SystemEventHandler.  The only graph change permitted is the Session node
-    created by ensure_session_node before dispatch.
+    context:compaction, cancel:requested, and cancel:completed are owned by
+    SystemEventHandler which persists a dedicated event node for each.  These
+    tests verify the new contract: event nodes ARE created (as opposed to the
+    old no-op behaviour that existed before Task 8).
     """
 
-    async def test_context_compaction_does_not_create_event_node(self) -> None:
-        """context:compaction must not create an Event or ContextCompaction node."""
+    async def test_context_compaction_creates_event_node(self) -> None:
+        """context:compaction must create a ContextCompaction event node."""
         worker, services = _make_worker_and_services()
         handlers = setup_handlers(services)
 
@@ -612,14 +613,15 @@ class TestSystemEventsAreNoOp:
             handlers,
         )
 
-        # DefaultHandler would produce a node with this ID; it must NOT exist
         event_node_id = make_node_id(SESSION_ID, "context:compaction", T0)
         event_node = await services.graph.get_node(event_node_id)
-        assert event_node is None
+        assert event_node is not None
+        assert "Event" in event_node["labels"]
+        assert "ContextCompaction" in event_node["labels"]
 
-    async def test_context_compaction_only_ensure_session_node_stub(self) -> None:
-        """After context:compaction only the Session node (from ensure_session_node)
-        must be in the graph — no other nodes."""
+    async def test_context_compaction_creates_session_and_event_nodes(self) -> None:
+        """After context:compaction the graph must contain the Session stub and
+        the ContextCompaction event node — exactly two nodes."""
         worker, services = _make_worker_and_services()
         handlers = setup_handlers(services)
 
@@ -634,12 +636,14 @@ class TestSystemEventsAreNoOp:
         session_node = await services.graph.get_node(SESSION_ID)
         assert session_node is not None
 
-        # The graph must contain exactly one node: the Session node
-        assert len(services.graph._nodes) == 1
+        # Event node must also exist — two nodes in total
+        event_node_id = make_node_id(SESSION_ID, "context:compaction", T0)
+        assert len(services.graph._nodes) == 2
         assert SESSION_ID in services.graph._nodes
+        assert event_node_id in services.graph._nodes
 
-    async def test_cancel_requested_does_not_create_event_node(self) -> None:
-        """cancel:requested must not create any Event node."""
+    async def test_cancel_requested_creates_event_node(self) -> None:
+        """cancel:requested must create a CancelRequested event node."""
         worker, services = _make_worker_and_services()
         handlers = setup_handlers(services)
 
@@ -652,7 +656,9 @@ class TestSystemEventsAreNoOp:
 
         event_node_id = make_node_id(SESSION_ID, "cancel:requested", T0)
         event_node = await services.graph.get_node(event_node_id)
-        assert event_node is None
+        assert event_node is not None
+        assert "Event" in event_node["labels"]
+        assert "CancelRequested" in event_node["labels"]
 
 
 # ===========================================================================
