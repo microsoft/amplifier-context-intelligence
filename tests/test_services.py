@@ -8,7 +8,10 @@ from context_intelligence_server.services import (
     GraphState,
     HookConfig,
     HookStateService,
+    RecipeContext,
+    RunTokens,
     SessionCursors,
+    StepContent,
 )
 
 
@@ -60,7 +63,7 @@ def test_session_cursors_defaults():
 
 
 def test_session_cursors_is_dataclass():
-    """SessionCursors must be a proper dataclass with exactly the 5 pointer fields."""
+    """SessionCursors must be a proper dataclass with the pointer fields and sub-dataclass fields."""
     assert dataclasses.is_dataclass(SessionCursors)
     # Verify all expected fields are present via dataclasses.fields
     field_names = {f.name for f in dataclasses.fields(SessionCursors)}
@@ -79,6 +82,103 @@ def test_session_cursors_no_counter_fields():
     sc = SessionCursors()
     assert not hasattr(sc, "run_counter")
     assert not hasattr(sc, "step_counter")
+
+
+# ---------------------------------------------------------------------------
+# TestSubDataclassDefaults tests
+# ---------------------------------------------------------------------------
+
+
+class TestSubDataclassDefaults:
+    """Tests for RunTokens, StepContent, RecipeContext, and expanded SessionCursors."""
+
+    def test_run_tokens_is_dataclass(self):
+        """RunTokens must be a proper dataclass."""
+        assert dataclasses.is_dataclass(RunTokens)
+
+    def test_run_tokens_defaults(self):
+        """RunTokens initialises with correct default values."""
+        rt = RunTokens()
+        assert rt.input_tokens == 0
+        assert rt.output_tokens == 0
+        assert rt.cached_tokens == 0
+        assert rt.reasoning_tokens == 0
+        assert rt.models_used == set()
+
+    def test_run_tokens_models_used_independent_instances(self):
+        """Each RunTokens() instance has its own models_used set (no shared mutable default)."""
+        rt1 = RunTokens()
+        rt2 = RunTokens()
+        rt1.models_used.add("model-a")
+        assert rt2.models_used == set()
+
+    def test_step_content_is_dataclass(self):
+        """StepContent must be a proper dataclass."""
+        assert dataclasses.is_dataclass(StepContent)
+
+    def test_step_content_defaults(self):
+        """StepContent initialises with correct default values."""
+        sc = StepContent()
+        assert sc.block_count == 0
+        assert sc.has_thinking is False
+
+    def test_recipe_context_is_dataclass(self):
+        """RecipeContext must be a proper dataclass."""
+        assert dataclasses.is_dataclass(RecipeContext)
+
+    def test_recipe_context_defaults(self):
+        """RecipeContext initialises with correct default values."""
+        rc = RecipeContext()
+        assert rc.name == ""
+        assert rc.description == ""
+        assert rc.total_steps == 0
+        assert rc.status == ""
+
+    def test_session_cursors_has_is_recipe_session(self):
+        """SessionCursors.is_recipe_session defaults to False."""
+        sc = SessionCursors()
+        assert sc.is_recipe_session is False
+
+    def test_session_cursors_has_run_tokens(self):
+        """SessionCursors.run_tokens defaults to a RunTokens instance."""
+        sc = SessionCursors()
+        assert isinstance(sc.run_tokens, RunTokens)
+
+    def test_session_cursors_has_step_content(self):
+        """SessionCursors.step_content defaults to a StepContent instance."""
+        sc = SessionCursors()
+        assert isinstance(sc.step_content, StepContent)
+
+    def test_session_cursors_has_recipe_context(self):
+        """SessionCursors.recipe_context defaults to a RecipeContext instance."""
+        sc = SessionCursors()
+        assert isinstance(sc.recipe_context, RecipeContext)
+
+    def test_session_cursors_sub_fields_independent_instances(self):
+        """Each SessionCursors() instance has its own sub-dataclass instances."""
+        sc1 = SessionCursors()
+        sc2 = SessionCursors()
+        assert sc1.run_tokens is not sc2.run_tokens
+        assert sc1.step_content is not sc2.step_content
+        assert sc1.recipe_context is not sc2.recipe_context
+
+    def test_run_tokens_atomic_reset(self):
+        """run_tokens supports atomic reset by wholesale replacement."""
+        sc = SessionCursors()
+        sc.run_tokens.input_tokens = 100
+        sc.run_tokens.models_used.add("gpt-4")
+        sc.run_tokens = RunTokens()
+        assert sc.run_tokens.input_tokens == 0
+        assert sc.run_tokens.models_used == set()
+
+    def test_step_content_atomic_reset(self):
+        """step_content supports atomic reset by wholesale replacement."""
+        sc = SessionCursors()
+        sc.step_content.block_count = 5
+        sc.step_content.has_thinking = True
+        sc.step_content = StepContent()
+        assert sc.step_content.block_count == 0
+        assert sc.step_content.has_thinking is False
 
 
 # ---------------------------------------------------------------------------
