@@ -354,9 +354,7 @@ class TestCancelRequestedHappyPath:
         assert node is not None
         assert node["is_immediate"] is False
 
-    async def test_is_immediate_true_when_set(
-        self, services: HookStateService
-    ) -> None:
+    async def test_is_immediate_true_when_set(self, services: HookStateService) -> None:
         """is_immediate is written as True when set in payload."""
         await _seed_session(services)
         handler = SystemEventHandler(services)
@@ -531,6 +529,22 @@ class TestCancelCompletedHappyPath:
         )
         node_id = make_node_id("s1", "cancel:completed", TIMESTAMP_EVENT)
         edge = await services.graph.get_edge(run_id, node_id)
+        assert edge is not None
+        assert edge["type"] == "HAS_EVENT"
+
+    async def test_has_event_edge_fallback_to_session_when_no_run(
+        self, services: HookStateService
+    ) -> None:
+        """HAS_EVENT edge scopes to session_id when no run is active."""
+        await _seed_session(services)
+        # No run seeded — current_run_id stays None
+        handler = SystemEventHandler(services)
+        await handler(
+            "cancel:completed",
+            {"session_id": "s1", "timestamp": TIMESTAMP_EVENT},
+        )
+        node_id = make_node_id("s1", "cancel:completed", TIMESTAMP_EVENT)
+        edge = await services.graph.get_edge("s1", node_id)
         assert edge is not None
         assert edge["type"] == "HAS_EVENT"
 
