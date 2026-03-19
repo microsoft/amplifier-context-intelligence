@@ -15,7 +15,8 @@ from context_intelligence_server.handlers.orchestrator_run import (
     _STATUS_MAP,
 )
 from context_intelligence_server.handlers.session import SessionHandler
-from context_intelligence_server.services import HookStateService
+from context_intelligence_server.handlers.step import StepHandler
+from context_intelligence_server.services import HookStateService, RunTokens
 from context_intelligence_server.utils import make_node_id
 
 
@@ -685,3 +686,281 @@ class TestOrchestratorCompleteDataProperty:
         assert flush_call_count == 1, (
             "flush() must be called exactly once on orchestrator:complete"
         )
+
+
+# ── run_tokens reset / flush helpers ─────────────────────────────────────────
+
+SESSION_TS = "2026-03-06T00:00:00Z"
+PROMPT_TS = "2026-03-06T01:00:00Z"
+EXEC_TS = "2026-03-06T02:00:00Z"
+
+
+async def _seed_run_with_steps(
+    services: HookStateService,
+    *,
+    session_id: str = "s1",
+    n_steps: int = 1,
+    input_tokens_per_step: int = 100,
+    output_tokens_per_step: int = 50,
+    model_per_step: str = "claude-3-5-sonnet",
+) -> str:
+    """Fire session:start → prompt:submit → execution:start → (provider:request →
+    llm:request → llm:response) × n_steps.
+
+    Returns the OrchestratorRun node ID.
+    """
+    session_handler = SessionHandler(services)
+    await session_handler(
+        "session:start",
+        {"session_id": session_id, "timestamp": SESSION_TS},
+    )
+
+    run_handler = OrchestratorRunHandler(services)
+    await run_handler(
+        "prompt:submit",
+        {"session_id": session_id, "timestamp": PROMPT_TS, "prompt": "Hello"},
+    )
+    await run_handler(
+        "execution:start",
+        {"session_id": session_id, "timestamp": EXEC_TS},
+    )
+
+    step_handler = StepHandler(services)
+    for i in range(n_steps):
+        step_ts = f"2026-03-06T03:{i:02d}:00Z"
+        response_ts = f"2026-03-06T03:{i:02d}:30Z"
+        await step_handler(
+            "provider:request",
+            {"session_id": session_id, "timestamp": step_ts, "provider": "anthropic"},
+        )
+        await step_handler(
+            "llm:request",
+            {
+                "session_id": session_id,
+                "timestamp": step_ts,
+                "model": model_per_step,
+            },
+        )
+        await step_handler(
+            "llm:response",
+            {
+                "session_id": session_id,
+                "timestamp": response_ts,
+                "usage": {
+                    "input_tokens": input_tokens_per_step,
+                    "output_tokens": output_tokens_per_step,
+                },
+            },
+        )
+
+    return make_node_id(session_id, "execution:start", EXEC_TS)
+
+
+# ── TestRunTokensResetAtExecutionStart ────────────────────────────────────────
+
+
+class TestRunTokensResetAtExecutionStart:
+    async def test_stale_tokens_cleared_on_execution_start(
+        self, services: HookStateService
+    ) -> None:
+        """Stale token data from a previous run is wiped at execution:start."""
+        await _seed_run_with_steps(services, input_tokens_per_step=200)
+
+        # After the first run we have accumulated tokens in run_tokens
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens.input_tokens == 200  # sanity: tokens are there
+
+        # Fire a second execution:start (simulate new run prompt cycle)
+        run_handler = OrchestratorRunHandler(services)
+        await run_handler(
+            "prompt:submit",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-03-06T05:00:00Z",
+                "prompt": "Again",
+            },
+        )
+        await run_handler(
+            "execution:start",
+            {"session_id": "s1", "timestamp": "2026-03-06T06:00:00Z"},
+        )
+
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens.input_tokens == 0, (
+            "run_tokens.input_tokens must be reset to 0 on execution:start"
+        )
+        assert cursors.run_tokens.output_tokens == 0
+        assert cursors.run_tokens.models_used == set()
+
+    async def test_run_tokens_is_fresh_instance(
+        self, services: HookStateService
+    ) -> None:
+        """execution:start replaces run_tokens with a brand-new RunTokens() object."""
+        await _seed_run_with_steps(services)
+
+        cursors = services.get_cursors("s1")
+        old_run_tokens = cursors.run_tokens  # capture reference
+
+        run_handler = OrchestratorRunHandler(services)
+        await run_handler(
+            "prompt:submit",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-03-06T05:00:00Z",
+                "prompt": "Again",
+            },
+        )
+        await run_handler(
+            "execution:start",
+            {"session_id": "s1", "timestamp": "2026-03-06T06:00:00Z"},
+        )
+
+        cursors = services.get_cursors("s1")
+        assert cursors.run_tokens is not old_run_tokens, (
+            "run_tokens must be a new instance after execution:start (atomic replace)"
+        )
+        assert isinstance(cursors.run_tokens, RunTokens)
+
+
+# ── TestTokenFlushAtOrchestratorComplete ─────────────────────────────────────
+
+
+class TestTokenFlushAtOrchestratorComplete:
+    async def test_total_input_tokens_written(self, services: HookStateService) -> None:
+        """total_input_tokens is written to the OrchestratorRun node."""
+        run_id = await _seed_run_with_steps(services, input_tokens_per_step=123)
+        handler = OrchestratorRunHandler(services)
+        await handler(
+            "orchestrator:complete",
+            {"session_id": "s1", "timestamp": COMPLETE_TIMESTAMP, "status": "success"},
+        )
+        node = await services.graph.get_node(run_id)
+        assert node is not None
+        assert node["total_input_tokens"] == 123
+
+    async def test_total_output_tokens_written(
+        self, services: HookStateService
+    ) -> None:
+        """total_output_tokens is written to the OrchestratorRun node."""
+        run_id = await _seed_run_with_steps(services, output_tokens_per_step=77)
+        handler = OrchestratorRunHandler(services)
+        await handler(
+            "orchestrator:complete",
+            {"session_id": "s1", "timestamp": COMPLETE_TIMESTAMP, "status": "success"},
+        )
+        node = await services.graph.get_node(run_id)
+        assert node is not None
+        assert node["total_output_tokens"] == 77
+
+    async def test_multi_step_sums_tokens(self, services: HookStateService) -> None:
+        """Token totals are the sum over all steps in the run."""
+        run_id = await _seed_run_with_steps(
+            services,
+            n_steps=3,
+            input_tokens_per_step=100,
+            output_tokens_per_step=50,
+        )
+        handler = OrchestratorRunHandler(services)
+        await handler(
+            "orchestrator:complete",
+            {"session_id": "s1", "timestamp": COMPLETE_TIMESTAMP, "status": "success"},
+        )
+        node = await services.graph.get_node(run_id)
+        assert node is not None
+        assert node["total_input_tokens"] == 300  # 3 × 100
+        assert node["total_output_tokens"] == 150  # 3 × 50
+
+    async def test_models_used_written_as_sorted_list(
+        self, services: HookStateService
+    ) -> None:
+        """models_used is serialized as a sorted list (set → sorted list for Neo4j)."""
+        # Use two different models across two steps
+        session_id = "s1"
+        session_handler = SessionHandler(services)
+        await session_handler(
+            "session:start", {"session_id": session_id, "timestamp": SESSION_TS}
+        )
+        run_handler = OrchestratorRunHandler(services)
+        await run_handler(
+            "prompt:submit",
+            {"session_id": session_id, "timestamp": PROMPT_TS, "prompt": "Hi"},
+        )
+        await run_handler(
+            "execution:start",
+            {"session_id": session_id, "timestamp": EXEC_TS},
+        )
+        run_id = make_node_id(session_id, "execution:start", EXEC_TS)
+
+        step_handler = StepHandler(services)
+        for model in ["claude-opus-4", "claude-sonnet-4"]:
+            step_ts = "2026-03-06T03:00:00Z"
+            await step_handler(
+                "provider:request",
+                {
+                    "session_id": session_id,
+                    "timestamp": step_ts,
+                    "provider": "anthropic",
+                },
+            )
+            await step_handler(
+                "llm:request",
+                {"session_id": session_id, "timestamp": step_ts, "model": model},
+            )
+            await step_handler(
+                "llm:response",
+                {
+                    "session_id": session_id,
+                    "timestamp": step_ts,
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            )
+
+        await run_handler(
+            "orchestrator:complete",
+            {
+                "session_id": session_id,
+                "timestamp": COMPLETE_TIMESTAMP,
+                "status": "success",
+            },
+        )
+        node = await services.graph.get_node(run_id)
+        assert node is not None
+        models = node["models_used"]
+        assert isinstance(models, list), "models_used must be a list, not a set"
+        assert models == sorted(models), "models_used must be sorted"
+        assert set(models) == {"claude-opus-4", "claude-sonnet-4"}
+
+    async def test_zero_tokens_still_written(self, services: HookStateService) -> None:
+        """Zero-token runs still have the token fields present (value 0, empty list)."""
+        # Seed a run with NO steps (no llm:response events)
+        session_handler = SessionHandler(services)
+        await session_handler(
+            "session:start", {"session_id": "s1", "timestamp": SESSION_TS}
+        )
+        run_handler = OrchestratorRunHandler(services)
+        await run_handler(
+            "prompt:submit",
+            {"session_id": "s1", "timestamp": PROMPT_TS, "prompt": "Hi"},
+        )
+        await run_handler(
+            "execution:start",
+            {"session_id": "s1", "timestamp": EXEC_TS},
+        )
+        run_id = make_node_id("s1", "execution:start", EXEC_TS)
+
+        await run_handler(
+            "orchestrator:complete",
+            {"session_id": "s1", "timestamp": COMPLETE_TIMESTAMP, "status": "success"},
+        )
+        node = await services.graph.get_node(run_id)
+        assert node is not None
+        assert "total_input_tokens" in node
+        assert "total_output_tokens" in node
+        assert "cached_tokens" in node
+        assert "reasoning_tokens" in node
+        assert "models_used" in node
+        assert node["total_input_tokens"] == 0
+        assert node["total_output_tokens"] == 0
+        assert node["cached_tokens"] == 0
+        assert node["reasoning_tokens"] == 0
+        assert node["models_used"] == []

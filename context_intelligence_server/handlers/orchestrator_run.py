@@ -8,7 +8,7 @@ from typing import Any
 
 from context_intelligence_server.ownership import check_ownership
 from context_intelligence_server.protocol import HookResult
-from context_intelligence_server.services import HookStateService
+from context_intelligence_server.services import HookStateService, RunTokens
 from context_intelligence_server.utils import (
     EventLogContext,
     HandlerLogger,
@@ -158,6 +158,8 @@ class OrchestratorRunHandler:
 
         # Update cursor state
         cursors.current_run_id = run_id
+        # Atomically reset run-level token accumulator for this new run
+        cursors.run_tokens = RunTokens()
 
         log.info("Created OrchestratorRun node %s", run_id)
 
@@ -233,6 +235,19 @@ class OrchestratorRunHandler:
             properties["turn_count"] = turn_count
 
         await self.services.graph.upsert_node(run_id, properties)
+
+        # Flush run-level token totals accumulated across all steps in this run
+        run_tokens = cursors.run_tokens
+        await self.services.graph.upsert_node(
+            run_id,
+            {
+                "total_input_tokens": run_tokens.input_tokens,
+                "total_output_tokens": run_tokens.output_tokens,
+                "cached_tokens": run_tokens.cached_tokens,
+                "reasoning_tokens": run_tokens.reasoning_tokens,
+                "models_used": sorted(run_tokens.models_used),
+            },
+        )
 
         # Flush is critical: orchestrator:complete is the authoritative signal that a run
         # finished; without it, the status update sits in the write buffer and may never
