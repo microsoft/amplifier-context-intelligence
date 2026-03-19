@@ -100,6 +100,15 @@ class RecipeHandler:
             node_id, derived, properties, session_id, timestamp, data, log
         )
 
+        # Cache recipe metadata for loop event enrichment
+        if event == "recipe:start":
+            cursors = self.services.get_cursors(session_id)
+            ctx = cursors.recipe_context
+            ctx.name = data.get("name") or data.get("recipe_name") or ""
+            ctx.description = data.get("description") or ""
+            ctx.total_steps = int(data.get("total_steps") or 0)
+            ctx.status = data.get("status") or ""
+
     async def _handle_loop_event(
         self,
         event: str,
@@ -127,6 +136,18 @@ class RecipeHandler:
         elif event == "recipe:loop_complete":
             properties["iterations_completed"] = data.get("iterations_completed", 0)
             properties["results_count"] = data.get("results_count", 0)
+
+        # Enrich with cached recipe context from recipe:start (if available)
+        cursors = self.services.get_cursors(session_id)
+        ctx = cursors.recipe_context
+        if ctx.name:
+            properties["recipe_name"] = ctx.name
+        if ctx.description:
+            properties["description"] = ctx.description
+        if ctx.total_steps:
+            properties["total_steps"] = ctx.total_steps
+        if ctx.status:
+            properties["status"] = ctx.status
 
         await self._persist_event(
             node_id, derived, properties, session_id, timestamp, data, log

@@ -500,6 +500,142 @@ class TestRecipeHandlerDataProperty:
         }
 
 
+class TestLoopEventEnrichmentFromRecipeStart:
+    """Loop events must carry recipe context set by a preceding recipe:start."""
+
+    async def test_loop_iteration_carries_recipe_name(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_iteration node must include recipe_name from recipe:start."""
+        await _seed_session(services)
+        handler = RecipeHandler(services)
+        await handler("recipe:start", _lifecycle_data(recipe_name="my-recipe"))
+        await handler("recipe:loop_iteration", _loop_iteration_data())
+        node_id = make_node_id(SESSION_ID, "recipe:loop_iteration", TIMESTAMP)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert node["recipe_name"] == "my-recipe"
+
+    async def test_loop_iteration_carries_description(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_iteration node must include description from recipe:start."""
+        await _seed_session(services)
+        handler = RecipeHandler(services)
+        await handler(
+            "recipe:start", _lifecycle_data(description="Loop-driven review workflow")
+        )
+        await handler("recipe:loop_iteration", _loop_iteration_data())
+        node_id = make_node_id(SESSION_ID, "recipe:loop_iteration", TIMESTAMP)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert node["description"] == "Loop-driven review workflow"
+
+    async def test_loop_iteration_carries_total_steps(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_iteration node must include total_steps from recipe:start."""
+        await _seed_session(services)
+        handler = RecipeHandler(services)
+        await handler("recipe:start", _lifecycle_data(total_steps=7))
+        await handler("recipe:loop_iteration", _loop_iteration_data())
+        node_id = make_node_id(SESSION_ID, "recipe:loop_iteration", TIMESTAMP)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert node["total_steps"] == 7
+
+    async def test_loop_iteration_carries_status(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_iteration node must include status from recipe:start."""
+        await _seed_session(services)
+        handler = RecipeHandler(services)
+        await handler("recipe:start", _lifecycle_data(status="running"))
+        await handler("recipe:loop_iteration", _loop_iteration_data())
+        node_id = make_node_id(SESSION_ID, "recipe:loop_iteration", TIMESTAMP)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert node["status"] == "running"
+
+    async def test_loop_complete_carries_recipe_name(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_complete node must include recipe_name from recipe:start."""
+        await _seed_session(services)
+        handler = RecipeHandler(services)
+        await handler("recipe:start", _lifecycle_data(recipe_name="deploy-pipeline"))
+        await handler("recipe:loop_complete", _loop_complete_data())
+        node_id = make_node_id(SESSION_ID, "recipe:loop_complete", TIMESTAMP)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert node["recipe_name"] == "deploy-pipeline"
+
+    async def test_loop_complete_carries_total_steps(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_complete node must include total_steps from recipe:start."""
+        await _seed_session(services)
+        handler = RecipeHandler(services)
+        await handler("recipe:start", _lifecycle_data(total_steps=5))
+        await handler("recipe:loop_complete", _loop_complete_data())
+        node_id = make_node_id(SESSION_ID, "recipe:loop_complete", TIMESTAMP)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert node["total_steps"] == 5
+
+    async def test_loop_event_without_recipe_start_has_no_recipe_fields(
+        self, services: HookStateService
+    ) -> None:
+        """Loop events without a preceding recipe:start must not add extra fields."""
+        await _seed_session(services)
+        handler = RecipeHandler(services)
+        # Fire loop event WITHOUT a recipe:start
+        await handler("recipe:loop_iteration", _loop_iteration_data())
+        node_id = make_node_id(SESSION_ID, "recipe:loop_iteration", TIMESTAMP)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert "recipe_name" not in node
+        assert "description" not in node
+        assert "total_steps" not in node
+        assert "status" not in node
+
+    async def test_recipe_start_caches_name_from_name_key(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:start must cache name from the 'name' key in the payload."""
+        await _seed_session(services)
+        handler = RecipeHandler(services)
+        await handler(
+            "recipe:start",
+            {
+                "session_id": SESSION_ID,
+                "timestamp": TIMESTAMP,
+                "name": "explicit-name",
+            },
+        )
+        cursors = services.get_cursors(SESSION_ID)
+        assert cursors.recipe_context.name == "explicit-name"
+
+    async def test_recipe_start_caches_total_steps_as_int(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:start must coerce total_steps to int even if the payload sends a string."""
+        await _seed_session(services)
+        handler = RecipeHandler(services)
+        await handler(
+            "recipe:start",
+            {
+                "session_id": SESSION_ID,
+                "timestamp": TIMESTAMP,
+                "name": "str-steps-recipe",
+                "total_steps": "12",  # string value — must be coerced to int
+            },
+        )
+        cursors = services.get_cursors(SESSION_ID)
+        assert cursors.recipe_context.total_steps == 12
+        assert isinstance(cursors.recipe_context.total_steps, int)
+
+
 class TestRecipeEdgeType:
     """RecipeHandler._persist_event must attach type='HAS_EVENT' on session→node edges."""
 
