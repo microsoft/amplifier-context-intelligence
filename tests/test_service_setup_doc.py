@@ -13,14 +13,14 @@ def get_doc_content() -> str:
 
 
 def test_option_a_server_init_is_first_config_subsection():
-    """Change 1: Option A with context-intelligence-server-init appears before Option B
+    """Change 1: Option A with context-intelligence-server init appears before Option B
     and before the manual config content in the Configuration section."""
     content = get_doc_content()
 
     # Option A heading must be present
     assert "### Option A" in content, "Option A heading not found"
-    assert "context-intelligence-server-init" in content, (
-        "server-init command not found"
+    assert "context-intelligence-server init" in content, (
+        "server init subcommand not found"
     )
 
     # Option B heading must be present
@@ -50,7 +50,7 @@ def test_option_a_heading_text():
     """Option A heading matches exact spec text."""
     content = get_doc_content()
     assert (
-        "### Option A \u2014 Generate config with `context-intelligence-server-init` (recommended)"
+        "### Option A \u2014 Generate config with `context-intelligence-server init` (recommended)"
         in content
     ), "Option A heading does not match exact spec text"
 
@@ -84,8 +84,8 @@ def test_server_settings_table_has_api_key_row():
     assert "Authorization: Bearer" in server_section, (
         "Authorization: Bearer not found in api_key row"
     )
-    assert "context-intelligence-server-init" in server_section, (
-        "context-intelligence-server-init not referenced in api_key row"
+    assert "context-intelligence-server init" in server_section, (
+        "context-intelligence-server init not referenced in api_key row"
     )
 
 

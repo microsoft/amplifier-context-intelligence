@@ -213,6 +213,24 @@ async def post_cypher(body: CypherRequest, request: Request) -> Response:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+def main() -> None:
+    """CLI entrypoint.
+
+    context-intelligence-server           → start the server (gunicorn)
+    context-intelligence-server init ...  → run first-run configuration
+    """
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "init":
+        # Strip "init" from argv so init_command's argparse sees only its own flags
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        from context_intelligence_server.init_command import main as _init_main
+
+        _init_main()
+    else:
+        run()
+
+
 def run() -> None:
     """Start the server using gunicorn + uvicorn worker for graceful SIGTERM shutdown."""
     from gunicorn.app.base import BaseApplication

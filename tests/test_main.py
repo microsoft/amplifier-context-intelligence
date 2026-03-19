@@ -859,6 +859,116 @@ class TestAuthMiddleware:
         assert response.status_code == 202
 
 
+# ---------------------------------------------------------------------------
+# main() dispatch tests
+# ---------------------------------------------------------------------------
+
+
+class TestMainDispatch:
+    """Tests for the CLI entrypoint main() dispatch function."""
+
+    def test_main_with_init_subcommand_calls_init_main(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """main() calls init_command.main() when first arg is 'init', not run()."""
+        from unittest.mock import patch as _patch
+
+        import context_intelligence_server.main as _main_mod
+
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "context-intelligence-server",
+                "init",
+                "--config-path",
+                "/tmp/test.yaml",
+                "--neo4j-password",
+                "pw",
+            ],
+        )
+
+        with (
+            _patch.object(_main_mod, "run") as mock_run,
+            _patch("context_intelligence_server.init_command.main") as mock_init_main,
+        ):
+            _main_mod.main()
+
+        mock_init_main.assert_called_once()
+        mock_run.assert_not_called()
+
+    def test_main_with_no_args_calls_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """main() calls run() when no subcommand is given."""
+        from unittest.mock import patch as _patch
+
+        import context_intelligence_server.main as _main_mod
+
+        monkeypatch.setattr("sys.argv", ["context-intelligence-server"])
+
+        with (
+            _patch.object(_main_mod, "run") as mock_run,
+            _patch("context_intelligence_server.init_command.main") as mock_init_main,
+        ):
+            _main_mod.main()
+
+        mock_run.assert_called_once()
+        mock_init_main.assert_not_called()
+
+    def test_main_with_non_init_flag_calls_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """main() calls run() when first arg is not 'init' (e.g. --workers 2)."""
+        from unittest.mock import patch as _patch
+
+        import context_intelligence_server.main as _main_mod
+
+        monkeypatch.setattr(
+            "sys.argv", ["context-intelligence-server", "--workers", "2"]
+        )
+
+        with (
+            _patch.object(_main_mod, "run") as mock_run,
+            _patch("context_intelligence_server.init_command.main") as mock_init_main,
+        ):
+            _main_mod.main()
+
+        mock_run.assert_called_once()
+        mock_init_main.assert_not_called()
+
+    def test_main_init_strips_init_from_argv(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """main() removes 'init' from sys.argv before delegating to init_command.main()."""
+        import sys
+        from unittest.mock import patch as _patch
+
+        import context_intelligence_server.main as _main_mod
+
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "context-intelligence-server",
+                "init",
+                "--neo4j-password",
+                "secret",
+            ],
+        )
+        captured_argv: list[str] = []
+
+        def capture_init() -> None:
+            captured_argv.extend(sys.argv)
+
+        with (
+            _patch(
+                "context_intelligence_server.init_command.main",
+                side_effect=capture_init,
+            ),
+        ):
+            _main_mod.main()
+
+        assert "init" not in captured_argv
+        assert "--neo4j-password" in captured_argv
+
+
 async def test_lifespan_creates_and_closes_driver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -899,7 +1009,9 @@ async def test_status_includes_neo4j_connected_true(
     """/status includes neo4j_connected: true when driver.verify_connectivity() succeeds."""
     mock_driver = AsyncMock()
     mock_driver.verify_connectivity = AsyncMock(return_value=None)
-    monkeypatch.setattr(main_module.app.state, "neo4j_driver", mock_driver, raising=False)
+    monkeypatch.setattr(
+        main_module.app.state, "neo4j_driver", mock_driver, raising=False
+    )
 
     response = await client.get("/status")
     assert response.status_code == 200
@@ -913,8 +1025,12 @@ async def test_status_includes_neo4j_connected_false_on_error(
 ) -> None:
     """/status includes neo4j_connected: false when driver.verify_connectivity() raises."""
     mock_driver = AsyncMock()
-    mock_driver.verify_connectivity = AsyncMock(side_effect=Exception("connection refused"))
-    monkeypatch.setattr(main_module.app.state, "neo4j_driver", mock_driver, raising=False)
+    mock_driver.verify_connectivity = AsyncMock(
+        side_effect=Exception("connection refused")
+    )
+    monkeypatch.setattr(
+        main_module.app.state, "neo4j_driver", mock_driver, raising=False
+    )
 
     response = await client.get("/status")
     assert response.status_code == 200

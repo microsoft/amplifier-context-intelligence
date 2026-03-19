@@ -78,12 +78,11 @@ echo "Neo4j ready."
 uv tool install git+https://github.com/colombod/amplifier-context-intelligence
 ```
 
-Two binaries are placed at `~/.local/bin`:
+One binary is placed at `~/.local/bin`:
 
 | Binary | Purpose |
 |--------|---------|
-| `context-intelligence-server` | Runs the FastAPI server |
-| `context-intelligence-server-init` | One-time first-run configuration |
+| `context-intelligence-server` | Runs the FastAPI server; also accepts `init` subcommand for first-run configuration |
 
 **Upgrade later:**
 
@@ -95,9 +94,9 @@ uv tool upgrade context-intelligence-server
 
 ## 4. Configuration
 
-### Option A — Generate config with `context-intelligence-server-init` (recommended)
+### Option A — Generate config with `context-intelligence-server init` (recommended)
 
-Run `context-intelligence-server-init` **once** to generate the server config
+Run `context-intelligence-server init` **once** to generate the server config
 with all required settings. Do not run it again after the server is in use
 — it regenerates `api_key`, which must then be updated everywhere.
 
@@ -105,7 +104,7 @@ with all required settings. Do not run it again after the server is in use
 DATA_DIR="$HOME/amplifier-context-intelligence-server-data-store"
 mkdir -p "${DATA_DIR}/blobs" "${DATA_DIR}/logs" "${DATA_DIR}/cursors"
 
-context-intelligence-server-init \
+context-intelligence-server init \
   --config-path ~/.config/context-intelligence/server-config.yaml \
   --neo4j-url  bolt://localhost:37687 \
   --neo4j-user neo4j \
@@ -152,7 +151,7 @@ grouped into three categories below.
 | `server_host` | `0.0.0.0` | Bind address. `0.0.0.0` = all interfaces; `127.0.0.1` = localhost only |
 | `server_port` | `8000` | Listen port |
 | `log_level` | `INFO` | Verbosity (`DEBUG` / `INFO` / `WARNING` / `ERROR`) |
-| `api_key` | *(generated)* | Bearer token for API auth. All endpoints except `/status` and static routes require `Authorization: Bearer <value>`. Generate with `context-intelligence-server-init`. |
+| `api_key` | *(generated)* | Bearer token for API auth. All endpoints except `/status` and static routes require `Authorization: Bearer <value>`. Generate with `context-intelligence-server init`. |
 
 ### Neo4j settings
 
@@ -281,7 +280,7 @@ amplifier bundle add git+https://github.com/colombod/amplifier-bundle-context-in
 
 ### Configure the hook
 
-Add the server URL and the API key (printed by `context-intelligence-server-init`
+Add the server URL and the API key (printed by `context-intelligence-server init`
 in Step 4) to `~/.amplifier/settings.yaml`:
 
 ```yaml

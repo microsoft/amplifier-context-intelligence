@@ -88,7 +88,7 @@ The dashboard shows a Neo4j status chip (Connected/Disconnected). When `api_key`
 Before starting the server for the first time outside Docker, run the init command to generate credentials:
 
 ```bash
-context-intelligence-server-init \
+context-intelligence-server init \
   --neo4j-url neo4j://localhost:7687 \
   --neo4j-user neo4j
 ```
@@ -325,7 +325,7 @@ Values are resolved with this priority (highest first):
 | Environment variable | YAML key | Default | Description |
 |----------------------|----------|---------|-------------|
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE` | *(env only)* | `server-config.yaml` | Path to the YAML config file |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY` | `api_key` | *(empty — auth disabled)* | Bearer token. When set, all API endpoints except `/status` and static routes require `Authorization: Bearer <value>`. Generate with `context-intelligence-server-init`. |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY` | `api_key` | *(empty — auth disabled)* | Bearer token. When set, all API endpoints except `/status` and static routes require `Authorization: Bearer <value>`. Generate with `context-intelligence-server init`. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL` | `neo4j_url` | `neo4j://neo4j:7687` | Neo4j bolt URI |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_USER` | `neo4j_user` | `neo4j` | Neo4j username |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD` | `neo4j_password` | `password` | Neo4j password |
