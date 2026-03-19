@@ -304,3 +304,243 @@ class TestContextCompactionHappyPath:
             {"session_id": "s1", "timestamp": TIMESTAMP_EVENT},
         )
         assert result.action == "continue"
+
+
+# ---------------------------------------------------------------------------
+# New tests: TestCancelRequestedHappyPath
+# ---------------------------------------------------------------------------
+
+
+class TestCancelRequestedHappyPath:
+    """cancel:requested creates :Event:CancelRequested node with correct props."""
+
+    async def test_creates_event_node(self, services: HookStateService) -> None:
+        """Event node is created in graph after cancel:requested fires."""
+        await _seed_session(services)
+        handler = SystemEventHandler(services)
+        await handler(
+            "cancel:requested",
+            {"session_id": "s1", "timestamp": TIMESTAMP_EVENT},
+        )
+        node_id = make_node_id("s1", "cancel:requested", TIMESTAMP_EVENT)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+
+    async def test_correct_labels(self, services: HookStateService) -> None:
+        """Event node has exactly the labels {Event, CancelRequested}."""
+        await _seed_session(services)
+        handler = SystemEventHandler(services)
+        await handler(
+            "cancel:requested",
+            {"session_id": "s1", "timestamp": TIMESTAMP_EVENT},
+        )
+        node_id = make_node_id("s1", "cancel:requested", TIMESTAMP_EVENT)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert set(node["labels"]) == {"Event", "CancelRequested"}
+
+    async def test_is_immediate_false_by_default(
+        self, services: HookStateService
+    ) -> None:
+        """is_immediate is written as False when not present in payload."""
+        await _seed_session(services)
+        handler = SystemEventHandler(services)
+        await handler(
+            "cancel:requested",
+            {"session_id": "s1", "timestamp": TIMESTAMP_EVENT},
+        )
+        node_id = make_node_id("s1", "cancel:requested", TIMESTAMP_EVENT)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert node["is_immediate"] is False
+
+    async def test_is_immediate_true_when_set(
+        self, services: HookStateService
+    ) -> None:
+        """is_immediate is written as True when set in payload."""
+        await _seed_session(services)
+        handler = SystemEventHandler(services)
+        await handler(
+            "cancel:requested",
+            {"session_id": "s1", "timestamp": TIMESTAMP_EVENT, "is_immediate": True},
+        )
+        node_id = make_node_id("s1", "cancel:requested", TIMESTAMP_EVENT)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert node["is_immediate"] is True
+
+    async def test_running_tools_written_when_present(
+        self, services: HookStateService
+    ) -> None:
+        """running_tools list is written to node when non-empty."""
+        await _seed_session(services)
+        handler = SystemEventHandler(services)
+        await handler(
+            "cancel:requested",
+            {
+                "session_id": "s1",
+                "timestamp": TIMESTAMP_EVENT,
+                "running_tools": ["tool_a", "tool_b"],
+            },
+        )
+        node_id = make_node_id("s1", "cancel:requested", TIMESTAMP_EVENT)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert node["running_tools"] == ["tool_a", "tool_b"]
+
+    async def test_running_tools_absent_when_empty_list(
+        self, services: HookStateService
+    ) -> None:
+        """running_tools is NOT written to node when payload list is empty."""
+        await _seed_session(services)
+        handler = SystemEventHandler(services)
+        await handler(
+            "cancel:requested",
+            {
+                "session_id": "s1",
+                "timestamp": TIMESTAMP_EVENT,
+                "running_tools": [],
+            },
+        )
+        node_id = make_node_id("s1", "cancel:requested", TIMESTAMP_EVENT)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert "running_tools" not in node
+
+    async def test_has_event_edge_from_active_run(
+        self, services: HookStateService
+    ) -> None:
+        """HAS_EVENT edge scopes to current_run_id when run is active."""
+        await _seed_session(services)
+        run_id = await _seed_run(services)
+        handler = SystemEventHandler(services)
+        await handler(
+            "cancel:requested",
+            {"session_id": "s1", "timestamp": TIMESTAMP_EVENT},
+        )
+        node_id = make_node_id("s1", "cancel:requested", TIMESTAMP_EVENT)
+        edge = await services.graph.get_edge(run_id, node_id)
+        assert edge is not None
+        assert edge["type"] == "HAS_EVENT"
+
+    async def test_has_event_edge_fallback_to_session_when_no_run(
+        self, services: HookStateService
+    ) -> None:
+        """HAS_EVENT edge scopes to session_id when no run is active."""
+        await _seed_session(services)
+        # No run seeded — current_run_id stays None
+        handler = SystemEventHandler(services)
+        await handler(
+            "cancel:requested",
+            {"session_id": "s1", "timestamp": TIMESTAMP_EVENT},
+        )
+        node_id = make_node_id("s1", "cancel:requested", TIMESTAMP_EVENT)
+        edge = await services.graph.get_edge("s1", node_id)
+        assert edge is not None
+        assert edge["type"] == "HAS_EVENT"
+
+    async def test_missing_session_id_returns_continue(
+        self, services: HookStateService
+    ) -> None:
+        """Missing session_id returns continue without raising."""
+        handler = SystemEventHandler(services)
+        result = await handler(
+            "cancel:requested",
+            {"timestamp": TIMESTAMP_EVENT},
+        )
+        assert result.action == "continue"
+
+
+# ---------------------------------------------------------------------------
+# New tests: TestCancelCompletedHappyPath
+# ---------------------------------------------------------------------------
+
+
+class TestCancelCompletedHappyPath:
+    """cancel:completed creates :Event:CancelCompleted node with correct props."""
+
+    async def test_creates_event_node(self, services: HookStateService) -> None:
+        """Event node is created in graph after cancel:completed fires."""
+        await _seed_session(services)
+        handler = SystemEventHandler(services)
+        await handler(
+            "cancel:completed",
+            {"session_id": "s1", "timestamp": TIMESTAMP_EVENT},
+        )
+        node_id = make_node_id("s1", "cancel:completed", TIMESTAMP_EVENT)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+
+    async def test_correct_labels(self, services: HookStateService) -> None:
+        """Event node has exactly the labels {Event, CancelCompleted}."""
+        await _seed_session(services)
+        handler = SystemEventHandler(services)
+        await handler(
+            "cancel:completed",
+            {"session_id": "s1", "timestamp": TIMESTAMP_EVENT},
+        )
+        node_id = make_node_id("s1", "cancel:completed", TIMESTAMP_EVENT)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert set(node["labels"]) == {"Event", "CancelCompleted"}
+
+    async def test_error_field_absent_when_no_error(
+        self, services: HookStateService
+    ) -> None:
+        """error field is NOT written to node when not present in payload."""
+        await _seed_session(services)
+        handler = SystemEventHandler(services)
+        await handler(
+            "cancel:completed",
+            {"session_id": "s1", "timestamp": TIMESTAMP_EVENT},
+        )
+        node_id = make_node_id("s1", "cancel:completed", TIMESTAMP_EVENT)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert "error" not in node
+
+    async def test_error_field_written_when_present(
+        self, services: HookStateService
+    ) -> None:
+        """error field is written as string when present in payload."""
+        await _seed_session(services)
+        handler = SystemEventHandler(services)
+        await handler(
+            "cancel:completed",
+            {
+                "session_id": "s1",
+                "timestamp": TIMESTAMP_EVENT,
+                "error": "Cancelled by user",
+            },
+        )
+        node_id = make_node_id("s1", "cancel:completed", TIMESTAMP_EVENT)
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert node["error"] == "Cancelled by user"
+
+    async def test_has_event_edge_from_active_run(
+        self, services: HookStateService
+    ) -> None:
+        """HAS_EVENT edge scopes to current_run_id when run is active."""
+        await _seed_session(services)
+        run_id = await _seed_run(services)
+        handler = SystemEventHandler(services)
+        await handler(
+            "cancel:completed",
+            {"session_id": "s1", "timestamp": TIMESTAMP_EVENT},
+        )
+        node_id = make_node_id("s1", "cancel:completed", TIMESTAMP_EVENT)
+        edge = await services.graph.get_edge(run_id, node_id)
+        assert edge is not None
+        assert edge["type"] == "HAS_EVENT"
+
+    async def test_missing_session_id_returns_continue(
+        self, services: HookStateService
+    ) -> None:
+        """Missing session_id returns continue without raising."""
+        handler = SystemEventHandler(services)
+        result = await handler(
+            "cancel:completed",
+            {"timestamp": TIMESTAMP_EVENT},
+        )
+        assert result.action == "continue"
