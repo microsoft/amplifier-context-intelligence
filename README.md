@@ -10,13 +10,13 @@ Amplifier CLI sessions
        |  hook-context-intelligence (thin forwarder)
        |  POST /events {event, workspace, data}
        v
-+------------------------------------------+        +-------------------+
-| Ingestion Server (:8000)                 | bolt   | Neo4j (:7474)     |
-| - Event processing pipeline              |------->| Property graph    |
-| - Blob storage (large payloads to disk)  |        | 5 node types      |
-| - Dashboard + API docs                   |        | 8 edge types      |
-| - Cypher proxy                           |        +-------------------+
-+------------------------------------------+
++------------------------------------------+        +----------------------+
+| Ingestion Server (:8000)                 | bolt   | Neo4j                |
+| - Event processing pipeline              |------->| :7687  bolt/driver   |
+| - Blob storage (large payloads to disk)  |        | :7474  browser UI    |
+| - Dashboard + API docs                   |        | Property graph       |
+| - Cypher proxy                           |        | 5 node / 8 edge types|
++------------------------------------------+        +----------------------+
 ```
 
 ---
@@ -65,7 +65,7 @@ The stack runs 2 services:
 | Service | Port | Description |
 |---------|------|-------------|
 | **Ingestion server** | [localhost:8000](http://localhost:8000) | Event processing, dashboard, API |
-| **Neo4j** | [localhost:7474](http://localhost:7474) | Property graph (bolt on :7687, auth enabled) |
+| **Neo4j** | browser [localhost:7474](http://localhost:7474) · bolt `:7687` | Property graph (auth enabled) |
 
 All services are configured with `restart: unless-stopped` — they automatically restart on crash or Docker daemon restart. They only stay down if you explicitly stop them with `docker compose stop` or `docker compose down`.
 
@@ -79,7 +79,14 @@ Open [http://localhost:8000](http://localhost:8000) — this is the single navig
 | `/dashboard` | Live session monitoring, event history, log stream |
 | `/docs` | Swagger API documentation |
 
-The dashboard shows a Neo4j status chip (Connected/Disconnected). When `api_key` is configured, the dashboard shows an API key prompt on first visit — enter the key from `credentials.yaml`.
+The home page and dashboard both show:
+- **Neo4j status** (Connected / Disconnected) polled every few seconds
+- **Neo4j Bolt URL** — the exact value of `neo4j_url` from `server-config.yaml`
+- **Neo4j Browser URL** — the exact value of `neo4j_browser_url` from `server-config.yaml`, as a clickable link
+
+Both URLs are displayed verbatim from the configuration. If Neo4j is on a remote host, the displayed values reflect that remote address — not `localhost`.
+
+When `api_key` is configured, the dashboard shows an API key prompt on first visit — enter the key from `credentials.yaml`.
 
 ---
 
@@ -89,11 +96,14 @@ Before starting the server for the first time outside Docker, run the init comma
 
 ```bash
 context-intelligence-server init \
-  --neo4j-url neo4j://localhost:7687 \
-  --neo4j-user neo4j
+  --neo4j-url         bolt://localhost:7687 \
+  --neo4j-browser-url http://localhost:7474 \
+  --neo4j-user        neo4j
 ```
 
 You will be prompted for the Neo4j password. The command writes `server-config.yaml` with all required fields including a generated `api_key`. The generated API key is printed to stdout — copy it to your bundle config as `context_intelligence_api_key`.
+
+`--neo4j-url` is the bolt driver URL (used for all graph operations). `--neo4j-browser-url` is the Neo4j Browser HTTP URL (displayed as a clickable link in the web UI). If Neo4j is on a remote host, use that host in both values.
 
 ---
 
@@ -146,7 +156,8 @@ Edit `server-config.yaml`:
 
 ```yaml
 # Neo4j connection
-neo4j_url: neo4j://localhost:7687
+neo4j_url: neo4j://localhost:7687          # bolt/driver URL (used for graph operations)
+neo4j_browser_url: http://localhost:7474   # browser UI URL (clickable link in web UI)
 neo4j_user: neo4j
 neo4j_password: ""          # empty string for NEO4J_AUTH=none instances
 
@@ -173,6 +184,7 @@ Pass settings directly on the command line or export them in your shell:
 
 ```bash
 AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL=neo4j://localhost:7687 \
+AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_BROWSER_URL=http://localhost:7474 \
 AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD="" \
 AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH=/tmp/ci-blobs \
 AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_PATH=/tmp/ci-logs/server.jsonl \
@@ -272,7 +284,7 @@ All settings live in `~/.amplifier/settings.yaml` under `overrides.hook-context-
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/events` | Ingest a session event (returns 202 immediately) |
-| `GET` | `/status` | Server health, active sessions, completed history, error counts |
+| `GET` | `/status` | Server health, active sessions, completed history, error counts, `neo4j_connected`, `neo4j_url`, `neo4j_browser_url` |
 | `GET` | `/` | Landing page with navigation cards |
 | `GET` | `/dashboard` | Live monitoring dashboard |
 | `GET` | `/docs` | Swagger API docs |
@@ -326,7 +338,8 @@ Values are resolved with this priority (highest first):
 |----------------------|----------|---------|-------------|
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE` | *(env only)* | `server-config.yaml` | Path to the YAML config file |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY` | `api_key` | *(empty — auth disabled)* | Bearer token. When set, all API endpoints except `/status` and static routes require `Authorization: Bearer <value>`. Generate with `context-intelligence-server init`. |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL` | `neo4j_url` | `neo4j://neo4j:7687` | Neo4j bolt URI |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL` | `neo4j_url` | `neo4j://neo4j:7687` | Neo4j bolt/driver URL used for all graph operations. **Displayed verbatim in the web UI.** May point to a remote host — `bolt://db.internal:7687` is valid. Use `bolt://` scheme for Community Edition single-node installs. |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_BROWSER_URL` | `neo4j_browser_url` | `http://localhost:7474` | Neo4j Browser HTTP UI URL. **Displayed verbatim as a clickable link in the web UI.** Set to the address reachable from your browser — not necessarily `localhost` if Neo4j is on a remote machine. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_USER` | `neo4j_user` | `neo4j` | Neo4j username |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD` | `neo4j_password` | `password` | Neo4j password |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH` | `blob_path` | `/data/blobs` | Blob storage root directory |

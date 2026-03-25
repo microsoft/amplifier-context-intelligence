@@ -69,6 +69,13 @@ echo "Neo4j ready."
 > **Important:** use `bolt://` (not `neo4j://`) for the server connection URL.
 > The routing protocol (`neo4j://`) fails on Community Edition single-node installs.
 > Set `neo4j_url` to `bolt://localhost:${NEO4J_BOLT_PORT}` in your config.
+>
+> Neo4j exposes **two ports**: the bolt driver port (`NEO4J_BOLT_PORT`) used for
+> all data operations, and the HTTP browser UI port (`NEO4J_HTTP_PORT`) used only
+> for the Neo4j Browser web interface. Both must be configured separately —
+> `neo4j_url` for the driver connection, `neo4j_browser_url` for the browser link
+> shown in the web UI. Both are displayed verbatim from the config, so if Neo4j
+> is on a remote machine, use that machine's hostname in both values.
 
 ---
 
@@ -105,18 +112,19 @@ DATA_DIR="$HOME/amplifier-context-intelligence-server-data-store"
 mkdir -p "${DATA_DIR}/blobs" "${DATA_DIR}/logs" "${DATA_DIR}/cursors"
 
 context-intelligence-server init \
-  --config-path ~/.config/context-intelligence/server-config.yaml \
-  --neo4j-url  bolt://localhost:37687 \
-  --neo4j-user neo4j \
-  --neo4j-password "<your-neo4j-password>" \
-  --blob-path    "${DATA_DIR}/blobs" \
-  --log-path     "${DATA_DIR}/logs/server.jsonl" \
-  --cursor-path  "${DATA_DIR}/cursors" \
-  --server-host  0.0.0.0 \
-  --server-port  8000
+  --config-path       ~/.config/context-intelligence/server-config.yaml \
+  --neo4j-url         bolt://localhost:37687 \
+  --neo4j-browser-url http://localhost:37474 \
+  --neo4j-user        neo4j \
+  --neo4j-password    "<your-neo4j-password>" \
+  --blob-path         "${DATA_DIR}/blobs" \
+  --log-path          "${DATA_DIR}/logs/server.jsonl" \
+  --cursor-path       "${DATA_DIR}/cursors" \
+  --server-host       0.0.0.0 \
+  --server-port       8000
 ```
 
-Replace `37687` with your `NEO4J_BOLT_PORT` from Step 2.
+Replace `37687` with your `NEO4J_BOLT_PORT` and `37474` with your `NEO4J_HTTP_PORT` from Step 2.
 
 The command prints:
 
@@ -127,9 +135,11 @@ API key: <generated-token>
 
 **Copy the API key** — you need it in Step 7 (Amplifier settings).
 
-The `--neo4j-url` must use the `bolt://` scheme and the non-standard port you
-chose in Step 2. All parameters and their defaults are described in the
-settings tables below.
+`--neo4j-url` must use the `bolt://` scheme and the bolt port chosen in Step 2.
+`--neo4j-browser-url` is the HTTP browser UI address — it is displayed verbatim
+as a clickable link in the web UI and never used for driver connections.
+If Neo4j runs on a remote machine, provide its hostname in both values.
+All parameters and their defaults are described in the settings tables below.
 
 ### Option B — Manual config (advanced)
 
@@ -157,7 +167,8 @@ grouped into three categories below.
 
 | Key | Example | Purpose |
 |-----|---------|---------|
-| `neo4j_url` | `bolt://localhost:37687` | Bolt connection URL. Use `bolt://` scheme. Port must match `NEO4J_BOLT_PORT` from Step 2. |
+| `neo4j_url` | `bolt://localhost:37687` | Bolt/driver URL for all graph operations. Use `bolt://` scheme. Port must match `NEO4J_BOLT_PORT` from Step 2. **Displayed verbatim in the web UI** — use the address reachable by the server process, which may differ from what your browser can reach. |
+| `neo4j_browser_url` | `http://localhost:37474` | Neo4j Browser HTTP UI URL. Port must match `NEO4J_HTTP_PORT` from Step 2. **Displayed verbatim as a clickable link in the web UI.** Use the address reachable from your browser — if Neo4j is on a remote machine this will be that machine's hostname or IP, not `localhost`. Never used for driver connections. |
 | `neo4j_user` | `neo4j` | Auth username |
 | `neo4j_password` | *(your password)* | Auth password. Always required for Docker deployments. Must match the password passed to `NEO4J_AUTH` when the container was created. |
 
@@ -321,7 +332,10 @@ overrides:
 ```bash
 # Health check (always unauthenticated)
 curl http://localhost:8000/status
-# → {"status":"ok","neo4j_connected":true,...}
+# → {"status":"ok","neo4j_connected":true,"neo4j_url":"bolt://localhost:37687","neo4j_browser_url":"http://localhost:37474",...}
+#
+# Both neo4j_url and neo4j_browser_url are read verbatim from server-config.yaml.
+# If Neo4j is on a remote host the response will show those remote addresses.
 
 # Confirm auth is enforced — must return 401
 curl -s -o /dev/null -w "%{http_code}" \
@@ -346,8 +360,9 @@ bypass the browser cache.
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `command not found: context-intelligence-server` | `~/.local/bin` not in `PATH` | Add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile |
-| `neo4j_connected: false` | Bolt port mismatch or wrong scheme | Set `neo4j_url` to `bolt://localhost:<NEO4J_BOLT_PORT>` in config |
+| `neo4j_connected: false` | Bolt port mismatch or wrong scheme | Set `neo4j_url` to `bolt://localhost:<NEO4J_BOLT_PORT>` in config — must use `bolt://` not `neo4j://` |
 | `neo4j_connected: false` (connection refused) | Neo4j container not running | `docker ps` to check; `docker start amplifier-context-intelligence-neo4j` to restart |
+| Dashboard "Neo4j Browser" link doesn't work | `neo4j_browser_url` has wrong host/port | Update `neo4j_browser_url` in `server-config.yaml` to the address reachable from your browser — if Neo4j is remote, use the remote hostname, not `localhost` |
 | Service starts then immediately stops | Config file missing or bad path | `journalctl --user -u context-intelligence-server` to see the error |
 | `Permission denied` on blob/log path | Directories don't exist | `mkdir -p` the paths listed in your config |
 | Port 8000 already in use | Conflict with another process | Change `server_port` in config and update the systemd unit |
