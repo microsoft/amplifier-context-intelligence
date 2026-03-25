@@ -114,7 +114,7 @@ def test_prerequisites_uv_install_command():
 def test_prerequisites_uv_tool_install_command():
     """Prerequisites section must include the uv tool install command."""
     assert (
-        "uv tool install git+https://github.com/colombod/amplifier-context-intelligence"
+        "uv tool install git+https://github.com/microsoft/amplifier-context-intelligence"
         in _content()
     )
 
