@@ -115,6 +115,7 @@ class Settings(BaseSettings):
     neo4j_url: str = "neo4j://neo4j:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = "password"
+    neo4j_browser_url: str = "http://localhost:7474"
 
     # -------------------------------------------------------------------------
     # Storage paths

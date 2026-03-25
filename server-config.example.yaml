@@ -16,7 +16,8 @@
 # "Neo4j URL" chip) so operators can see at a glance which database the
 # server is connected to.
 # -----------------------------------------------------------------------------
-neo4j_url: neo4j://localhost:7687
+neo4j_url: neo4j://localhost:7687          # bolt/neo4j driver URL — used for all graph queries
+neo4j_browser_url: http://localhost:7474  # Neo4j HTTP browser UI — displayed as a clickable link in the web UI
 neo4j_user: neo4j
 neo4j_password: ""          # Empty only for local Neo4j with NEO4J_AUTH=none (dev only).
                              # Docker and production deployments always use a password.
