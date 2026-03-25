@@ -75,6 +75,11 @@ async function refresh() {
       }
     }
 
+    const serverUrl = document.getElementById('server-url');
+    if (serverUrl) serverUrl.textContent = data.server_url || '\u2014';
+    const neo4jUrl = document.getElementById('neo4j-url');
+    if (neo4jUrl) neo4jUrl.textContent = data.neo4j_url || '\u2014';
+
     const sb = document.getElementById('sessions-body');
     if (sb) sb.innerHTML = (data.sessions || []).map(s =>
       `<tr><td>${truncate(s.session_id, 20)}</td><td>${truncate(s.workspace, 28)}</td>` +

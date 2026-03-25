@@ -11,6 +11,10 @@
 #
 # -----------------------------------------------------------------------------
 # Neo4j connection
+# neo4j_url is the bolt/neo4j driver URL used for all graph operations.
+# It is also advertised in the web UI (home page Neo4j card and dashboard
+# "Neo4j URL" chip) so operators can see at a glance which database the
+# server is connected to.
 # -----------------------------------------------------------------------------
 neo4j_url: neo4j://localhost:7687
 neo4j_user: neo4j
@@ -37,6 +41,9 @@ cursor_path: /home/user/.local/share/ci-server/cursors
 
 # -----------------------------------------------------------------------------
 # Server bind address
+# These two values are combined into the HTTP URL advertised in the web UI
+# (home page "Server URL" chip and dashboard "Server URL" chip).
+# Example: server_host=127.0.0.1 + server_port=8000 → http://127.0.0.1:8000
 # -----------------------------------------------------------------------------
 server_host: 127.0.0.1      # Use 0.0.0.0 to accept connections from other machines
 server_port: 8000

@@ -88,6 +88,8 @@ async def dashboard() -> FileResponse:
 async def get_status(request: Request) -> dict[str, Any]:
     response = build_status_response(registry, _start_time)
     response["neo4j_connected"] = await _check_neo4j_connected(request.app)
+    response["server_url"] = f"http://{_settings.server_host}:{_settings.server_port}"
+    response["neo4j_url"] = _settings.neo4j_url
     return response
 
 

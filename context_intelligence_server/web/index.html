@@ -62,6 +62,7 @@
         <div class="nav-card-title">Neo4j</div>
         <div id="neo4j-status-desc">Checking connection...</div>
         <div id="neo4j-status-badge" style="font-weight:600;">&mdash;</div>
+        <div id="neo4j-url" style="margin-top:0.5rem;font-size:0.75rem;font-family:monospace;color:var(--muted-foreground);word-break:break-all;">&mdash;</div>
       </div>
     </div>
 
@@ -73,6 +74,7 @@
       <div class="stat-chip"><span class="stat-label">Active sessions</span><span class="stat-value" id="ls-active">&mdash;</span></div>
       <div class="stat-chip"><span class="stat-label">Completed</span><span class="stat-value" id="ls-completed">&mdash;</span></div>
       <div class="stat-chip"><span class="stat-label">Errors (1h)</span><span class="stat-value" id="ls-errors">&mdash;</span></div>
+      <div class="stat-chip"><span class="stat-label">Server URL</span><span class="stat-value" id="ls-server-url" style="font-size:0.78rem;font-family:monospace;">&mdash;</span></div>
     </div>
   </div>
 
@@ -86,6 +88,7 @@
         document.getElementById('ls-active').textContent = d.active_sessions ?? '—';
         document.getElementById('ls-completed').textContent = (d.completed_sessions || []).length;
         document.getElementById('ls-errors').textContent = d.error_count_last_hour ?? 0;
+        document.getElementById('ls-server-url').textContent = d.server_url || '\u2014';
         const neo4jDesc = document.getElementById('neo4j-status-desc');
         const neo4jBadge = document.getElementById('neo4j-status-badge');
         if (d.neo4j_connected) {
@@ -97,6 +100,7 @@
           neo4jBadge.textContent = '\u25cb Disconnected';
           neo4jBadge.style.color = 'var(--destructive)';
         }
+        document.getElementById('neo4j-url').textContent = d.neo4j_url || '\u2014';
         const themeBtn = document.getElementById('theme-toggle');
         if (themeBtn) themeBtn.textContent = document.documentElement.classList.contains('dark') ? '☀' : '☾';
       } catch { /* server may be starting */ }
