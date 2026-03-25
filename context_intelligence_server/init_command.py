@@ -25,7 +25,7 @@ def run_init(
     neo4j_url: str,
     neo4j_user: str,
     neo4j_password: str,
-    neo4j_browser_url: str = "http://localhost:7474",
+    neo4j_browser_url: str | None = None,
     blob_path: str | None = None,
     log_path: str | None = None,
     cursor_path: str | None = None,
@@ -49,11 +49,12 @@ def run_init(
     api_key = secrets.token_urlsafe(32)
 
     existing["neo4j_url"] = neo4j_url
-    existing["neo4j_browser_url"] = neo4j_browser_url
     existing["neo4j_user"] = neo4j_user
     existing["neo4j_password"] = neo4j_password
     existing["api_key"] = api_key
 
+    if neo4j_browser_url is not None:
+        existing["neo4j_browser_url"] = neo4j_browser_url
     if blob_path is not None:
         existing["blob_path"] = str(Path(blob_path).expanduser())
     if log_path is not None:
@@ -108,7 +109,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--neo4j-browser-url",
         type=str,
-        default="http://localhost:7474",
+        default=None,
         help="Neo4j Browser HTTP UI URL (default: http://localhost:7474). "
         "Displayed as a clickable link in the web UI. "
         "Set to the address reachable from your browser — use the actual "

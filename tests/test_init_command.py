@@ -36,10 +36,9 @@ class TestRunInit:
         assert data["neo4j_password"] == "test-password"
         assert "api_key" in data
         assert len(data["api_key"]) > 0
-        assert data["neo4j_browser_url"] == "http://localhost:7474"
 
-    def test_neo4j_browser_url_default(self, tmp_path: Path) -> None:
-        """neo4j_browser_url defaults to http://localhost:7474 when not provided."""
+    def test_neo4j_browser_url_absent_when_not_provided(self, tmp_path: Path) -> None:
+        """neo4j_browser_url is NOT written to config when not provided — it is optional."""
         config_path = tmp_path / "server-config.yaml"
         run_init(
             config_path=config_path,
@@ -48,7 +47,7 @@ class TestRunInit:
             neo4j_password="pw",
         )
         data = yaml.safe_load(config_path.read_text())
-        assert data["neo4j_browser_url"] == "http://localhost:7474"
+        assert "neo4j_browser_url" not in data
 
     def test_auto_generates_api_key(self, tmp_path: Path) -> None:
         """api_key is auto-generated and non-empty."""
@@ -232,6 +231,18 @@ class TestRunInitNewParams:
         )
         data = yaml.safe_load(config_path.read_text())
         assert data["neo4j_browser_url"] == "http://remotehost:37474"
+
+    def test_neo4j_browser_url_not_written_when_omitted(self, tmp_path: Path) -> None:
+        """neo4j_browser_url is NOT written to config when not provided — it is optional."""
+        config_path = tmp_path / "server-config.yaml"
+        run_init(
+            config_path=config_path,
+            neo4j_url="bolt://localhost:7687",
+            neo4j_user="neo4j",
+            neo4j_password="pw",
+        )
+        data = yaml.safe_load(config_path.read_text())
+        assert "neo4j_browser_url" not in data
 
     def test_all_flags_produce_complete_config(self, tmp_path: Path) -> None:
         """Providing all flags at once produces a complete config with all keys."""
@@ -418,3 +429,29 @@ class TestCliEntryPoint:
         assert data["server_host"] == "127.0.0.1"
         assert data["server_port"] == 9000
         assert isinstance(data["server_port"], int)
+
+    def test_cli_omitting_neo4j_browser_url_does_not_write_it(
+        self, tmp_path: Path
+    ) -> None:
+        """Omitting --neo4j-browser-url from CLI means the key is absent from config."""
+        import subprocess
+        import sys
+
+        config_path = tmp_path / "server-config.yaml"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "context_intelligence_server.init_command",
+                "--config-path",
+                str(config_path),
+                "--neo4j-password",
+                "pw",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).parent.parent),
+        )
+        assert result.returncode == 0
+        data = yaml.safe_load(config_path.read_text())
+        assert "neo4j_browser_url" not in data
