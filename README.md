@@ -30,7 +30,7 @@ Amplifier CLI sessions
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/colombod/amplifier-context-intelligence.git
+git clone https://github.com/microsoft/amplifier-context-intelligence.git
 cd amplifier-context-intelligence
 ```
 
@@ -110,7 +110,7 @@ Run the server as a plain Python process against any Neo4j instance — useful f
 ### 1. Install dependencies
 
 ```bash
-git clone https://github.com/colombod/amplifier-context-intelligence.git
+git clone https://github.com/microsoft/amplifier-context-intelligence.git
 cd amplifier-context-intelligence
 uv sync
 ```
@@ -224,12 +224,12 @@ or macOS (launchd), see [docs/service-setup.md](docs/service-setup.md).
 
 ## Feeding Events into the Server
 
-The server receives events from [amplifier-bundle-context-intelligence](https://github.com/colombod/amplifier-bundle-context-intelligence) — a thin-forwarder hook that captures every Amplifier session event and dispatches it to the server over HTTP.
+The server receives events from [amplifier-bundle-context-intelligence](https://github.com/microsoft/amplifier-bundle-context-intelligence) — a thin-forwarder hook that captures every Amplifier session event and dispatches it to the server over HTTP.
 
 ### Install the bundle
 
 ```bash
-amplifier bundle add git+https://github.com/colombod/amplifier-bundle-context-intelligence@main --name context-intelligence --app
+amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-context-intelligence@main --name context-intelligence --app
 ```
 
 The `--app` flag makes the bundle always active across all sessions — no need to run `amplifier bundle use`.
@@ -421,7 +421,7 @@ RETURN r.node_id,
 ### Setup
 
 ```bash
-git clone https://github.com/colombod/amplifier-context-intelligence.git
+git clone https://github.com/microsoft/amplifier-context-intelligence.git
 cd amplifier-context-intelligence
 uv sync
 ```
@@ -453,5 +453,5 @@ amplifier-context-intelligence/
 
 ## Related
 
-- [amplifier-bundle-context-intelligence](https://github.com/colombod/amplifier-bundle-context-intelligence) — Amplifier bundle that forwards session events to this server
+- [amplifier-bundle-context-intelligence](https://github.com/microsoft/amplifier-bundle-context-intelligence) — Amplifier bundle that forwards session events to this server
 - [amplifier](https://github.com/microsoft/amplifier) — The Amplifier framework
