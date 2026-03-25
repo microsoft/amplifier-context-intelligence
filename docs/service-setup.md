@@ -75,7 +75,7 @@ echo "Neo4j ready."
 ## 3. Install the Server
 
 ```bash
-uv tool install git+https://github.com/microsoft/amplifier-context-intelligence
+uv tool install git+https://github.com/colombod/amplifier-context-intelligence
 ```
 
 One binary is placed at `~/.local/bin`:
@@ -136,7 +136,7 @@ settings tables below.
 ```bash
 mkdir -p ~/.config/context-intelligence
 curl -o ~/.config/context-intelligence/server-config.yaml \
-  https://raw.githubusercontent.com/microsoft/amplifier-context-intelligence/main/server-config.example.yaml
+  https://raw.githubusercontent.com/colombod/amplifier-context-intelligence/main/server-config.example.yaml
 ```
 
 Edit the file and set values for your machine. Configuration keys are
@@ -269,13 +269,13 @@ Add it to the `app` list in `~/.amplifier/settings.yaml`:
 ```yaml
 bundle:
   app:
-    - git+https://github.com/microsoft/amplifier-bundle-context-intelligence@main
+    - git+https://github.com/colombod/amplifier-bundle-context-intelligence@main
 ```
 
 Or use the CLI:
 
 ```bash
-amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-context-intelligence@main
+amplifier bundle add git+https://github.com/colombod/amplifier-bundle-context-intelligence@main
 ```
 
 ### Configure the hook
@@ -304,7 +304,7 @@ overrides:
 bundle:
   active: <your-active-bundle>
   app:
-    - git+https://github.com/microsoft/amplifier-bundle-context-intelligence@main
+    - git+https://github.com/colombod/amplifier-bundle-context-intelligence@main
     # ... other bundles ...
 
 overrides:
