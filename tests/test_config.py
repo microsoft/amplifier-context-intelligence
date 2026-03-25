@@ -24,6 +24,7 @@ def test_settings_defaults():
     assert s.neo4j_password == "password"
     assert s.blob_path == "/data/blobs"
     assert s.log_level == "INFO"
+    assert s.neo4j_browser_url == "http://localhost:7474"
 
 
 def test_settings_env_override(monkeypatch):
@@ -190,6 +191,18 @@ def test_yaml_empty_file_uses_defaults(tmp_path: Path, monkeypatch):
     assert s.server_port == 8000
 
 
+def test_neo4j_browser_url_env_var(monkeypatch):
+    """AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_BROWSER_URL overrides the default."""
+    monkeypatch.setenv(
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_BROWSER_URL",
+        "http://neo4j.internal:7474",
+    )
+    from context_intelligence_server.config import Settings
+
+    s = Settings()
+    assert s.neo4j_browser_url == "http://neo4j.internal:7474"
+
+
 def test_api_key_defaults_to_none():
     """api_key should default to None when not configured."""
     from context_intelligence_server.config import Settings
@@ -260,6 +273,11 @@ def test_api_key_empty_string_from_yaml_treated_as_none(tmp_path: Path, monkeypa
         ("cursor_path", "/mnt/cursors", "/mnt/cursors"),
         ("log_level", "WARNING", "WARNING"),
         ("server_host", "127.0.0.1", "127.0.0.1"),
+        (
+            "neo4j_browser_url",
+            "http://neo4j.internal:7474",
+            "http://neo4j.internal:7474",
+        ),
     ],
 )
 def test_yaml_sets_individual_fields(

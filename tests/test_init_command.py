@@ -36,6 +36,19 @@ class TestRunInit:
         assert data["neo4j_password"] == "test-password"
         assert "api_key" in data
         assert len(data["api_key"]) > 0
+        assert data["neo4j_browser_url"] == "http://localhost:7474"
+
+    def test_neo4j_browser_url_default(self, tmp_path: Path) -> None:
+        """neo4j_browser_url defaults to http://localhost:7474 when not provided."""
+        config_path = tmp_path / "server-config.yaml"
+        run_init(
+            config_path=config_path,
+            neo4j_url="bolt://localhost:7687",
+            neo4j_user="neo4j",
+            neo4j_password="pw",
+        )
+        data = yaml.safe_load(config_path.read_text())
+        assert data["neo4j_browser_url"] == "http://localhost:7474"
 
     def test_auto_generates_api_key(self, tmp_path: Path) -> None:
         """api_key is auto-generated and non-empty."""
@@ -207,6 +220,19 @@ class TestRunInitNewParams:
         assert data["server_port"] == 9090
         assert isinstance(data["server_port"], int)
 
+    def test_neo4j_browser_url_custom(self, tmp_path: Path) -> None:
+        """--neo4j-browser-url is written verbatim — supports remote hosts."""
+        config_path = tmp_path / "server-config.yaml"
+        run_init(
+            config_path=config_path,
+            neo4j_url="bolt://remotehost:37687",
+            neo4j_user="neo4j",
+            neo4j_password="pw",
+            neo4j_browser_url="http://remotehost:37474",
+        )
+        data = yaml.safe_load(config_path.read_text())
+        assert data["neo4j_browser_url"] == "http://remotehost:37474"
+
     def test_all_flags_produce_complete_config(self, tmp_path: Path) -> None:
         """Providing all flags at once produces a complete config with all keys."""
         config_path = tmp_path / "server-config.yaml"
@@ -220,6 +246,7 @@ class TestRunInitNewParams:
             cursor_path="/data/cursors",
             server_host="0.0.0.0",
             server_port=8080,
+            neo4j_browser_url="http://localhost:9474",
         )
 
         data = yaml.safe_load(config_path.read_text())
@@ -232,6 +259,7 @@ class TestRunInitNewParams:
         assert data["cursor_path"] == "/data/cursors"
         assert data["server_host"] == "0.0.0.0"
         assert data["server_port"] == 8080
+        assert data["neo4j_browser_url"] == "http://localhost:9474"
 
 
 class TestLogPathDirectoryNormalisation:
@@ -324,6 +352,32 @@ class TestCliEntryPoint:
         data = yaml.safe_load(config_path.read_text())
         assert data["neo4j_url"] == "bolt://localhost:7687"
         assert not data["neo4j_url"].startswith("neo4j://")
+
+    def test_cli_accepts_neo4j_browser_url_flag(self, tmp_path: Path) -> None:
+        """CLI --neo4j-browser-url flag is written to config verbatim."""
+        import subprocess
+        import sys
+
+        config_path = tmp_path / "server-config.yaml"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "context_intelligence_server.init_command",
+                "--config-path",
+                str(config_path),
+                "--neo4j-password",
+                "pw",
+                "--neo4j-browser-url",
+                "http://neo4j-host:37474",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).parent.parent),
+        )
+        assert result.returncode == 0
+        data = yaml.safe_load(config_path.read_text())
+        assert data["neo4j_browser_url"] == "http://neo4j-host:37474"
 
     def test_cli_accepts_all_new_flags(self, tmp_path: Path) -> None:
         """CLI accepts --blob-path, --log-path, --cursor-path, --server-host, --server-port."""
