@@ -75,8 +75,8 @@ class SessionHandler:
         if parent_id:
             await self.services.ensure_session_node(parent_id, {})
             await self.services.graph.upsert_edge(
-                parent_id,
                 session_id,
+                parent_id,
                 {"type": "SUBSESSION_OF", "occurred_at": timestamp},
             )
 
@@ -87,15 +87,14 @@ class SessionHandler:
         data: dict[str, Any],
         log: EventLogContext,
     ) -> None:
-        parent_id = (data.get("parent_id") or "").strip()
+        parent = data.get("parent")
 
-        if parent_id:
+        if parent:
             labels: list[str] = ["Session", "SubSession", "ForkedSession"]
         else:
-            labels = ["Session", "ForkedSession"]
+            labels = ["Session", "RootSession", "ForkedSession"]
             log.warning(
-                "session:fork for %r has no parent_id — creating orphaned fork",
-                session_id,
+                "session:fork for %r has no parent — degrading to Root", session_id
             )
 
         await self.services.graph.upsert_node(
@@ -109,11 +108,11 @@ class SessionHandler:
             },
         )
 
-        if parent_id:
-            await self.services.ensure_session_node(parent_id, {})
+        if parent:
+            await self.services.ensure_session_node(parent, {})
             await self.services.graph.upsert_edge(
-                parent_id,
                 session_id,
+                parent,
                 {"type": "SUBSESSION_OF", "occurred_at": timestamp},
             )
 
@@ -125,7 +124,7 @@ class SessionHandler:
             {
                 "labels": ["Session"],
                 "ended_at": timestamp,
-                "status": "completed",
+                "status": data.get("status", "completed"),
                 "data_session_end": json.dumps(data),
             },
         )
