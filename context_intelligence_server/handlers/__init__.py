@@ -1,30 +1,17 @@
 """Event handlers for the context-intelligence server.
 
-Seven handlers are registered in this package:
+Three handlers are registered in this package:
 
-- DefaultHandler        — catches all unclaimed, non-excluded events
-- OrchestratorRunHandler — owns orchestrator_run lifecycle events
-- RecipeHandler         — owns recipe lifecycle events
-- SessionHandler        — owns Session node lifecycle events (start/fork/end)
-- StepHandler           — owns step lifecycle events
-- SystemEventHandler    — owns known system events (compaction, cancellation)
-- ToolExecutionHandler  — owns tool_execution lifecycle events
+- DefaultHandler    — creates Event nodes for ALL events, unconditional
+- SessionHandler    — enricher: owns Session node lifecycle for start/fork/end
+- ToolCallHandler   — enricher: owns ToolCall lifecycle for tool:pre/post/error
+                      (not imported yet — added in Phase 2 Task 6)
 """
 
 from context_intelligence_server.handlers.default import DefaultHandler
-from context_intelligence_server.handlers.event import SystemEventHandler
-from context_intelligence_server.handlers.orchestrator_run import OrchestratorRunHandler
-from context_intelligence_server.handlers.recipe import RecipeHandler
 from context_intelligence_server.handlers.session import SessionHandler
-from context_intelligence_server.handlers.step import StepHandler
-from context_intelligence_server.handlers.tool_execution import ToolExecutionHandler
 
 __all__ = [
     "DefaultHandler",
-    "OrchestratorRunHandler",
-    "RecipeHandler",
     "SessionHandler",
-    "StepHandler",
-    "SystemEventHandler",
-    "ToolExecutionHandler",
 ]
