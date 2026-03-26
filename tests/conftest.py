@@ -83,32 +83,18 @@ def anyio_backend() -> str:
 
 
 @pytest.fixture(autouse=True)
-def safe_cursor_path(tmp_path: Any) -> Generator[None, None, None]:
-    """Patch registry.get_settings so cursor writes go to tmp_path for all tests.
-
-    Prevents PermissionError when drain_worker's CancelledError / stale-reap
-    handler calls _persist_cursors_sync with the default cursor_path (/data/cursors).
-
-    Only patches context_intelligence_server.registry.get_settings so that
-    tests in test_config.py that call Settings() or the config-level get_settings
-    are unaffected.  The stale-session tests override registry.get_settings
-    again via their own patch() context managers, which take precedence.
-    """
+def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
     from unittest.mock import patch
-
     from context_intelligence_server.config import Settings as _Settings
 
     _real = _Settings()
 
     class _SettingsProxy:
-        """Forward all attribute access to real settings except cursor_path."""
-
         blob_path: str = _real.blob_path
         neo4j_url: str = _real.neo4j_url
         neo4j_user: str = _real.neo4j_user
         neo4j_password: str = _real.neo4j_password
         stale_session_timeout: float = _real.stale_session_timeout
-        cursor_path: str = str(tmp_path)
 
     with patch(
         "context_intelligence_server.registry.get_settings",
