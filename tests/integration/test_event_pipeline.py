@@ -87,263 +87,197 @@ def _make_registry_and_worker(
 
 
 class TestFullEventSequence:
-    """Process a realistic session through the full pipeline and verify graph
-    state at every step.
+    """Process a realistic session through the simplified pipeline and verify
+    graph state at each step.
+
+    The simplified pipeline is: DefaultHandler (always) + SessionHandler
+    (enricher) + ToolCallHandler (enricher).  OrchestratorRun, Step, and
+    ToolExecution nodes no longer exist; cursor state has been removed.
 
     Event sequence:
-        session:start → prompt:submit → execution:start → provider:request
-        → tool:pre → tool:post → orchestrator:complete
+        session:start → tool:pre → tool:post → session:end
     """
 
+    # -----------------------------------------------------------------------
+    # Sequence constants — scoped to this class to avoid shadowing the
+    # module-level SESSION_ID / T0…T6 used by the other test classes.
+    # -----------------------------------------------------------------------
+
+    _SESSION_ID = "integ-session-001"
+    _T0 = "2026-01-01T00:00:00.000000000+00:00"  # session:start
+    _T1 = "2026-01-01T00:00:01.000000000+00:00"  # tool:pre
+    _T2 = "2026-01-01T00:00:02.000000000+00:00"  # tool:post
+    _T3 = "2026-01-01T00:00:03.000000000+00:00"  # session:end
+    _TOOL_CALL_ID = "toolu_01AbcDef123"
+    _PARALLEL_GROUP = "pg-001"
+
     async def test_session_start_creates_root_session_node(self) -> None:
-        """After session:start the graph must have a Session+Root node."""
+        """After session:start the Session node must carry RootSession label
+        and status='running'."""
         worker, services = _make_worker_and_services()
         handlers = setup_handlers(services)
 
         await process_event(
             worker,
             "session:start",
-            {"session_id": SESSION_ID, "timestamp": T0},
-            handlers,
-        )
-
-        node = await services.graph.get_node(SESSION_ID)
-        assert node is not None
-        assert "Session" in node["labels"]
-        assert "Root" in node["labels"]
-        assert node["status"] == "running"
-
-    async def test_prompt_submit_creates_prompt_step_node(self) -> None:
-        """After prompt:submit a PromptStep+Step node must exist."""
-        worker, services = _make_worker_and_services()
-        handlers = setup_handlers(services)
-
-        await process_event(
-            worker,
-            "session:start",
-            {"session_id": SESSION_ID, "timestamp": T0},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "prompt:submit",
-            {"session_id": SESSION_ID, "timestamp": T1, "prompt": "Hello world"},
-            handlers,
-        )
-
-        prompt_id = make_node_id(SESSION_ID, "prompt:submit", T1)
-        node = await services.graph.get_node(prompt_id)
-        assert node is not None
-        assert "PromptStep" in node["labels"]
-        assert "Step" in node["labels"]
-
-    async def test_execution_start_creates_orchestrator_run_with_has_run_edge(
-        self,
-    ) -> None:
-        """After execution:start an OrchestratorRun node and HAS_RUN edge must exist."""
-        worker, services = _make_worker_and_services()
-        handlers = setup_handlers(services)
-
-        await process_event(
-            worker,
-            "session:start",
-            {"session_id": SESSION_ID, "timestamp": T0},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "prompt:submit",
-            {"session_id": SESSION_ID, "timestamp": T1, "prompt": "Hello"},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "execution:start",
-            {"session_id": SESSION_ID, "timestamp": T2},
-            handlers,
-        )
-
-        run_id = make_node_id(SESSION_ID, "execution:start", T2)
-        run_node = await services.graph.get_node(run_id)
-        assert run_node is not None
-        assert "OrchestratorRun" in run_node["labels"]
-        assert run_node["status"] == "in_progress"
-
-        # HAS_RUN edge: Session → OrchestratorRun
-        has_run_edge = await services.graph.get_edge(SESSION_ID, run_id)
-        assert has_run_edge is not None
-        assert has_run_edge["type"] == "HAS_RUN"
-
-    async def test_execution_start_creates_has_step_edge_to_prompt_step(self) -> None:
-        """After execution:start the run must have a HAS_STEP edge to the PromptStep."""
-        worker, services = _make_worker_and_services()
-        handlers = setup_handlers(services)
-
-        await process_event(
-            worker,
-            "session:start",
-            {"session_id": SESSION_ID, "timestamp": T0},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "prompt:submit",
-            {"session_id": SESSION_ID, "timestamp": T1, "prompt": "Hello"},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "execution:start",
-            {"session_id": SESSION_ID, "timestamp": T2},
-            handlers,
-        )
-
-        run_id = make_node_id(SESSION_ID, "execution:start", T2)
-        prompt_id = make_node_id(SESSION_ID, "prompt:submit", T1)
-
-        # HAS_STEP edge: OrchestratorRun → PromptStep
-        has_step_edge = await services.graph.get_edge(run_id, prompt_id)
-        assert has_step_edge is not None
-        assert has_step_edge["type"] == "HAS_STEP"
-
-    async def test_provider_request_creates_assistant_step_with_has_step_edge(
-        self,
-    ) -> None:
-        """After provider:request an AssistantStep+Step node and HAS_STEP edge must exist."""
-        worker, services = _make_worker_and_services()
-        handlers = setup_handlers(services)
-
-        await process_event(
-            worker,
-            "session:start",
-            {"session_id": SESSION_ID, "timestamp": T0},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "prompt:submit",
-            {"session_id": SESSION_ID, "timestamp": T1, "prompt": "Hello"},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "execution:start",
-            {"session_id": SESSION_ID, "timestamp": T2},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "provider:request",
-            {"session_id": SESSION_ID, "timestamp": T3, "provider": "anthropic"},
-            handlers,
-        )
-
-        run_id = make_node_id(SESSION_ID, "execution:start", T2)
-        step_id = make_node_id(SESSION_ID, "provider:request", T3)
-
-        step_node = await services.graph.get_node(step_id)
-        assert step_node is not None
-        assert "AssistantStep" in step_node["labels"]
-        assert "Step" in step_node["labels"]
-
-        # HAS_STEP edge: OrchestratorRun → AssistantStep
-        has_step_edge = await services.graph.get_edge(run_id, step_id)
-        assert has_step_edge is not None
-        assert has_step_edge["type"] == "HAS_STEP"
-
-    async def test_tool_pre_creates_tool_execution_with_triggered_edge(self) -> None:
-        """After tool:pre a ToolExecution node and TRIGGERED edge from Step must exist."""
-        worker, services = _make_worker_and_services()
-        handlers = setup_handlers(services)
-        tool_call_id = "call_integ_001"
-
-        await process_event(
-            worker,
-            "session:start",
-            {"session_id": SESSION_ID, "timestamp": T0},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "prompt:submit",
-            {"session_id": SESSION_ID, "timestamp": T1, "prompt": "Hello"},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "execution:start",
-            {"session_id": SESSION_ID, "timestamp": T2},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "provider:request",
-            {"session_id": SESSION_ID, "timestamp": T3, "provider": "anthropic"},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "tool:pre",
             {
-                "session_id": SESSION_ID,
-                "timestamp": T4,
-                "tool_call_id": tool_call_id,
-                "tool_name": "bash",
+                "session_id": self._SESSION_ID,
+                "parent_id": None,
+                "timestamp": self._T0,
             },
             handlers,
         )
 
-        step_id = make_node_id(SESSION_ID, "provider:request", T3)
-        te_id = make_node_id(SESSION_ID, "tool:pre", T4, disambiguator=tool_call_id)
+        node = await services.graph.get_node(self._SESSION_ID)
+        assert node is not None
+        assert "RootSession" in node["labels"]
+        assert "Session" in node["labels"]
+        assert node["status"] == "running"
 
-        te_node = await services.graph.get_node(te_id)
-        assert te_node is not None
-        assert "ToolExecution" in te_node["labels"]
-        assert te_node["status"] == "executing"
-
-        # TRIGGERED edge: AssistantStep → ToolExecution
-        triggered_edge = await services.graph.get_edge(step_id, te_id)
-        assert triggered_edge is not None
-        assert triggered_edge["type"] == "TRIGGERED"
-
-    async def test_tool_post_completes_tool_execution(self) -> None:
-        """After tool:post the ToolExecution node must have status='complete'."""
+    async def test_session_start_creates_session_event_node(self) -> None:
+        """After session:start DefaultHandler must create a SessionStart Event
+        node and attach it to the Session via HAS_EVENT."""
         worker, services = _make_worker_and_services()
         handlers = setup_handlers(services)
-        tool_call_id = "call_integ_002"
 
         await process_event(
             worker,
             "session:start",
-            {"session_id": SESSION_ID, "timestamp": T0},
+            {
+                "session_id": self._SESSION_ID,
+                "parent_id": None,
+                "timestamp": self._T0,
+            },
             handlers,
         )
+
+        event_node_id = make_node_id(self._SESSION_ID, "session:start", self._T0)
+        event_node = await services.graph.get_node(event_node_id)
+        assert event_node is not None
+        assert "SessionStart" in event_node["labels"]
+        assert "Session" in event_node["labels"]
+        assert "Event" in event_node["labels"]
+
+        # DefaultHandler attaches Event node to Session via HAS_EVENT
+        edge = await services.graph.get_edge(self._SESSION_ID, event_node_id)
+        assert edge is not None
+
+    async def test_tool_pre_creates_tool_call_node(self) -> None:
+        """After tool:pre ToolCallHandler must create a ToolCall node with the
+        correct properties and a HAS_TOOL_CALL edge from the Session."""
+        worker, services = _make_worker_and_services()
+        handlers = setup_handlers(services)
+
         await process_event(
             worker,
-            "prompt:submit",
-            {"session_id": SESSION_ID, "timestamp": T1, "prompt": "Hello"},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "execution:start",
-            {"session_id": SESSION_ID, "timestamp": T2},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "provider:request",
-            {"session_id": SESSION_ID, "timestamp": T3},
+            "session:start",
+            {
+                "session_id": self._SESSION_ID,
+                "parent_id": None,
+                "timestamp": self._T0,
+            },
             handlers,
         )
         await process_event(
             worker,
             "tool:pre",
             {
-                "session_id": SESSION_ID,
-                "timestamp": T4,
-                "tool_call_id": tool_call_id,
-                "tool_name": "bash",
+                "session_id": self._SESSION_ID,
+                "timestamp": self._T1,
+                "tool_call_id": self._TOOL_CALL_ID,
+                "tool_name": "delegate",
+                "parallel_group_id": self._PARALLEL_GROUP,
+            },
+            handlers,
+        )
+
+        tc_node_id = f"{self._SESSION_ID}__tool_call__{self._TOOL_CALL_ID}"
+        tc_node = await services.graph.get_node(tc_node_id)
+        assert tc_node is not None
+        assert "ToolCall" in tc_node["labels"]
+        assert tc_node["tool_name"] == "delegate"
+        assert tc_node["tool_call_id"] == self._TOOL_CALL_ID
+        assert tc_node["parallel_group_id"] == self._PARALLEL_GROUP
+
+        # HAS_TOOL_CALL edge: Session → ToolCall (with started_at)
+        edge = await services.graph.get_edge(self._SESSION_ID, tc_node_id)
+        assert edge is not None
+        assert edge["type"] == "HAS_TOOL_CALL"
+        assert "started_at" in edge
+
+    async def test_tool_pre_creates_event_node(self) -> None:
+        """After tool:pre DefaultHandler must create a ToolPre Event node with
+        HAS_EVENT edges from both the Session and the ToolCall node."""
+        worker, services = _make_worker_and_services()
+        handlers = setup_handlers(services)
+
+        await process_event(
+            worker,
+            "session:start",
+            {
+                "session_id": self._SESSION_ID,
+                "parent_id": None,
+                "timestamp": self._T0,
+            },
+            handlers,
+        )
+        await process_event(
+            worker,
+            "tool:pre",
+            {
+                "session_id": self._SESSION_ID,
+                "timestamp": self._T1,
+                "tool_call_id": self._TOOL_CALL_ID,
+                "tool_name": "delegate",
+                "parallel_group_id": self._PARALLEL_GROUP,
+            },
+            handlers,
+        )
+
+        event_node_id = make_node_id(
+            self._SESSION_ID, "tool:pre", self._T1, self._TOOL_CALL_ID
+        )
+        event_node = await services.graph.get_node(event_node_id)
+        assert event_node is not None
+        assert "ToolPre" in event_node["labels"]
+        assert "Tool" in event_node["labels"]
+        assert "Event" in event_node["labels"]
+
+        # HAS_EVENT edge: Session → Event (DefaultHandler)
+        session_to_event = await services.graph.get_edge(
+            self._SESSION_ID, event_node_id
+        )
+        assert session_to_event is not None
+
+        # HAS_EVENT edge: ToolCall → Event (ToolCallHandler)
+        tc_node_id = f"{self._SESSION_ID}__tool_call__{self._TOOL_CALL_ID}"
+        tc_to_event = await services.graph.get_edge(tc_node_id, event_node_id)
+        assert tc_to_event is not None
+
+    async def test_tool_post_enriches_tool_call_node(self) -> None:
+        """After tool:post the ToolCall node must have ended_at set to T2."""
+        worker, services = _make_worker_and_services()
+        handlers = setup_handlers(services)
+
+        await process_event(
+            worker,
+            "session:start",
+            {
+                "session_id": self._SESSION_ID,
+                "parent_id": None,
+                "timestamp": self._T0,
+            },
+            handlers,
+        )
+        await process_event(
+            worker,
+            "tool:pre",
+            {
+                "session_id": self._SESSION_ID,
+                "timestamp": self._T1,
+                "tool_call_id": self._TOOL_CALL_ID,
+                "tool_name": "delegate",
+                "parallel_group_id": self._PARALLEL_GROUP,
             },
             handlers,
         )
@@ -351,92 +285,50 @@ class TestFullEventSequence:
             worker,
             "tool:post",
             {
-                "session_id": SESSION_ID,
-                "timestamp": T5,
-                "tool_call_id": tool_call_id,
-                "result": "exit code 0",
+                "session_id": self._SESSION_ID,
+                "timestamp": self._T2,
+                "tool_call_id": self._TOOL_CALL_ID,
+                "tool_name": "delegate",
+                "parallel_group_id": self._PARALLEL_GROUP,
+                "result": {"success": True, "output": "done"},
             },
             handlers,
         )
 
-        te_id = make_node_id(SESSION_ID, "tool:pre", T4, disambiguator=tool_call_id)
-        te_node = await services.graph.get_node(te_id)
-        assert te_node is not None
-        assert te_node["status"] == "complete"
+        tc_node_id = f"{self._SESSION_ID}__tool_call__{self._TOOL_CALL_ID}"
+        tc_node = await services.graph.get_node(tc_node_id)
+        assert tc_node is not None
+        assert tc_node.get("ended_at") == self._T2
 
-    async def test_orchestrator_complete_closes_run_with_mapped_status(self) -> None:
-        """After orchestrator:complete the OrchestratorRun must have status='complete' (mapped from 'success')."""
+    async def test_session_end_sets_ended_at(self) -> None:
+        """After session:end the Session node must have ended_at set."""
         worker, services = _make_worker_and_services()
         handlers = setup_handlers(services)
 
         await process_event(
             worker,
             "session:start",
-            {"session_id": SESSION_ID, "timestamp": T0},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "prompt:submit",
-            {"session_id": SESSION_ID, "timestamp": T1, "prompt": "Hello"},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "execution:start",
-            {"session_id": SESSION_ID, "timestamp": T2},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "orchestrator:complete",
             {
-                "session_id": SESSION_ID,
-                "timestamp": T6,
-                "status": "success",
-                "turn_count": 2,
+                "session_id": self._SESSION_ID,
+                "parent_id": None,
+                "timestamp": self._T0,
+            },
+            handlers,
+        )
+        await process_event(
+            worker,
+            "session:end",
+            {
+                "session_id": self._SESSION_ID,
+                "parent_id": None,
+                "timestamp": self._T3,
             },
             handlers,
         )
 
-        run_id = make_node_id(SESSION_ID, "execution:start", T2)
-        run_node = await services.graph.get_node(run_id)
-        assert run_node is not None
-        assert run_node["status"] == "complete"  # "success" maps to "complete"
-        assert run_node.get("turn_count") == 2
-
-    async def test_orchestrator_complete_clears_current_run_id(self) -> None:
-        """After orchestrator:complete the session cursors must have current_run_id=None."""
-        worker, services = _make_worker_and_services()
-        handlers = setup_handlers(services)
-
-        await process_event(
-            worker,
-            "session:start",
-            {"session_id": SESSION_ID, "timestamp": T0},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "prompt:submit",
-            {"session_id": SESSION_ID, "timestamp": T1, "prompt": "Hello"},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "execution:start",
-            {"session_id": SESSION_ID, "timestamp": T2},
-            handlers,
-        )
-        await process_event(
-            worker,
-            "orchestrator:complete",
-            {"session_id": SESSION_ID, "timestamp": T6, "status": "success"},
-            handlers,
-        )
-
-        cursors = services.get_cursors(SESSION_ID)
-        assert cursors.current_run_id is None
+        node = await services.graph.get_node(self._SESSION_ID)
+        assert node is not None
+        assert "ended_at" in node
 
 
 # ===========================================================================
