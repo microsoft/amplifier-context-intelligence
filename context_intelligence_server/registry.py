@@ -189,9 +189,7 @@ class SessionRegistry:
                 self.drain_worker(worker), name=f"drain-{worker.session_id}"
             )
 
-    def get_or_create(
-        self, session_id: str, workspace: str, replay: bool = False
-    ) -> SessionWorker:
+    def get_or_create(self, session_id: str, workspace: str) -> SessionWorker:
         if session_id not in self._workers:
             settings = get_settings()
             blob_store = AsyncDiskBlobStore(root=settings.blob_path)

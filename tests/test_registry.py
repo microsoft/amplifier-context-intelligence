@@ -823,7 +823,7 @@ class TestStaleSessionReaping:
     """Stale sessions are reaped when idle > stale_session_timeout."""
 
     @pytest.mark.asyncio
-    async def test_stale_worker_reaped_after_timeout(self, tmp_path: Path) -> None:
+    async def test_stale_worker_reaped_after_timeout(self) -> None:
         """Worker with last_event_time ~5.8 days ago gets graph.close called
         and is deregistered."""
         from unittest.mock import MagicMock
@@ -841,7 +841,6 @@ class TestStaleSessionReaping:
 
         mock_settings = MagicMock()
         mock_settings.stale_session_timeout = 432000.0  # 5 days
-        mock_settings.cursor_path = str(tmp_path)
 
         with patch(
             "context_intelligence_server.registry.get_settings",
@@ -854,7 +853,7 @@ class TestStaleSessionReaping:
         worker.services.graph.close.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_stale_session_not_added_to_completed(self, tmp_path: Path) -> None:
+    async def test_stale_session_not_added_to_completed(self) -> None:
         """Reaped stale sessions are NOT added to the _completed deque."""
         from unittest.mock import MagicMock
 
@@ -870,7 +869,6 @@ class TestStaleSessionReaping:
 
         mock_settings = MagicMock()
         mock_settings.stale_session_timeout = 432000.0
-        mock_settings.cursor_path = str(tmp_path)
 
         with patch(
             "context_intelligence_server.registry.get_settings",
@@ -882,9 +880,7 @@ class TestStaleSessionReaping:
         assert len(reg._completed) == 0
 
     @pytest.mark.asyncio
-    async def test_stale_reap_graph_close_error_still_deregisters(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_stale_reap_graph_close_error_still_deregisters(self) -> None:
         """If graph.close raises during stale reaping, worker is still deregistered."""
         from unittest.mock import MagicMock
 
@@ -902,7 +898,6 @@ class TestStaleSessionReaping:
 
         mock_settings = MagicMock()
         mock_settings.stale_session_timeout = 432000.0  # 5 days
-        mock_settings.cursor_path = str(tmp_path)
 
         with patch(
             "context_intelligence_server.registry.get_settings",
@@ -939,16 +934,14 @@ class TestCancelledErrorCallsClose:
         worker.services.graph.close.assert_awaited_once()
 
 
-class TestCursorPersistence:
+class TestGetOrCreate:
     """SessionRegistry get_or_create creates workers correctly."""
 
     @pytest.mark.asyncio
-    async def test_get_or_create_creates_worker_when_not_replay(
-        self, tmp_path: Path
-    ) -> None:
-        """get_or_create creates a worker (cursor persistence removed)."""
+    async def test_get_or_create_creates_worker(self) -> None:
+        """get_or_create creates a new worker for an unknown session."""
         reg = SessionRegistry()
-        worker = reg.get_or_create("session-restore", "/ws", replay=False)
+        worker = reg.get_or_create("session-restore", "/ws")
 
         assert worker is not None
         assert worker.session_id == "session-restore"
@@ -1026,3 +1019,10 @@ class TestCursorPersistenceRemoved:
         import context_intelligence_server.registry as registry_mod
 
         assert not hasattr(registry_mod, "Path")
+
+    def test_get_or_create_has_no_replay_parameter(self) -> None:
+        """get_or_create must not accept a replay parameter (dead code removed)."""
+        import inspect
+
+        sig = inspect.signature(SessionRegistry.get_or_create)
+        assert "replay" not in sig.parameters

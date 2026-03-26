@@ -117,7 +117,7 @@ async def post_events(request: EventRequest, replay: bool = False) -> EventRespo
                 session_id,
             )
             return EventResponse(status="duplicate", session_id=session_id or None)
-    worker = registry.get_or_create(session_id, request.workspace, replay=replay)
+    worker = registry.get_or_create(session_id, request.workspace)
     await worker.queue.put((request.event, request.workspace, request.data))
     logger.info("event_enqueued: event=%s session_id=%s", request.event, session_id)
     return EventResponse(status="queued", session_id=session_id or None)

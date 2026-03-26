@@ -752,39 +752,6 @@ class TestCursorPurgeEndpoints:
 
 
 # ---------------------------------------------------------------------------
-# replay flag tests
-# ---------------------------------------------------------------------------
-
-
-async def test_post_events_replay_flag_passes_to_get_or_create(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """POST /events?replay=true calls get_or_create with replay=True."""
-    captured_kwargs: dict = {}
-
-    original = registry.get_or_create
-
-    def capturing_get_or_create(
-        session_id: str, workspace: str, replay: bool = False
-    ) -> Any:
-        captured_kwargs["replay"] = replay
-        return original(session_id, workspace, replay=replay)
-
-    with patch.object(registry, "get_or_create", side_effect=capturing_get_or_create):
-        response = await client.post(
-            "/events?replay=true",
-            json={
-                "event": "tool_use",
-                "workspace": "/ws",
-                "data": {"session_id": "sess-replay-flag"},
-            },
-        )
-    assert response.status_code == 202
-    assert captured_kwargs["replay"] is True
-
-
-# ---------------------------------------------------------------------------
 # Auth middleware integration tests
 # ---------------------------------------------------------------------------
 
