@@ -1,130 +1,411 @@
-"""Tests for ToolCallHandler — Phase 2 stub for tool:pre/post/error events.
+"""Tests for ToolCallHandler — tool lifecycle enricher.
 
-TDD RED phase: these tests must fail before tool_call.py is created (conftest.py
-injects a stub with different handled_events). They pass after the real module is
-created and the conftest.py stub injection is removed.
+TDD RED phase: tests 2–5 fail because the stub ToolCallHandler returns
+'continue' without creating ToolCall nodes or edges. Tests 1 and 6 pass
+against the stub (handled_events already correct; guards return continue).
 """
 
 from __future__ import annotations
 
-import pytest
-
+from context_intelligence_server.handlers.default import DefaultHandler
+from context_intelligence_server.handlers.tool_call import ToolCallHandler
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 
-class TestToolCallHandlerClass:
-    """ToolCallHandler class structure requirements."""
+# ---------------------------------------------------------------------------
+# 1. TestToolCallHandlerHandledEvents
+# ---------------------------------------------------------------------------
 
-    def test_tool_call_handler_importable(self) -> None:
-        """ToolCallHandler can be imported from context_intelligence_server.handlers.tool_call."""
-        from context_intelligence_server.handlers.tool_call import ToolCallHandler
 
-        assert ToolCallHandler is not None
+class TestToolCallHandlerHandledEvents:
+    """handled_events == frozenset({'tool:pre', 'tool:post', 'tool:error'})."""
 
-    def test_handled_events_is_frozenset(self) -> None:
-        """handled_events must be a frozenset."""
-        from context_intelligence_server.handlers.tool_call import ToolCallHandler
-
-        assert isinstance(ToolCallHandler.handled_events, frozenset)
-
-    def test_handled_events_contains_tool_pre(self) -> None:
-        """handled_events must contain 'tool:pre'."""
-        from context_intelligence_server.handlers.tool_call import ToolCallHandler
-
-        assert "tool:pre" in ToolCallHandler.handled_events
-
-    def test_handled_events_contains_tool_post(self) -> None:
-        """handled_events must contain 'tool:post'."""
-        from context_intelligence_server.handlers.tool_call import ToolCallHandler
-
-        assert "tool:post" in ToolCallHandler.handled_events
-
-    def test_handled_events_contains_tool_error(self) -> None:
-        """handled_events must contain 'tool:error'."""
-        from context_intelligence_server.handlers.tool_call import ToolCallHandler
-
-        assert "tool:error" in ToolCallHandler.handled_events
-
-    def test_handled_events_exact_set(self) -> None:
+    def test_handled_events_is_exact_frozenset(self) -> None:
         """handled_events must be exactly frozenset({'tool:pre', 'tool:post', 'tool:error'})."""
-        from context_intelligence_server.handlers.tool_call import ToolCallHandler
-
         assert ToolCallHandler.handled_events == frozenset(
             {"tool:pre", "tool:post", "tool:error"}
         )
 
 
-class TestToolCallHandlerInit:
-    """ToolCallHandler.__init__ stores services."""
-
-    def test_init_stores_services(self, services: HookStateService) -> None:
-        """__init__ must store services as self.services."""
-        from context_intelligence_server.handlers.tool_call import ToolCallHandler
-
-        handler = ToolCallHandler(services)
-        assert handler.services is services
-
-    def test_init_accepts_hook_state_service(self, services: HookStateService) -> None:
-        """__init__ must accept a HookStateService instance without error."""
-        from context_intelligence_server.handlers.tool_call import ToolCallHandler
-
-        handler = ToolCallHandler(services)
-        assert handler is not None
+# ---------------------------------------------------------------------------
+# 2. TestToolPreCreatesToolCallNode
+# ---------------------------------------------------------------------------
 
 
-class TestToolCallHandlerCall:
-    """ToolCallHandler.__call__ returns HookResult(action='continue')."""
+class TestToolPreCreatesToolCallNode:
+    """tool:pre creates a ToolCall node with correct ID, labels, and properties."""
 
-    @pytest.mark.anyio
-    async def test_call_returns_hook_result_action_continue(
+    async def test_tool_pre_creates_tool_call_node(
         self, services: HookStateService
     ) -> None:
-        """__call__ must return HookResult with action='continue'."""
-        from context_intelligence_server.handlers.tool_call import ToolCallHandler
+        """tool:pre must create a ToolCall node at '{session_id}__tool_call__{tool_call_id}'."""
+        default_handler = DefaultHandler(services)
+        tool_call_handler = ToolCallHandler(services)
 
-        handler = ToolCallHandler(services)
-        result = await handler("tool:pre", {"session_id": "s1"})
-        assert result.action == "continue"
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+            "parallel_group_id": "pg-1",
+        }
+        # DefaultHandler must run first to create the Event node
+        await default_handler("tool:pre", data)
+        await tool_call_handler("tool:pre", data)
 
-    @pytest.mark.anyio
-    async def test_call_returns_continue_for_tool_post(
+        node = await services.graph.get_node("s1__tool_call__tc-abc")
+        assert node is not None
+
+    async def test_tool_call_node_has_tool_call_label(
         self, services: HookStateService
     ) -> None:
-        """__call__ must return HookResult(action='continue') for tool:post."""
-        from context_intelligence_server.handlers.tool_call import ToolCallHandler
+        """ToolCall node must include 'ToolCall' in its labels."""
+        default_handler = DefaultHandler(services)
+        tool_call_handler = ToolCallHandler(services)
 
-        handler = ToolCallHandler(services)
-        result = await handler("tool:post", {"session_id": "s1"})
-        assert result.action == "continue"
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        await default_handler("tool:pre", data)
+        await tool_call_handler("tool:pre", data)
 
-    @pytest.mark.anyio
-    async def test_call_returns_continue_for_tool_error(
+        node = await services.graph.get_node("s1__tool_call__tc-abc")
+        assert node is not None
+        assert "ToolCall" in node["labels"]
+
+    async def test_tool_call_node_has_tool_name_property(
         self, services: HookStateService
     ) -> None:
-        """__call__ must return HookResult(action='continue') for tool:error."""
-        from context_intelligence_server.handlers.tool_call import ToolCallHandler
+        """ToolCall node must have tool_name property."""
+        default_handler = DefaultHandler(services)
+        tool_call_handler = ToolCallHandler(services)
 
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        await default_handler("tool:pre", data)
+        await tool_call_handler("tool:pre", data)
+
+        node = await services.graph.get_node("s1__tool_call__tc-abc")
+        assert node is not None
+        assert node["tool_name"] == "bash"
+
+    async def test_tool_call_node_has_tool_call_id_property(
+        self, services: HookStateService
+    ) -> None:
+        """ToolCall node must have tool_call_id property."""
+        default_handler = DefaultHandler(services)
+        tool_call_handler = ToolCallHandler(services)
+
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        await default_handler("tool:pre", data)
+        await tool_call_handler("tool:pre", data)
+
+        node = await services.graph.get_node("s1__tool_call__tc-abc")
+        assert node is not None
+        assert node["tool_call_id"] == "tc-abc"
+
+    async def test_tool_call_node_has_parallel_group_id_property(
+        self, services: HookStateService
+    ) -> None:
+        """ToolCall node must have parallel_group_id property when provided."""
+        default_handler = DefaultHandler(services)
+        tool_call_handler = ToolCallHandler(services)
+
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+            "parallel_group_id": "pg-1",
+        }
+        await default_handler("tool:pre", data)
+        await tool_call_handler("tool:pre", data)
+
+        node = await services.graph.get_node("s1__tool_call__tc-abc")
+        assert node is not None
+        assert node["parallel_group_id"] == "pg-1"
+
+    async def test_tool_call_node_has_session_id_property(
+        self, services: HookStateService
+    ) -> None:
+        """ToolCall node must have session_id property."""
+        default_handler = DefaultHandler(services)
+        tool_call_handler = ToolCallHandler(services)
+
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        await default_handler("tool:pre", data)
+        await tool_call_handler("tool:pre", data)
+
+        node = await services.graph.get_node("s1__tool_call__tc-abc")
+        assert node is not None
+        assert node["session_id"] == "s1"
+
+    async def test_tool_pre_creates_has_tool_call_edge_from_session(
+        self, services: HookStateService
+    ) -> None:
+        """HAS_TOOL_CALL edge must be created from session -> ToolCall with started_at."""
+        default_handler = DefaultHandler(services)
+        tool_call_handler = ToolCallHandler(services)
+
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        await default_handler("tool:pre", data)
+        await tool_call_handler("tool:pre", data)
+
+        edge = await services.graph.get_edge("s1", "s1__tool_call__tc-abc")
+        assert edge is not None
+        assert edge["started_at"] == "2026-01-01T00:00:00Z"
+
+    async def test_tool_pre_creates_has_event_edge_from_tool_call_to_event(
+        self, services: HookStateService
+    ) -> None:
+        """HAS_EVENT edge must be created from ToolCall -> pre Event node."""
+        default_handler = DefaultHandler(services)
+        tool_call_handler = ToolCallHandler(services)
+
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        # DefaultHandler runs first to create the Event node
+        await default_handler("tool:pre", data)
+        await tool_call_handler("tool:pre", data)
+
+        tool_call_node_id = "s1__tool_call__tc-abc"
+        event_node_id = make_node_id("s1", "tool:pre", "2026-01-01T00:00:00Z", "tc-abc")
+        edge = await services.graph.get_edge(tool_call_node_id, event_node_id)
+        assert edge is not None
+
+
+# ---------------------------------------------------------------------------
+# 3. TestToolPostEnrichesToolCall
+# ---------------------------------------------------------------------------
+
+
+class TestToolPostEnrichesToolCall:
+    """tool:post enriches existing ToolCall: sets ended_at, creates HAS_EVENT edge."""
+
+    async def test_tool_post_sets_ended_at(
+        self, services: HookStateService
+    ) -> None:
+        """tool:post must set ended_at on the ToolCall node."""
+        default_handler = DefaultHandler(services)
+        tool_call_handler = ToolCallHandler(services)
+
+        pre_data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        post_data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:01:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+
+        # Full lifecycle: default + handler for pre, then default + handler for post
+        await default_handler("tool:pre", pre_data)
+        await tool_call_handler("tool:pre", pre_data)
+        await default_handler("tool:post", post_data)
+        await tool_call_handler("tool:post", post_data)
+
+        node = await services.graph.get_node("s1__tool_call__tc-abc")
+        assert node is not None
+        assert node["ended_at"] == "2026-01-01T00:01:00Z"
+
+    async def test_tool_post_creates_has_event_edge_for_post_event(
+        self, services: HookStateService
+    ) -> None:
+        """tool:post must create HAS_EVENT edge from ToolCall -> post Event node."""
+        default_handler = DefaultHandler(services)
+        tool_call_handler = ToolCallHandler(services)
+
+        pre_data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        post_data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:01:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+
+        await default_handler("tool:pre", pre_data)
+        await tool_call_handler("tool:pre", pre_data)
+        await default_handler("tool:post", post_data)
+        await tool_call_handler("tool:post", post_data)
+
+        tool_call_node_id = "s1__tool_call__tc-abc"
+        post_event_id = make_node_id("s1", "tool:post", "2026-01-01T00:01:00Z", "tc-abc")
+        edge = await services.graph.get_edge(tool_call_node_id, post_event_id)
+        assert edge is not None
+
+
+# ---------------------------------------------------------------------------
+# 4. TestToolErrorEnrichesToolCall
+# ---------------------------------------------------------------------------
+
+
+class TestToolErrorEnrichesToolCall:
+    """tool:error enriches existing ToolCall: sets ended_at."""
+
+    async def test_tool_error_sets_ended_at(
+        self, services: HookStateService
+    ) -> None:
+        """tool:error must set ended_at on the ToolCall node."""
+        default_handler = DefaultHandler(services)
+        tool_call_handler = ToolCallHandler(services)
+
+        pre_data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        error_data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:01:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+            "error": "timeout",
+        }
+
+        await default_handler("tool:pre", pre_data)
+        await tool_call_handler("tool:pre", pre_data)
+        await default_handler("tool:error", error_data)
+        await tool_call_handler("tool:error", error_data)
+
+        node = await services.graph.get_node("s1__tool_call__tc-abc")
+        assert node is not None
+        assert node["ended_at"] == "2026-01-01T00:01:00Z"
+
+
+# ---------------------------------------------------------------------------
+# 5. TestParallelToolCalls
+# ---------------------------------------------------------------------------
+
+
+class TestParallelToolCalls:
+    """Parallel calls with same timestamp but different tool_call_ids → distinct nodes."""
+
+    async def test_parallel_calls_produce_distinct_tool_call_nodes(
+        self, services: HookStateService
+    ) -> None:
+        """Same timestamp, different tool_call_ids → distinct ToolCall nodes."""
+        default_handler = DefaultHandler(services)
+        tool_call_handler = ToolCallHandler(services)
+
+        data1 = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-001",
+            "tool_name": "bash",
+        }
+        data2 = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-002",
+            "tool_name": "read_file",
+        }
+
+        await default_handler("tool:pre", data1)
+        await tool_call_handler("tool:pre", data1)
+        await default_handler("tool:pre", data2)
+        await tool_call_handler("tool:pre", data2)
+
+        node1 = await services.graph.get_node("s1__tool_call__tc-001")
+        node2 = await services.graph.get_node("s1__tool_call__tc-002")
+        assert node1 is not None
+        assert node2 is not None
+
+    async def test_parallel_nodes_have_correct_tool_names(
+        self, services: HookStateService
+    ) -> None:
+        """Each distinct ToolCall node must carry its own tool_name."""
+        default_handler = DefaultHandler(services)
+        tool_call_handler = ToolCallHandler(services)
+
+        data1 = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-001",
+            "tool_name": "bash",
+        }
+        data2 = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-002",
+            "tool_name": "read_file",
+        }
+
+        await default_handler("tool:pre", data1)
+        await tool_call_handler("tool:pre", data1)
+        await default_handler("tool:pre", data2)
+        await tool_call_handler("tool:pre", data2)
+
+        node1 = await services.graph.get_node("s1__tool_call__tc-001")
+        node2 = await services.graph.get_node("s1__tool_call__tc-002")
+        assert node1 is not None
+        assert node2 is not None
+        assert node1["tool_name"] == "bash"
+        assert node2["tool_name"] == "read_file"
+
+
+# ---------------------------------------------------------------------------
+# 6. TestToolCallHandlerGuards
+# ---------------------------------------------------------------------------
+
+
+class TestToolCallHandlerGuards:
+    """Missing session_id or tool_call_id must short-circuit without mutations."""
+
+    async def test_missing_session_id_returns_continue(
+        self, services: HookStateService
+    ) -> None:
+        """Missing session_id must return HookResult(action='continue')."""
         handler = ToolCallHandler(services)
-        result = await handler("tool:error", {"session_id": "s1", "error": "timeout"})
-        assert result.action == "continue"
-
-
-class TestPipelineIntegration:
-    """Full import chain: setup_handlers returns ToolCallHandler as enricher."""
-
-    def test_setup_handlers_includes_tool_call_handler(self) -> None:
-        """setup_handlers must include ToolCallHandler with correct type name."""
-        from context_intelligence_server.pipeline import setup_handlers
-
-        h = setup_handlers(HookStateService())
-        assert type(h.enrichers[1]).__name__ == "ToolCallHandler"
-
-    def test_tool_call_handler_enricher_has_correct_events(self) -> None:
-        """ToolCallHandler enricher in pipeline must have tool:pre/post/error events."""
-        from context_intelligence_server.pipeline import setup_handlers
-
-        h = setup_handlers(HookStateService())
-        tool_handler = h.enrichers[1]
-        assert tool_handler.handled_events == frozenset(
-            {"tool:pre", "tool:post", "tool:error"}
+        result = await handler(
+            "tool:pre",
+            {"timestamp": "2026-01-01T00:00:00Z", "tool_call_id": "tc-abc", "tool_name": "bash"},
         )
+        assert result.action == "continue"
+
+    async def test_missing_tool_call_id_returns_continue(
+        self, services: HookStateService
+    ) -> None:
+        """Missing tool_call_id must return HookResult(action='continue')."""
+        handler = ToolCallHandler(services)
+        result = await handler(
+            "tool:pre",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z", "tool_name": "bash"},
+        )
+        assert result.action == "continue"
