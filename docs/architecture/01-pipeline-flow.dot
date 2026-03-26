@@ -39,7 +39,7 @@ digraph pipeline_flow {
 
     EnsureSessionNode [
         label     = "EnsureSessionNode\nMERGE (:Session {session_id})"
-        fillcolor = "#FFFFFF"
+        fillcolor = "#F5F5F5"
     ]
 
     // ── Blob offload ──────────────────────────────────────────────────────────
@@ -52,7 +52,7 @@ digraph pipeline_flow {
 
     BlobOffload [
         label     = "BlobOffload\nprocess_event_data()\noffload large payloads → blob store"
-        fillcolor = "#FFFFFF"
+        fillcolor = "#F5F5F5"
     ]
 
     // ── DefaultHandler (ALWAYS) ───────────────────────────────────────────────
@@ -92,7 +92,6 @@ digraph pipeline_flow {
     GraphFlush [
         label     = "GraphFlush\ngraph.flush()\ncommit all pending writes"
         fillcolor = "#FFCCBC"
-        style     = "filled,rounded"
     ]
 
     // ── Done ──────────────────────────────────────────────────────────────────
@@ -154,5 +153,7 @@ digraph pipeline_flow {
             fillcolor = "#FFF9C4"
             style     = "filled"
         ]
+
+        LegendAlways -> LegendClaimed -> LegendDecision [style = invis]
     }
 }
