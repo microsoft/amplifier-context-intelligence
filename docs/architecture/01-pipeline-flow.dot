@@ -1,0 +1,158 @@
+digraph pipeline_flow {
+    // ── Global defaults ──────────────────────────────────────────────────────
+    graph [
+        rankdir   = TB
+        splines   = ortho
+        nodesep   = 0.6
+        ranksep   = 0.7
+        fontname  = "Helvetica"
+        fontsize  = 11
+        label     = "Per-Event Execution Spine\n(context_intelligence_server)"
+        labelloc  = t
+        labeljust = c
+    ]
+    node [
+        fontname = "Helvetica"
+        fontsize = 11
+        style    = "filled,rounded"
+        shape    = box
+    ]
+    edge [
+        fontname = "Helvetica"
+        fontsize = 10
+    ]
+
+    // ── Entry ─────────────────────────────────────────────────────────────────
+    EventReceived [
+        label     = "Event Received"
+        shape     = oval
+        fillcolor = "#E3F2FD"
+    ]
+
+    // ── Session guarantee ─────────────────────────────────────────────────────
+    HasSessionId [
+        label     = "HasSessionId?"
+        shape     = diamond
+        fillcolor = "#FFF9C4"
+        style     = "filled"
+    ]
+
+    EnsureSessionNode [
+        label     = "EnsureSessionNode\nMERGE (:Session {session_id})"
+        fillcolor = "#FFFFFF"
+    ]
+
+    // ── Blob offload ──────────────────────────────────────────────────────────
+    HasBlobStore [
+        label     = "HasBlobStore?"
+        shape     = diamond
+        fillcolor = "#FFF9C4"
+        style     = "filled"
+    ]
+
+    BlobOffload [
+        label     = "BlobOffload\nprocess_event_data()\noffload large payloads → blob store"
+        fillcolor = "#FFFFFF"
+    ]
+
+    // ── DefaultHandler (ALWAYS) ───────────────────────────────────────────────
+    DefaultHandler [
+        label     = "DefaultHandler\n[ALWAYS runs]\n\nCREATE (:Event {\n  :FullPascal, :Category, :Event\n  tool_call_id tiebreaker\n})\n(Session)-[:HAS_EVENT]->(Event)"
+        fillcolor = "#C8E6C9"
+        fontname  = "Helvetica-Bold"
+        penwidth  = 2.5
+    ]
+
+    // ── Enricher loop ─────────────────────────────────────────────────────────
+    EnricherLoop [
+        label     = "EnricherLoop\nfor enricher in enrichers[]:\n  if event_type in enricher.handled_events"
+        fillcolor = "#E1BEE7"
+    ]
+
+    // ── Individual enrichers ──────────────────────────────────────────────────
+    SessionHandler [
+        label     = "SessionHandler [0]\nsession:start | session:fork | session:end\nMERGE session metadata\nupsert workspace / repo context"
+        fillcolor = "#F3E5F5"
+    ]
+
+    ToolCallHandler [
+        label     = "ToolCallHandler [1]\ntool:pre | tool:post | tool:error\nCREATE (:ToolCall)\nlink to parent Event"
+        fillcolor = "#F3E5F5"
+    ]
+
+    // ── Terminal check ────────────────────────────────────────────────────────
+    IsTerminal [
+        label     = "IsTerminal?\n(session:end)"
+        shape     = diamond
+        fillcolor = "#FFF9C4"
+        style     = "filled"
+    ]
+
+    // ── Flush ─────────────────────────────────────────────────────────────────
+    GraphFlush [
+        label     = "GraphFlush\ngraph.flush()\ncommit all pending writes"
+        fillcolor = "#FFCCBC"
+        style     = "filled,rounded"
+    ]
+
+    // ── Done ──────────────────────────────────────────────────────────────────
+    Done [
+        label     = "Done"
+        shape     = oval
+        fillcolor = "#E3F2FD"
+    ]
+
+    // ── Edges ─────────────────────────────────────────────────────────────────
+    EventReceived -> HasSessionId
+
+    HasSessionId  -> EnsureSessionNode [label = "no"]
+    HasSessionId  -> HasBlobStore      [label = "yes"]
+    EnsureSessionNode -> HasBlobStore
+
+    HasBlobStore  -> BlobOffload       [label = "yes"]
+    HasBlobStore  -> DefaultHandler    [label = "no"]
+    BlobOffload   -> DefaultHandler
+
+    DefaultHandler -> EnricherLoop
+
+    EnricherLoop  -> SessionHandler    [label = "event_type matches"]
+    EnricherLoop  -> ToolCallHandler   [label = "event_type matches"]
+    EnricherLoop  -> IsTerminal        [label = "no match / after enrichers"]
+
+    SessionHandler  -> IsTerminal
+    ToolCallHandler -> IsTerminal
+
+    IsTerminal -> GraphFlush [label = "yes\n(session:end)"]
+    IsTerminal -> Done       [label = "no"]
+
+    GraphFlush -> Done
+
+    // ── Legend ────────────────────────────────────────────────────────────────
+    subgraph cluster_legend {
+        graph [
+            label     = "Legend"
+            fontsize  = 10
+            fontname  = "Helvetica"
+            style     = "dashed"
+            color     = "#AAAAAA"
+        ]
+        node [fontsize = 10]
+
+        LegendAlways [
+            label     = "ALWAYS runs"
+            fillcolor = "#C8E6C9"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
+        ]
+        LegendClaimed [
+            label     = "if claimed\n(enricher match)"
+            fillcolor = "#F3E5F5"
+        ]
+        LegendDecision [
+            label     = "decision"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = "filled"
+        ]
+    }
+}
