@@ -1,12 +1,10 @@
 """Session registry — per-session worker management."""
 
 import asyncio
-import json
 import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +13,7 @@ from context_intelligence_server.config import get_settings
 from context_intelligence_server.dashboard import EventRecord, ring_buffer
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
 from context_intelligence_server.pipeline import process_event, setup_handlers
-from context_intelligence_server.services import HookStateService, SessionCursors
+from context_intelligence_server.services import HookStateService
 
 logger = logging.getLogger("context_intelligence_server")
 
@@ -237,17 +235,6 @@ class SessionRegistry:
                 logger.info(
                     "replay_mode: deleted persisted cursors for session %s", session_id
                 )
-            else:
-                # Normal mode: restore persisted cursors if available
-                persisted = self._load_persisted_cursors(session_id)
-                if persisted is not None:
-                    self._workers[session_id].services.set_cursors(
-                        session_id, persisted
-                    )
-                    logger.info(
-                        "cursor_restored: session %s restored from persisted state",
-                        session_id,
-                    )
             self.start_drain(self._workers[session_id])
         else:
             # Session already active — replay flag has no effect on existing workers.
@@ -313,97 +300,16 @@ class SessionRegistry:
     def _persist_cursors_sync(
         self, worker: SessionWorker, cursor_path: str | None = None
     ) -> None:
-        """Serialize worker's cursors to {cursor_path}/{session_id}/cursors.json.
-
-        Payload schema::
-
-            {
-                "last_updated": "<ISO-8601 UTC timestamp>",
-                "cursors": {
-                    "current_run_id": ...,
-                    "current_step_id": ...,
-                    "prompt_preview": ...,
-                    "parallel_groups": {...},
-                    "tool_call_map": {...},
-                },
-            }
-        """
-        if cursor_path is None:
-            cursor_path = get_settings().cursor_path
-
-        cursors = worker.services.get_cursors(worker.session_id)
-
-        session_dir = Path(cursor_path) / worker.session_id
-        session_dir.mkdir(parents=True, exist_ok=True)
-
-        payload = {
-            "last_updated": datetime.now(timezone.utc).isoformat(),
-            "cursors": {
-                "current_run_id": cursors.current_run_id,
-                "current_step_id": cursors.current_step_id,
-                "prompt_preview": cursors.prompt_preview,
-                "parallel_groups": cursors.parallel_groups,
-                "tool_call_map": cursors.tool_call_map,
-            },
-        }
-
-        cursor_file = session_dir / "cursors.json"
-        cursor_file.write_text(json.dumps(payload))
+        """No-op: cursor persistence removed (SessionCursors removed from services)."""
 
     def _load_persisted_cursors(
         self,
         session_id: str,
         cursor_path: str | None = None,
         ttl: float | None = None,
-    ) -> SessionCursors | None:
-        """Load cursors from disk, check TTL, return SessionCursors or None.
-
-        Returns ``None`` when the file is missing, corrupt, or expired
-        (``last_updated`` age exceeds *ttl* seconds).
-        """
-        if cursor_path is None:
-            cursor_path = get_settings().cursor_path
-
-        cursor_file = Path(cursor_path) / session_id / "cursors.json"
-
-        if not cursor_file.exists():
-            return None
-
-        try:
-            data = json.loads(cursor_file.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning(
-                "cursor_load_failed session=%s path=%s: %s",
-                session_id,
-                cursor_file,
-                exc,
-            )
-            return None
-
-        if ttl is not None:
-            try:
-                last_updated = datetime.fromisoformat(data["last_updated"])
-                age = (datetime.now(timezone.utc) - last_updated).total_seconds()
-                if age > ttl:
-                    return None
-            except (KeyError, ValueError) as exc:
-                logger.warning(
-                    "cursor_ttl_check_failed session=%s: %s", session_id, exc
-                )
-                return None
-
-        try:
-            cursors_data = data["cursors"]
-            return SessionCursors(
-                current_run_id=cursors_data.get("current_run_id"),
-                current_step_id=cursors_data.get("current_step_id"),
-                prompt_preview=cursors_data.get("prompt_preview", ""),
-                parallel_groups=cursors_data.get("parallel_groups", {}),
-                tool_call_map=cursors_data.get("tool_call_map", {}),
-            )
-        except (KeyError, TypeError) as exc:
-            logger.warning("cursor_deserialize_failed session=%s: %s", session_id, exc)
-            return None
+    ) -> None:
+        """No-op: cursor loading removed (SessionCursors removed from services)."""
+        return None
 
     def _delete_persisted_cursors(
         self, session_id: str, cursor_path: str | None = None

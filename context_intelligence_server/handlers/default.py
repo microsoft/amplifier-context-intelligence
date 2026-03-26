@@ -55,9 +55,8 @@ class DefaultHandler:
             },
         )
 
-        # Attach to active run if one exists, otherwise to session
-        cursors = self.services.get_cursors(session_id)
-        parent_id = cursors.current_run_id if cursors.current_run_id else session_id
+        # Attach to the session node
+        parent_id = session_id
 
         await self.services.graph.upsert_edge(
             parent_id,

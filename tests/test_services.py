@@ -1,17 +1,13 @@
-"""Tests for SessionCursors, HookConfig, and GraphState in services.py."""
+"""Tests for HookConfig, GraphState, and HookStateService in services.py."""
 
 from __future__ import annotations
 
-import dataclasses
+from unittest.mock import AsyncMock, patch
 
 from context_intelligence_server.services import (
     GraphState,
     HookConfig,
     HookStateService,
-    RecipeContext,
-    RunTokens,
-    SessionCursors,
-    StepContent,
 )
 
 
@@ -45,140 +41,6 @@ def test_hook_config_is_excluded_wildcard():
     assert cfg.is_excluded("session-naming:foo") is True
     assert cfg.is_excluded("session-naming:bar") is True
     assert cfg.is_excluded("tool-call:something") is False
-
-
-# ---------------------------------------------------------------------------
-# SessionCursors tests
-# ---------------------------------------------------------------------------
-
-
-def test_session_cursors_defaults():
-    """SessionCursors initialises with correct default values for remaining fields."""
-    sc = SessionCursors()
-    assert sc.current_run_id is None
-    assert sc.current_step_id is None
-    assert sc.prompt_preview == ""
-    assert sc.parallel_groups == {}
-    assert sc.tool_call_map == {}
-
-
-def test_session_cursors_is_dataclass():
-    """SessionCursors must be a proper dataclass with the pointer fields and sub-dataclass fields."""
-    assert dataclasses.is_dataclass(SessionCursors)
-    # Verify all expected fields are present via dataclasses.fields
-    field_names = {f.name for f in dataclasses.fields(SessionCursors)}
-    assert "current_run_id" in field_names
-    assert "current_step_id" in field_names
-    assert "prompt_preview" in field_names
-    assert "parallel_groups" in field_names
-    assert "tool_call_map" in field_names
-    # Counters must NOT be present — they are ephemeral accumulators
-    assert "run_counter" not in field_names
-    assert "step_counter" not in field_names
-
-
-def test_session_cursors_no_counter_fields():
-    """SessionCursors must not expose run_counter or step_counter attributes."""
-    sc = SessionCursors()
-    assert not hasattr(sc, "run_counter")
-    assert not hasattr(sc, "step_counter")
-
-
-# ---------------------------------------------------------------------------
-# TestSubDataclassDefaults tests
-# ---------------------------------------------------------------------------
-
-
-class TestSubDataclassDefaults:
-    """Tests for RunTokens, StepContent, RecipeContext, and expanded SessionCursors."""
-
-    def test_run_tokens_is_dataclass(self):
-        """RunTokens must be a proper dataclass."""
-        assert dataclasses.is_dataclass(RunTokens)
-
-    def test_run_tokens_defaults(self):
-        """RunTokens initialises with correct default values."""
-        rt = RunTokens()
-        assert rt.input_tokens == 0
-        assert rt.output_tokens == 0
-        assert rt.cached_tokens == 0
-        assert rt.reasoning_tokens == 0
-        assert rt.models_used == set()
-
-    def test_run_tokens_models_used_independent_instances(self):
-        """Each RunTokens() instance has its own models_used set (no shared mutable default)."""
-        rt1 = RunTokens()
-        rt2 = RunTokens()
-        rt1.models_used.add("model-a")
-        assert rt2.models_used == set()
-
-    def test_step_content_is_dataclass(self):
-        """StepContent must be a proper dataclass."""
-        assert dataclasses.is_dataclass(StepContent)
-
-    def test_step_content_defaults(self):
-        """StepContent initialises with correct default values."""
-        sc = StepContent()
-        assert sc.block_count == 0
-        assert sc.has_thinking is False
-
-    def test_recipe_context_is_dataclass(self):
-        """RecipeContext must be a proper dataclass."""
-        assert dataclasses.is_dataclass(RecipeContext)
-
-    def test_recipe_context_defaults(self):
-        """RecipeContext initialises with correct default values."""
-        rc = RecipeContext()
-        assert rc.name == ""
-        assert rc.description == ""
-        assert rc.total_steps == 0
-        assert rc.status == ""
-
-    def test_session_cursors_has_is_recipe_session(self):
-        """SessionCursors.is_recipe_session defaults to False."""
-        sc = SessionCursors()
-        assert sc.is_recipe_session is False
-
-    def test_session_cursors_has_run_tokens(self):
-        """SessionCursors.run_tokens defaults to a RunTokens instance."""
-        sc = SessionCursors()
-        assert isinstance(sc.run_tokens, RunTokens)
-
-    def test_session_cursors_has_step_content(self):
-        """SessionCursors.step_content defaults to a StepContent instance."""
-        sc = SessionCursors()
-        assert isinstance(sc.step_content, StepContent)
-
-    def test_session_cursors_has_recipe_context(self):
-        """SessionCursors.recipe_context defaults to a RecipeContext instance."""
-        sc = SessionCursors()
-        assert isinstance(sc.recipe_context, RecipeContext)
-
-    def test_session_cursors_sub_fields_independent_instances(self):
-        """Each SessionCursors() instance has its own sub-dataclass instances."""
-        sc1 = SessionCursors()
-        sc2 = SessionCursors()
-        assert sc1.run_tokens is not sc2.run_tokens
-        assert sc1.step_content is not sc2.step_content
-        assert sc1.recipe_context is not sc2.recipe_context
-
-    def test_run_tokens_atomic_reset(self):
-        """run_tokens supports atomic reset by wholesale replacement."""
-        sc = SessionCursors()
-        sc.run_tokens.input_tokens = 100
-        sc.run_tokens.models_used.add("gpt-4")
-        sc.run_tokens = RunTokens()
-        assert sc.run_tokens.input_tokens == 0
-        assert sc.run_tokens.models_used == set()
-
-    def test_step_content_atomic_reset(self):
-        """step_content supports atomic reset by wholesale replacement."""
-        sc = SessionCursors()
-        sc.step_content.block_count = 5
-        sc.step_content.has_thinking = True
-        sc.step_content = StepContent()
-        assert sc.step_content.block_count == 0
-        assert sc.step_content.has_thinking is False
 
 
 # ---------------------------------------------------------------------------
@@ -340,56 +202,20 @@ class TestHookStateService:
         svc = HookStateService(blob_store=sentinel)
         assert svc.blob_store is sentinel
 
-    def test_get_cursors_lazy_creation(self):
-        """get_cursors creates a SessionCursors on first access."""
+    def test_no_cursor_methods(self):
+        """HookStateService must not have get_cursors, set_cursors, or remove_cursors methods."""
         svc = HookStateService()
-        cursors = svc.get_cursors("session-1")
-        assert isinstance(cursors, SessionCursors)
+        assert not hasattr(svc, "get_cursors")
+        assert not hasattr(svc, "set_cursors")
+        assert not hasattr(svc, "remove_cursors")
 
-    def test_get_cursors_same_instance(self):
-        """get_cursors returns the same SessionCursors instance for the same session_id."""
+    def test_no_cursors_dict(self):
+        """HookStateService must not have a _cursors attribute."""
         svc = HookStateService()
-        c1 = svc.get_cursors("session-1")
-        c2 = svc.get_cursors("session-1")
-        assert c1 is c2
-
-    def test_get_cursors_different_sessions(self):
-        """get_cursors returns distinct SessionCursors for distinct session ids."""
-        svc = HookStateService()
-        c1 = svc.get_cursors("session-1")
-        c2 = svc.get_cursors("session-2")
-        assert c1 is not c2
-
-    def test_remove_cursors_resets(self):
-        """remove_cursors causes get_cursors to create a fresh instance on the next call."""
-        svc = HookStateService()
-        c1 = svc.get_cursors("session-1")
-        svc.remove_cursors("session-1")
-        c2 = svc.get_cursors("session-1")
-        assert c1 is not c2
-
-    def test_remove_cursors_safe_for_nonexistent(self):
-        """remove_cursors does not raise when session_id has no cursors entry."""
-        svc = HookStateService()
-        svc.remove_cursors("nonexistent-session")  # must not raise
-
-    def test_set_cursors_restores_state(self):
-        """set_cursors replaces the cursor entry; get_cursors returns the injected instance."""
-        svc = HookStateService()
-        cursors = SessionCursors(
-            current_run_id="run-123",
-            current_step_id="step-456",
-            prompt_preview="hello",
-        )
-        svc.set_cursors("session-1", cursors)
-        restored = svc.get_cursors("session-1")
-        assert restored is cursors
-        assert restored.current_run_id == "run-123"
-        assert restored.current_step_id == "step-456"
-        assert restored.prompt_preview == "hello"
+        assert not hasattr(svc, "_cursors")
 
     async def test_ensure_session_node_creates_root(self):
-        """ensure_session_node creates a Session+Root node when no parent field is present."""
+        """ensure_session_node creates a RootSession+Session node when no parent field is present."""
         svc = HookStateService()
         await svc.ensure_session_node(
             "session-1", {"started_at": "2024-01-01T00:00:00"}
@@ -397,7 +223,7 @@ class TestHookStateService:
         node = await svc.graph.get_node("session-1")
         assert node is not None
         assert "Session" in node["labels"]
-        assert "Root" in node["labels"]
+        assert "RootSession" in node["labels"]
         assert node["status"] == "running"
 
     async def test_ensure_session_node_is_idempotent(self):
@@ -417,7 +243,7 @@ class TestHookStateService:
         assert node["status"] == "modified"
 
     async def test_ensure_session_node_creates_subsession(self):
-        """ensure_session_node creates a Session+Subsession node when parent_id is present."""
+        """ensure_session_node creates a SubSession+Session node when parent_id is present."""
         svc = HookStateService()
         await svc.ensure_session_node(
             "session-2",
@@ -426,7 +252,7 @@ class TestHookStateService:
         node = await svc.graph.get_node("session-2")
         assert node is not None
         assert "Session" in node["labels"]
-        assert "Subsession" in node["labels"]
+        assert "SubSession" in node["labels"]
         assert node["status"] == "running"
 
     async def test_ensure_session_node_parent_field_creates_subsession(self):
@@ -439,7 +265,7 @@ class TestHookStateService:
         node = await svc.graph.get_node("session-3")
         assert node is not None
         assert "Session" in node["labels"]
-        assert "Subsession" in node["labels"]
+        assert "SubSession" in node["labels"]
 
     async def test_ensure_session_node_graph_backed_repopulates_cache(self):
         """When session node already exists in graph but not in _seen_sessions cache,
@@ -449,7 +275,7 @@ class TestHookStateService:
         await svc.graph.upsert_node(
             "session-replay",
             {
-                "labels": ["Session", "Root"],
+                "labels": ["Session", "RootSession"],
                 "status": "running",
                 "started_at": "2024-01-01T00:00:00",
             },
@@ -471,7 +297,7 @@ class TestHookStateService:
         assert node["started_at"] == "2024-01-01T00:00:00"
 
     async def test_ensure_session_node_graph_backed_creates_when_absent(self):
-        """ensure_session_node creates a Root node when the session is absent from both
+        """ensure_session_node creates a RootSession node when the session is absent from both
         _seen_sessions cache and the graph."""
         svc = HookStateService()
         # Both graph and cache are empty — node should be created
@@ -481,32 +307,32 @@ class TestHookStateService:
 
         node = await svc.graph.get_node("session-new")
         assert node is not None
-        assert "Root" in node["labels"]
+        assert "RootSession" in node["labels"]
         assert "session-new" in svc._seen_sessions
 
     async def test_ensure_session_node_no_label_change_on_existing(self):
-        """When a Subsession node already exists in the graph, ensure_session_node must NOT
-        add a Root label to it — labels on existing nodes are never changed."""
+        """When a SubSession node already exists in the graph, ensure_session_node must NOT
+        add a RootSession label to it — labels on existing nodes are never changed."""
         svc = HookStateService()
-        # Pre-create a Subsession node (e.g. already stored from a previous run)
+        # Pre-create a SubSession node (e.g. already stored from a previous run)
         await svc.graph.upsert_node(
             "session-sub",
             {
-                "labels": ["Session", "Subsession"],
+                "labels": ["Session", "SubSession"],
                 "status": "running",
                 "started_at": "2024-01-01T00:00:00",
             },
         )
 
-        # Call without a parent field — a naive implementation would add a Root label
+        # Call without a parent field — a naive implementation would add a RootSession label
         await svc.ensure_session_node("session-sub", {})
 
         node = await svc.graph.get_node("session-sub")
         assert node is not None
-        # Root must NOT have been added to an existing Subsession node
-        assert "Root" not in node["labels"]
-        # Subsession label must still be present
-        assert "Subsession" in node["labels"]
+        # RootSession must NOT have been added to an existing SubSession node
+        assert "RootSession" not in node["labels"]
+        # SubSession label must still be present
+        assert "SubSession" in node["labels"]
 
 
 # ---------------------------------------------------------------------------
@@ -520,31 +346,23 @@ class TestEnsureSessionNodeWriteFailure:
     async def test_failed_upsert_does_not_cache_session(self):
         """If upsert_node raises, session_id must NOT be added to _seen_sessions so
         a subsequent call can retry and succeed."""
-        from unittest.mock import AsyncMock
-
         svc = HookStateService()
 
-        # Save the original upsert_node method
-        original_upsert_node = svc.graph.upsert_node
-
-        # Replace with a failing mock
-        svc.graph.upsert_node = AsyncMock(side_effect=OSError("write failed"))
-
-        # Call ensure_session_node — expect the OSError to propagate
-        try:
-            await svc.ensure_session_node(
-                "session-fail", {"started_at": "2024-01-01T00:00:00"}
-            )
-        except OSError:
-            pass
+        # Replace with a failing mock using patch.object — restores automatically on exit
+        with patch.object(
+            svc.graph, "upsert_node", AsyncMock(side_effect=OSError("write failed"))
+        ):
+            try:
+                await svc.ensure_session_node(
+                    "session-fail", {"started_at": "2024-01-01T00:00:00"}
+                )
+            except OSError:
+                pass
 
         # The session id must NOT have been cached because the write failed
         assert "session-fail" not in svc._seen_sessions
 
-        # Restore original upsert_node
-        svc.graph.upsert_node = original_upsert_node
-
-        # Retry — should succeed now
+        # Retry — should succeed now that the original upsert_node is restored
         await svc.ensure_session_node(
             "session-fail", {"started_at": "2024-01-01T00:00:00"}
         )

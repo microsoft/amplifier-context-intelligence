@@ -16,7 +16,7 @@ from context_intelligence_server.registry import (
     SessionRegistry,
     SessionWorker,
 )
-from context_intelligence_server.services import HookStateService, SessionCursors
+from context_intelligence_server.services import HookStateService
 
 
 # ---------------------------------------------------------------------------
@@ -825,8 +825,8 @@ class TestStaleSessionReaping:
 
     @pytest.mark.asyncio
     async def test_stale_worker_reaped_after_timeout(self, tmp_path: Path) -> None:
-        """Worker with last_event_time ~5.8 days ago gets cursors persisted,
-        graph.close called, deregistered, and cursor file exists."""
+        """Worker with last_event_time ~5.8 days ago gets graph.close called
+        and is deregistered."""
         from unittest.mock import MagicMock
 
         reg = SessionRegistry()
@@ -853,8 +853,6 @@ class TestStaleSessionReaping:
 
         assert "stale-session" not in reg._workers
         worker.services.graph.close.assert_awaited_once()
-        cursor_file = tmp_path / "stale-session" / "cursors.json"
-        assert cursor_file.exists()
 
     @pytest.mark.asyncio
     async def test_stale_session_not_added_to_completed(self, tmp_path: Path) -> None:
@@ -986,40 +984,23 @@ class TestCursorPersistence:
     """SessionRegistry cursor persistence: _persist_cursors_sync, _load_persisted_cursors,
     _delete_persisted_cursors."""
 
-    def test_persist_cursors_creates_file(self, tmp_path: Path) -> None:
-        """_persist_cursors_sync writes JSON at {cursor_path}/{session_id}/cursors.json
-        with last_updated (ISO-8601) and cursor fields."""
-        import json
-
+    def test_persist_cursors_is_noop(self, tmp_path: Path) -> None:
+        """_persist_cursors_sync is a no-op (SessionCursors removed)."""
         registry = SessionRegistry()
         worker = SessionWorker(
             session_id="test-session",
             workspace="/workspace/test",
             services=HookStateService(workspace="/workspace/test"),
         )
-        cursors = worker.services.get_cursors("test-session")
-        cursors.current_run_id = "run-1"
-        cursors.current_step_id = "step-1"
-        cursors.prompt_preview = "Hello, World!"
-        cursors.parallel_groups = {"g1": ["a", "b"]}
-        cursors.tool_call_map = {"call1": "result1"}
 
+        # Should not raise and should not create any files
         registry._persist_cursors_sync(worker, cursor_path=str(tmp_path))
 
         expected_path = tmp_path / "test-session" / "cursors.json"
-        assert expected_path.exists()
+        assert not expected_path.exists()
 
-        data = json.loads(expected_path.read_text())
-        assert "last_updated" in data
-        assert "cursors" in data
-        assert data["cursors"]["current_run_id"] == "run-1"
-        assert data["cursors"]["current_step_id"] == "step-1"
-        assert data["cursors"]["prompt_preview"] == "Hello, World!"
-        assert data["cursors"]["parallel_groups"] == {"g1": ["a", "b"]}
-        assert data["cursors"]["tool_call_map"] == {"call1": "result1"}
-
-    def test_load_persisted_cursors_restores(self, tmp_path: Path) -> None:
-        """_load_persisted_cursors restores SessionCursors from disk with correct fields."""
+    def test_load_persisted_cursors_returns_none(self, tmp_path: Path) -> None:
+        """_load_persisted_cursors always returns None (SessionCursors removed)."""
         import json
         from datetime import datetime, timezone
 
@@ -1029,9 +1010,6 @@ class TestCursorPersistence:
             "cursors": {
                 "current_run_id": "run-abc",
                 "current_step_id": "step-xyz",
-                "prompt_preview": "Test prompt",
-                "parallel_groups": {"group1": ["a", "b"]},
-                "tool_call_map": {"call1": "result1"},
             },
         }
         session_dir = tmp_path / "test-session"
@@ -1042,13 +1020,8 @@ class TestCursorPersistence:
             "test-session", cursor_path=str(tmp_path)
         )
 
-        assert result is not None
-        assert isinstance(result, SessionCursors)
-        assert result.current_run_id == "run-abc"
-        assert result.current_step_id == "step-xyz"
-        assert result.prompt_preview == "Test prompt"
-        assert result.parallel_groups == {"group1": ["a", "b"]}
-        assert result.tool_call_map == {"call1": "result1"}
+        # Always returns None since SessionCursors no longer exists
+        assert result is None
 
     def test_load_persisted_cursors_returns_none_when_missing(
         self, tmp_path: Path
@@ -1114,52 +1087,27 @@ class TestCursorPersistence:
         assert not cursor_file.exists()
 
     @pytest.mark.asyncio
-    async def test_get_or_create_restores_cursors_when_not_replay(
+    async def test_get_or_create_creates_worker_when_not_replay(
         self, tmp_path: Path
     ) -> None:
-        """get_or_create loads and restores persisted cursors when replay=False."""
-        import json
-        from datetime import datetime, timezone
-
-        cursor_data = {
-            "last_updated": datetime.now(timezone.utc).isoformat(),
-            "cursors": {
-                "current_run_id": "run-restored",
-                "current_step_id": "step-restored",
-                "prompt_preview": "restored preview",
-                "parallel_groups": {},
-                "tool_call_map": {},
-            },
-        }
-        # safe_cursor_path fixture patches get_settings().cursor_path → tmp_path
-        session_dir = tmp_path / "session-restore"
-        session_dir.mkdir()
-        (session_dir / "cursors.json").write_text(json.dumps(cursor_data))
-
+        """get_or_create creates a worker (cursor restoration removed since SessionCursors removed)."""
         reg = SessionRegistry()
         worker = reg.get_or_create("session-restore", "/ws", replay=False)
 
-        cursors = worker.services.get_cursors("session-restore")
-        assert cursors.current_run_id == "run-restored"
-        assert cursors.current_step_id == "step-restored"
-        assert cursors.prompt_preview == "restored preview"
+        assert worker is not None
+        assert worker.session_id == "session-restore"
+        assert isinstance(worker.services, HookStateService)
 
     @pytest.mark.asyncio
     async def test_get_or_create_deletes_cursors_when_replay(
         self, tmp_path: Path
     ) -> None:
-        """get_or_create deletes persisted cursors when replay=True."""
+        """get_or_create deletes persisted cursor files when replay=True."""
         import json
 
         cursor_data = {
             "last_updated": "2024-01-01T00:00:00+00:00",
-            "cursors": {
-                "current_run_id": "run-old",
-                "current_step_id": "step-old",
-                "prompt_preview": "",
-                "parallel_groups": {},
-                "tool_call_map": {},
-            },
+            "cursors": {},
         }
         # safe_cursor_path fixture patches get_settings().cursor_path → tmp_path
         session_dir = tmp_path / "session-replay"
@@ -1169,13 +1117,10 @@ class TestCursorPersistence:
         assert cursor_file.exists()
 
         reg = SessionRegistry()
-        worker = reg.get_or_create("session-replay", "/ws", replay=True)
+        reg.get_or_create("session-replay", "/ws", replay=True)
 
         # Cursor file should be deleted
         assert not cursor_file.exists()
-        # In-memory cursors should be empty (not restored from deleted file)
-        cursors = worker.services.get_cursors("session-replay")
-        assert cursors.current_run_id is None
 
     def test_purge_all_cursors_deletes_all_files_and_returns_count(
         self, tmp_path: Path
@@ -1257,62 +1202,18 @@ class TestProcessOneLogsException:
 
 
 class TestCursorLoadLogging:
-    """R-2, R-3, R-4: _load_persisted_cursors logs warnings on corrupt/invalid data."""
+    """_load_persisted_cursors is now a no-op (SessionCursors removed)."""
 
-    def test_corrupt_json_logs_warning(self, tmp_path, caplog):
-        import logging
-
-        session_dir = tmp_path / "sess-corrupt"
-        session_dir.mkdir()
-        (session_dir / "cursors.json").write_text("{corrupt json!!!}")
-        registry = SessionRegistry()
-        with caplog.at_level(logging.WARNING, logger="context_intelligence_server"):
-            result = registry._load_persisted_cursors(
-                "sess-corrupt", cursor_path=str(tmp_path)
-            )
-        assert result is None
-        assert "cursor_load_failed" in caplog.text
-        assert "sess-corrupt" in caplog.text
-
-    def test_bad_last_updated_logs_warning(self, tmp_path, caplog):
+    def test_load_always_returns_none(self, tmp_path) -> None:
+        """_load_persisted_cursors always returns None regardless of file contents."""
         import json
-        import logging
 
-        session_dir = tmp_path / "sess-bad-ts"
+        session_dir = tmp_path / "sess-any"
         session_dir.mkdir()
-        cursor_data = {
-            "last_updated": "not-a-timestamp",
-            "cursors": {
-                "current_run_id": None,
-                "current_step_id": None,
-                "prompt_preview": "",
-                "parallel_groups": {},
-                "tool_call_map": {},
-            },
-        }
+        cursor_data = {"last_updated": "2026-01-01T00:00:00+00:00", "cursors": {}}
         (session_dir / "cursors.json").write_text(json.dumps(cursor_data))
         registry = SessionRegistry()
-        with caplog.at_level(logging.WARNING, logger="context_intelligence_server"):
-            result = registry._load_persisted_cursors(
-                "sess-bad-ts", cursor_path=str(tmp_path), ttl=1.0
-            )
+        result = registry._load_persisted_cursors(
+            "sess-any", cursor_path=str(tmp_path)
+        )
         assert result is None
-        assert "cursor_ttl_check_failed" in caplog.text
-        assert "sess-bad-ts" in caplog.text
-
-    def test_missing_cursors_key_logs_warning(self, tmp_path, caplog):
-        import json
-        import logging
-
-        session_dir = tmp_path / "sess-no-key"
-        session_dir.mkdir()
-        cursor_data = {"last_updated": "2026-01-01T00:00:00+00:00"}
-        (session_dir / "cursors.json").write_text(json.dumps(cursor_data))
-        registry = SessionRegistry()
-        with caplog.at_level(logging.WARNING, logger="context_intelligence_server"):
-            result = registry._load_persisted_cursors(
-                "sess-no-key", cursor_path=str(tmp_path)
-            )
-        assert result is None
-        assert "cursor_deserialize_failed" in caplog.text
-        assert "sess-no-key" in caplog.text

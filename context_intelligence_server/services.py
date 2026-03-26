@@ -1,10 +1,5 @@
-"""SessionCursors, HookConfig, GraphState, and HookStateService primitives.
+"""HookConfig, GraphState, and HookStateService primitives.
 
-- RunTokens        — per-run token accumulator sub-dataclass (reset at execution:start)
-- StepContent      — per-step content tracker sub-dataclass (reset at provider:request)
-- RecipeContext    — recipe metadata sub-dataclass (set at recipe:start)
-- SessionCursors   — per-session cursor tracking (dataclass); owns RunTokens,
-                     StepContent, and RecipeContext via atomic-replaceable fields
 - HookConfig       — event-exclusion configuration wrapper
 - GraphState       — in-memory property graph conforming to GraphStore protocol
 - HookStateService — server-side hook state service (no external dependencies)
@@ -12,82 +7,8 @@
 
 from __future__ import annotations
 
-import dataclasses
 import fnmatch
 from typing import Any
-
-
-# ---------------------------------------------------------------------------
-# SessionCursors sub-dataclasses
-# ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass
-class RunTokens:
-    """Per-run token accumulator.
-
-    Reset atomically at execution:start by replacing the instance wholesale
-    (e.g. ``cursors.run_tokens = RunTokens()``).  Flushed at
-    orchestrator:complete.
-    """
-
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cached_tokens: int = 0
-    reasoning_tokens: int = 0
-    models_used: set[str] = dataclasses.field(default_factory=set)
-
-
-@dataclasses.dataclass
-class StepContent:
-    """Per-step content tracker.
-
-    Reset atomically at provider:request by replacing the instance wholesale
-    (e.g. ``cursors.step_content = StepContent()``).  Flushed at
-    llm:response.
-    """
-
-    block_count: int = 0
-    has_thinking: bool = False
-
-
-@dataclasses.dataclass
-class RecipeContext:
-    """Recipe metadata.
-
-    Written once at recipe:start and held for the duration of the recipe
-    session.
-    """
-
-    name: str = ""
-    description: str = ""
-    total_steps: int = 0
-    status: str = ""
-
-
-# ---------------------------------------------------------------------------
-# SessionCursors
-# ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass
-class SessionCursors:
-    """Pointer-only state and lightweight accumulators.
-
-    Pointer fields are reconstructable from ordered event replay.
-    Sub-dataclass fields (run_tokens, step_content, recipe_context) support
-    atomic reset by wholesale replacement, e.g. ``sc.run_tokens = RunTokens()``.
-    """
-
-    current_run_id: str | None = None
-    current_step_id: str | None = None
-    prompt_preview: str = ""
-    parallel_groups: dict[str, list[str]] = dataclasses.field(default_factory=dict)
-    tool_call_map: dict[str, str] = dataclasses.field(default_factory=dict)
-    is_recipe_session: bool = False
-    run_tokens: RunTokens = dataclasses.field(default_factory=RunTokens)
-    step_content: StepContent = dataclasses.field(default_factory=StepContent)
-    recipe_context: RecipeContext = dataclasses.field(default_factory=RecipeContext)
 
 
 # ---------------------------------------------------------------------------
@@ -237,8 +158,8 @@ class GraphState:
 class HookStateService:
     """Server-side hook state service.
 
-    Owns the per-session cursor map, the graph store, and the set of already-seen
-    sessions.  The workspace is set directly at construction time.
+    Owns the graph store and the set of already-seen sessions.  The workspace
+    is set directly at construction time.
     """
 
     def __init__(
@@ -256,36 +177,7 @@ class HookStateService:
             self.graph = GraphState()
         self.graph.workspace = workspace
         self.blob_store = blob_store
-        self._cursors: dict[str, SessionCursors] = {}
         self._seen_sessions: set[str] = set()
-
-    # ------------------------------------------------------------------
-    # Cursor management
-    # ------------------------------------------------------------------
-
-    def get_cursors(self, session_id: str) -> SessionCursors:
-        """Return (creating if necessary) the SessionCursors for *session_id*.
-
-        The same instance is returned on every subsequent call for the same id.
-        """
-        if session_id not in self._cursors:
-            self._cursors[session_id] = SessionCursors()
-        return self._cursors[session_id]
-
-    def set_cursors(self, session_id: str, cursors: SessionCursors) -> None:
-        """Replace the SessionCursors entry for *session_id* with *cursors*.
-
-        Used to restore persisted cursor state into a freshly-created worker.
-        """
-        self._cursors[session_id] = cursors
-
-    def remove_cursors(self, session_id: str) -> None:
-        """Remove the SessionCursors entry for *session_id*.
-
-        Safe to call when *session_id* has no entry — this is a no-op in that
-        case.
-        """
-        self._cursors.pop(session_id, None)
 
     # ------------------------------------------------------------------
     # Session node management
@@ -301,9 +193,12 @@ class HookStateService:
         2. Graph query — call ``graph.get_node(session_id)``.  If the node
            already exists (e.g. from a previous run), repopulate the cache and
            return without overwriting any data.  If the node is absent, create
-           it with the appropriate labels (``Session + Root`` when no parent is
-           present, ``Session + Subsession`` when *data* contains a
+           it with the appropriate labels (``Session + RootSession`` when no
+           parent is present, ``Session + SubSession`` when *data* contains a
            ``parent_id`` or ``parent`` field) and set ``status = 'running'``.
+
+        Only caches session_id after a successful write to ensure retry
+        resilience on write failure.
         """
         # Tier 1: fast path — warm cache hit
         if session_id in self._seen_sessions:
@@ -318,7 +213,7 @@ class HookStateService:
 
         # Node absent from both cache and graph — create it
         parent = data.get("parent_id") or data.get("parent")
-        labels = ["Session", "Subsession" if parent else "Root"]
+        labels = ["SubSession", "Session"] if parent else ["RootSession", "Session"]
 
         node_data: dict[str, Any] = {
             "labels": labels,

@@ -57,9 +57,9 @@ class SessionHandler:
         parent_id = (data.get("parent_id") or "").strip()
 
         if parent_id:
-            labels: list[str] = ["Session", "Subsession"]
+            labels: list[str] = ["Session", "SubSession"]
         else:
-            labels = ["Session", "Root"]
+            labels = ["Session", "RootSession"]
 
         await self.services.graph.upsert_node(
             session_id,
@@ -71,11 +71,6 @@ class SessionHandler:
                 "data": json.dumps(data),
             },
         )
-
-        cursors = self.services.get_cursors(session_id)
-        metadata = data.get("metadata") or {}
-        if metadata.get("recipe_name"):
-            cursors.is_recipe_session = True
 
         if parent_id:
             await self.services.ensure_session_node(parent_id, {})
@@ -95,9 +90,9 @@ class SessionHandler:
         parent = data.get("parent")
 
         if parent:
-            labels: list[str] = ["Session", "Subsession", "ForkedSession"]
+            labels: list[str] = ["Session", "SubSession", "ForkedSession"]
         else:
-            labels = ["Session", "Root", "ForkedSession"]
+            labels = ["Session", "RootSession", "ForkedSession"]
             log.warning(
                 "session:fork for %r has no parent — degrading to Root", session_id
             )
@@ -112,11 +107,6 @@ class SessionHandler:
                 "data": json.dumps(data),
             },
         )
-
-        cursors = self.services.get_cursors(session_id)
-        metadata = data.get("metadata") or {}
-        if metadata.get("recipe_name"):
-            cursors.is_recipe_session = True
 
         if parent:
             await self.services.ensure_session_node(parent, {})
@@ -143,5 +133,3 @@ class SessionHandler:
         # session:end; all buffered data must reach the backing store before
         # the process can exit. schedule_flush() is for intermediate events only.
         await self.services.graph.flush()
-
-        self.services.remove_cursors(session_id)
