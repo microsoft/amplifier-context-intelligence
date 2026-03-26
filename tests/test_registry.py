@@ -307,14 +307,13 @@ class TestDrainLoopCallsProcessEvent:
         )
         worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
 
-        with patch.object(reg, "_persist_cursors_sync"):
-            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
-            await asyncio.sleep(0.02)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+        await asyncio.sleep(0.02)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
         worker.services.graph.close.assert_awaited_once()
 
@@ -914,45 +913,6 @@ class TestStaleSessionReaping:
 
         assert "stale-session" not in reg._workers
 
-    @pytest.mark.asyncio
-    async def test_stale_reap_persist_error_still_closes_and_deregisters(
-        self, tmp_path: Path
-    ) -> None:
-        """If _persist_cursors_sync raises during stale reaping,
-        graph.close is still called and the worker is still deregistered."""
-        from unittest.mock import MagicMock
-
-        reg = SessionRegistry()
-        worker = SessionWorker(
-            session_id="stale-session",
-            workspace="/workspace/test",
-            services=HookStateService(workspace="/workspace/test"),
-        )
-        worker.last_event_time = time.time() - (5.8 * 24 * 3600)
-        reg._register_for_test(worker)
-        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
-
-        mock_settings = MagicMock()
-        mock_settings.stale_session_timeout = 432000.0  # 5 days
-        mock_settings.cursor_path = str(tmp_path)
-
-        with (
-            patch(
-                "context_intelligence_server.registry.get_settings",
-                return_value=mock_settings,
-            ),
-            patch.object(
-                reg,
-                "_persist_cursors_sync",
-                side_effect=OSError("disk full"),
-            ),
-        ):
-            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
-            await asyncio.wait_for(task, timeout=2.0)
-
-        worker.services.graph.close.assert_awaited_once()
-        assert "stale-session" not in reg._workers
-
 
 class TestCancelledErrorCallsClose:
     """CancelledError causes graph.close() (not just flush) to be called."""
@@ -968,194 +928,31 @@ class TestCancelledErrorCallsClose:
         )
         worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
 
-        with patch.object(reg, "_persist_cursors_sync"):
-            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
-            await asyncio.sleep(0.02)
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+        await asyncio.sleep(0.02)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
         worker.services.graph.close.assert_awaited_once()
 
 
 class TestCursorPersistence:
-    """SessionRegistry cursor persistence: _persist_cursors_sync, _load_persisted_cursors,
-    _delete_persisted_cursors."""
-
-    def test_persist_cursors_is_noop(self, tmp_path: Path) -> None:
-        """_persist_cursors_sync is a no-op (SessionCursors removed)."""
-        registry = SessionRegistry()
-        worker = SessionWorker(
-            session_id="test-session",
-            workspace="/workspace/test",
-            services=HookStateService(workspace="/workspace/test"),
-        )
-
-        # Should not raise and should not create any files
-        registry._persist_cursors_sync(worker, cursor_path=str(tmp_path))
-
-        expected_path = tmp_path / "test-session" / "cursors.json"
-        assert not expected_path.exists()
-
-    def test_load_persisted_cursors_returns_none(self, tmp_path: Path) -> None:
-        """_load_persisted_cursors always returns None (SessionCursors removed)."""
-        import json
-        from datetime import datetime, timezone
-
-        registry = SessionRegistry()
-        cursor_data = {
-            "last_updated": datetime.now(timezone.utc).isoformat(),
-            "cursors": {
-                "current_run_id": "run-abc",
-                "current_step_id": "step-xyz",
-            },
-        }
-        session_dir = tmp_path / "test-session"
-        session_dir.mkdir()
-        (session_dir / "cursors.json").write_text(json.dumps(cursor_data))
-
-        result = registry._load_persisted_cursors(
-            "test-session", cursor_path=str(tmp_path)
-        )
-
-        # Always returns None since SessionCursors no longer exists
-        assert result is None
-
-    def test_load_persisted_cursors_returns_none_when_missing(
-        self, tmp_path: Path
-    ) -> None:
-        """_load_persisted_cursors returns None when cursor file does not exist."""
-        registry = SessionRegistry()
-        result = registry._load_persisted_cursors(
-            "nonexistent-session", cursor_path=str(tmp_path)
-        )
-        assert result is None
-
-    def test_load_persisted_cursors_returns_none_when_expired(
-        self, tmp_path: Path
-    ) -> None:
-        """_load_persisted_cursors returns None when last_updated exceeds TTL
-        (2020-01-01 timestamp is far in the past)."""
-        import json
-
-        registry = SessionRegistry()
-        cursor_data = {
-            "last_updated": "2020-01-01T00:00:00+00:00",
-            "cursors": {
-                "current_run_id": "run-old",
-                "current_step_id": "step-old",
-                "prompt_preview": "",
-                "parallel_groups": {},
-                "tool_call_map": {},
-            },
-        }
-        session_dir = tmp_path / "test-session"
-        session_dir.mkdir()
-        (session_dir / "cursors.json").write_text(json.dumps(cursor_data))
-
-        # TTL of 1 second — 2020-01-01 is far past that
-        result = registry._load_persisted_cursors(
-            "test-session", cursor_path=str(tmp_path), ttl=1.0
-        )
-        assert result is None
-
-    def test_delete_persisted_cursors(self, tmp_path: Path) -> None:
-        """_delete_persisted_cursors removes the cursor file when it exists."""
-        import json
-
-        registry = SessionRegistry()
-        cursor_data = {
-            "last_updated": "2024-01-01T00:00:00+00:00",
-            "cursors": {
-                "current_run_id": None,
-                "current_step_id": None,
-                "prompt_preview": "",
-                "parallel_groups": {},
-                "tool_call_map": {},
-            },
-        }
-        session_dir = tmp_path / "test-session"
-        session_dir.mkdir()
-        cursor_file = session_dir / "cursors.json"
-        cursor_file.write_text(json.dumps(cursor_data))
-        assert cursor_file.exists()
-
-        registry._delete_persisted_cursors("test-session", cursor_path=str(tmp_path))
-
-        assert not cursor_file.exists()
+    """SessionRegistry get_or_create creates workers correctly."""
 
     @pytest.mark.asyncio
     async def test_get_or_create_creates_worker_when_not_replay(
         self, tmp_path: Path
     ) -> None:
-        """get_or_create creates a worker (cursor restoration removed since SessionCursors removed)."""
+        """get_or_create creates a worker (cursor persistence removed)."""
         reg = SessionRegistry()
         worker = reg.get_or_create("session-restore", "/ws", replay=False)
 
         assert worker is not None
         assert worker.session_id == "session-restore"
         assert isinstance(worker.services, HookStateService)
-
-    @pytest.mark.asyncio
-    async def test_get_or_create_deletes_cursors_when_replay(
-        self, tmp_path: Path
-    ) -> None:
-        """get_or_create deletes persisted cursor files when replay=True."""
-        import json
-
-        cursor_data = {
-            "last_updated": "2024-01-01T00:00:00+00:00",
-            "cursors": {},
-        }
-        # safe_cursor_path fixture patches get_settings().cursor_path → tmp_path
-        session_dir = tmp_path / "session-replay"
-        session_dir.mkdir()
-        cursor_file = session_dir / "cursors.json"
-        cursor_file.write_text(json.dumps(cursor_data))
-        assert cursor_file.exists()
-
-        reg = SessionRegistry()
-        reg.get_or_create("session-replay", "/ws", replay=True)
-
-        # Cursor file should be deleted
-        assert not cursor_file.exists()
-
-    def test_purge_all_cursors_deletes_all_files_and_returns_count(
-        self, tmp_path: Path
-    ) -> None:
-        """purge_all_cursors() removes all cursors.json files and returns the count."""
-        import json
-
-        reg = SessionRegistry()
-        sessions = ["sess-x", "sess-y", "sess-z"]
-        cursor_files = []
-        for sid in sessions:
-            session_dir = tmp_path / sid
-            session_dir.mkdir()
-            cursor_file = session_dir / "cursors.json"
-            cursor_file.write_text(
-                json.dumps(
-                    {
-                        "last_updated": "2024-01-01T00:00:00Z",
-                        "cursors": {},
-                    }
-                )
-            )
-            cursor_files.append(cursor_file)
-
-        count = reg.purge_all_cursors(cursor_path=str(tmp_path))
-
-        assert count == len(sessions)
-        for cursor_file in cursor_files:
-            assert not cursor_file.exists()
-
-    def test_purge_all_cursors_returns_zero_when_empty(self, tmp_path: Path) -> None:
-        """purge_all_cursors() returns 0 when no cursor files exist (idempotent)."""
-        reg = SessionRegistry()
-        count = reg.purge_all_cursors(cursor_path=str(tmp_path))
-        assert count == 0
 
 
 class TestProcessOneLogsException:
@@ -1201,19 +998,31 @@ class TestProcessOneLogsException:
         assert "tool_call" in caplog.text
 
 
-class TestCursorLoadLogging:
-    """_load_persisted_cursors is now a no-op (SessionCursors removed)."""
+class TestCursorPersistenceRemoved:
+    """Verify that all cursor persistence methods have been removed from SessionRegistry."""
 
-    def test_load_always_returns_none(self, tmp_path) -> None:
-        """_load_persisted_cursors always returns None regardless of file contents."""
-        import json
+    def test_no_persist_cursors_sync_method(self) -> None:
+        """SessionRegistry must not have _persist_cursors_sync method."""
+        assert not hasattr(SessionRegistry, "_persist_cursors_sync")
 
-        session_dir = tmp_path / "sess-any"
-        session_dir.mkdir()
-        cursor_data = {"last_updated": "2026-01-01T00:00:00+00:00", "cursors": {}}
-        (session_dir / "cursors.json").write_text(json.dumps(cursor_data))
-        registry = SessionRegistry()
-        result = registry._load_persisted_cursors(
-            "sess-any", cursor_path=str(tmp_path)
-        )
-        assert result is None
+    def test_no_load_persisted_cursors_method(self) -> None:
+        """SessionRegistry must not have _load_persisted_cursors method."""
+        assert not hasattr(SessionRegistry, "_load_persisted_cursors")
+
+    def test_no_delete_persisted_cursors_method(self) -> None:
+        """SessionRegistry must not have _delete_persisted_cursors method."""
+        assert not hasattr(SessionRegistry, "_delete_persisted_cursors")
+
+    def test_no_purge_session_cursors_method(self) -> None:
+        """SessionRegistry must not have purge_session_cursors method."""
+        assert not hasattr(SessionRegistry, "purge_session_cursors")
+
+    def test_no_purge_all_cursors_method(self) -> None:
+        """SessionRegistry must not have purge_all_cursors method."""
+        assert not hasattr(SessionRegistry, "purge_all_cursors")
+
+    def test_no_path_import_in_registry_module(self) -> None:
+        """registry module must not expose Path (from pathlib)."""
+        import context_intelligence_server.registry as registry_mod
+
+        assert not hasattr(registry_mod, "Path")

@@ -5,7 +5,6 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
@@ -95,7 +94,7 @@ class SessionRegistry:
         - Dispatches each event via process_event.
         - On TimeoutError (no events for flush_timeout seconds): calls graph.flush
           as a periodic fallback for disconnected sessions.
-        - On CancelledError (shutdown): persists cursors, calls graph.close, then exits cleanly.
+        - On CancelledError (shutdown): calls graph.close, then exits cleanly.
         - On session:end: drains tail events, creates CompletedSession,
           calls graph.close, deregisters the worker, then exits.
         """
@@ -165,13 +164,6 @@ class SessionRegistry:
                         settings.stale_session_timeout,
                     )
                     try:
-                        self._persist_cursors_sync(worker)
-                    except Exception:
-                        logger.exception(
-                            "cursor persist failed on stale reap for session %s",
-                            worker.session_id,
-                        )
-                    try:
                         await worker.services.graph.close()
                     except Exception:
                         logger.exception(
@@ -182,14 +174,6 @@ class SessionRegistry:
                     break
 
             except asyncio.CancelledError:
-                # Shutdown: persist cursors and close graph before exiting
-                try:
-                    self._persist_cursors_sync(worker)
-                except Exception:
-                    logger.exception(
-                        "cursor persist failed on cancel for session %s",
-                        worker.session_id,
-                    )
                 try:
                     await worker.services.graph.close()
                 except Exception:
@@ -229,17 +213,7 @@ class SessionRegistry:
                     graph_store=neo4j_store,
                 ),
             )
-            if replay:
-                # Replay mode: delete any persisted cursors so processing starts fresh
-                self._delete_persisted_cursors(session_id)
-                logger.info(
-                    "replay_mode: deleted persisted cursors for session %s", session_id
-                )
             self.start_drain(self._workers[session_id])
-        else:
-            # Session already active — replay flag has no effect on existing workers.
-            if replay:
-                logger.debug("replay_ignored: session %s already active", session_id)
         return self._workers[session_id]
 
     def remove(self, session_id: str) -> None:
@@ -272,52 +246,3 @@ class SessionRegistry:
 
     def active_sessions(self) -> list[str]:
         return sorted(self._workers.keys())
-
-    def purge_session_cursors(self, session_id: str) -> None:
-        """Delete the persisted cursor file for a single session."""
-        self._delete_persisted_cursors(session_id)
-
-    def purge_all_cursors(self, cursor_path: str | None = None) -> int:
-        """Delete all cursor files under *cursor_path*.
-
-        Returns the number of files deleted.
-        """
-        if cursor_path is None:
-            cursor_path = get_settings().cursor_path
-
-        cursor_root = Path(cursor_path)
-        count = 0
-        if cursor_root.exists():
-            for cursor_file in cursor_root.glob("*/cursors.json"):
-                cursor_file.unlink()
-                count += 1
-        return count
-
-    # ------------------------------------------------------------------
-    # Cursor persistence
-    # ------------------------------------------------------------------
-
-    def _persist_cursors_sync(
-        self, worker: SessionWorker, cursor_path: str | None = None
-    ) -> None:
-        """No-op: cursor persistence removed (SessionCursors removed from services)."""
-
-    def _load_persisted_cursors(
-        self,
-        session_id: str,
-        cursor_path: str | None = None,
-        ttl: float | None = None,
-    ) -> None:
-        """No-op: cursor loading removed (SessionCursors removed from services)."""
-        return None
-
-    def _delete_persisted_cursors(
-        self, session_id: str, cursor_path: str | None = None
-    ) -> None:
-        """Delete cursor file for *session_id* if it exists."""
-        if cursor_path is None:
-            cursor_path = get_settings().cursor_path
-
-        cursor_file = Path(cursor_path) / session_id / "cursors.json"
-        if cursor_file.exists():
-            cursor_file.unlink()
