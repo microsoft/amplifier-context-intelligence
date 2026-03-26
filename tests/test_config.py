@@ -59,15 +59,13 @@ def test_settings_log_path_default():
     assert s.log_path == "/data/logs/server.jsonl"
 
 
-def test_three_tier_timeout_defaults():
-    """Settings should have correct defaults for three-tier session lifecycle timeouts and cursor path."""
+def test_session_timeout_defaults():
+    """Settings should have correct defaults for session lifecycle timeouts."""
     from context_intelligence_server.config import Settings
 
     s = Settings()
     assert s.dashboard_inactive_timeout == 1800.0
     assert s.stale_session_timeout == 432000.0
-    assert s.cursor_persist_ttl == 15552000.0
-    assert s.cursor_path == "/data/cursors"
 
 
 # ---------------------------------------------------------------------------
@@ -165,14 +163,13 @@ def test_yaml_config_file_path_via_env(tmp_path: Path, monkeypatch):
 def test_yaml_settings_source_direct_path(tmp_path: Path):
     """YamlConfigSettingsSource should accept a yaml_file argument directly."""
     config_file = tmp_path / "direct.yaml"
-    config_file.write_text("log_level: WARNING\ncursor_path: /tmp/cursors\n")
+    config_file.write_text("log_level: WARNING\n")
 
     from context_intelligence_server.config import Settings, YamlConfigSettingsSource
 
     src = YamlConfigSettingsSource(Settings, yaml_file=config_file)
     data = src()
     assert data["log_level"] == "WARNING"
-    assert data["cursor_path"] == "/tmp/cursors"
 
 
 def test_yaml_empty_file_uses_defaults(tmp_path: Path, monkeypatch):
@@ -270,7 +267,6 @@ def test_api_key_empty_string_from_yaml_treated_as_none(tmp_path: Path, monkeypa
         ("neo4j_user", "admin", "admin"),
         ("neo4j_password", "secret", "secret"),
         ("blob_path", "/mnt/blobs", "/mnt/blobs"),
-        ("cursor_path", "/mnt/cursors", "/mnt/cursors"),
         ("log_level", "WARNING", "WARNING"),
         ("server_host", "127.0.0.1", "127.0.0.1"),
         (

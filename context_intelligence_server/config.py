@@ -50,8 +50,6 @@ class YamlConfigSettingsSource(PydanticBaseSettingsSource):
         neo4j_password: ""
         blob_path: /home/user/.local/share/ci-server/blobs
         log_path: /home/user/.local/share/ci-server/logs/server.jsonl
-        cursor_path: /home/user/.local/share/ci-server/cursors
-
     Environment variables always take precedence over values in the YAML file.
     """
 
@@ -121,7 +119,6 @@ class Settings(BaseSettings):
     # Storage paths
     # -------------------------------------------------------------------------
     blob_path: str = "/data/blobs"
-    cursor_path: str = "/data/cursors"
 
     # -------------------------------------------------------------------------
     # Logging
@@ -134,7 +131,6 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     dashboard_inactive_timeout: float = 1800.0  # 30 min  — dashboard visibility
     stale_session_timeout: float = 432000.0  # 5 days  — worker reap
-    cursor_persist_ttl: float = 15552000.0  # 180 days — cursor file TTL
 
     @classmethod
     def settings_customise_sources(
