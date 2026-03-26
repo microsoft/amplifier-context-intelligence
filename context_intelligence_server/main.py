@@ -123,26 +123,6 @@ async def post_events(request: EventRequest, replay: bool = False) -> EventRespo
     return EventResponse(status="queued", session_id=session_id or None)
 
 
-@app.delete("/sessions/cursors")
-async def purge_all_cursors() -> dict[str, Any]:
-    """Delete all cursor files under cursor_path.
-
-    Returns ``{status: 'ok', purged: <count>}``.
-    """
-    purged = await asyncio.to_thread(registry.purge_all_cursors)
-    return {"status": "ok", "purged": purged}
-
-
-@app.delete("/sessions/{session_id}/cursors")
-async def purge_session_cursors(session_id: str) -> dict[str, Any]:
-    """Delete the cursor file for a single session.
-
-    Returns ``{status: 'ok', session_id: <session_id>}``.
-    """
-    await asyncio.to_thread(registry.purge_session_cursors, session_id)
-    return {"status": "ok", "session_id": session_id}
-
-
 @app.get("/blobs/{session_id}")
 async def list_blobs(session_id: str) -> JSONResponse:
     blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
