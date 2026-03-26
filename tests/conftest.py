@@ -6,8 +6,9 @@ from typing import Any
 import httpx
 import pytest
 
-from context_intelligence_server.main import app, registry
-from context_intelligence_server.services import HookStateService
+
+from context_intelligence_server.main import app, registry  # noqa: E402
+from context_intelligence_server.services import HookStateService  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

@@ -54,7 +54,7 @@ class SessionRegistry:
         worker: SessionWorker,
         event: str,
         data: dict[str, Any],
-        handlers: dict[str, Any],
+        handlers: Any,
     ) -> None:
         """Dispatch one event, update worker stats, and record to the ring buffer."""
         result = "ok"

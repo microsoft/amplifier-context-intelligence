@@ -942,6 +942,40 @@ class TestGetOrCreate:
         assert isinstance(worker.services, HookStateService)
 
 
+class TestProcessOneHandlersAnnotation:
+    """task-10: _process_one handlers parameter must be annotated as Any (not dict[str, Any])."""
+
+    def test_process_one_handlers_annotation_is_not_dict(self) -> None:
+        """_process_one handlers param must NOT be annotated as dict[str, Any]."""
+        import inspect
+        import types
+
+        sig = inspect.signature(SessionRegistry._process_one)
+        handlers_param = sig.parameters["handlers"]
+        annotation = handlers_param.annotation
+
+        # The annotation must NOT be dict[str, Any]
+        # After task-10 it should be Any (or PipelineHandlers)
+        assert annotation is not dict, "handlers must not be plain dict"
+        # If it's a generic alias (dict[str, Any]), it should fail this check
+        assert not isinstance(annotation, types.GenericAlias), (
+            "handlers annotation must not be dict[str, Any] (a GenericAlias); "
+            f"got: {annotation!r}"
+        )
+
+    def test_process_one_handlers_annotation_is_any(self) -> None:
+        """_process_one handlers param should be annotated as Any."""
+        import inspect
+        from typing import Any
+
+        sig = inspect.signature(SessionRegistry._process_one)
+        annotation = sig.parameters["handlers"].annotation
+
+        assert annotation is Any, (
+            f"Expected handlers annotation to be typing.Any, got: {annotation!r}"
+        )
+
+
 class TestProcessOneLogsException:
     """R-1: _process_one must log at ERROR level when process_event raises."""
 

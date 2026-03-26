@@ -20,8 +20,6 @@ Test coverage:
 from __future__ import annotations
 
 import logging
-import sys
-import types
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -29,34 +27,9 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# Stub ToolCallHandler module injection (must happen before pipeline imports)
-# This allows setup_handlers to import ToolCallHandler even though it doesn't
-# exist yet in the handlers package.
+# NOTE: ToolCallHandler stub injection is performed in conftest.py so it
+# fires before any test module loads, regardless of pytest collection order.
 # ---------------------------------------------------------------------------
-
-
-def _make_stub_tool_call_module() -> types.ModuleType:
-    """Create a stub tool_call module with a minimal ToolCallHandler class."""
-    module = types.ModuleType("context_intelligence_server.handlers.tool_call")
-
-    class ToolCallHandler:
-        handled_events: frozenset[str] = frozenset({"tool_call:start", "tool_call:end"})
-
-        def __init__(self, services: Any) -> None:
-            self.services = services
-            self._mock_call: AsyncMock = AsyncMock()
-
-        async def __call__(self, event: str, data: dict[str, Any]) -> None:
-            return await self._mock_call(event, data)
-
-    module.ToolCallHandler = ToolCallHandler  # type: ignore[attr-defined]
-    return module
-
-
-if "context_intelligence_server.handlers.tool_call" not in sys.modules:
-    sys.modules["context_intelligence_server.handlers.tool_call"] = (
-        _make_stub_tool_call_module()
-    )
 
 
 # ---------------------------------------------------------------------------
