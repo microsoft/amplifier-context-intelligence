@@ -57,7 +57,9 @@ class ToolCallHandler:
         event_node_id = make_node_id(session_id, event, timestamp, tool_call_id)
 
         if event == "tool:pre":
-            await self._handle_pre(session_id, tc_node_id, event_node_id, timestamp, data)
+            await self._handle_pre(
+                session_id, tc_node_id, event_node_id, timestamp, data
+            )
         else:
             # tool:post or tool:error — close the lifecycle
             await self._handle_close(tc_node_id, event_node_id, timestamp)
