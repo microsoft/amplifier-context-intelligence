@@ -72,9 +72,8 @@ class TestSessionStart:
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        # No parent — no edge should be created
-        edge = await services.graph.get_edge("s1", "")
-        assert edge is None
+        # No parent — no edge should be created at all
+        assert len(services.graph._edges) == 0, "root session must not create any edge"
 
     async def test_subsession_labels(self, services: HookStateService) -> None:
         handler = SessionHandler(services)
@@ -170,9 +169,7 @@ class TestSessionFork:
         assert "SubSession" in node["labels"]
         assert "ForkedSession" in node["labels"]
 
-    async def test_fork_edge_parent_to_child(
-        self, services: HookStateService
-    ) -> None:
+    async def test_fork_edge_parent_to_child(self, services: HookStateService) -> None:
         """SUBSESSION_OF edge goes from parent→child (not child→parent)."""
         handler = SessionHandler(services)
         await handler(
