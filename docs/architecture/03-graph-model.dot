@@ -1,0 +1,167 @@
+digraph graph_model {
+    // ── Global defaults ───────────────────────────────────────────────────────
+    graph [
+        rankdir   = LR
+        compound  = true
+        splines   = curved
+        nodesep   = 0.9
+        ranksep   = 1.6
+        fontname  = "Helvetica"
+        fontsize  = 11
+        label     = "Neo4j Property Graph Schema\n(context_intelligence — all node/label/edge types)"
+        labelloc  = t
+        labeljust = c
+    ]
+    node [
+        fontname = "Helvetica"
+        fontsize = 11
+        style    = "filled,rounded"
+        shape    = box
+    ]
+    edge [
+        fontname = "Helvetica"
+        fontsize = 10
+    ]
+
+    // ── Sessions cluster ──────────────────────────────────────────────────────
+    subgraph cluster_sessions {
+        graph [
+            label     = "Session Nodes"
+            fontname  = "Helvetica-Bold"
+            fontsize  = 12
+            style     = filled
+            color     = "#1565C0"
+            fillcolor = "#E3F2FD"
+            penwidth  = 2
+        ]
+
+        RootSession [
+            shape     = record
+            style     = filled
+            fillcolor = "#BBDEFB"
+            label     = "{ :RootSession :Session | node_id: session UUID | workspace: string | started_at: ISO 8601 | ended_at: ISO 8601 (on end) | status: \"running\" }"
+        ]
+
+        SubSession [
+            shape     = record
+            style     = filled
+            fillcolor = "#BBDEFB"
+            label     = "{ :SubSession :Session | node_id: session UUID | workspace: string | started_at: ISO 8601 | ended_at: ISO 8601 }"
+        ]
+
+        ForkedSession [
+            shape     = record
+            style     = filled
+            fillcolor = "#CE93D8"
+            label     = "{ :ForkedSession :SubSession :Session | node_id: child session UUID | workspace: may be null | started_at: ISO 8601 }"
+        ]
+    }
+
+    // ── Events cluster ────────────────────────────────────────────────────────
+    subgraph cluster_events {
+        graph [
+            label     = "Event Nodes"
+            fontname  = "Helvetica-Bold"
+            fontsize  = 12
+            style     = filled
+            color     = "#2E7D32"
+            fillcolor = "#E8F5E9"
+            penwidth  = 2
+        ]
+
+        EventNode [
+            shape     = record
+            style     = filled
+            fillcolor = "#A5D6A7"
+            label     = "{ :FullPascal :Category :Event | node_id: session__event__epoch_ms[__tool_call_id] | event_name: string | occurred_at: ISO 8601 | data: JSON (with blob refs) }"
+        ]
+
+        EventExamples [
+            shape     = plaintext
+            style     = ""
+            fillcolor = "transparent"
+            label     = "Label examples:\ntool:pre \u2192 :ToolPre :Tool :Event\nsession:start \u2192 :SessionStart :Session :Event\ncontext:compaction \u2192 :ContextCompaction :Context :Event\ndelegate:agent_spawned \u2192 :DelegateAgentSpawned :Delegate :Event"
+        ]
+    }
+
+    // ── ToolCall cluster ──────────────────────────────────────────────────────
+    subgraph cluster_toolcall {
+        graph [
+            label     = "ToolCall Nodes"
+            fontname  = "Helvetica-Bold"
+            fontsize  = 12
+            style     = filled
+            color     = "#E65100"
+            fillcolor = "#FFF3E0"
+            penwidth  = 2
+        ]
+
+        ToolCall [
+            shape     = record
+            style     = filled
+            fillcolor = "#FFE0B2"
+            label     = "{ :ToolCall | node_id: session_id__tool_call__tool_call_id | tool_name: string | tool_call_id: string (tiebreaker) | parallel_group_id: UUID | session_id: string }"
+        ]
+    }
+
+    // ── Note nodes ────────────────────────────────────────────────────────────
+    note_dual_edge [
+        shape     = box
+        style     = filled
+        fillcolor = "#FFF9C4"
+        label     = "\u26a0 Dual HAS_EVENT edges on tool events\n(Session)-[:HAS_EVENT]->(Event)  \u2014 DefaultHandler (always)\n(ToolCall)-[:HAS_EVENT]->(Event)  \u2014 ToolCallHandler (additionally)\nBoth edges coexist; enrichers are ADDITIVE"
+    ]
+
+    note_tiebreaker [
+        shape     = box
+        style     = filled
+        fillcolor = "#FFF9C4"
+        label     = "\u2139 ToolCall node_id has NO timestamp\npre / post / error share the same :ToolCall node\nEvent node_id appends tool_call_id as tiebreaker\nto distinguish tool events with the same epoch_ms"
+    ]
+
+    note_direction [
+        shape     = box
+        style     = filled
+        fillcolor = "#FFCCBC"
+        penwidth  = 2
+        label     = "\u26a0 SUBSESSION_OF direction: PARENT \u2192 CHILD\n(opposite of old design \u2014 confirm before querying)"
+    ]
+
+    // ── Edges ─────────────────────────────────────────────────────────────────
+    RootSession -> SubSession [
+        label     = "SUBSESSION_OF\n(PARENT\u2192CHILD)"
+        color     = "#1565C0"
+        fontcolor = "#1565C0"
+        penwidth  = 2
+    ]
+
+    RootSession -> ForkedSession [
+        label     = "SUBSESSION_OF"
+        color     = "#7B1FA2"
+        fontcolor = "#7B1FA2"
+        penwidth  = 2
+    ]
+
+    RootSession -> EventNode [
+        label     = "HAS_EVENT {occurred_at}\nFrom DefaultHandler (always)"
+        color     = "#2E7D32"
+        fontcolor = "#2E7D32"
+        penwidth  = 1.5
+        lhead     = cluster_events
+    ]
+
+    RootSession -> ToolCall [
+        label     = "HAS_TOOL_CALL\n{started_at, ended_at}"
+        color     = "#E65100"
+        fontcolor = "#E65100"
+        penwidth  = 1.5
+    ]
+
+    ToolCall -> EventNode [
+        label     = "HAS_EVENT {occurred_at}\nFrom ToolCallHandler (additionally)"
+        color     = "#E65100"
+        fontcolor = "#E65100"
+        style     = dashed
+        penwidth  = 1.5
+    ]
+}
