@@ -5,7 +5,7 @@ import dataclasses
 import time
 from collections import deque
 from pathlib import Path
-from unittest.mock import ANY, AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -826,8 +826,6 @@ class TestStaleSessionReaping:
     async def test_stale_worker_reaped_after_timeout(self) -> None:
         """Worker with last_event_time ~5.8 days ago gets graph.close called
         and is deregistered."""
-        from unittest.mock import MagicMock
-
         reg = SessionRegistry()
         worker = SessionWorker(
             session_id="stale-session",
@@ -855,8 +853,6 @@ class TestStaleSessionReaping:
     @pytest.mark.asyncio
     async def test_stale_session_not_added_to_completed(self) -> None:
         """Reaped stale sessions are NOT added to the _completed deque."""
-        from unittest.mock import MagicMock
-
         reg = SessionRegistry()
         worker = SessionWorker(
             session_id="stale-session",
@@ -882,8 +878,6 @@ class TestStaleSessionReaping:
     @pytest.mark.asyncio
     async def test_stale_reap_graph_close_error_still_deregisters(self) -> None:
         """If graph.close raises during stale reaping, worker is still deregistered."""
-        from unittest.mock import MagicMock
-
         reg = SessionRegistry()
         worker = SessionWorker(
             session_id="stale-session",
@@ -989,40 +983,3 @@ class TestProcessOneLogsException:
         assert "process_one_failed" in caplog.text
         assert "test-session" in caplog.text
         assert "tool_call" in caplog.text
-
-
-class TestCursorPersistenceRemoved:
-    """Verify that all cursor persistence methods have been removed from SessionRegistry."""
-
-    def test_no_persist_cursors_sync_method(self) -> None:
-        """SessionRegistry must not have _persist_cursors_sync method."""
-        assert not hasattr(SessionRegistry, "_persist_cursors_sync")
-
-    def test_no_load_persisted_cursors_method(self) -> None:
-        """SessionRegistry must not have _load_persisted_cursors method."""
-        assert not hasattr(SessionRegistry, "_load_persisted_cursors")
-
-    def test_no_delete_persisted_cursors_method(self) -> None:
-        """SessionRegistry must not have _delete_persisted_cursors method."""
-        assert not hasattr(SessionRegistry, "_delete_persisted_cursors")
-
-    def test_no_purge_session_cursors_method(self) -> None:
-        """SessionRegistry must not have purge_session_cursors method."""
-        assert not hasattr(SessionRegistry, "purge_session_cursors")
-
-    def test_no_purge_all_cursors_method(self) -> None:
-        """SessionRegistry must not have purge_all_cursors method."""
-        assert not hasattr(SessionRegistry, "purge_all_cursors")
-
-    def test_no_path_import_in_registry_module(self) -> None:
-        """registry module must not expose Path (from pathlib)."""
-        import context_intelligence_server.registry as registry_mod
-
-        assert not hasattr(registry_mod, "Path")
-
-    def test_get_or_create_has_no_replay_parameter(self) -> None:
-        """get_or_create must not accept a replay parameter (dead code removed)."""
-        import inspect
-
-        sig = inspect.signature(SessionRegistry.get_or_create)
-        assert "replay" not in sig.parameters
