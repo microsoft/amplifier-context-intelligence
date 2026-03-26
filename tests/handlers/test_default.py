@@ -1,12 +1,13 @@
 """Tests for DefaultHandler — Event node creation for unclaimed events.
 
-Adapted from bundle's test_default_handler.py for the server-side implementation,
-which uses the flat-dict GraphState API (no nested 'properties' key, 2-arg get_edge).
+3-level label hierarchy: [FullPascal, Category, 'Event']
+No run-awareness — events always attach to session node directly.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 
 from context_intelligence_server.handlers.default import DefaultHandler
 from context_intelligence_server.services import HookStateService
@@ -14,33 +15,66 @@ from context_intelligence_server.utils import make_node_id
 
 
 class TestDeriveLabelConversions:
-    """DefaultHandler.derive_label converts event names to PascalCase labels."""
+    """DefaultHandler.derive_labels returns [FullPascal, Category, 'Event']."""
 
-    def test_colon_separator(self) -> None:
-        assert DefaultHandler.derive_label("context:compaction") == "ContextCompaction"
+    def test_tool_pre(self) -> None:
+        assert DefaultHandler.derive_labels("tool:pre") == ["ToolPre", "Tool", "Event"]
 
-    def test_single_word(self) -> None:
-        assert DefaultHandler.derive_label("session:resume") == "SessionResume"
+    def test_session_start(self) -> None:
+        assert DefaultHandler.derive_labels("session:start") == [
+            "SessionStart",
+            "Session",
+            "Event",
+        ]
 
-    def test_underscore_separator(self) -> None:
-        assert DefaultHandler.derive_label("my_event") == "MyEvent"
+    def test_recipe_loop_iteration(self) -> None:
+        assert DefaultHandler.derive_labels("recipe:loop_iteration") == [
+            "RecipeLoopIteration",
+            "Recipe",
+            "Event",
+        ]
 
-    def test_mixed_separators(self) -> None:
-        assert DefaultHandler.derive_label("custom:my_event") == "CustomMyEvent"
+    def test_context_compaction(self) -> None:
+        assert DefaultHandler.derive_labels("context:compaction") == [
+            "ContextCompaction",
+            "Context",
+            "Event",
+        ]
+
+    def test_delegate_agent_spawned(self) -> None:
+        assert DefaultHandler.derive_labels("delegate:agent_spawned") == [
+            "DelegateAgentSpawned",
+            "Delegate",
+            "Event",
+        ]
 
     def test_cancel_requested(self) -> None:
-        assert DefaultHandler.derive_label("cancel:requested") == "CancelRequested"
+        assert DefaultHandler.derive_labels("cancel:requested") == [
+            "CancelRequested",
+            "Cancel",
+            "Event",
+        ]
 
-    def test_cancel_completed(self) -> None:
-        assert DefaultHandler.derive_label("cancel:completed") == "CancelCompleted"
+    def test_underscore_only(self) -> None:
+        """No colon — FullPascal == Category."""
+        assert DefaultHandler.derive_labels("my_event") == [
+            "MyEvent",
+            "MyEvent",
+            "Event",
+        ]
+
+    def test_single_word(self) -> None:
+        """Single word — FullPascal == Category."""
+        assert DefaultHandler.derive_labels("ping") == ["Ping", "Ping", "Event"]
 
 
 class TestDefaultHandlerCreatesEventNodes:
-    """DefaultHandler creates :Event:{DerivedLabel} nodes + HAS_EVENT edges."""
+    """DefaultHandler creates Event nodes with 3-level labels + HAS_EVENT edges."""
 
-    async def test_creates_event_node_with_derived_label(
+    async def test_creates_event_node_with_three_labels(
         self, services: HookStateService
     ) -> None:
+        """Event node has 3 labels: FullPascal, Category, and 'Event'."""
         handler = DefaultHandler(services)
         await handler(
             "session:resume",
@@ -52,11 +86,17 @@ class TestDefaultHandlerCreatesEventNodes:
         event_id = make_node_id("s1", "session:resume", "2026-01-01T02:00:00Z")
         node = await services.graph.get_node(event_id)
         assert node is not None
-        assert set(node["labels"]) == {"Event", "SessionResume"}
+        labels = set(node["labels"])
+        assert "SessionResume" in labels
+        assert "Session" in labels
+        assert "Event" in labels
         assert node["occurred_at"] == "2026-01-01T02:00:00Z"
         assert node["event_name"] == "session:resume"
 
-    async def test_creates_has_event_edge(self, services: HookStateService) -> None:
+    async def test_creates_has_event_edge_from_session_no_run_awareness(
+        self, services: HookStateService
+    ) -> None:
+        """HAS_EVENT edge goes from session_id to event node (no run-awareness)."""
         handler = DefaultHandler(services)
         await handler(
             "session:resume",
@@ -86,7 +126,7 @@ class TestDefaultHandlerCreatesEventNodes:
     async def test_works_with_arbitrary_unclaimed_event(
         self, services: HookStateService
     ) -> None:
-        """DefaultHandler is generic — works for any event name."""
+        """DefaultHandler is generic — custom:my_event → CustomMyEvent, Custom, Event."""
         handler = DefaultHandler(services)
         await handler(
             "custom:my_event",
@@ -98,7 +138,10 @@ class TestDefaultHandlerCreatesEventNodes:
         event_id = make_node_id("s1", "custom:my_event", "2026-01-01T03:00:00Z")
         node = await services.graph.get_node(event_id)
         assert node is not None
-        assert set(node["labels"]) == {"Event", "CustomMyEvent"}
+        labels = set(node["labels"])
+        assert "CustomMyEvent" in labels
+        assert "Custom" in labels
+        assert "Event" in labels
         assert node["event_name"] == "custom:my_event"
 
     async def test_returns_continue(self, services: HookStateService) -> None:
@@ -110,8 +153,84 @@ class TestDefaultHandlerCreatesEventNodes:
         assert result.action == "continue"
 
 
+class TestDefaultHandlerTiebreaker:
+    """tool_call_id used as disambiguator for tool events."""
+
+    async def test_tool_pre_uses_tool_call_id_as_disambiguator(
+        self, services: HookStateService
+    ) -> None:
+        """tool:pre passes tool_call_id to make_node_id as fourth arg."""
+        handler = DefaultHandler(services)
+        await handler(
+            "tool:pre",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T02:00:00Z",
+                "tool_call_id": "tc-abc",
+            },
+        )
+        event_id = make_node_id("s1", "tool:pre", "2026-01-01T02:00:00Z", "tc-abc")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+
+    async def test_non_tool_events_have_no_disambiguator(
+        self, services: HookStateService
+    ) -> None:
+        """Non-tool events do NOT use tool_call_id as disambiguator."""
+        handler = DefaultHandler(services)
+        await handler(
+            "session:resume",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T02:00:00Z",
+                "tool_call_id": "tc-abc",  # present but should be ignored
+            },
+        )
+        # Node should exist without the disambiguator
+        event_id_no_disambiguator = make_node_id(
+            "s1", "session:resume", "2026-01-01T02:00:00Z"
+        )
+        node = await services.graph.get_node(event_id_no_disambiguator)
+        assert node is not None
+        # Node with disambiguator should NOT exist
+        event_id_with_disambiguator = make_node_id(
+            "s1", "session:resume", "2026-01-01T02:00:00Z", "tc-abc"
+        )
+        node_wrong = await services.graph.get_node(event_id_with_disambiguator)
+        assert node_wrong is None
+
+    async def test_parallel_tool_calls_produce_distinct_nodes(
+        self, services: HookStateService
+    ) -> None:
+        """Same timestamp, different tool_call_ids produce distinct nodes."""
+        handler = DefaultHandler(services)
+        await handler(
+            "tool:pre",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T02:00:00Z",
+                "tool_call_id": "tc-001",
+            },
+        )
+        await handler(
+            "tool:pre",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T02:00:00Z",
+                "tool_call_id": "tc-002",
+            },
+        )
+        event_id_1 = make_node_id("s1", "tool:pre", "2026-01-01T02:00:00Z", "tc-001")
+        event_id_2 = make_node_id("s1", "tool:pre", "2026-01-01T02:00:00Z", "tc-002")
+        assert event_id_1 != event_id_2
+        node1 = await services.graph.get_node(event_id_1)
+        node2 = await services.graph.get_node(event_id_2)
+        assert node1 is not None
+        assert node2 is not None
+
+
 class TestDefaultHandlerDataProperty:
-    """DefaultHandler stores full event payload in the 'data' property."""
+    """DefaultHandler stores full event payload in 'data' property as JSON string."""
 
     async def test_stores_data_property(self, services: HookStateService) -> None:
         """Event node has 'data' property containing the full JSON payload."""
@@ -132,63 +251,10 @@ class TestDefaultHandlerDataProperty:
         assert data["custom_info"] == "extra-value"
 
 
-class TestDefaultHandlerRunAwareness:
-    """DefaultHandler attaches HAS_EVENT to Session.
-    
-    Note: run-awareness via cursor tracking is removed (SessionCursors removed).
-    DefaultHandler now always attaches events to the session node.
-    """
-
-    async def test_event_without_active_run_attaches_to_session(
-        self, services: HookStateService
-    ) -> None:
-        """HAS_EVENT goes from Session to Event (cursor run-awareness removed)."""
-        handler = DefaultHandler(services)
-        await handler(
-            "session:resume",
-            {"session_id": "s1", "timestamp": "2026-01-01T02:00:00Z"},
-        )
-        event_id = make_node_id("s1", "session:resume", "2026-01-01T02:00:00Z")
-        edge = await services.graph.get_edge("s1", event_id)
-        assert edge is not None, "HAS_EVENT edge from session is missing"
-
-    async def test_event_node_has_correct_labels(
-        self, services: HookStateService
-    ) -> None:
-        """Event node labels and properties are set correctly."""
-        handler = DefaultHandler(services)
-        await handler(
-            "artifact:read",
-            {"session_id": "s1", "timestamp": "2026-03-06T02:30:00Z"},
-        )
-        event_id = make_node_id("s1", "artifact:read", "2026-03-06T02:30:00Z")
-        node = await services.graph.get_node(event_id)
-        assert node is not None
-        assert set(node["labels"]) == {"Event", "ArtifactRead"}
-        assert node["event_name"] == "artifact:read"
-
-    async def test_event_attaches_to_session_node(
-        self, services: HookStateService
-    ) -> None:
-        """Events always attach to the session node (no run tracking)."""
-        handler = DefaultHandler(services)
-        await handler(
-            "prompt:complete",
-            {"session_id": "s1", "timestamp": "2026-03-06T03:01:00Z"},
-        )
-        event_id = make_node_id("s1", "prompt:complete", "2026-03-06T03:01:00Z")
-
-        # Should attach to session
-        edge_from_session = await services.graph.get_edge("s1", event_id)
-        assert edge_from_session is not None
-
-
 class TestDefaultHandlerEdgeType:
-    """DefaultHandler must attach a semantic 'type' key on its HAS_EVENT edges."""
+    """HAS_EVENT edge has type='HAS_EVENT'."""
 
-    async def test_has_event_edge_type_when_no_active_run(
-        self, services: HookStateService
-    ) -> None:
+    async def test_has_event_edge_type(self, services: HookStateService) -> None:
         """Edge from session → event node must have type='HAS_EVENT'."""
         handler = DefaultHandler(services)
         await handler(
@@ -202,11 +268,9 @@ class TestDefaultHandlerEdgeType:
 
 
 class TestDefaultHandlerDroppedEventLogging:
-    """D-1: DefaultHandler must log at WARNING (not DEBUG) when dropping events without session_id."""
+    """D-1: DefaultHandler must log at WARNING when dropping events without session_id."""
 
     async def test_missing_session_id_logs_warning(self, services, caplog):
-        import logging
-
         handler = DefaultHandler(services)
         with caplog.at_level(logging.WARNING):
             result = await handler(
