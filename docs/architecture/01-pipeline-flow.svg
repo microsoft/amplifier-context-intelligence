@@ -13,26 +13,26 @@
 <text text-anchor="middle" x="339.5" y="-1140.2" font-family="Helvetica,sans-Serif" font-size="11.00">(context_intelligence_server)</text>
 <g id="clust1" class="cluster">
 <title>cluster_legend</title>
-<polygon fill="none" stroke="#aaaaaa" stroke-dasharray="5,2" points="540,-870 540,-1125 654,-1125 654,-870 540,-870"/>
-<text text-anchor="middle" x="597" y="-1113" font-family="Helvetica,sans-Serif" font-size="10.00">Legend</text>
+<polygon fill="none" stroke="#aaaaaa" stroke-dasharray="5,2" points="536,-870 536,-1125 650,-1125 650,-870 536,-870"/>
+<text text-anchor="middle" x="593" y="-1113" font-family="Helvetica,sans-Serif" font-size="10.00">Legend</text>
 </g>
 <!-- EventReceived -->
 <g id="node1" class="node">
 <title>EventReceived</title>
-<ellipse fill="#e3f2fd" stroke="black" cx="424" cy="-1080" rx="61.17" ry="18"/>
-<text text-anchor="middle" x="424" y="-1077.2" font-family="Helvetica,sans-Serif" font-size="11.00">Event Received</text>
+<ellipse fill="#e3f2fd" stroke="black" cx="420" cy="-1080" rx="61.17" ry="18"/>
+<text text-anchor="middle" x="420" y="-1077.2" font-family="Helvetica,sans-Serif" font-size="11.00">Event Received</text>
 </g>
 <!-- HasSessionId -->
 <g id="node2" class="node">
 <title>HasSessionId</title>
-<polygon fill="#fff9c4" stroke="black" points="424,-1011 343.42,-993 424,-975 504.58,-993 424,-1011"/>
-<text text-anchor="middle" x="424" y="-990.2" font-family="Helvetica,sans-Serif" font-size="11.00">HasSessionId?</text>
+<polygon fill="#fff9c4" stroke="black" points="420,-1011 339.42,-993 420,-975 500.58,-993 420,-1011"/>
+<text text-anchor="middle" x="420" y="-990.2" font-family="Helvetica,sans-Serif" font-size="11.00">HasSessionId?</text>
 </g>
 <!-- EventReceived&#45;&gt;HasSessionId -->
 <g id="edge1" class="edge">
 <title>EventReceived&#45;&gt;HasSessionId</title>
-<path fill="none" stroke="black" d="M424,-1061.97C424,-1061.97 424,-1021 424,-1021"/>
-<polygon fill="black" stroke="black" points="427.5,-1021 424,-1011 420.5,-1021 427.5,-1021"/>
+<path fill="none" stroke="black" d="M420,-1061.97C420,-1061.97 420,-1021 420,-1021"/>
+<polygon fill="black" stroke="black" points="423.5,-1021 420,-1011 416.5,-1021 423.5,-1021"/>
 </g>
 <!-- EnsureSessionNode -->
 <g id="node3" class="node">
@@ -44,9 +44,9 @@
 <!-- HasSessionId&#45;&gt;EnsureSessionNode -->
 <g id="edge2" class="edge">
 <title>HasSessionId&#45;&gt;EnsureSessionNode</title>
-<path fill="none" stroke="black" d="M361.61,-988.83C361.61,-988.83 361.61,-924.19 361.61,-924.19"/>
-<polygon fill="black" stroke="black" points="365.11,-924.19 361.61,-914.19 358.11,-924.19 365.11,-924.19"/>
-<text text-anchor="middle" x="410.5" y="-942" font-family="Helvetica,sans-Serif" font-size="10.00">no</text>
+<path fill="none" stroke="black" d="M359.61,-988.32C359.61,-988.32 359.61,-924.29 359.61,-924.29"/>
+<polygon fill="black" stroke="black" points="363.11,-924.29 359.61,-914.29 356.11,-924.29 363.11,-924.29"/>
+<text text-anchor="middle" x="407" y="-942" font-family="Helvetica,sans-Serif" font-size="10.00">yes</text>
 </g>
 <!-- HasBlobStore -->
 <g id="node4" class="node">
@@ -57,9 +57,9 @@
 <!-- HasSessionId&#45;&gt;HasBlobStore -->
 <g id="edge3" class="edge">
 <title>HasSessionId&#45;&gt;HasBlobStore</title>
-<path fill="none" stroke="black" d="M419.25,-976.02C419.25,-976.02 419.25,-827.94 419.25,-827.94"/>
-<polygon fill="black" stroke="black" points="422.75,-827.94 419.25,-817.94 415.75,-827.94 422.75,-827.94"/>
-<text text-anchor="middle" x="475" y="-893.5" font-family="Helvetica,sans-Serif" font-size="10.00">yes</text>
+<path fill="none" stroke="black" d="M419.25,-975.02C419.25,-975.02 419.25,-827.81 419.25,-827.81"/>
+<polygon fill="black" stroke="black" points="422.75,-827.81 419.25,-817.81 415.75,-827.81 422.75,-827.81"/>
+<text text-anchor="middle" x="472.5" y="-893.5" font-family="Helvetica,sans-Serif" font-size="10.00">no</text>
 </g>
 <!-- EnsureSessionNode&#45;&gt;HasBlobStore -->
 <g id="edge4" class="edge">
@@ -133,8 +133,8 @@
 <!-- EnricherLoop&#45;&gt;SessionHandler -->
 <g id="edge9" class="edge">
 <title>EnricherLoop&#45;&gt;SessionHandler</title>
-<path fill="none" stroke="black" d="M268.5,-434.8C268.5,-402.41 268.5,-346 268.5,-346 268.5,-346 252.13,-346 252.13,-346"/>
-<polygon fill="black" stroke="black" points="252.13,-342.5 242.13,-346 252.13,-349.5 252.13,-342.5"/>
+<path fill="none" stroke="black" d="M263,-434.8C263,-402.41 263,-346 263,-346 263,-346 252.05,-346 252.05,-346"/>
+<polygon fill="black" stroke="black" points="252.05,-342.5 242.05,-346 252.05,-349.5 252.05,-342.5"/>
 <text text-anchor="middle" x="225" y="-402" font-family="Helvetica,sans-Serif" font-size="10.00">event_type matches</text>
 </g>
 <!-- ToolCallHandler -->
@@ -163,15 +163,15 @@
 <!-- EnricherLoop&#45;&gt;IsTerminal -->
 <g id="edge11" class="edge">
 <title>EnricherLoop&#45;&gt;IsTerminal</title>
-<path fill="none" stroke="black" d="M483.5,-434.9C483.5,-378.75 483.5,-235 483.5,-235 483.5,-235 477.17,-235 477.17,-235"/>
-<polygon fill="black" stroke="black" points="477.17,-231.5 467.17,-235 477.17,-238.5 477.17,-231.5"/>
+<path fill="none" stroke="black" d="M274,-434.66C274,-376.34 274,-224 274,-224 274,-224 306.08,-224 306.08,-224"/>
+<polygon fill="black" stroke="black" points="306.08,-227.5 316.08,-224 306.08,-220.5 306.08,-227.5"/>
 <text text-anchor="middle" x="616" y="-343.5" font-family="Helvetica,sans-Serif" font-size="10.00">no match / after enrichers</text>
 </g>
 <!-- SessionHandler&#45;&gt;IsTerminal -->
 <g id="edge12" class="edge">
 <title>SessionHandler&#45;&gt;IsTerminal</title>
-<path fill="none" stroke="black" d="M227.75,-317.99C227.75,-285.11 227.75,-235 227.75,-235 227.75,-235 274.64,-235 274.64,-235"/>
-<polygon fill="black" stroke="black" points="274.64,-238.5 284.64,-235 274.64,-231.5 274.64,-238.5"/>
+<path fill="none" stroke="black" d="M227.75,-317.87C227.75,-287.98 227.75,-245 227.75,-245 227.75,-245 303.13,-245 303.13,-245"/>
+<polygon fill="black" stroke="black" points="303.13,-248.5 313.13,-245 303.13,-241.5 303.13,-248.5"/>
 </g>
 <!-- ToolCallHandler&#45;&gt;IsTerminal -->
 <g id="edge13" class="edge">
@@ -217,22 +217,22 @@
 <!-- LegendAlways -->
 <g id="node13" class="node">
 <title>LegendAlways</title>
-<path fill="#c8e6c9" stroke="black" stroke-width="2.5" d="M630,-1098C630,-1098 564,-1098 564,-1098 558,-1098 552,-1092 552,-1086 552,-1086 552,-1074 552,-1074 552,-1068 558,-1062 564,-1062 564,-1062 630,-1062 630,-1062 636,-1062 642,-1068 642,-1074 642,-1074 642,-1086 642,-1086 642,-1092 636,-1098 630,-1098"/>
-<text text-anchor="middle" x="597" y="-1077.5" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="10.00">ALWAYS runs</text>
+<path fill="#c8e6c9" stroke="black" stroke-width="2.5" d="M626,-1098C626,-1098 560,-1098 560,-1098 554,-1098 548,-1092 548,-1086 548,-1086 548,-1074 548,-1074 548,-1068 554,-1062 560,-1062 560,-1062 626,-1062 626,-1062 632,-1062 638,-1068 638,-1074 638,-1074 638,-1086 638,-1086 638,-1092 632,-1098 626,-1098"/>
+<text text-anchor="middle" x="593" y="-1077.5" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="10.00">ALWAYS runs</text>
 </g>
 <!-- LegendClaimed -->
 <g id="node14" class="node">
 <title>LegendClaimed</title>
-<path fill="#f3e5f5" stroke="black" d="M634,-1011C634,-1011 560,-1011 560,-1011 554,-1011 548,-1005 548,-999 548,-999 548,-987 548,-987 548,-981 554,-975 560,-975 560,-975 634,-975 634,-975 640,-975 646,-981 646,-987 646,-987 646,-999 646,-999 646,-1005 640,-1011 634,-1011"/>
-<text text-anchor="middle" x="597" y="-996" font-family="Helvetica,sans-Serif" font-size="10.00">if claimed</text>
-<text text-anchor="middle" x="597" y="-985" font-family="Helvetica,sans-Serif" font-size="10.00">(enricher match)</text>
+<path fill="#f3e5f5" stroke="black" d="M630,-1011C630,-1011 556,-1011 556,-1011 550,-1011 544,-1005 544,-999 544,-999 544,-987 544,-987 544,-981 550,-975 556,-975 556,-975 630,-975 630,-975 636,-975 642,-981 642,-987 642,-987 642,-999 642,-999 642,-1005 636,-1011 630,-1011"/>
+<text text-anchor="middle" x="593" y="-996" font-family="Helvetica,sans-Serif" font-size="10.00">if claimed</text>
+<text text-anchor="middle" x="593" y="-985" font-family="Helvetica,sans-Serif" font-size="10.00">(enricher match)</text>
 </g>
 <!-- LegendAlways&#45;&gt;LegendClaimed -->
 <!-- LegendDecision -->
 <g id="node15" class="node">
 <title>LegendDecision</title>
-<polygon fill="#fff9c4" stroke="black" points="597,-914 549.6,-896 597,-878 644.4,-896 597,-914"/>
-<text text-anchor="middle" x="597" y="-893.5" font-family="Helvetica,sans-Serif" font-size="10.00">decision</text>
+<polygon fill="#fff9c4" stroke="black" points="593,-914 545.6,-896 593,-878 640.4,-896 593,-914"/>
+<text text-anchor="middle" x="593" y="-893.5" font-family="Helvetica,sans-Serif" font-size="10.00">decision</text>
 </g>
 <!-- LegendClaimed&#45;&gt;LegendDecision -->
 </g>

@@ -104,8 +104,8 @@ digraph pipeline_flow {
     // ── Edges ─────────────────────────────────────────────────────────────────
     EventReceived -> HasSessionId
 
-    HasSessionId  -> EnsureSessionNode [label = "no"]
-    HasSessionId  -> HasBlobStore      [label = "yes"]
+    HasSessionId  -> EnsureSessionNode [label = "yes"]
+    HasSessionId  -> HasBlobStore      [label = "no"]
     EnsureSessionNode -> HasBlobStore
 
     HasBlobStore  -> BlobOffload       [label = "yes"]
