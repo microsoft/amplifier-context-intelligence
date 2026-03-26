@@ -1,36 +1,28 @@
-"""Server-side event processing pipeline with error isolation.
+"""Server-side event processing pipeline — always-default + ordered enrichers model.
 
-Provides three public functions:
+Provides four public exports:
 
-- ``setup_handlers(services)``  — instantiate all 7 handlers and return a
-  handler registry dict with ``"entity"`` and ``"default"`` keys.
-- ``_find_handler(event, handlers)`` — first-match-wins dispatch resolution
-  with fnmatch wildcard support (e.g. ``content_block:*``).
+- ``TERMINAL_EVENTS`` — frozenset containing only ``'session:end'``
+- ``PipelineHandlers`` — NamedTuple with ``default`` (DefaultHandler) and
+  ``enrichers`` (list of ordered enrichers)
+- ``setup_handlers(services)`` — return a PipelineHandlers with DefaultHandler
+  and ``[SessionHandler, ToolCallHandler]`` enrichers
 - ``process_event(worker, event, data, handlers)`` — full pipeline step:
-  ensure-session-node → dispatch → terminal flush, all wrapped in a
-  broad try/except so the drain loop is never interrupted by handler errors.
-
-This module replaces the bundle's ``_wrap_with_session_guarantee`` pattern for
-the server-side deployment model.
+  ensure-session-node → blob processing → always-default dispatch →
+  enricher dispatch (for matching events) → terminal flush, all wrapped in a
+  broad try/except so the drain loop is never interrupted by handler errors
 """
 
 from __future__ import annotations
 
-import fnmatch
 import logging
-from typing import Any, TYPE_CHECKING
+from typing import Any, NamedTuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from context_intelligence_server.registry import SessionWorker
 
 from context_intelligence_server.blob_processor import process_event_data
 from context_intelligence_server.handlers.default import DefaultHandler
-from context_intelligence_server.handlers.event import SystemEventHandler
-from context_intelligence_server.handlers.orchestrator_run import OrchestratorRunHandler
-from context_intelligence_server.handlers.recipe import RecipeHandler
-from context_intelligence_server.handlers.session import SessionHandler
-from context_intelligence_server.handlers.step import StepHandler
-from context_intelligence_server.handlers.tool_execution import ToolExecutionHandler
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.utils import make_node_id
 
@@ -41,13 +33,19 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-TERMINAL_EVENTS: frozenset[str] = frozenset(
-    {
-        "session:end",
-        "execution:end",
-        "orchestrator:complete",
-    }
-)
+TERMINAL_EVENTS: frozenset[str] = frozenset({"session:end"})
+
+
+# ---------------------------------------------------------------------------
+# PipelineHandlers
+# ---------------------------------------------------------------------------
+
+
+class PipelineHandlers(NamedTuple):
+    """Holds the always-called default handler and the ordered enrichers list."""
+
+    default: DefaultHandler
+    enrichers: list[Any]
 
 
 # ---------------------------------------------------------------------------
@@ -55,49 +53,25 @@ TERMINAL_EVENTS: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 
 
-def setup_handlers(services: HookStateService) -> dict[str, Any]:
-    """Instantiate all 7 handlers and return the handler registry.
+def setup_handlers(services: HookStateService) -> PipelineHandlers:
+    """Instantiate handlers and return a PipelineHandlers.
 
-    Returns a dict with:
-    - ``"entity"``: list of 6 entity handlers in dispatch-priority order
-      (SessionHandler, OrchestratorRunHandler, StepHandler, RecipeHandler,
-      ToolExecutionHandler, SystemEventHandler)
-    - ``"default"``: DefaultHandler instance that catches unclaimed events
+    Returns a PipelineHandlers with:
+    - ``default``: DefaultHandler instance (always called for every event)
+    - ``enrichers``: [SessionHandler, ToolCallHandler] in dispatch order
+      (called additionally for events they claim)
 
     All handlers receive the same *services* instance.
     """
-    entity: list[Any] = [
-        SessionHandler(services),
-        OrchestratorRunHandler(services),
-        StepHandler(services),
-        RecipeHandler(services),
-        ToolExecutionHandler(services),
-        SystemEventHandler(services),
-    ]
-    default = DefaultHandler(services)
-    return {"entity": entity, "default": default}
+    # Local imports to allow tests to stub ToolCallHandler via sys.modules
+    # before it is fully implemented in the handlers package.
+    from context_intelligence_server.handlers.session import SessionHandler  # noqa: PLC0415
+    from context_intelligence_server.handlers.tool_call import ToolCallHandler  # noqa: PLC0415
 
-
-# ---------------------------------------------------------------------------
-# _find_handler
-# ---------------------------------------------------------------------------
-
-
-def _find_handler(event: str, handlers: dict[str, Any]) -> Any:
-    """Return the first matching entity handler, or the default handler.
-
-    Iterates through ``handlers["entity"]`` in order.  For each handler,
-    checks whether *event* matches any pattern in ``handler.handled_events``
-    using :func:`fnmatch.fnmatch` (so patterns like ``content_block:*`` work).
-
-    First match wins.  Falls back to ``handlers["default"]`` when no entity
-    handler claims the event.
-    """
-    for handler in handlers["entity"]:
-        for pattern in handler.handled_events:
-            if fnmatch.fnmatch(event, pattern):
-                return handler
-    return handlers["default"]
+    return PipelineHandlers(
+        default=DefaultHandler(services),
+        enrichers=[SessionHandler(services), ToolCallHandler(services)],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -109,23 +83,29 @@ async def process_event(
     worker: "SessionWorker",
     event: str,
     data: dict[str, Any],
-    handlers: dict[str, Any],
+    handlers: PipelineHandlers,
 ) -> None:
-    """Process one event through the full pipeline with complete error isolation.
+    """Process one event through the always-default + enrichers pipeline.
 
     Steps
     -----
     1. Extract ``session_id`` from *data*.
     2. If *session_id* is present, call ``worker.services.ensure_session_node``
        to idempotently create a Session node before any handler runs.
-    3. Resolve the matching handler via :func:`_find_handler`.
-    4. Invoke the handler.
-    5. If *event* is in :data:`TERMINAL_EVENTS`, call ``worker.services.graph.flush``
-       to persist all buffered writes.
+    3. Blob processing: if session_id + timestamp + blob_store are all present,
+       call ``process_event_data``.  Log a WARNING if blob_store is present but
+       timestamp is missing.
+    4. **Always** invoke ``handlers.default`` (records every event as an
+       Event node in the graph).
+    5. For each enricher in ``handlers.enrichers``, if the event is in the
+       enricher's ``handled_events``, call the enricher additionally.
+    6. If *event* is in :data:`TERMINAL_EVENTS`, call
+       ``worker.services.graph.flush`` to persist all buffered writes.
 
     All of the above is wrapped in a single ``try/except Exception`` block so
     that handler errors are *logged with structured context* but **never
-    propagate** — the drain loop must continue regardless of per-event failures.
+    propagate** — the drain loop must continue regardless of per-event
+    failures.
     """
     session_id: str | None = None
     try:
@@ -135,7 +115,7 @@ async def process_event(
         if session_id:
             await worker.services.ensure_session_node(session_id, data)
 
-        # Step 2.5 — blob processing (after ensure_session_node, before handler dispatch)
+        # Step 3 — blob processing (after ensure_session_node, before dispatch)
         timestamp: str | None = (
             data.get("timestamp") if isinstance(data, dict) else None
         )
@@ -151,13 +131,15 @@ async def process_event(
                 event,
             )
 
-        # Step 3 — resolve handler
-        handler = _find_handler(event, handlers)
+        # Step 4 — always call default handler
+        await handlers.default(event, data)
 
-        # Step 4 — dispatch
-        await handler(event, data)
+        # Step 5 — call matching enrichers additionally
+        for enricher in handlers.enrichers:
+            if event in enricher.handled_events:
+                await enricher(event, data)
 
-        # Step 5 — terminal flush
+        # Step 6 — terminal flush
         if event in TERMINAL_EVENTS:
             await worker.services.graph.flush()
 
