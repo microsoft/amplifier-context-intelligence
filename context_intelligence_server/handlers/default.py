@@ -13,6 +13,8 @@ from context_intelligence_server.utils import make_node_id
 
 logger = logging.getLogger(__name__)
 
+_EVENT_PARTS_RE = re.compile(r"[:_]")
+
 
 class DefaultHandler:
     """Creates :Event:{DerivedLabel} nodes from unclaimed events.
@@ -82,13 +84,13 @@ class DefaultHandler:
           'my_event'           → ['MyEvent', 'MyEvent', 'Event']
           'ping'               → ['Ping', 'Ping', 'Event']
         """
-        parts = re.split(r"[:_]", event_name)
+        parts = _EVENT_PARTS_RE.split(event_name)
         full_pascal = "".join(part.capitalize() for part in parts if part)
 
         if ":" in event_name:
             last_colon = event_name.rfind(":")
             category_raw = event_name[:last_colon]
-            category_parts = re.split(r"[:_]", category_raw)
+            category_parts = _EVENT_PARTS_RE.split(category_raw)
             category = "".join(p.capitalize() for p in category_parts if p)
         else:
             category = full_pascal
