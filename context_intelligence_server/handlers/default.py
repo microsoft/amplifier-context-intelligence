@@ -18,10 +18,9 @@ class DefaultHandler:
     """Creates :Event:{DerivedLabel} nodes from unclaimed events.
 
     For every event that no entity handler claims, the DefaultHandler:
-    1. Derives a PascalCase label from the event name.
-    2. Creates an Event node with labels {Event, DerivedLabel}.
-    3. Attaches it to the active OrchestratorRun (if one is running) or to
-       the Session otherwise via a HAS_EVENT edge.
+    1. Derives a 3-level label hierarchy from the event name.
+    2. Creates an Event node with labels [FullPascal, Category, 'Event'].
+    3. Attaches it to the Session node via a HAS_EVENT edge.
 
     This covers app-level events (e.g. session:resume) that don't need
     special entity-node mutations — they are simply recorded as Event
@@ -41,14 +40,18 @@ class DefaultHandler:
             return HookResult(action="continue")
 
         timestamp = data.get("timestamp", "")
-        derived = self.derive_label(event)
+        labels = self.derive_labels(event)
+
+        # tool:* events use tool_call_id as tiebreaker to distinguish
+        # parallel tool calls with the same timestamp.
+        disambiguator = data.get("tool_call_id") if event.startswith("tool:") else None
 
         # Create Event node
-        event_node_id = make_node_id(session_id, event, timestamp)
+        event_node_id = make_node_id(session_id, event, timestamp, disambiguator)
         await self.services.graph.upsert_node(
             event_node_id,
             {
-                "labels": ["Event", derived],
+                "labels": labels,
                 "event_name": event,
                 "occurred_at": timestamp,
                 "data": json.dumps(data),
@@ -56,10 +59,8 @@ class DefaultHandler:
         )
 
         # Attach to the session node
-        parent_id = session_id
-
         await self.services.graph.upsert_edge(
-            parent_id,
+            session_id,
             event_node_id,
             {"type": "HAS_EVENT", "occurred_at": timestamp},
         )
@@ -67,7 +68,29 @@ class DefaultHandler:
         return HookResult(action="continue")
 
     @staticmethod
-    def derive_label(event_name: str) -> str:
-        """Derive PascalCase label. "context:compaction" -> "ContextCompaction"."""
+    def derive_labels(event_name: str) -> list[str]:
+        """Derive 3-level label hierarchy from event name.
+
+        Returns [FullPascal, Category, 'Event'] where:
+        - FullPascal: all parts (split on : and _) capitalized and joined
+        - Category: the prefix before the last colon (same PascalCase transform)
+          If no colon, Category == FullPascal.
+
+        Examples:
+          'tool:pre'           → ['ToolPre', 'Tool', 'Event']
+          'recipe:loop_iter'   → ['RecipeLoopIter', 'Recipe', 'Event']
+          'my_event'           → ['MyEvent', 'MyEvent', 'Event']
+          'ping'               → ['Ping', 'Ping', 'Event']
+        """
         parts = re.split(r"[:_]", event_name)
-        return "".join(part.capitalize() for part in parts if part)
+        full_pascal = "".join(part.capitalize() for part in parts if part)
+
+        if ":" in event_name:
+            last_colon = event_name.rfind(":")
+            category_raw = event_name[:last_colon]
+            category_parts = re.split(r"[:_]", category_raw)
+            category = "".join(p.capitalize() for p in category_parts if p)
+        else:
+            category = full_pascal
+
+        return [full_pascal, category, "Event"]
