@@ -191,9 +191,13 @@ class TestSessionFork:
     async def test_fork_uses_parent_id_not_parent_key(
         self, services: HookStateService
     ) -> None:
-        """Fork canonical key is parent_id (not legacy 'parent' key)."""
+        """Fork canonical key is parent_id; legacy 'parent' key must be ignored.
+
+        Positive case: parent_id creates an edge.
+        Negative case: legacy 'parent' key alone must NOT create an edge.
+        """
         handler = SessionHandler(services)
-        # Using parent_id (canonical), not 'parent' (legacy)
+        # Positive: using parent_id (canonical) creates an edge
         await handler(
             "session:fork",
             {
@@ -205,6 +209,19 @@ class TestSessionFork:
         # Edge must exist parent→child when parent_id is provided
         edge = await services.graph.get_edge("p1", "f1")
         assert edge is not None
+
+        # Negative: legacy 'parent' key alone must NOT create any edge
+        handler2 = SessionHandler(services)
+        await handler2(
+            "session:fork",
+            {
+                "session_id": "f2",
+                "parent": "p2",  # legacy key — must be ignored
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        legacy_edge = await services.graph.get_edge("p2", "f2")
+        assert legacy_edge is None, "legacy 'parent' key must not create an edge"
 
     async def test_fork_missing_parent_id_creates_node_no_edge(
         self, services: HookStateService
@@ -225,6 +242,11 @@ class TestSessionFork:
         assert "SubSession" not in node["labels"]
         # Orphaned forks do NOT get RootSession — they are ForkedSession+Session only
         assert "RootSession" not in node["labels"]
+        # Orphaned forks must NOT create any SUBSESSION_OF edge — the GraphState._edges
+        # dict is checked directly because no parent node ID exists to query against.
+        assert len(services.graph._edges) == 0, (
+            "No edge should be created for an orphaned fork (no parent_id)"
+        )
 
 
 class TestSessionEnd:
