@@ -1,4 +1,4 @@
-"""ToolLifter — extracts tool_name and tool_input from tool:* events."""
+"""ToolLifter — extracts tool_name, tool_input, tool_call_id, parallel_group_id from tool:* events."""
 
 from __future__ import annotations
 
