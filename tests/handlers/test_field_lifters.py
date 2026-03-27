@@ -308,3 +308,45 @@ class TestLlmLifter:
     def test_empty_data_returns_empty(self) -> None:
         result = self.lifter.extract("llm:request", {})
         assert result == {}
+
+
+class TestPromptLifter:
+    """Tests for PromptLifter — extracts prompt and response_preview from prompt:* events."""
+
+    def setup_method(self) -> None:
+        from context_intelligence_server.handlers.field_lifters.prompt import (
+            PromptLifter,
+        )
+
+        self.lifter = PromptLifter()
+
+    def test_matches_prompt_events(self) -> None:
+        assert self.lifter.matches("prompt:submit") is True
+        assert self.lifter.matches("prompt:complete") is True
+        assert self.lifter.matches("llm:request") is False
+
+    def test_lifts_prompt_on_submit(self) -> None:
+        data = {"prompt": "What is the capital of France?"}
+        result = self.lifter.extract("prompt:submit", data)
+        assert result["prompt"] == "What is the capital of France?"
+
+    def test_lifts_prompt_and_response_preview_on_complete(self) -> None:
+        data = {
+            "prompt": "What is the capital of France?",
+            "response_preview": "The capital of France is Paris.",
+            "length": 31,
+        }
+        result = self.lifter.extract("prompt:complete", data)
+        assert result["prompt"] == "What is the capital of France?"
+        assert result["response_preview"] == "The capital of France is Paris."
+        assert "length" not in result
+
+    def test_skips_absent_response_preview_on_submit(self) -> None:
+        data = {"prompt": "Hello?"}
+        result = self.lifter.extract("prompt:submit", data)
+        assert result["prompt"] == "Hello?"
+        assert "response_preview" not in result
+
+    def test_empty_data_returns_empty(self) -> None:
+        result = self.lifter.extract("prompt:submit", {})
+        assert result == {}
