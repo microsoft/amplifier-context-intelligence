@@ -115,3 +115,83 @@ class TestUniversalLifter:
         lifter = UniversalLifter()
         result = lifter.extract("tool:pre", {})
         assert result == {}
+
+
+class TestSessionLifter:
+    """Tests for SessionLifter — extracts parent and metadata fields from session:* events."""
+
+    def setup_method(self) -> None:
+        from context_intelligence_server.handlers.field_lifters.session import (
+            SessionLifter,
+        )
+
+        self.lifter = SessionLifter()
+
+    def test_matches_only_session_events(self) -> None:
+        assert self.lifter.matches("session:start") is True
+        assert self.lifter.matches("session:fork") is True
+        assert self.lifter.matches("session:end") is True
+        assert self.lifter.matches("session:resume") is True
+        assert self.lifter.matches("tool:pre") is False
+
+    def test_lifts_parent_from_fork(self) -> None:
+        data = {"parent": "sess-parent-123"}
+        result = self.lifter.extract("session:fork", data)
+        assert result["parent"] == "sess-parent-123"
+
+    def test_parent_absent_skipped(self) -> None:
+        data = {"session_id": "sess-1"}
+        result = self.lifter.extract("session:start", data)
+        assert "parent" not in result
+
+    def test_none_parent_value_skipped(self) -> None:
+        data = {"parent": None}
+        result = self.lifter.extract("session:fork", data)
+        assert "parent" not in result
+
+    def test_lifts_metadata_agent_name(self) -> None:
+        data = {"metadata": {"agent_name": "my-agent"}}
+        result = self.lifter.extract("session:start", data)
+        assert result["agent_name"] == "my-agent"
+
+    def test_lifts_all_metadata_keys(self) -> None:
+        data = {
+            "metadata": {
+                "agent_name": "my-agent",
+                "tool_call_id": "tc-42",
+                "parallel_group_id": "pg-7",
+                "recipe_name": "my-recipe",
+                "recipe_step": "step-one",
+                "recipe_step_index": 3,
+            }
+        }
+        result = self.lifter.extract("session:start", data)
+        assert result["agent_name"] == "my-agent"
+        assert result["tool_call_id"] == "tc-42"
+        assert result["parallel_group_id"] == "pg-7"
+        assert result["recipe_name"] == "my-recipe"
+        assert result["recipe_step"] == "step-one"
+        assert result["recipe_step_index"] == 3
+
+    def test_missing_metadata_returns_empty(self) -> None:
+        data = {"session_id": "sess-1"}
+        result = self.lifter.extract("session:start", data)
+        assert result == {}
+
+    def test_none_metadata_values_skipped(self) -> None:
+        data = {
+            "metadata": {
+                "agent_name": "my-agent",
+                "tool_call_id": None,
+                "recipe_name": None,
+            }
+        }
+        result = self.lifter.extract("session:start", data)
+        assert result["agent_name"] == "my-agent"
+        assert "tool_call_id" not in result
+        assert "recipe_name" not in result
+
+    def test_metadata_not_a_dict_returns_empty(self) -> None:
+        data = {"metadata": "not-a-dict"}
+        result = self.lifter.extract("session:start", data)
+        assert result == {}
