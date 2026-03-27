@@ -8,11 +8,14 @@ import re
 from typing import Any
 
 from context_intelligence_server.handlers.field_lifters import (
+    ArtifactLifter,
     DelegateLifter,
     FieldLifter,
     LlmLifter,
     PromptLifter,
+    RecipeLifter,
     SessionLifter,
+    SkillLifter,
     ToolLifter,
     UniversalLifter,
 )
@@ -44,13 +47,17 @@ class DefaultHandler:
 
     # Stage 3: ALL matching lifters fire (not first-match-wins).
     # UniversalLifter must be FIRST so event-specific lifters can override.
+    # All others sorted alphabetically by event family for maintainability.
     _LIFTERS: list[FieldLifter] = [
         UniversalLifter(),
-        SessionLifter(),
-        ToolLifter(),
-        DelegateLifter(),
-        LlmLifter(),
-        PromptLifter(),
+        ArtifactLifter(),  # artifact:*
+        DelegateLifter(),  # delegate:*
+        LlmLifter(),  # llm:*
+        PromptLifter(),  # prompt:*
+        RecipeLifter(),  # recipe:*
+        SessionLifter(),  # session:*
+        SkillLifter(),  # skill:*
+        ToolLifter(),  # tool:*
     ]
 
     def __init__(self, services: HookStateService) -> None:
