@@ -53,6 +53,16 @@ class SessionHandler:
     async def _handle_start(
         self, session_id: str, timestamp: str, data: dict[str, Any]
     ) -> None:
+        # Guard: session:fork fires before session:start for forked sessions.
+        # If already classified as ForkedSession, do NOT re-classify as SubSession
+        # or create a SUBSESSION_OF edge. Only enrich timing data.
+        existing = await self.services.graph.get_node(session_id)
+        if existing and "ForkedSession" in existing.get("labels", []):
+            await self.services.graph.upsert_node(
+                session_id, {"started_at": timestamp}
+            )
+            return
+
         parent_id = (data.get("parent_id") or "").strip()
 
         if parent_id:
