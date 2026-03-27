@@ -1,17 +1,33 @@
 """Pydantic request/response models for the Context Intelligence Server."""
 
+from __future__ import annotations
+
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class EventRequest(BaseModel):
-    """Inbound event payload from an Amplifier client."""
+    """Inbound event payload from an Amplifier client.
+
+    workspace is mandatory — events without a workspace are invalid.
+    The Amplifier client must always supply workspace on every event.
+    Events without workspace (e.g. an incorrectly configured hook) are
+    rejected at the endpoint with HTTP 422.
+    """
 
     event: str
-    workspace: str | None = None
+    workspace: str
     idempotency_key: str | None = None
     data: dict[str, Any]
+
+    @field_validator("workspace")
+    @classmethod
+    def workspace_must_not_be_empty(cls, v: str) -> str:
+        """Reject blank workspace — a workspace is always a non-empty project slug."""
+        if not v or not v.strip():
+            raise ValueError("workspace must not be empty")
+        return v
 
 
 class EventResponse(BaseModel):

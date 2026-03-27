@@ -40,13 +40,36 @@ def test_event_request_missing_event():
         EventRequest(workspace="my-feature-branch", data={"session_id": "abc123"})  # type: ignore[call-arg]
 
 
-def test_event_request_workspace_is_optional():
-    """EventRequest accepts events without workspace — session:fork and tool:error have no envelope workspace."""
+def test_event_request_missing_workspace():
+    """EventRequest raises ValidationError when workspace is absent.
+
+    workspace is mandatory — all events must carry a workspace string.
+    This test is a permanent regression guard.
+    """
+    with pytest.raises(ValidationError):
+        EventRequest(event="session:start", data={"session_id": "abc123"})  # type: ignore[call-arg]
+
+
+def test_event_request_empty_workspace_raises():
+    """EventRequest raises ValidationError when workspace is an empty string."""
+    with pytest.raises(ValidationError):
+        EventRequest(event="session:start", workspace="", data={"session_id": "abc123"})
+
+
+def test_event_request_blank_workspace_raises():
+    """EventRequest raises ValidationError when workspace is whitespace only."""
+    with pytest.raises(ValidationError):
+        EventRequest(event="session:start", workspace="   ", data={"session_id": "abc123"})
+
+
+def test_event_request_workspace_non_empty_accepted():
+    """EventRequest accepts any non-empty workspace string."""
     req = EventRequest(
-        event="session:fork", data={"session_id": "abc123", "parent_id": "parent"}
+        event="session:start",
+        workspace="my-project-slug",
+        data={"session_id": "abc123"},
     )
-    assert req.workspace is None
-    assert req.event == "session:fork"
+    assert req.workspace == "my-project-slug"
 
 
 def test_event_request_data_without_session_id():

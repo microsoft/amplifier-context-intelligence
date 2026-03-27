@@ -117,16 +117,8 @@ async def post_events(request: EventRequest, replay: bool = False) -> EventRespo
                 session_id,
             )
             return EventResponse(status="duplicate", session_id=session_id or None)
-    # Events like session:fork and tool:error have no envelope workspace.
-    # Inherit workspace from the parent session worker if available so that
-    # Neo4j MERGE queries use a consistent workspace key across parent and child.
-    workspace = request.workspace
-    if workspace is None:
-        parent_id = request.data.get("parent_id") or request.data.get("parent")
-        if parent_id and parent_id in registry._workers:
-            workspace = registry._workers[parent_id].services.graph.workspace
-    worker = registry.get_or_create(session_id, workspace)
-    await worker.queue.put((request.event, workspace, request.data))
+    worker = registry.get_or_create(session_id, request.workspace)
+    await worker.queue.put((request.event, request.workspace, request.data))
     logger.info("event_enqueued: event=%s session_id=%s", request.event, session_id)
     return EventResponse(status="queued", session_id=session_id or None)
 
