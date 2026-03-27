@@ -193,9 +193,14 @@ class HookStateService:
         2. Graph query — call ``graph.get_node(session_id)``.  If the node
            already exists (e.g. from a previous run), repopulate the cache and
            return without overwriting any data.  If the node is absent, create
-           it with the appropriate labels (``Session + RootSession`` when no
-           parent is present, ``Session + SubSession`` when *data* contains a
-           ``parent_id`` or ``parent`` field) and set ``status = 'running'``.
+           it with labels ``["Session"]`` and ``status = 'running'``.
+
+        This method is a safety net that creates a minimal session node if it
+        doesn't exist.  ``SessionHandler`` is the sole authority on session
+        type labels (``RootSession``, ``SubSession``, ``ForkedSession``).
+        ``ensure_session_node`` always creates a bare ``Session`` node;
+        ``SessionHandler`` enriches it with the correct type label via a
+        subsequent upsert.
 
         Only caches session_id after a successful write to ensure retry
         resilience on write failure.
@@ -211,12 +216,11 @@ class HookStateService:
             self._seen_sessions.add(session_id)
             return
 
-        # Node absent from both cache and graph — create it
-        parent = data.get("parent_id") or data.get("parent")
-        labels = ["SubSession", "Session"] if parent else ["RootSession", "Session"]
-
+        # Node absent from both cache and graph — create it as a bare Session node.
+        # ensure_session_node is a safety net; SessionHandler is the sole authority
+        # on session type labels (RootSession, SubSession, ForkedSession).
         node_data: dict[str, Any] = {
-            "labels": labels,
+            "labels": ["Session"],
             "status": "running",
         }
         if "started_at" in data:
