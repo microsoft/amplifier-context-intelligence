@@ -8,6 +8,9 @@ from context_intelligence_server.handlers.field_lifters.base import (
     FieldLifter,
     safe_prop,
 )
+from context_intelligence_server.handlers.field_lifters.navigation import (
+    UniversalLifter,
+)
 
 
 class TestSafeProp:
@@ -63,3 +66,50 @@ class TestFieldLifterMatches:
         lifter = self.WildcardLifter()
         with pytest.raises(NotImplementedError):
             lifter.extract("tool:pre", {})
+
+
+class TestUniversalLifter:
+    """Tests for UniversalLifter — extracts 4 navigation fields from any event."""
+
+    def test_matches_all_events(self) -> None:
+        lifter = UniversalLifter()
+        assert lifter.matches("tool:pre") is True
+        assert lifter.matches("session:start") is True
+        assert lifter.matches("anything:here") is True
+
+    def test_extracts_all_four_fields(self) -> None:
+        lifter = UniversalLifter()
+        data = {
+            "session_id": "sess-1",
+            "parent_id": "sess-0",
+            "tool_call_id": "tc-42",
+            "parallel_group_id": "pg-7",
+        }
+        result = lifter.extract("tool:pre", data)
+        assert result == {
+            "session_id": "sess-1",
+            "parent_id": "sess-0",
+            "tool_call_id": "tc-42",
+            "parallel_group_id": "pg-7",
+        }
+
+    def test_skips_none_values(self) -> None:
+        lifter = UniversalLifter()
+        data = {"session_id": "sess-1", "parent_id": None}
+        result = lifter.extract("tool:pre", data)
+        assert "parent_id" not in result
+        assert result["session_id"] == "sess-1"
+
+    def test_skips_missing_keys(self) -> None:
+        lifter = UniversalLifter()
+        data = {"session_id": "sess-1"}
+        result = lifter.extract("tool:pre", data)
+        assert "parent_id" not in result
+        assert "tool_call_id" not in result
+        assert "parallel_group_id" not in result
+        assert result["session_id"] == "sess-1"
+
+    def test_empty_data_returns_empty(self) -> None:
+        lifter = UniversalLifter()
+        result = lifter.extract("tool:pre", {})
+        assert result == {}
