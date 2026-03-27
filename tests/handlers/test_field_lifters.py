@@ -277,3 +277,34 @@ class TestDelegateLifter:
     def test_empty_data_returns_empty(self) -> None:
         result = self.lifter.extract("delegate:agent_spawned", {})
         assert result == {}
+
+
+class TestLlmLifter:
+    """Tests for LlmLifter — extracts model and provider from llm:* events."""
+
+    def setup_method(self) -> None:
+        from context_intelligence_server.handlers.field_lifters.llm import (
+            LlmLifter,
+        )
+
+        self.lifter = LlmLifter()
+
+    def test_matches_llm_events(self) -> None:
+        assert self.lifter.matches("llm:request") is True
+        assert self.lifter.matches("llm:response") is True
+        assert self.lifter.matches("tool:pre") is False
+
+    def test_lifts_model_and_provider(self) -> None:
+        data = {"model": "claude-3-5-sonnet", "provider": "anthropic", "status": "ok"}
+        result = self.lifter.extract("llm:request", data)
+        assert result == {"model": "claude-3-5-sonnet", "provider": "anthropic"}
+
+    def test_skips_missing_provider(self) -> None:
+        data = {"model": "claude-3-5-sonnet"}
+        result = self.lifter.extract("llm:request", data)
+        assert result == {"model": "claude-3-5-sonnet"}
+        assert "provider" not in result
+
+    def test_empty_data_returns_empty(self) -> None:
+        result = self.lifter.extract("llm:request", {})
+        assert result == {}
