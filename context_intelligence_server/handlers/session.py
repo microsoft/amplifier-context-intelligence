@@ -58,9 +58,7 @@ class SessionHandler:
         # or create a SUBSESSION_OF edge. Only enrich timing data.
         existing = await self.services.graph.get_node(session_id)
         if existing and "ForkedSession" in existing.get("labels", []):
-            await self.services.graph.upsert_node(
-                session_id, {"started_at": timestamp}
-            )
+            await self.services.graph.upsert_node(session_id, {"started_at": timestamp})
             return
 
         parent_id = (data.get("parent_id") or "").strip()
