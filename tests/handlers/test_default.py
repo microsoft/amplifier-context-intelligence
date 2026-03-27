@@ -543,9 +543,7 @@ class TestDefaultHandlerFieldLifting:
         assert node.get("model") == "claude-3-5-sonnet"
         assert node.get("provider") == "anthropic"
 
-    async def test_prompt_submit_lifts_prompt(
-        self, services: HookStateService
-    ) -> None:
+    async def test_prompt_submit_lifts_prompt(self, services: HookStateService) -> None:
         """prompt:submit node has prompt lifted by PromptLifter."""
         handler = DefaultHandler(services)
         await handler(
@@ -579,7 +577,9 @@ class TestDefaultHandlerFieldLifting:
         node = await services.graph.get_node(event_id)
         assert node is not None
         assert node.get("prompt") == "What is AI?"
-        assert node.get("response_preview") == "AI stands for Artificial Intelligence..."
+        assert (
+            node.get("response_preview") == "AI stands for Artificial Intelligence..."
+        )
 
     async def test_data_blob_still_present_alongside_lifted_fields(
         self, services: HookStateService
