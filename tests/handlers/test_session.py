@@ -150,10 +150,10 @@ class TestSessionStartParentIdEdgeCases:
 
 
 class TestSessionFork:
-    """session:fork creates ForkedSession:SubSession:Session nodes."""
+    """session:fork creates ForkedSession:Session nodes (NOT SubSession)."""
 
     async def test_fork_labels_with_parent(self, services: HookStateService) -> None:
-        """Fork with parent gets [ForkedSession, SubSession, Session] labels."""
+        """Fork with parent gets exactly [ForkedSession, Session] labels — SubSession must NOT be present."""
         handler = SessionHandler(services)
         await handler(
             "session:fork",
@@ -166,11 +166,13 @@ class TestSessionFork:
         node = await services.graph.get_node("f1")
         assert node is not None
         assert "Session" in node["labels"]
-        assert "SubSession" in node["labels"]
         assert "ForkedSession" in node["labels"]
+        assert "SubSession" not in node["labels"], (
+            "Forked sessions are NOT subsessions — SubSession must not be present"
+        )
 
     async def test_fork_edge_parent_to_child(self, services: HookStateService) -> None:
-        """SUBSESSION_OF edge goes from parent→child (not child→parent)."""
+        """HAS_FORK edge goes from parent→child (not child→parent)."""
         handler = SessionHandler(services)
         await handler(
             "session:fork",
@@ -184,6 +186,10 @@ class TestSessionFork:
         edge = await services.graph.get_edge("p1", "f1")
         assert edge is not None
         assert edge["occurred_at"] == "2026-01-01T00:00:00Z"
+        assert edge["type"] == "HAS_FORK", (
+            f"Fork edge must be HAS_FORK, got: {edge.get('type')}"
+        )
+        assert edge["type"] != "SUBSESSION_OF", "Fork edge must NOT be SUBSESSION_OF"
 
     async def test_fork_uses_parent_id_not_parent_key(
         self, services: HookStateService
@@ -339,7 +345,10 @@ class TestSessionResumeNotClaimed:
 
 
 class TestSessionEdgeTypes:
-    """Edges created by SessionHandler must carry explicit semantic 'type' keys."""
+    """Edges created by SessionHandler must carry explicit semantic 'type' keys.
+
+    session:start creates SUBSESSION_OF edges; session:fork creates HAS_FORK edges.
+    """
 
     async def test_start_subsession_edge_type_is_subsession_of(
         self, services: HookStateService
@@ -359,10 +368,8 @@ class TestSessionEdgeTypes:
         assert edge is not None
         assert edge.get("type") == "SUBSESSION_OF"
 
-    async def test_fork_edge_type_is_subsession_of(
-        self, services: HookStateService
-    ) -> None:
-        """session:fork parent→child edge must have type='SUBSESSION_OF'."""
+    async def test_fork_edge_type_is_has_fork(self, services: HookStateService) -> None:
+        """session:fork parent→child edge must have type='HAS_FORK' (not SUBSESSION_OF)."""
         handler = SessionHandler(services)
         await handler(
             "session:fork",
@@ -375,7 +382,12 @@ class TestSessionEdgeTypes:
         # Parent→Child direction
         edge = await services.graph.get_edge("parent1", "fork1")
         assert edge is not None
-        assert edge.get("type") == "SUBSESSION_OF"
+        assert edge.get("type") == "HAS_FORK", (
+            f"Fork edge must be HAS_FORK, got: {edge.get('type')}"
+        )
+        assert edge.get("type") != "SUBSESSION_OF", (
+            "Fork edge must NOT be SUBSESSION_OF — forks are not subsessions"
+        )
 
 
 class TestLateParentDiscovery:
