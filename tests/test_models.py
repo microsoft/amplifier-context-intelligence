@@ -40,10 +40,13 @@ def test_event_request_missing_event():
         EventRequest(workspace="my-feature-branch", data={"session_id": "abc123"})  # type: ignore[call-arg]
 
 
-def test_event_request_missing_workspace():
-    """EventRequest raises ValidationError when workspace is missing."""
-    with pytest.raises(ValidationError):
-        EventRequest(event="tool:pre", data={"session_id": "abc123"})  # type: ignore[call-arg]
+def test_event_request_workspace_is_optional():
+    """EventRequest accepts events without workspace — session:fork and tool:error have no envelope workspace."""
+    req = EventRequest(
+        event="session:fork", data={"session_id": "abc123", "parent_id": "parent"}
+    )
+    assert req.workspace is None
+    assert req.event == "session:fork"
 
 
 def test_event_request_data_without_session_id():

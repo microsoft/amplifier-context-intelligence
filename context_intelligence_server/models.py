@@ -9,7 +9,7 @@ class EventRequest(BaseModel):
     """Inbound event payload from an Amplifier client."""
 
     event: str
-    workspace: str
+    workspace: str | None = None
     idempotency_key: str | None = None
     data: dict[str, Any]
 
