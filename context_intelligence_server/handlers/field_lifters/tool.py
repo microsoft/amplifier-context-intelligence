@@ -9,6 +9,8 @@ from context_intelligence_server.handlers.field_lifters.base import FieldLifter
 _TOOL_KEYS: tuple[str, ...] = (
     "tool_name",
     "tool_input",
+    "tool_call_id",
+    "parallel_group_id",
 )
 
 
@@ -20,6 +22,8 @@ class ToolLifter(FieldLifter):
     Extracts:
     - tool_name: the name of the tool being called
     - tool_input: the input dict, blob reference, or any value — lifted as-is
+    - tool_call_id: correlates tool-call events
+    - parallel_group_id: groups parallel tool calls
 
     None values and missing keys are silently skipped.
     tool_input may be a dict, a blob reference ({"$blob_ref": "ci-blob://..."}),

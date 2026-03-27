@@ -20,8 +20,8 @@ class UniversalLifter(FieldLifter):
     Fires on all events (event_pattern = "*") and extracts:
     - session_id: current session identifier
     - parent_id: parent session identifier for hierarchy traversal
-    - tool_call_id: correlates tool-call events
-    - parallel_group_id: groups parallel tool calls
+    - tool_call_id: tool call identifier for correlating pre/post/error events
+    - parallel_group_id: group identifier for parallel tool executions
 
     None values and missing keys are silently skipped.
     """
