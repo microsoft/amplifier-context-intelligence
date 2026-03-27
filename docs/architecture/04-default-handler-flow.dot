@@ -105,7 +105,7 @@ digraph default_handler_flow {
         shape     = box
         style     = filled
         fillcolor = "#FFF9C4"
-        label     = "\u26a0 Collision Rule\nLifted fields matching reserved properties\n(node_id, occurred_at, event_name, data, labels)\nare prefixed with data_\nNone values are silently skipped"
+        label     = "⚠ Collision Rule\nLifted fields matching reserved properties\n(node_id, occurred_at, event_name, data, labels)\nare prefixed with data_\nNone values are silently skipped"
     ]
 
     // ── Pipeline edges ────────────────────────────────────────────────────────
