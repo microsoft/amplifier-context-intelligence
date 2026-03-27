@@ -97,7 +97,7 @@ digraph handler_architecture {
         shape     = box
         style     = "filled"
         fillcolor = "#FFF9C4"
-        label     = "\u26a0 IMPORTANT\nClaiming an event does NOT prevent\nDefaultHandler from running.\nEnrichers are ADDITIVE \u2014 DefaultHandler\nalways creates the base Event node first."
+        label     = "⚠ IMPORTANT\nClaiming an event does NOT prevent\nDefaultHandler from running.\nEnrichers are ADDITIVE \u2014 DefaultHandler\nalways creates the base Event node first."
     ]
 
     // ── Edges ─────────────────────────────────────────────────────────────────

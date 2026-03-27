@@ -109,7 +109,7 @@ digraph graph_model {
         shape     = box
         style     = filled
         fillcolor = "#FFF9C4"
-        label     = "\u26a0 Dual HAS_EVENT edges on tool events\n(Session)-[:HAS_EVENT]->(Event)  \u2014 DefaultHandler (always)\n(ToolCall)-[:HAS_EVENT]->(Event)  \u2014 ToolCallHandler (additionally)\nBoth edges coexist; enrichers are ADDITIVE"
+        label     = "⚠ Dual HAS_EVENT edges on tool events\n(Session)-[:HAS_EVENT]->(Event)  \u2014 DefaultHandler (always)\n(ToolCall)-[:HAS_EVENT]->(Event)  \u2014 ToolCallHandler (additionally)\nBoth edges coexist; enrichers are ADDITIVE"
     ]
 
     note_tiebreaker [
@@ -124,7 +124,7 @@ digraph graph_model {
         style     = filled
         fillcolor = "#FFCCBC"
         penwidth  = 2
-        label     = "\u26a0 SUBSESSION_OF direction: PARENT \u2192 CHILD\n(opposite of old design \u2014 confirm before querying)"
+        label     = "⚠ SUBSESSION_OF direction: PARENT \u2192 CHILD\n(opposite of old design \u2014 confirm before querying)"
     ]
 
     // ── Edges ─────────────────────────────────────────────────────────────────

@@ -21,7 +21,7 @@ class DefaultHandler:
 
     For every event that no entity handler claims, the DefaultHandler:
     1. Derives a 3-level label hierarchy from the event name.
-    2. Creates an Event node with labels [FullPascal, Category, 'Event'].
+    2. Creates an Event node with labels [FullPascalEvent, CategoryEvent, 'Event'].
     3. Attaches it to the Session node via a HAS_EVENT edge.
 
     This covers app-level events (e.g. session:resume) that don't need

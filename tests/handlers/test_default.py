@@ -75,6 +75,14 @@ class TestDeriveLabelConversions:
             "Event",
         ]
 
+    def test_session_fork(self) -> None:
+        """session:fork produces SessionForkEvent — distinct from SubSession/Session entity labels."""
+        assert DefaultHandler.derive_labels("session:fork") == [
+            "SessionForkEvent",
+            "SessionEvent",
+            "Event",
+        ]
+
 
 class TestDefaultHandlerCreatesEventNodes:
     """DefaultHandler creates Event nodes with 3-level labels + HAS_EVENT edges."""
@@ -134,7 +142,7 @@ class TestDefaultHandlerCreatesEventNodes:
     async def test_works_with_arbitrary_unclaimed_event(
         self, services: HookStateService
     ) -> None:
-        """DefaultHandler is generic — custom:my_event → CustomMyEvent, Custom, Event."""
+        """DefaultHandler is generic — custom:my_event → CustomMyEventEvent, CustomEvent, Event."""
         handler = DefaultHandler(services)
         await handler(
             "custom:my_event",
