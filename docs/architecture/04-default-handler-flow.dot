@@ -1,0 +1,148 @@
+digraph default_handler_flow {
+    // ── Global defaults ───────────────────────────────────────────────────────
+    graph [
+        rankdir   = TB
+        splines   = ortho
+        nodesep   = 0.8
+        ranksep   = 0.9
+        fontname  = "Helvetica"
+        fontsize  = 11
+        label     = "DefaultHandler \u2014 Internal 5-Stage Event Node Creation Pipeline"
+        labelloc  = t
+        labeljust = c
+    ]
+    node [
+        fontname = "Helvetica"
+        fontsize = 11
+        style    = "filled,rounded"
+        shape    = box
+    ]
+    edge [
+        fontname = "Helvetica"
+        fontsize = 10
+    ]
+
+    // ── Input ─────────────────────────────────────────────────────────────────
+    input [
+        shape     = oval
+        style     = filled
+        fillcolor = "#E3F2FD"
+        label     = "event: dict\n(raw event from recorder)"
+    ]
+
+    // ── Stage 1: Label Derivation ─────────────────────────────────────────────
+    stage1 [
+        fillcolor = "#F5F5F5"
+        label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+            <TR><TD><B>&#9312; Label Derivation</B></TD></TR>
+            <TR><TD>Split on ":" and "_" &#8594; PascalCase each part + Event suffix</TD></TR>
+            <TR><TD><I>tool:pre &#8594; :ToolPreEvent :ToolEvent :Event</I></TD></TR>
+            <TR><TD><I>session:start &#8594; :SessionStartEvent :SessionEvent :Event</I></TD></TR>
+            <TR><TD><I>delegate:agent_spawned &#8594; :DelegateAgentSpawnedEvent :DelegateEvent :Event</I></TD></TR>
+            <TR><TD><B>Yields: [FullPascalEvent, CategoryEvent, Event]</B></TD></TR>
+        </TABLE>>
+    ]
+
+    // ── Stage 2: node_id Computation ──────────────────────────────────────────
+    stage2 [
+        fillcolor = "#F5F5F5"
+        label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+            <TR><TD><B>&#9313; node_id Computation</B></TD></TR>
+            <TR><TD>make_node_id(session_id, event, timestamp)</TD></TR>
+            <TR><TD>+ tool_call_id tiebreaker (when present)</TD></TR>
+            <TR><TD><I>e.g. "sess__tool_pre__1700000000000__abc123"</I></TD></TR>
+        </TABLE>>
+    ]
+
+    // ── Stage 3: Field Lifting (highlighted &#8212; ALL matching lifters fire) ──
+    stage3 [
+        fillcolor = "#C8E6C9"
+        fontname  = "Helvetica-Bold"
+        penwidth  = 2.5
+        label     = <<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
+            <TR><TD COLSPAN="2" BGCOLOR="#A5D6A7"><B>&#9314; Field Lifting &#8212; ALL matching FieldLifters fire</B></TD></TR>
+            <TR><TD BGCOLOR="#E8F5E9"><B>Lifter (pattern)</B></TD><TD BGCOLOR="#E8F5E9"><B>Fields Lifted</B></TD></TR>
+            <TR><TD>UniversalLifter(*)</TD><TD>session_id, parent_id, tool_call_id, parallel_group_id</TD></TR>
+            <TR><TD>SessionLifter(session:*)</TD><TD>parent, agent_name, recipe_name, recipe_step</TD></TR>
+            <TR><TD>ToolLifter(tool:*)</TD><TD>tool_name, tool_input</TD></TR>
+            <TR><TD>DelegateLifter(delegate:*)</TD><TD>agent, sub_session_id, parent_session_id</TD></TR>
+            <TR><TD>LlmLifter(llm:*)</TD><TD>model, provider</TD></TR>
+            <TR><TD>PromptLifter(prompt:*)</TD><TD>prompt, response_preview</TD></TR>
+        </TABLE>>
+    ]
+
+    // ── Stage 4: Node Construction ────────────────────────────────────────────
+    stage4 [
+        fillcolor = "#F5F5F5"
+        label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+            <TR><TD><B>&#9315; Node Construction</B></TD></TR>
+            <TR><TD>{ labels, event_name, occurred_at,</TD></TR>
+            <TR><TD>&#160;&#160;**lifted, data: JSON }</TD></TR>
+            <TR><TD><I>MERGE on node_id &#8594; upsert into Neo4j</I></TD></TR>
+        </TABLE>>
+    ]
+
+    // ── Stage 5: HAS_EVENT Edge ───────────────────────────────────────────────
+    stage5 [
+        fillcolor = "#F5F5F5"
+        label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+            <TR><TD><B>&#9316; HAS_EVENT Edge</B></TD></TR>
+            <TR><TD>(Session)-[:HAS_EVENT {occurred_at}]-&gt;(Event)</TD></TR>
+            <TR><TD>Directed: Session &#8594; Event node (always)</TD></TR>
+        </TABLE>>
+    ]
+
+    // ── Output ────────────────────────────────────────────────────────────────
+    output [
+        shape     = oval
+        style     = filled
+        fillcolor = "#E3F2FD"
+        label     = "Event node persisted\nin Neo4j property graph"
+    ]
+
+    // ── Collision rule note ───────────────────────────────────────────────────
+    collision_note [
+        shape     = box
+        style     = filled
+        fillcolor = "#FFF9C4"
+        label     = "\u26a0 Collision Rule\nLifted fields matching reserved properties\n(node_id, occurred_at, event_name, data, labels)\nare prefixed with data_\nNone values are silently skipped"
+    ]
+
+    // ── Pipeline edges ────────────────────────────────────────────────────────
+    input  -> stage1
+    stage1 -> stage2
+    stage2 -> stage3
+    stage3 -> stage4
+    stage4 -> stage5
+    stage5 -> output
+
+    // ── Annotation edge to collision note ─────────────────────────────────────
+    stage3 -> collision_note [style = dotted, color = "#AAAAAA", arrowhead = none]
+
+    // ── Legend ────────────────────────────────────────────────────────────────
+    subgraph cluster_legend {
+        graph [
+            label    = "Legend"
+            style    = dashed
+            color    = "#AAAAAA"
+            fontname = "Helvetica"
+            fontsize = 10
+        ]
+        node [fontsize = 10]
+
+        legend_green [
+            fillcolor = "#C8E6C9"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
+            label     = "Green + bold border\n= ALL matching lifters fire\n(not first-match; every matching pattern runs)"
+        ]
+        legend_blue [
+            shape     = oval
+            style     = filled
+            fillcolor = "#E3F2FD"
+            label     = "Blue oval = Input / Output"
+        ]
+
+        legend_green -> legend_blue [style = invis]
+    }
+}
