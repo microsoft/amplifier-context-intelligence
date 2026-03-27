@@ -7,6 +7,15 @@ import logging
 import re
 from typing import Any
 
+from context_intelligence_server.handlers.field_lifters import (
+    DelegateLifter,
+    FieldLifter,
+    LlmLifter,
+    PromptLifter,
+    SessionLifter,
+    ToolLifter,
+    UniversalLifter,
+)
 from context_intelligence_server.protocol import HookResult
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.utils import make_node_id
@@ -22,7 +31,9 @@ class DefaultHandler:
     For every event that no entity handler claims, the DefaultHandler:
     1. Derives a 3-level label hierarchy from the event name.
     2. Creates an Event node with labels [FullPascalEvent, CategoryEvent, 'Event'].
-    3. Attaches it to the Session node via a HAS_EVENT edge.
+    3. Applies ALL matching FieldLifters to expose structured fields as top-level
+       node properties.
+    4. Attaches it to the Session node via a HAS_EVENT edge.
 
     This covers app-level events (e.g. session:resume) that don't need
     special entity-node mutations — they are simply recorded as Event
@@ -31,36 +42,56 @@ class DefaultHandler:
 
     handled_events: set[str]
 
+    # Stage 3: ALL matching lifters fire (not first-match-wins).
+    # UniversalLifter must be FIRST so event-specific lifters can override.
+    _LIFTERS: list[FieldLifter] = [
+        UniversalLifter(),
+        SessionLifter(),
+        ToolLifter(),
+        DelegateLifter(),
+        LlmLifter(),
+        PromptLifter(),
+    ]
+
     def __init__(self, services: HookStateService) -> None:
         self.services = services
         self.handled_events = set()
 
     async def __call__(self, event: str, data: dict[str, Any]) -> HookResult:
+        # Stage 1: Guard — drop events without session_id
         session_id = data.get("session_id")
         if not session_id:
             logger.warning("DefaultHandler: dropping event %s — no session_id", event)
             return HookResult(action="continue")
 
+        # Stage 1: Label derivation — [FullPascalEvent, CategoryEvent, 'Event']
         timestamp = data.get("timestamp", "")
         labels = self.derive_labels(event)
 
-        # tool:* events use tool_call_id as tiebreaker to distinguish
-        # parallel tool calls with the same timestamp.
-        disambiguator = data.get("tool_call_id") if event.startswith("tool:") else None
+        # Stage 2: node_id — session_id + event + timestamp + tool_call_id tiebreaker
+        # tool_call_id is used for ALL events (not just tool:*) — events like
+        # delegate:agent_spawned also carry tool_call_id for parallel-call reasons.
+        disambiguator = data.get("tool_call_id")
 
-        # Create Event node
         event_node_id = make_node_id(session_id, event, timestamp, disambiguator)
-        await self.services.graph.upsert_node(
-            event_node_id,
-            {
-                "labels": labels,
-                "event_name": event,
-                "occurred_at": timestamp,
-                "data": json.dumps(data),
-            },
-        )
 
-        # Attach to the session node
+        # Stage 3: Field lifting — ALL matching FieldLifters fire and contribute properties
+        lifted: dict[str, Any] = {}
+        for lifter in self._LIFTERS:
+            if lifter.matches(event):
+                lifted.update(lifter.extract(event, data))
+
+        # Stage 4: Node construction — base props + lifted fields + full data blob
+        node_props: dict[str, Any] = {
+            "labels": labels,
+            "event_name": event,
+            "occurred_at": timestamp,
+            **lifted,
+            "data": json.dumps(data),
+        }
+        await self.services.graph.upsert_node(event_node_id, node_props)
+
+        # Stage 5: HAS_EVENT edge — (Session)-[:HAS_EVENT {occurred_at}]->(Event)
         await self.services.graph.upsert_edge(
             session_id,
             event_node_id,

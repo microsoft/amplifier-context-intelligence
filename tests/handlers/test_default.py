@@ -297,3 +297,159 @@ class TestDefaultHandlerDroppedEventLogging:
         assert "session:resume" in caplog.text
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warning_records) >= 1
+
+
+class TestDefaultHandlerFieldLifters:
+    """DefaultHandler integrates FieldLifters to expose lifted fields on Event nodes."""
+
+    def test_has_lifters_class_attribute(self) -> None:
+        """DefaultHandler must expose a _LIFTERS class-level list."""
+        assert hasattr(DefaultHandler, "_LIFTERS")
+        assert isinstance(DefaultHandler._LIFTERS, list)
+        assert len(DefaultHandler._LIFTERS) == 6
+
+    def test_lifters_include_all_six_types(self) -> None:
+        """_LIFTERS must contain instances of all 6 lifter types in the correct order."""
+        from context_intelligence_server.handlers.field_lifters import (
+            DelegateLifter,
+            LlmLifter,
+            PromptLifter,
+            SessionLifter,
+            ToolLifter,
+            UniversalLifter,
+        )
+
+        lifter_types = [type(lifter) for lifter in DefaultHandler._LIFTERS]
+        assert lifter_types[0] is UniversalLifter, "UniversalLifter must be first"
+        assert SessionLifter in lifter_types
+        assert ToolLifter in lifter_types
+        assert DelegateLifter in lifter_types
+        assert LlmLifter in lifter_types
+        assert PromptLifter in lifter_types
+
+    async def test_universal_lifter_session_id_on_event_node(
+        self, services: HookStateService
+    ) -> None:
+        """UniversalLifter must expose session_id as a top-level property on Event nodes."""
+        handler = DefaultHandler(services)
+        await handler(
+            "session:resume",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T02:00:00Z",
+            },
+        )
+        event_id = make_node_id("s1", "session:resume", "2026-01-01T02:00:00Z")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        assert node.get("session_id") == "s1"
+
+    async def test_tool_lifter_tool_name_on_tool_event_node(
+        self, services: HookStateService
+    ) -> None:
+        """ToolLifter must expose tool_name as a top-level property on tool:* Event nodes."""
+        handler = DefaultHandler(services)
+        await handler(
+            "tool:pre",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T02:00:00Z",
+                "tool_call_id": "tc-abc",
+                "tool_name": "bash",
+            },
+        )
+        event_id = make_node_id("s1", "tool:pre", "2026-01-01T02:00:00Z", "tc-abc")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        assert node.get("tool_name") == "bash"
+
+    async def test_delegate_lifter_agent_on_delegate_event_node(
+        self, services: HookStateService
+    ) -> None:
+        """DelegateLifter must expose agent as a top-level property on delegate:* Event nodes."""
+        handler = DefaultHandler(services)
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T02:00:00Z",
+                "agent": "foundation:explorer",
+                "sub_session_id": "sub-42",
+            },
+        )
+        event_id = make_node_id("s1", "delegate:agent_spawned", "2026-01-01T02:00:00Z")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        assert node.get("agent") == "foundation:explorer"
+        assert node.get("sub_session_id") == "sub-42"
+
+    async def test_llm_lifter_model_on_llm_event_node(
+        self, services: HookStateService
+    ) -> None:
+        """LlmLifter must expose model/provider as top-level properties on llm:* Event nodes."""
+        handler = DefaultHandler(services)
+        await handler(
+            "llm:request",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T02:00:00Z",
+                "model": "claude-3-5-sonnet",
+                "provider": "anthropic",
+            },
+        )
+        event_id = make_node_id("s1", "llm:request", "2026-01-01T02:00:00Z")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        assert node.get("model") == "claude-3-5-sonnet"
+        assert node.get("provider") == "anthropic"
+
+    async def test_full_data_blob_still_stored_alongside_lifted_fields(
+        self, services: HookStateService
+    ) -> None:
+        """Full data blob must remain in 'data' property even when fields are lifted."""
+        handler = DefaultHandler(services)
+        await handler(
+            "tool:pre",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T02:00:00Z",
+                "tool_call_id": "tc-abc",
+                "tool_name": "bash",
+                "extra_field": "should-be-in-data",
+            },
+        )
+        event_id = make_node_id("s1", "tool:pre", "2026-01-01T02:00:00Z", "tc-abc")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        # Lifted field as top-level prop
+        assert node.get("tool_name") == "bash"
+        # Full blob still stored
+        assert "data" in node
+        blob = json.loads(node["data"])
+        assert blob["extra_field"] == "should-be-in-data"
+        assert blob["tool_name"] == "bash"
+
+    async def test_multiple_lifters_fire_for_matching_events(
+        self, services: HookStateService
+    ) -> None:
+        """ALL matching lifters fire (not first-match-wins): universal + tool:* both match tool:pre."""
+        handler = DefaultHandler(services)
+        await handler(
+            "tool:pre",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T02:00:00Z",
+                "tool_call_id": "tc-xyz",
+                "tool_name": "read_file",
+                "parallel_group_id": "pg-1",
+            },
+        )
+        event_id = make_node_id("s1", "tool:pre", "2026-01-01T02:00:00Z", "tc-xyz")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        # From UniversalLifter (fires for all events)
+        assert node.get("session_id") == "s1"
+        assert node.get("tool_call_id") == "tc-xyz"
+        assert node.get("parallel_group_id") == "pg-1"
+        # From ToolLifter (fires for tool:*)
+        assert node.get("tool_name") == "read_file"
