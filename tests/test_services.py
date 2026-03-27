@@ -215,7 +215,11 @@ class TestHookStateService:
         assert not hasattr(svc, "_cursors")
 
     async def test_ensure_session_node_creates_root(self):
-        """ensure_session_node creates a RootSession+Session node when no parent field is present."""
+        """ensure_session_node creates a bare Session node (no RootSession) when no parent field is present.
+
+        ensure_session_node is a safety net that creates a minimal session node.
+        SessionHandler is the sole authority on session type labels (RootSession, SubSession, ForkedSession).
+        """
         svc = HookStateService()
         await svc.ensure_session_node(
             "session-1", {"started_at": "2024-01-01T00:00:00"}
@@ -223,7 +227,7 @@ class TestHookStateService:
         node = await svc.graph.get_node("session-1")
         assert node is not None
         assert "Session" in node["labels"]
-        assert "RootSession" in node["labels"]
+        assert "RootSession" not in node["labels"]
         assert node["status"] == "running"
 
     async def test_ensure_session_node_is_idempotent(self):
@@ -243,7 +247,11 @@ class TestHookStateService:
         assert node["status"] == "modified"
 
     async def test_ensure_session_node_creates_subsession(self):
-        """ensure_session_node creates a SubSession+Session node when parent_id is present."""
+        """ensure_session_node creates a bare Session node (no SubSession) even when parent_id is present.
+
+        ensure_session_node is a safety net that creates a minimal session node.
+        SessionHandler is the sole authority on session type labels (RootSession, SubSession, ForkedSession).
+        """
         svc = HookStateService()
         await svc.ensure_session_node(
             "session-2",
@@ -252,11 +260,14 @@ class TestHookStateService:
         node = await svc.graph.get_node("session-2")
         assert node is not None
         assert "Session" in node["labels"]
-        assert "SubSession" in node["labels"]
+        assert "SubSession" not in node["labels"]
         assert node["status"] == "running"
 
     async def test_ensure_session_node_parent_field_creates_subsession(self):
-        """ensure_session_node treats 'parent' field as a parent indicator (no parent_id needed)."""
+        """ensure_session_node creates a bare Session node even when 'parent' field is present.
+
+        The safety-net node carries only ['Session']; type labels are added by SessionHandler.
+        """
         svc = HookStateService()
         await svc.ensure_session_node(
             "session-3",
@@ -265,7 +276,7 @@ class TestHookStateService:
         node = await svc.graph.get_node("session-3")
         assert node is not None
         assert "Session" in node["labels"]
-        assert "SubSession" in node["labels"]
+        assert "SubSession" not in node["labels"]
 
     async def test_ensure_session_node_graph_backed_repopulates_cache(self):
         """When session node already exists in graph but not in _seen_sessions cache,
@@ -297,8 +308,12 @@ class TestHookStateService:
         assert node["started_at"] == "2024-01-01T00:00:00"
 
     async def test_ensure_session_node_graph_backed_creates_when_absent(self):
-        """ensure_session_node creates a RootSession node when the session is absent from both
-        _seen_sessions cache and the graph."""
+        """ensure_session_node creates a bare Session node when the session is absent from both
+        _seen_sessions cache and the graph.
+
+        ensure_session_node is a safety net that creates a minimal session node;
+        it does NOT assign type labels (RootSession, SubSession, ForkedSession).
+        """
         svc = HookStateService()
         # Both graph and cache are empty — node should be created
         await svc.ensure_session_node(
@@ -307,32 +322,35 @@ class TestHookStateService:
 
         node = await svc.graph.get_node("session-new")
         assert node is not None
-        assert "RootSession" in node["labels"]
+        assert "Session" in node["labels"]
+        assert "RootSession" not in node["labels"]
         assert "session-new" in svc._seen_sessions
 
     async def test_ensure_session_node_no_label_change_on_existing(self):
-        """When a SubSession node already exists in the graph, ensure_session_node must NOT
-        add a RootSession label to it — labels on existing nodes are never changed."""
+        """When a node already exists in the graph, ensure_session_node must NOT overwrite it.
+
+        Labels on existing nodes are never changed — ensure_session_node is a no-op when the
+        node already exists in the graph (the graph-query tier fires before any write).
+        """
         svc = HookStateService()
-        # Pre-create a SubSession node (e.g. already stored from a previous run)
+        # Pre-create a bare Session node (e.g. already stored from a previous run)
         await svc.graph.upsert_node(
             "session-sub",
             {
-                "labels": ["Session", "SubSession"],
+                "labels": ["Session"],
                 "status": "running",
                 "started_at": "2024-01-01T00:00:00",
             },
         )
 
-        # Call without a parent field — a naive implementation would add a RootSession label
+        # Call without a parent field — must be a no-op because the node already exists
         await svc.ensure_session_node("session-sub", {})
 
         node = await svc.graph.get_node("session-sub")
         assert node is not None
-        # RootSession must NOT have been added to an existing SubSession node
-        assert "RootSession" not in node["labels"]
-        # SubSession label must still be present
-        assert "SubSession" in node["labels"]
+        # Node must be unchanged — only Session label is present
+        assert "Session" in node["labels"]
+        assert node["status"] == "running"
 
 
 # ---------------------------------------------------------------------------
