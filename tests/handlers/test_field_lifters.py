@@ -302,6 +302,29 @@ class TestDelegateLifter:
         assert "sub_session_id" not in result
         assert "parent_session_id" not in result
 
+    def test_lifts_tool_call_id(self) -> None:
+        data = {"agent": "foundation:git-ops", "tool_call_id": "tc-del-001"}
+        result = self.lifter.extract("delegate:agent_spawned", data)
+        assert result["tool_call_id"] == "tc-del-001"
+
+    def test_lifts_parallel_group_id(self) -> None:
+        data = {"agent": "foundation:git-ops", "parallel_group_id": "pg-del-001"}
+        result = self.lifter.extract("delegate:agent_spawned", data)
+        assert result["parallel_group_id"] == "pg-del-001"
+
+    def test_lifts_all_five_fields(self) -> None:
+        data = {
+            "agent": "foundation:explorer",
+            "sub_session_id": "child-sess",
+            "parent_session_id": "parent-sess",
+            "tool_call_id": "tc-001",
+            "parallel_group_id": "pg-001",
+        }
+        result = self.lifter.extract("delegate:agent_spawned", data)
+        assert len(result) == 5
+        assert result["tool_call_id"] == "tc-001"
+        assert result["parallel_group_id"] == "pg-001"
+
     def test_empty_data_returns_empty(self) -> None:
         result = self.lifter.extract("delegate:agent_spawned", {})
         assert result == {}
