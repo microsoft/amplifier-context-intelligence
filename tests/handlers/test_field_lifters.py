@@ -92,7 +92,11 @@ class TestUniversalLifter:
 
     def test_does_not_lift_tool_correlation_fields(self) -> None:
         lifter = UniversalLifter()
-        data = {"session_id": "s1", "tool_call_id": "tc-001", "parallel_group_id": "pg-001"}
+        data = {
+            "session_id": "s1",
+            "tool_call_id": "tc-001",
+            "parallel_group_id": "pg-001",
+        }
         result = lifter.extract("tool:pre", data)
         assert "tool_call_id" not in result
         assert "parallel_group_id" not in result
@@ -267,7 +271,7 @@ class TestToolLifter:
 
 
 class TestDelegateLifter:
-    """Tests for DelegateLifter — extracts agent, sub_session_id, parent_session_id from delegate:* events."""
+    """Tests for DelegateLifter — extracts agent, sub_session_id, parent_session_id, tool_call_id, parallel_group_id from delegate:* events."""
 
     def setup_method(self) -> None:
         from context_intelligence_server.handlers.field_lifters.delegate import (
@@ -282,7 +286,7 @@ class TestDelegateLifter:
         assert self.lifter.matches("delegate:error") is True
         assert self.lifter.matches("tool:pre") is False
 
-    def test_lifts_all_three_fields(self) -> None:
+    def test_lifts_core_provenance_fields(self) -> None:
         data = {
             "agent": "my-agent",
             "sub_session_id": "sess-child",
