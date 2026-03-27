@@ -51,7 +51,7 @@ digraph handler_architecture {
         shape     = plaintext
         style     = ""
         fillcolor = "transparent"
-        label     = "enrichers[] &#8212; ordered by priority index"
+        label     = "enrichers[] — ordered by priority index"
     ]
 
     // ── SessionHandler [0] ────────────────────────────────────────────────────
@@ -90,7 +90,7 @@ digraph handler_architecture {
         fillcolor = "#FAFAFA"
         color     = "#AAAAAA"
         fontcolor = "#AAAAAA"
-        label     = "FutureHandler [N]\n\u2026 extension point \u2026"
+        label     = "FutureHandler [N]\n… extension point …"
     ]
 
     // ── Warning note ──────────────────────────────────────────────────────────
@@ -98,7 +98,7 @@ digraph handler_architecture {
         shape     = box
         style     = "filled"
         fillcolor = "#FFF9C4"
-        label     = "⚠ IMPORTANT\nClaiming an event does NOT prevent\nDefaultHandler from running.\nEnrichers are ADDITIVE \u2014 DefaultHandler\nalways creates the base Event node first."
+        label     = "⚠ IMPORTANT\nClaiming an event does NOT prevent\nDefaultHandler from running.\nEnrichers are ADDITIVE — DefaultHandler\nalways creates the base Event node first."
     ]
 
     // ── Edges ─────────────────────────────────────────────────────────────────

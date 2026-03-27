@@ -80,7 +80,7 @@ digraph graph_model {
             shape     = plaintext
             style     = ""
             fillcolor = "transparent"
-            label     = "Label examples:\ntool:pre \u2192 :ToolPreEvent :ToolEvent :Event\nsession:start \u2192 :SessionStartEvent :SessionEvent :Event\ncontext:compaction \u2192 :ContextCompactionEvent :ContextEvent :Event\ndelegate:agent_spawned \u2192 :DelegateAgentSpawnedEvent :DelegateEvent :Event"
+            label     = "Label examples:\ntool:pre → :ToolPreEvent :ToolEvent :Event\nsession:start → :SessionStartEvent :SessionEvent :Event\ncontext:compaction → :ContextCompactionEvent :ContextEvent :Event\ndelegate:agent_spawned → :DelegateAgentSpawnedEvent :DelegateEvent :Event"
         ]
     }
 
@@ -109,14 +109,14 @@ digraph graph_model {
         shape     = box
         style     = filled
         fillcolor = "#FFF9C4"
-        label     = "⚠ Dual HAS_EVENT edges on tool events\n(Session)-[:HAS_EVENT]->(Event)  \u2014 DefaultHandler (always)\n(ToolCall)-[:HAS_EVENT]->(Event)  \u2014 ToolCallHandler (additionally)\nBoth edges coexist; enrichers are ADDITIVE"
+        label     = "⚠ Dual HAS_EVENT edges on tool events\n(Session)-[:HAS_EVENT]->(Event)  — DefaultHandler (always)\n(ToolCall)-[:HAS_EVENT]->(Event)  — ToolCallHandler (additionally)\nBoth edges coexist; enrichers are ADDITIVE"
     ]
 
     note_tiebreaker [
         shape     = box
         style     = filled
         fillcolor = "#FFF9C4"
-        label     = "\u2139 ToolCall node_id has NO timestamp\npre / post / error share the same :ToolCall node\nEvent node_id appends tool_call_id as tiebreaker\nto distinguish tool events with the same epoch_ms"
+        label     = "ℹ ToolCall node_id has NO timestamp\npre / post / error share the same :ToolCall node\nEvent node_id appends tool_call_id as tiebreaker\nto distinguish tool events with the same epoch_ms"
     ]
 
     note_direction [
@@ -124,12 +124,12 @@ digraph graph_model {
         style     = filled
         fillcolor = "#FFCCBC"
         penwidth  = 2
-        label     = "⚠ Session edge types differ by origin:\nSUBSESSION_OF: session:start with parent_id\nHAS_FORK: session:fork\nBoth are parent\u2192child direction.\nForkedSession does NOT carry SubSession label."
+        label     = "⚠ Session edge types differ by origin:\nSUBSESSION_OF: session:start with parent_id\nHAS_FORK: session:fork\nBoth are parent→child direction.\nForkedSession does NOT carry SubSession label."
     ]
 
     // ── Edges ─────────────────────────────────────────────────────────────────
     RootSession -> SubSession [
-        label     = "SUBSESSION_OF\n(PARENT\u2192CHILD)"
+        label     = "SUBSESSION_OF\n(PARENT→CHILD)"
         color     = "#1565C0"
         fontcolor = "#1565C0"
         penwidth  = 2
