@@ -4,7 +4,7 @@ from .artifact import ArtifactLifter
 from .base import RESERVED_PROPS, FieldLifter
 from .delegate import DelegateLifter
 from .llm import LlmLifter
-from .navigation import UniversalLifter
+from .universal import UniversalLifter
 from .prompt import PromptLifter
 from .recipe import RecipeLifter
 from .session import SessionLifter

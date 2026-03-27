@@ -8,7 +8,7 @@ from context_intelligence_server.handlers.field_lifters.base import (
     FieldLifter,
     safe_prop,
 )
-from context_intelligence_server.handlers.field_lifters.navigation import (
+from context_intelligence_server.handlers.field_lifters.universal import (
     UniversalLifter,
 )
 
