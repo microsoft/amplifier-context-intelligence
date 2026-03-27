@@ -98,6 +98,8 @@ class TestUniversalLifter:
         data = {"session_id": "sess-1", "parent_id": None}
         result = lifter.extract("tool:pre", data)
         assert "parent_id" not in result
+        assert "tool_call_id" not in result
+        assert "parallel_group_id" not in result
         assert result["session_id"] == "sess-1"
 
     def test_skips_missing_keys(self) -> None:

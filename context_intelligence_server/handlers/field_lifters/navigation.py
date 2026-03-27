@@ -28,7 +28,7 @@ class UniversalLifter(FieldLifter):
 
     event_pattern = "*"
 
-    def extract(self, event: str, data: dict[str, Any]) -> dict[str, Any]:
+    def extract(self, event: str, data: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG002
         """Extract navigation fields from event data, skipping None values."""
         result: dict[str, Any] = {}
         for key in _NAVIGATION_KEYS:
