@@ -195,3 +195,44 @@ class TestSessionLifter:
         data = {"metadata": "not-a-dict"}
         result = self.lifter.extract("session:start", data)
         assert result == {}
+
+
+class TestToolLifter:
+    """Tests for ToolLifter — extracts tool_name and tool_input from tool:* events."""
+
+    def setup_method(self) -> None:
+        from context_intelligence_server.handlers.field_lifters.tool import (
+            ToolLifter,
+        )
+
+        self.lifter = ToolLifter()
+
+    def test_matches_only_tool_events(self) -> None:
+        assert self.lifter.matches("tool:pre") is True
+        assert self.lifter.matches("tool:post") is True
+        assert self.lifter.matches("tool:error") is True
+        assert self.lifter.matches("session:start") is False
+        assert self.lifter.matches("delegate:agent_spawned") is False
+
+    def test_lifts_tool_name(self) -> None:
+        data = {"tool_name": "bash", "tool_input": {"command": "ls"}}
+        result = self.lifter.extract("tool:pre", data)
+        assert result["tool_name"] == "bash"
+
+    def test_lifts_tool_input_when_present(self) -> None:
+        tool_input = {"command": "ls -la", "cwd": "/tmp"}
+        data = {"tool_name": "bash", "tool_input": tool_input}
+        result = self.lifter.extract("tool:pre", data)
+        assert result["tool_input"] == tool_input
+
+    def test_skips_absent_tool_input(self) -> None:
+        data = {"tool_name": "bash"}
+        result = self.lifter.extract("tool:pre", data)
+        assert result["tool_name"] == "bash"
+        assert "tool_input" not in result
+
+    def test_tool_input_blob_ref_lifted_as_is(self) -> None:
+        blob_ref = {"$blob_ref": "ci-blob://abc123/tool_input"}
+        data = {"tool_name": "read_file", "tool_input": blob_ref}
+        result = self.lifter.extract("tool:pre", data)
+        assert result["tool_input"] == blob_ref
