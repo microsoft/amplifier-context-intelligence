@@ -41,8 +41,7 @@ digraph handler_architecture {
             <TR><TD><B>DefaultHandler</B></TD></TR>
             <TR><TD>UNCONDITIONAL &#8212; ALL events</TD></TR>
             <TR><TD>handled_events = set() (empty &#8212; accepts everything)</TD></TR>
-            <TR><TD>Field Lifting: 9 FieldLifters &#8212; ALL matching fire (not first-match-wins)</TD></TR>
-            <TR><TD>Families: * | artifact:* | delegate:* | llm:* | prompt:* | recipe:* | session:* | skill:* | tool:*</TD></TR>
+            <TR><TD>Field Lifting: ALL matching FieldLifters fire (not first-match-wins)</TD></TR>
             <TR><TD>Creates [:FullPascalEvent, :CategoryEvent, :Event] node + lifted top-level props</TD></TR>
             <TR><TD>Creates (Session)-[:HAS_EVENT]-&gt;(Event) edge</TD></TR>
             <TR><TD>See: 04-default-handler-flow.dot for internal pipeline detail</TD></TR>

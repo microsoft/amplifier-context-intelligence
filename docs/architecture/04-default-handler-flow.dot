@@ -60,14 +60,17 @@ digraph default_handler_flow {
         fontname  = "Helvetica-Bold"
         penwidth  = 2.5
         label     = <<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
-            <TR><TD COLSPAN="2" BGCOLOR="#A5D6A7"><B>&#9314; Field Lifting &#8212; ALL matching FieldLifters fire</B></TD></TR>
+            <TR><TD COLSPAN="2" BGCOLOR="#A5D6A7"><B>&#9314; Field Lifting &#8212; ALL matching FieldLifters fire (9 lifters)</B></TD></TR>
             <TR><TD BGCOLOR="#E8F5E9"><B>Lifter (pattern)</B></TD><TD BGCOLOR="#E8F5E9"><B>Fields Lifted</B></TD></TR>
             <TR><TD>UniversalLifter(*)</TD><TD>session_id, parent_id, tool_call_id, parallel_group_id</TD></TR>
-            <TR><TD>SessionLifter(session:*)</TD><TD>parent, agent_name, recipe_name, recipe_step</TD></TR>
-            <TR><TD>ToolLifter(tool:*)</TD><TD>tool_name, tool_input</TD></TR>
+            <TR><TD>ArtifactLifter(artifact:*)</TD><TD>bytes, path</TD></TR>
             <TR><TD>DelegateLifter(delegate:*)</TD><TD>agent, sub_session_id, parent_session_id</TD></TR>
             <TR><TD>LlmLifter(llm:*)</TD><TD>model, provider</TD></TR>
             <TR><TD>PromptLifter(prompt:*)</TD><TD>prompt, response_preview</TD></TR>
+            <TR><TD>RecipeLifter(recipe:*)</TD><TD>recipe_name, current_step, description, status, step_id, total_steps</TD></TR>
+            <TR><TD>SessionLifter(session:*)</TD><TD>parent, agent_name, recipe_*, metadata sub-keys</TD></TR>
+            <TR><TD>SkillLifter(skill:*)</TD><TD>skill_directory, skill_name</TD></TR>
+            <TR><TD>ToolLifter(tool:*)</TD><TD>tool_name, tool_input, tool_call_id, parallel_group_id</TD></TR>
         </TABLE>>
     ]
 

@@ -73,7 +73,7 @@ digraph graph_model {
             shape     = record
             style     = filled
             fillcolor = "#A5D6A7"
-            label     = "{ :FullPascalEvent :CategoryEvent :Event | node_id: session__event__epoch_ms[__tool_call_id] | event_name: string | occurred_at: ISO 8601 | session_id | parent_id | tool_call_id | parallel_group_id | [event-specific: tool_name, model, agent, prompt, ...] | data: full JSON blob }"
+            label     = "{ :FullPascalEvent :CategoryEvent :Event | node_id: session__event__epoch_ms[__tool_call_id] | event_name: string | occurred_at: ISO 8601 | session_id | parent_id | tool_call_id | parallel_group_id | [event-specific: tool_name, model, agent, prompt, skill_directory, skill_name, recipe_name, recipe_step, bytes, path, ...] | data: full JSON blob }"
         ]
 
         EventExamples [
@@ -124,7 +124,7 @@ digraph graph_model {
         style     = filled
         fillcolor = "#FFCCBC"
         penwidth  = 2
-        label     = "⚠ Session edge types differ by origin:\nSUBSESSION_OF: session:start with parent_id\nHAS_FORK: session:fork\nBoth are parent→child direction.\nForkedSession does NOT carry SubSession label."
+        label     = "⚠ Session edge types differ by origin:\nSUBSESSION_OF: session:start with parent_id\nHAS_FORK: session:fork\nBoth are parent→child direction.\nForkedSession does NOT carry SubSession label.\n\n⚠ Fork Guard (classification is permanent):\nsession:start after session:fork only enriches started_at\nSubSession label + SUBSESSION_OF edge NOT applied to ForkedSession"
     ]
 
     // ── Edges ─────────────────────────────────────────────────────────────────
