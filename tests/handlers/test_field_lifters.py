@@ -236,3 +236,44 @@ class TestToolLifter:
         data = {"tool_name": "read_file", "tool_input": blob_ref}
         result = self.lifter.extract("tool:pre", data)
         assert result["tool_input"] == blob_ref
+
+
+class TestDelegateLifter:
+    """Tests for DelegateLifter — extracts agent, sub_session_id, parent_session_id from delegate:* events."""
+
+    def setup_method(self) -> None:
+        from context_intelligence_server.handlers.field_lifters.delegate import (
+            DelegateLifter,
+        )
+
+        self.lifter = DelegateLifter()
+
+    def test_matches_only_delegate_events(self) -> None:
+        assert self.lifter.matches("delegate:agent_spawned") is True
+        assert self.lifter.matches("delegate:agent_completed") is True
+        assert self.lifter.matches("delegate:error") is True
+        assert self.lifter.matches("tool:pre") is False
+
+    def test_lifts_all_three_fields(self) -> None:
+        data = {
+            "agent": "my-agent",
+            "sub_session_id": "sess-child",
+            "parent_session_id": "sess-parent",
+        }
+        result = self.lifter.extract("delegate:agent_spawned", data)
+        assert result == {
+            "agent": "my-agent",
+            "sub_session_id": "sess-child",
+            "parent_session_id": "sess-parent",
+        }
+
+    def test_skips_missing_fields(self) -> None:
+        data = {"agent": "my-agent"}
+        result = self.lifter.extract("delegate:agent_spawned", data)
+        assert result == {"agent": "my-agent"}
+        assert "sub_session_id" not in result
+        assert "parent_session_id" not in result
+
+    def test_empty_data_returns_empty(self) -> None:
+        result = self.lifter.extract("delegate:agent_spawned", {})
+        assert result == {}
