@@ -350,3 +350,130 @@ class TestPromptLifter:
     def test_empty_data_returns_empty(self) -> None:
         result = self.lifter.extract("prompt:submit", {})
         assert result == {}
+
+
+class TestToolLifterNewFields:
+    """Tests for new tool_call_id and parallel_group_id fields in ToolLifter."""
+
+    def setup_method(self) -> None:
+        from context_intelligence_server.handlers.field_lifters.tool import ToolLifter
+
+        self.lifter = ToolLifter()
+
+    def test_lifts_tool_call_id(self) -> None:
+        data = {"tool_name": "bash", "tool_call_id": "tc-001"}
+        result = self.lifter.extract("tool:pre", data)
+        assert result["tool_call_id"] == "tc-001"
+
+    def test_lifts_parallel_group_id(self) -> None:
+        data = {"tool_name": "bash", "parallel_group_id": "pg-abc"}
+        result = self.lifter.extract("tool:pre", data)
+        assert result["parallel_group_id"] == "pg-abc"
+
+    def test_lifts_all_four_fields(self) -> None:
+        data = {
+            "tool_name": "delegate",
+            "tool_input": {"agent": "test:agent"},
+            "tool_call_id": "tc-xyz",
+            "parallel_group_id": "pg-xyz",
+        }
+        result = self.lifter.extract("tool:pre", data)
+        assert result["tool_name"] == "delegate"
+        assert result["tool_input"] == {"agent": "test:agent"}
+        assert result["tool_call_id"] == "tc-xyz"
+        assert result["parallel_group_id"] == "pg-xyz"
+
+
+class TestSkillLifter:
+    """Tests for SkillLifter — extracts skill_directory and skill_name from skill:* events."""
+
+    def setup_method(self) -> None:
+        from context_intelligence_server.handlers.field_lifters.skill import SkillLifter
+
+        self.lifter = SkillLifter()
+
+    def test_matches_skill_events(self) -> None:
+        assert self.lifter.matches("skill:loaded")
+        assert self.lifter.matches("skill:executed")
+        assert not self.lifter.matches("tool:pre")
+
+    def test_lifts_skill_directory_and_name(self) -> None:
+        data = {"skill_directory": "/path/to/skills", "skill_name": "brainstorming"}
+        result = self.lifter.extract("skill:loaded", data)
+        assert result == {"skill_directory": "/path/to/skills", "skill_name": "brainstorming"}
+
+    def test_skips_missing_fields(self) -> None:
+        data = {"skill_name": "my-skill"}
+        result = self.lifter.extract("skill:loaded", data)
+        assert result == {"skill_name": "my-skill"}
+        assert "skill_directory" not in result
+
+    def test_skips_none_values(self) -> None:
+        data = {"skill_directory": None, "skill_name": "test"}
+        result = self.lifter.extract("skill:loaded", data)
+        assert "skill_directory" not in result
+        assert result["skill_name"] == "test"
+
+
+class TestRecipeLifter:
+    """Tests for RecipeLifter — extracts orchestration fields from recipe:* events."""
+
+    def setup_method(self) -> None:
+        from context_intelligence_server.handlers.field_lifters.recipe import RecipeLifter
+
+        self.lifter = RecipeLifter()
+
+    def test_matches_recipe_events(self) -> None:
+        assert self.lifter.matches("recipe:start")
+        assert self.lifter.matches("recipe:step")
+        assert self.lifter.matches("recipe:complete")
+        assert self.lifter.matches("recipe:loop_iteration")
+        assert not self.lifter.matches("skill:loaded")
+
+    def test_lifts_all_six_fields(self) -> None:
+        data = {
+            "recipe_name": "subagent-driven-development",
+            "current_step": 3,
+            "description": "Execute implementation plan",
+            "status": "running",
+            "step_id": "implement-task",
+            "total_steps": 7,
+        }
+        result = self.lifter.extract("recipe:step", data)
+        assert result["recipe_name"] == "subagent-driven-development"
+        assert result["current_step"] == 3
+        assert result["description"] == "Execute implementation plan"
+        assert result["status"] == "running"
+        assert result["step_id"] == "implement-task"
+        assert result["total_steps"] == 7
+
+    def test_partial_fields(self) -> None:
+        data = {"recipe_name": "my-recipe", "status": "completed"}
+        result = self.lifter.extract("recipe:complete", data)
+        assert result == {"recipe_name": "my-recipe", "status": "completed"}
+        assert "current_step" not in result
+
+
+class TestArtifactLifter:
+    """Tests for ArtifactLifter — extracts bytes and path from artifact:* events."""
+
+    def setup_method(self) -> None:
+        from context_intelligence_server.handlers.field_lifters.artifact import ArtifactLifter
+
+        self.lifter = ArtifactLifter()
+
+    def test_matches_artifact_events(self) -> None:
+        assert self.lifter.matches("artifact:read")
+        assert self.lifter.matches("artifact:write")
+        assert not self.lifter.matches("tool:pre")
+
+    def test_lifts_bytes_and_path(self) -> None:
+        data = {"bytes": 4528, "path": "/home/user/AGENTS.md", "session_id": "s1"}
+        result = self.lifter.extract("artifact:write", data)
+        assert result == {"bytes": 4528, "path": "/home/user/AGENTS.md"}
+
+    def test_skips_missing_fields(self) -> None:
+        data = {"path": "/tmp/output.txt"}
+        result = self.lifter.extract("artifact:read", data)
+        assert result == {"path": "/tmp/output.txt"}
+        assert "bytes" not in result

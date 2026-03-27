@@ -312,26 +312,32 @@ class TestDefaultHandlerFieldLifters:
         """DefaultHandler must expose a _LIFTERS class-level list."""
         assert hasattr(DefaultHandler, "_LIFTERS")
         assert isinstance(DefaultHandler._LIFTERS, list)
-        assert len(DefaultHandler._LIFTERS) == 6
+        assert len(DefaultHandler._LIFTERS) == 9
 
     def test_lifters_include_all_six_types(self) -> None:
-        """_LIFTERS must contain instances of all 6 lifter types in the correct order."""
+        """_LIFTERS must contain instances of all 9 lifter types in the correct order."""
         from context_intelligence_server.handlers.field_lifters import (
+            ArtifactLifter,
             DelegateLifter,
             LlmLifter,
             PromptLifter,
+            RecipeLifter,
             SessionLifter,
+            SkillLifter,
             ToolLifter,
             UniversalLifter,
         )
 
         lifter_types = [type(lifter) for lifter in DefaultHandler._LIFTERS]
         assert lifter_types[0] is UniversalLifter, "UniversalLifter must be first"
-        assert SessionLifter in lifter_types
-        assert ToolLifter in lifter_types
+        assert ArtifactLifter in lifter_types
         assert DelegateLifter in lifter_types
         assert LlmLifter in lifter_types
         assert PromptLifter in lifter_types
+        assert RecipeLifter in lifter_types
+        assert SessionLifter in lifter_types
+        assert SkillLifter in lifter_types
+        assert ToolLifter in lifter_types
 
     async def test_universal_lifter_session_id_on_event_node(
         self, services: HookStateService

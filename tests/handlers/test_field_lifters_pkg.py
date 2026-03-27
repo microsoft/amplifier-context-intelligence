@@ -60,14 +60,17 @@ class TestFieldLiftersPkgExports:
         assert RESERVED_PROPS is not None
 
     def test_all_contains_expected_exports(self) -> None:
-        """__all__ must contain all 8 expected names."""
+        """__all__ must contain all 11 expected names."""
         assert set(field_lifters_module.__all__) == {
+            "ArtifactLifter",
             "DelegateLifter",
             "FieldLifter",
             "LlmLifter",
             "PromptLifter",
             "RESERVED_PROPS",
+            "RecipeLifter",
             "SessionLifter",
+            "SkillLifter",
             "ToolLifter",
             "UniversalLifter",
         }
