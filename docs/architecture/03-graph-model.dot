@@ -73,7 +73,7 @@ digraph graph_model {
             shape     = record
             style     = filled
             fillcolor = "#A5D6A7"
-            label     = "{ :FullPascalEvent :CategoryEvent :Event | node_id: session__event__epoch_ms[__tool_call_id] | event_name: string | occurred_at: ISO 8601 | session_id | parent_id | tool_call_id | parallel_group_id | [event-specific: tool_name, model, agent, prompt, skill_directory, skill_name, recipe_name, recipe_step, bytes, path, ...] | data: full JSON blob }"
+            label     = "{ :FullPascalEvent :CategoryEvent :Event | node_id: session__event__epoch_ms[__tool_call_id] | event_name: string | occurred_at: ISO 8601 | session_id | parent_id | tool_call_id | parallel_group_id | [event-specific: tool_name, model, agent, prompt, skill_directory, skill_name, recipe_name, current_step, bytes, path, ...] | data: full JSON blob }"
         ]
 
         EventExamples [
