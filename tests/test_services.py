@@ -246,7 +246,7 @@ class TestHookStateService:
         assert node is not None
         assert node["status"] == "modified"
 
-    async def test_ensure_session_node_creates_subsession(self):
+    async def test_ensure_session_node_no_subsession_label_when_parent_id_present(self):
         """ensure_session_node creates a bare Session node (no SubSession) even when parent_id is present.
 
         ensure_session_node is a safety net that creates a minimal session node.
@@ -263,7 +263,7 @@ class TestHookStateService:
         assert "SubSession" not in node["labels"]
         assert node["status"] == "running"
 
-    async def test_ensure_session_node_parent_field_creates_subsession(self):
+    async def test_ensure_session_node_no_subsession_label_when_parent_field_present(self):
         """ensure_session_node creates a bare Session node even when 'parent' field is present.
 
         The safety-net node carries only ['Session']; type labels are added by SessionHandler.

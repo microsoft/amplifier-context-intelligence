@@ -86,10 +86,8 @@ class SessionHandler:
     ) -> None:
         parent_id = data.get("parent_id")
 
-        if parent_id:
-            labels: list[str] = ["ForkedSession", "Session"]
-        else:
-            labels = ["ForkedSession", "Session"]
+        labels: list[str] = ["ForkedSession", "Session"]
+        if not parent_id:
             log.warning(
                 "session:fork for %r has no parent_id — orphaned fork", session_id
             )
