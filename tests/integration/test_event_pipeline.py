@@ -154,8 +154,8 @@ class TestFullEventSequence:
         event_node_id = make_node_id(self._SESSION_ID, "session:start", self._T0)
         event_node = await services.graph.get_node(event_node_id)
         assert event_node is not None
-        assert "SessionStart" in event_node["labels"]
-        assert "Session" in event_node["labels"]
+        assert "SessionStartEvent" in event_node["labels"]
+        assert "SessionEvent" in event_node["labels"]
         assert "Event" in event_node["labels"]
 
         # DefaultHandler attaches Event node to Session via HAS_EVENT
@@ -239,8 +239,8 @@ class TestFullEventSequence:
         )
         event_node = await services.graph.get_node(event_node_id)
         assert event_node is not None
-        assert "ToolPre" in event_node["labels"]
-        assert "Tool" in event_node["labels"]
+        assert "ToolPreEvent" in event_node["labels"]
+        assert "ToolEvent" in event_node["labels"]
         assert "Event" in event_node["labels"]
 
         # HAS_EVENT edge: Session → Event (DefaultHandler)
@@ -453,7 +453,7 @@ class TestUnclaimedEventsFlowToDefault:
         node = await services.graph.get_node(event_node_id)
         assert node is not None
         assert "Event" in node["labels"]
-        assert "SessionResume" in node["labels"]
+        assert "SessionResumeEvent" in node["labels"]
 
     async def test_session_resume_event_attached_to_session(self) -> None:
         """When no run is active, the Event node must be attached to the Session node."""
@@ -509,7 +509,7 @@ class TestSystemEventsCreateNodes:
         event_node = await services.graph.get_node(event_node_id)
         assert event_node is not None
         assert "Event" in event_node["labels"]
-        assert "ContextCompaction" in event_node["labels"]
+        assert "ContextCompactionEvent" in event_node["labels"]
 
     async def test_context_compaction_creates_session_and_event_nodes(self) -> None:
         """After context:compaction the graph must contain the Session stub and
@@ -550,7 +550,7 @@ class TestSystemEventsCreateNodes:
         event_node = await services.graph.get_node(event_node_id)
         assert event_node is not None
         assert "Event" in event_node["labels"]
-        assert "CancelRequested" in event_node["labels"]
+        assert "CancelRequestedEvent" in event_node["labels"]
 
 
 # ===========================================================================

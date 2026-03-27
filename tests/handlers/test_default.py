@@ -15,57 +15,65 @@ from context_intelligence_server.utils import make_node_id
 
 
 class TestDeriveLabelConversions:
-    """DefaultHandler.derive_labels returns [FullPascal, Category, 'Event']."""
+    """DefaultHandler.derive_labels returns [FullPascalEvent, CategoryEvent, 'Event']."""
 
     def test_tool_pre(self) -> None:
-        assert DefaultHandler.derive_labels("tool:pre") == ["ToolPre", "Tool", "Event"]
+        assert DefaultHandler.derive_labels("tool:pre") == [
+            "ToolPreEvent",
+            "ToolEvent",
+            "Event",
+        ]
 
     def test_session_start(self) -> None:
         assert DefaultHandler.derive_labels("session:start") == [
-            "SessionStart",
-            "Session",
+            "SessionStartEvent",
+            "SessionEvent",
             "Event",
         ]
 
     def test_recipe_loop_iteration(self) -> None:
         assert DefaultHandler.derive_labels("recipe:loop_iteration") == [
-            "RecipeLoopIteration",
-            "Recipe",
+            "RecipeLoopIterationEvent",
+            "RecipeEvent",
             "Event",
         ]
 
     def test_context_compaction(self) -> None:
         assert DefaultHandler.derive_labels("context:compaction") == [
-            "ContextCompaction",
-            "Context",
+            "ContextCompactionEvent",
+            "ContextEvent",
             "Event",
         ]
 
     def test_delegate_agent_spawned(self) -> None:
         assert DefaultHandler.derive_labels("delegate:agent_spawned") == [
-            "DelegateAgentSpawned",
-            "Delegate",
+            "DelegateAgentSpawnedEvent",
+            "DelegateEvent",
             "Event",
         ]
 
     def test_cancel_requested(self) -> None:
         assert DefaultHandler.derive_labels("cancel:requested") == [
-            "CancelRequested",
-            "Cancel",
+            "CancelRequestedEvent",
+            "CancelEvent",
             "Event",
         ]
 
     def test_underscore_only(self) -> None:
-        """No colon — FullPascal == Category."""
+        """No colon — FullPascalEvent == CategoryEvent."""
         assert DefaultHandler.derive_labels("my_event") == [
-            "MyEvent",
-            "MyEvent",
+            "MyEventEvent",
+            "MyEventEvent",
             "Event",
         ]
 
     def test_single_word(self) -> None:
-        """Single word — FullPascal == Category."""
-        assert DefaultHandler.derive_labels("ping") == ["Ping", "Ping", "Event"]
+        """Single word — FullPascalEvent == CategoryEvent."""
+        assert DefaultHandler.derive_labels("ping") == [
+            "PingEvent",
+            "PingEvent",
+            "Event",
+        ]
 
 
 class TestDefaultHandlerCreatesEventNodes:
@@ -87,8 +95,8 @@ class TestDefaultHandlerCreatesEventNodes:
         node = await services.graph.get_node(event_id)
         assert node is not None
         labels = set(node["labels"])
-        assert "SessionResume" in labels
-        assert "Session" in labels
+        assert "SessionResumeEvent" in labels
+        assert "SessionEvent" in labels
         assert "Event" in labels
         assert node["occurred_at"] == "2026-01-01T02:00:00Z"
         assert node["event_name"] == "session:resume"
@@ -139,8 +147,8 @@ class TestDefaultHandlerCreatesEventNodes:
         node = await services.graph.get_node(event_id)
         assert node is not None
         labels = set(node["labels"])
-        assert "CustomMyEvent" in labels
-        assert "Custom" in labels
+        assert "CustomMyEventEvent" in labels
+        assert "CustomEvent" in labels
         assert "Event" in labels
         assert node["event_name"] == "custom:my_event"
 

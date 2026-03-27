@@ -73,16 +73,20 @@ class DefaultHandler:
     def derive_labels(event_name: str) -> list[str]:
         """Derive 3-level label hierarchy from event name.
 
-        Returns [FullPascal, Category, 'Event'] where:
-        - FullPascal: all parts (split on : and _) capitalized and joined
-        - Category: the prefix before the last colon (same PascalCase transform)
-          If no colon, Category == FullPascal.
+        Returns [FullPascalEvent, CategoryEvent, 'Event'] where:
+        - FullPascalEvent: all parts (split on : and _) capitalized and joined, with 'Event' suffix
+        - CategoryEvent: the prefix before the last colon (same PascalCase transform), with 'Event' suffix
+          If no colon, CategoryEvent == FullPascalEvent.
+
+        The 'Event' suffix prevents label clashes with entity node types (e.g.
+        session:start would otherwise produce the label 'Session', clashing with
+        actual Session nodes).
 
         Examples:
-          'tool:pre'           → ['ToolPre', 'Tool', 'Event']
-          'recipe:loop_iter'   → ['RecipeLoopIter', 'Recipe', 'Event']
-          'my_event'           → ['MyEvent', 'MyEvent', 'Event']
-          'ping'               → ['Ping', 'Ping', 'Event']
+          'tool:pre'           → ['ToolPreEvent', 'ToolEvent', 'Event']
+          'recipe:loop_iter'   → ['RecipeLoopIterEvent', 'RecipeEvent', 'Event']
+          'my_event'           → ['MyEventEvent', 'MyEventEvent', 'Event']
+          'ping'               → ['PingEvent', 'PingEvent', 'Event']
         """
         parts = _EVENT_PARTS_RE.split(event_name)
         full_pascal = "".join(part.capitalize() for part in parts if part)
@@ -95,4 +99,4 @@ class DefaultHandler:
         else:
             category = full_pascal
 
-        return [full_pascal, category, "Event"]
+        return [f"{full_pascal}Event", f"{category}Event", "Event"]
