@@ -164,7 +164,6 @@ neo4j_password: ""          # empty string for NEO4J_AUTH=none instances
 # Storage — directories are created automatically
 blob_path: /home/you/.local/share/ci-server/blobs
 log_path:  /home/you/.local/share/ci-server/logs/server.jsonl
-cursor_path: /home/you/.local/share/ci-server/cursors
 
 # Server bind address
 server_host: 127.0.0.1
@@ -188,7 +187,6 @@ AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_BROWSER_URL=http://localhost:7474 \
 AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD="" \
 AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH=/tmp/ci-blobs \
 AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_PATH=/tmp/ci-logs/server.jsonl \
-AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CURSOR_PATH=/tmp/ci-cursors \
   uvicorn context_intelligence_server.main:app --reload
 ```
 
@@ -201,7 +199,6 @@ YAML provides the baseline; environment variables override individual values at 
 neo4j_url: neo4j://localhost:7687
 blob_path: /data/ci-blobs
 log_path:  /data/ci-logs/server.jsonl
-cursor_path: /data/ci-cursors
 ```
 
 ```bash
@@ -345,12 +342,10 @@ Values are resolved with this priority (highest first):
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH` | `blob_path` | `/data/blobs` | Blob storage root directory |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_PATH` | `log_path` | `/data/logs/server.jsonl` | Structured log file path |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_LEVEL` | `log_level` | `INFO` | Log level (`DEBUG`/`INFO`/`WARNING`/`ERROR`) |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CURSOR_PATH` | `cursor_path` | `/data/cursors` | Cursor persistence root directory |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVER_HOST` | `server_host` | `0.0.0.0` | Bind host |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVER_PORT` | `server_port` | `8000` | Bind port |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_DASHBOARD_INACTIVE_TIMEOUT` | `dashboard_inactive_timeout` | `1800.0` | Seconds before a session is hidden from the dashboard (30 min) |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_STALE_SESSION_TIMEOUT` | `stale_session_timeout` | `432000.0` | Seconds before a session worker is reaped and cursors persisted (5 days) |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CURSOR_PERSIST_TTL` | `cursor_persist_ttl` | `15552000.0` | Seconds before cursor files are deleted from disk (180 days) |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_STALE_SESSION_TIMEOUT` | `stale_session_timeout` | `432000.0` | Seconds before a session worker is reaped (5 days) |
 
 > **Note:** `CONFIG_FILE` is resolved before any other setting and cannot itself be set from the YAML file — only from the environment.
 
@@ -365,7 +360,6 @@ The Docker Compose stack uses bind mounts under `$HOME/amplifier-context-intelli
 | Neo4j graph | `~/amplifier-context-intelligence-server-data-store/neo4j` | Property graph database |
 | Blobs | `~/amplifier-context-intelligence-server-data-store/blobs` | Event blob JSON files |
 | Logs | `~/amplifier-context-intelligence-server-data-store/logs` | Rotating JSONL log files |
-| Cursors | `~/amplifier-context-intelligence-server-data-store/cursors` | Session cursor state |
 
 Graph data and blob data survive container rebuilds and restarts. The ingestion server's in-memory counters (completed sessions, recent events) reset on process restart — the Neo4j graph is the durable record.
 
@@ -391,15 +385,13 @@ All nodes carry a `workspace` property for multi-workspace isolation.
 
 | Label | Created by | Key properties |
 |-------|-----------|----------------|
-| `Session` + `Root`/`Subsession` | `session:start` | `node_id`, `status`, `started_at` |
-| `OrchestratorRun` | `execution:start` | `node_id`, `status`, `run_number` |
-| `Step` + `PromptStep`/`AssistantStep` | `prompt:submit`, `provider:request` | `node_id`, `model`, `input_tokens` |
-| `ToolExecution` | `tool:pre` | `node_id`, `tool_name`, `status` |
+| `Session` + `RootSession`/`SubSession`/`ForkedSession` | `session:start`, `session:fork` | `node_id`, `status`, `started_at` |
+| `ToolCall` | `tool:pre` | `node_id` (session__tool_call__tool_call_id), `tool_name`, `tool_call_id` |
 | `Event` + derived label | unclaimed events | `node_id`, `event_type` |
 
 ### Edge types
 
-`HAS_RUN` | `HAS_STEP` | `NEXT` | `TRIGGERED` | `PARALLEL_WITH` | `SPAWNED` | `SUBSESSION_OF` | `HAS_EVENT`
+`SUBSESSION_OF` | `HAS_FORK` (session:fork parent→child) | `HAS_EVENT` | `HAS_TOOL_CALL` (Session→ToolCall, has started_at/ended_at)
 
 ### Example queries
 
@@ -413,12 +405,10 @@ MATCH path = (s:Session)-[*1..4]->(n)
 WHERE s.node_id CONTAINS "my-session-id"
 RETURN path
 
--- Token usage per run
-MATCH (s:Session)-[:HAS_RUN]->(r:OrchestratorRun)-[:HAS_STEP]->(step:Step)
-WHERE s.workspace = "my-project"
-RETURN r.node_id,
-       sum(step.input_tokens) AS input_tokens,
-       sum(step.output_tokens) AS output_tokens
+-- Find all events for a session
+MATCH (s:Session {node_id: "your-session-id"})-[:HAS_EVENT]->(e:Event)
+RETURN labels(e), e.occurred_at
+ORDER BY e.occurred_at
 ```
 
 ---
@@ -455,7 +445,7 @@ amplifier-context-intelligence/
 │   ├── pipeline.py                      # Event dispatch pipeline
 │   ├── neo4j_store.py                   # Neo4jGraphStore (buffered writes)
 │   ├── blob_store.py                    # AsyncDiskBlobStore
-│   ├── handlers/                        # 7 event handlers
+│   ├── handlers/                        # DefaultHandler, SessionHandler, ToolCallHandler + field_lifters/
 │   └── web/                             # Dashboard HTML + static assets
 ├── server-config.example.yaml           # Configuration file template
 ├── docker-compose.yml                   # 2-service stack (server + neo4j)
