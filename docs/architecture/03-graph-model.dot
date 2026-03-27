@@ -53,7 +53,7 @@ digraph graph_model {
             shape     = record
             style     = filled
             fillcolor = "#CE93D8"
-            label     = "{ :ForkedSession :SubSession :Session | node_id: child session UUID | workspace: may be null | started_at: ISO 8601 }"
+            label     = "{ :ForkedSession :Session | node_id: child session UUID | workspace: may be null | started_at: ISO 8601 | Distinct from SubSession }"
         ]
     }
 
@@ -73,14 +73,14 @@ digraph graph_model {
             shape     = record
             style     = filled
             fillcolor = "#A5D6A7"
-            label     = "{ :FullPascal :Category :Event | node_id: session__event__epoch_ms[__tool_call_id] | event_name: string | occurred_at: ISO 8601 | data: JSON (with blob refs) }"
+            label     = "{ :FullPascalEvent :CategoryEvent :Event | node_id: session__event__epoch_ms[__tool_call_id] | event_name: string | occurred_at: ISO 8601 | data: JSON (with blob refs) }"
         ]
 
         EventExamples [
             shape     = plaintext
             style     = ""
             fillcolor = "transparent"
-            label     = "Label examples:\ntool:pre \u2192 :ToolPre :Tool :Event\nsession:start \u2192 :SessionStart :Session :Event\ncontext:compaction \u2192 :ContextCompaction :Context :Event\ndelegate:agent_spawned \u2192 :DelegateAgentSpawned :Delegate :Event"
+            label     = "Label examples:\ntool:pre \u2192 :ToolPreEvent :ToolEvent :Event\nsession:start \u2192 :SessionStartEvent :SessionEvent :Event\ncontext:compaction \u2192 :ContextCompactionEvent :ContextEvent :Event\ndelegate:agent_spawned \u2192 :DelegateAgentSpawnedEvent :DelegateEvent :Event"
         ]
     }
 
@@ -124,7 +124,7 @@ digraph graph_model {
         style     = filled
         fillcolor = "#FFCCBC"
         penwidth  = 2
-        label     = "⚠ SUBSESSION_OF direction: PARENT \u2192 CHILD\n(opposite of old design \u2014 confirm before querying)"
+        label     = "⚠ Session edge types differ by origin:\nSUBSESSION_OF: session:start with parent_id\nHAS_FORK: session:fork\nBoth are parent\u2192child direction.\nForkedSession does NOT carry SubSession label."
     ]
 
     // ── Edges ─────────────────────────────────────────────────────────────────
@@ -136,7 +136,7 @@ digraph graph_model {
     ]
 
     RootSession -> ForkedSession [
-        label     = "SUBSESSION_OF"
+        label     = "HAS_FORK\n(parent->child)"
         color     = "#7B1FA2"
         fontcolor = "#7B1FA2"
         penwidth  = 2

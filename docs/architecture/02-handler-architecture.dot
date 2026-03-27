@@ -41,7 +41,7 @@ digraph handler_architecture {
             <TR><TD><B>DefaultHandler</B></TD></TR>
             <TR><TD>UNCONDITIONAL &#8212; ALL events</TD></TR>
             <TR><TD>handled_events = set()  (empty &#8212; accepts everything)</TD></TR>
-            <TR><TD>Creates [:FullPascal, :Category, :Event] node</TD></TR>
+            <TR><TD>Creates [:FullPascalEvent, :CategoryEvent, :Event] node</TD></TR>
             <TR><TD>Creates (Session)-[:HAS_EVENT]-&gt;(Event) edge</TD></TR>
         </TABLE>>
     ]
@@ -62,8 +62,9 @@ digraph handler_architecture {
         label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
             <TR><TD><B>SessionHandler [0]</B></TD></TR>
             <TR><TD>session:start | session:fork | session:end</TD></TR>
-            <TR><TD>Labels: RootSession / SubSession / ForkedSession</TD></TR>
-            <TR><TD>Edges: SUBSESSION_OF (parent&#8594;child)</TD></TR>
+            <TR><TD>Labels: RootSession:Session | SubSession:Session | ForkedSession:Session</TD></TR>
+            <TR><TD>session:start &#8594; SUBSESSION_OF | session:fork &#8594; HAS_FORK</TD></TR>
+            <TR><TD>(both parent&#8594;child — ForkedSession is NOT a SubSession)</TD></TR>
             <TR><TD>Sets: started_at / ended_at / workspace</TD></TR>
         </TABLE>>
     ]
