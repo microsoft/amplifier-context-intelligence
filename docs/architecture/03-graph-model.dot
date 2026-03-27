@@ -73,14 +73,14 @@ digraph graph_model {
             shape     = record
             style     = filled
             fillcolor = "#A5D6A7"
-            label     = "{ :FullPascalEvent :CategoryEvent :Event | node_id: session__event__epoch_ms[__tool_call_id] | event_name: string | occurred_at: ISO 8601 | data: JSON (with blob refs) }"
+            label     = "{ :FullPascalEvent :CategoryEvent :Event | node_id: session__event__epoch_ms[__tool_call_id] | event_name: string | occurred_at: ISO 8601 | session_id | parent_id | tool_call_id | parallel_group_id | [event-specific: tool_name, model, agent, prompt, ...] | data: full JSON blob }"
         ]
 
         EventExamples [
             shape     = plaintext
             style     = ""
             fillcolor = "transparent"
-            label     = "Label examples:\ntool:pre → :ToolPreEvent :ToolEvent :Event\nsession:start → :SessionStartEvent :SessionEvent :Event\ncontext:compaction → :ContextCompactionEvent :ContextEvent :Event\ndelegate:agent_spawned → :DelegateAgentSpawnedEvent :DelegateEvent :Event"
+            label     = "Label examples:\ntool:pre → :ToolPreEvent :ToolEvent :Event\nsession:start → :SessionStartEvent :SessionEvent :Event\ncontext:compaction → :ContextCompactionEvent :ContextEvent :Event\ndelegate:agent_spawned → :DelegateAgentSpawnedEvent :DelegateEvent :Event\nLifted fields queryable directly — no JSON parsing needed\ndata blob stores complete raw payload"
         ]
     }
 
