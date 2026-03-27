@@ -426,3 +426,143 @@ class TestLateParentDiscovery:
         parent_node = await services.graph.get_node("parent")
         assert parent_node is not None
         assert "Session" in parent_node["labels"]
+
+
+class TestSessionStartForkGuard:
+    """session:start must not override ForkedSession classification from session:fork.
+
+    In the real Amplifier event stream, session:fork fires first (~70ms before
+    session:start) for forked sessions. The fork guard ensures that session:start
+    does not demote a ForkedSession to a SubSession or replace HAS_FORK with
+    SUBSESSION_OF.
+    """
+
+    async def test_session_start_after_fork_preserves_forked_session_label(
+        self, services: HookStateService
+    ) -> None:
+        """session:start after session:fork keeps ForkedSession label — not SubSession."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+
+        # Step 1: session:fork fires first — classifies child as ForkedSession
+        await handler(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "parent": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {},
+            },
+        )
+
+        # Step 2: session:start fires immediately after (~70ms later in real stream)
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00.070Z",
+            },
+        )
+
+        node = await services.graph.get_node("child")
+        assert node is not None
+        labels = node["labels"]
+        assert "ForkedSession" in labels, f"ForkedSession must be preserved: {labels}"
+        assert "SubSession" not in labels, f"SubSession must NOT be added: {labels}"
+        assert "Session" in labels
+
+    async def test_session_start_after_fork_keeps_has_fork_edge(
+        self, services: HookStateService
+    ) -> None:
+        """session:start after session:fork must NOT create a SUBSESSION_OF edge."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+
+        await handler(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "parent": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {},
+            },
+        )
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00.070Z",
+            },
+        )
+
+        # HAS_FORK must still exist
+        fork_edge = await services.graph.get_edge("parent", "child")
+        assert fork_edge is not None
+        assert fork_edge["type"] == "HAS_FORK", f"Expected HAS_FORK: {fork_edge}"
+
+        # SUBSESSION_OF must NOT exist (it would only exist if the guard failed)
+        # Note: since both HAS_FORK and SUBSESSION_OF would be (parent -> child),
+        # the last write wins — but we verify the type is HAS_FORK, not SUBSESSION_OF
+        assert fork_edge["type"] != "SUBSESSION_OF"
+
+    async def test_session_start_after_fork_enriches_started_at(
+        self, services: HookStateService
+    ) -> None:
+        """session:start after session:fork still sets started_at from session:start timestamp."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+
+        await handler(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "parent": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {},
+            },
+        )
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00.070Z",
+            },
+        )
+
+        node = await services.graph.get_node("child")
+        assert node is not None
+        # started_at is set by session:start (the guard allows timing enrichment)
+        assert node.get("started_at") == "2026-01-01T00:00:00.070Z"
+
+    async def test_session_start_without_prior_fork_creates_subsession_normally(
+        self, services: HookStateService
+    ) -> None:
+        """session:start with parent_id (no prior fork) still creates SubSession normally."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+
+        # No prior session:fork — only session:start
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+
+        node = await services.graph.get_node("child")
+        assert node is not None
+        labels = node["labels"]
+        assert "SubSession" in labels
+        assert "ForkedSession" not in labels
+
+        edge = await services.graph.get_edge("parent", "child")
+        assert edge is not None
+        assert edge["type"] == "SUBSESSION_OF"
