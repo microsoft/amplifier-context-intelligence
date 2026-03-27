@@ -189,30 +189,36 @@ class TestDefaultHandlerTiebreaker:
         node = await services.graph.get_node(event_id)
         assert node is not None
 
-    async def test_non_tool_events_have_no_disambiguator(
+    async def test_any_event_with_tool_call_id_uses_disambiguator(
         self, services: HookStateService
     ) -> None:
-        """Non-tool events do NOT use tool_call_id as disambiguator."""
+        """Any event carrying tool_call_id uses it as disambiguator (not just tool:*).
+
+        Behaviour change: delegate:agent_spawned (and any other event) with a
+        tool_call_id gets the disambiguator embedded in its node_id, preventing
+        collisions when the same event fires multiple times at the same timestamp
+        for parallel tool calls.
+        """
         handler = DefaultHandler(services)
         await handler(
-            "session:resume",
+            "delegate:agent_spawned",
             {
                 "session_id": "s1",
                 "timestamp": "2026-01-01T02:00:00Z",
-                "tool_call_id": "tc-abc",  # present but should be ignored
+                "tool_call_id": "tc-abc",
             },
         )
-        # Node should exist without the disambiguator
-        event_id_no_disambiguator = make_node_id(
-            "s1", "session:resume", "2026-01-01T02:00:00Z"
-        )
-        node = await services.graph.get_node(event_id_no_disambiguator)
-        assert node is not None
-        # Node with disambiguator should NOT exist
+        # Node should exist WITH the disambiguator in its node_id
         event_id_with_disambiguator = make_node_id(
-            "s1", "session:resume", "2026-01-01T02:00:00Z", "tc-abc"
+            "s1", "delegate:agent_spawned", "2026-01-01T02:00:00Z", "tc-abc"
         )
-        node_wrong = await services.graph.get_node(event_id_with_disambiguator)
+        node = await services.graph.get_node(event_id_with_disambiguator)
+        assert node is not None
+        # Node WITHOUT disambiguator should NOT exist
+        event_id_no_disambiguator = make_node_id(
+            "s1", "delegate:agent_spawned", "2026-01-01T02:00:00Z"
+        )
+        node_wrong = await services.graph.get_node(event_id_no_disambiguator)
         assert node_wrong is None
 
     async def test_parallel_tool_calls_produce_distinct_nodes(
@@ -453,3 +459,213 @@ class TestDefaultHandlerFieldLifters:
         assert node.get("parallel_group_id") == "pg-1"
         # From ToolLifter (fires for tool:*)
         assert node.get("tool_name") == "read_file"
+
+
+class TestDefaultHandlerFieldLifting:
+    """Integration tests: end-to-end field lifting for each lifter type."""
+
+    async def test_tool_pre_lifts_navigation_and_tool_fields(
+        self, services: HookStateService
+    ) -> None:
+        """tool:pre node has tool_name, tool_call_id, parallel_group_id, tool_input at top level."""
+        handler = DefaultHandler(services)
+        await handler(
+            "tool:pre",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T04:00:00Z",
+                "tool_name": "bash",
+                "tool_call_id": "tc-lift",
+                "parallel_group_id": "pg-lift",
+                "tool_input": {"cmd": "ls -la"},
+            },
+        )
+        event_id = make_node_id("s1", "tool:pre", "2026-01-01T04:00:00Z", "tc-lift")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        # Navigation fields (UniversalLifter)
+        assert node.get("tool_call_id") == "tc-lift"
+        assert node.get("parallel_group_id") == "pg-lift"
+        # Tool fields (ToolLifter)
+        assert node.get("tool_name") == "bash"
+        assert node.get("tool_input") == {"cmd": "ls -la"}
+
+    async def test_session_fork_lifts_parent_and_metadata(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork node has parent_id (UniversalLifter), parent (SessionLifter),
+        agent_name (SessionLifter metadata), tool_call_id overridden by SessionLifter metadata.
+        """
+        handler = DefaultHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T04:01:00Z",
+                "parent_id": "parent-sess-id",
+                "parent": "parent-ref-value",
+                "metadata": {
+                    "agent_name": "foundation:explorer",
+                    "tool_call_id": "meta-tc-override",
+                },
+            },
+        )
+        # No top-level tool_call_id, so no disambiguator in node_id
+        event_id = make_node_id("s1", "session:fork", "2026-01-01T04:01:00Z")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        # parent_id from UniversalLifter (top-level field)
+        assert node.get("parent_id") == "parent-sess-id"
+        # parent from SessionLifter (top-level parent field)
+        assert node.get("parent") == "parent-ref-value"
+        # agent_name from SessionLifter metadata
+        assert node.get("agent_name") == "foundation:explorer"
+        # tool_call_id overridden by SessionLifter metadata value
+        assert node.get("tool_call_id") == "meta-tc-override"
+
+    async def test_llm_response_lifts_model_and_provider(
+        self, services: HookStateService
+    ) -> None:
+        """llm:response node has model and provider lifted by LlmLifter."""
+        handler = DefaultHandler(services)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T04:02:00Z",
+                "model": "claude-3-5-sonnet",
+                "provider": "anthropic",
+            },
+        )
+        event_id = make_node_id("s1", "llm:response", "2026-01-01T04:02:00Z")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        assert node.get("model") == "claude-3-5-sonnet"
+        assert node.get("provider") == "anthropic"
+
+    async def test_prompt_submit_lifts_prompt(
+        self, services: HookStateService
+    ) -> None:
+        """prompt:submit node has prompt lifted by PromptLifter."""
+        handler = DefaultHandler(services)
+        await handler(
+            "prompt:submit",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T04:03:00Z",
+                "prompt": "What is AI?",
+            },
+        )
+        event_id = make_node_id("s1", "prompt:submit", "2026-01-01T04:03:00Z")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        assert node.get("prompt") == "What is AI?"
+
+    async def test_prompt_complete_lifts_prompt_and_response_preview(
+        self, services: HookStateService
+    ) -> None:
+        """prompt:complete node has both prompt and response_preview lifted by PromptLifter."""
+        handler = DefaultHandler(services)
+        await handler(
+            "prompt:complete",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T04:04:00Z",
+                "prompt": "What is AI?",
+                "response_preview": "AI stands for Artificial Intelligence...",
+            },
+        )
+        event_id = make_node_id("s1", "prompt:complete", "2026-01-01T04:04:00Z")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        assert node.get("prompt") == "What is AI?"
+        assert node.get("response_preview") == "AI stands for Artificial Intelligence..."
+
+    async def test_data_blob_still_present_alongside_lifted_fields(
+        self, services: HookStateService
+    ) -> None:
+        """Full data blob JSON still stored even when fields are lifted; extra_field in blob but not at top level."""
+        handler = DefaultHandler(services)
+        await handler(
+            "tool:pre",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T04:05:00Z",
+                "tool_call_id": "tc-blob",
+                "tool_name": "read_file",
+                "extra_field": "only-in-blob",
+            },
+        )
+        event_id = make_node_id("s1", "tool:pre", "2026-01-01T04:05:00Z", "tc-blob")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        # Lifted field at top level
+        assert node.get("tool_name") == "read_file"
+        # Full blob still stored
+        assert "data" in node
+        blob = json.loads(node["data"])
+        assert blob["extra_field"] == "only-in-blob"
+        assert blob["tool_name"] == "read_file"
+        # extra_field NOT present as top-level property (only in blob)
+        assert node.get("extra_field") is None
+
+    async def test_none_lifted_fields_not_written_to_node(
+        self, services: HookStateService
+    ) -> None:
+        """parent_id=None produces no parent_id key on the event node."""
+        handler = DefaultHandler(services)
+        await handler(
+            "session:resume",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T04:06:00Z",
+                "parent_id": None,
+            },
+        )
+        event_id = make_node_id("s1", "session:resume", "2026-01-01T04:06:00Z")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        # parent_id=None must NOT appear as a top-level node property
+        assert "parent_id" not in node
+
+    async def test_delegate_spawned_lifts_agent_and_session_ids(
+        self, services: HookStateService
+    ) -> None:
+        """delegate:agent_spawned has agent, sub_session_id, parent_session_id lifted by DelegateLifter."""
+        handler = DefaultHandler(services)
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T04:07:00Z",
+                "agent": "foundation:explorer",
+                "sub_session_id": "sub-sess-99",
+                "parent_session_id": "parent-sess-42",
+            },
+        )
+        event_id = make_node_id("s1", "delegate:agent_spawned", "2026-01-01T04:07:00Z")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        assert node.get("agent") == "foundation:explorer"
+        assert node.get("sub_session_id") == "sub-sess-99"
+        assert node.get("parent_session_id") == "parent-sess-42"
+
+    async def test_unknown_event_still_gets_universal_fields(
+        self, services: HookStateService
+    ) -> None:
+        """custom:something gets session_id and parent_id from UniversalLifter."""
+        handler = DefaultHandler(services)
+        await handler(
+            "custom:something",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T04:08:00Z",
+                "parent_id": "parent-sess-custom",
+            },
+        )
+        event_id = make_node_id("s1", "custom:something", "2026-01-01T04:08:00Z")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        # UniversalLifter always fires regardless of event type
+        assert node.get("session_id") == "s1"
+        assert node.get("parent_id") == "parent-sess-custom"
