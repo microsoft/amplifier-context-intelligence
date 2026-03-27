@@ -87,7 +87,7 @@ class SessionHandler:
         parent_id = data.get("parent_id")
 
         if parent_id:
-            labels: list[str] = ["ForkedSession", "SubSession", "Session"]
+            labels: list[str] = ["ForkedSession", "Session"]
         else:
             labels = ["ForkedSession", "Session"]
             log.warning(
@@ -110,7 +110,7 @@ class SessionHandler:
             await self.services.graph.upsert_edge(
                 parent_id,
                 session_id,
-                {"type": "SUBSESSION_OF", "occurred_at": timestamp},
+                {"type": "HAS_FORK", "occurred_at": timestamp},
             )
 
     async def _handle_end(self, session_id: str, timestamp: str) -> None:
