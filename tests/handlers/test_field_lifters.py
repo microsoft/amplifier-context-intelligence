@@ -69,7 +69,7 @@ class TestFieldLifterMatches:
 
 
 class TestUniversalLifter:
-    """Tests for UniversalLifter — extracts 4 navigation fields from any event."""
+    """Tests for UniversalLifter — extracts session_id and parent_id from every event."""
 
     def test_matches_all_events(self) -> None:
         lifter = UniversalLifter()
@@ -77,21 +77,26 @@ class TestUniversalLifter:
         assert lifter.matches("session:start") is True
         assert lifter.matches("anything:here") is True
 
-    def test_extracts_all_four_fields(self) -> None:
+    def test_extracts_session_id_and_parent_id(self) -> None:
         lifter = UniversalLifter()
         data = {
-            "session_id": "sess-1",
-            "parent_id": "sess-0",
-            "tool_call_id": "tc-42",
-            "parallel_group_id": "pg-7",
+            "session_id": "sess-001",
+            "parent_id": "parent-001",
+            "tool_call_id": "tc-001",
         }
+        result = lifter.extract("any:event", data)
+        assert result["session_id"] == "sess-001"
+        assert result["parent_id"] == "parent-001"
+        # tool_call_id is NOT a navigation field — must not be lifted here
+        assert "tool_call_id" not in result
+
+    def test_does_not_lift_tool_correlation_fields(self) -> None:
+        lifter = UniversalLifter()
+        data = {"session_id": "s1", "tool_call_id": "tc-001", "parallel_group_id": "pg-001"}
         result = lifter.extract("tool:pre", data)
-        assert result == {
-            "session_id": "sess-1",
-            "parent_id": "sess-0",
-            "tool_call_id": "tc-42",
-            "parallel_group_id": "pg-7",
-        }
+        assert "tool_call_id" not in result
+        assert "parallel_group_id" not in result
+        assert result["session_id"] == "s1"
 
     def test_skips_none_values(self) -> None:
         lifter = UniversalLifter()

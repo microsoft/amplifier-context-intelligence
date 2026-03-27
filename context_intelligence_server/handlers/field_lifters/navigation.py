@@ -1,4 +1,4 @@
-"""UniversalLifter — extracts navigation fields from every event."""
+"""UniversalLifter — lifts session_id and parent_id from every event."""
 
 from __future__ import annotations
 
@@ -6,32 +6,27 @@ from typing import Any
 
 from context_intelligence_server.handlers.field_lifters.base import FieldLifter
 
-_NAVIGATION_KEYS: tuple[str, ...] = (
-    "session_id",
-    "parent_id",
-    "tool_call_id",
-    "parallel_group_id",
-)
-
 
 class UniversalLifter(FieldLifter):
-    """Lifts the 4 universal navigation fields from every event.
+    """Lifts session_id and parent_id from every event's data dict.
 
-    Fires on all events (event_pattern = "*") and extracts:
-    - session_id: current session identifier
-    - parent_id: parent session identifier for hierarchy traversal
-    - tool_call_id: tool call identifier for correlating pre/post/error events
-    - parallel_group_id: group identifier for parallel tool executions
+    Fires on ALL events ("*" pattern). Extracts only the two fields
+    needed for session hierarchy navigation that are present across
+    all event types.
 
-    None values and missing keys are silently skipped.
+    tool_call_id and parallel_group_id are intentionally NOT lifted here —
+    they are tool-correlation fields owned by ToolLifter (tool:*) and
+    DelegateLifter (delegate:*).
     """
 
     event_pattern = "*"
 
+    _NAVIGATION_KEYS: tuple[str, ...] = ("session_id", "parent_id")
+
     def extract(self, event: str, data: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG002
-        """Extract navigation fields from event data, skipping None values."""
+        """Lift session_id and parent_id for session hierarchy navigation."""
         result: dict[str, Any] = {}
-        for key in _NAVIGATION_KEYS:
+        for key in self._NAVIGATION_KEYS:
             value = data.get(key)
             if value is not None:
                 result[key] = value
