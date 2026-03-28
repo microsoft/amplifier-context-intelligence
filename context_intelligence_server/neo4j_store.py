@@ -76,6 +76,7 @@ class Neo4jGraphStore:
         self._workspace = workspace
         self._node_buffer: dict[str, dict[str, Any]] = {}
         self._edge_buffer: dict[tuple, dict[str, Any]] = {}
+        self._label_patches: list[dict[str, Any]] = []
         self._schema_initialized: bool = False
         self._closed: bool = False
         self._flush_task = None

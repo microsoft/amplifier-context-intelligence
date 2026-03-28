@@ -106,6 +106,19 @@ def test_no_graph_forest_name_in_source():
 
 
 # ---------------------------------------------------------------------------
+# Init — buffer initialization
+# ---------------------------------------------------------------------------
+
+
+def test_label_patches_initialized_as_empty_list():
+    """Neo4jGraphStore.__init__ must initialize _label_patches as an empty list."""
+    store = _make_store()
+    assert hasattr(store, "_label_patches"), "_label_patches attribute must be set in __init__"
+    assert store._label_patches == [], "_label_patches must be initialized as []"
+    assert isinstance(store._label_patches, list), "_label_patches must be a list"
+
+
+# ---------------------------------------------------------------------------
 # supported_dialects
 # ---------------------------------------------------------------------------
 
