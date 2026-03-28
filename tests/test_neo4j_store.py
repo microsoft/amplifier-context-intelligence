@@ -977,3 +977,58 @@ async def test_get_edge_neo4j_fallback_uses_store_workspace_value():
 
     params = store._driver.execute_query.call_args[0][1]
     assert params.get("workspace") == "workspace-alpha"
+
+
+# ---------------------------------------------------------------------------
+# TestNeo4jGraphStoreSetLabels
+# ---------------------------------------------------------------------------
+
+
+class TestNeo4jGraphStoreSetLabels:
+    """set_labels() buffers label patches and flush() applies or restores them."""
+
+    async def test_set_labels_buffers_patch(self):
+        """set_labels appends a patch dict to _label_patches with no immediate I/O."""
+        store = _make_store()
+        store._label_patches = []
+
+        await store.set_labels("s1", remove_labels=["RootSession"], add_labels=["ForkedSession"])
+
+        assert len(store._label_patches) == 1
+        patch = store._label_patches[0]
+        assert patch["node_id"] == "s1"
+        assert patch["remove"] == ["RootSession"]
+        assert patch["add"] == ["ForkedSession"]
+
+    async def test_flush_clears_label_patches(self):
+        """After a successful flush, _label_patches is empty."""
+        store = _make_store()
+        store._label_patches = []
+
+        await store.set_labels("s1", remove_labels=["RootSession"], add_labels=["ForkedSession"])
+
+        mock_tx, mock_session = _make_flush_mocks()
+        store._driver.session = MagicMock(return_value=mock_session)
+        store._schema_initialized = True
+
+        await store.flush()
+
+        assert store._label_patches == []
+
+    async def test_flush_restores_patches_on_failure(self):
+        """If flush fails, _label_patches is restored for retry."""
+        store = _make_store()
+        store._label_patches = []
+
+        await store.set_labels("s1", remove_labels=["RootSession"], add_labels=["ForkedSession"])
+
+        mock_tx, mock_session = _make_flush_mocks()
+        mock_tx.run = AsyncMock(side_effect=RuntimeError("neo4j down"))
+        store._driver.session = MagicMock(return_value=mock_session)
+        store._schema_initialized = True
+
+        with pytest.raises(RuntimeError):
+            await store.flush()
+
+        assert len(store._label_patches) == 1
+        assert store._label_patches[0]["node_id"] == "s1"
