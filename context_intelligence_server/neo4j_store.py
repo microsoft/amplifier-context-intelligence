@@ -431,10 +431,20 @@ class Neo4jGraphStore:
             # Uniqueness constraint on Session nodes — prevents duplicate Session nodes from
             # concurrent worker flushes. Label-required IS UNIQUE (Community-compatible).
             # Combined with MERGE (n:Session ...) in flush(), makes concurrent MERGEs atomic.
-            await session.run(
-                "CREATE CONSTRAINT session_node_id_workspace_unique IF NOT EXISTS "
-                "FOR (n:Session) REQUIRE (n.node_id, n.workspace) IS UNIQUE"
-            )
+            try:
+                await session.run(
+                    "CREATE CONSTRAINT session_node_id_workspace_unique IF NOT EXISTS "
+                    "FOR (n:Session) REQUIRE (n.node_id, n.workspace) IS UNIQUE"
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Pre-existing Session nodes may violate the constraint — log and continue.
+                # The server works without it; concurrent duplicate writes are less likely
+                # on a clean database. Run 'MATCH (n:Session) WITH n.node_id, n.workspace,
+                # collect(n) AS ns WHERE size(ns) > 1 FOREACH (d IN tail(ns) | DETACH DELETE d)'
+                # to remove existing duplicates, then restart.
+                _LOG.warning(
+                    "Could not create Session uniqueness constraint (existing duplicates?): %s", exc
+                )
 
         self._schema_initialized = True
 
