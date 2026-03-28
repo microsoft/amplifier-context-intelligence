@@ -135,6 +135,22 @@ class GraphState:
         """
         self._edges.pop((src_id, dst_id), None)
 
+    async def set_labels(
+        self, node_id: str, remove_labels: list[str], add_labels: list[str]
+    ) -> None:
+        """Atomically remove specific labels and add new labels on a node.
+
+        If the node does not exist, creates it with add_labels.
+        Labels in remove_labels that are not present are silently skipped.
+        Unlike upsert_node, this method CAN remove labels — it is the correct
+        way to perform session type label reclassification.
+        """
+        if node_id not in self._nodes:
+            self._nodes[node_id] = {}
+        existing = self._nodes[node_id]
+        current: set[str] = set(existing.get("labels", []))
+        existing["labels"] = sorted((current - set(remove_labels)) | set(add_labels))
+
     # ------------------------------------------------------------------
     # Flush / close (no-ops for in-memory store)
     # ------------------------------------------------------------------
