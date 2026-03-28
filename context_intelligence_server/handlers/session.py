@@ -136,25 +136,49 @@ class SessionHandler:
         data: dict[str, Any],
         log: EventLogContext,
     ) -> None:
-        parent_id = data.get("parent_id")
+        parent_id = (data.get("parent_id") or "").strip()
+        workspace = data.get("workspace") or self.services.graph.workspace
 
-        labels: list[str] = ["ForkedSession", "Session"]
         if not parent_id:
             log.warning(
                 "session:fork for %r has no parent_id — orphaned fork", session_id
             )
 
-        workspace = data.get("workspace") or self.services.graph.workspace
+        # Get existing node to determine current type
+        existing = await self.services.graph.get_node(session_id)
+        labels: list[str] = existing.get("labels", []) if existing else []
+        current_type = _current_type(labels)
 
+        # Always enrich started_at and workspace
         await self.services.graph.upsert_node(
-            session_id,
-            {
-                "labels": labels,
-                "started_at": timestamp,
-                "workspace": workspace,
-            },
+            session_id, {"started_at": timestamp, "workspace": workspace}
         )
 
+        # ForkedSession: fully terminal — preserve classification, return immediately
+        if current_type == "ForkedSession":
+            return
+
+        # RootSession or SubSession: reclassify to ForkedSession, rectify edge
+        if current_type in ("RootSession", "SubSession"):
+            await self.services.graph.set_labels(
+                session_id,
+                remove_labels=[current_type],
+                add_labels=["ForkedSession"],
+            )
+            if parent_id:
+                self.services.graph.remove_edge(parent_id, session_id)
+                await self.services.ensure_session_node(parent_id, {})
+                await self.services.graph.upsert_edge(
+                    parent_id,
+                    session_id,
+                    {"type": "HAS_FORK", "occurred_at": timestamp},
+                )
+            return
+
+        # bare: add Session + ForkedSession labels (include Session base label for new nodes)
+        await self.services.graph.set_labels(
+            session_id, remove_labels=[], add_labels=["Session", "ForkedSession"]
+        )
         if parent_id:
             await self.services.ensure_session_node(parent_id, {})
             await self.services.graph.upsert_edge(
