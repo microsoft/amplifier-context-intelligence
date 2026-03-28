@@ -280,8 +280,9 @@ class Neo4jGraphStore:
             async with self._driver.session(database=self._database) as db_session:
                 tx = await db_session.begin_transaction()
                 try:
-                    # ---- nodes (label-free MERGE prevents duplicates across flush cycles) ----
-                    all_rows: list[dict[str, Any]] = []
+                    # ---- nodes ---- (Session nodes use label-aware MERGE + uniqueness constraint)
+                    session_rows: list[dict[str, Any]] = []  # have Session label
+                    other_rows: list[dict[str, Any]] = []  # everything else
                     label_assignments: list[dict[str, Any]] = []
 
                     for node_id, data in node_snapshot.items():
@@ -290,7 +291,12 @@ class Neo4jGraphStore:
                             {k: v for k, v in data.items() if k != "labels"}
                         )
                         props["workspace"] = self.workspace
-                        all_rows.append({"node_id": node_id, "props": props})
+                        row: dict[str, Any] = {"node_id": node_id, "props": props}
+
+                        if "Session" in labels:
+                            session_rows.append(row)
+                        else:
+                            other_rows.append(row)
 
                         if labels:
                             for label in labels:
@@ -299,19 +305,27 @@ class Neo4jGraphStore:
                                 {"node_id": node_id, "labels": sorted(set(labels))}
                             )
 
-                    # Merge all nodes by identity (node_id + workspace) — NO label in MERGE key.
-                    # This prevents duplicates when the same node is written with different
-                    # primary labels in different flush cycles.
-                    if all_rows:
+                    # Session nodes: MERGE by Session label + uniqueness constraint (atomic under concurrency)
+                    if session_rows:
+                        await tx.run(
+                            "UNWIND $rows AS row "
+                            "MERGE (n:Session {node_id: row.node_id, workspace: row.props.workspace}) "
+                            "SET n += row.props",
+                            rows=session_rows,
+                        )
+
+                    # Non-session nodes: label-free MERGE (no constraint needed — single-worker owned)
+                    if other_rows:
                         await tx.run(
                             "UNWIND $rows AS row "
                             "MERGE (n {node_id: row.node_id, workspace: row.props.workspace}) "
                             "SET n += row.props",
-                            rows=all_rows,
+                            rows=other_rows,
                         )
 
                     # Set all labels for labeled nodes (primary + extra in one SET per node).
-                    # Runs after MERGE so the node exists before MATCH.
+                    # For Session nodes, Session label is already set by the MERGE above — this
+                    # adds any additional type labels (RootSession, SubSession, ForkedSession, etc.)
                     for item in label_assignments:
                         labels_str = ":".join(item["labels"])
                         await tx.run(
@@ -414,24 +428,13 @@ class Neo4jGraphStore:
                 "FOR (n:Session) ON (n.workspace)"
             )
 
-            # Uniqueness constraint prevents duplicate nodes from concurrent worker flushes.
-            # With this constraint, MERGE (n {node_id, workspace}) is atomic — two concurrent
-            # MERGEs for the same (node_id, workspace) pair cannot produce two nodes.
-            # Try IS NODE KEY first (creates uniqueness + existence constraints), fall back
-            # to IS UNIQUE (uniqueness only) for older Neo4j versions.
-            try:
-                await session.run(
-                    "CREATE CONSTRAINT node_id_workspace_unique IF NOT EXISTS "
-                    "FOR (n) REQUIRE (n.node_id, n.workspace) IS NODE KEY"
-                )
-            except Exception:
-                try:
-                    await session.run(
-                        "CREATE CONSTRAINT node_id_workspace_unique IF NOT EXISTS "
-                        "FOR (n) REQUIRE (n.node_id, n.workspace) IS UNIQUE"
-                    )
-                except Exception:
-                    pass  # constraint may already exist with a different name
+            # Uniqueness constraint on Session nodes — prevents duplicate Session nodes from
+            # concurrent worker flushes. Label-required IS UNIQUE (Community-compatible).
+            # Combined with MERGE (n:Session ...) in flush(), makes concurrent MERGEs atomic.
+            await session.run(
+                "CREATE CONSTRAINT session_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Session) REQUIRE (n.node_id, n.workspace) IS UNIQUE"
+            )
 
         self._schema_initialized = True
 
