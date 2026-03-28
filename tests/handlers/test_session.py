@@ -582,6 +582,7 @@ class TestSessionLabelStateMachine:
     ) -> None:
         """(bare, start, no parent) -> RootSession:Session"""
         h = SessionHandler(services)
+        assert hasattr(h, "_label_machine"), "SessionHandler must delegate to SessionLabelStateMachine"
         await services.ensure_session_node("s1", {})
         await h(
             "session:start",
@@ -598,6 +599,7 @@ class TestSessionLabelStateMachine:
     ) -> None:
         """(bare, start, with parent) -> SubSession:Session + SUBSESSION_OF"""
         h = SessionHandler(services)
+        assert hasattr(h, "_label_machine"), "SessionHandler must delegate to SessionLabelStateMachine"
         await services.ensure_session_node("parent", {})
         await services.ensure_session_node("child", {})
         await h(
@@ -621,6 +623,7 @@ class TestSessionLabelStateMachine:
     ) -> None:
         """(RootSession, start, no parent) -> no label change, started_at enriched"""
         h = SessionHandler(services)
+        assert hasattr(h, "_label_machine"), "SessionHandler must delegate to SessionLabelStateMachine"
         await services.graph.upsert_node("s1", {"labels": ["RootSession", "Session"]})
         await h(
             "session:start",
@@ -677,6 +680,7 @@ class TestSessionLabelStateMachine:
     ) -> None:
         """(SubSession, start, with parent) -> SubSession unchanged, started_at enriched"""
         h = SessionHandler(services)
+        assert hasattr(h, "_label_machine"), "SessionHandler must delegate to SessionLabelStateMachine"
         await services.ensure_session_node("parent", {})
         await services.graph.upsert_node("child", {"labels": ["SubSession", "Session"]})
         await h(
@@ -697,6 +701,7 @@ class TestSessionLabelStateMachine:
     ) -> None:
         """(ForkedSession, start, any) -> TERMINAL — no classification change"""
         h = SessionHandler(services)
+        assert hasattr(h, "_label_machine"), "SessionHandler must delegate to SessionLabelStateMachine"
         await services.graph.upsert_node("s1", {"labels": ["ForkedSession", "Session"]})
         await h(
             "session:start",
@@ -719,6 +724,7 @@ class TestSessionLabelStateMachine:
     ) -> None:
         """(bare, fork) -> ForkedSession:Session + HAS_FORK"""
         h = SessionHandler(services)
+        assert hasattr(h, "_label_machine"), "SessionHandler must delegate to SessionLabelStateMachine"
         await services.ensure_session_node("parent", {})
         await services.ensure_session_node("child", {})
         await h(
@@ -795,6 +801,7 @@ class TestSessionLabelStateMachine:
     ) -> None:
         """(ForkedSession, fork) -> TERMINAL — no change at all"""
         h = SessionHandler(services)
+        assert hasattr(h, "_label_machine"), "SessionHandler must delegate to SessionLabelStateMachine"
         await services.ensure_session_node("parent", {})
         await services.graph.upsert_node(
             "child", {"labels": ["ForkedSession", "Session"]}
