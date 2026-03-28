@@ -190,7 +190,6 @@ class SessionHandler:
     async def _handle_end(
         self, session_id: str, timestamp: str, data: dict[str, Any]
     ) -> None:
-        # data will be consumed by subsequent task (stub recovery / label state machine)
         await self.services.graph.upsert_node(
             session_id,
             {
@@ -199,6 +198,17 @@ class SessionHandler:
                 "status": "completed",
             },
         )
+
+        # Stub recovery: if session:start was permanently missed (bare Session),
+        # classify the session now using parent_id from the end event data.
+        existing = await self.services.graph.get_node(session_id)
+        labels: list[str] = existing.get("labels", []) if existing else []
+        if _current_type(labels) is None:
+            parent_id = (data.get("parent_id") or "").strip()
+            fallback = "SubSession" if parent_id else "RootSession"
+            await self.services.graph.set_labels(
+                session_id, remove_labels=[], add_labels=[fallback]
+            )
 
         # Terminal event — flush directly. There is no hot path after
         # session:end; all buffered data must reach the backing store before
