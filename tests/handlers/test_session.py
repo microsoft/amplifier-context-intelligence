@@ -12,8 +12,63 @@ from __future__ import annotations
 
 import pytest
 
-from context_intelligence_server.handlers.session import SessionHandler
+from context_intelligence_server.handlers.session import (
+    SessionHandler,
+    _TYPE_LABELS,
+    _current_type,
+)
 from context_intelligence_server.services import HookStateService
+
+
+class TestTypeLabelConstant:
+    """_TYPE_LABELS must be a frozenset containing the three type labels."""
+
+    def test_type_labels_is_frozenset(self) -> None:
+        assert isinstance(_TYPE_LABELS, frozenset)
+
+    def test_type_labels_contains_root_session(self) -> None:
+        assert "RootSession" in _TYPE_LABELS
+
+    def test_type_labels_contains_sub_session(self) -> None:
+        assert "SubSession" in _TYPE_LABELS
+
+    def test_type_labels_contains_forked_session(self) -> None:
+        assert "ForkedSession" in _TYPE_LABELS
+
+    def test_type_labels_contains_exactly_three_entries(self) -> None:
+        assert len(_TYPE_LABELS) == 3
+
+
+class TestCurrentTypeHelper:
+    """_current_type() returns the most-specific type label present, or None."""
+
+    def test_returns_none_for_bare_session(self) -> None:
+        """A bare session (only 'Session') has no type label."""
+        assert _current_type(["Session"]) is None
+
+    def test_returns_none_for_empty_labels(self) -> None:
+        assert _current_type([]) is None
+
+    def test_returns_root_session(self) -> None:
+        assert _current_type(["RootSession", "Session"]) == "RootSession"
+
+    def test_returns_sub_session(self) -> None:
+        assert _current_type(["SubSession", "Session"]) == "SubSession"
+
+    def test_returns_forked_session(self) -> None:
+        assert _current_type(["ForkedSession", "Session"]) == "ForkedSession"
+
+    def test_forked_takes_priority_over_sub(self) -> None:
+        """ForkedSession > SubSession in specificity."""
+        assert _current_type(["SubSession", "ForkedSession", "Session"]) == "ForkedSession"
+
+    def test_forked_takes_priority_over_root(self) -> None:
+        """ForkedSession > RootSession in specificity."""
+        assert _current_type(["RootSession", "ForkedSession", "Session"]) == "ForkedSession"
+
+    def test_sub_takes_priority_over_root(self) -> None:
+        """SubSession > RootSession in specificity."""
+        assert _current_type(["RootSession", "SubSession", "Session"]) == "SubSession"
 
 
 class TestSessionIdGuard:

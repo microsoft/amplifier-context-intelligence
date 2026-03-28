@@ -11,6 +11,18 @@ from context_intelligence_server.utils import EventLogContext, HandlerLogger
 
 logger = logging.getLogger(__name__)
 
+_TYPE_LABELS: frozenset[str] = frozenset({"RootSession", "SubSession", "ForkedSession"})
+
+
+def _current_type(labels: list[str]) -> str | None:
+    """Return the current session type label, or None if the session is bare.
+    Bare sessions have only the base 'Session' label — no type label yet.
+    ForkedSession > SubSession > RootSession in specificity (checked in this order)."""
+    for label in ("ForkedSession", "SubSession", "RootSession"):
+        if label in labels:
+            return label
+    return None
+
 
 class SessionHandler:
     """Handles session lifecycle events.
@@ -46,7 +58,7 @@ class SessionHandler:
         elif event == "session:fork":
             await self._handle_fork(session_id, timestamp, data, log)
         elif event == "session:end":
-            await self._handle_end(session_id, timestamp)
+            await self._handle_end(session_id, timestamp, data)
 
         return HookResult(action="continue")
 
@@ -119,7 +131,9 @@ class SessionHandler:
                 {"type": "HAS_FORK", "occurred_at": timestamp},
             )
 
-    async def _handle_end(self, session_id: str, timestamp: str) -> None:
+    async def _handle_end(
+        self, session_id: str, timestamp: str, data: dict[str, Any]
+    ) -> None:
         await self.services.graph.upsert_node(
             session_id,
             {
