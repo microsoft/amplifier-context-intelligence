@@ -421,3 +421,79 @@ class TestGraphState:
         remaining = await state.get_edge("n2", "n3")
         assert remaining is not None
         assert remaining["type"] == "LIKES"
+
+
+# ---------------------------------------------------------------------------
+# GraphState.set_labels tests
+# ---------------------------------------------------------------------------
+
+
+class TestGraphStateSetLabels:
+    """Tests for GraphState.set_labels — atomic label add/remove on graph nodes."""
+
+    async def _make_node(self, labels: list[str]) -> tuple["GraphState", str]:  # type: ignore[name-defined]
+        """Helper: create a GraphState with workspace='test' and a node 's1'."""
+        state = GraphState(workspace="test")
+        await state.upsert_node("s1", {"labels": labels, "status": "running"})
+        return state, "s1"
+
+    async def test_add_only(self):
+        """Adding labels to a bare Session node works without removing anything."""
+        state, node_id = await self._make_node(["Session"])
+        await state.set_labels(node_id, remove_labels=[], add_labels=["RootSession"])
+        node = await state.get_node(node_id)
+        assert node is not None
+        assert "RootSession" in node["labels"]
+        assert "Session" in node["labels"]
+
+    async def test_remove_only(self):
+        """Removing a label leaves other labels intact."""
+        state, node_id = await self._make_node(["RootSession", "Session"])
+        await state.set_labels(node_id, remove_labels=["RootSession"], add_labels=[])
+        node = await state.get_node(node_id)
+        assert node is not None
+        assert "RootSession" not in node["labels"]
+        assert "Session" in node["labels"]
+
+    async def test_remove_and_add(self):
+        """Removes old type label and adds new type label atomically."""
+        state, node_id = await self._make_node(["RootSession", "Session"])
+        await state.set_labels(
+            node_id,
+            remove_labels=["RootSession"],
+            add_labels=["ForkedSession"],
+        )
+        node = await state.get_node(node_id)
+        assert node is not None
+        assert "RootSession" not in node["labels"]
+        assert "ForkedSession" in node["labels"]
+        assert "Session" in node["labels"]
+
+    async def test_nonexistent_node_created_with_add_labels(self):
+        """If node does not exist, it is created with add_labels."""
+        state = GraphState(workspace="test")
+        await state.set_labels(
+            "new",
+            remove_labels=[],
+            add_labels=["ForkedSession", "Session"],
+        )
+        node = await state.get_node("new")
+        assert node is not None
+        assert "ForkedSession" in node["labels"]
+        assert "Session" in node["labels"]
+
+    async def test_empty_remove_is_noop(self):
+        """Empty remove_labels does not affect existing labels."""
+        state, node_id = await self._make_node(["Session"])
+        await state.set_labels(node_id, remove_labels=[], add_labels=["RootSession"])
+        node = await state.get_node(node_id)
+        assert node is not None
+        assert "Session" in node["labels"]
+
+    async def test_remove_absent_label_is_noop(self):
+        """Removing a label not present on the node silently succeeds."""
+        state, node_id = await self._make_node(["Session"])
+        await state.set_labels(node_id, remove_labels=["RootSession"], add_labels=[])
+        node = await state.get_node(node_id)
+        assert node is not None
+        assert node["labels"] == ["Session"]
