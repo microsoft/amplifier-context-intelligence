@@ -134,6 +134,7 @@ class SessionHandler:
     async def _handle_end(
         self, session_id: str, timestamp: str, data: dict[str, Any]
     ) -> None:
+        # data will be consumed by subsequent task (stub recovery / label state machine)
         await self.services.graph.upsert_node(
             session_id,
             {
