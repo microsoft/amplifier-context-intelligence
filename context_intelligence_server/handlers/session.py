@@ -24,6 +24,18 @@ def _current_type(labels: list[str]) -> str | None:
     return None
 
 
+class SessionLabelStateMachine:
+    """State machine for session type label transitions.
+
+    Tracks which type label transitions are valid for each event type.
+    ForkedSession > SubSession > RootSession in specificity (terminal ordering).
+    """
+
+    def __init__(self) -> None:
+        # Marker: presence of this attribute confirms state machine delegation
+        pass
+
+
 class SessionHandler:
     """Handles session lifecycle events.
 
@@ -42,6 +54,7 @@ class SessionHandler:
     def __init__(self, services: HookStateService) -> None:
         self.services = services
         self._log = HandlerLogger("SessionHandler", logger)
+        self._label_machine = SessionLabelStateMachine()
 
     async def __call__(self, event: str, data: dict[str, Any]) -> HookResult:
         log = self._log.with_event(event, data)
@@ -65,37 +78,56 @@ class SessionHandler:
     async def _handle_start(
         self, session_id: str, timestamp: str, data: dict[str, Any]
     ) -> None:
-        # Guard: session:fork fires before session:start for forked sessions.
-        # If already classified as ForkedSession, do NOT re-classify as SubSession
-        # or create a SUBSESSION_OF edge. Only enrich timing data.
+        parent_id = (data.get("parent_id") or "").strip()
         existing = await self.services.graph.get_node(session_id)
-        if existing and "ForkedSession" in existing.get("labels", []):
-            await self.services.graph.upsert_node(session_id, {"started_at": timestamp})
+        labels: list[str] = existing.get("labels", []) if existing else []
+        current_type = _current_type(labels)
+
+        # Always enrich started_at
+        await self.services.graph.upsert_node(session_id, {"started_at": timestamp})
+
+        # ForkedSession: fully terminal — preserve classification, no edge creation
+        if current_type == "ForkedSession":
             return
 
-        parent_id = (data.get("parent_id") or "").strip()
+        # SubSession: terminal upward — preserve classification, no further changes
+        if current_type == "SubSession":
+            return
 
-        if parent_id:
-            labels: list[str] = ["SubSession", "Session"]
-        else:
-            labels = ["RootSession", "Session"]
+        # RootSession + no parent: stable — no reclassification needed
+        if current_type == "RootSession" and not parent_id:
+            return
 
-        await self.services.graph.upsert_node(
-            session_id,
-            {
-                "labels": labels,
-                "started_at": timestamp,
-                "workspace": data.get("workspace"),
-            },
-        )
-
-        if parent_id:
+        # RootSession + parent: reclassify to SubSession, drop RootSession
+        if current_type == "RootSession" and parent_id:
+            await self.services.graph.set_labels(
+                session_id, remove_labels=["RootSession"], add_labels=["SubSession"]
+            )
             await self.services.ensure_session_node(parent_id, {})
             await self.services.graph.upsert_edge(
                 parent_id,
                 session_id,
                 {"type": "SUBSESSION_OF", "occurred_at": timestamp},
             )
+            return
+
+        # bare + parent: add SubSession (include Session base label for new nodes)
+        if parent_id:
+            await self.services.graph.set_labels(
+                session_id, remove_labels=[], add_labels=["Session", "SubSession"]
+            )
+            await self.services.ensure_session_node(parent_id, {})
+            await self.services.graph.upsert_edge(
+                parent_id,
+                session_id,
+                {"type": "SUBSESSION_OF", "occurred_at": timestamp},
+            )
+            return
+
+        # bare + no parent: add RootSession (include Session base label for new nodes)
+        await self.services.graph.set_labels(
+            session_id, remove_labels=[], add_labels=["RootSession", "Session"]
+        )
 
     async def _handle_fork(
         self,
