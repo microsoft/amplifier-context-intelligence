@@ -566,3 +566,289 @@ class TestSessionStartForkGuard:
         edge = await services.graph.get_edge("parent", "child")
         assert edge is not None
         assert edge["type"] == "SUBSESSION_OF"
+
+
+class TestSessionLabelStateMachine:
+    """One test per row in the state machine transition table.
+
+    Tests cover _handle_start (7 transitions), _handle_fork (4 transitions),
+    and _handle_end stub recovery (2 transitions).
+    """
+
+    # ---- _handle_start transitions ----
+
+    async def test_start_bare_no_parent_creates_root(
+        self, services: HookStateService
+    ) -> None:
+        """(bare, start, no parent) -> RootSession:Session"""
+        h = SessionHandler(services)
+        await services.ensure_session_node("s1", {})
+        await h(
+            "session:start",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        assert "RootSession" in node["labels"]
+        assert "SubSession" not in node["labels"]
+        assert len(services.graph._edges) == 0
+
+    async def test_start_bare_with_parent_creates_subsession(
+        self, services: HookStateService
+    ) -> None:
+        """(bare, start, with parent) -> SubSession:Session + SUBSESSION_OF"""
+        h = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.ensure_session_node("child", {})
+        await h(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "SubSession" in node["labels"]
+        assert "RootSession" not in node["labels"]
+        edge = await services.graph.get_edge("parent", "child")
+        assert edge is not None
+        assert edge["type"] == "SUBSESSION_OF"
+
+    async def test_start_root_no_parent_stays_root(
+        self, services: HookStateService
+    ) -> None:
+        """(RootSession, start, no parent) -> no label change, started_at enriched"""
+        h = SessionHandler(services)
+        await services.graph.upsert_node("s1", {"labels": ["RootSession", "Session"]})
+        await h(
+            "session:start",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:01:00Z"},
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        assert "RootSession" in node["labels"]
+        assert "SubSession" not in node["labels"]
+        assert node["started_at"] == "2026-01-01T00:01:00Z"
+
+    async def test_start_root_with_parent_becomes_subsession(
+        self, services: HookStateService
+    ) -> None:
+        """(RootSession, start, with parent) -> SubSession, RootSession dropped"""
+        h = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.graph.upsert_node(
+            "child", {"labels": ["RootSession", "Session"]}
+        )
+        await h(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "SubSession" in node["labels"]
+        assert "RootSession" not in node["labels"]
+        edge = await services.graph.get_edge("parent", "child")
+        assert edge is not None
+        assert edge["type"] == "SUBSESSION_OF"
+
+    async def test_start_subsession_no_parent_stays_subsession(
+        self, services: HookStateService
+    ) -> None:
+        """(SubSession, start, no parent) -> no change (terminal upward)"""
+        h = SessionHandler(services)
+        await services.graph.upsert_node("s1", {"labels": ["SubSession", "Session"]})
+        await h(
+            "session:start",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        assert "SubSession" in node["labels"]
+        assert "RootSession" not in node["labels"]
+
+    async def test_start_subsession_with_parent_stays_subsession(
+        self, services: HookStateService
+    ) -> None:
+        """(SubSession, start, with parent) -> SubSession unchanged, started_at enriched"""
+        h = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.graph.upsert_node("child", {"labels": ["SubSession", "Session"]})
+        await h(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:01:00Z",
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "SubSession" in node["labels"]
+        assert node["started_at"] == "2026-01-01T00:01:00Z"
+
+    async def test_start_forkedsession_stays_forked(
+        self, services: HookStateService
+    ) -> None:
+        """(ForkedSession, start, any) -> TERMINAL — no classification change"""
+        h = SessionHandler(services)
+        await services.graph.upsert_node("s1", {"labels": ["ForkedSession", "Session"]})
+        await h(
+            "session:start",
+            {
+                "session_id": "s1",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:01:00Z",
+            },
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        assert "ForkedSession" in node["labels"]
+        assert "SubSession" not in node["labels"]
+        assert "RootSession" not in node["labels"]
+
+    # ---- _handle_fork transitions ----
+
+    async def test_fork_bare_creates_forkedsession(
+        self, services: HookStateService
+    ) -> None:
+        """(bare, fork) -> ForkedSession:Session + HAS_FORK"""
+        h = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.ensure_session_node("child", {})
+        await h(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {},
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "ForkedSession" in node["labels"]
+        assert "SubSession" not in node["labels"]
+        edge = await services.graph.get_edge("parent", "child")
+        assert edge is not None
+        assert edge["type"] == "HAS_FORK"
+
+    async def test_fork_root_reclassifies_to_forked_drops_root(
+        self, services: HookStateService
+    ) -> None:
+        """(RootSession, fork) -> ForkedSession, RootSession DROPPED, HAS_FORK"""
+        h = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.graph.upsert_node(
+            "child", {"labels": ["RootSession", "Session"]}
+        )
+        await h(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {},
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "ForkedSession" in node["labels"]
+        assert "RootSession" not in node["labels"]
+        edge = await services.graph.get_edge("parent", "child")
+        assert edge is not None
+        assert edge["type"] == "HAS_FORK"
+
+    async def test_fork_subsession_reclassifies_replaces_edge(
+        self, services: HookStateService
+    ) -> None:
+        """(SubSession, fork) -> ForkedSession, SubSession DROPPED, SUBSESSION_OF removed, HAS_FORK added"""
+        h = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.graph.upsert_node("child", {"labels": ["SubSession", "Session"]})
+        # Existing SUBSESSION_OF edge
+        await services.graph.upsert_edge("parent", "child", {"type": "SUBSESSION_OF"})
+        await h(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {},
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "ForkedSession" in node["labels"]
+        assert "SubSession" not in node["labels"]
+        edge = await services.graph.get_edge("parent", "child")
+        assert edge is not None
+        assert edge["type"] == "HAS_FORK"
+
+    async def test_fork_forkedsession_stays_forked_terminal(
+        self, services: HookStateService
+    ) -> None:
+        """(ForkedSession, fork) -> TERMINAL — no change at all"""
+        h = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.graph.upsert_node(
+            "child", {"labels": ["ForkedSession", "Session"]}
+        )
+        await services.graph.upsert_edge("parent", "child", {"type": "HAS_FORK"})
+        await h(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "metadata": {},
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "ForkedSession" in node["labels"]
+        assert "SubSession" not in node["labels"]
+        edge = await services.graph.get_edge("parent", "child")
+        assert edge is not None
+        assert edge["type"] == "HAS_FORK"  # not changed
+
+    # ---- _handle_end stub recovery ----
+
+    async def test_end_bare_no_parent_fallback_root(
+        self, services: HookStateService
+    ) -> None:
+        """session:end for bare Session with no parent_id -> RootSession fallback"""
+        h = SessionHandler(services)
+        await services.ensure_session_node("s1", {})
+        await h(
+            "session:end",
+            {"session_id": "s1", "timestamp": "2026-01-01T01:00:00Z"},
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        assert "RootSession" in node["labels"]
+        assert node["ended_at"] == "2026-01-01T01:00:00Z"
+
+    async def test_end_bare_with_parent_fallback_subsession(
+        self, services: HookStateService
+    ) -> None:
+        """session:end for bare Session with parent_id -> SubSession fallback"""
+        h = SessionHandler(services)
+        await services.ensure_session_node("s1", {})
+        await h(
+            "session:end",
+            {
+                "session_id": "s1",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T01:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        assert "SubSession" in node["labels"]
+        assert "RootSession" not in node["labels"]
