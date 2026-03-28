@@ -952,3 +952,90 @@ class TestSessionLabelStateMachine:
         assert "SubSession" in node["labels"]
         assert node["ended_at"] == "2026-01-01T01:00:00Z"
         assert "RootSession" not in node["labels"]
+
+
+# ---------------------------------------------------------------------------
+# TestSessionNodeProperties — session_id / parent_id on Session nodes
+# ---------------------------------------------------------------------------
+
+
+class TestSessionNodeProperties:
+    """Session nodes must carry session_id and parent_id as direct properties.
+
+    These properties enable direct Neo4j queries by session_id without
+    requiring traversal of HAS_EVENT edges.
+    """
+
+    async def test_session_node_has_session_id_property(
+        self, services: HookStateService
+    ) -> None:
+        """session:start (root) must set session_id as a direct node property."""
+        h = SessionHandler(services)
+        await h("session:start", {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"})
+        node = await services.graph.get_node("s1")
+        assert node is not None, "Node 's1' must exist after session:start"
+        assert node.get("session_id") == "s1", (
+            f"session:start must store session_id on the node. Got: {node!r}"
+        )
+
+    async def test_subsession_node_has_parent_id_property(
+        self, services: HookStateService
+    ) -> None:
+        """SubSession node must have parent_id as a direct property."""
+        h = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await h(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None, "Child node must exist after session:start with parent"
+        assert node.get("session_id") == "child", (
+            f"session:start must store session_id. Got: {node!r}"
+        )
+        assert node.get("parent_id") == "parent", (
+            f"session:start must store parent_id on SubSession node. Got: {node!r}"
+        )
+
+    async def test_root_session_parent_id_is_none(
+        self, services: HookStateService
+    ) -> None:
+        """RootSession must have parent_id=None as a direct property (not absent)."""
+        h = SessionHandler(services)
+        await h("session:start", {"session_id": "root", "timestamp": "2026-01-01T00:00:00Z"})
+        node = await services.graph.get_node("root")
+        assert node is not None, "Root node must exist after session:start"
+        assert node.get("session_id") == "root"
+        # parent_id must be explicitly None — either absent or None is acceptable
+        # (None stored explicitly beats absent for query clarity)
+        assert node.get("parent_id") is None, (
+            f"RootSession parent_id must be None (not a non-None value). Got: {node!r}"
+        )
+
+    async def test_forked_session_has_parent_id_property(
+        self, services: HookStateService
+    ) -> None:
+        """ForkedSession node must have parent_id as a direct property."""
+        h = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await h(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {},
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None, "Child node must exist after session:fork"
+        assert node.get("session_id") == "child", (
+            f"session:fork must store session_id. Got: {node!r}"
+        )
+        assert node.get("parent_id") == "parent", (
+            f"session:fork must store parent_id on ForkedSession node. Got: {node!r}"
+        )

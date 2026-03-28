@@ -238,6 +238,7 @@ class HookStateService:
         node_data: dict[str, Any] = {
             "labels": ["Session"],
             "status": "running",
+            "session_id": session_id,  # explicit property — enables direct query without HAS_EVENT traversal
         }
         if "started_at" in data:
             node_data["started_at"] = data["started_at"]

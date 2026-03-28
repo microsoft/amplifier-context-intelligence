@@ -83,8 +83,15 @@ class SessionHandler:
         labels: list[str] = existing.get("labels", []) if existing else []
         current_type = _current_type(labels)
 
-        # Always enrich started_at
-        await self.services.graph.upsert_node(session_id, {"started_at": timestamp})
+        # Always enrich started_at and session identity properties
+        await self.services.graph.upsert_node(
+            session_id,
+            {
+                "started_at": timestamp,
+                "session_id": session_id,
+                "parent_id": parent_id if parent_id else None,
+            },
+        )
 
         # ForkedSession: fully terminal — preserve classification, no edge creation
         if current_type == "ForkedSession":
@@ -149,9 +156,15 @@ class SessionHandler:
         labels: list[str] = existing.get("labels", []) if existing else []
         current_type = _current_type(labels)
 
-        # Always enrich started_at and workspace
+        # Always enrich started_at, workspace, and session identity properties
         await self.services.graph.upsert_node(
-            session_id, {"started_at": timestamp, "workspace": workspace}
+            session_id,
+            {
+                "started_at": timestamp,
+                "workspace": workspace,
+                "session_id": session_id,
+                "parent_id": parent_id if parent_id else None,
+            },
         )
 
         # ForkedSession: fully terminal — preserve classification, return immediately
@@ -196,6 +209,7 @@ class SessionHandler:
                 "labels": ["Session"],
                 "ended_at": timestamp,
                 "status": "completed",
+                "session_id": session_id,
             },
         )
 

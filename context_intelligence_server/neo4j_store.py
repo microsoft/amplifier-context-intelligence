@@ -255,6 +255,12 @@ class Neo4jGraphStore:
         Optimistically snapshots and clears buffers before writing.  On any
         failure the transaction is rolled back and the buffers are restored
         (merging any writes that arrived during the flush attempt).
+
+        All nodes are merged by (node_id, workspace) identity — label is never
+        part of the MERGE key.  This prevents duplicate nodes when the same
+        session is written with different type labels across flush cycles
+        (e.g. bare Session created by a child worker, then RootSession written
+        by the parent worker's session:end flush).
         """
         if not self._node_buffer and not self._edge_buffer and not self._label_patches:
             return  # early exit — nothing to write
@@ -274,10 +280,9 @@ class Neo4jGraphStore:
             async with self._driver.session(database=self._database) as db_session:
                 tx = await db_session.begin_transaction()
                 try:
-                    # ---- nodes ----
-                    no_label_rows: list[dict[str, Any]] = []
-                    labeled_groups: dict[str, list[dict[str, Any]]] = {}
-                    multi_label_rows: list[dict[str, Any]] = []
+                    # ---- nodes (label-free MERGE prevents duplicates across flush cycles) ----
+                    all_rows: list[dict[str, Any]] = []
+                    label_assignments: list[dict[str, Any]] = []
 
                     for node_id, data in node_snapshot.items():
                         labels: list[str] = data.get("labels", [])
@@ -285,48 +290,33 @@ class Neo4jGraphStore:
                             {k: v for k, v in data.items() if k != "labels"}
                         )
                         props["workspace"] = self.workspace
-                        row: dict[str, Any] = {"node_id": node_id, "props": props}
+                        all_rows.append({"node_id": node_id, "props": props})
 
-                        if not labels:
-                            no_label_rows.append(row)
-                        else:
-                            primary = labels[0]
-                            labeled_groups.setdefault(primary, []).append(row)
-                            if len(labels) > 1:
-                                multi_label_rows.append(
-                                    {"node_id": node_id, "extra_labels": labels[1:]}
-                                )
+                        if labels:
+                            for label in labels:
+                                _validate_identifier(label, "label")
+                            label_assignments.append(
+                                {"node_id": node_id, "labels": sorted(set(labels))}
+                            )
 
-                    # Enrichment rows: nodes with no labels
-                    if no_label_rows:
+                    # Merge all nodes by identity (node_id + workspace) — NO label in MERGE key.
+                    # This prevents duplicates when the same node is written with different
+                    # primary labels in different flush cycles.
+                    if all_rows:
                         await tx.run(
                             "UNWIND $rows AS row "
                             "MERGE (n {node_id: row.node_id, workspace: row.props.workspace}) "
                             "SET n += row.props",
-                            rows=no_label_rows,
+                            rows=all_rows,
                         )
 
-                    # Primary-label groups
-                    for label, rows in labeled_groups.items():
-                        _validate_identifier(label, "label")
-                        node_merge_query = (  # type: ignore[assignment]
-                            f"UNWIND $rows AS row "
-                            f"MERGE (n:{label} {{node_id: row.node_id, workspace: row.props.workspace}}) "
-                            f"SET n += row.props"
-                        )
-                        await tx.run(node_merge_query, rows=rows)  # type: ignore[arg-type]
-
-                    # Second pass: set additional labels for multi-label nodes
-                    for item in multi_label_rows:
-                        for extra_label in item["extra_labels"]:
-                            _validate_identifier(extra_label, "label")
-                        labels_str = ":".join(item["extra_labels"])
-                        label_set_query = (  # type: ignore[assignment]
-                            f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) "
-                            f"SET n:{labels_str}"
-                        )
+                    # Set all labels for labeled nodes (primary + extra in one SET per node).
+                    # Runs after MERGE so the node exists before MATCH.
+                    for item in label_assignments:
+                        labels_str = ":".join(item["labels"])
                         await tx.run(
-                            label_set_query,  # type: ignore[arg-type]
+                            f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) "
+                            f"SET n:{labels_str}",
                             node_id=item["node_id"],
                             workspace=self.workspace,
                         )

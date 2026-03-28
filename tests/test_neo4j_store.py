@@ -1062,3 +1062,103 @@ class TestNeo4jGraphStoreSetLabels:
             "set_labels must update _node_buffer immediately — get_node() returned stale labels"
         )
         assert "Session" in node["labels"]
+
+
+# ---------------------------------------------------------------------------
+# TestNeo4jGraphStoreFlushNoLabelMerge — label-free MERGE regression
+# ---------------------------------------------------------------------------
+
+
+class TestNeo4jGraphStoreFlushNoLabelMerge:
+    """flush() must use label-free MERGE (node_id + workspace only) to prevent duplicates.
+
+    When the same node_id is written with different primary labels across flush cycles,
+    label-in-MERGE creates duplicate Neo4j nodes (one per distinct primary label).
+    Regression test for the 'bare Session -> RootSession duplicate' bug.
+    """
+
+    def _make_store(self) -> Neo4jGraphStore:
+        return _make_store(workspace="test-ws")
+
+    async def test_flush_node_merge_does_not_include_label(self) -> None:
+        """flush() node MERGE query must NOT include a label in the MERGE pattern.
+
+        Correct:  MERGE (n {node_id: ..., workspace: ...})
+        Wrong:    MERGE (n:Session {node_id: ..., workspace: ...})
+
+        Including the label in MERGE means a second flush with a different primary
+        label (e.g. RootSession) creates a second node for the same logical entity.
+        """
+        import re
+        store = self._make_store()
+        await store.upsert_node("parent-123", {"labels": ["Session"], "status": "running"})
+
+        mock_tx, mock_session = _make_flush_mocks()
+        store._driver.session = MagicMock(return_value=mock_session)
+        store._schema_initialized = True
+
+        await store.flush()
+
+        merge_queries = [
+            str(c.args[0])
+            for c in mock_tx.run.call_args_list
+            if c.args and "MERGE" in str(c.args[0])
+        ]
+        assert merge_queries, "Expected at least one MERGE query during flush"
+        for q in merge_queries:
+            assert not re.search(r"MERGE\s*\(n:[A-Za-z]+\s*\{", q), (
+                f"flush() MUST NOT include label in MERGE key — got: {q!r}"
+            )
+
+    async def test_flush_second_cycle_uses_label_free_merge_for_reclassified_node(
+        self,
+    ) -> None:
+        """A node written as bare Session, then re-written as RootSession, must use
+        label-free MERGE in both flushes — no label in the MERGE pattern.
+        """
+        import re
+        store = self._make_store()
+
+        # Flush 1: bare Session (ensure_session_node pattern)
+        await store.upsert_node("parent-123", {"labels": ["Session"], "status": "running"})
+        mock_tx, mock_session = _make_flush_mocks()
+        store._driver.session = MagicMock(return_value=mock_session)
+        store._schema_initialized = True
+        await store.flush()
+
+        # Flush 2: same node re-classified as RootSession:Session
+        await store.upsert_node(
+            "parent-123", {"labels": ["RootSession", "Session"], "ended_at": "T1"}
+        )
+        mock_tx2, mock_session2 = _make_flush_mocks()
+        store._driver.session = MagicMock(return_value=mock_session2)
+        store._schema_initialized = True
+        await store.flush()
+
+        merge_queries_flush2 = [
+            str(c.args[0])
+            for c in mock_tx2.run.call_args_list
+            if c.args and "MERGE" in str(c.args[0])
+        ]
+        assert merge_queries_flush2, "Expected MERGE queries in flush 2"
+        for q in merge_queries_flush2:
+            assert not re.search(r"MERGE\s*\(n:[A-Za-z]+\s*\{", q), (
+                f"Flush 2 MUST NOT include label in MERGE key — found: {q!r}. "
+                "Including label causes duplicate nodes when a node is written with "
+                "different primary labels across flush cycles."
+            )
+
+        # Labels must be applied separately via MATCH ... SET n:Label
+        all_queries_flush2 = [
+            str(c.args[0])
+            for c in mock_tx2.run.call_args_list
+            if c.args
+        ]
+        set_label_queries = [
+            q for q in all_queries_flush2
+            if "SET n:" in q and "MERGE" not in q
+        ]
+        assert any("RootSession" in q for q in set_label_queries), (
+            f"Labels must be applied via MATCH ... SET n:Label (not in MERGE). "
+            f"Queries seen: {all_queries_flush2}"
+        )

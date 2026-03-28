@@ -499,3 +499,34 @@ class TestGraphStateSetLabels:
         node = await state.get_node(node_id)
         assert node is not None
         assert node["labels"] == ["Session"]
+
+
+# ---------------------------------------------------------------------------
+# TestEnsureSessionNodeSessionId — session_id property regression
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureSessionNodeSessionId:
+    """ensure_session_node must store session_id as a direct node property.
+
+    Enables direct query by session_id without traversing HAS_EVENT edges.
+    """
+
+    async def test_ensure_session_node_stores_session_id(self) -> None:
+        """Bare Session stub must have session_id as a direct property."""
+        svc = HookStateService(workspace="test")
+        await svc.ensure_session_node("sess-abc", {})
+        node = await svc.graph.get_node("sess-abc")
+        assert node is not None
+        assert node.get("session_id") == "sess-abc", (
+            f"ensure_session_node must set session_id property on the bare Session stub. "
+            f"Got node: {node!r}"
+        )
+
+    async def test_ensure_session_node_session_id_matches_node_id(self) -> None:
+        """session_id property must equal the node_id passed to ensure_session_node."""
+        svc = HookStateService(workspace="test")
+        await svc.ensure_session_node("my-session-xyz", {})
+        node = await svc.graph.get_node("my-session-xyz")
+        assert node is not None
+        assert node.get("session_id") == "my-session-xyz"
