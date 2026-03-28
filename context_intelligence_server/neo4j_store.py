@@ -242,7 +242,7 @@ class Neo4jGraphStore:
         failure the transaction is rolled back and the buffers are restored
         (merging any writes that arrived during the flush attempt).
         """
-        if not self._node_buffer and not self._edge_buffer:
+        if not self._node_buffer and not self._edge_buffer and not self._label_patches:
             return  # early exit — nothing to write
 
         # Snapshot and clear buffers optimistically
@@ -250,6 +250,8 @@ class Neo4jGraphStore:
         edge_snapshot = self._edge_buffer
         self._node_buffer = {}
         self._edge_buffer = {}
+        patch_snapshot = self._label_patches
+        self._label_patches = []
 
         success = False
         try:
@@ -258,6 +260,24 @@ class Neo4jGraphStore:
             async with self._driver.session(database=self._database) as db_session:
                 tx = await db_session.begin_transaction()
                 try:
+                    # ---- label patches (must run before node writes) ----
+                    for lp in patch_snapshot:
+                        pid = lp["node_id"]
+                        for label in lp.get("remove", []):
+                            _validate_identifier(label, "label")
+                            await tx.run(
+                                f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) REMOVE n:{label}",
+                                node_id=pid,
+                                workspace=self.workspace,
+                            )
+                        for label in lp.get("add", []):
+                            _validate_identifier(label, "label")
+                            await tx.run(
+                                f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) SET n:{label}",
+                                node_id=pid,
+                                workspace=self.workspace,
+                            )
+
                     # ---- nodes ----
                     no_label_rows: list[dict[str, Any]] = []
                     labeled_groups: dict[str, list[dict[str, Any]]] = {}
@@ -360,6 +380,8 @@ class Neo4jGraphStore:
                 merged_edges = dict(edge_snapshot)
                 merged_edges.update(self._edge_buffer)
                 self._edge_buffer = merged_edges
+                merged_patches = patch_snapshot + self._label_patches
+                self._label_patches = merged_patches
 
     async def _ensure_schema(self) -> None:
         """Create Neo4j indexes idempotently (runs once per store instance).
