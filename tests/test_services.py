@@ -263,7 +263,9 @@ class TestHookStateService:
         assert "SubSession" not in node["labels"]
         assert node["status"] == "running"
 
-    async def test_ensure_session_node_no_subsession_label_when_parent_field_present(self):
+    async def test_ensure_session_node_no_subsession_label_when_parent_field_present(
+        self,
+    ):
         """ensure_session_node creates a bare Session node even when 'parent' field is present.
 
         The safety-net node carries only ['Session']; type labels are added by SessionHandler.
@@ -431,7 +433,7 @@ class TestGraphState:
 class TestGraphStateSetLabels:
     """Tests for GraphState.set_labels — atomic label add/remove on graph nodes."""
 
-    async def _make_node(self, labels: list[str]) -> tuple["GraphState", str]:  # type: ignore[name-defined]
+    async def _make_node(self, labels: list[str]) -> tuple[GraphState, str]:
         """Helper: create a GraphState with workspace='test' and a node 's1'."""
         state = GraphState(workspace="test")
         await state.upsert_node("s1", {"labels": labels, "status": "running"})
