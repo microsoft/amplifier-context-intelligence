@@ -214,6 +214,23 @@ class Neo4jGraphStore:
         """
         self._edge_buffer.pop((src_id, dst_id), None)
 
+    async def set_labels(
+        self, node_id: str, remove_labels: list[str], add_labels: list[str]
+    ) -> None:
+        """Buffer a label patch to be applied at flush time before node writes.
+
+        Each label in remove_labels is removed via REMOVE n:Label Cypher.
+        Each label in add_labels is set via SET n:Label Cypher.
+        Patches are applied in buffer order, before any node or edge writes.
+        """
+        self._label_patches.append(
+            {
+                "node_id": node_id,
+                "remove": list(remove_labels),
+                "add": list(add_labels),
+            }
+        )
+
     # ------------------------------------------------------------------
     # Persistence methods
     # ------------------------------------------------------------------
