@@ -388,10 +388,12 @@ class Neo4jGraphStore:
                 self._label_patches = merged_patches
 
     async def _ensure_schema(self) -> None:
-        """Create Neo4j indexes idempotently (runs once per store instance).
+        """Create Neo4j indexes and constraints idempotently (runs once per store instance).
 
         Creates node_id indexes on Session, OrchestratorRun, Step, ToolExecution,
-        and Event labels, plus a named workspace index on Session.
+        and Event labels, plus a named workspace index on Session, plus a uniqueness
+        constraint on (node_id, workspace) to prevent duplicate nodes from concurrent
+        worker flushes.
         """
         if self._schema_initialized:
             return
@@ -411,6 +413,25 @@ class Neo4jGraphStore:
                 "CREATE INDEX idx_session_workspace IF NOT EXISTS "
                 "FOR (n:Session) ON (n.workspace)"
             )
+
+            # Uniqueness constraint prevents duplicate nodes from concurrent worker flushes.
+            # With this constraint, MERGE (n {node_id, workspace}) is atomic — two concurrent
+            # MERGEs for the same (node_id, workspace) pair cannot produce two nodes.
+            # Try IS NODE KEY first (creates uniqueness + existence constraints), fall back
+            # to IS UNIQUE (uniqueness only) for older Neo4j versions.
+            try:
+                await session.run(
+                    "CREATE CONSTRAINT node_id_workspace_unique IF NOT EXISTS "
+                    "FOR (n) REQUIRE (n.node_id, n.workspace) IS NODE KEY"
+                )
+            except Exception:
+                try:
+                    await session.run(
+                        "CREATE CONSTRAINT node_id_workspace_unique IF NOT EXISTS "
+                        "FOR (n) REQUIRE (n.node_id, n.workspace) IS UNIQUE"
+                    )
+                except Exception:
+                    pass  # constraint may already exist with a different name
 
         self._schema_initialized = True
 

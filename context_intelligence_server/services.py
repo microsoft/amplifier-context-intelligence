@@ -228,7 +228,19 @@ class HookStateService:
         # Tier 2: graph query — check durable state
         existing = await self.graph.get_node(session_id)
         if existing is not None:
-            # Node already in graph; repopulate cache and skip creation
+            # Node already in graph. Also upsert a bare stub to this worker's buffer
+            # so that the current worker's flush uses MERGE (idempotent) rather than
+            # creating a second node.  This prevents the asyncio race condition where:
+            #   1. Worker A flushes a stub node — tx is in-flight.
+            #   2. Worker B calls get_node — falls through to Neo4j, finds the node.
+            #   3. Without this upsert, Worker B's _node_buffer stays empty.
+            #   4. Worker B's flush later issues a fresh MERGE → duplicate node.
+            # upsert_node uses union-merge for labels, so existing type labels
+            # (e.g. "RootSession") are preserved — this call never strips labels.
+            await self.graph.upsert_node(
+                session_id,
+                {"labels": ["Session"], "status": "running", "session_id": session_id},
+            )
             self._seen_sessions.add(session_id)
             return
 

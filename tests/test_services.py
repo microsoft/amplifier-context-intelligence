@@ -530,3 +530,92 @@ class TestEnsureSessionNodeSessionId:
         node = await svc.graph.get_node("my-session-xyz")
         assert node is not None
         assert node.get("session_id") == "my-session-xyz"
+
+
+# ---------------------------------------------------------------------------
+# TestEnsureSessionNodeBufferPopulation — race-condition prevention
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureSessionNodeBufferPopulation:
+    """ensure_session_node must call upsert_node even when Tier 2 (graph query) hits.
+
+    Race condition: two asyncio workers run concurrently.  Worker B's _node_buffer
+    is empty, but the node was written by Worker A whose transaction is in-flight
+    (not yet committed).  When Worker B calls get_node it falls back to Neo4j,
+    finds nothing, and creates a SECOND node.  Even when Worker A's tx commits first,
+    Worker B finds the node via Neo4j (Tier 2) but WITHOUT the fix its own
+    _node_buffer stays empty — subsequent writes create a second MERGE.
+
+    The fix: always call upsert_node when Tier 2 returns a node so the current
+    worker's buffer is populated and its subsequent flush uses MERGE (idempotent).
+    """
+
+    async def test_ensure_session_node_calls_upsert_when_tier2_returns_node(
+        self,
+    ) -> None:
+        """upsert_node is called when get_node returns a node (Tier 2 hit).
+
+        Verifies that ensure_session_node populates the calling worker's graph
+        buffer even when the node was already found — critical for making the
+        subsequent MERGE idempotent and preventing duplicate Neo4j nodes under
+        concurrent worker flushes.
+        """
+        svc = HookStateService(workspace="test-ws")
+
+        # Replace graph with a mock that simulates Neo4jGraphStore Tier 2 behavior:
+        # get_node returns a node from Neo4j (buffer empty, falls through to DB).
+        # upsert_node is mocked so we can assert it was called.
+        mock_graph = AsyncMock()
+        mock_graph.get_node = AsyncMock(
+            return_value={
+                "labels": ["RootSession", "Session"],
+                "status": "running",
+                "session_id": "s1",
+            }
+        )
+        mock_graph.upsert_node = AsyncMock()
+        svc.graph = mock_graph
+        svc._seen_sessions.clear()
+
+        await svc.ensure_session_node("s1", {})
+
+        # upsert_node MUST have been called to populate _node_buffer.
+        # Without this, the worker's flush issues a fresh MERGE for the same node_id,
+        # producing a duplicate when another worker's transaction committed the node
+        # between our get_node and our flush.
+        mock_graph.upsert_node.assert_called_once()
+        call_node_id = mock_graph.upsert_node.call_args[0][0]
+        call_data = mock_graph.upsert_node.call_args[0][1]
+        assert call_node_id == "s1", (
+            f"upsert_node must be called with the session_id 's1', got {call_node_id!r}"
+        )
+        assert "Session" in call_data.get("labels", []), (
+            f"upsert_node data must include 'Session' label, got {call_data!r}"
+        )
+
+    async def test_ensure_session_node_tier2_preserves_existing_labels(self) -> None:
+        """When Tier 2 is hit and upsert_node is called, existing type labels must survive.
+
+        upsert_node uses union-merge for labels — calling it with bare ["Session"]
+        must NOT strip the existing "RootSession" label that was set by SessionHandler.
+        """
+        svc = HookStateService(workspace="test")
+        # Simulate node in graph (e.g. written by another worker's flush)
+        await svc.graph.upsert_node(
+            "sess-reclassified",
+            {"labels": ["RootSession", "Session"], "status": "running"},
+        )
+        # Clear seen_sessions — fresh worker, doesn't know about this session
+        svc._seen_sessions.clear()
+
+        await svc.ensure_session_node("sess-reclassified", {})
+
+        node = await svc.graph.get_node("sess-reclassified")
+        assert node is not None
+        # Union-merge must preserve RootSession — not strip it to bare Session
+        assert "RootSession" in node["labels"], (
+            f"Existing RootSession label must be preserved after ensure_session_node. "
+            f"Got labels: {node['labels']!r}"
+        )
+        assert "Session" in node["labels"]

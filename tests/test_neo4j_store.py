@@ -113,7 +113,9 @@ def test_no_graph_forest_name_in_source():
 def test_label_patches_initialized_as_empty_list():
     """Neo4jGraphStore.__init__ must initialize _label_patches as an empty list."""
     store = _make_store()
-    assert hasattr(store, "_label_patches"), "_label_patches attribute must be set in __init__"
+    assert hasattr(store, "_label_patches"), (
+        "_label_patches attribute must be set in __init__"
+    )
     assert store._label_patches == [], "_label_patches must be initialized as []"
     assert isinstance(store._label_patches, list), "_label_patches must be a list"
 
@@ -557,6 +559,35 @@ class TestSchemaIndexesWorkspace:
                 f"container restarts on a persistent volume do not raise "
                 f"EquivalentSchemaRuleAlreadyExists.  Offending query: {query!r}"
             )
+
+    async def test_ensure_schema_creates_uniqueness_constraint(self) -> None:
+        """_ensure_schema creates a node_id+workspace uniqueness constraint.
+
+        The constraint makes MERGE (n {node_id, workspace}) truly atomic under
+        concurrent worker flushes — two MERGEs for the same (node_id, workspace)
+        pair cannot produce two nodes.  This is the database-level enforcement
+        that prevents the race condition where child and parent workers both
+        flush stub nodes for the same session.
+        """
+        store = _make_store()
+        store._schema_initialized = False
+
+        mock_session = self._make_schema_session()
+        store._driver.session = MagicMock(return_value=mock_session)
+
+        await store._ensure_schema()
+
+        all_queries = [
+            call.args[0] for call in mock_session.run.call_args_list if call.args
+        ]
+        constraint_queries = [
+            q for q in all_queries if "CONSTRAINT" in q.upper() and "node_id" in q
+        ]
+        assert constraint_queries, (
+            f"Expected a uniqueness CONSTRAINT on (node_id, workspace) to be created "
+            f"in _ensure_schema to prevent concurrent-worker duplicate nodes. "
+            f"Queries issued: {all_queries}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1005,7 +1036,9 @@ class TestNeo4jGraphStoreSetLabels:
         store = _make_store()
         store._label_patches = []
 
-        await store.set_labels("s1", remove_labels=["RootSession"], add_labels=["ForkedSession"])
+        await store.set_labels(
+            "s1", remove_labels=["RootSession"], add_labels=["ForkedSession"]
+        )
 
         assert len(store._label_patches) == 1
         patch = store._label_patches[0]
@@ -1018,7 +1051,9 @@ class TestNeo4jGraphStoreSetLabels:
         store = _make_store()
         store._label_patches = []
 
-        await store.set_labels("s1", remove_labels=["RootSession"], add_labels=["ForkedSession"])
+        await store.set_labels(
+            "s1", remove_labels=["RootSession"], add_labels=["ForkedSession"]
+        )
 
         mock_tx, mock_session = _make_flush_mocks()
         store._driver.session = MagicMock(return_value=mock_session)
@@ -1033,7 +1068,9 @@ class TestNeo4jGraphStoreSetLabels:
         store = _make_store()
         store._label_patches = []
 
-        await store.set_labels("s1", remove_labels=["RootSession"], add_labels=["ForkedSession"])
+        await store.set_labels(
+            "s1", remove_labels=["RootSession"], add_labels=["ForkedSession"]
+        )
 
         mock_tx, mock_session = _make_flush_mocks()
         mock_tx.run = AsyncMock(side_effect=RuntimeError("neo4j down"))
@@ -1090,8 +1127,11 @@ class TestNeo4jGraphStoreFlushNoLabelMerge:
         label (e.g. RootSession) creates a second node for the same logical entity.
         """
         import re
+
         store = self._make_store()
-        await store.upsert_node("parent-123", {"labels": ["Session"], "status": "running"})
+        await store.upsert_node(
+            "parent-123", {"labels": ["Session"], "status": "running"}
+        )
 
         mock_tx, mock_session = _make_flush_mocks()
         store._driver.session = MagicMock(return_value=mock_session)
@@ -1117,10 +1157,13 @@ class TestNeo4jGraphStoreFlushNoLabelMerge:
         label-free MERGE in both flushes — no label in the MERGE pattern.
         """
         import re
+
         store = self._make_store()
 
         # Flush 1: bare Session (ensure_session_node pattern)
-        await store.upsert_node("parent-123", {"labels": ["Session"], "status": "running"})
+        await store.upsert_node(
+            "parent-123", {"labels": ["Session"], "status": "running"}
+        )
         mock_tx, mock_session = _make_flush_mocks()
         store._driver.session = MagicMock(return_value=mock_session)
         store._schema_initialized = True
@@ -1150,13 +1193,10 @@ class TestNeo4jGraphStoreFlushNoLabelMerge:
 
         # Labels must be applied separately via MATCH ... SET n:Label
         all_queries_flush2 = [
-            str(c.args[0])
-            for c in mock_tx2.run.call_args_list
-            if c.args
+            str(c.args[0]) for c in mock_tx2.run.call_args_list if c.args
         ]
         set_label_queries = [
-            q for q in all_queries_flush2
-            if "SET n:" in q and "MERGE" not in q
+            q for q in all_queries_flush2 if "SET n:" in q and "MERGE" not in q
         ]
         assert any("RootSession" in q for q in set_label_queries), (
             f"Labels must be applied via MATCH ... SET n:Label (not in MERGE). "
