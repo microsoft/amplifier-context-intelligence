@@ -1045,3 +1045,20 @@ class TestNeo4jGraphStoreSetLabels:
 
         assert len(store._label_patches) == 1
         assert store._label_patches[0]["node_id"] == "s1"
+
+    async def test_set_labels_updates_node_buffer_immediately(self) -> None:
+        """set_labels must update _node_buffer immediately so get_node() reflects the change.
+
+        This is the regression test for the fork guard bug: _handle_fork calls set_labels
+        to mark a session as ForkedSession, then _handle_start calls get_node() to check
+        labels. Without this fix, get_node() returns stale labels and the fork guard fails.
+        """
+        store = _make_store()
+        store._node_buffer["s1"] = {"labels": ["Session"], "status": "running"}
+        await store.set_labels("s1", remove_labels=[], add_labels=["ForkedSession"])
+        node = await store.get_node("s1")
+        assert node is not None
+        assert "ForkedSession" in node["labels"], (
+            "set_labels must update _node_buffer immediately — get_node() returned stale labels"
+        )
+        assert "Session" in node["labels"]

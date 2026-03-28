@@ -217,12 +217,26 @@ class Neo4jGraphStore:
     async def set_labels(
         self, node_id: str, remove_labels: list[str], add_labels: list[str]
     ) -> None:
-        """Buffer a label patch to be applied at flush time before node writes.
+        """Buffer a label patch and immediately update _node_buffer.
+
+        Two-phase effect:
+        1. _node_buffer updated immediately — so get_node() reflects the change
+           within the same flush cycle. Essential for fork guard and state machine
+           logic that reads labels between handler calls.
+        2. Patch queued in _label_patches — applied to Neo4j at flush time via
+           explicit REMOVE/SET Cypher statements AFTER node writes.
 
         Each label in remove_labels is removed via REMOVE n:Label Cypher.
         Each label in add_labels is set via SET n:Label Cypher.
-        Patches are applied in buffer order, before any node or edge writes.
         """
+        # Phase 1: update in-memory buffer immediately (same as GraphState.set_labels)
+        if node_id not in self._node_buffer:
+            self._node_buffer[node_id] = {}
+        existing = self._node_buffer[node_id]
+        current = set(existing.get("labels", []))
+        existing["labels"] = sorted((current - set(remove_labels)) | set(add_labels))
+
+        # Phase 2: queue patch for Neo4j flush
         self._label_patches.append(
             {
                 "node_id": node_id,
@@ -260,24 +274,6 @@ class Neo4jGraphStore:
             async with self._driver.session(database=self._database) as db_session:
                 tx = await db_session.begin_transaction()
                 try:
-                    # ---- label patches (must run before node writes) ----
-                    for lp in patch_snapshot:
-                        pid = lp["node_id"]
-                        for label in lp.get("remove", []):
-                            _validate_identifier(label, "label")
-                            await tx.run(
-                                f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) REMOVE n:{label}",
-                                node_id=pid,
-                                workspace=self.workspace,
-                            )
-                        for label in lp.get("add", []):
-                            _validate_identifier(label, "label")
-                            await tx.run(
-                                f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) SET n:{label}",
-                                node_id=pid,
-                                workspace=self.workspace,
-                            )
-
                     # ---- nodes ----
                     no_label_rows: list[dict[str, Any]] = []
                     labeled_groups: dict[str, list[dict[str, Any]]] = {}
@@ -334,6 +330,24 @@ class Neo4jGraphStore:
                             node_id=item["node_id"],
                             workspace=self.workspace,
                         )
+
+                    # ---- label patches (must run AFTER node writes — nodes must exist in Neo4j before MATCH) ----
+                    for lp in patch_snapshot:
+                        pid = lp["node_id"]
+                        for label in lp.get("remove", []):
+                            _validate_identifier(label, "label")
+                            await tx.run(
+                                f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) REMOVE n:{label}",
+                                node_id=pid,
+                                workspace=self.workspace,
+                            )
+                        for label in lp.get("add", []):
+                            _validate_identifier(label, "label")
+                            await tx.run(
+                                f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) SET n:{label}",
+                                node_id=pid,
+                                workspace=self.workspace,
+                            )
 
                     # ---- edges ----
                     edge_groups: dict[str, list[dict[str, Any]]] = {}
