@@ -352,3 +352,53 @@ class TestSkillsEndpointExempt:
         }
         await middleware(scope, None, mock_send)
         assert received == [200]
+
+
+class TestVersionEndpointExempt:
+    """/version is exempt from authentication even when api_key is set."""
+
+    async def test_version_path_exempt_from_auth(self) -> None:
+        """GET /version without token passes through (version info must be accessible without auth)."""
+        from context_intelligence_server.auth import BearerTokenMiddleware
+
+        received: list[int] = []
+
+        async def mock_app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        async def mock_send(event):
+            if event["type"] == "http.response.start":
+                received.append(event["status"])
+
+        middleware = BearerTokenMiddleware(mock_app, api_key="secret")
+        scope = {
+            "type": "http",
+            "path": "/version",
+            "headers": [],  # No Authorization header
+        }
+        await middleware(scope, None, mock_send)
+        assert received == [200], f"Expected 200 (exempt), got {received}"
+
+    async def test_version_path_with_auth_also_passes(self) -> None:
+        """GET /version with a valid token also returns 200."""
+        from context_intelligence_server.auth import BearerTokenMiddleware
+
+        received: list[int] = []
+
+        async def mock_app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        async def mock_send(event):
+            if event["type"] == "http.response.start":
+                received.append(event["status"])
+
+        middleware = BearerTokenMiddleware(mock_app, api_key="secret")
+        scope = {
+            "type": "http",
+            "path": "/version",
+            "headers": [(b"authorization", b"Bearer secret")],
+        }
+        await middleware(scope, None, mock_send)
+        assert received == [200], f"Expected 200, got {received}"

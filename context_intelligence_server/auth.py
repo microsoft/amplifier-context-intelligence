@@ -7,7 +7,7 @@ from typing import Any
 
 # Paths that are exempt from authentication (health checks, monitoring, dashboard pages).
 _EXEMPT_PATHS: frozenset[str] = frozenset(
-    {"/status", "/logs/stream", "/", "/dashboard", "/docs", "/openapi.json"}
+    {"/status", "/version", "/logs/stream", "/", "/dashboard", "/docs", "/openapi.json"}
 )
 
 # Path prefixes that are exempt from authentication (static assets).
