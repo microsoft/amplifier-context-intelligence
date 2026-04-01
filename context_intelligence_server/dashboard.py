@@ -9,6 +9,11 @@ from typing import TYPE_CHECKING, Any
 
 from context_intelligence_server.config import get_settings
 
+from importlib.metadata import version as _pkg_version
+
+# Resolved once at import time — never changes within a process lifetime.
+_SERVER_VERSION: str = _pkg_version("context-intelligence-server")
+
 if TYPE_CHECKING:
     from context_intelligence_server.registry import SessionRegistry
 
@@ -126,4 +131,5 @@ def build_status_response(
             dataclasses.asdict(s) for s in registry.completed_sessions()
         ],
         "error_count_last_hour": error_count_last_hour(ring_buffer),
+        "server_version": _SERVER_VERSION,
     }

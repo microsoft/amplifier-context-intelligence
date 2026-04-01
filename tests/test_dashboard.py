@@ -383,3 +383,31 @@ class TestDashboardVisibilityFiltering:
         assert len(response["sessions"]) == 1
         assert response["sessions"][0]["session_id"] == "fresh"
         assert response["active_sessions"] == 1
+
+
+# ---------------------------------------------------------------------------
+# TestBuildStatusResponseServerVersion
+# ---------------------------------------------------------------------------
+
+
+class TestBuildStatusResponseServerVersion:
+    def test_server_version_key_present(self) -> None:
+        """build_status_response() includes 'server_version' key."""
+        registry = SessionRegistry()
+        result = build_status_response(registry, time.time())
+        assert "server_version" in result
+
+    def test_server_version_matches_constant(self) -> None:
+        """server_version value matches the module-level _SERVER_VERSION constant."""
+        from context_intelligence_server.dashboard import _SERVER_VERSION
+
+        registry = SessionRegistry()
+        result = build_status_response(registry, time.time())
+        assert result["server_version"] == _SERVER_VERSION
+
+    def test_server_version_constant_is_nonempty_string(self) -> None:
+        """_SERVER_VERSION is a non-empty string."""
+        from context_intelligence_server.dashboard import _SERVER_VERSION
+
+        assert isinstance(_SERVER_VERSION, str)
+        assert len(_SERVER_VERSION) > 0
