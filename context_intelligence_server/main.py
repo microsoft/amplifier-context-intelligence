@@ -25,6 +25,8 @@ from context_intelligence_server.auth import BearerTokenMiddleware
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.dashboard import build_status_response
+from context_intelligence_server.handlers.skills import SkillRegistry
+from context_intelligence_server.handlers.skills import router as skills_router
 from context_intelligence_server.idempotency import EventIdempotencyCache
 from context_intelligence_server.logging_config import setup_logging
 from context_intelligence_server.models import (
@@ -48,6 +50,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         _settings.neo4j_url,
         auth=(_settings.neo4j_user, _settings.neo4j_password),
     )
+    _skills_dir = Path(__file__).parent / "skills"
+    app.state.skill_registry = SkillRegistry()
+    if _skills_dir.exists():
+        app.state.skill_registry.load_from_dir(_skills_dir)
+        logger.info(
+            "lifespan_startup: skill_registry populated count=%d",
+            len(app.state.skill_registry.skill_names),
+        )
+    else:
+        logger.warning(
+            "lifespan_startup: skills directory not found at %s; skill_registry will be empty",
+            _skills_dir,
+        )
     try:
         yield
     finally:
@@ -56,6 +71,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 app = FastAPI(title="Context Intelligence Server", lifespan=lifespan)
+app.include_router(skills_router)
 _start_time = time.time()
 registry = SessionRegistry()
 idempotency_cache = EventIdempotencyCache()
