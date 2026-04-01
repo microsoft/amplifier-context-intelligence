@@ -11,7 +11,7 @@ _EXEMPT_PATHS: frozenset[str] = frozenset(
 )
 
 # Path prefixes that are exempt from authentication (static assets).
-_EXEMPT_PREFIXES: tuple[str, ...] = ("/static/",)
+_EXEMPT_PREFIXES: tuple[str, ...] = ("/static/", "/skills/")
 
 
 class BearerTokenMiddleware:

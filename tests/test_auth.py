@@ -304,3 +304,51 @@ class TestAuthEnforcedViaAsgiApp:
             "/cypher", json={"query": "MATCH (n) RETURN n"}
         )
         assert response.status_code == 401
+
+
+class TestSkillsEndpointExempt:
+    """GET /skills/* is exempt from authentication even when api_key is set."""
+
+    async def test_skills_path_exempt_from_auth(self) -> None:
+        from context_intelligence_server.auth import BearerTokenMiddleware
+
+        received: list[int] = []
+
+        async def mock_app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        async def mock_send(event):
+            if event["type"] == "http.response.start":
+                received.append(event["status"])
+
+        middleware = BearerTokenMiddleware(mock_app, api_key="secret")
+        scope = {
+            "type": "http",
+            "path": "/skills/context-intelligence-graph-query",
+            "headers": [],  # No Authorization header
+        }
+        await middleware(scope, None, mock_send)
+        assert received == [200], f"Expected 200 (exempt), got {received}"
+
+    async def test_skills_subpath_exempt(self) -> None:
+        from context_intelligence_server.auth import BearerTokenMiddleware
+
+        received: list[int] = []
+
+        async def mock_app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        async def mock_send(event):
+            if event["type"] == "http.response.start":
+                received.append(event["status"])
+
+        middleware = BearerTokenMiddleware(mock_app, api_key="secret")
+        scope = {
+            "type": "http",
+            "path": "/skills/any-other-skill",
+            "headers": [],
+        }
+        await middleware(scope, None, mock_send)
+        assert received == [200]
