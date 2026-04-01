@@ -20,8 +20,8 @@ class BearerTokenMiddleware:
     If *api_key* is ``None``, all requests pass through without authentication
     (backward compatibility for un-authed local dev setups).
 
-    The ``/status`` path is always exempt so Docker health checks and monitoring
-    tools continue working without credentials.
+    Several paths are always exempt (see ``_EXEMPT_PATHS``) so health checks,
+    monitoring tools, and public-facing pages continue working without credentials.
     """
 
     def __init__(self, app: Callable[..., Any], api_key: str | None = None) -> None:

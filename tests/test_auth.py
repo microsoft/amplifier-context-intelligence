@@ -359,8 +359,6 @@ class TestVersionEndpointExempt:
 
     async def test_version_path_exempt_from_auth(self) -> None:
         """GET /version without token passes through (version info must be accessible without auth)."""
-        from context_intelligence_server.auth import BearerTokenMiddleware
-
         received: list[int] = []
 
         async def mock_app(scope, receive, send):
@@ -382,8 +380,6 @@ class TestVersionEndpointExempt:
 
     async def test_version_path_with_auth_also_passes(self) -> None:
         """GET /version with a valid token also returns 200."""
-        from context_intelligence_server.auth import BearerTokenMiddleware
-
         received: list[int] = []
 
         async def mock_app(scope, receive, send):
