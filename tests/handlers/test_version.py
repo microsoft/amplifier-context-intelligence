@@ -1,4 +1,5 @@
 """Tests for the GET /version endpoint."""
+
 from __future__ import annotations
 
 import httpx

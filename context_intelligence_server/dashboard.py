@@ -5,11 +5,10 @@ from __future__ import annotations
 import dataclasses
 import time
 from collections import deque
+from importlib.metadata import version as _pkg_version
 from typing import TYPE_CHECKING, Any
 
 from context_intelligence_server.config import get_settings
-
-from importlib.metadata import version as _pkg_version
 
 # Resolved once at import time — never changes within a process lifetime.
 _SERVER_VERSION: str = _pkg_version("context-intelligence-server")

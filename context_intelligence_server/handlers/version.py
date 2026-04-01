@@ -1,4 +1,5 @@
 """Lightweight version endpoint — returns the running server version."""
+
 from __future__ import annotations
 
 from fastapi import APIRouter
