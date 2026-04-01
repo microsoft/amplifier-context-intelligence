@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 from context_intelligence_server.config import get_settings
 
 # Resolved once at import time — never changes within a process lifetime.
-_SERVER_VERSION: str = _pkg_version("context-intelligence-server")
+SERVER_VERSION: str = _pkg_version("context-intelligence-server")
 
 if TYPE_CHECKING:
     from context_intelligence_server.registry import SessionRegistry
@@ -91,7 +91,7 @@ def build_status_response(
 
     Returns:
         A dict with keys: status, uptime_seconds, active_sessions, sessions,
-        recent_events, completed_sessions, error_count_last_hour.
+        recent_events, completed_sessions, error_count_last_hour, server_version.
     """
     settings = get_settings()
     now = time.time()
@@ -130,5 +130,5 @@ def build_status_response(
             dataclasses.asdict(s) for s in registry.completed_sessions()
         ],
         "error_count_last_hour": error_count_last_hour(ring_buffer),
-        "server_version": _SERVER_VERSION,
+        "server_version": SERVER_VERSION,
     }

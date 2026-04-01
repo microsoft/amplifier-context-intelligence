@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from context_intelligence_server.dashboard import _SERVER_VERSION
+from context_intelligence_server.dashboard import SERVER_VERSION
 
 
 class TestGetVersion200:
@@ -35,7 +35,7 @@ class TestGetVersion200:
     ) -> None:
         response = await client.get("/version")
         data = response.json()
-        assert data["version"] == _SERVER_VERSION
+        assert data["version"] == SERVER_VERSION
 
 
 class TestGetVersionNoAuth:

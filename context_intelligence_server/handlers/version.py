@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from context_intelligence_server.dashboard import _SERVER_VERSION
+from context_intelligence_server.dashboard import SERVER_VERSION
 
 router = APIRouter()
 
@@ -19,4 +19,4 @@ async def get_version() -> dict[str, str]:
     Returns:
         JSON object with a single ``version`` key, e.g. ``{"version": "2.0.0"}``.
     """
-    return {"version": _SERVER_VERSION}
+    return {"version": SERVER_VERSION}

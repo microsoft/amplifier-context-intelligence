@@ -398,16 +398,16 @@ class TestBuildStatusResponseServerVersion:
         assert "server_version" in result
 
     def test_server_version_matches_constant(self) -> None:
-        """server_version value matches the module-level _SERVER_VERSION constant."""
-        from context_intelligence_server.dashboard import _SERVER_VERSION
+        """server_version value matches the module-level SERVER_VERSION constant."""
+        from context_intelligence_server.dashboard import SERVER_VERSION
 
         registry = SessionRegistry()
         result = build_status_response(registry, time.time())
-        assert result["server_version"] == _SERVER_VERSION
+        assert result["server_version"] == SERVER_VERSION
 
     def test_server_version_constant_is_nonempty_string(self) -> None:
-        """_SERVER_VERSION is a non-empty string."""
-        from context_intelligence_server.dashboard import _SERVER_VERSION
+        """SERVER_VERSION is a non-empty string."""
+        from context_intelligence_server.dashboard import SERVER_VERSION
 
-        assert isinstance(_SERVER_VERSION, str)
-        assert len(_SERVER_VERSION) > 0
+        assert isinstance(SERVER_VERSION, str)
+        assert len(SERVER_VERSION) > 0
