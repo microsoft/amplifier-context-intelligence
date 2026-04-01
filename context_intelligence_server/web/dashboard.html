@@ -55,6 +55,7 @@
       <div class="stat-chip"><span class="stat-label">Neo4j</span><span class="stat-value" id="neo4j-status">&mdash;</span></div>
       <div class="stat-chip"><span class="stat-label">Neo4j Bolt</span><span class="stat-value" id="neo4j-url" style="font-size:0.78rem;font-family:monospace;">&mdash;</span></div>
       <div class="stat-chip"><span class="stat-label">Neo4j Browser</span><span class="stat-value"><a id="neo4j-browser-url" href="#" target="_blank" style="font-size:0.78rem;font-family:monospace;color:var(--primary);">&mdash;</a></span></div>
+      <div class="stat-chip"><span class="stat-label">Version</span><span class="stat-value" id="dash-version">&mdash;</span></div>
     </div>
 
     <!-- Active sessions -->
@@ -155,6 +156,16 @@
         if (e.key === 'Enter') tryAuth();
       });
     })();
+  </script>
+  <script>
+    // Version badge — /version is unauthenticated, no token needed
+    fetch('/version')
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        var el = document.getElementById('dash-version');
+        if (el) el.textContent = d.version || 'unknown';
+      })
+      .catch(function() {});
   </script>
 </body>
 </html>
