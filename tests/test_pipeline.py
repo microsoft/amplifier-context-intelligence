@@ -182,7 +182,7 @@ def test_setup_handlers_enricher_count() -> None:
 def test_setup_handlers_enricher_order() -> None:
     """Enrichers must be [SessionHandler, ToolCallHandler] in that order."""
     from context_intelligence_server.pipeline import setup_handlers
-    from context_intelligence_server.handlers.session import SessionHandler
+    from context_intelligence_server.handlers.data_layer_2.session import SessionHandler
     from context_intelligence_server.services import HookStateService
 
     services = HookStateService(workspace="test")
