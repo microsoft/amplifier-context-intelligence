@@ -108,32 +108,32 @@ class SessionHandler:
         # RootSession + parent: reclassify to SubSession, drop RootSession
         if current_type == "RootSession" and parent_id:
             await self.services.graph.set_labels(
-                session_id, remove_labels=["RootSession"], add_labels=["SubSession"]
+                session_id, remove_labels=["RootSession"], add_labels=["SubSession", "SST_EVENT"]
             )
             await self.services.ensure_session_node(parent_id, {})
             await self.services.graph.upsert_edge(
                 parent_id,
                 session_id,
-                {"type": "SUBSESSION_OF", "occurred_at": timestamp},
+                {"type": "HAS_SUBSESSION", "sst_semantic": "LEADS_TO", "occurred_at": timestamp},
             )
             return
 
         # bare + parent: add SubSession (include Session base label for new nodes)
         if parent_id:
             await self.services.graph.set_labels(
-                session_id, remove_labels=[], add_labels=["Session", "SubSession"]
+                session_id, remove_labels=[], add_labels=["Session", "SubSession", "SST_EVENT"]
             )
             await self.services.ensure_session_node(parent_id, {})
             await self.services.graph.upsert_edge(
                 parent_id,
                 session_id,
-                {"type": "SUBSESSION_OF", "occurred_at": timestamp},
+                {"type": "HAS_SUBSESSION", "sst_semantic": "LEADS_TO", "occurred_at": timestamp},
             )
             return
 
         # bare + no parent: add RootSession (include Session base label for new nodes)
         await self.services.graph.set_labels(
-            session_id, remove_labels=[], add_labels=["RootSession", "Session"]
+            session_id, remove_labels=[], add_labels=["RootSession", "Session", "SST_EVENT"]
         )
 
     async def _handle_fork(
@@ -176,7 +176,7 @@ class SessionHandler:
             await self.services.graph.set_labels(
                 session_id,
                 remove_labels=[current_type],
-                add_labels=["ForkedSession"],
+                add_labels=["ForkedSession", "SST_EVENT"],
             )
             if parent_id:
                 self.services.graph.remove_edge(parent_id, session_id)
@@ -184,20 +184,20 @@ class SessionHandler:
                 await self.services.graph.upsert_edge(
                     parent_id,
                     session_id,
-                    {"type": "HAS_FORK", "occurred_at": timestamp},
+                    {"type": "FORKED", "sst_semantic": "LEADS_TO", "occurred_at": timestamp},
                 )
             return
 
         # bare: add Session + ForkedSession labels (include Session base label for new nodes)
         await self.services.graph.set_labels(
-            session_id, remove_labels=[], add_labels=["Session", "ForkedSession"]
+            session_id, remove_labels=[], add_labels=["Session", "ForkedSession", "SST_EVENT"]
         )
         if parent_id:
             await self.services.ensure_session_node(parent_id, {})
             await self.services.graph.upsert_edge(
                 parent_id,
                 session_id,
-                {"type": "HAS_FORK", "occurred_at": timestamp},
+                {"type": "FORKED", "sst_semantic": "LEADS_TO", "occurred_at": timestamp},
             )
 
     async def _handle_end(
@@ -206,7 +206,7 @@ class SessionHandler:
         await self.services.graph.upsert_node(
             session_id,
             {
-                "labels": ["Session"],
+                "labels": ["Session", "SST_EVENT"],
                 "ended_at": timestamp,
                 "status": "completed",
                 "session_id": session_id,
@@ -221,7 +221,7 @@ class SessionHandler:
             parent_id = (data.get("parent_id") or "").strip()
             fallback = "SubSession" if parent_id else "RootSession"
             await self.services.graph.set_labels(
-                session_id, remove_labels=[], add_labels=[fallback]
+                session_id, remove_labels=[], add_labels=[fallback, "SST_EVENT"]
             )
 
         # Terminal event — flush directly. There is no hot path after
