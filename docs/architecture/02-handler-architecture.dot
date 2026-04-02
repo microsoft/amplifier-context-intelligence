@@ -1,5 +1,5 @@
 digraph handler_architecture {
-    // ── Global defaults ───────────────────────────────────────────────────────
+    // ─── Global defaults ─────────────────────────────────────────────────────
     graph [
         rankdir   = TB
         splines   = ortho
@@ -7,7 +7,7 @@ digraph handler_architecture {
         ranksep   = 0.9
         fontname  = "Helvetica"
         fontsize  = 11
-        label     = "Handler Registry Structure\n(PipelineHandlers — default + enrichers[])"
+        label     = "Handler & Router Architecture\n(layer-based organisation)"
         labelloc  = t
         labeljust = c
     ]
@@ -22,7 +22,7 @@ digraph handler_architecture {
         fontsize = 10
     ]
 
-    // ── PipelineHandlers (NamedTuple record) ──────────────────────────────────
+    // ─── PipelineHandlers (NamedTuple record) ──────────────────────────────
     PipelineHandlers [
         shape     = record
         style     = "filled"
@@ -30,73 +30,145 @@ digraph handler_architecture {
         label     = "{PipelineHandlers (NamedTuple) | default: DefaultHandler | enrichers: list[Handler]}"
     ]
 
-    // ── DefaultHandler (ALWAYS — unconditional base layer) ────────────────────
-    DefaultHandler [
-        shape     = box
-        style     = "filled,rounded"
-        fillcolor = "#C8E6C9"
-        fontname  = "Helvetica-Bold"
-        penwidth  = 2.5
-        label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
-            <TR><TD><B>DefaultHandler</B></TD></TR>
-            <TR><TD>UNCONDITIONAL &#8212; ALL events</TD></TR>
-            <TR><TD>handled_events = set() (empty &#8212; accepts everything)</TD></TR>
-            <TR><TD>Field Lifting: 9 FieldLifters &#8212; ALL matching fire (not first-match-wins)</TD></TR>
-            <TR><TD>Families: * | artifact:* | delegate:* | llm:* | prompt:* | recipe:* | session:* | skill:* | tool:*</TD></TR>
-            <TR><TD>Creates [:FullPascalEvent, :CategoryEvent, :Event] node + lifted top-level props</TD></TR>
-            <TR><TD>Creates (Session)-[:HAS_EVENT]-&gt;(Event) edge</TD></TR>
-            <TR><TD>See: 04-default-handler-flow.dot for internal pipeline detail</TD></TR>
-        </TABLE>>
-    ]
+    // ─── Shared contract ──────────────────────────────────────────────────
+    subgraph cluster_protocol {
+        graph [
+            label     = "Shared Contract\ncontext_intelligence_server/protocol.py"
+            style     = "dashed"
+            color     = "#90CAF9"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
 
-    // ── Enrichers ordered list label ──────────────────────────────────────────
-    enrichers_label [
-        shape     = plaintext
-        style     = ""
-        fillcolor = "transparent"
-        label     = "enrichers[] — ordered by priority index"
-    ]
+        Protocol [
+            shape     = box
+            style     = "filled,rounded"
+            fillcolor = "#BBDEFB"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>EventHandler (Protocol)</B></TD></TR>
+                <TR><TD>handled_events: AbstractSet[str]</TD></TR>
+                <TR><TD>services: HookStateService</TD></TR>
+                <TR><TD>async __call__(event, data) &#8594; HookResult</TD></TR>
+            </TABLE>>
+        ]
+    }
 
-    // ── SessionHandler [0] ────────────────────────────────────────────────────
-    SessionHandler [
-        shape     = box
-        style     = "filled,rounded"
-        fillcolor = "#F3E5F5"
-        label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
-            <TR><TD><B>SessionHandler [0]</B></TD></TR>
-            <TR><TD>session:start | session:fork | session:end</TD></TR>
-            <TR><TD>Labels: RootSession:Session | SubSession:Session | ForkedSession:Session</TD></TR>
-            <TR><TD>session:start &#8594; SUBSESSION_OF | session:fork &#8594; HAS_FORK</TD></TR>
-            <TR><TD>(both parent&#8594;child — ForkedSession is NOT a SubSession)</TD></TR>
-            <TR><TD>Sets: started_at / ended_at / workspace</TD></TR>
-        </TABLE>>
-    ]
+    // ─── Routers (separate from event handling) ──────────────────────────
+    subgraph cluster_routers {
+        graph [
+            label     = "routers/\nFastAPI HTTP endpoints (separate concern)"
+            style     = "filled"
+            color     = "#E0E0E0"
+            fillcolor = "#FAFAFA"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
 
-    // ── ToolCallHandler [1] ───────────────────────────────────────────────────
-    ToolCallHandler [
-        shape     = box
-        style     = "filled,rounded"
-        fillcolor = "#F3E5F5"
-        label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
-            <TR><TD><B>ToolCallHandler [1]</B></TD></TR>
-            <TR><TD>tool:pre | tool:post | tool:error</TD></TR>
-            <TR><TD>Node: :ToolCall (session_id__tool_call__tool_call_id)</TD></TR>
-            <TR><TD>Edges: HAS_TOOL_CALL / HAS_EVENT</TD></TR>
-            <TR><TD>Correlates: pre&#8594;post/error via tool_call_id</TD></TR>
-        </TABLE>>
-    ]
+        SkillsRouter [
+            shape     = box
+            style     = "filled,rounded"
+            fillcolor = "#E0E0E0"
+            label     = "skills.py\nSkillRegistry + GET /skills/{name}"
+        ]
 
-    // ── FutureHandler [N] (extension point) ───────────────────────────────────
-    FutureHandler [
-        shape     = box
-        style     = "filled,rounded,dashed"
-        fillcolor = "#FAFAFA"
-        color     = "#AAAAAA"
-        fontcolor = "#AAAAAA"
-        label     = "FutureHandler [N]\n… extension point …"
-    ]
+        VersionRouter [
+            shape     = box
+            style     = "filled,rounded"
+            fillcolor = "#E0E0E0"
+            label     = "version.py\nGET /version"
+        ]
+    }
 
-    // ── Warning note ──────────────────────────────────────────────────────────
+    // ─── Data Layer 1: Raw event capture ─────────────────────────────────
+    subgraph cluster_data_layer_1 {
+        graph [
+            label     = "handlers/data_layer_1/\nRaw event capture"
+            style     = "filled"
+            color     = "#81C784"
+            fillcolor = "#E8F5E9"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        DefaultHandler [
+            shape     = box
+            style     = "filled,rounded"
+            fillcolor = "#C8E6C9"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>DefaultHandler</B></TD></TR>
+                <TR><TD>UNCONDITIONAL &#8212; ALL events</TD></TR>
+                <TR><TD>handled_events = set() (empty &#8212; accepts everything)</TD></TR>
+                <TR><TD>9 FieldLifters &#8212; ALL matching fire</TD></TR>
+                <TR><TD>Creates [:Event] node + lifted top-level props</TD></TR>
+                <TR><TD>Creates (Session)-[:HAS_EVENT]-&gt;(Event) edge</TD></TR>
+            </TABLE>>
+        ]
+
+        FieldLifters [
+            shape     = box
+            style     = "filled,rounded"
+            fillcolor = "#A5D6A7"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>field_lifters/</B></TD></TR>
+                <TR><TD>UniversalLifter(*) | ArtifactLifter(artifact:*)</TD></TR>
+                <TR><TD>DelegateLifter(delegate:*) | LlmLifter(llm:*)</TD></TR>
+                <TR><TD>PromptLifter(prompt:*) | RecipeLifter(recipe:*)</TD></TR>
+                <TR><TD>SessionLifter(session:*) | SkillLifter(skill:*)</TD></TR>
+                <TR><TD>ToolLifter(tool:*)</TD></TR>
+            </TABLE>>
+        ]
+
+        DefaultHandler -> FieldLifters [label = "delegates field\nextraction to"]
+    }
+
+    // ─── Data Layer 2: Semantic enrichment ───────────────────────────────
+    subgraph cluster_data_layer_2 {
+        graph [
+            label     = "handlers/data_layer_2/\nSemantic enrichment"
+            style     = "filled"
+            color     = "#CE93D8"
+            fillcolor = "#F3E5F5"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        SessionHandler [
+            shape     = box
+            style     = "filled,rounded"
+            fillcolor = "#E1BEE7"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>SessionHandler [0]</B></TD></TR>
+                <TR><TD>session:start | session:fork | session:end</TD></TR>
+                <TR><TD>Labels: RootSession | SubSession | ForkedSession</TD></TR>
+                <TR><TD>Edges: SUBSESSION_OF | HAS_FORK</TD></TR>
+            </TABLE>>
+        ]
+
+        ToolCallHandler [
+            shape     = box
+            style     = "filled,rounded"
+            fillcolor = "#E1BEE7"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>ToolCallHandler [1]</B></TD></TR>
+                <TR><TD>tool:pre | tool:post | tool:error</TD></TR>
+                <TR><TD>Node: :ToolCall</TD></TR>
+                <TR><TD>Edges: HAS_TOOL_CALL | HAS_EVENT</TD></TR>
+            </TABLE>>
+        ]
+
+        FutureHandler [
+            shape     = box
+            style     = "filled,rounded,dashed"
+            fillcolor = "#FAFAFA"
+            color     = "#AAAAAA"
+            fontcolor = "#AAAAAA"
+            label     = "FutureHandler [N]\n… extension point …\n(new handlers land here)"
+        ]
+    }
+
+    // ─── Warning note ─────────────────────────────────────────────────────
     note [
         shape     = box
         style     = "filled"
@@ -104,11 +176,15 @@ digraph handler_architecture {
         label     = "⚠ IMPORTANT\nClaiming an event does NOT prevent\nDefaultHandler from running.\nEnrichers are ADDITIVE — DefaultHandler\nalways creates the base Event node first."
     ]
 
-    // ── Edges ─────────────────────────────────────────────────────────────────
+    // ─── Edges ────────────────────────────────────────────────────────────
     PipelineHandlers -> DefaultHandler   [label = "default"]
-    PipelineHandlers -> enrichers_label  [label = "enrichers"]
-    enrichers_label  -> SessionHandler
-    enrichers_label  -> ToolCallHandler
+    PipelineHandlers -> SessionHandler   [label = "enrichers[0]"]
+    PipelineHandlers -> ToolCallHandler  [label = "enrichers[1]"]
     ToolCallHandler  -> FutureHandler    [style = dashed, color = "#AAAAAA"]
     DefaultHandler   -> note             [style = dotted, color = "#AAAAAA", arrowhead = none]
+
+    // Protocol conformance
+    DefaultHandler   -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
+    SessionHandler   -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
+    ToolCallHandler  -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
 }
