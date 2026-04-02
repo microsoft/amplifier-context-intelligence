@@ -65,8 +65,10 @@ def setup_handlers(services: HookStateService) -> PipelineHandlers:
     """
     # Local imports to allow tests to stub ToolCallHandler via sys.modules
     # before it is fully implemented in the handlers package.
-    from context_intelligence_server.handlers.session import SessionHandler  # noqa: PLC0415
-    from context_intelligence_server.handlers.tool_call import ToolCallHandler  # noqa: PLC0415
+    from context_intelligence_server.handlers.data_layer_2.session import SessionHandler  # noqa: PLC0415
+    from context_intelligence_server.handlers.data_layer_2.tool_call import (
+        ToolCallHandler,
+    )  # noqa: PLC0415
 
     return PipelineHandlers(
         default=DefaultHandler(services),

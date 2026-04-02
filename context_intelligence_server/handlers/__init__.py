@@ -8,8 +8,8 @@ Three handlers are registered in this package:
 """
 
 from context_intelligence_server.handlers.data_layer_1.default import DefaultHandler
-from context_intelligence_server.handlers.session import SessionHandler
-from context_intelligence_server.handlers.tool_call import ToolCallHandler
+from context_intelligence_server.handlers.data_layer_2.session import SessionHandler
+from context_intelligence_server.handlers.data_layer_2.tool_call import ToolCallHandler
 
 __all__ = [
     "DefaultHandler",
