@@ -10,6 +10,8 @@ from __future__ import annotations
 import fnmatch
 from typing import Any
 
+from context_intelligence_server.handlers.data_layer_2.state import DataLayer2State
+
 
 # ---------------------------------------------------------------------------
 # HookConfig
@@ -194,6 +196,7 @@ class HookStateService:
         self.graph.workspace = workspace
         self.blob_store = blob_store
         self._seen_sessions: set[str] = set()
+        self.data_layer_2 = DataLayer2State()
 
     # ------------------------------------------------------------------
     # Session node management
