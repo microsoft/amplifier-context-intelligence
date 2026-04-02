@@ -57,7 +57,7 @@ digraph pipeline_flow {
 
     // ── DefaultHandler (ALWAYS) ───────────────────────────────────────────────
     DefaultHandler [
-        label     = "DefaultHandler\n[ALWAYS runs]\n\nCREATE (:Event {\n  :FullPascalEvent, :CategoryEvent, :Event\n  tool_call_id tiebreaker\n})\n(Session)-[:HAS_EVENT]->(Event)"
+        label     = "DefaultHandler [data_layer_1]\n[ALWAYS runs]\n\nCREATE (:Event {\n  :FullPascalEvent, :CategoryEvent, :Event\n  tool_call_id tiebreaker\n})\n(Session)-[:HAS_EVENT]->(Event)"
         fillcolor = "#C8E6C9"
         fontname  = "Helvetica-Bold"
         penwidth  = 2.5
@@ -71,12 +71,12 @@ digraph pipeline_flow {
 
     // ── Individual enrichers ──────────────────────────────────────────────────
     SessionHandler [
-        label     = "SessionHandler [0]\nsession:start | session:fork | session:end\nMERGE session metadata\nupsert workspace / repo context"
+        label     = "SessionHandler [0] [data_layer_2]\nsession:start | session:fork | session:end\nMERGE session metadata\nupsert workspace / repo context"
         fillcolor = "#F3E5F5"
     ]
 
     ToolCallHandler [
-        label     = "ToolCallHandler [1]\ntool:pre | tool:post | tool:error\nCREATE (:ToolCall)\nlink to parent Event"
+        label     = "ToolCallHandler [1] [data_layer_2]\ntool:pre | tool:post | tool:error\nCREATE (:ToolCall)\nlink to parent Event"
         fillcolor = "#F3E5F5"
     ]
 
