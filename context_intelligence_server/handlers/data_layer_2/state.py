@@ -1,8 +1,4 @@
-"""Cross-handler per-session state for data_layer_2 enrichers.
-
-All fields are scalars — no session_id keying needed since each HookStateService
-is already per-session.
-"""
+"""Cross-handler per-session state for data_layer_2 enrichers."""
 
 from __future__ import annotations
 

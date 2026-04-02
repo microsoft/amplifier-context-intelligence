@@ -1,23 +1,12 @@
-"""Tests for ToolCallHandler — new schema with direct tool_call_id as node key.
+"""Tests for ToolCallHandler — direct tool_call_id node key, SST_EVENT label, no edges.
 
-TDD RED phase: tests assert the new schema where:
-- handled_events == frozenset({'tool:pre', 'tool:post'}) — tool:error is removed
-- ToolCall node ID is the tool_call_id directly (e.g. 'tc-abc'), not the old
-  compound key 's1__tool_call__tc-abc'
-- No edges are created by tool:pre or tool:post (no HAS_TOOL_CALL, no HAS_EVENT)
-- SST_EVENT label is present on the ToolCall node
-- tool_input property is stored from the event data
-- started_at property is stored from the event timestamp
-- result_success, result_output, result_error properties from tool:post data
-
-All tests in classes 1–5 FAIL with the current implementation because:
-- handled_events still includes tool:error
-- node ID still uses the compound key
-- edges are still created
-- SST_EVENT label is missing
-- result_* properties are missing
-
-Guards in class 6 pass because the guard logic is unchanged.
+Verifies:
+- handled_events == frozenset({'tool:pre', 'tool:post'}) — tool:error excluded
+- ToolCall node ID is the tool_call_id directly ('tc-abc'), not a compound key
+- No edges created by tool:pre or tool:post
+- SST_EVENT label on all ToolCall nodes
+- result_success / result_output / result_error captured from tool:post
+- Guard: missing session_id or tool_call_id short-circuits without mutation
 """
 
 from __future__ import annotations

@@ -1,11 +1,12 @@
 """Tests for SessionHandler — session lifecycle graph mutations.
 
-Rewrites the test file to assert:
-- New labels: RootSession/SubSession/ForkedSession
-- Parent→child edge direction for SUBSESSION_OF
-- Fork uses data['parent_id'] (canonical), not legacy 'parent'
-- No cursor tests at all
-- session:end does not store status from data (always 'completed')
+Covers:
+- Label state machine: RootSession, SubSession, ForkedSession transitions
+- Edge types: HAS_SUBSESSION (parent→child), FORKED (parent→fork)
+- SST_EVENT label on all session types
+- MountPlan companion node on session:fork
+- Fork guard: ForkedSession preserved across session:start
+- Stub recovery: session:end classifies bare sessions
 """
 
 from __future__ import annotations
@@ -307,7 +308,9 @@ class TestSessionFork:
         assert "RootSession" not in node["labels"]
         # Orphaned forks must NOT create any FORKED or HAS_SUBSESSION edge to a parent —
         # only the companion MountPlan HAS_PART edge is allowed.
-        parent_edge = await services.graph.get_edge("f1", "f1")  # no parent ID — check self-edges
+        parent_edge = await services.graph.get_edge(
+            "f1", "f1"
+        )  # no parent ID — check self-edges
         assert parent_edge is None
         # Verify no edge from any unknown parent to f1 exists (no parent_id was supplied)
         edges_from_other_nodes = [
@@ -978,7 +981,9 @@ class TestSessionNodeProperties:
     ) -> None:
         """session:start (root) must set session_id as a direct node property."""
         h = SessionHandler(services)
-        await h("session:start", {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"})
+        await h(
+            "session:start", {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"}
+        )
         node = await services.graph.get_node("s1")
         assert node is not None, "Node 's1' must exist after session:start"
         assert node.get("session_id") == "s1", (
@@ -1013,7 +1018,9 @@ class TestSessionNodeProperties:
     ) -> None:
         """RootSession must have parent_id=None as a direct property (not absent)."""
         h = SessionHandler(services)
-        await h("session:start", {"session_id": "root", "timestamp": "2026-01-01T00:00:00Z"})
+        await h(
+            "session:start", {"session_id": "root", "timestamp": "2026-01-01T00:00:00Z"}
+        )
         node = await services.graph.get_node("root")
         assert node is not None, "Root node must exist after session:start"
         assert node.get("session_id") == "root"
@@ -1298,9 +1305,7 @@ class TestSessionEdgeSstSemantic:
             f"HAS_SUBSESSION edge must have sst_semantic='LEADS_TO'. Got: {edge.get('sst_semantic')}"
         )
 
-    async def test_fork_edge_has_sst_semantic(
-        self, services: HookStateService
-    ) -> None:
+    async def test_fork_edge_has_sst_semantic(self, services: HookStateService) -> None:
         """session:fork parent→child edge must carry sst_semantic='LEADS_TO'."""
         handler = SessionHandler(services)
         await handler(

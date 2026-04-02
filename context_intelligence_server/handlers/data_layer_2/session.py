@@ -32,7 +32,7 @@ class SessionLabelStateMachine:
     """
 
     def __init__(self) -> None:
-        # Marker: presence of this attribute confirms state machine delegation
+        # Phase B: state machine logic will move here from SessionHandler
         pass
 
 
@@ -108,32 +108,46 @@ class SessionHandler:
         # RootSession + parent: reclassify to SubSession, drop RootSession
         if current_type == "RootSession" and parent_id:
             await self.services.graph.set_labels(
-                session_id, remove_labels=["RootSession"], add_labels=["SubSession", "SST_EVENT"]
+                session_id,
+                remove_labels=["RootSession"],
+                add_labels=["SubSession", "SST_EVENT"],
             )
             await self.services.ensure_session_node(parent_id, {})
             await self.services.graph.upsert_edge(
                 parent_id,
                 session_id,
-                {"type": "HAS_SUBSESSION", "sst_semantic": "LEADS_TO", "occurred_at": timestamp},
+                {
+                    "type": "HAS_SUBSESSION",
+                    "sst_semantic": "LEADS_TO",
+                    "occurred_at": timestamp,
+                },
             )
             return
 
         # bare + parent: add SubSession (include Session base label for new nodes)
         if parent_id:
             await self.services.graph.set_labels(
-                session_id, remove_labels=[], add_labels=["Session", "SubSession", "SST_EVENT"]
+                session_id,
+                remove_labels=[],
+                add_labels=["Session", "SubSession", "SST_EVENT"],
             )
             await self.services.ensure_session_node(parent_id, {})
             await self.services.graph.upsert_edge(
                 parent_id,
                 session_id,
-                {"type": "HAS_SUBSESSION", "sst_semantic": "LEADS_TO", "occurred_at": timestamp},
+                {
+                    "type": "HAS_SUBSESSION",
+                    "sst_semantic": "LEADS_TO",
+                    "occurred_at": timestamp,
+                },
             )
             return
 
         # bare + no parent: add RootSession (include Session base label for new nodes)
         await self.services.graph.set_labels(
-            session_id, remove_labels=[], add_labels=["RootSession", "Session", "SST_EVENT"]
+            session_id,
+            remove_labels=[],
+            add_labels=["RootSession", "Session", "SST_EVENT"],
         )
 
     async def _handle_fork(
@@ -169,14 +183,7 @@ class SessionHandler:
 
         # ForkedSession: fully terminal — preserve classification, return immediately
         if current_type == "ForkedSession":
-            # E04: Session → MountPlan (record existence, no blob dereferencing)
-            mount_plan_id = f"{session_id}::mount_plan"
-            await self.services.graph.upsert_node(
-                mount_plan_id, {"labels": ["MountPlan", "SST_THING"]}
-            )
-            await self.services.graph.upsert_edge(
-                session_id, mount_plan_id, {"type": "HAS_PART", "sst_semantic": "CONTAINS"}
-            )
+            await self._create_mount_plan(session_id)
             return
 
         # RootSession or SubSession: reclassify to ForkedSession, rectify edge
@@ -192,37 +199,33 @@ class SessionHandler:
                 await self.services.graph.upsert_edge(
                     parent_id,
                     session_id,
-                    {"type": "FORKED", "sst_semantic": "LEADS_TO", "occurred_at": timestamp},
+                    {
+                        "type": "FORKED",
+                        "sst_semantic": "LEADS_TO",
+                        "occurred_at": timestamp,
+                    },
                 )
-            # E04: Session → MountPlan (record existence, no blob dereferencing)
-            mount_plan_id = f"{session_id}::mount_plan"
-            await self.services.graph.upsert_node(
-                mount_plan_id, {"labels": ["MountPlan", "SST_THING"]}
-            )
-            await self.services.graph.upsert_edge(
-                session_id, mount_plan_id, {"type": "HAS_PART", "sst_semantic": "CONTAINS"}
-            )
+            await self._create_mount_plan(session_id)
             return
 
         # bare: add Session + ForkedSession labels (include Session base label for new nodes)
         await self.services.graph.set_labels(
-            session_id, remove_labels=[], add_labels=["Session", "ForkedSession", "SST_EVENT"]
+            session_id,
+            remove_labels=[],
+            add_labels=["Session", "ForkedSession", "SST_EVENT"],
         )
         if parent_id:
             await self.services.ensure_session_node(parent_id, {})
             await self.services.graph.upsert_edge(
                 parent_id,
                 session_id,
-                {"type": "FORKED", "sst_semantic": "LEADS_TO", "occurred_at": timestamp},
+                {
+                    "type": "FORKED",
+                    "sst_semantic": "LEADS_TO",
+                    "occurred_at": timestamp,
+                },
             )
-        # E04: Session → MountPlan (record existence, no blob dereferencing)
-        mount_plan_id = f"{session_id}::mount_plan"
-        await self.services.graph.upsert_node(
-            mount_plan_id, {"labels": ["MountPlan", "SST_THING"]}
-        )
-        await self.services.graph.upsert_edge(
-            session_id, mount_plan_id, {"type": "HAS_PART", "sst_semantic": "CONTAINS"}
-        )
+        await self._create_mount_plan(session_id)
 
     async def _handle_end(
         self, session_id: str, timestamp: str, data: dict[str, Any]
@@ -252,3 +255,15 @@ class SessionHandler:
         # session:end; all buffered data must reach the backing store before
         # the process can exit. schedule_flush() is for intermediate events only.
         await self.services.graph.flush()
+
+    async def _create_mount_plan(self, session_id: str) -> None:
+        """E04: Session → MountPlan (record existence, no blob dereferencing)."""
+        mount_plan_id = f"{session_id}::mount_plan"
+        await self.services.graph.upsert_node(
+            mount_plan_id, {"labels": ["MountPlan", "SST_THING"]}
+        )
+        await self.services.graph.upsert_edge(
+            session_id,
+            mount_plan_id,
+            {"type": "HAS_PART", "sst_semantic": "CONTAINS"},
+        )
