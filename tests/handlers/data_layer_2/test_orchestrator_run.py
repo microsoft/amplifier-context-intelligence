@@ -67,9 +67,7 @@ class TestExecutionStartCreatesOrchestratorRun:
         )
         node_id = "s1::orch_run::2026-01-01T00:00:00Z"
         node = await services.graph.get_node(node_id)
-        assert node is not None, (
-            f"execution:start must create node at '{node_id}'"
-        )
+        assert node is not None, f"execution:start must create node at '{node_id}'"
 
     async def test_node_has_orchestrator_run_and_sst_event_labels(
         self, services: HookStateService
@@ -198,9 +196,7 @@ class TestExecutionEndUpsertsProperties:
             f"ended_at must be set by execution:end. Got: {node!r}"
         )
 
-    async def test_execution_end_sets_status(
-        self, services: HookStateService
-    ) -> None:
+    async def test_execution_end_sets_status(self, services: HookStateService) -> None:
         """execution:end must set status on the OrchestratorRun node."""
         handler = OrchestratorRunHandler(services)
         await handler(
