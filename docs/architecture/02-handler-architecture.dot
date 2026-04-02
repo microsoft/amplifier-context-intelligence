@@ -169,19 +169,61 @@ digraph handler_architecture {
     }
 
     // ─── Warning note ─────────────────────────────────────────────────────
-    note [
+    warning_note [
         shape     = box
         style     = "filled"
         fillcolor = "#FFF9C4"
         label     = "⚠ IMPORTANT\nClaiming an event does NOT prevent\nDefaultHandler from running.\nEnrichers are ADDITIVE — DefaultHandler\nalways creates the base Event node first."
     ]
 
+    subgraph cluster_legend {
+        graph [
+            label     = "Legend"
+            style     = "filled"
+            color     = "#BDBDBD"
+            fillcolor = "#F5F5F5"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        legend_contract [
+            shape     = box
+            style     = "filled,rounded"
+            fillcolor = "#BBDEFB"
+            label     = "blue = shared contract\n(protocol.py)"
+        ]
+        legend_capture [
+            shape     = box
+            style     = "filled,rounded"
+            fillcolor = "#C8E6C9"
+            label     = "green = raw capture\n(data_layer_1)"
+        ]
+        legend_enrich [
+            shape     = box
+            style     = "filled,rounded"
+            fillcolor = "#E1BEE7"
+            label     = "purple = semantic enrichment\n(data_layer_2)"
+        ]
+        legend_http [
+            shape     = box
+            style     = "filled,rounded"
+            fillcolor = "#E0E0E0"
+            label     = "grey = HTTP routers\n(separate concern)"
+        ]
+        legend_warning [
+            shape     = box
+            style     = "filled"
+            fillcolor = "#FFF9C4"
+            label     = "yellow = warning note"
+        ]
+    }
+
     // ─── Edges ────────────────────────────────────────────────────────────
     PipelineHandlers -> DefaultHandler   [label = "default"]
     PipelineHandlers -> SessionHandler   [label = "enrichers[0]"]
     PipelineHandlers -> ToolCallHandler  [label = "enrichers[1]"]
     ToolCallHandler  -> FutureHandler    [style = dashed, color = "#AAAAAA"]
-    DefaultHandler   -> note             [style = dotted, color = "#AAAAAA", arrowhead = none]
+    DefaultHandler   -> warning_note     [style = dotted, color = "#AAAAAA", arrowhead = none]
 
     // Protocol conformance
     DefaultHandler   -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
