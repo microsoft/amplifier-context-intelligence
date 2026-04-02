@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from context_intelligence_server.handlers.session import (
+from context_intelligence_server.handlers.data_layer_2.session import (
     SessionHandler,
     _TYPE_LABELS,
     _current_type,
