@@ -27,3 +27,7 @@ class DataLayer2State:
 
     # E15 OrchestratorRun→Prompt turn-flow cursor
     last_completed_orch_run_id: str | None = None
+
+    # Iteration counter — incremented on each provider:request; used to compute
+    # iteration_id as '{session_id}::iteration::{iteration_count}'
+    iteration_count: int = 0
