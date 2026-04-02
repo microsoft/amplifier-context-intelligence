@@ -310,7 +310,7 @@ class TestToolPostEnrichesToolCall:
             "timestamp": "2026-01-01T00:01:00Z",
             "tool_call_id": "tc-abc",
             "tool_name": "bash",
-            "result": {"success": True},
+            "result": {"error": None},
         }
 
         await handler("tool:pre", pre_data)

@@ -94,7 +94,7 @@ class ToolCallHandler:
         node_data: dict[str, Any] = {
             "labels": ["ToolCall", "SST_EVENT"],
             "ended_at": timestamp,
-            "result_success": result.get("success"),
+            "result_success": result.get("error") is None,
             "result_output": result.get("output"),
             "result_error": result.get("error"),
         }
