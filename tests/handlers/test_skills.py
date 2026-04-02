@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from context_intelligence_server.handlers.skills import SkillRegistry
+from context_intelligence_server.routers.skills import SkillRegistry
 from context_intelligence_server.main import app as _app
 from context_intelligence_server.main import lifespan
 

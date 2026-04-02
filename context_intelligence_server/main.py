@@ -25,9 +25,9 @@ from context_intelligence_server.auth import BearerTokenMiddleware
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.dashboard import build_status_response
-from context_intelligence_server.handlers.skills import SkillRegistry
-from context_intelligence_server.handlers.skills import router as skills_router
-from context_intelligence_server.handlers.version import router as version_router
+from context_intelligence_server.routers.skills import SkillRegistry
+from context_intelligence_server.routers.skills import router as skills_router
+from context_intelligence_server.routers.version import router as version_router
 from context_intelligence_server.idempotency import EventIdempotencyCache
 from context_intelligence_server.logging_config import setup_logging
 from context_intelligence_server.models import (
