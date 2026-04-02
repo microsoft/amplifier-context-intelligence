@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from context_intelligence_server.registry import SessionWorker
 
 from context_intelligence_server.blob_processor import process_event_data
-from context_intelligence_server.handlers.default import DefaultHandler
+from context_intelligence_server.handlers.data_layer_1.default import DefaultHandler
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.utils import make_node_id
 

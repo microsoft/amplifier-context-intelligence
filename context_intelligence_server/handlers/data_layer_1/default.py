@@ -7,7 +7,7 @@ import logging
 import re
 from typing import Any
 
-from context_intelligence_server.handlers.field_lifters import (
+from context_intelligence_server.handlers.data_layer_1.field_lifters import (
     ArtifactLifter,
     DelegateLifter,
     FieldLifter,

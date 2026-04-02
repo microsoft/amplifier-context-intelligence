@@ -7,7 +7,7 @@ Three handlers are registered in this package:
 - ToolCallHandler   — enricher: owns ToolCall lifecycle (tool:pre/post/error)
 """
 
-from context_intelligence_server.handlers.default import DefaultHandler
+from context_intelligence_server.handlers.data_layer_1.default import DefaultHandler
 from context_intelligence_server.handlers.session import SessionHandler
 from context_intelligence_server.handlers.tool_call import ToolCallHandler
 
