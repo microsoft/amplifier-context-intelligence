@@ -7,7 +7,7 @@ digraph default_handler_flow {
         ranksep   = 0.9
         fontname  = "Helvetica"
         fontsize  = 11
-        label     = "DefaultHandler \u2014 Internal 5-Stage Event Node Creation Pipeline"
+        label     = "DefaultHandler \u2014 Internal 5-Stage Event Node Creation Pipeline\n(handlers/data_layer_1/default.py)"
         labelloc  = t
         labeljust = c
     ]
