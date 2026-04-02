@@ -246,10 +246,10 @@ class TestSessionFork:
         edge = await services.graph.get_edge("p1", "f1")
         assert edge is not None
         assert edge["occurred_at"] == "2026-01-01T00:00:00Z"
-        assert edge["type"] == "HAS_FORK", (
-            f"Fork edge must be HAS_FORK, got: {edge.get('type')}"
+        assert edge["type"] == "FORKED", (
+            f"Fork edge must be FORKED, got: {edge.get('type')}"
         )
-        assert edge["type"] != "SUBSESSION_OF", "Fork edge must NOT be SUBSESSION_OF"
+        assert edge["type"] != "HAS_SUBSESSION", "Fork edge must NOT be HAS_SUBSESSION"
 
     async def test_fork_uses_parent_id_not_parent_key(
         self, services: HookStateService
@@ -410,10 +410,10 @@ class TestSessionEdgeTypes:
     session:start creates SUBSESSION_OF edges; session:fork creates HAS_FORK edges.
     """
 
-    async def test_start_subsession_edge_type_is_subsession_of(
+    async def test_start_subsession_edge_type_is_has_subsession(
         self, services: HookStateService
     ) -> None:
-        """session:start parent→child edge must have type='SUBSESSION_OF'."""
+        """session:start parent→child edge must have type='HAS_SUBSESSION'."""
         handler = SessionHandler(services)
         await handler(
             "session:start",
@@ -426,10 +426,11 @@ class TestSessionEdgeTypes:
         # Parent→Child direction
         edge = await services.graph.get_edge("parent", "child")
         assert edge is not None
-        assert edge.get("type") == "SUBSESSION_OF"
+        assert edge.get("type") == "HAS_SUBSESSION"
+        assert edge.get("sst_semantic") == "LEADS_TO"
 
-    async def test_fork_edge_type_is_has_fork(self, services: HookStateService) -> None:
-        """session:fork parent→child edge must have type='HAS_FORK' (not SUBSESSION_OF)."""
+    async def test_fork_edge_type_is_forked(self, services: HookStateService) -> None:
+        """session:fork parent→child edge must have type='FORKED' (not HAS_SUBSESSION)."""
         handler = SessionHandler(services)
         await handler(
             "session:fork",
@@ -442,12 +443,10 @@ class TestSessionEdgeTypes:
         # Parent→Child direction
         edge = await services.graph.get_edge("parent1", "fork1")
         assert edge is not None
-        assert edge.get("type") == "HAS_FORK", (
-            f"Fork edge must be HAS_FORK, got: {edge.get('type')}"
+        assert edge.get("type") == "FORKED", (
+            f"Fork edge must be FORKED, got: {edge.get('type')}"
         )
-        assert edge.get("type") != "SUBSESSION_OF", (
-            "Fork edge must NOT be SUBSESSION_OF — forks are not subsessions"
-        )
+        assert edge.get("sst_semantic") == "LEADS_TO"
 
 
 class TestLateParentDiscovery:
@@ -536,7 +535,7 @@ class TestSessionStartForkGuard:
     async def test_session_start_after_fork_keeps_has_fork_edge(
         self, services: HookStateService
     ) -> None:
-        """session:start after session:fork must NOT create a SUBSESSION_OF edge."""
+        """session:start after session:fork must NOT create a HAS_SUBSESSION edge."""
         handler = SessionHandler(services)
         await services.ensure_session_node("parent", {})
 
@@ -559,15 +558,15 @@ class TestSessionStartForkGuard:
             },
         )
 
-        # HAS_FORK must still exist
+        # FORKED must still exist
         fork_edge = await services.graph.get_edge("parent", "child")
         assert fork_edge is not None
-        assert fork_edge["type"] == "HAS_FORK", f"Expected HAS_FORK: {fork_edge}"
+        assert fork_edge["type"] == "FORKED", f"Expected FORKED: {fork_edge}"
 
-        # SUBSESSION_OF must NOT exist (it would only exist if the guard failed)
-        # Note: since both HAS_FORK and SUBSESSION_OF would be (parent -> child),
-        # the last write wins — but we verify the type is HAS_FORK, not SUBSESSION_OF
-        assert fork_edge["type"] != "SUBSESSION_OF"
+        # HAS_SUBSESSION must NOT exist (it would only exist if the guard failed)
+        # Note: since both FORKED and HAS_SUBSESSION would be (parent -> child),
+        # the last write wins — but we verify the type is FORKED, not HAS_SUBSESSION
+        assert fork_edge["type"] != "HAS_SUBSESSION"
 
     async def test_session_start_after_fork_enriches_started_at(
         self, services: HookStateService
@@ -625,7 +624,7 @@ class TestSessionStartForkGuard:
 
         edge = await services.graph.get_edge("parent", "child")
         assert edge is not None
-        assert edge["type"] == "SUBSESSION_OF"
+        assert edge["type"] == "HAS_SUBSESSION"
 
 
 class TestSessionLabelStateMachine:
@@ -659,7 +658,7 @@ class TestSessionLabelStateMachine:
     async def test_start_bare_with_parent_creates_subsession(
         self, services: HookStateService
     ) -> None:
-        """(bare, start, with parent) -> SubSession:Session + SUBSESSION_OF"""
+        """(bare, start, with parent) -> SubSession:Session + HAS_SUBSESSION"""
         handler = SessionHandler(services)
         assert hasattr(handler, "_label_machine"), (
             "SessionHandler must delegate to SessionLabelStateMachine"
@@ -680,7 +679,7 @@ class TestSessionLabelStateMachine:
         assert "RootSession" not in node["labels"]
         edge = await services.graph.get_edge("parent", "child")
         assert edge is not None
-        assert edge["type"] == "SUBSESSION_OF"
+        assert edge["type"] == "HAS_SUBSESSION"
 
     async def test_start_root_no_parent_stays_root(
         self, services: HookStateService
@@ -727,7 +726,7 @@ class TestSessionLabelStateMachine:
         assert "RootSession" not in node["labels"]
         edge = await services.graph.get_edge("parent", "child")
         assert edge is not None
-        assert edge["type"] == "SUBSESSION_OF"
+        assert edge["type"] == "HAS_SUBSESSION"
 
     async def test_start_subsession_no_parent_stays_subsession(
         self, services: HookStateService
@@ -798,7 +797,7 @@ class TestSessionLabelStateMachine:
     async def test_fork_bare_creates_forkedsession(
         self, services: HookStateService
     ) -> None:
-        """(bare, fork) -> ForkedSession:Session + HAS_FORK"""
+        """(bare, fork) -> ForkedSession:Session + FORKED"""
         handler = SessionHandler(services)
         assert hasattr(handler, "_label_machine"), (
             "SessionHandler must delegate to SessionLabelStateMachine"
@@ -820,12 +819,12 @@ class TestSessionLabelStateMachine:
         assert "SubSession" not in node["labels"]
         edge = await services.graph.get_edge("parent", "child")
         assert edge is not None
-        assert edge["type"] == "HAS_FORK"
+        assert edge["type"] == "FORKED"
 
     async def test_fork_root_reclassifies_to_forked_drops_root(
         self, services: HookStateService
     ) -> None:
-        """(RootSession, fork) -> ForkedSession, RootSession DROPPED, HAS_FORK"""
+        """(RootSession, fork) -> ForkedSession, RootSession DROPPED, FORKED"""
         handler = SessionHandler(services)
         assert hasattr(handler, "_label_machine"), (
             "SessionHandler must delegate to SessionLabelStateMachine"
@@ -849,20 +848,20 @@ class TestSessionLabelStateMachine:
         assert "RootSession" not in node["labels"]
         edge = await services.graph.get_edge("parent", "child")
         assert edge is not None
-        assert edge["type"] == "HAS_FORK"
+        assert edge["type"] == "FORKED"
 
     async def test_fork_subsession_reclassifies_replaces_edge(
         self, services: HookStateService
     ) -> None:
-        """(SubSession, fork) -> ForkedSession, SubSession DROPPED, SUBSESSION_OF removed, HAS_FORK added"""
+        """(SubSession, fork) -> ForkedSession, SubSession DROPPED, HAS_SUBSESSION removed, FORKED added"""
         handler = SessionHandler(services)
         assert hasattr(handler, "_label_machine"), (
             "SessionHandler must delegate to SessionLabelStateMachine"
         )
         await services.ensure_session_node("parent", {})
         await services.graph.upsert_node("child", {"labels": ["SubSession", "Session"]})
-        # Existing SUBSESSION_OF edge
-        await services.graph.upsert_edge("parent", "child", {"type": "SUBSESSION_OF"})
+        # Existing HAS_SUBSESSION edge
+        await services.graph.upsert_edge("parent", "child", {"type": "HAS_SUBSESSION"})
         await handler(
             "session:fork",
             {
@@ -878,7 +877,7 @@ class TestSessionLabelStateMachine:
         assert "SubSession" not in node["labels"]
         edge = await services.graph.get_edge("parent", "child")
         assert edge is not None
-        assert edge["type"] == "HAS_FORK"
+        assert edge["type"] == "FORKED"
 
     async def test_fork_forkedsession_stays_forked_terminal(
         self, services: HookStateService
@@ -892,7 +891,7 @@ class TestSessionLabelStateMachine:
         await services.graph.upsert_node(
             "child", {"labels": ["ForkedSession", "Session"]}
         )
-        await services.graph.upsert_edge("parent", "child", {"type": "HAS_FORK"})
+        await services.graph.upsert_edge("parent", "child", {"type": "FORKED"})
         await handler(
             "session:fork",
             {
@@ -908,7 +907,7 @@ class TestSessionLabelStateMachine:
         assert "SubSession" not in node["labels"]
         edge = await services.graph.get_edge("parent", "child")
         assert edge is not None
-        assert edge["type"] == "HAS_FORK"  # not changed
+        assert edge["type"] == "FORKED"  # not changed
 
     # ---- _handle_end stub recovery ----
 
@@ -1038,4 +1037,274 @@ class TestSessionNodeProperties:
         )
         assert node.get("parent_id") == "parent", (
             f"session:fork must store parent_id on ForkedSession node. Got: {node!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestSessionSSTEventLabel — Session nodes must carry the SST_EVENT label
+# ---------------------------------------------------------------------------
+
+
+class TestSessionSSTEventLabel:
+    """Session nodes must carry the SST_EVENT label for SST graph membership.
+
+    SST_EVENT marks Session nodes as timelike events in the SST ontology.
+    This label must be present on all session types: RootSession, SubSession,
+    and ForkedSession, and must survive the session:end transition.
+    """
+
+    async def test_root_session_has_sst_event_label(
+        self, services: HookStateService
+    ) -> None:
+        """session:start (root) must add SST_EVENT to the node labels."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        assert "SST_EVENT" in node["labels"], (
+            f"RootSession node must carry SST_EVENT label. Got: {node['labels']}"
+        )
+
+    async def test_subsession_has_sst_event_label(
+        self, services: HookStateService
+    ) -> None:
+        """session:start (subsession) must add SST_EVENT to the node labels."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "SST_EVENT" in node["labels"], (
+            f"SubSession node must carry SST_EVENT label. Got: {node['labels']}"
+        )
+
+    async def test_forked_session_has_sst_event_label(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork must add SST_EVENT to the ForkedSession node labels."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "f1",
+                "parent_id": "p1",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("f1")
+        assert node is not None
+        assert "SST_EVENT" in node["labels"], (
+            f"ForkedSession node must carry SST_EVENT label. Got: {node['labels']}"
+        )
+
+    async def test_session_end_preserves_sst_event_label(
+        self, services: HookStateService
+    ) -> None:
+        """session:end must not remove the SST_EVENT label."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        await handler(
+            "session:end",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T01:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        assert "SST_EVENT" in node["labels"], (
+            f"SST_EVENT label must be preserved after session:end. Got: {node['labels']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestSessionForkMountPlan — session:fork must create a companion MountPlan node
+# ---------------------------------------------------------------------------
+
+
+class TestSessionForkMountPlan:
+    """session:fork must create a companion MountPlan node for context tracking.
+
+    When a fork event fires, the ForkedSession node must be accompanied by a
+    MountPlan node (keyed as '<session_id>::mount_plan') connected via a
+    HAS_PART edge with sst_semantic='CONTAINS'.
+    """
+
+    async def test_fork_creates_mount_plan_node(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork must create a companion node at '<session_id>::mount_plan'."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "f1",
+                "parent_id": "p1",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        mount_plan = await services.graph.get_node("f1::mount_plan")
+        assert mount_plan is not None, (
+            "session:fork must create a companion MountPlan node at 'f1::mount_plan'"
+        )
+
+    async def test_mount_plan_has_correct_labels(
+        self, services: HookStateService
+    ) -> None:
+        """MountPlan node must have labels ['MountPlan', 'SST_THING']."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "f1",
+                "parent_id": "p1",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        mount_plan = await services.graph.get_node("f1::mount_plan")
+        assert mount_plan is not None
+        assert "MountPlan" in mount_plan["labels"], (
+            f"MountPlan node must have 'MountPlan' label. Got: {mount_plan['labels']}"
+        )
+        assert "SST_THING" in mount_plan["labels"], (
+            f"MountPlan node must have 'SST_THING' label. Got: {mount_plan['labels']}"
+        )
+
+    async def test_fork_creates_has_part_edge_to_mount_plan(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork must create a HAS_PART edge from ForkedSession to MountPlan."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "f1",
+                "parent_id": "p1",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        edge = await services.graph.get_edge("f1", "f1::mount_plan")
+        assert edge is not None, (
+            "session:fork must create a HAS_PART edge from ForkedSession to MountPlan"
+        )
+        assert edge.get("type") == "HAS_PART", (
+            f"Edge from ForkedSession to MountPlan must have type='HAS_PART'. Got: {edge.get('type')}"
+        )
+        assert edge.get("sst_semantic") == "CONTAINS", (
+            f"Edge from ForkedSession to MountPlan must have sst_semantic='CONTAINS'. Got: {edge.get('sst_semantic')}"
+        )
+
+    async def test_orphan_fork_still_creates_mount_plan(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork without parent_id must still create a companion MountPlan node."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "f1",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        mount_plan = await services.graph.get_node("f1::mount_plan")
+        assert mount_plan is not None, (
+            "Orphaned fork must still create a companion MountPlan node"
+        )
+
+    async def test_terminal_fork_does_not_duplicate_mount_plan(
+        self, services: HookStateService
+    ) -> None:
+        """A second session:fork for a ForkedSession (terminal) must not create duplicate labels."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.graph.upsert_node("f1", {"labels": ["ForkedSession", "Session"]})
+        await services.graph.upsert_edge("parent", "f1", {"type": "FORKED"})
+
+        # First fork — already classified, so terminal
+        await handler(
+            "session:fork",
+            {
+                "session_id": "f1",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "metadata": {},
+            },
+        )
+        mount_plan = await services.graph.get_node("f1::mount_plan")
+        assert mount_plan is not None
+        # Labels must not be duplicated (e.g., no ['MountPlan', 'SST_THING', 'MountPlan'])
+        assert mount_plan["labels"].count("MountPlan") == 1, (
+            f"MountPlan label must appear exactly once. Got: {mount_plan['labels']}"
+        )
+        assert mount_plan["labels"].count("SST_THING") == 1, (
+            f"SST_THING label must appear exactly once. Got: {mount_plan['labels']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestSessionEdgeSstSemantic — all session edges carry sst_semantic='LEADS_TO'
+# ---------------------------------------------------------------------------
+
+
+class TestSessionEdgeSstSemantic:
+    """All parent→child session edges must carry sst_semantic='LEADS_TO'.
+
+    Both HAS_SUBSESSION (session:start with parent) and FORKED (session:fork)
+    edges are timelike LEADS_TO relationships in the SST ontology.
+    """
+
+    async def test_subsession_edge_has_sst_semantic(
+        self, services: HookStateService
+    ) -> None:
+        """session:start parent→child edge must carry sst_semantic='LEADS_TO'."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        edge = await services.graph.get_edge("parent", "child")
+        assert edge is not None
+        assert edge.get("sst_semantic") == "LEADS_TO", (
+            f"HAS_SUBSESSION edge must have sst_semantic='LEADS_TO'. Got: {edge.get('sst_semantic')}"
+        )
+
+    async def test_fork_edge_has_sst_semantic(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork parent→child edge must carry sst_semantic='LEADS_TO'."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "f1",
+                "parent_id": "p1",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        edge = await services.graph.get_edge("p1", "f1")
+        assert edge is not None
+        assert edge.get("sst_semantic") == "LEADS_TO", (
+            f"FORKED edge must have sst_semantic='LEADS_TO'. Got: {edge.get('sst_semantic')}"
         )
