@@ -164,7 +164,7 @@ class TestFullEventSequence:
 
     async def test_tool_pre_creates_tool_call_node(self) -> None:
         """After tool:pre ToolCallHandler must create a ToolCall node with the
-        correct properties and a HAS_TOOL_CALL edge from the Session."""
+        correct properties keyed by tool_call_id directly. No edges are created."""
         worker, services = _make_worker_and_services()
         handlers = setup_handlers(services)
 
@@ -191,23 +191,23 @@ class TestFullEventSequence:
             handlers,
         )
 
-        tc_node_id = f"{self._SESSION_ID}__tool_call__{self._TOOL_CALL_ID}"
-        tc_node = await services.graph.get_node(tc_node_id)
+        # Node ID is the tool_call_id directly (Phase A cleanup)
+        tc_node = await services.graph.get_node(self._TOOL_CALL_ID)
         assert tc_node is not None
         assert "ToolCall" in tc_node["labels"]
+        assert "SST_EVENT" in tc_node["labels"]
         assert tc_node["tool_name"] == "delegate"
         assert tc_node["tool_call_id"] == self._TOOL_CALL_ID
         assert tc_node["parallel_group_id"] == self._PARALLEL_GROUP
 
-        # HAS_TOOL_CALL edge: Session → ToolCall (with started_at)
-        edge = await services.graph.get_edge(self._SESSION_ID, tc_node_id)
-        assert edge is not None
-        assert edge["type"] == "HAS_TOOL_CALL"
-        assert "started_at" in edge
+        # No HAS_TOOL_CALL edge created (Phase A cleanup — no edges from ToolCallHandler)
+        edge = await services.graph.get_edge(self._SESSION_ID, self._TOOL_CALL_ID)
+        assert edge is None
 
     async def test_tool_pre_creates_event_node(self) -> None:
         """After tool:pre DefaultHandler must create a ToolPre Event node with
-        HAS_EVENT edges from both the Session and the ToolCall node."""
+        a HAS_EVENT edge from the Session. ToolCallHandler no longer creates
+        edges (Phase A cleanup)."""
         worker, services = _make_worker_and_services()
         handlers = setup_handlers(services)
 
@@ -249,10 +249,10 @@ class TestFullEventSequence:
         )
         assert session_to_event is not None
 
-        # HAS_EVENT edge: ToolCall → Event (ToolCallHandler)
-        tc_node_id = f"{self._SESSION_ID}__tool_call__{self._TOOL_CALL_ID}"
-        tc_to_event = await services.graph.get_edge(tc_node_id, event_node_id)
-        assert tc_to_event is not None
+        # No HAS_EVENT edge from ToolCall → Event (Phase A cleanup — ToolCallHandler
+        # no longer creates edges; ToolCall nodes exist standalone without edges)
+        tc_to_event = await services.graph.get_edge(self._TOOL_CALL_ID, event_node_id)
+        assert tc_to_event is None
 
     async def test_tool_post_enriches_tool_call_node(self) -> None:
         """After tool:post the ToolCall node must have ended_at set to T2."""
@@ -295,8 +295,8 @@ class TestFullEventSequence:
             handlers,
         )
 
-        tc_node_id = f"{self._SESSION_ID}__tool_call__{self._TOOL_CALL_ID}"
-        tc_node = await services.graph.get_node(tc_node_id)
+        # Node ID is the tool_call_id directly (Phase A cleanup)
+        tc_node = await services.graph.get_node(self._TOOL_CALL_ID)
         assert tc_node is not None
         assert tc_node.get("ended_at") == self._T2
 
