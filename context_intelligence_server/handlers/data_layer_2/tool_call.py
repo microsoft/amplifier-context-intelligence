@@ -90,11 +90,12 @@ class ToolCallHandler:
 
         No edges are created — edge creation is a data_layer_2 violation.
         """
+        result: dict[str, Any] = data.get("result", {})
         node_data: dict[str, Any] = {
             "labels": ["ToolCall", "SST_EVENT"],
             "ended_at": timestamp,
-            "result_success": data.get("result_success"),
-            "result_output": data.get("result_output"),
-            "result_error": data.get("result_error"),
+            "result_success": result.get("success"),
+            "result_output": result.get("output"),
+            "result_error": result.get("error"),
         }
         await self.services.graph.upsert_node(tool_call_id, node_data)

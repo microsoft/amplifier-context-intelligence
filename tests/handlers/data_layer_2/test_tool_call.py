@@ -321,7 +321,7 @@ class TestToolPostEnrichesToolCall:
             "timestamp": "2026-01-01T00:01:00Z",
             "tool_call_id": "tc-abc",
             "tool_name": "bash",
-            "result_success": True,
+            "result": {"success": True},
         }
 
         await handler("tool:pre", pre_data)
@@ -348,7 +348,7 @@ class TestToolPostEnrichesToolCall:
             "timestamp": "2026-01-01T00:01:00Z",
             "tool_call_id": "tc-abc",
             "tool_name": "bash",
-            "result_output": "file.txt",
+            "result": {"output": "file.txt"},
         }
 
         await handler("tool:pre", pre_data)
@@ -375,7 +375,7 @@ class TestToolPostEnrichesToolCall:
             "timestamp": "2026-01-01T00:01:00Z",
             "tool_call_id": "tc-abc",
             "tool_name": "bash",
-            "result_error": "timeout",
+            "result": {"error": "timeout"},
         }
 
         await handler("tool:pre", pre_data)
