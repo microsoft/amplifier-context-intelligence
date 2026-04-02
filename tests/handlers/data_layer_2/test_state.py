@@ -62,3 +62,33 @@ class TestDataLayer2StateFieldIsolation:
         assert "tool_1" not in state_b.pending_tool_block_ids, (
             "pending_tool_block_ids must not be shared across DataLayer2State instances"
         )
+
+
+class TestHookStateServiceHasDataLayer2:
+    """HookStateService must expose a data_layer_2 attribute of type DataLayer2State."""
+
+    def test_services_has_data_layer_2_attribute(self) -> None:
+        """HookStateService instance exposes a data_layer_2 attribute."""
+        from context_intelligence_server.services import HookStateService
+
+        services = HookStateService(workspace="test")
+        assert hasattr(services, "data_layer_2")
+
+    def test_data_layer_2_is_data_layer_2_state_instance(self) -> None:
+        """services.data_layer_2 is an instance of DataLayer2State."""
+        from context_intelligence_server.services import HookStateService
+
+        services = HookStateService(workspace="test")
+        assert isinstance(services.data_layer_2, DataLayer2State)
+
+    def test_data_layer_2_defaults_are_clean(self) -> None:
+        """services.data_layer_2 fields all have correct default values."""
+        from context_intelligence_server.services import HookStateService
+
+        services = HookStateService(workspace="test")
+        state = services.data_layer_2
+        assert state.execution_start_ts is None
+        assert state.active_iteration_id is None
+        assert state.pending_tool_block_ids == {}
+        assert state.last_prompt_id is None
+        assert state.last_completed_orch_run_id is None
