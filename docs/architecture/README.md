@@ -6,6 +6,10 @@ standalone artifacts.
 
 ---
 
+> **Note:** SVGs are generated build artifacts and are not tracked in git. Images below will
+> appear broken until you run the regeneration command in the
+> [Regenerating SVGs](#regenerating-svgs) section at the bottom of this file.
+
 ## Pipeline Flow
 
 ![Pipeline Flow](./01-pipeline-flow.svg)
