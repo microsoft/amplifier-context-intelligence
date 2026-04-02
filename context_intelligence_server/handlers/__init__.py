@@ -1,18 +1,13 @@
 """Event handlers for the context-intelligence server.
 
-Three handlers are registered in this package:
+Handlers are organised by architectural layer:
 
-- DefaultHandler    — creates Event nodes for ALL events (unconditional)
-- SessionHandler    — enricher: owns Session node lifecycle (start/fork/end)
-- ToolCallHandler   — enricher: owns ToolCall lifecycle (tool:pre/post/error)
+- ``data_layer_1/`` — raw event capture: DefaultHandler and all FieldLifter classes
+- ``data_layer_2/`` — semantic enrichment: SessionHandler, ToolCallHandler, and
+  all future enrichers
+
+The shared ``EventHandler`` protocol and ``HookResult`` live at
+``context_intelligence_server.protocol`` (not inside this package).
+
+New event handlers always land in ``data_layer_2/``, never at this package root.
 """
-
-from context_intelligence_server.handlers.data_layer_1.default import DefaultHandler
-from context_intelligence_server.handlers.data_layer_2.session import SessionHandler
-from context_intelligence_server.handlers.data_layer_2.tool_call import ToolCallHandler
-
-__all__ = [
-    "DefaultHandler",
-    "SessionHandler",
-    "ToolCallHandler",
-]
