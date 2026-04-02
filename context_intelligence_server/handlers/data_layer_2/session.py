@@ -169,6 +169,14 @@ class SessionHandler:
 
         # ForkedSession: fully terminal — preserve classification, return immediately
         if current_type == "ForkedSession":
+            # E04: Session → MountPlan (record existence, no blob dereferencing)
+            mount_plan_id = f"{session_id}::mount_plan"
+            await self.services.graph.upsert_node(
+                mount_plan_id, {"labels": ["MountPlan", "SST_THING"]}
+            )
+            await self.services.graph.upsert_edge(
+                session_id, mount_plan_id, {"type": "HAS_PART", "sst_semantic": "CONTAINS"}
+            )
             return
 
         # RootSession or SubSession: reclassify to ForkedSession, rectify edge
@@ -186,6 +194,14 @@ class SessionHandler:
                     session_id,
                     {"type": "FORKED", "sst_semantic": "LEADS_TO", "occurred_at": timestamp},
                 )
+            # E04: Session → MountPlan (record existence, no blob dereferencing)
+            mount_plan_id = f"{session_id}::mount_plan"
+            await self.services.graph.upsert_node(
+                mount_plan_id, {"labels": ["MountPlan", "SST_THING"]}
+            )
+            await self.services.graph.upsert_edge(
+                session_id, mount_plan_id, {"type": "HAS_PART", "sst_semantic": "CONTAINS"}
+            )
             return
 
         # bare: add Session + ForkedSession labels (include Session base label for new nodes)
@@ -199,6 +215,14 @@ class SessionHandler:
                 session_id,
                 {"type": "FORKED", "sst_semantic": "LEADS_TO", "occurred_at": timestamp},
             )
+        # E04: Session → MountPlan (record existence, no blob dereferencing)
+        mount_plan_id = f"{session_id}::mount_plan"
+        await self.services.graph.upsert_node(
+            mount_plan_id, {"labels": ["MountPlan", "SST_THING"]}
+        )
+        await self.services.graph.upsert_edge(
+            session_id, mount_plan_id, {"type": "HAS_PART", "sst_semantic": "CONTAINS"}
+        )
 
     async def _handle_end(
         self, session_id: str, timestamp: str, data: dict[str, Any]

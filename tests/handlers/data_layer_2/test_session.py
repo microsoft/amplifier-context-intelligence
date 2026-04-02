@@ -289,7 +289,7 @@ class TestSessionFork:
     async def test_fork_missing_parent_id_creates_node_no_edge(
         self, services: HookStateService
     ) -> None:
-        """Fork without parent_id creates ForkedSession+Session node, no edge, no RootSession."""
+        """Fork without parent_id creates ForkedSession+Session node, no parent edge, no RootSession."""
         handler = SessionHandler(services)
         await handler(
             "session:fork",
@@ -305,10 +305,18 @@ class TestSessionFork:
         assert "SubSession" not in node["labels"]
         # Orphaned forks do NOT get RootSession — they are ForkedSession+Session only
         assert "RootSession" not in node["labels"]
-        # Orphaned forks must NOT create any SUBSESSION_OF edge — the GraphState._edges
-        # dict is checked directly because no parent node ID exists to query against.
-        assert len(services.graph._edges) == 0, (
-            "No edge should be created for an orphaned fork (no parent_id)"
+        # Orphaned forks must NOT create any FORKED or HAS_SUBSESSION edge to a parent —
+        # only the companion MountPlan HAS_PART edge is allowed.
+        parent_edge = await services.graph.get_edge("f1", "f1")  # no parent ID — check self-edges
+        assert parent_edge is None
+        # Verify no edge from any unknown parent to f1 exists (no parent_id was supplied)
+        edges_from_other_nodes = [
+            (src, dst)
+            for (src, dst) in services.graph._edges
+            if dst == "f1" and src != "f1"
+        ]
+        assert len(edges_from_other_nodes) == 0, (
+            "No parent→child edge should be created for an orphaned fork (no parent_id)"
         )
 
 
