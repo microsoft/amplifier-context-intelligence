@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from context_intelligence_server.handlers.field_lifters.base import (
+from context_intelligence_server.handlers.data_layer_1.field_lifters.base import (
     FieldLifter,
     safe_prop,
 )
-from context_intelligence_server.handlers.field_lifters.universal import (
+from context_intelligence_server.handlers.data_layer_1.field_lifters.universal import (
     UniversalLifter,
 )
 
@@ -130,7 +130,7 @@ class TestSessionLifter:
     """Tests for SessionLifter — extracts parent and metadata fields from session:* events."""
 
     def setup_method(self) -> None:
-        from context_intelligence_server.handlers.field_lifters.session import (
+        from context_intelligence_server.handlers.data_layer_1.field_lifters.session import (
             SessionLifter,
         )
 
@@ -210,7 +210,7 @@ class TestToolLifter:
     """Tests for ToolLifter — extracts tool_name and tool_input from tool:* events."""
 
     def setup_method(self) -> None:
-        from context_intelligence_server.handlers.field_lifters.tool import (
+        from context_intelligence_server.handlers.data_layer_1.field_lifters.tool import (
             ToolLifter,
         )
 
@@ -274,7 +274,7 @@ class TestDelegateLifter:
     """Tests for DelegateLifter — extracts agent, sub_session_id, parent_session_id, tool_call_id, parallel_group_id from delegate:* events."""
 
     def setup_method(self) -> None:
-        from context_intelligence_server.handlers.field_lifters.delegate import (
+        from context_intelligence_server.handlers.data_layer_1.field_lifters.delegate import (
             DelegateLifter,
         )
 
@@ -338,7 +338,7 @@ class TestLlmLifter:
     """Tests for LlmLifter — extracts model and provider from llm:* events."""
 
     def setup_method(self) -> None:
-        from context_intelligence_server.handlers.field_lifters.llm import (
+        from context_intelligence_server.handlers.data_layer_1.field_lifters.llm import (
             LlmLifter,
         )
 
@@ -369,7 +369,7 @@ class TestPromptLifter:
     """Tests for PromptLifter — extracts prompt and response_preview from prompt:* events."""
 
     def setup_method(self) -> None:
-        from context_intelligence_server.handlers.field_lifters.prompt import (
+        from context_intelligence_server.handlers.data_layer_1.field_lifters.prompt import (
             PromptLifter,
         )
 
@@ -411,7 +411,7 @@ class TestSkillLifter:
     """Tests for SkillLifter — extracts skill_directory and skill_name from skill:* events."""
 
     def setup_method(self) -> None:
-        from context_intelligence_server.handlers.field_lifters.skill import SkillLifter
+        from context_intelligence_server.handlers.data_layer_1.field_lifters.skill import SkillLifter
 
         self.lifter = SkillLifter()
 
@@ -445,7 +445,7 @@ class TestRecipeLifter:
     """Tests for RecipeLifter — extracts orchestration fields from recipe:* events."""
 
     def setup_method(self) -> None:
-        from context_intelligence_server.handlers.field_lifters.recipe import (
+        from context_intelligence_server.handlers.data_layer_1.field_lifters.recipe import (
             RecipeLifter,
         )
 
@@ -486,7 +486,7 @@ class TestArtifactLifter:
     """Tests for ArtifactLifter — extracts bytes and path from artifact:* events."""
 
     def setup_method(self) -> None:
-        from context_intelligence_server.handlers.field_lifters.artifact import (
+        from context_intelligence_server.handlers.data_layer_1.field_lifters.artifact import (
             ArtifactLifter,
         )
 

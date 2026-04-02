@@ -151,7 +151,7 @@ def test_setup_handlers_returns_pipeline_handlers() -> None:
 
 def test_setup_handlers_has_default_handler_with_services() -> None:
     from context_intelligence_server.pipeline import setup_handlers
-    from context_intelligence_server.handlers.default import DefaultHandler
+    from context_intelligence_server.handlers.data_layer_1.default import DefaultHandler
     from context_intelligence_server.services import HookStateService
 
     services = HookStateService(workspace="test")

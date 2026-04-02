@@ -7,7 +7,7 @@ against the stub (handled_events already correct; guards return continue).
 
 from __future__ import annotations
 
-from context_intelligence_server.handlers.default import DefaultHandler
+from context_intelligence_server.handlers.data_layer_1.default import DefaultHandler
 from context_intelligence_server.handlers.tool_call import ToolCallHandler
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.utils import make_node_id

@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 
-from context_intelligence_server.handlers.default import DefaultHandler
+from context_intelligence_server.handlers.data_layer_1.default import DefaultHandler
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.utils import make_node_id
 
@@ -316,7 +316,7 @@ class TestDefaultHandlerFieldLifters:
 
     def test_lifters_include_all_six_types(self) -> None:
         """_LIFTERS must contain instances of all 9 lifter types in the correct order."""
-        from context_intelligence_server.handlers.field_lifters import (
+        from context_intelligence_server.handlers.data_layer_1.field_lifters import (
             ArtifactLifter,
             DelegateLifter,
             LlmLifter,
