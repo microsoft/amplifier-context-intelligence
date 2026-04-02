@@ -4,8 +4,6 @@ Task 12: handlers/__init__.py must be a docstring-only module.
 Handlers are imported directly from their sub-package paths.
 """
 
-from __future__ import annotations
-
 import context_intelligence_server.handlers as handlers_module
 
 
@@ -40,6 +38,6 @@ class TestHandlersInitNoReExports:
             ToolCallHandler,
         )
 
-        assert DefaultHandler is not None
-        assert SessionHandler is not None
-        assert ToolCallHandler is not None
+        assert isinstance(DefaultHandler, type)
+        assert isinstance(SessionHandler, type)
+        assert isinstance(ToolCallHandler, type)
