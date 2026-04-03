@@ -101,6 +101,9 @@ async def process_event_data(
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "blob_offload_failed session=%s field=%s node=%s: %s",
-                session_id, field_name, node_id, exc,
+                session_id,
+                field_name,
+                node_id,
+                exc,
             )
             data[field_name] = {"$blob_error": f"write failed: {exc}"}

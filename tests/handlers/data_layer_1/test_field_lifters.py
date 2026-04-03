@@ -411,7 +411,9 @@ class TestSkillLifter:
     """Tests for SkillLifter — extracts skill_directory and skill_name from skill:* events."""
 
     def setup_method(self) -> None:
-        from context_intelligence_server.handlers.data_layer_1.field_lifters.skill import SkillLifter
+        from context_intelligence_server.handlers.data_layer_1.field_lifters.skill import (
+            SkillLifter,
+        )
 
         self.lifter = SkillLifter()
 

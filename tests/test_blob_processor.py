@@ -289,9 +289,12 @@ def test_lift_raw_fields_usage_existing_keys_win() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_blob_write_failure_logs_warning(caplog: pytest.LogCaptureFixture) -> None:
+async def test_blob_write_failure_logs_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Failed blob writes must emit a WARNING log with session_id, field_name, and node_id."""
     import logging
+
     data: dict[str, Any] = {"messages": [{"role": "user", "content": "hi"}]}
     blob_store = AsyncMock()
     blob_store.write = AsyncMock(side_effect=OSError("disk full"))

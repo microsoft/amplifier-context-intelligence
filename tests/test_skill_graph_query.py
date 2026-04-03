@@ -28,9 +28,7 @@ def test_skill_file_exists() -> None:
 
 
 def test_frontmatter_version_2() -> None:
-    assert "version: 2.0.0" in _content(), (
-        "Frontmatter must specify version: 2.0.0"
-    )
+    assert "version: 2.0.0" in _content(), "Frontmatter must specify version: 2.0.0"
 
 
 def test_frontmatter_name() -> None:
@@ -52,21 +50,15 @@ def test_frontmatter_description_mentions_property_graph() -> None:
 
 
 def test_section_1_heading() -> None:
-    assert "Section 1" in _content(), (
-        "File must contain Section 1"
-    )
+    assert "Section 1" in _content(), "File must contain Section 1"
 
 
 def test_section_1_data_layer_1_explained() -> None:
-    assert "Data layer 1" in _content(), (
-        "Section 1 must explain Data layer 1"
-    )
+    assert "Data layer 1" in _content(), "Section 1 must explain Data layer 1"
 
 
 def test_section_1_data_layer_2_explained() -> None:
-    assert "Data layer 2" in _content(), (
-        "Section 1 must explain Data layer 2"
-    )
+    assert "Data layer 2" in _content(), "Section 1 must explain Data layer 2"
 
 
 def test_section_1_layer_identification_double_underscore() -> None:
@@ -103,9 +95,7 @@ def test_section_1_plain_ids_mentioned() -> None:
 
 
 def test_section_2_heading() -> None:
-    assert "Section 2" in _content(), (
-        "File must contain Section 2"
-    )
+    assert "Section 2" in _content(), "File must contain Section 2"
 
 
 def test_section_2_data_layer_1_nodes_table() -> None:
@@ -123,15 +113,17 @@ def test_section_2_data_layer_1_edges_table() -> None:
         "Section 2 must have Data Layer 1 Edges table"
     )
     assert "HAS_FORK" in content, "Data Layer 1 Edges table must include HAS_FORK"
-    assert "HAS_TOOL_CALL" in content, "Data Layer 1 Edges table must include HAS_TOOL_CALL"
+    assert "HAS_TOOL_CALL" in content, (
+        "Data Layer 1 Edges table must include HAS_TOOL_CALL"
+    )
     assert "HAS_EVENT" in content, "Data Layer 1 Edges table must include HAS_EVENT"
 
 
 def test_section_2_data_layer_2_entity_types_table() -> None:
     content = _content()
-    assert "Data Layer 2 Entity Types" in content or "Data layer 2 Entity Types" in content, (
-        "Section 2 must have Data Layer 2 Entity Types table"
-    )
+    assert (
+        "Data Layer 2 Entity Types" in content or "Data layer 2 Entity Types" in content
+    ), "Section 2 must have Data Layer 2 Entity Types table"
     # All 10 entities must be present
     entities = [
         "OrchestratorRun",
@@ -159,9 +151,9 @@ def test_section_2_data_layer_2_entity_sst_labels() -> None:
 
 def test_section_2_data_layer_2_edge_types_table() -> None:
     content = _content()
-    assert "Data Layer 2 Edge Types" in content or "Data layer 2 Edge Types" in content, (
-        "Section 2 must have Data Layer 2 Edge Types table"
-    )
+    assert (
+        "Data Layer 2 Edge Types" in content or "Data layer 2 Edge Types" in content
+    ), "Section 2 must have Data Layer 2 Edge Types table"
     # Key edges must be present
     edges = [
         "HAS_EXECUTION",
@@ -176,9 +168,7 @@ def test_section_2_data_layer_2_edge_types_table() -> None:
         "ENABLES",
     ]
     for edge in edges:
-        assert edge in content, (
-            f"Data Layer 2 Edge Types table must include {edge}"
-        )
+        assert edge in content, f"Data Layer 2 Edge Types table must include {edge}"
 
 
 def test_section_2_edge_types_sst_semantic_property() -> None:
@@ -194,9 +184,7 @@ def test_section_2_edge_types_sst_semantic_property() -> None:
 
 def test_data_blob_uri_mentioned() -> None:
     content = _content()
-    assert "ci-blob://" in content, (
-        "Skill must mention ci-blob:// URI references"
-    )
+    assert "ci-blob://" in content, "Skill must mention ci-blob:// URI references"
     assert "JSON string" in content, (
         "Skill must note that 'data' is a JSON string, not a Cypher map"
     )

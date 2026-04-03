@@ -59,7 +59,9 @@ def test_event_request_empty_workspace_raises():
 def test_event_request_blank_workspace_raises():
     """EventRequest raises ValidationError when workspace is whitespace only."""
     with pytest.raises(ValidationError):
-        EventRequest(event="session:start", workspace="   ", data={"session_id": "abc123"})
+        EventRequest(
+            event="session:start", workspace="   ", data={"session_id": "abc123"}
+        )
 
 
 def test_event_request_workspace_non_empty_accepted():

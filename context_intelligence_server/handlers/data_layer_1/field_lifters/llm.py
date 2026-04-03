@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from context_intelligence_server.handlers.data_layer_1.field_lifters.base import FieldLifter
+from context_intelligence_server.handlers.data_layer_1.field_lifters.base import (
+    FieldLifter,
+)
 
 _LLM_KEYS: tuple[str, ...] = (
     "model",

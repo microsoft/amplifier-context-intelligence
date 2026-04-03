@@ -184,9 +184,15 @@ def test_setup_handlers_enricher_order() -> None:
     ContentBlockHandler, ToolCallHandler] in that dispatch order."""
     from context_intelligence_server.pipeline import setup_handlers
     from context_intelligence_server.handlers.data_layer_2.session import SessionHandler
-    from context_intelligence_server.handlers.data_layer_2.orchestrator_run import OrchestratorRunHandler
-    from context_intelligence_server.handlers.data_layer_2.iteration import IterationHandler
-    from context_intelligence_server.handlers.data_layer_2.content_block import ContentBlockHandler
+    from context_intelligence_server.handlers.data_layer_2.orchestrator_run import (
+        OrchestratorRunHandler,
+    )
+    from context_intelligence_server.handlers.data_layer_2.iteration import (
+        IterationHandler,
+    )
+    from context_intelligence_server.handlers.data_layer_2.content_block import (
+        ContentBlockHandler,
+    )
     from context_intelligence_server.services import HookStateService
 
     services = HookStateService(workspace="test")

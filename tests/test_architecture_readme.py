@@ -69,7 +69,9 @@ def test_readme_references_dot_source_files() -> None:
         "04-default-handler-flow.dot",
     ]
     for dot_file in dot_files:
-        assert dot_file in content, f"README must reference source DOT file '{dot_file}'"
+        assert dot_file in content, (
+            f"README must reference source DOT file '{dot_file}'"
+        )
 
 
 def test_readme_has_regenerating_svgs_section() -> None:
@@ -83,9 +85,7 @@ def test_readme_has_shell_loop_command() -> None:
     assert "for f in docs/architecture/*.dot" in content, (
         "README must contain the shell loop command for regenerating SVGs"
     )
-    assert 'dot -Tsvg "$f"' in content, (
-        "README must contain the dot -Tsvg command"
-    )
+    assert 'dot -Tsvg "$f"' in content, "README must contain the dot -Tsvg command"
     assert '"${f%.dot}.svg"' in content, (
         "README must contain the output substitution in the shell loop"
     )
