@@ -21,6 +21,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from neo4j import AsyncGraphDatabase
 
+from context_intelligence_server import __version__
 from context_intelligence_server.auth import BearerTokenMiddleware
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
@@ -71,7 +72,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await app.state.neo4j_driver.close()
 
 
-app = FastAPI(title="Context Intelligence Server", lifespan=lifespan)
+app = FastAPI(
+    title="Context Intelligence Server", version=__version__, lifespan=lifespan
+)
 app.include_router(skills_router)
 app.include_router(version_router)
 _start_time = time.time()
