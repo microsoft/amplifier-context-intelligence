@@ -501,3 +501,313 @@ class TestToolCallHandlerGuards:
             },
         )
         assert result.action == "continue"
+
+
+# ---------------------------------------------------------------------------
+# 7. TestE08HasToolCallEdge
+# ---------------------------------------------------------------------------
+
+
+class TestE08HasToolCallEdge:
+    """E08: Iteration -[:HAS_TOOL_CALL {sst_semantic: 'CONTAINS'}]-> ToolCall."""
+
+    async def test_e08_edge_created_when_active_iteration_id_set(
+        self, services: HookStateService
+    ) -> None:
+        """E08 edge must be created when active_iteration_id is set."""
+        services.data_layer_2.active_iteration_id = "s1::iteration::1"
+        handler = ToolCallHandler(services)
+
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        await handler("tool:pre", data)
+
+        edge = await services.graph.get_edge("s1::iteration::1", "tc-abc")
+        assert edge is not None
+        assert edge.get("sst_semantic") == "CONTAINS"
+
+    async def test_e08_edge_type_is_has_tool_call(
+        self, services: HookStateService
+    ) -> None:
+        """E08 edge must have type HAS_TOOL_CALL."""
+        services.data_layer_2.active_iteration_id = "s1::iteration::1"
+        handler = ToolCallHandler(services)
+
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        await handler("tool:pre", data)
+
+        edge = await services.graph.get_edge("s1::iteration::1", "tc-abc")
+        assert edge is not None
+        assert edge.get("type") == "HAS_TOOL_CALL"
+
+    async def test_e08_no_edge_when_no_active_iteration(
+        self, services: HookStateService
+    ) -> None:
+        """E08 edge must NOT be created when active_iteration_id is None (zero edges)."""
+        # active_iteration_id is None by default
+        assert services.data_layer_2.active_iteration_id is None
+        handler = ToolCallHandler(services)
+
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        await handler("tool:pre", data)
+
+        assert len(services.graph._edges) == 0
+
+
+# ---------------------------------------------------------------------------
+# 8. TestE09CausedEdge
+# ---------------------------------------------------------------------------
+
+
+class TestE09CausedEdge:
+    """E09: ContentBlock -[:CAUSED {sst_semantic: 'LEADS_TO'}]-> ToolCall."""
+
+    async def test_e09_edge_created_when_pending_match_exists(
+        self, services: HookStateService
+    ) -> None:
+        """E09 edge must be created when pending_tool_block_ids has matching entry."""
+        services.data_layer_2.pending_tool_block_ids["tc-abc"] = "s1::block::1::0"
+        handler = ToolCallHandler(services)
+
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        await handler("tool:pre", data)
+
+        edge = await services.graph.get_edge("s1::block::1::0", "tc-abc")
+        assert edge is not None
+        assert edge.get("sst_semantic") == "LEADS_TO"
+
+    async def test_e09_edge_type_is_caused(self, services: HookStateService) -> None:
+        """E09 edge must have type CAUSED."""
+        services.data_layer_2.pending_tool_block_ids["tc-abc"] = "s1::block::1::0"
+        handler = ToolCallHandler(services)
+
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        await handler("tool:pre", data)
+
+        edge = await services.graph.get_edge("s1::block::1::0", "tc-abc")
+        assert edge is not None
+        assert edge.get("type") == "CAUSED"
+
+    async def test_e09_pending_entry_consumed_after_edge_creation(
+        self, services: HookStateService
+    ) -> None:
+        """E09 must consume (pop) the pending entry after creating the edge."""
+        services.data_layer_2.pending_tool_block_ids["tc-abc"] = "s1::block::1::0"
+        handler = ToolCallHandler(services)
+
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        await handler("tool:pre", data)
+
+        assert "tc-abc" not in services.data_layer_2.pending_tool_block_ids
+
+    async def test_e09_no_edge_when_no_pending_match(
+        self, services: HookStateService
+    ) -> None:
+        """E09 edge must NOT be created when no pending match exists."""
+        # pending_tool_block_ids is empty by default
+        assert len(services.data_layer_2.pending_tool_block_ids) == 0
+        handler = ToolCallHandler(services)
+
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        await handler("tool:pre", data)
+
+        caused_edges = [
+            edge
+            for (src, dst), edge in services.graph._edges.items()
+            if edge.get("type") == "CAUSED"
+        ]
+        assert len(caused_edges) == 0
+
+
+# ---------------------------------------------------------------------------
+# 9. TestE10ParallelExecutionEdge
+# ---------------------------------------------------------------------------
+
+
+class TestE10ParallelExecutionEdge:
+    """E10: ToolCall -[:PARALLEL_EXECUTION {sst_semantic: 'NEAR'}]- ToolCall."""
+
+    async def test_e10_edge_created_between_parallel_group_tools(
+        self, services: HookStateService
+    ) -> None:
+        """E10 edge must be created between tools in same parallel_group_id."""
+        handler = ToolCallHandler(services)
+
+        data_a = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-a",
+            "tool_name": "bash",
+            "parallel_group_id": "pg-1",
+        }
+        data_b = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-b",
+            "tool_name": "read_file",
+            "parallel_group_id": "pg-1",
+        }
+        await handler("tool:pre", data_a)
+        await handler("tool:pre", data_b)
+
+        # Edge between A and B must exist (in either direction)
+        edge_ab = await services.graph.get_edge("tc-a", "tc-b")
+        edge_ba = await services.graph.get_edge("tc-b", "tc-a")
+        assert edge_ab is not None or edge_ba is not None
+
+    async def test_e10_edge_has_sst_semantic_near(
+        self, services: HookStateService
+    ) -> None:
+        """E10 edge must have sst_semantic='NEAR'."""
+        handler = ToolCallHandler(services)
+
+        data_a = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-a",
+            "tool_name": "bash",
+            "parallel_group_id": "pg-1",
+        }
+        data_b = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-b",
+            "tool_name": "read_file",
+            "parallel_group_id": "pg-1",
+        }
+        await handler("tool:pre", data_a)
+        await handler("tool:pre", data_b)
+
+        edge = await services.graph.get_edge("tc-a", "tc-b")
+        if edge is None:
+            edge = await services.graph.get_edge("tc-b", "tc-a")
+        assert edge is not None
+        assert edge.get("sst_semantic") == "NEAR"
+
+    async def test_e10_three_tools_produce_three_edges(
+        self, services: HookStateService
+    ) -> None:
+        """Three parallel tools must produce three PARALLEL_EXECUTION edges.
+
+        A-B when B arrives; C-A and C-B when C arrives.
+        """
+        handler = ToolCallHandler(services)
+
+        for tool_id, tool_name in [
+            ("tc-a", "bash"),
+            ("tc-b", "read_file"),
+            ("tc-c", "write_file"),
+        ]:
+            await handler(
+                "tool:pre",
+                {
+                    "session_id": "s1",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "tool_call_id": tool_id,
+                    "tool_name": tool_name,
+                    "parallel_group_id": "pg-1",
+                },
+            )
+
+        parallel_edges = [
+            edge
+            for (src, dst), edge in services.graph._edges.items()
+            if edge.get("type") == "PARALLEL_EXECUTION"
+        ]
+        assert len(parallel_edges) == 3
+
+    async def test_e10_no_edge_when_no_parallel_group_id(
+        self, services: HookStateService
+    ) -> None:
+        """E10 edge must NOT be created when parallel_group_id is absent."""
+        handler = ToolCallHandler(services)
+
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        await handler("tool:pre", data)
+
+        assert len(services.graph._edges) == 0
+
+    async def test_e10_different_groups_do_not_link(
+        self, services: HookStateService
+    ) -> None:
+        """Tools in different parallel groups must NOT be linked to each other."""
+        handler = ToolCallHandler(services)
+
+        data_a = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-a",
+            "tool_name": "bash",
+            "parallel_group_id": "pg-1",
+        }
+        data_b = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-b",
+            "tool_name": "read_file",
+            "parallel_group_id": "pg-2",
+        }
+        await handler("tool:pre", data_a)
+        await handler("tool:pre", data_b)
+
+        # No cross-group PARALLEL_EXECUTION edges
+        edge_ab = await services.graph.get_edge("tc-a", "tc-b")
+        edge_ba = await services.graph.get_edge("tc-b", "tc-a")
+        assert edge_ab is None
+        assert edge_ba is None
+
+
+# ---------------------------------------------------------------------------
+# 10. TestToolCallHandlerHasParallelGroups
+# ---------------------------------------------------------------------------
+
+
+class TestToolCallHandlerHasParallelGroups:
+    """Handler must have _parallel_groups as dict instance variable."""
+
+    def test_handler_has_parallel_groups_attribute(
+        self, services: HookStateService
+    ) -> None:
+        """ToolCallHandler must have _parallel_groups as a dict instance variable."""
+        handler = ToolCallHandler(services)
+        assert hasattr(handler, "_parallel_groups")
+        assert isinstance(handler._parallel_groups, dict)
