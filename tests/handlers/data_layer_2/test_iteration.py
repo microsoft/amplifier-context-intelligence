@@ -61,9 +61,7 @@ class TestProviderRequestCreatesIteration:
         )
         node_id = "s1::iteration::1"
         node = await services.graph.get_node(node_id)
-        assert node is not None, (
-            f"provider:request must create node at '{node_id}'"
-        )
+        assert node is not None, f"provider:request must create node at '{node_id}'"
 
     async def test_node_has_iteration_and_sst_event_labels(
         self, services: HookStateService
@@ -131,7 +129,9 @@ class TestProviderRequestCreatesIteration:
         )
         node1 = await services.graph.get_node("s1::iteration::1")
         node2 = await services.graph.get_node("s1::iteration::2")
-        assert node1 is not None, "First Iteration node must exist at 's1::iteration::1'"
+        assert node1 is not None, (
+            "First Iteration node must exist at 's1::iteration::1'"
+        )
         assert node2 is not None, (
             "Second provider:request must create node at 's1::iteration::2'"
         )

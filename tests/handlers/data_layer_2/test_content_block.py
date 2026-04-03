@@ -16,7 +16,9 @@ Covers:
 
 from __future__ import annotations
 
-from context_intelligence_server.handlers.data_layer_2.content_block import ContentBlockHandler
+from context_intelligence_server.handlers.data_layer_2.content_block import (
+    ContentBlockHandler,
+)
 from context_intelligence_server.services import HookStateService
 
 
@@ -63,9 +65,7 @@ class TestContentBlockStartCreatesNode:
         )
         node_id = "s1::block::1::0"
         node = await services.graph.get_node(node_id)
-        assert node is not None, (
-            f"content_block:start must create node at '{node_id}'"
-        )
+        assert node is not None, f"content_block:start must create node at '{node_id}'"
 
     async def test_node_has_content_block_and_sst_event_labels(
         self, services: HookStateService
@@ -299,13 +299,14 @@ class TestContentBlockToolCallCache:
         assert "tool-block-abc" in services.data_layer_2.pending_tool_block_ids, (
             "block.id must be cached in pending_tool_block_ids for tool_call blocks"
         )
-        assert services.data_layer_2.pending_tool_block_ids["tool-block-abc"] == "s1::block::1::0", (
+        assert (
+            services.data_layer_2.pending_tool_block_ids["tool-block-abc"]
+            == "s1::block::1::0"
+        ), (
             "pending_tool_block_ids['tool-block-abc'] must map to the block node id 's1::block::1::0'"
         )
 
-    async def test_text_block_not_cached(
-        self, services: HookStateService
-    ) -> None:
+    async def test_text_block_not_cached(self, services: HookStateService) -> None:
         """text blocks must NOT be cached in pending_tool_block_ids."""
         services.data_layer_2.active_iteration_id = "s1::iteration::1"
         handler = ContentBlockHandler(services)
