@@ -20,6 +20,7 @@ from context_intelligence_server.handlers.data_layer_2.content_block import (
     ContentBlockHandler,
 )
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +187,8 @@ class TestE07HasPartEdge:
                 "block_index": 0,
             },
         )
-        # No edges should be created when active_iteration_id is None
-        assert len(services.graph._edges) == 0, (
+        # No E07 edge should be created, but SOURCED_FROM edge is always created
+        assert len(services.graph._edges) == 1, (
             f"No E07 edge should exist when active_iteration_id is None. "
             f"Got {len(services.graph._edges)} edges: {list(services.graph._edges.keys())}"
         )
@@ -421,4 +422,74 @@ class TestContentBlockHandlerGuards:
         assert len(services.graph._edges) == 0, (
             f"No graph mutations must occur when session_id is missing. "
             f"Got {len(services.graph._edges)} edges."
+        )
+
+
+# ---------------------------------------------------------------------------
+# 7. TestContentBlockSourcedFrom
+# ---------------------------------------------------------------------------
+
+
+class TestContentBlockSourcedFrom:
+    """SOURCED_FROM bridge edges from ContentBlock to data_layer_1 event nodes."""
+
+    async def test_content_block_start_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """content_block:start must create SOURCED_FROM edge from block node to data_layer_1 event node."""
+        services.data_layer_2.active_iteration_id = "s1::iteration::1"
+        handler = ContentBlockHandler(services)
+        timestamp = "2026-01-01T00:00:00Z"
+        await handler(
+            "content_block:start",
+            {
+                "session_id": "s1",
+                "timestamp": timestamp,
+                "block_index": 0,
+            },
+        )
+        block_node_id = "s1::block::1::0"
+        data_layer_1_node_id = make_node_id("s1", "content_block:start", timestamp)
+        edge = await services.graph.get_edge(block_node_id, data_layer_1_node_id)
+        assert edge is not None, (
+            f"SOURCED_FROM edge from '{block_node_id}' to '{data_layer_1_node_id}' must exist"
+        )
+        assert edge.get("type") == "SOURCED_FROM", (
+            f"Edge must have type='SOURCED_FROM'. Got: {edge.get('type')}"
+        )
+
+    async def test_content_block_end_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """content_block:end must create SOURCED_FROM edge from block node to data_layer_1 event node."""
+        services.data_layer_2.active_iteration_id = "s1::iteration::1"
+        handler = ContentBlockHandler(services)
+        start_timestamp = "2026-01-01T00:00:00Z"
+        end_timestamp = "2026-01-01T00:01:00Z"
+        # Must call content_block:start first
+        await handler(
+            "content_block:start",
+            {
+                "session_id": "s1",
+                "timestamp": start_timestamp,
+                "block_index": 0,
+            },
+        )
+        await handler(
+            "content_block:end",
+            {
+                "session_id": "s1",
+                "timestamp": end_timestamp,
+                "block_index": 0,
+                "block": {"type": "text"},
+            },
+        )
+        block_node_id = "s1::block::1::0"
+        data_layer_1_node_id = make_node_id("s1", "content_block:end", end_timestamp)
+        edge = await services.graph.get_edge(block_node_id, data_layer_1_node_id)
+        assert edge is not None, (
+            f"SOURCED_FROM edge from '{block_node_id}' to '{data_layer_1_node_id}' must exist"
+        )
+        assert edge.get("type") == "SOURCED_FROM", (
+            f"Edge must have type='SOURCED_FROM'. Got: {edge.get('type')}"
         )

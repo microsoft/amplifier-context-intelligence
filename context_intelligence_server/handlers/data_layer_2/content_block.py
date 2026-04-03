@@ -14,6 +14,7 @@ from typing import Any
 
 from context_intelligence_server.protocol import HookResult
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,14 @@ class ContentBlockHandler:
                 },
             )
 
+        # SOURCED_FROM bridge: ContentBlock -> data_layer_1 content_block:start event
+        data_layer_1_node_id = make_node_id(
+            session_id, "content_block:start", timestamp
+        )
+        await self.services.graph.upsert_edge(
+            block_node_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
+        )
+
     async def _handle_end(
         self,
         block_node_id: str,
@@ -131,3 +140,10 @@ class ContentBlockHandler:
                 self.services.data_layer_2.pending_tool_block_ids[block_id] = (
                     block_node_id
                 )
+
+        # SOURCED_FROM bridge: ContentBlock -> data_layer_1 content_block:end event
+        session_id: str = data.get("session_id", "")
+        data_layer_1_node_id = make_node_id(session_id, "content_block:end", timestamp)
+        await self.services.graph.upsert_edge(
+            block_node_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
+        )
