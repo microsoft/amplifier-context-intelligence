@@ -1,5 +1,5 @@
 digraph default_handler_flow {
-    // ── Global defaults ───────────────────────────────────────────────────────
+    // -- Global defaults -------------------------------------------------------
     graph [
         rankdir   = TB
         splines   = ortho
@@ -22,7 +22,7 @@ digraph default_handler_flow {
         fontsize = 10
     ]
 
-    // ── Input ─────────────────────────────────────────────────────────────────
+    // -- Input -----------------------------------------------------------------
     input [
         shape     = oval
         style     = filled
@@ -30,7 +30,7 @@ digraph default_handler_flow {
         label     = "event: dict\n(raw event from recorder)"
     ]
 
-    // ── Stage 1: Label Derivation ─────────────────────────────────────────────
+    // -- Stage 1: Label Derivation ---------------------------------------------
     stage1 [
         fillcolor = "#F5F5F5"
         label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
@@ -43,7 +43,7 @@ digraph default_handler_flow {
         </TABLE>>
     ]
 
-    // ── Stage 2: node_id Computation ──────────────────────────────────────────
+    // -- Stage 2: node_id Computation ------------------------------------------
     stage2 [
         fillcolor = "#F5F5F5"
         label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
@@ -54,7 +54,7 @@ digraph default_handler_flow {
         </TABLE>>
     ]
 
-    // ── Stage 3: Field Lifting (highlighted &#8212; ALL matching lifters fire) ──
+    // -- Stage 3: Field Lifting (highlighted &#8212; ALL matching lifters fire) --
     stage3 [
         fillcolor = "#C8E6C9"
         fontname  = "Helvetica-Bold"
@@ -74,7 +74,7 @@ digraph default_handler_flow {
         </TABLE>>
     ]
 
-    // ── Stage 4: Node Construction ────────────────────────────────────────────
+    // -- Stage 4: Node Construction --------------------------------------------
     stage4 [
         fillcolor = "#F5F5F5"
         label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
@@ -85,7 +85,7 @@ digraph default_handler_flow {
         </TABLE>>
     ]
 
-    // ── Stage 5: HAS_EVENT Edge ───────────────────────────────────────────────
+    // -- Stage 5: HAS_EVENT Edge -----------------------------------------------
     stage5 [
         fillcolor = "#F5F5F5"
         label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
@@ -95,7 +95,7 @@ digraph default_handler_flow {
         </TABLE>>
     ]
 
-    // ── Output ────────────────────────────────────────────────────────────────
+    // -- Output ----------------------------------------------------------------
     output [
         shape     = oval
         style     = filled
@@ -103,15 +103,15 @@ digraph default_handler_flow {
         label     = "Event node persisted\nin Neo4j property graph"
     ]
 
-    // ── Collision rule note ───────────────────────────────────────────────────
+    // -- Collision rule note ---------------------------------------------------
     collision_note [
         shape     = box
         style     = filled
         fillcolor = "#FFF9C4"
-        label     = "⚠ Collision Rule\nLifted fields matching reserved properties\n(node_id, occurred_at, event_name, data, labels)\nare prefixed with data_\nNone values are silently skipped"
+        label     = "[!] Collision Rule\nLifted fields matching reserved properties\n(node_id, occurred_at, event_name, data, labels)\nare prefixed with data_\nNone values are silently skipped"
     ]
 
-    // ── Pipeline edges ────────────────────────────────────────────────────────
+    // -- Pipeline edges --------------------------------------------------------
     input  -> stage1
     stage1 -> stage2
     stage2 -> stage3
@@ -119,10 +119,10 @@ digraph default_handler_flow {
     stage4 -> stage5
     stage5 -> output
 
-    // ── Annotation edge to collision note ─────────────────────────────────────
+    // -- Annotation edge to collision note -------------------------------------
     stage3 -> collision_note [style = dotted, color = "#AAAAAA", arrowhead = none]
 
-    // ── Legend ────────────────────────────────────────────────────────────────
+    // -- Legend ----------------------------------------------------------------
     subgraph cluster_legend {
         graph [
             label    = "Legend"

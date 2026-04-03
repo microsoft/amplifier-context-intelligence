@@ -1,5 +1,5 @@
 digraph pipeline_flow {
-    // ── Global defaults ──────────────────────────────────────────────────────
+    // -- Global defaults ------------------------------------------------------
     graph [
         rankdir   = TB
         splines   = ortho
@@ -23,14 +23,14 @@ digraph pipeline_flow {
         fontsize = 10
     ]
 
-    // ── Entry ────────────────────────────────────────────────────────────────
+    // -- Entry ----------------------------------------------------------------
     EventReceived [
         label     = "Event Received"
         shape     = oval
         fillcolor = "#E3F2FD"
     ]
 
-    // ── Session guarantee ────────────────────────────────────────────────────
+    // -- Session guarantee ----------------------------------------------------
     HasSessionId [
         label     = "HasSessionId?"
         shape     = diamond
@@ -43,7 +43,7 @@ digraph pipeline_flow {
         fillcolor = "#F5F5F5"
     ]
 
-    // ── Blob offload ─────────────────────────────────────────────────────────
+    // -- Blob offload ---------------------------------------------------------
     HasBlobStore [
         label     = "HasBlobStore?"
         shape     = diamond
@@ -56,7 +56,7 @@ digraph pipeline_flow {
         fillcolor = "#F5F5F5"
     ]
 
-    // ── DefaultHandler (ALWAYS) ──────────────────────────────────────────────
+    // -- DefaultHandler (ALWAYS) ----------------------------------------------
     DefaultHandler [
         label     = "DefaultHandler [data_layer_1]\n[ALWAYS runs]\n\nCREATE (:Event {\n  :FullPascalEvent, :CategoryEvent, :Event\n  tool_call_id tiebreaker\n})\n(Session)-[:HAS_EVENT]->(Event)"
         fillcolor = "#C8E6C9"
@@ -64,13 +64,13 @@ digraph pipeline_flow {
         penwidth  = 2.5
     ]
 
-    // ── Enricher loop ────────────────────────────────────────────────────────
+    // -- Enricher loop --------------------------------------------------------
     EnricherLoop [
         label     = "EnricherLoop\nfor enricher in enrichers[]:\n  if event_type in enricher.handled_events"
         fillcolor = "#E1BEE7"
     ]
 
-    // ── Enrichers (data_layer_2) — conditional dispatch ──────────────────────
+    // -- Enrichers (data_layer_2) -- conditional dispatch ----------------------
     subgraph cluster_enrichers {
         graph [
             label     = "Enrichers [data_layer_2] \u2014 conditional, ADDITIVE dispatch"
@@ -122,7 +122,7 @@ digraph pipeline_flow {
         ]
     }
 
-    // ── Terminal check ───────────────────────────────────────────────────────
+    // -- Terminal check -------------------------------------------------------
     IsTerminal [
         label     = "IsTerminal?\n(session:end)"
         shape     = diamond
@@ -130,20 +130,20 @@ digraph pipeline_flow {
         style     = "filled"
     ]
 
-    // ── Flush ────────────────────────────────────────────────────────────────
+    // -- Flush ----------------------------------------------------------------
     GraphFlush [
         label     = "GraphFlush\ngraph.flush()\ncommit all pending writes"
         fillcolor = "#FFCCBC"
     ]
 
-    // ── Done ─────────────────────────────────────────────────────────────────
+    // -- Done -----------------------------------------------------------------
     Done [
         label     = "Done"
         shape     = oval
         fillcolor = "#E3F2FD"
     ]
 
-    // ── Edges ────────────────────────────────────────────────────────────────
+    // -- Edges ----------------------------------------------------------------
     EventReceived   -> HasSessionId
 
     HasSessionId    -> EnsureSessionNode [label = "yes"]
@@ -182,7 +182,7 @@ digraph pipeline_flow {
 
     GraphFlush -> Done
 
-    // ── Legend ───────────────────────────────────────────────────────────────
+    // -- Legend ---------------------------------------------------------------
     subgraph cluster_legend {
         graph [
             label     = "Legend"

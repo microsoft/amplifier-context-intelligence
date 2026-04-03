@@ -1,5 +1,5 @@
 digraph handler_architecture {
-    // ─── Global defaults ──────────────────────────────────────────────────────
+    // --- Global defaults ------------------------------------------------------
     graph [
         rankdir   = TB
         splines   = ortho
@@ -22,7 +22,7 @@ digraph handler_architecture {
         fontsize = 10
     ]
 
-    // ─── PipelineHandlers (NamedTuple) ────────────────────────────────────────
+    // --- PipelineHandlers (NamedTuple) ----------------------------------------
     PipelineHandlers [
         style     = "filled,rounded"
         fillcolor = "#E3F2FD"
@@ -33,7 +33,7 @@ digraph handler_architecture {
         </TABLE>>
     ]
 
-    // ─── Shared Contract ─────────────────────────────────────────────────────
+    // --- Shared Contract -----------------------------------------------------
     subgraph cluster_protocol {
         graph [
             label     = "Shared Contract\ncontext_intelligence_server/protocol.py"
@@ -55,7 +55,7 @@ digraph handler_architecture {
         ]
     }
 
-    // ─── Routers (separate concern) ──────────────────────────────────────────
+    // --- Routers (separate concern) ------------------------------------------
     subgraph cluster_routers {
         graph [
             label     = "routers/\nFastAPI HTTP endpoints (separate concern)"
@@ -81,7 +81,7 @@ digraph handler_architecture {
         SkillsRouter -> VersionRouter [style = invis]
     }
 
-    // ─── Data Layer 1: Raw event capture ────────────────────────────────────
+    // --- Data Layer 1: Raw event capture ------------------------------------
     subgraph cluster_data_layer_1 {
         graph [
             label     = "handlers/data_layer_1/\nRaw event capture"
@@ -123,7 +123,7 @@ digraph handler_architecture {
         DefaultHandler -> FieldLifters [label = "delegates field\nextraction to"]
     }
 
-    // ─── Data Layer 2: Semantic enrichment ──────────────────────────────────
+    // --- Data Layer 2: Semantic enrichment ----------------------------------
     subgraph cluster_data_layer_2 {
         graph [
             label     = "handlers/data_layer_2/\nSemantic enrichment (8 enrichers)"
@@ -235,7 +235,7 @@ digraph handler_architecture {
         ]
     }
 
-    // ─── DataLayer2State (shared per-session state) ──────────────────────────
+    // --- DataLayer2State (shared per-session state) --------------------------
     subgraph cluster_state {
         graph [
             label     = "handlers/data_layer_2/state.py\nShared per-session cross-handler state"
@@ -261,14 +261,14 @@ digraph handler_architecture {
         ]
     }
 
-    // ─── Warning note ────────────────────────────────────────────────────────
+    // --- Warning note --------------------------------------------------------
     warning_note [
         style     = "filled"
         fillcolor = "#FFF9C4"
         label     = "\u26a0 IMPORTANT\nClaiming an event does NOT prevent\nDefaultHandler from running.\nEnrichers are ADDITIVE \u2014 DefaultHandler\nalways creates the base Event node first."
     ]
 
-    // ─── Legend ──────────────────────────────────────────────────────────────
+    // --- Legend --------------------------------------------------------------
     subgraph cluster_legend {
         graph [
             label     = "Legend"
@@ -313,7 +313,7 @@ digraph handler_architecture {
         legend_contract -> legend_capture -> legend_enrich -> legend_state -> legend_http -> legend_warning [style = invis]
     }
 
-    // ─── Structural edges ────────────────────────────────────────────────────
+    // --- Structural edges ----------------------------------------------------
     PipelineHandlers -> DefaultHandler             [label = "default"]
     PipelineHandlers -> SessionHandler             [label = "enrichers[0]"]
     PipelineHandlers -> OrchestratorRunHandler     [label = "enrichers[1]"]
@@ -337,7 +337,7 @@ digraph handler_architecture {
     CancellationHandler     -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
     ContextCompactionHandler -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
 
-    // ─── State read / write arrows (constraint=false to preserve layout) ─────
+    // --- State read / write arrows (constraint=false to preserve layout) -----
     // OrchestratorRunHandler
     OrchestratorRunHandler -> DataLayer2State [
         label      = "writes execution_start_ts\nlast_completed_orch_run_id"

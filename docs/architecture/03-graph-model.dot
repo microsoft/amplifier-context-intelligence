@@ -1,5 +1,5 @@
 digraph graph_model {
-    // ── Global defaults ──────────────────────────────────────────────────────
+    // -- Global defaults ------------------------------------------------------
     graph [
         rankdir   = LR
         compound  = true
@@ -23,7 +23,7 @@ digraph graph_model {
         fontsize = 9
     ]
 
-    // ── Sessions cluster ─────────────────────────────────────────────────────
+    // -- Sessions cluster -----------------------------------------------------
     subgraph cluster_sessions {
         graph [
             label     = "Session Nodes"
@@ -71,7 +71,7 @@ digraph graph_model {
         RootSession -> ForkedSession [style = invis]
     }
 
-    // ── Execution cluster ────────────────────────────────────────────────────
+    // -- Execution cluster ----------------------------------------------------
     subgraph cluster_execution {
         graph [
             label     = "Execution"
@@ -97,7 +97,7 @@ digraph graph_model {
         ]
     }
 
-    // ── LLM loop cluster ─────────────────────────────────────────────────────
+    // -- LLM loop cluster -----------------------------------------------------
     subgraph cluster_llm_loop {
         graph [
             label     = "LLM Loop"
@@ -166,7 +166,7 @@ digraph graph_model {
         ContentBlock -> ToolCallPeer [style = invis]
     }
 
-    // ── Prompt cluster ───────────────────────────────────────────────────────
+    // -- Prompt cluster -------------------------------------------------------
     subgraph cluster_prompt {
         graph [
             label     = "Turn-Flow"
@@ -190,7 +190,7 @@ digraph graph_model {
         ]
     }
 
-    // ── Side events cluster ──────────────────────────────────────────────────
+    // -- Side events cluster --------------------------------------------------
     subgraph cluster_side_events {
         graph [
             label     = "Side Events"
@@ -226,7 +226,7 @@ digraph graph_model {
         Cancellation -> ContextCompaction [style = invis]
     }
 
-    // ── Concept / Thing cluster ──────────────────────────────────────────────
+    // -- Concept / Thing cluster ----------------------------------------------
     subgraph cluster_concepts {
         graph [
             label     = "Concept / Thing Nodes"
@@ -261,9 +261,9 @@ digraph graph_model {
         Orchestrator -> MountPlan [style = invis]
     }
 
-    // ── Edges ────────────────────────────────────────────────────────────────
+    // -- Edges ----------------------------------------------------------------
 
-    // E01: HAS_EXECUTION [CONTAINS] — Session → OrchestratorRun
+    // E01: HAS_EXECUTION [CONTAINS] -- Session -> OrchestratorRun
     RootSession -> OrchestratorRun [
         label     = "E01: HAS_EXECUTION\n{sst_semantic: CONTAINS}"
         color     = "#1565C0"
@@ -271,7 +271,7 @@ digraph graph_model {
         penwidth  = 2
     ]
 
-    // E02: FORKED [LEADS_TO] — Session → ForkedSession
+    // E02: FORKED [LEADS_TO] -- Session -> ForkedSession
     RootSession -> ForkedSession [
         label     = "E02: FORKED\n{sst_semantic: LEADS_TO}"
         color     = "#E53935"
@@ -279,7 +279,7 @@ digraph graph_model {
         penwidth  = 2
     ]
 
-    // E03: HAS_ATTRIBUTE [EXPRESSES] — Session → Orchestrator
+    // E03: HAS_ATTRIBUTE [EXPRESSES] -- Session -> Orchestrator
     RootSession -> Orchestrator [
         label     = "E03: HAS_ATTRIBUTE\n{sst_semantic: EXPRESSES}"
         color     = "#2E7D32"
@@ -287,7 +287,7 @@ digraph graph_model {
         penwidth  = 2
     ]
 
-    // E04: HAS_PART [CONTAINS] — Session → MountPlan
+    // E04: HAS_PART [CONTAINS] -- Session -> MountPlan
     RootSession -> MountPlan [
         label     = "E04: HAS_PART\n{sst_semantic: CONTAINS}"
         color     = "#1565C0"
@@ -296,7 +296,7 @@ digraph graph_model {
         style     = dashed
     ]
 
-    // E05: HAS_PART [CONTAINS] — Session → Prompt
+    // E05: HAS_PART [CONTAINS] -- Session -> Prompt
     RootSession -> Prompt [
         label     = "E05: HAS_PART\n{sst_semantic: CONTAINS}"
         color     = "#1565C0"
@@ -304,7 +304,7 @@ digraph graph_model {
         penwidth  = 2
     ]
 
-    // E06: HAS_PART [CONTAINS] — OrchestratorRun → Iteration
+    // E06: HAS_PART [CONTAINS] -- OrchestratorRun -> Iteration
     OrchestratorRun -> Iteration [
         label     = "E06: HAS_PART\n{sst_semantic: CONTAINS}"
         color     = "#1565C0"
@@ -312,7 +312,7 @@ digraph graph_model {
         penwidth  = 2
     ]
 
-    // E07: HAS_PART [CONTAINS] — Iteration → ContentBlock
+    // E07: HAS_PART [CONTAINS] -- Iteration -> ContentBlock
     Iteration -> ContentBlock [
         label     = "E07: HAS_PART\n{sst_semantic: CONTAINS}"
         color     = "#1565C0"
@@ -320,7 +320,7 @@ digraph graph_model {
         penwidth  = 2
     ]
 
-    // E08: HAS_TOOL_CALL [CONTAINS] — Iteration → ToolCall
+    // E08: HAS_TOOL_CALL [CONTAINS] -- Iteration -> ToolCall
     Iteration -> ToolCall [
         label     = "E08: HAS_TOOL_CALL\n{sst_semantic: CONTAINS}"
         color     = "#1565C0"
@@ -328,7 +328,7 @@ digraph graph_model {
         penwidth  = 2
     ]
 
-    // E09: CAUSED [LEADS_TO] — ContentBlock → ToolCall
+    // E09: CAUSED [LEADS_TO] -- ContentBlock -> ToolCall
     ContentBlock -> ToolCall [
         label     = "E09: CAUSED\n{sst_semantic: LEADS_TO}"
         color     = "#E53935"
@@ -336,17 +336,17 @@ digraph graph_model {
         penwidth  = 2
     ]
 
-    // E10: PARALLEL_EXECUTION [NEAR] — ToolCall ↔ ToolCall (undirected)
+    // E10: PARALLEL_EXECUTION [NEAR] -- ToolCall <-> ToolCall (undirected)
     ToolCall -> ToolCallPeer [
         dir       = none
-        label     = "E10: PARALLEL_EXECUTION\n{sst_semantic: NEAR}\n[undirected — same parallel_group_id]"
+        label     = "E10: PARALLEL_EXECUTION\n{sst_semantic: NEAR}\n[undirected -- same parallel_group_id]"
         color     = "#7B1FA2"
         fontcolor = "#7B1FA2"
         penwidth  = 2
         style     = dashed
     ]
 
-    // E11: HAS_PART [CONTAINS] — Session → Cancellation
+    // E11: HAS_PART [CONTAINS] -- Session -> Cancellation
     RootSession -> Cancellation [
         label     = "E11: HAS_PART\n{sst_semantic: CONTAINS}"
         color     = "#1565C0"
@@ -354,7 +354,7 @@ digraph graph_model {
         penwidth  = 1.5
     ]
 
-    // E12: HAS_COMPACTION [CONTAINS] — Session → ContextCompaction
+    // E12: HAS_COMPACTION [CONTAINS] -- Session -> ContextCompaction
     RootSession -> ContextCompaction [
         label     = "E12: HAS_COMPACTION\n{sst_semantic: CONTAINS}"
         color     = "#1565C0"
@@ -362,7 +362,7 @@ digraph graph_model {
         penwidth  = 1.5
     ]
 
-    // E13: HAS_SUBSESSION [LEADS_TO] — Session → SubSession
+    // E13: HAS_SUBSESSION [LEADS_TO] -- Session -> SubSession
     RootSession -> SubSession [
         label     = "E13: HAS_SUBSESSION\n{sst_semantic: LEADS_TO}"
         color     = "#E53935"
@@ -370,7 +370,7 @@ digraph graph_model {
         penwidth  = 2
     ]
 
-    // E14: TRIGGERS [LEADS_TO] — Prompt → OrchestratorRun (turn-flow cursor)
+    // E14: TRIGGERS [LEADS_TO] -- Prompt -> OrchestratorRun (turn-flow cursor)
     Prompt -> OrchestratorRun [
         label     = "E14: TRIGGERS\n{sst_semantic: LEADS_TO}"
         color     = "#E53935"
@@ -380,7 +380,7 @@ digraph graph_model {
         constraint = false
     ]
 
-    // E15: ENABLES [LEADS_TO] — OrchestratorRun → Prompt (turn-flow cursor)
+    // E15: ENABLES [LEADS_TO] -- OrchestratorRun -> Prompt (turn-flow cursor)
     OrchestratorRun -> Prompt [
         label     = "E15: ENABLES\n{sst_semantic: LEADS_TO}"
         color     = "#E53935"
@@ -390,7 +390,7 @@ digraph graph_model {
         constraint = false
     ]
 
-    // ── Notes ────────────────────────────────────────────────────────────────
+    // -- Notes ----------------------------------------------------------------
     note_turn_cycle [
         shape     = box
         style     = filled
@@ -409,7 +409,7 @@ digraph graph_model {
     OrchestratorRun -> note_turn_cycle [style = dotted, color = "#AAAAAA", arrowhead = none, constraint = false]
     RootSession     -> note_fork_guard  [style = dotted, color = "#AAAAAA", arrowhead = none, constraint = false]
 
-    // ── Legend ───────────────────────────────────────────────────────────────
+    // -- Legend ---------------------------------------------------------------
     subgraph cluster_legend {
         graph [
             label     = "Legend"
