@@ -14,6 +14,7 @@ from typing import Any
 
 from context_intelligence_server.protocol import HookResult
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 
 class PromptHandler:
@@ -57,6 +58,12 @@ class PromptHandler:
                 "prompt": prompt_text,
                 "occurred_at": timestamp,
             },
+        )
+
+        # SOURCED_FROM bridge: Prompt -> data_layer_1 prompt:submit event
+        data_layer_1_node_id = make_node_id(session_id, "prompt:submit", timestamp)
+        await self.services.graph.upsert_edge(
+            prompt_node_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
         )
 
         # E05: Session -[:HAS_PART {sst_semantic: 'CONTAINS'}]-> Prompt (always)

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from context_intelligence_server.handlers.data_layer_2.prompt import PromptHandler
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 
 # ---------------------------------------------------------------------------
@@ -189,9 +190,9 @@ class TestPromptE15Edge:
             },
         )
         # No orch_run exists, so no edge can be formed
-        # Verify by checking the graph has exactly 1 edge (E05 only)
-        assert len(services.graph._edges) == 1, (
-            f"Expected exactly 1 edge (E05), got {len(services.graph._edges)}"
+        # Verify by checking the graph has exactly 2 edges (E05 + SOURCED_FROM)
+        assert len(services.graph._edges) == 2, (
+            f"Expected exactly 2 edges (E05 + SOURCED_FROM), got {len(services.graph._edges)}"
         )
 
     async def test_e15_clears_cursor_after_creation(
@@ -305,3 +306,37 @@ class TestPromptSessionIdGuard:
             {"timestamp": "2026-01-01T00:00:00Z", "prompt": "hello"},
         )
         assert result.action == "continue"
+
+
+# ---------------------------------------------------------------------------
+# 7. TestPromptSourcedFrom
+# ---------------------------------------------------------------------------
+
+
+class TestPromptSourcedFrom:
+    """SOURCED_FROM: Prompt -[:SOURCED_FROM]-> data_layer_1 prompt:submit event node."""
+
+    async def test_sourced_from_edge_created_for_prompt_submit(
+        self, services: HookStateService
+    ) -> None:
+        """prompt:submit must create a SOURCED_FROM edge from the Prompt node to the
+        data_layer_1 event node identified by make_node_id(session_id, 'prompt:submit', timestamp).
+        """
+        handler = PromptHandler(services)
+        await handler(
+            "prompt:submit",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "prompt": "hello world",
+            },
+        )
+        prompt_node_id = "s1::prompt::2026-01-01T00:00:00Z"
+        data_layer_1_node_id = make_node_id(
+            "s1", "prompt:submit", "2026-01-01T00:00:00Z"
+        )
+        edge = await services.graph.get_edge(prompt_node_id, data_layer_1_node_id)
+        assert edge is not None, (
+            f"SOURCED_FROM edge must exist from '{prompt_node_id}' to '{data_layer_1_node_id}'"
+        )
+        assert edge["type"] == "SOURCED_FROM"
