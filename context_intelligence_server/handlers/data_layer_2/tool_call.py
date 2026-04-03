@@ -130,7 +130,11 @@ class ToolCallHandler:
         timestamp: str,
         data: dict[str, Any],
     ) -> None:
-        """Enrich existing ToolCall node with completion properties."""
+        """Enrich existing ToolCall node with completion properties.
+
+        Also creates a SOURCED_FROM edge from the ToolCall node to the
+        corresponding data_layer_1 tool:post event node (with disambiguator).
+        """
         result: dict[str, Any] = data.get("result", {})
         node_data: dict[str, Any] = {
             "labels": ["ToolCall", "SST_EVENT"],
@@ -159,7 +163,9 @@ class ToolCallHandler:
         """Mark ToolCall as failed with error details.
 
         Uses upsert semantics so safe to call even when no prior tool:pre was
-        received. No Phase B cursor edges are attempted.
+        received. No Phase B cursor edges are attempted. Also creates a
+        SOURCED_FROM edge from the ToolCall node to the corresponding
+        data_layer_1 tool:error event node (with disambiguator).
         """
         result_error: str | None = (
             data.get("error") or data.get("error_message") or data.get("message")
