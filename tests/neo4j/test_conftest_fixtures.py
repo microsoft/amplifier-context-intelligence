@@ -13,20 +13,27 @@ from __future__ import annotations
 
 import importlib
 import sys
+from collections.abc import Generator
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _clear_conftest_module_cache() -> Generator[None, None, None]:
+    """Clear the cached tests.neo4j.conftest module before each test."""
+    sys.modules.pop("tests.neo4j.conftest", None)
+    yield
+    sys.modules.pop("tests.neo4j.conftest", None)
 
 
 def test_conftest_module_importable() -> None:
     """tests.neo4j.conftest must be importable without errors."""
-    # Remove cached module to force fresh import
-    mod_name = "tests.neo4j.conftest"
-    sys.modules.pop(mod_name, None)
-    mod = importlib.import_module(mod_name)
+    mod = importlib.import_module("tests.neo4j.conftest")
     assert mod is not None
 
 
 def test_neo4j_container_fixture_exists() -> None:
     """neo4j_container fixture must be defined in tests.neo4j.conftest."""
-    sys.modules.pop("tests.neo4j.conftest", None)
     mod = importlib.import_module("tests.neo4j.conftest")
     assert hasattr(mod, "neo4j_container"), (
         "neo4j_container fixture not found in tests.neo4j.conftest"
@@ -35,7 +42,6 @@ def test_neo4j_container_fixture_exists() -> None:
 
 def test_neo4j_services_fixture_exists() -> None:
     """neo4j_services fixture must be defined in tests.neo4j.conftest."""
-    sys.modules.pop("tests.neo4j.conftest", None)
     mod = importlib.import_module("tests.neo4j.conftest")
     assert hasattr(mod, "neo4j_services"), (
         "neo4j_services fixture not found in tests.neo4j.conftest"
@@ -44,7 +50,6 @@ def test_neo4j_services_fixture_exists() -> None:
 
 def test_get_free_port_returns_valid_port() -> None:
     """_get_free_port helper must return a valid TCP port (1-65535)."""
-    sys.modules.pop("tests.neo4j.conftest", None)
     mod = importlib.import_module("tests.neo4j.conftest")
     assert hasattr(mod, "_get_free_port"), (
         "_get_free_port helper not found in tests.neo4j.conftest"
@@ -56,8 +61,6 @@ def test_get_free_port_returns_valid_port() -> None:
 
 def test_neo4j_container_fixture_is_session_scoped() -> None:
     """neo4j_container must be session-scoped."""
-
-    sys.modules.pop("tests.neo4j.conftest", None)
     mod = importlib.import_module("tests.neo4j.conftest")
     fixture_fn = mod.neo4j_container
     # pytest wraps fixtures; check the _pytestfixturefunction marker
@@ -70,7 +73,6 @@ def test_neo4j_container_fixture_is_session_scoped() -> None:
 
 def test_neo4j_services_fixture_is_function_scoped() -> None:
     """neo4j_services must be function-scoped (default)."""
-    sys.modules.pop("tests.neo4j.conftest", None)
     mod = importlib.import_module("tests.neo4j.conftest")
     fixture_fn = mod.neo4j_services
     fixtureinfo = getattr(fixture_fn, "_pytestfixturefunction", None)

@@ -19,6 +19,7 @@ from typing import Any, Generator
 
 import httpx
 import pytest
+from neo4j import GraphDatabase
 
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
 from context_intelligence_server.services import HookStateService
@@ -63,7 +64,11 @@ def neo4j_container() -> Generator[dict[str, Any], None, None]:
             if r.status_code < 500:
                 break
         except Exception:
-            time.sleep(1)
+            pass
+        time.sleep(1)
+    else:
+        container.stop()
+        pytest.fail("Neo4j container did not become ready within 60 seconds")
 
     yield {
         "bolt_url": f"bolt://localhost:{bolt_port}",
@@ -96,8 +101,6 @@ def neo4j_services(
     yield services
 
     # Clean up all data between tests — synchronous driver for teardown
-    from neo4j import GraphDatabase
-
     driver = GraphDatabase.driver(
         neo4j_container["bolt_url"],
         auth=(neo4j_container["user"], neo4j_container["password"]),
