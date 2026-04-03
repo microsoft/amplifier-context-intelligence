@@ -19,6 +19,7 @@ from context_intelligence_server.handlers.data_layer_2.session import (
     _current_type,
 )
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 
 class TestTypeLabelConstant:
@@ -133,8 +134,10 @@ class TestSessionStart:
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        # No parent — no edge should be created at all
-        assert len(services.graph._edges) == 0, "root session must not create any edge"
+        # No parent — only the SOURCED_FROM edge to the data_layer_1 session:start event node
+        assert len(services.graph._edges) == 1, (
+            "root session must create exactly 1 SOURCED_FROM edge"
+        )
 
     async def test_subsession_labels(self, services: HookStateService) -> None:
         handler = SessionHandler(services)
@@ -664,7 +667,9 @@ class TestSessionLabelStateMachine:
         assert node is not None
         assert "RootSession" in node["labels"]
         assert "SubSession" not in node["labels"]
-        assert len(services.graph._edges) == 0
+        assert len(services.graph._edges) == 1, (
+            "bare root session must create exactly 1 SOURCED_FROM edge"
+        )
 
     async def test_start_bare_with_parent_creates_subsession(
         self, services: HookStateService
@@ -1320,4 +1325,95 @@ class TestSessionEdgeSstSemantic:
         assert edge is not None
         assert edge.get("sst_semantic") == "LEADS_TO", (
             f"FORKED edge must have sst_semantic='LEADS_TO'. Got: {edge.get('sst_semantic')}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestSessionSourcedFrom — SOURCED_FROM bridge edges Session -> data_layer_1 event node
+# ---------------------------------------------------------------------------
+
+
+class TestSessionSourcedFrom:
+    """Session handler must create SOURCED_FROM edges to data_layer_1 event nodes.
+
+    For each session:start, session:fork, and session:end event, a SOURCED_FROM
+    edge must be created from the Session node to the corresponding data_layer_1
+    event node (identified via make_node_id). These edges bridge data_layer_2
+    Session nodes to the data_layer_1 event log for provenance tracking.
+    """
+
+    async def test_session_start_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """session:start must create a SOURCED_FROM edge Session -> data_layer_1 event node."""
+        handler = SessionHandler(services)
+        timestamp = "2026-01-01T00:00:00Z"
+        await handler(
+            "session:start",
+            {
+                "session_id": "s1",
+                "timestamp": timestamp,
+            },
+        )
+        data_layer_1_node_id = make_node_id("s1", "session:start", timestamp)
+        edge = await services.graph.get_edge("s1", data_layer_1_node_id)
+        assert edge is not None, (
+            f"session:start must create a SOURCED_FROM edge to {data_layer_1_node_id!r}"
+        )
+        assert edge.get("type") == "SOURCED_FROM", (
+            f"Edge must have type='SOURCED_FROM'. Got: {edge.get('type')}"
+        )
+        assert edge.get("sst_semantic") is None, (
+            f"SOURCED_FROM edge must not carry sst_semantic. Got: {edge.get('sst_semantic')}"
+        )
+
+    async def test_session_fork_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork must create a SOURCED_FROM edge Session -> data_layer_1 event node."""
+        handler = SessionHandler(services)
+        timestamp = "2026-01-01T00:00:00Z"
+        await handler(
+            "session:fork",
+            {
+                "session_id": "f1",
+                "parent_id": "p1",
+                "timestamp": timestamp,
+            },
+        )
+        data_layer_1_node_id = make_node_id("f1", "session:fork", timestamp)
+        edge = await services.graph.get_edge("f1", data_layer_1_node_id)
+        assert edge is not None, (
+            f"session:fork must create a SOURCED_FROM edge to {data_layer_1_node_id!r}"
+        )
+        assert edge.get("type") == "SOURCED_FROM", (
+            f"Edge must have type='SOURCED_FROM'. Got: {edge.get('type')}"
+        )
+        assert edge.get("sst_semantic") is None, (
+            f"SOURCED_FROM edge must not carry sst_semantic. Got: {edge.get('sst_semantic')}"
+        )
+
+    async def test_session_end_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """session:end must create a SOURCED_FROM edge Session -> data_layer_1 event node."""
+        handler = SessionHandler(services)
+        timestamp = "2026-01-01T01:00:00Z"
+        await handler(
+            "session:end",
+            {
+                "session_id": "s1",
+                "timestamp": timestamp,
+            },
+        )
+        data_layer_1_node_id = make_node_id("s1", "session:end", timestamp)
+        edge = await services.graph.get_edge("s1", data_layer_1_node_id)
+        assert edge is not None, (
+            f"session:end must create a SOURCED_FROM edge to {data_layer_1_node_id!r}"
+        )
+        assert edge.get("type") == "SOURCED_FROM", (
+            f"Edge must have type='SOURCED_FROM'. Got: {edge.get('type')}"
+        )
+        assert edge.get("sst_semantic") is None, (
+            f"SOURCED_FROM edge must not carry sst_semantic. Got: {edge.get('sst_semantic')}"
         )

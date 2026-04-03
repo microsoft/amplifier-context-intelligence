@@ -7,7 +7,11 @@ from typing import Any
 
 from context_intelligence_server.protocol import HookResult
 from context_intelligence_server.services import HookStateService
-from context_intelligence_server.utils import EventLogContext, HandlerLogger
+from context_intelligence_server.utils import (
+    EventLogContext,
+    HandlerLogger,
+    make_node_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +95,12 @@ class SessionHandler:
                 "session_id": session_id,
                 "parent_id": parent_id if parent_id else None,
             },
+        )
+
+        # SOURCED_FROM bridge: Session -> data_layer_1 session:start event
+        data_layer_1_node_id = make_node_id(session_id, "session:start", timestamp)
+        await self.services.graph.upsert_edge(
+            session_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
         )
 
         # ForkedSession: fully terminal — preserve classification, no edge creation
@@ -181,6 +191,12 @@ class SessionHandler:
             },
         )
 
+        # SOURCED_FROM bridge: Session -> data_layer_1 session:fork event
+        data_layer_1_node_id = make_node_id(session_id, "session:fork", timestamp)
+        await self.services.graph.upsert_edge(
+            session_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
+        )
+
         # ForkedSession: fully terminal — preserve classification, return immediately
         if current_type == "ForkedSession":
             await self._create_mount_plan(session_id)
@@ -238,6 +254,12 @@ class SessionHandler:
                 "status": "completed",
                 "session_id": session_id,
             },
+        )
+
+        # SOURCED_FROM bridge: Session -> data_layer_1 session:end event
+        data_layer_1_node_id = make_node_id(session_id, "session:end", timestamp)
+        await self.services.graph.upsert_edge(
+            session_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
         )
 
         # Stub recovery: if session:start was permanently missed (bare Session),
