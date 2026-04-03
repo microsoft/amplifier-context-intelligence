@@ -1,12 +1,13 @@
 """Tests for ToolCallHandler — direct tool_call_id node key, SST_EVENT label, cursor edges.
 
 Verifies:
-- handled_events == frozenset({'tool:pre', 'tool:post'}) — tool:error excluded
+- handled_events == frozenset({'tool:pre', 'tool:post', 'tool:error'})
 - ToolCall node ID is the tool_call_id directly ('tc-abc'), not a compound key
 - Edges created by tool:pre only when cursors are set (E08 when active_iteration_id,
   E09 when pending_tool_block_ids match, E10 when parallel_group_id)
 - SST_EVENT label on all ToolCall nodes
 - result_success / result_output / result_error captured from tool:post
+- tool:error sets result_success=False, result_error, ended_at; creates minimal node if orphaned
 - Guard: missing session_id or tool_call_id short-circuits without mutation
 """
 
@@ -22,15 +23,15 @@ from context_intelligence_server.services import HookStateService
 
 
 class TestToolCallHandlerHandledEvents:
-    """handled_events == frozenset({'tool:pre', 'tool:post'}) — tool:error excluded."""
+    """handled_events == frozenset({'tool:pre', 'tool:post', 'tool:error'})."""
 
     def test_handled_events_is_exact_frozenset(self) -> None:
-        """handled_events must be exactly frozenset({'tool:pre', 'tool:post'})."""
-        assert ToolCallHandler.handled_events == frozenset({"tool:pre", "tool:post"})
+        """handled_events must be exactly frozenset({'tool:pre', 'tool:post', 'tool:error'})."""
+        assert ToolCallHandler.handled_events == frozenset({"tool:pre", "tool:post", "tool:error"})
 
-    def test_tool_error_not_in_handled_events(self) -> None:
-        """tool:error must NOT be in handled_events."""
-        assert "tool:error" not in ToolCallHandler.handled_events
+    def test_tool_error_in_handled_events(self) -> None:
+        """tool:error must be in handled_events."""
+        assert "tool:error" in ToolCallHandler.handled_events
 
 
 # ---------------------------------------------------------------------------
@@ -785,3 +786,135 @@ class TestToolCallHandlerHasParallelGroups:
         handler = ToolCallHandler(services)
         assert hasattr(handler, "_parallel_groups")
         assert isinstance(handler._parallel_groups, dict)
+
+
+# ---------------------------------------------------------------------------
+# 11. TestToolErrorCompletesToolCall
+# ---------------------------------------------------------------------------
+
+
+class TestToolErrorCompletesToolCall:
+    """tool:error marks a ToolCall as failed; creates minimal node if pre was never seen."""
+
+    async def test_tool_error_sets_result_success_false(
+        self, services: HookStateService
+    ) -> None:
+        """tool:error must set result_success=False on the ToolCall node."""
+        handler = ToolCallHandler(services)
+
+        pre_data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        error_data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:01:00Z",
+            "tool_call_id": "tc-abc",
+            "error": "TimeoutError",
+        }
+
+        await handler("tool:pre", pre_data)
+        await handler("tool:error", error_data)
+
+        node = await services.graph.get_node("tc-abc")
+        assert node is not None
+        assert node["result_success"] is False
+
+    async def test_tool_error_sets_result_error_from_error_field(
+        self, services: HookStateService
+    ) -> None:
+        """tool:error must set result_error from the 'error' field ('TimeoutError')."""
+        handler = ToolCallHandler(services)
+
+        pre_data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        error_data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:01:00Z",
+            "tool_call_id": "tc-abc",
+            "error": "TimeoutError",
+        }
+
+        await handler("tool:pre", pre_data)
+        await handler("tool:error", error_data)
+
+        node = await services.graph.get_node("tc-abc")
+        assert node is not None
+        assert node["result_error"] == "TimeoutError"
+
+    async def test_tool_error_sets_ended_at(
+        self, services: HookStateService
+    ) -> None:
+        """tool:error must set ended_at matching the error event timestamp."""
+        handler = ToolCallHandler(services)
+
+        pre_data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        error_data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:01:00Z",
+            "tool_call_id": "tc-abc",
+            "error": "TimeoutError",
+        }
+
+        await handler("tool:pre", pre_data)
+        await handler("tool:error", error_data)
+
+        node = await services.graph.get_node("tc-abc")
+        assert node is not None
+        assert node["ended_at"] == "2026-01-01T00:01:00Z"
+
+    async def test_tool_error_without_prior_pre_creates_minimal_node(
+        self, services: HookStateService
+    ) -> None:
+        """tool:error with no prior tool:pre must create a minimal node with result_success=False."""
+        handler = ToolCallHandler(services)
+
+        error_data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:01:00Z",
+            "tool_call_id": "tc-orphan",
+            "error": "ConnectionError",
+        }
+
+        await handler("tool:error", error_data)
+
+        node = await services.graph.get_node("tc-orphan")
+        assert node is not None
+        assert node["result_success"] is False
+
+    async def test_tool_error_falls_back_to_error_message_field(
+        self, services: HookStateService
+    ) -> None:
+        """tool:error must fall back to 'error_message' key when 'error' is absent."""
+        handler = ToolCallHandler(services)
+
+        pre_data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        error_data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:01:00Z",
+            "tool_call_id": "tc-abc",
+            "error_message": "disk full",
+        }
+
+        await handler("tool:pre", pre_data)
+        await handler("tool:error", error_data)
+
+        node = await services.graph.get_node("tc-abc")
+        assert node is not None
+        assert node["result_error"] == "disk full"
