@@ -17,6 +17,7 @@ from typing import Any
 
 from context_intelligence_server.protocol import HookResult
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,12 @@ class OrchestratorRunHandler:
             },
         )
 
+        # SOURCED_FROM bridge: OrchestratorRun -> data_layer_1 execution:start event
+        data_layer_1_node_id = make_node_id(session_id, "execution:start", timestamp)
+        await self.services.graph.upsert_edge(
+            orch_run_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
+        )
+
         # E14 (conditional): Prompt -[:TRIGGERS {sst_semantic: 'LEADS_TO'}]-> OrchestratorRun
         last_prompt_id = self.services.data_layer_2.last_prompt_id
         if last_prompt_id is not None:
@@ -135,6 +142,12 @@ class OrchestratorRunHandler:
             node_data["response"] = data["response"]
 
         await self.services.graph.upsert_node(orch_run_id, node_data)
+
+        # SOURCED_FROM bridge: OrchestratorRun -> data_layer_1 execution:end event
+        data_layer_1_node_id = make_node_id(session_id, "execution:end", timestamp)
+        await self.services.graph.upsert_edge(
+            orch_run_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
+        )
 
     async def _handle_orchestrator_complete(
         self, session_id: str, data: dict[str, Any]
@@ -187,6 +200,14 @@ class OrchestratorRunHandler:
                 "type": "HAS_ATTRIBUTE",
                 "sst_semantic": "EXPRESSES",
             },
+        )
+
+        # SOURCED_FROM bridge: OrchestratorRun -> data_layer_1 orchestrator:complete event
+        data_layer_1_node_id = make_node_id(
+            session_id, "orchestrator:complete", timestamp
+        )
+        await self.services.graph.upsert_edge(
+            orch_run_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
         )
 
         # Update cursors

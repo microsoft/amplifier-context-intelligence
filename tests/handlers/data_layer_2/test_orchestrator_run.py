@@ -24,6 +24,7 @@ from context_intelligence_server.handlers.data_layer_2.orchestrator_run import (
     OrchestratorRunHandler,
 )
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 
 # ---------------------------------------------------------------------------
@@ -448,9 +449,9 @@ class TestE14TriggersEdge:
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        # Only 1 edge should exist: E01 HAS_EXECUTION (Session -> OrchestratorRun)
-        assert len(services.graph._edges) == 1, (
-            f"Only E01 edge should exist when no last_prompt_id. "
+        # Only 2 edges should exist: E01 HAS_EXECUTION (Session -> OrchestratorRun) + SOURCED_FROM
+        assert len(services.graph._edges) == 2, (
+            f"Only E01 + SOURCED_FROM edges should exist when no last_prompt_id. "
             f"Got {len(services.graph._edges)} edges: {list(services.graph._edges.keys())}"
         )
 
@@ -485,4 +486,98 @@ class TestOrchestratorRunHandlerGuards:
         assert len(services.graph._edges) == 0, (
             f"No graph mutations must occur when session_id is missing. "
             f"Got {len(services.graph._edges)} edges."
+        )
+
+
+# ---------------------------------------------------------------------------
+# 9. TestOrchestratorRunSourcedFrom
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorRunSourcedFrom:
+    """SOURCED_FROM bridge: OrchestratorRun -> data_layer_1 event node."""
+
+    async def test_execution_start_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """execution:start must create SOURCED_FROM edge from OrchestratorRun to data_layer_1 node."""
+        handler = OrchestratorRunHandler(services)
+        await handler(
+            "execution:start",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z"
+        data_layer_1_node_id = make_node_id(
+            "s1", "execution:start", "2026-01-01T00:00:00Z"
+        )
+        edge = await services.graph.get_edge(orch_run_id, data_layer_1_node_id)
+        assert edge is not None, (
+            f"SOURCED_FROM edge from '{orch_run_id}' to '{data_layer_1_node_id}' must exist"
+        )
+        assert edge.get("type") == "SOURCED_FROM", (
+            f"Edge must have type='SOURCED_FROM'. Got: {edge.get('type')}"
+        )
+
+    async def test_execution_end_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """execution:end must create SOURCED_FROM edge from OrchestratorRun to data_layer_1 node."""
+        handler = OrchestratorRunHandler(services)
+        # Must call execution:start first to set the cursor
+        await handler(
+            "execution:start",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+        await handler(
+            "execution:end",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:01:00Z",
+                "status": "completed",
+            },
+        )
+        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z"
+        data_layer_1_node_id = make_node_id(
+            "s1", "execution:end", "2026-01-01T00:01:00Z"
+        )
+        edge = await services.graph.get_edge(orch_run_id, data_layer_1_node_id)
+        assert edge is not None, (
+            f"SOURCED_FROM edge from '{orch_run_id}' to '{data_layer_1_node_id}' must exist"
+        )
+        assert edge.get("type") == "SOURCED_FROM", (
+            f"Edge must have type='SOURCED_FROM'. Got: {edge.get('type')}"
+        )
+
+    async def test_orchestrator_complete_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """orchestrator:complete must create SOURCED_FROM edge from OrchestratorRun to data_layer_1 node."""
+        handler = OrchestratorRunHandler(services)
+        # Must call execution:start first to set the cursor
+        await handler(
+            "execution:start",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+        await handler(
+            "orchestrator:complete",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:02:00Z",
+                "orchestrator": "my-orchestrator",
+                "turn_count": 3,
+            },
+        )
+        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z"
+        data_layer_1_node_id = make_node_id(
+            "s1", "orchestrator:complete", "2026-01-01T00:02:00Z"
+        )
+        edge = await services.graph.get_edge(orch_run_id, data_layer_1_node_id)
+        assert edge is not None, (
+            f"SOURCED_FROM edge from '{orch_run_id}' to '{data_layer_1_node_id}' must exist"
+        )
+        assert edge.get("type") == "SOURCED_FROM", (
+            f"Edge must have type='SOURCED_FROM'. Got: {edge.get('type')}"
         )
