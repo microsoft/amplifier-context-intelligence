@@ -199,7 +199,7 @@ class SessionHandler:
 
         # ForkedSession: fully terminal — preserve classification, return immediately
         if current_type == "ForkedSession":
-            await self._create_mount_plan(session_id)
+            await self._create_mount_plan(session_id, data_layer_1_node_id)
             return
 
         # RootSession or SubSession: reclassify to ForkedSession, rectify edge
@@ -221,7 +221,7 @@ class SessionHandler:
                         "occurred_at": timestamp,
                     },
                 )
-            await self._create_mount_plan(session_id)
+            await self._create_mount_plan(session_id, data_layer_1_node_id)
             return
 
         # bare: add Session + ForkedSession labels (include Session base label for new nodes)
@@ -241,7 +241,7 @@ class SessionHandler:
                     "occurred_at": timestamp,
                 },
             )
-        await self._create_mount_plan(session_id)
+        await self._create_mount_plan(session_id, data_layer_1_node_id)
 
     async def _handle_end(
         self, session_id: str, timestamp: str, data: dict[str, Any]
@@ -278,8 +278,12 @@ class SessionHandler:
         # the process can exit. schedule_flush() is for intermediate events only.
         await self.services.graph.flush()
 
-    async def _create_mount_plan(self, session_id: str) -> None:
-        """E04: Session → MountPlan (record existence, no blob dereferencing)."""
+    async def _create_mount_plan(
+        self, session_id: str, data_layer_1_fork_node_id: str
+    ) -> None:
+        """E04: Session → MountPlan (record existence, no blob dereferencing).
+        SOURCED_FROM: MountPlan → session:fork data_layer_1 event (blob source).
+        """
         mount_plan_id = f"{session_id}::mount_plan"
         await self.services.graph.upsert_node(
             mount_plan_id, {"labels": ["MountPlan", "SST_THING"]}
@@ -288,4 +292,11 @@ class SessionHandler:
             session_id,
             mount_plan_id,
             {"type": "HAS_PART", "sst_semantic": "CONTAINS"},
+        )
+        # SOURCED_FROM bridge: MountPlan -> data_layer_1 session:fork event
+        # The session:fork event contains data.raw (blob) with the full mount plan config
+        await self.services.graph.upsert_edge(
+            mount_plan_id,
+            data_layer_1_fork_node_id,
+            {"type": "SOURCED_FROM"},
         )

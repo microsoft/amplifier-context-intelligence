@@ -1417,3 +1417,35 @@ class TestSessionSourcedFrom:
         assert edge.get("sst_semantic") is None, (
             f"SOURCED_FROM edge must not carry sst_semantic. Got: {edge.get('sst_semantic')}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestSourcedFromMountPlan — MountPlan must have SOURCED_FROM edge to
+#                            the data_layer_1 session:fork event node
+# ---------------------------------------------------------------------------
+
+
+class TestSourcedFromMountPlan:
+    """MountPlan must have a SOURCED_FROM edge to the data_layer_1 session:fork event node.
+
+    The session:fork event carries data.raw (blob) with the full mount plan config.
+    Without this SOURCED_FROM edge, agents cannot navigate from the MountPlan node
+    to the raw session:fork event and its blob payload.
+    """
+
+    async def test_mount_plan_sourced_from_session_fork_event(
+        self, services: HookStateService
+    ) -> None:
+        """MountPlan must have SOURCED_FROM edge to the data_layer_1 session:fork event node."""
+        handler = SessionHandler(services)
+        data = {
+            "session_id": "s1",
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "parent_id": "parent-session",
+        }
+        await handler("session:fork", data)
+
+        mount_plan_id = "s1::mount_plan"
+        expected_dl1_node_id = make_node_id("s1", "session:fork", "2026-01-01T00:00:00.000Z")
+        assert (mount_plan_id, expected_dl1_node_id) in services.graph._edges
+        assert services.graph._edges[(mount_plan_id, expected_dl1_node_id)]["type"] == "SOURCED_FROM"
