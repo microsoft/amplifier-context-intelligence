@@ -452,7 +452,8 @@ class Neo4jGraphStore:
                 # collect(n) AS ns WHERE size(ns) > 1 FOREACH (d IN tail(ns) | DETACH DELETE d)'
                 # to remove existing duplicates, then restart.
                 _LOG.warning(
-                    "Could not create Session uniqueness constraint (existing duplicates?): %s", exc
+                    "Could not create Session uniqueness constraint (existing duplicates?): %s",
+                    exc,
                 )
 
         self._schema_initialized = True
