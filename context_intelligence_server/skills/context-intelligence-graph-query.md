@@ -27,9 +27,12 @@ entities — turns (OrchestratorRun), LLM iterations (Iteration), content blocks
 typed relationships. It answers: *what ran, how, and at what scale.* Conversation
 structure, execution scale, tool correlation, turn-level reasoning.
 
-Both layers coexist in the same graph and can be joined. Use data layer 1 when you
-need exact event fields or the raw timeline. Use data layer 2 when you need structure,
-scale, or causation.
+Both layers coexist in the same graph and are bridged by **SOURCED_FROM** edges — the
+canonical cross-layer connection. Every data layer 2 entity carries one or more
+SOURCED_FROM edges back to the raw data layer 1 events that produced it, giving every
+semantic node a direct provenance link into the original event stream. Use data layer 1
+when you need exact event fields or the raw timeline. Use data layer 2 when you need
+structure, scale, or causation. Navigate between them with SOURCED_FROM.
 
 **Layer identification signal:** The `node_id` separator tells you which layer a node
 came from. `__` (double underscore) = data layer 1 node. `::` (double colon) =
@@ -102,6 +105,7 @@ All edges carry an `sst_semantic` property that expresses the relationship's mea
 | `PARALLEL_EXECUTION` | `NEAR` | ToolCall ↔ ToolCall | These tool calls ran concurrently in the same parallel group |
 | `TRIGGERS` | `LEADS_TO` | Prompt → OrchestratorRun | This prompt started this orchestrator run |
 | `ENABLES` | `LEADS_TO` | OrchestratorRun → Prompt | This run's completion enabled the next prompt |
+| `SOURCED_FROM` | (none) | data_layer_2 entity → data_layer_1 Event | Cross-layer provenance bridge. Every data layer 2 entity has one SOURCED_FROM edge per contributing raw event. No `sst_semantic` — infrastructure, not SST model. |
 
 ---
 
@@ -234,14 +238,50 @@ RETURN count(run) AS turn_count
 
 ## Section 4 — Cross-Layer Queries
 
-Data layer 1 (raw events) and data layer 2 (semantic entities) coexist in the same graph
-and can be joined. Two join strategies cover the common cases.
+Data layer 1 (raw events) and data layer 2 (semantic entities) coexist in the same graph.
+The canonical way to move between them is the `SOURCED_FROM` edge. Two additional fallback
+strategies cover cases where SOURCED_FROM edges are absent (older sessions ingested before
+the SOURCED_FROM handler was deployed).
 
-### Join 1 — ToolCall Direct Match
+### Join 1 — SOURCED_FROM (Canonical)
+
+Every data layer 2 entity is linked back to the raw data layer 1 event(s) that produced
+it via `SOURCED_FROM` edges. This is the preferred join strategy because it is exact,
+direction-aware, and does not require shared scalar keys.
+
+```cypher
+// Navigate from a ToolCall entity back to its source raw event
+MATCH (s:Session {workspace: $workspace, node_id: $session_id})
+      -[:HAS_EXECUTION]->(run:OrchestratorRun)
+      -[:HAS_PART]->(iter:Iteration)
+      -[:HAS_TOOL_CALL]->(tc:ToolCall)
+MATCH (tc)-[:SOURCED_FROM]->(pre:ToolPreEvent)
+RETURN tc.tool_name          AS tool_name,
+       tc.result_success      AS succeeded,
+       pre.occurred_at        AS event_fired_at,
+       pre.data               AS raw_payload
+ORDER BY pre.occurred_at
+```
+
+```cypher
+// Navigate in the reverse direction — from a raw event to the semantic entity it produced
+MATCH (pre:ToolPreEvent {workspace: $workspace, session_id: $session_id})
+MATCH (tc:ToolCall)-[:SOURCED_FROM]->(pre)
+RETURN pre.tool_name          AS event_name,
+       pre.occurred_at        AS fired_at,
+       tc.result_success      AS succeeded,
+       tc.result_output       AS output
+ORDER BY pre.occurred_at
+```
+
+Use this join when you want to retrieve the raw event payload for a semantic entity, or
+when you want the structured result for a raw event.
+
+### Join 2 — ToolCall Direct Match (Fallback)
 
 The `:ToolCall` data layer 2 node uses the provider's `tool_call_id` directly as its
 `node_id`. The `:ToolPreEvent` data layer 1 node lifts the same identifier as its
-`tool_call_id` property. This shared key is the direct join between the layers.
+`tool_call_id` property. This shared key is a direct join between the layers.
 
 ```cypher
 // Find the semantic ToolCall entity for a given raw ToolPreEvent
@@ -254,10 +294,11 @@ RETURN e.tool_name          AS event_tool_name,
        tc.ended_at          AS completed_at
 ```
 
-Use this join when you have a raw event and want the structured result (success, output,
-timing) stored on the data layer 2 entity, or vice versa.
+Use this join when SOURCED_FROM edges are absent (older sessions) and you have a
+ToolPreEvent. It works only for ToolCall entities — other data layer 2 types do not
+share a direct key with data layer 1.
 
-### Join 2 — Session Containment
+### Join 3 — Session Containment (Fallback)
 
 When you need to correlate raw events with the semantic structure of a session, join
 through the shared `:Session` node. Data layer 1 uses `HAS_EVENT` to attach raw event
@@ -554,6 +595,27 @@ RETURN pre.tool_name          AS tool_name,
 ORDER BY pre.occurred_at
 ```
 
+### Pattern 8 — SOURCED_FROM Cross-Layer Navigation
+
+Navigates from a semantic `:ToolCall` entity (data layer 2) through its `SOURCED_FROM`
+edge to the originating `:ToolPreEvent` (data layer 1). Returns both the structured
+result stored on the semantic entity and the raw event timestamp from the event stream.
+Use this pattern as the canonical cross-layer join when SOURCED_FROM edges are present.
+
+```cypher
+MATCH (s:Session {workspace: $workspace, node_id: $session_id})
+      -[:HAS_EXECUTION]->(run:OrchestratorRun)
+      -[:HAS_PART]->(iter:Iteration)
+      -[:HAS_TOOL_CALL]->(tc:ToolCall)
+MATCH (tc)-[:SOURCED_FROM]->(pre:ToolPreEvent)
+RETURN iter.iteration_number  AS iteration,
+       tc.tool_name            AS tool,
+       tc.result_success       AS succeeded,
+       pre.occurred_at         AS event_fired_at,
+       pre.data                AS raw_payload
+ORDER BY pre.occurred_at
+```
+
 ---
 
 ## Gotchas
@@ -580,8 +642,10 @@ etc.) are your first resort. When you need raw payload fields not lifted, retrie
 **4. `ENABLES` edges are sparse.**
 The `ENABLES` edge from `OrchestratorRun` to the next `Prompt` is only written when
 the session has a multi-turn chain. Single-turn sessions and sessions where the run
-ended without a follow-up prompt will have no `ENABLES` edge. Do not rely on `ENABLES`
-existing to determine if a session ended cleanly.
+ended without a follow-up prompt will have no `ENABLES` edge. For a session with N
+prompts, there are exactly N−1 `ENABLES` edges (each run connects to the next prompt,
+but the last run has no successor). Do not rely on `ENABLES` existing to determine if
+a session ended cleanly.
 
 **5. Workspace scoping is mandatory.**
 Every query must include `{workspace: $workspace}` on the anchor node. Omitting the
@@ -595,3 +659,15 @@ means the same logical entity (e.g. an Orchestrator named `loop-streaming`) can 
 as separate nodes in different workspaces. Cross-workspace queries (passing `workspace:
 '*'`) will return one node per workspace, not one node per unique `node_id`. Account
 for this when aggregating across workspaces.
+
+**7. `SOURCED_FROM` edges may be absent on older sessions.**
+Sessions ingested before the SOURCED_FROM handler was deployed will not have any
+cross-layer provenance edges. To check which data layer 2 nodes are missing their
+source link, run:
+
+```cypher
+MATCH (n:SST_EVENT) WHERE NOT (n)-[:SOURCED_FROM]->() AND NOT n:Session RETURN labels(n), count(*)
+```
+
+If this returns results, fall back to Join 2 (ToolCall Direct Match) or Join 3
+(Session Containment) for those sessions.
