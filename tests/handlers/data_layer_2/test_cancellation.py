@@ -15,6 +15,7 @@ from context_intelligence_server.handlers.data_layer_2.cancellation import (
     CancellationHandler,
 )
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 
 # ---------------------------------------------------------------------------
@@ -227,3 +228,37 @@ class TestCancellationSessionIdGuard:
         assert len(services.graph._edges) == 0, (
             "No edges must be created when session_id is missing"
         )
+
+
+# ---------------------------------------------------------------------------
+# 5. TestCancellationSourcedFrom
+# ---------------------------------------------------------------------------
+
+
+class TestCancellationSourcedFrom:
+    """SOURCED_FROM: Cancellation -[:SOURCED_FROM]-> data_layer_1 cancel:completed event node."""
+
+    async def test_sourced_from_edge_created_for_cancel_completed(
+        self, services: HookStateService
+    ) -> None:
+        """cancel:completed must create a SOURCED_FROM edge from the Cancellation node to the
+        data_layer_1 event node identified by make_node_id(session_id, 'cancel:completed', timestamp).
+        """
+        handler = CancellationHandler(services)
+        await handler(
+            "cancel:completed",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "immediate": True,
+            },
+        )
+        cancellation_node_id = "s1::cancellation::2026-01-01T00:00:00Z"
+        data_layer_1_node_id = make_node_id(
+            "s1", "cancel:completed", "2026-01-01T00:00:00Z"
+        )
+        edge = await services.graph.get_edge(cancellation_node_id, data_layer_1_node_id)
+        assert edge is not None, (
+            f"SOURCED_FROM edge must exist from '{cancellation_node_id}' to '{data_layer_1_node_id}'"
+        )
+        assert edge["type"] == "SOURCED_FROM"

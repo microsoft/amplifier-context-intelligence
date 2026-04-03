@@ -16,6 +16,7 @@ from typing import Any
 
 from context_intelligence_server.protocol import HookResult
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 
 class CancellationHandler:
@@ -68,6 +69,12 @@ class CancellationHandler:
                 "type": "HAS_PART",
                 "sst_semantic": "CONTAINS",
             },
+        )
+
+        # SOURCED_FROM bridge: Cancellation -> data_layer_1 cancel:completed event
+        data_layer_1_node_id = make_node_id(session_id, "cancel:completed", timestamp)
+        await self.services.graph.upsert_edge(
+            cancellation_node_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
         )
 
         return HookResult(action="continue")
