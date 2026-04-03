@@ -101,7 +101,7 @@ def pipeline_handlers(
     from context_intelligence_server.pipeline import PipelineHandlers
 
     return PipelineHandlers(
-        default=default_handler,
+        default=default_handler,  # type: ignore[arg-type]
         enrichers=[session_enricher, tool_enricher],
     )
 
@@ -298,7 +298,7 @@ async def test_process_event_multiple_enrichers_both_called(
     enricher_a = _StubEnricher({"shared:event"}, name="enricher_a")
     enricher_b = _StubEnricher({"shared:event"}, name="enricher_b")
     handlers = PipelineHandlers(
-        default=default_handler,
+        default=default_handler,  # type: ignore[arg-type]
         enrichers=[enricher_a, enricher_b],
     )
 
@@ -381,7 +381,7 @@ async def test_process_event_handler_exception_does_not_propagate(
     from context_intelligence_server.pipeline import PipelineHandlers, process_event
 
     default_handler._mock_call = AsyncMock(side_effect=RuntimeError("boom!"))
-    handlers = PipelineHandlers(default=default_handler, enrichers=[])
+    handlers = PipelineHandlers(default=default_handler, enrichers=[])  # type: ignore[arg-type]
 
     # Must NOT raise
     await process_event(mock_worker, "some:event", {"session_id": "sess-123"}, handlers)

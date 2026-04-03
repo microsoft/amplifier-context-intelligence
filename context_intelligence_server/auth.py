@@ -2,7 +2,7 @@
 
 import hmac
 import json
-from collections.abc import Callable
+from collections.abc import Callable, MutableMapping
 from typing import Any
 
 # Paths that are exempt from authentication (health checks, monitoring, dashboard pages).
@@ -28,7 +28,9 @@ class BearerTokenMiddleware:
         self.app = app
         self.api_key = api_key
 
-    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+    async def __call__(
+        self, scope: MutableMapping[str, Any], receive: Any, send: Any
+    ) -> None:
         if scope.get("type") != "http" or self.api_key is None:
             await self.app(scope, receive, send)
             return
