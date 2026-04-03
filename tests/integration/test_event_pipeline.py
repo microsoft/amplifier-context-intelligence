@@ -211,7 +211,9 @@ class TestFullEventSequence:
         """After tool:pre DefaultHandler must create a ToolPre Event node with
         a HAS_EVENT edge from the Session. ToolCallHandler creates E08/E09/E10
         edges only when cursors (active_iteration_id, pending_tool_block_ids,
-        parallel_group_id) are set — none are set in this sequence."""
+        parallel_group_id) are set — none are set in this sequence.
+        ToolCallHandler also creates a SOURCED_FROM edge from the ToolCall node
+        to the ToolPreEvent node (data_layer_2 bridge) regardless of cursors."""
         worker, services = _make_worker_and_services()
         handlers = setup_handlers(services)
 
