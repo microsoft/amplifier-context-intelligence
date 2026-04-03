@@ -47,6 +47,8 @@ class ContentBlockHandler:
 
         block_index = data.get("block_index")
         iteration_id = self.services.data_layer_2.active_iteration_id
+        # ID format is "{session_id}::iteration::{n}"; [-1] extracts the iteration number.
+        # If the cursor format ever changes, this extraction must be updated to match.
         iteration_n = iteration_id.split("::")[-1] if iteration_id else "0"
         block_node_id = f"{session_id}::block::{iteration_n}::{block_index}"
 

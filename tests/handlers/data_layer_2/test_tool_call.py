@@ -222,11 +222,11 @@ class TestToolPreCreatesToolCallNode:
 
 
 # ---------------------------------------------------------------------------
-# 3. TestToolPreNoViolationEdges
+# 3. TestToolPreNoEdgesWithoutCursors
 # ---------------------------------------------------------------------------
 
 
-class TestToolPreNoViolationEdges:
+class TestToolPreNoEdgesWithoutCursors:
     """tool:pre must not create any edges — no HAS_TOOL_CALL, no HAS_EVENT."""
 
     async def test_no_session_to_tool_call_edge(
