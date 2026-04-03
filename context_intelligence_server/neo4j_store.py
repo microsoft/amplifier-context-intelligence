@@ -15,7 +15,7 @@ import json
 import logging
 import re
 from datetime import datetime
-from typing import Any
+from typing import Any, LiteralString, cast
 
 from neo4j import AsyncGraphDatabase
 from neo4j.exceptions import Neo4jError
@@ -329,8 +329,11 @@ class Neo4jGraphStore:
                     for item in label_assignments:
                         labels_str = ":".join(item["labels"])
                         await tx.run(
-                            f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) "
-                            f"SET n:{labels_str}",
+                            cast(
+                                LiteralString,
+                                f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) "
+                                f"SET n:{labels_str}",
+                            ),
                             node_id=item["node_id"],
                             workspace=self.workspace,
                         )
@@ -341,14 +344,20 @@ class Neo4jGraphStore:
                         for label in lp.get("remove", []):
                             _validate_identifier(label, "label")
                             await tx.run(
-                                f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) REMOVE n:{label}",
+                                cast(
+                                    LiteralString,
+                                    f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) REMOVE n:{label}",
+                                ),
                                 node_id=pid,
                                 workspace=self.workspace,
                             )
                         for label in lp.get("add", []):
                             _validate_identifier(label, "label")
                             await tx.run(
-                                f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) SET n:{label}",
+                                cast(
+                                    LiteralString,
+                                    f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) SET n:{label}",
+                                ),
                                 node_id=pid,
                                 workspace=self.workspace,
                             )
