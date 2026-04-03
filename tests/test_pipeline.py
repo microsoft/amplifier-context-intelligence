@@ -170,25 +170,32 @@ def test_setup_handlers_has_enrichers_list() -> None:
 
 
 def test_setup_handlers_enricher_count() -> None:
-    """setup_handlers must return exactly 2 enrichers: SessionHandler and ToolCallHandler."""
+    """setup_handlers must return exactly 5 enrichers in Phase B dispatch order."""
     from context_intelligence_server.pipeline import setup_handlers
     from context_intelligence_server.services import HookStateService
 
     services = HookStateService(workspace="test")
     result = setup_handlers(services)
-    assert len(result.enrichers) == 2
+    assert len(result.enrichers) == 5
 
 
 def test_setup_handlers_enricher_order() -> None:
-    """Enrichers must be [SessionHandler, ToolCallHandler] in that order."""
+    """Enrichers must be [SessionHandler, OrchestratorRunHandler, IterationHandler,
+    ContentBlockHandler, ToolCallHandler] in that dispatch order."""
     from context_intelligence_server.pipeline import setup_handlers
     from context_intelligence_server.handlers.data_layer_2.session import SessionHandler
+    from context_intelligence_server.handlers.data_layer_2.orchestrator_run import OrchestratorRunHandler
+    from context_intelligence_server.handlers.data_layer_2.iteration import IterationHandler
+    from context_intelligence_server.handlers.data_layer_2.content_block import ContentBlockHandler
     from context_intelligence_server.services import HookStateService
 
     services = HookStateService(workspace="test")
     result = setup_handlers(services)
     assert isinstance(result.enrichers[0], SessionHandler)
-    assert type(result.enrichers[1]).__name__ == "ToolCallHandler"
+    assert isinstance(result.enrichers[1], OrchestratorRunHandler)
+    assert isinstance(result.enrichers[2], IterationHandler)
+    assert isinstance(result.enrichers[3], ContentBlockHandler)
+    assert type(result.enrichers[4]).__name__ == "ToolCallHandler"
 
 
 def test_setup_handlers_all_enrichers_have_handled_events() -> None:

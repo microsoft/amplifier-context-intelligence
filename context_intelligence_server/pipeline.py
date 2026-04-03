@@ -6,7 +6,7 @@ Provides four public exports:
 - ``PipelineHandlers`` — NamedTuple with ``default`` (DefaultHandler) and
   ``enrichers`` (list of ordered enrichers)
 - ``setup_handlers(services)`` — return a PipelineHandlers with DefaultHandler
-  and ``[SessionHandler, ToolCallHandler]`` enrichers
+  and ``[SessionHandler, OrchestratorRunHandler, IterationHandler, ContentBlockHandler, ToolCallHandler]`` enrichers
 - ``process_event(worker, event, data, handlers)`` — full pipeline step:
   ensure-session-node → blob processing → always-default dispatch →
   enricher dispatch (for matching events) → terminal flush, all wrapped in a
@@ -58,21 +58,29 @@ def setup_handlers(services: HookStateService) -> PipelineHandlers:
 
     Returns a PipelineHandlers with:
     - ``default``: DefaultHandler instance (always called for every event)
-    - ``enrichers``: [SessionHandler, ToolCallHandler] in dispatch order
+    - ``enrichers``: [SessionHandler, OrchestratorRunHandler, IterationHandler,
+      ContentBlockHandler, ToolCallHandler] in dispatch order
       (called additionally for events they claim)
 
     All handlers receive the same *services* instance.
     """
-    # Local imports to allow tests to stub ToolCallHandler via sys.modules
-    # before it is fully implemented in the handlers package.
+    # Local imports to allow tests to stub handlers via sys.modules
+    # before they are fully implemented in the handlers package.
+    from context_intelligence_server.handlers.data_layer_2.content_block import ContentBlockHandler  # noqa: PLC0415
+    from context_intelligence_server.handlers.data_layer_2.iteration import IterationHandler  # noqa: PLC0415
+    from context_intelligence_server.handlers.data_layer_2.orchestrator_run import OrchestratorRunHandler  # noqa: PLC0415
     from context_intelligence_server.handlers.data_layer_2.session import SessionHandler  # noqa: PLC0415
-    from context_intelligence_server.handlers.data_layer_2.tool_call import (
-        ToolCallHandler,
-    )  # noqa: PLC0415
+    from context_intelligence_server.handlers.data_layer_2.tool_call import ToolCallHandler  # noqa: PLC0415
 
     return PipelineHandlers(
         default=DefaultHandler(services),
-        enrichers=[SessionHandler(services), ToolCallHandler(services)],
+        enrichers=[
+            SessionHandler(services),
+            OrchestratorRunHandler(services),
+            IterationHandler(services),
+            ContentBlockHandler(services),
+            ToolCallHandler(services),
+        ],
     )
 
 
