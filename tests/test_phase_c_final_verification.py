@@ -156,11 +156,11 @@ class TestAll8EnrichersRegistered:
         assert handler.handled_events == {"content_block:start", "content_block:end"}
 
     def test_tool_call_handler_handled_events(self) -> None:
-        """ToolCallHandler must handle tool:pre and tool:post."""
+        """ToolCallHandler must handle tool:pre, tool:post, and tool:error."""
         enrichers = self._get_enrichers()
         handler = enrichers[4]
         assert type(handler).__name__ == "ToolCallHandler"
-        assert handler.handled_events == {"tool:pre", "tool:post"}
+        assert handler.handled_events == {"tool:pre", "tool:post", "tool:error"}
 
     def test_prompt_handler_handled_events(self) -> None:
         """PromptHandler must handle prompt:submit."""

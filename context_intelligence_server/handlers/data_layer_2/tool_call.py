@@ -1,13 +1,14 @@
-"""ToolCallHandler — correlates tool:pre/post events into ToolCall nodes.
+"""ToolCallHandler — correlates tool:pre/post/error events into ToolCall nodes.
 
 Each tool invocation lifecycle produces up to two events:
   tool:pre   — tool invocation started
   tool:post  — tool invocation completed successfully
+  tool:error — tool invocation failed (uncaught exception)
 
 This handler creates a single ToolCall node per invocation (keyed by
 tool_call_id directly) with the SST_EVENT label, and enriches it with
-result properties on tool:post. Phase B cursor edges (E08, E09, E10) are
-created by _handle_pre when the corresponding cursors are set.
+result properties on tool:post or tool:error. Phase B cursor edges (E08,
+E09, E10) are created by _handle_pre when the corresponding cursors are set.
 """
 
 from __future__ import annotations
@@ -24,13 +25,13 @@ logger = logging.getLogger(__name__)
 class ToolCallHandler:
     """Enricher handler for tool call lifecycle events.
 
-    Correlates tool:pre and tool:post events into a single ToolCall node in
-    the graph. The ToolCall node ID is the tool_call_id directly (not a
-    compound key). Phase B cursor edges (E08, E09, E10) are created by
-    _handle_pre when the corresponding cursors are set.
+    Correlates tool:pre, tool:post, and tool:error events into a single
+    ToolCall node in the graph. The ToolCall node ID is the tool_call_id
+    directly (not a compound key). Phase B cursor edges (E08, E09, E10) are
+    created by _handle_pre when the corresponding cursors are set.
     """
 
-    handled_events: frozenset[str] = frozenset({"tool:pre", "tool:post"})
+    handled_events: frozenset[str] = frozenset({"tool:pre", "tool:post", "tool:error"})
 
     def __init__(self, services: HookStateService) -> None:
         self.services = services
@@ -52,6 +53,8 @@ class ToolCallHandler:
 
         if event == "tool:pre":
             await self._handle_pre(session_id, tool_call_id, timestamp, data)
+        elif event == "tool:error":
+            await self._handle_error(tool_call_id, timestamp, data)
         else:
             # tool:post — enrich the existing node
             await self._handle_post(tool_call_id, timestamp, data)
@@ -125,5 +128,27 @@ class ToolCallHandler:
             "result_success": result.get("error") is None,
             "result_output": result.get("output"),
             "result_error": result.get("error"),
+        }
+        await self.services.graph.upsert_node(tool_call_id, node_data)
+
+    async def _handle_error(
+        self,
+        tool_call_id: str,
+        timestamp: str,
+        data: dict[str, Any],
+    ) -> None:
+        """Mark ToolCall as failed with error details.
+
+        Uses upsert semantics so safe to call even when no prior tool:pre was
+        received. No Phase B cursor edges are attempted.
+        """
+        result_error: str | None = (
+            data.get("error") or data.get("error_message") or data.get("message")
+        )
+        node_data: dict[str, Any] = {
+            "labels": ["ToolCall", "SST_EVENT"],
+            "ended_at": timestamp,
+            "result_success": False,
+            "result_error": result_error,
         }
         await self.services.graph.upsert_node(tool_call_id, node_data)
