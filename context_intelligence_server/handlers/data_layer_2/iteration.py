@@ -14,6 +14,7 @@ from typing import Any
 
 from context_intelligence_server.protocol import HookResult
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,12 @@ class IterationHandler:
                 },
             )
 
+        # SOURCED_FROM bridge: Iteration -> data_layer_1 provider:request event
+        data_layer_1_node_id = make_node_id(session_id, "provider:request", timestamp)
+        await self.services.graph.upsert_edge(
+            iteration_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
+        )
+
     async def _handle_llm_request(self, data: dict[str, Any]) -> None:
         """Enrich active Iteration with provider, model, message_count, has_system.
 
@@ -122,6 +129,15 @@ class IterationHandler:
                 "has_system": data.get("has_system"),
             },
         )
+
+        # SOURCED_FROM bridge: Iteration -> data_layer_1 llm:request event
+        session_id: str = data.get("session_id", "")
+        timestamp: str = data.get("timestamp", "")
+        if session_id and timestamp:
+            data_layer_1_node_id = make_node_id(session_id, "llm:request", timestamp)
+            await self.services.graph.upsert_edge(
+                iteration_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
+            )
 
     async def _handle_llm_response(self, data: dict[str, Any]) -> None:
         """Enrich active Iteration with usage fields.
@@ -144,3 +160,12 @@ class IterationHandler:
                 "usage_cache_write": usage.get("cache_creation_input_tokens"),
             },
         )
+
+        # SOURCED_FROM bridge: Iteration -> data_layer_1 llm:response event
+        session_id: str = data.get("session_id", "")
+        timestamp: str = data.get("timestamp", "")
+        if session_id and timestamp:
+            data_layer_1_node_id = make_node_id(session_id, "llm:response", timestamp)
+            await self.services.graph.upsert_edge(
+                iteration_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
+            )

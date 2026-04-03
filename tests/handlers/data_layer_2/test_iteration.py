@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from context_intelligence_server.handlers.data_layer_2.iteration import IterationHandler
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 
 # ---------------------------------------------------------------------------
@@ -212,9 +213,9 @@ class TestE06HasPartEdge:
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        # No edges should be created when execution_start_ts is None
-        assert len(services.graph._edges) == 0, (
-            f"No E06 edge should exist when execution_start_ts is None. "
+        # Only SOURCED_FROM edge should be created when execution_start_ts is None
+        assert len(services.graph._edges) == 1, (
+            f"Only SOURCED_FROM edge should exist when execution_start_ts is None. "
             f"Got {len(services.graph._edges)} edges: {list(services.graph._edges.keys())}"
         )
 
@@ -484,4 +485,110 @@ class TestIterationHandlerGuards:
         assert len(services.graph._edges) == 0, (
             f"No graph mutations must occur when session_id is missing. "
             f"Got {len(services.graph._edges)} edges."
+        )
+
+
+# ---------------------------------------------------------------------------
+# 7. TestIterationSourcedFrom
+# ---------------------------------------------------------------------------
+
+
+class TestIterationSourcedFrom:
+    """SOURCED_FROM edges from Iteration to data_layer_1 event nodes."""
+
+    async def test_provider_request_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """provider:request must create SOURCED_FROM edge from Iteration to data_layer_1 provider:request node."""
+        handler = IterationHandler(services)
+        timestamp = "2026-01-01T00:00:00Z"
+        await handler(
+            "provider:request",
+            {
+                "session_id": "s1",
+                "timestamp": timestamp,
+            },
+        )
+        iteration_id = "s1::iteration::1"
+        data_layer_1_node_id = make_node_id("s1", "provider:request", timestamp)
+        edge = await services.graph.get_edge(iteration_id, data_layer_1_node_id)
+        assert edge is not None, (
+            f"SOURCED_FROM edge from '{iteration_id}' to '{data_layer_1_node_id}' "
+            "must exist after provider:request"
+        )
+        assert edge.get("type") == "SOURCED_FROM", (
+            f"Edge type must be 'SOURCED_FROM'. Got: {edge.get('type')!r}"
+        )
+
+    async def test_llm_request_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """llm:request must create SOURCED_FROM edge from Iteration to data_layer_1 llm:request node."""
+        handler = IterationHandler(services)
+        # Call provider:request first to set the active_iteration_id cursor
+        await handler(
+            "provider:request",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        timestamp = "2026-01-01T00:00:01Z"
+        await handler(
+            "llm:request",
+            {
+                "session_id": "s1",
+                "timestamp": timestamp,
+                "provider": "anthropic",
+                "model": "claude-3-5-sonnet",
+                "message_count": 5,
+                "has_system": True,
+            },
+        )
+        iteration_id = "s1::iteration::1"
+        data_layer_1_node_id = make_node_id("s1", "llm:request", timestamp)
+        edge = await services.graph.get_edge(iteration_id, data_layer_1_node_id)
+        assert edge is not None, (
+            f"SOURCED_FROM edge from '{iteration_id}' to '{data_layer_1_node_id}' "
+            "must exist after llm:request"
+        )
+        assert edge.get("type") == "SOURCED_FROM", (
+            f"Edge type must be 'SOURCED_FROM'. Got: {edge.get('type')!r}"
+        )
+
+    async def test_llm_response_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """llm:response must create SOURCED_FROM edge from Iteration to data_layer_1 llm:response node."""
+        handler = IterationHandler(services)
+        # Call provider:request first to set the active_iteration_id cursor
+        await handler(
+            "provider:request",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        timestamp = "2026-01-01T00:00:02Z"
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": timestamp,
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 250,
+                    "cache_creation_input_tokens": 0,
+                },
+            },
+        )
+        iteration_id = "s1::iteration::1"
+        data_layer_1_node_id = make_node_id("s1", "llm:response", timestamp)
+        edge = await services.graph.get_edge(iteration_id, data_layer_1_node_id)
+        assert edge is not None, (
+            f"SOURCED_FROM edge from '{iteration_id}' to '{data_layer_1_node_id}' "
+            "must exist after llm:response"
+        )
+        assert edge.get("type") == "SOURCED_FROM", (
+            f"Edge type must be 'SOURCED_FROM'. Got: {edge.get('type')!r}"
         )
