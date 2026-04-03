@@ -3,11 +3,12 @@ digraph pipeline_flow {
     graph [
         rankdir   = TB
         splines   = ortho
-        nodesep   = 0.6
+        compound  = true
+        nodesep   = 0.5
         ranksep   = 0.7
         fontname  = "Helvetica"
         fontsize  = 11
-        label     = "Per-Event Execution Spine\n(context_intelligence_server)"
+        label     = "Per-Event Execution Spine\n(context_intelligence_server/pipeline.py)"
         labelloc  = t
         labeljust = c
     ]
@@ -22,14 +23,14 @@ digraph pipeline_flow {
         fontsize = 10
     ]
 
-    // ── Entry ─────────────────────────────────────────────────────────────────
+    // ── Entry ────────────────────────────────────────────────────────────────
     EventReceived [
         label     = "Event Received"
         shape     = oval
         fillcolor = "#E3F2FD"
     ]
 
-    // ── Session guarantee ─────────────────────────────────────────────────────
+    // ── Session guarantee ────────────────────────────────────────────────────
     HasSessionId [
         label     = "HasSessionId?"
         shape     = diamond
@@ -42,7 +43,7 @@ digraph pipeline_flow {
         fillcolor = "#F5F5F5"
     ]
 
-    // ── Blob offload ──────────────────────────────────────────────────────────
+    // ── Blob offload ─────────────────────────────────────────────────────────
     HasBlobStore [
         label     = "HasBlobStore?"
         shape     = diamond
@@ -51,11 +52,11 @@ digraph pipeline_flow {
     ]
 
     BlobOffload [
-        label     = "BlobOffload\nprocess_event_data()\noffload large payloads → blob store"
+        label     = "BlobOffload\nprocess_event_data()\noffload large payloads \u2192 blob store"
         fillcolor = "#F5F5F5"
     ]
 
-    // ── DefaultHandler (ALWAYS) ───────────────────────────────────────────────
+    // ── DefaultHandler (ALWAYS) ──────────────────────────────────────────────
     DefaultHandler [
         label     = "DefaultHandler [data_layer_1]\n[ALWAYS runs]\n\nCREATE (:Event {\n  :FullPascalEvent, :CategoryEvent, :Event\n  tool_call_id tiebreaker\n})\n(Session)-[:HAS_EVENT]->(Event)"
         fillcolor = "#C8E6C9"
@@ -63,24 +64,65 @@ digraph pipeline_flow {
         penwidth  = 2.5
     ]
 
-    // ── Enricher loop ─────────────────────────────────────────────────────────
+    // ── Enricher loop ────────────────────────────────────────────────────────
     EnricherLoop [
         label     = "EnricherLoop\nfor enricher in enrichers[]:\n  if event_type in enricher.handled_events"
         fillcolor = "#E1BEE7"
     ]
 
-    // ── Individual enrichers ──────────────────────────────────────────────────
-    SessionHandler [
-        label     = "SessionHandler [0] [data_layer_2]\nsession:start | session:fork | session:end\nMERGE session metadata\nupsert workspace / repo context"
-        fillcolor = "#F3E5F5"
-    ]
+    // ── Enrichers (data_layer_2) — conditional dispatch ──────────────────────
+    subgraph cluster_enrichers {
+        graph [
+            label     = "Enrichers [data_layer_2] \u2014 conditional, ADDITIVE dispatch"
+            style     = "filled"
+            color     = "#CE93D8"
+            fillcolor = "#FCF3FF"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
 
-    ToolCallHandler [
-        label     = "ToolCallHandler [1] [data_layer_2]\ntool:pre | tool:post | tool:error\nCREATE (:ToolCall)\nlink to parent Event"
-        fillcolor = "#F3E5F5"
-    ]
+        SessionHandler [
+            label     = "SessionHandler [0]\nsession:start | session:fork | session:end\nMERGE session metadata\nupsert workspace / repo context\nE02 FORKED | E13 HAS_SUBSESSION"
+            fillcolor = "#F3E5F5"
+        ]
 
-    // ── Terminal check ────────────────────────────────────────────────────────
+        OrchestratorRunHandler [
+            label     = "OrchestratorRunHandler [1]\nexecution:start | execution:end\norchestrator:complete\nCREATE :OrchestratorRun :SST_EVENT\nE01 HAS_EXECUTION | E03 HAS_ATTRIBUTE | E14 TRIGGERS"
+            fillcolor = "#F3E5F5"
+        ]
+
+        IterationHandler [
+            label     = "IterationHandler [2]\nprovider:request | llm:request | llm:response\nCREATE :Iteration :SST_EVENT\nE06 HAS_PART (OrchestratorRun\u2192Iteration)"
+            fillcolor = "#F3E5F5"
+        ]
+
+        ContentBlockHandler [
+            label     = "ContentBlockHandler [3]\ncontent_block:start | content_block:end\nCREATE :ContentBlock :SST_EVENT\nE07 HAS_PART | cache pending_tool_block_ids"
+            fillcolor = "#F3E5F5"
+        ]
+
+        ToolCallHandler [
+            label     = "ToolCallHandler [4]\ntool:pre | tool:post\nCREATE / enrich :ToolCall :SST_EVENT\nE08 HAS_TOOL_CALL | E09 CAUSED | E10 PARALLEL_EXECUTION"
+            fillcolor = "#F3E5F5"
+        ]
+
+        PromptHandler [
+            label     = "PromptHandler [5]\nprompt:submit\nCREATE :Prompt :SST_EVENT\nE05 HAS_PART | E15 ENABLES"
+            fillcolor = "#F3E5F5"
+        ]
+
+        CancellationHandler [
+            label     = "CancellationHandler [6]\ncancel:completed\nCREATE :Cancellation :SST_EVENT\nE11 HAS_PART"
+            fillcolor = "#F3E5F5"
+        ]
+
+        ContextCompactionHandler [
+            label     = "ContextCompactionHandler [7]\ncontext:pre_compact | context:post_compact\nCREATE :ContextCompaction :SST_EVENT\nE12 HAS_COMPACTION"
+            fillcolor = "#F3E5F5"
+        ]
+    }
+
+    // ── Terminal check ───────────────────────────────────────────────────────
     IsTerminal [
         label     = "IsTerminal?\n(session:end)"
         shape     = diamond
@@ -88,45 +130,59 @@ digraph pipeline_flow {
         style     = "filled"
     ]
 
-    // ── Flush ─────────────────────────────────────────────────────────────────
+    // ── Flush ────────────────────────────────────────────────────────────────
     GraphFlush [
         label     = "GraphFlush\ngraph.flush()\ncommit all pending writes"
         fillcolor = "#FFCCBC"
     ]
 
-    // ── Done ──────────────────────────────────────────────────────────────────
+    // ── Done ─────────────────────────────────────────────────────────────────
     Done [
         label     = "Done"
         shape     = oval
         fillcolor = "#E3F2FD"
     ]
 
-    // ── Edges ─────────────────────────────────────────────────────────────────
-    EventReceived -> HasSessionId
+    // ── Edges ────────────────────────────────────────────────────────────────
+    EventReceived   -> HasSessionId
 
-    HasSessionId  -> EnsureSessionNode [label = "yes"]
-    HasSessionId  -> HasBlobStore      [label = "no"]
+    HasSessionId    -> EnsureSessionNode [label = "yes"]
+    HasSessionId    -> HasBlobStore      [label = "no"]
     EnsureSessionNode -> HasBlobStore
 
-    HasBlobStore  -> BlobOffload       [label = "yes"]
-    HasBlobStore  -> DefaultHandler    [label = "no"]
-    BlobOffload   -> DefaultHandler
+    HasBlobStore    -> BlobOffload       [label = "yes"]
+    HasBlobStore    -> DefaultHandler    [label = "no"]
+    BlobOffload     -> DefaultHandler
 
-    DefaultHandler -> EnricherLoop
+    DefaultHandler  -> EnricherLoop
 
-    EnricherLoop  -> SessionHandler    [label = "event_type matches"]
-    EnricherLoop  -> ToolCallHandler   [label = "event_type matches"]
-    EnricherLoop  -> IsTerminal        [label = "no match / after enrichers"]
+    // Fan-out to enrichers (compound edge to cluster head)
+    EnricherLoop    -> SessionHandler            [label = "event_type matches"]
+    EnricherLoop    -> OrchestratorRunHandler    [label = "event_type matches"]
+    EnricherLoop    -> IterationHandler          [label = "event_type matches"]
+    EnricherLoop    -> ContentBlockHandler       [label = "event_type matches"]
+    EnricherLoop    -> ToolCallHandler           [label = "event_type matches"]
+    EnricherLoop    -> PromptHandler             [label = "event_type matches"]
+    EnricherLoop    -> CancellationHandler       [label = "event_type matches"]
+    EnricherLoop    -> ContextCompactionHandler  [label = "event_type matches"]
+    EnricherLoop    -> IsTerminal                [label = "no match /\nafter enrichers"]
 
-    SessionHandler  -> IsTerminal
-    ToolCallHandler -> IsTerminal
+    // Fan-in from enrichers
+    SessionHandler           -> IsTerminal
+    OrchestratorRunHandler   -> IsTerminal
+    IterationHandler         -> IsTerminal
+    ContentBlockHandler      -> IsTerminal
+    ToolCallHandler          -> IsTerminal
+    PromptHandler            -> IsTerminal
+    CancellationHandler      -> IsTerminal
+    ContextCompactionHandler -> IsTerminal
 
     IsTerminal -> GraphFlush [label = "yes\n(session:end)"]
     IsTerminal -> Done       [label = "no"]
 
     GraphFlush -> Done
 
-    // ── Legend ────────────────────────────────────────────────────────────────
+    // ── Legend ───────────────────────────────────────────────────────────────
     subgraph cluster_legend {
         graph [
             label     = "Legend"

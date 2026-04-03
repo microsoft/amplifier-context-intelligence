@@ -1,13 +1,13 @@
 digraph handler_architecture {
-    // ─── Global defaults ─────────────────────────────────────────────────────
+    // ─── Global defaults ──────────────────────────────────────────────────────
     graph [
         rankdir   = TB
         splines   = ortho
-        nodesep   = 0.8
-        ranksep   = 0.9
+        nodesep   = 0.7
+        ranksep   = 1.0
         fontname  = "Helvetica"
         fontsize  = 11
-        label     = "Handler & Router Architecture\n(layer-based organisation)"
+        label     = "Handler & Router Architecture\n(context_intelligence_server/pipeline.py \u2014 setup_handlers())"
         labelloc  = t
         labeljust = c
     ]
@@ -22,15 +22,18 @@ digraph handler_architecture {
         fontsize = 10
     ]
 
-    // ─── PipelineHandlers (NamedTuple record) ──────────────────────────────
+    // ─── PipelineHandlers (NamedTuple) ────────────────────────────────────────
     PipelineHandlers [
-        shape     = record
-        style     = "filled"
+        style     = "filled,rounded"
         fillcolor = "#E3F2FD"
-        label     = "{PipelineHandlers (NamedTuple) | default: DefaultHandler | enrichers: list[Handler]}"
+        label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+            <TR><TD><B>PipelineHandlers (NamedTuple)</B></TD></TR>
+            <TR><TD>default: DefaultHandler</TD></TR>
+            <TR><TD>enrichers: list[Handler]  &#8212; 8 data_layer_2 enrichers</TD></TR>
+        </TABLE>>
     ]
 
-    // ─── Shared contract ──────────────────────────────────────────────────
+    // ─── Shared Contract ─────────────────────────────────────────────────────
     subgraph cluster_protocol {
         graph [
             label     = "Shared Contract\ncontext_intelligence_server/protocol.py"
@@ -41,7 +44,6 @@ digraph handler_architecture {
         ]
 
         Protocol [
-            shape     = box
             style     = "filled,rounded"
             fillcolor = "#BBDEFB"
             label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
@@ -53,7 +55,7 @@ digraph handler_architecture {
         ]
     }
 
-    // ─── Routers (separate from event handling) ──────────────────────────
+    // ─── Routers (separate concern) ──────────────────────────────────────────
     subgraph cluster_routers {
         graph [
             label     = "routers/\nFastAPI HTTP endpoints (separate concern)"
@@ -65,21 +67,21 @@ digraph handler_architecture {
         ]
 
         SkillsRouter [
-            shape     = box
             style     = "filled,rounded"
             fillcolor = "#E0E0E0"
             label     = "skills.py\nSkillRegistry + GET /skills/{name}"
         ]
 
         VersionRouter [
-            shape     = box
             style     = "filled,rounded"
             fillcolor = "#E0E0E0"
             label     = "version.py\nGET /version"
         ]
+
+        SkillsRouter -> VersionRouter [style = invis]
     }
 
-    // ─── Data Layer 1: Raw event capture ─────────────────────────────────
+    // ─── Data Layer 1: Raw event capture ────────────────────────────────────
     subgraph cluster_data_layer_1 {
         graph [
             label     = "handlers/data_layer_1/\nRaw event capture"
@@ -91,7 +93,6 @@ digraph handler_architecture {
         ]
 
         DefaultHandler [
-            shape     = box
             style     = "filled,rounded"
             fillcolor = "#C8E6C9"
             fontname  = "Helvetica-Bold"
@@ -107,7 +108,6 @@ digraph handler_architecture {
         ]
 
         FieldLifters [
-            shape     = box
             style     = "filled,rounded"
             fillcolor = "#A5D6A7"
             label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
@@ -123,10 +123,10 @@ digraph handler_architecture {
         DefaultHandler -> FieldLifters [label = "delegates field\nextraction to"]
     }
 
-    // ─── Data Layer 2: Semantic enrichment ───────────────────────────────
+    // ─── Data Layer 2: Semantic enrichment ──────────────────────────────────
     subgraph cluster_data_layer_2 {
         graph [
-            label     = "handlers/data_layer_2/\nSemantic enrichment"
+            label     = "handlers/data_layer_2/\nSemantic enrichment (8 enrichers)"
             style     = "filled"
             color     = "#CE93D8"
             fillcolor = "#F3E5F5"
@@ -135,47 +135,140 @@ digraph handler_architecture {
         ]
 
         SessionHandler [
-            shape     = box
             style     = "filled,rounded"
             fillcolor = "#E1BEE7"
             label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
                 <TR><TD><B>SessionHandler [0]</B></TD></TR>
                 <TR><TD>session:start | session:fork | session:end</TD></TR>
                 <TR><TD>Labels: RootSession | SubSession | ForkedSession</TD></TR>
-                <TR><TD>Edges: SUBSESSION_OF | HAS_FORK</TD></TR>
+                <TR><TD>Edges: HAS_SUBSESSION (E13) | FORKED (E02)</TD></TR>
+            </TABLE>>
+        ]
+
+        OrchestratorRunHandler [
+            style     = "filled,rounded"
+            fillcolor = "#E1BEE7"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>OrchestratorRunHandler [1]</B></TD></TR>
+                <TR><TD>execution:start | execution:end | orchestrator:complete</TD></TR>
+                <TR><TD>Node: :OrchestratorRun :SST_EVENT</TD></TR>
+                <TR><TD>Edges: HAS_EXECUTION (E01) | HAS_ATTRIBUTE (E03) | TRIGGERS (E14)</TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Writes: execution_start_ts, last_completed_orch_run_id</I></TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Reads:  last_prompt_id</I></TD></TR>
+            </TABLE>>
+        ]
+
+        IterationHandler [
+            style     = "filled,rounded"
+            fillcolor = "#E1BEE7"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>IterationHandler [2]</B></TD></TR>
+                <TR><TD>provider:request | llm:request | llm:response</TD></TR>
+                <TR><TD>Node: :Iteration :SST_EVENT</TD></TR>
+                <TR><TD>Edges: HAS_PART (E06)</TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Writes: active_iteration_id, iteration_count</I></TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Reads:  execution_start_ts</I></TD></TR>
+            </TABLE>>
+        ]
+
+        ContentBlockHandler [
+            style     = "filled,rounded"
+            fillcolor = "#E1BEE7"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>ContentBlockHandler [3]</B></TD></TR>
+                <TR><TD>content_block:start | content_block:end</TD></TR>
+                <TR><TD>Node: :ContentBlock :SST_EVENT</TD></TR>
+                <TR><TD>Edges: HAS_PART (E07)</TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Reads:  active_iteration_id</I></TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Writes: pending_tool_block_ids</I></TD></TR>
             </TABLE>>
         ]
 
         ToolCallHandler [
-            shape     = box
             style     = "filled,rounded"
             fillcolor = "#E1BEE7"
             label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
-                <TR><TD><B>ToolCallHandler [1]</B></TD></TR>
-                <TR><TD>tool:pre | tool:post | tool:error</TD></TR>
-                <TR><TD>Node: :ToolCall</TD></TR>
-                <TR><TD>Edges: HAS_TOOL_CALL | HAS_EVENT</TD></TR>
+                <TR><TD><B>ToolCallHandler [4]</B></TD></TR>
+                <TR><TD>tool:pre | tool:post</TD></TR>
+                <TR><TD>Node: :ToolCall :SST_EVENT</TD></TR>
+                <TR><TD>Edges: HAS_TOOL_CALL (E08) | CAUSED (E09) | PARALLEL_EXECUTION (E10)</TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Reads:  active_iteration_id, pending_tool_block_ids</I></TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Intra-handler: _parallel_groups dict</I></TD></TR>
             </TABLE>>
         ]
 
-        FutureHandler [
-            shape     = box
-            style     = "filled,rounded,dashed"
-            fillcolor = "#FAFAFA"
-            color     = "#AAAAAA"
-            fontcolor = "#AAAAAA"
-            label     = "FutureHandler [N]\n… extension point …\n(new handlers land here)"
+        PromptHandler [
+            style     = "filled,rounded"
+            fillcolor = "#E1BEE7"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>PromptHandler [5]</B></TD></TR>
+                <TR><TD>prompt:submit</TD></TR>
+                <TR><TD>Node: :Prompt :SST_EVENT</TD></TR>
+                <TR><TD>Edges: HAS_PART (E05) | ENABLES (E15)</TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Reads:  last_completed_orch_run_id</I></TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Writes: last_prompt_id</I></TD></TR>
+            </TABLE>>
+        ]
+
+        CancellationHandler [
+            style     = "filled,rounded"
+            fillcolor = "#E1BEE7"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>CancellationHandler [6]</B></TD></TR>
+                <TR><TD>cancel:completed</TD></TR>
+                <TR><TD>Node: :Cancellation :SST_EVENT</TD></TR>
+                <TR><TD>Edges: HAS_PART (E11)</TD></TR>
+                <TR><TD ALIGN="LEFT"><I>No state read/write</I></TD></TR>
+            </TABLE>>
+        ]
+
+        ContextCompactionHandler [
+            style     = "filled,rounded"
+            fillcolor = "#E1BEE7"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>ContextCompactionHandler [7]</B></TD></TR>
+                <TR><TD>context:pre_compact | context:post_compact</TD></TR>
+                <TR><TD>Node: :ContextCompaction :SST_EVENT</TD></TR>
+                <TR><TD>Edges: HAS_COMPACTION (E12)</TD></TR>
+                <TR><TD ALIGN="LEFT"><I>No state read/write</I></TD></TR>
+            </TABLE>>
         ]
     }
 
-    // ─── Warning note ─────────────────────────────────────────────────────
+    // ─── DataLayer2State (shared per-session state) ──────────────────────────
+    subgraph cluster_state {
+        graph [
+            label     = "handlers/data_layer_2/state.py\nShared per-session cross-handler state"
+            style     = "filled"
+            color     = "#F57F17"
+            fillcolor = "#FFF8E1"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        DataLayer2State [
+            style     = "filled,rounded"
+            fillcolor = "#FFE082"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>DataLayer2State</B></TD></TR>
+                <TR><TD>execution_start_ts: str | None</TD></TR>
+                <TR><TD>active_iteration_id: str | None</TD></TR>
+                <TR><TD>pending_tool_block_ids: dict[str, str]</TD></TR>
+                <TR><TD>last_prompt_id: str | None</TD></TR>
+                <TR><TD>last_completed_orch_run_id: str | None</TD></TR>
+                <TR><TD>iteration_count: int</TD></TR>
+            </TABLE>>
+        ]
+    }
+
+    // ─── Warning note ────────────────────────────────────────────────────────
     warning_note [
-        shape     = box
         style     = "filled"
         fillcolor = "#FFF9C4"
-        label     = "⚠ IMPORTANT\nClaiming an event does NOT prevent\nDefaultHandler from running.\nEnrichers are ADDITIVE — DefaultHandler\nalways creates the base Event node first."
+        label     = "\u26a0 IMPORTANT\nClaiming an event does NOT prevent\nDefaultHandler from running.\nEnrichers are ADDITIVE \u2014 DefaultHandler\nalways creates the base Event node first."
     ]
 
+    // ─── Legend ──────────────────────────────────────────────────────────────
     subgraph cluster_legend {
         graph [
             label     = "Legend"
@@ -187,46 +280,139 @@ digraph handler_architecture {
         ]
 
         legend_contract [
-            shape     = box
             style     = "filled,rounded"
             fillcolor = "#BBDEFB"
             label     = "blue = shared contract\n(protocol.py)"
         ]
         legend_capture [
-            shape     = box
             style     = "filled,rounded"
             fillcolor = "#C8E6C9"
             label     = "green = raw capture\n(data_layer_1)"
         ]
         legend_enrich [
-            shape     = box
             style     = "filled,rounded"
             fillcolor = "#E1BEE7"
             label     = "purple = semantic enrichment\n(data_layer_2)"
         ]
+        legend_state [
+            style     = "filled,rounded"
+            fillcolor = "#FFE082"
+            label     = "amber = shared state\n(DataLayer2State)"
+        ]
         legend_http [
-            shape     = box
             style     = "filled,rounded"
             fillcolor = "#E0E0E0"
             label     = "grey = HTTP routers\n(separate concern)"
         ]
         legend_warning [
-            shape     = box
             style     = "filled"
             fillcolor = "#FFF9C4"
-            label     = "yellow = warning note"
+            label     = "yellow = warning / note"
         ]
+
+        legend_contract -> legend_capture -> legend_enrich -> legend_state -> legend_http -> legend_warning [style = invis]
     }
 
-    // ─── Edges ────────────────────────────────────────────────────────────
-    PipelineHandlers -> DefaultHandler   [label = "default"]
-    PipelineHandlers -> SessionHandler   [label = "enrichers[0]"]
-    PipelineHandlers -> ToolCallHandler  [label = "enrichers[1]"]
-    ToolCallHandler  -> FutureHandler    [style = dashed, color = "#AAAAAA"]
-    DefaultHandler   -> warning_note     [style = dotted, color = "#AAAAAA", arrowhead = none]
+    // ─── Structural edges ────────────────────────────────────────────────────
+    PipelineHandlers -> DefaultHandler             [label = "default"]
+    PipelineHandlers -> SessionHandler             [label = "enrichers[0]"]
+    PipelineHandlers -> OrchestratorRunHandler     [label = "enrichers[1]"]
+    PipelineHandlers -> IterationHandler           [label = "enrichers[2]"]
+    PipelineHandlers -> ContentBlockHandler        [label = "enrichers[3]"]
+    PipelineHandlers -> ToolCallHandler            [label = "enrichers[4]"]
+    PipelineHandlers -> PromptHandler              [label = "enrichers[5]"]
+    PipelineHandlers -> CancellationHandler        [label = "enrichers[6]"]
+    PipelineHandlers -> ContextCompactionHandler   [label = "enrichers[7]"]
 
-    // Protocol conformance
-    DefaultHandler   -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
-    SessionHandler   -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
-    ToolCallHandler  -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
+    DefaultHandler -> warning_note [style = dotted, color = "#AAAAAA", arrowhead = none]
+
+    // Protocol conformance (all handlers implement EventHandler)
+    DefaultHandler          -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
+    SessionHandler          -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
+    OrchestratorRunHandler  -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
+    IterationHandler        -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
+    ContentBlockHandler     -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
+    ToolCallHandler         -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
+    PromptHandler           -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
+    CancellationHandler     -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
+    ContextCompactionHandler -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
+
+    // ─── State read / write arrows (constraint=false to preserve layout) ─────
+    // OrchestratorRunHandler
+    OrchestratorRunHandler -> DataLayer2State [
+        label      = "writes execution_start_ts\nlast_completed_orch_run_id"
+        color      = "#1565C0"
+        fontcolor  = "#1565C0"
+        style      = "bold"
+        constraint = false
+    ]
+    DataLayer2State -> OrchestratorRunHandler [
+        label      = "reads last_prompt_id"
+        color      = "#2E7D32"
+        fontcolor  = "#2E7D32"
+        style      = "dashed"
+        arrowhead  = open
+        constraint = false
+    ]
+
+    // IterationHandler
+    IterationHandler -> DataLayer2State [
+        label      = "writes active_iteration_id\niteration_count"
+        color      = "#1565C0"
+        fontcolor  = "#1565C0"
+        style      = "bold"
+        constraint = false
+    ]
+    DataLayer2State -> IterationHandler [
+        label      = "reads execution_start_ts"
+        color      = "#2E7D32"
+        fontcolor  = "#2E7D32"
+        style      = "dashed"
+        arrowhead  = open
+        constraint = false
+    ]
+
+    // ContentBlockHandler
+    ContentBlockHandler -> DataLayer2State [
+        label      = "writes pending_tool_block_ids"
+        color      = "#1565C0"
+        fontcolor  = "#1565C0"
+        style      = "bold"
+        constraint = false
+    ]
+    DataLayer2State -> ContentBlockHandler [
+        label      = "reads active_iteration_id"
+        color      = "#2E7D32"
+        fontcolor  = "#2E7D32"
+        style      = "dashed"
+        arrowhead  = open
+        constraint = false
+    ]
+
+    // ToolCallHandler
+    DataLayer2State -> ToolCallHandler [
+        label      = "reads active_iteration_id\npending_tool_block_ids"
+        color      = "#2E7D32"
+        fontcolor  = "#2E7D32"
+        style      = "dashed"
+        arrowhead  = open
+        constraint = false
+    ]
+
+    // PromptHandler
+    PromptHandler -> DataLayer2State [
+        label      = "writes last_prompt_id"
+        color      = "#1565C0"
+        fontcolor  = "#1565C0"
+        style      = "bold"
+        constraint = false
+    ]
+    DataLayer2State -> PromptHandler [
+        label      = "reads last_completed_orch_run_id"
+        color      = "#2E7D32"
+        fontcolor  = "#2E7D32"
+        style      = "dashed"
+        arrowhead  = open
+        constraint = false
+    ]
 }

@@ -170,11 +170,12 @@ class OrchestratorRunHandler:
             },
         )
 
-        # Create Orchestrator concept node
+        # Create Orchestrator concept node — keyed by name, with name as property
         await self.services.graph.upsert_node(
             orchestrator,
             {
                 "labels": ["Orchestrator", "SST_CONCEPT"],
+                "orchestrator": orchestrator,
             },
         )
 

@@ -1,5 +1,5 @@
 digraph graph_model {
-    // ── Global defaults ───────────────────────────────────────────────────────
+    // ── Global defaults ──────────────────────────────────────────────────────
     graph [
         rankdir   = LR
         compound  = true
@@ -8,7 +8,7 @@ digraph graph_model {
         ranksep   = 1.6
         fontname  = "Helvetica"
         fontsize  = 11
-        label     = "Neo4j Property Graph Schema\n(context_intelligence — all node/label/edge types)"
+        label     = "SST Graph Model \u2014 Complete Neo4j Schema\n(context_intelligence_server/handlers/data_layer_2/)"
         labelloc  = t
         labeljust = c
     ]
@@ -20,15 +20,15 @@ digraph graph_model {
     ]
     edge [
         fontname = "Helvetica"
-        fontsize = 10
+        fontsize = 9
     ]
 
-    // ── Sessions cluster ──────────────────────────────────────────────────────
+    // ── Sessions cluster ─────────────────────────────────────────────────────
     subgraph cluster_sessions {
         graph [
             label     = "Session Nodes"
             fontname  = "Helvetica-Bold"
-            fontsize  = 12
+            fontsize  = 11
             style     = filled
             color     = "#1565C0"
             fillcolor = "#E3F2FD"
@@ -36,132 +36,439 @@ digraph graph_model {
         ]
 
         RootSession [
-            shape     = record
-            style     = filled
             fillcolor = "#BBDEFB"
-            label     = "{ :RootSession :Session | node_id: session UUID | workspace: string | started_at: ISO 8601 | ended_at: ISO 8601 (on end) | status: \"running\" }"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:RootSession :Session :SST_EVENT</B></TD></TR>
+                <TR><TD>node_id: session UUID</TD></TR>
+                <TR><TD>workspace: string</TD></TR>
+                <TR><TD>started_at / ended_at: ISO 8601</TD></TR>
+                <TR><TD>status: "running" &#8594; closed</TD></TR>
+            </TABLE>>
         ]
 
         SubSession [
-            shape     = record
-            style     = filled
             fillcolor = "#BBDEFB"
-            label     = "{ :SubSession :Session | node_id: session UUID | workspace: string | started_at: ISO 8601 | ended_at: ISO 8601 }"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:SubSession :Session :SST_EVENT</B></TD></TR>
+                <TR><TD>node_id: child session UUID</TD></TR>
+                <TR><TD>workspace: string</TD></TR>
+                <TR><TD>started_at / ended_at: ISO 8601</TD></TR>
+            </TABLE>>
         ]
 
         ForkedSession [
-            shape     = record
-            style     = filled
-            fillcolor = "#CE93D8"
-            label     = "{ :ForkedSession :Session | node_id: child session UUID | workspace: may be null | started_at: ISO 8601 | Distinct from SubSession }"
+            fillcolor = "#BBDEFB"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:ForkedSession :Session :SST_EVENT</B></TD></TR>
+                <TR><TD>node_id: child session UUID</TD></TR>
+                <TR><TD>workspace: may be null</TD></TR>
+                <TR><TD>started_at: ISO 8601</TD></TR>
+                <TR><TD><I>Fork guard: permanent classification</I></TD></TR>
+            </TABLE>>
         ]
+
+        RootSession -> SubSession    [style = invis]
+        RootSession -> ForkedSession [style = invis]
     }
 
-    // ── Events cluster ────────────────────────────────────────────────────────
-    subgraph cluster_events {
+    // ── Execution cluster ────────────────────────────────────────────────────
+    subgraph cluster_execution {
         graph [
-            label     = "Event Nodes"
+            label     = "Execution"
             fontname  = "Helvetica-Bold"
-            fontsize  = 12
+            fontsize  = 11
             style     = filled
-            color     = "#2E7D32"
-            fillcolor = "#E8F5E9"
+            color     = "#1565C0"
+            fillcolor = "#E3F2FD"
             penwidth  = 2
         ]
 
-        EventNode [
-            shape     = record
-            style     = filled
-            fillcolor = "#A5D6A7"
-            label     = "{ :FullPascalEvent :CategoryEvent :Event | node_id: session__event__epoch_ms[__tool_call_id] | event_name: string | occurred_at: ISO 8601 | session_id | parent_id | tool_call_id | parallel_group_id | [event-specific: tool_name, model, agent, prompt, skill_directory, skill_name, recipe_name, current_step, bytes, path, ...] | data: full JSON blob }"
-        ]
-
-        EventExamples [
-            shape     = plaintext
-            style     = ""
-            fillcolor = "transparent"
-            label     = "Label examples:\ntool:pre → :ToolPreEvent :ToolEvent :Event\nsession:start → :SessionStartEvent :SessionEvent :Event\ncontext:compaction → :ContextCompactionEvent :ContextEvent :Event\ndelegate:agent_spawned → :DelegateAgentSpawnedEvent :DelegateEvent :Event\nLifted fields queryable directly — no JSON parsing needed\ndata blob stores complete raw payload"
+        OrchestratorRun [
+            fillcolor = "#BBDEFB"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:OrchestratorRun :SST_EVENT</B></TD></TR>
+                <TR><TD>node_id: {session}::orch_run::{ts}</TD></TR>
+                <TR><TD>session_id: string</TD></TR>
+                <TR><TD>started_at / ended_at / completed_at</TD></TR>
+                <TR><TD>orchestrator_name: string</TD></TR>
+                <TR><TD>turn_count: int</TD></TR>
+                <TR><TD>status / response</TD></TR>
+            </TABLE>>
         ]
     }
 
-    // ── ToolCall cluster ──────────────────────────────────────────────────────
-    subgraph cluster_toolcall {
+    // ── LLM loop cluster ─────────────────────────────────────────────────────
+    subgraph cluster_llm_loop {
         graph [
-            label     = "ToolCall Nodes"
+            label     = "LLM Loop"
             fontname  = "Helvetica-Bold"
-            fontsize  = 12
+            fontsize  = 11
             style     = filled
-            color     = "#E65100"
-            fillcolor = "#FFF3E0"
+            color     = "#1565C0"
+            fillcolor = "#E3F2FD"
             penwidth  = 2
+        ]
+
+        Iteration [
+            fillcolor = "#BBDEFB"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:Iteration :SST_EVENT</B></TD></TR>
+                <TR><TD>node_id: {session}::iteration::{n}</TD></TR>
+                <TR><TD>session_id: string</TD></TR>
+                <TR><TD>iteration_number: int</TD></TR>
+                <TR><TD>started_at: ISO 8601</TD></TR>
+                <TR><TD>provider / model</TD></TR>
+                <TR><TD>message_count / has_system</TD></TR>
+                <TR><TD>usage_input / usage_output</TD></TR>
+            </TABLE>>
+        ]
+
+        ContentBlock [
+            fillcolor = "#BBDEFB"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:ContentBlock :SST_EVENT</B></TD></TR>
+                <TR><TD>node_id: {session}::block::{n}::{idx}</TD></TR>
+                <TR><TD>session_id: string</TD></TR>
+                <TR><TD>block_index: int</TD></TR>
+                <TR><TD>block_type: text | tool_call</TD></TR>
+                <TR><TD>started_at / ended_at</TD></TR>
+            </TABLE>>
         ]
 
         ToolCall [
-            shape     = record
+            fillcolor = "#BBDEFB"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:ToolCall :SST_EVENT</B></TD></TR>
+                <TR><TD>node_id: {tool_call_id}</TD></TR>
+                <TR><TD>tool_name: string</TD></TR>
+                <TR><TD>tool_call_id: string (key)</TD></TR>
+                <TR><TD>tool_input: dict</TD></TR>
+                <TR><TD>session_id: string</TD></TR>
+                <TR><TD>parallel_group_id: UUID (optional)</TD></TR>
+                <TR><TD>started_at / ended_at</TD></TR>
+                <TR><TD>result_success / result_output</TD></TR>
+            </TABLE>>
+        ]
+
+        ToolCallPeer [
+            fillcolor = "#DDEEFF"
+            color     = "#7B1FA2"
+            penwidth  = 1.5
+            style     = "filled,rounded,dashed"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:ToolCall :SST_EVENT</B></TD></TR>
+                <TR><TD><I>(parallel peer \u2014 same group)</I></TD></TR>
+            </TABLE>>
+        ]
+
+        Iteration    -> ContentBlock [style = invis]
+        Iteration    -> ToolCall     [style = invis]
+        ContentBlock -> ToolCallPeer [style = invis]
+    }
+
+    // ── Prompt cluster ───────────────────────────────────────────────────────
+    subgraph cluster_prompt {
+        graph [
+            label     = "Turn-Flow"
+            fontname  = "Helvetica-Bold"
+            fontsize  = 11
             style     = filled
-            fillcolor = "#FFE0B2"
-            label     = "{ :ToolCall | node_id: session_id__tool_call__tool_call_id | tool_name: string | tool_call_id: string (tiebreaker) | parallel_group_id: UUID | session_id: string }"
+            color     = "#1565C0"
+            fillcolor = "#E3F2FD"
+            penwidth  = 2
+        ]
+
+        Prompt [
+            fillcolor = "#BBDEFB"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:Prompt :SST_EVENT</B></TD></TR>
+                <TR><TD>node_id: {session}::prompt::{ts}</TD></TR>
+                <TR><TD>session_id: string</TD></TR>
+                <TR><TD>prompt: string</TD></TR>
+                <TR><TD>occurred_at: ISO 8601</TD></TR>
+            </TABLE>>
         ]
     }
 
-    // ── Note nodes ────────────────────────────────────────────────────────────
-    note_dual_edge [
-        shape     = box
-        style     = filled
-        fillcolor = "#FFF9C4"
-        label     = "⚠ Dual HAS_EVENT edges on tool events\n(Session)-[:HAS_EVENT]->(Event)  — DefaultHandler (always)\n(ToolCall)-[:HAS_EVENT]->(Event)  — ToolCallHandler (additionally)\nBoth edges coexist; enrichers are ADDITIVE"
-    ]
+    // ── Side events cluster ──────────────────────────────────────────────────
+    subgraph cluster_side_events {
+        graph [
+            label     = "Side Events"
+            fontname  = "Helvetica-Bold"
+            fontsize  = 11
+            style     = filled
+            color     = "#1565C0"
+            fillcolor = "#E3F2FD"
+            penwidth  = 2
+        ]
 
-    note_tiebreaker [
-        shape     = box
-        style     = filled
-        fillcolor = "#FFF9C4"
-        label     = "ℹ ToolCall node_id has NO timestamp\npre / post / error share the same :ToolCall node\nEvent node_id appends tool_call_id as tiebreaker\nto distinguish tool events with the same epoch_ms"
-    ]
+        Cancellation [
+            fillcolor = "#BBDEFB"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:Cancellation :SST_EVENT</B></TD></TR>
+                <TR><TD>node_id: {session}::cancellation::{ts}</TD></TR>
+                <TR><TD>session_id: string</TD></TR>
+                <TR><TD>was_immediate: bool</TD></TR>
+                <TR><TD>occurred_at: ISO 8601</TD></TR>
+            </TABLE>>
+        ]
 
-    note_direction [
-        shape     = box
-        style     = filled
-        fillcolor = "#FFCCBC"
-        penwidth  = 2
-        label     = "⚠ Session edge types differ by origin:\nSUBSESSION_OF: session:start with parent_id\nHAS_FORK: session:fork\nBoth are parent→child direction.\nForkedSession does NOT carry SubSession label.\n\n⚠ Fork Guard (classification is permanent):\nsession:start after session:fork only enriches started_at\nSubSession label + SUBSESSION_OF edge NOT applied to ForkedSession"
-    ]
+        ContextCompaction [
+            fillcolor = "#BBDEFB"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:ContextCompaction :SST_EVENT</B></TD></TR>
+                <TR><TD>node_id: {session}::compaction::{ts}</TD></TR>
+                <TR><TD>session_id: string</TD></TR>
+                <TR><TD>occurred_at: ISO 8601</TD></TR>
+            </TABLE>>
+        ]
 
-    // ── Edges ─────────────────────────────────────────────────────────────────
-    RootSession -> SubSession [
-        label     = "SUBSESSION_OF\n(PARENT→CHILD)"
+        Cancellation -> ContextCompaction [style = invis]
+    }
+
+    // ── Concept / Thing cluster ──────────────────────────────────────────────
+    subgraph cluster_concepts {
+        graph [
+            label     = "Concept / Thing Nodes"
+            fontname  = "Helvetica-Bold"
+            fontsize  = 11
+            style     = filled
+            color     = "#2E7D32"
+            fillcolor = "#F1F8E9"
+            penwidth  = 2
+        ]
+
+        Orchestrator [
+            fillcolor = "#C8E6C9"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:Orchestrator :SST_CONCEPT</B></TD></TR>
+                <TR><TD>node_id: orchestrator_name (string key)</TD></TR>
+                <TR><TD>Shared across sessions</TD></TR>
+            </TABLE>>
+        ]
+
+        MountPlan [
+            fillcolor = "#FFE0B2"
+            color     = "#E65100"
+            penwidth  = 1.5
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:MountPlan :SST_THING</B></TD></TR>
+                <TR><TD>node_id: derived from session</TD></TR>
+                <TR><TD>Mount configuration snapshot</TD></TR>
+            </TABLE>>
+        ]
+
+        Orchestrator -> MountPlan [style = invis]
+    }
+
+    // ── Edges ────────────────────────────────────────────────────────────────
+
+    // E01: HAS_EXECUTION [CONTAINS] — Session → OrchestratorRun
+    RootSession -> OrchestratorRun [
+        label     = "E01: HAS_EXECUTION\n{sst_semantic: CONTAINS}"
         color     = "#1565C0"
         fontcolor = "#1565C0"
         penwidth  = 2
     ]
 
+    // E02: FORKED [LEADS_TO] — Session → ForkedSession
     RootSession -> ForkedSession [
-        label     = "HAS_FORK\n(parent->child)"
-        color     = "#7B1FA2"
-        fontcolor = "#7B1FA2"
+        label     = "E02: FORKED\n{sst_semantic: LEADS_TO}"
+        color     = "#E53935"
+        fontcolor = "#E53935"
         penwidth  = 2
     ]
 
-    RootSession -> EventNode [
-        label     = "HAS_EVENT {occurred_at}\nFrom DefaultHandler (always)"
+    // E03: HAS_ATTRIBUTE [EXPRESSES] — Session → Orchestrator
+    RootSession -> Orchestrator [
+        label     = "E03: HAS_ATTRIBUTE\n{sst_semantic: EXPRESSES}"
         color     = "#2E7D32"
         fontcolor = "#2E7D32"
-        penwidth  = 1.5
-        lhead     = cluster_events
+        penwidth  = 2
     ]
 
-    RootSession -> ToolCall [
-        label     = "HAS_TOOL_CALL\n{started_at, ended_at}"
-        color     = "#E65100"
-        fontcolor = "#E65100"
+    // E04: HAS_PART [CONTAINS] — Session → MountPlan
+    RootSession -> MountPlan [
+        label     = "E04: HAS_PART\n{sst_semantic: CONTAINS}"
+        color     = "#1565C0"
+        fontcolor = "#1565C0"
         penwidth  = 1.5
-    ]
-
-    ToolCall -> EventNode [
-        label     = "HAS_EVENT {occurred_at}\nFrom ToolCallHandler (additionally)"
-        color     = "#E65100"
-        fontcolor = "#E65100"
         style     = dashed
+    ]
+
+    // E05: HAS_PART [CONTAINS] — Session → Prompt
+    RootSession -> Prompt [
+        label     = "E05: HAS_PART\n{sst_semantic: CONTAINS}"
+        color     = "#1565C0"
+        fontcolor = "#1565C0"
+        penwidth  = 2
+    ]
+
+    // E06: HAS_PART [CONTAINS] — OrchestratorRun → Iteration
+    OrchestratorRun -> Iteration [
+        label     = "E06: HAS_PART\n{sst_semantic: CONTAINS}"
+        color     = "#1565C0"
+        fontcolor = "#1565C0"
+        penwidth  = 2
+    ]
+
+    // E07: HAS_PART [CONTAINS] — Iteration → ContentBlock
+    Iteration -> ContentBlock [
+        label     = "E07: HAS_PART\n{sst_semantic: CONTAINS}"
+        color     = "#1565C0"
+        fontcolor = "#1565C0"
+        penwidth  = 2
+    ]
+
+    // E08: HAS_TOOL_CALL [CONTAINS] — Iteration → ToolCall
+    Iteration -> ToolCall [
+        label     = "E08: HAS_TOOL_CALL\n{sst_semantic: CONTAINS}"
+        color     = "#1565C0"
+        fontcolor = "#1565C0"
+        penwidth  = 2
+    ]
+
+    // E09: CAUSED [LEADS_TO] — ContentBlock → ToolCall
+    ContentBlock -> ToolCall [
+        label     = "E09: CAUSED\n{sst_semantic: LEADS_TO}"
+        color     = "#E53935"
+        fontcolor = "#E53935"
+        penwidth  = 2
+    ]
+
+    // E10: PARALLEL_EXECUTION [NEAR] — ToolCall ↔ ToolCall (undirected)
+    ToolCall -> ToolCallPeer [
+        dir       = none
+        label     = "E10: PARALLEL_EXECUTION\n{sst_semantic: NEAR}\n[undirected — same parallel_group_id]"
+        color     = "#7B1FA2"
+        fontcolor = "#7B1FA2"
+        penwidth  = 2
+        style     = dashed
+    ]
+
+    // E11: HAS_PART [CONTAINS] — Session → Cancellation
+    RootSession -> Cancellation [
+        label     = "E11: HAS_PART\n{sst_semantic: CONTAINS}"
+        color     = "#1565C0"
+        fontcolor = "#1565C0"
         penwidth  = 1.5
     ]
+
+    // E12: HAS_COMPACTION [CONTAINS] — Session → ContextCompaction
+    RootSession -> ContextCompaction [
+        label     = "E12: HAS_COMPACTION\n{sst_semantic: CONTAINS}"
+        color     = "#1565C0"
+        fontcolor = "#1565C0"
+        penwidth  = 1.5
+    ]
+
+    // E13: HAS_SUBSESSION [LEADS_TO] — Session → SubSession
+    RootSession -> SubSession [
+        label     = "E13: HAS_SUBSESSION\n{sst_semantic: LEADS_TO}"
+        color     = "#E53935"
+        fontcolor = "#E53935"
+        penwidth  = 2
+    ]
+
+    // E14: TRIGGERS [LEADS_TO] — Prompt → OrchestratorRun (turn-flow cursor)
+    Prompt -> OrchestratorRun [
+        label     = "E14: TRIGGERS\n{sst_semantic: LEADS_TO}"
+        color     = "#E53935"
+        fontcolor = "#E53935"
+        penwidth  = 2
+        style     = bold
+        constraint = false
+    ]
+
+    // E15: ENABLES [LEADS_TO] — OrchestratorRun → Prompt (turn-flow cursor)
+    OrchestratorRun -> Prompt [
+        label     = "E15: ENABLES\n{sst_semantic: LEADS_TO}"
+        color     = "#E53935"
+        fontcolor = "#E53935"
+        penwidth  = 2
+        style     = bold
+        constraint = false
+    ]
+
+    // ── Notes ────────────────────────────────────────────────────────────────
+    note_turn_cycle [
+        shape     = box
+        style     = filled
+        fillcolor = "#FFF9C4"
+        label     = "\u2139 Turn-flow cycle (E14/E15)\nPrompt \u2192 OrchestratorRun (TRIGGERS)\nOrchestratorRun \u2192 Prompt (ENABLES)\nCursors: last_prompt_id, last_completed_orch_run_id\nMediates multi-turn conversation context"
+    ]
+
+    note_fork_guard [
+        shape     = box
+        style     = filled
+        fillcolor = "#FFCCBC"
+        penwidth  = 2
+        label     = "\u26a0 Fork Guard (classification is permanent)\nsession:fork \u2192 ForkedSession + FORKED edge (E02)\nsession:start with parent_id \u2192 SubSession + HAS_SUBSESSION (E13)\nForkedSession does NOT carry SubSession label.\nsession:start after fork only enriches started_at."
+    ]
+
+    OrchestratorRun -> note_turn_cycle [style = dotted, color = "#AAAAAA", arrowhead = none, constraint = false]
+    RootSession     -> note_fork_guard  [style = dotted, color = "#AAAAAA", arrowhead = none, constraint = false]
+
+    // ── Legend ───────────────────────────────────────────────────────────────
+    subgraph cluster_legend {
+        graph [
+            label     = "Legend"
+            style     = "filled"
+            color     = "#BDBDBD"
+            fillcolor = "#F5F5F5"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+        node [fontsize = 10]
+
+        legend_sst_event [
+            style     = "filled,rounded"
+            fillcolor = "#BBDEFB"
+            label     = "Light blue = :SST_EVENT node\n(session-scoped, time-bounded)"
+        ]
+        legend_sst_thing [
+            style     = "filled,rounded"
+            fillcolor = "#FFE0B2"
+            label     = "Light orange = :SST_THING node\n(durable, session-independent)"
+        ]
+        legend_sst_concept [
+            style     = "filled,rounded"
+            fillcolor = "#C8E6C9"
+            label     = "Light green = :SST_CONCEPT node\n(named concept, shared across sessions)"
+        ]
+        legend_contains [
+            style     = "filled,rounded"
+            fillcolor = "#F5F5F5"
+            color     = "#1565C0"
+            fontcolor = "#1565C0"
+            penwidth  = 2
+            label     = "Blue edge = CONTAINS semantic\n(hierarchical containment)"
+        ]
+        legend_leads_to [
+            style     = "filled,rounded"
+            fillcolor = "#F5F5F5"
+            color     = "#E53935"
+            fontcolor = "#E53935"
+            penwidth  = 2
+            label     = "Red edge = LEADS_TO semantic\n(causal / turn-flow progression)"
+        ]
+        legend_near [
+            style     = "filled,rounded"
+            fillcolor = "#F5F5F5"
+            color     = "#7B1FA2"
+            fontcolor = "#7B1FA2"
+            penwidth  = 2
+            label     = "Purple edge = NEAR semantic\n(co-occurrence / parallel execution)"
+        ]
+        legend_expresses [
+            style     = "filled,rounded"
+            fillcolor = "#F5F5F5"
+            color     = "#2E7D32"
+            fontcolor = "#2E7D32"
+            penwidth  = 2
+            label     = "Green edge = EXPRESSES semantic\n(attribute / identity link)"
+        ]
+
+        legend_sst_event -> legend_sst_thing -> legend_sst_concept -> legend_contains -> legend_leads_to -> legend_near -> legend_expresses [style = invis]
+    }
 }
