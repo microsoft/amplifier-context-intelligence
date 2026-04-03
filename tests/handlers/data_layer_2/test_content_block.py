@@ -174,7 +174,7 @@ class TestE07HasPartEdge:
     async def test_e07_not_created_when_no_active_iteration(
         self, services: HookStateService
     ) -> None:
-        """E07 must NOT be created when active_iteration_id is None; no edges created."""
+        """E07 must NOT be created when active_iteration_id is None; only SOURCED_FROM edge is created."""
         handler = ContentBlockHandler(services)
         # active_iteration_id is None by default (no prior provider:request event)
         assert services.data_layer_2.active_iteration_id is None

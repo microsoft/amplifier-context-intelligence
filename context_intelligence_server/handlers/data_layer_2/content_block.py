@@ -4,7 +4,9 @@ Assembles ContentBlock:SST_EVENT nodes from content_block:start / content_block:
 event pairs, and wires the semantic edge E07.
 
 Edges created here:
-  E07 — Iteration -[:HAS_PART {sst_semantic: 'CONTAINS'}]-> ContentBlock
+  E07         — Iteration -[:HAS_PART {sst_semantic: 'CONTAINS'}]-> ContentBlock
+  SOURCED_FROM — ContentBlock ->[:SOURCED_FROM]-> data_layer_1 content_block:start event
+  SOURCED_FROM — ContentBlock ->[:SOURCED_FROM]-> data_layer_1 content_block:end event
 """
 
 from __future__ import annotations
