@@ -66,11 +66,19 @@ def setup_handlers(services: HookStateService) -> PipelineHandlers:
     """
     # Local imports to allow tests to stub handlers via sys.modules
     # before they are fully implemented in the handlers package.
-    from context_intelligence_server.handlers.data_layer_2.content_block import ContentBlockHandler  # noqa: PLC0415
-    from context_intelligence_server.handlers.data_layer_2.iteration import IterationHandler  # noqa: PLC0415
-    from context_intelligence_server.handlers.data_layer_2.orchestrator_run import OrchestratorRunHandler  # noqa: PLC0415
+    from context_intelligence_server.handlers.data_layer_2.content_block import (
+        ContentBlockHandler,
+    )  # noqa: PLC0415
+    from context_intelligence_server.handlers.data_layer_2.iteration import (
+        IterationHandler,
+    )  # noqa: PLC0415
+    from context_intelligence_server.handlers.data_layer_2.orchestrator_run import (
+        OrchestratorRunHandler,
+    )  # noqa: PLC0415
     from context_intelligence_server.handlers.data_layer_2.session import SessionHandler  # noqa: PLC0415
-    from context_intelligence_server.handlers.data_layer_2.tool_call import ToolCallHandler  # noqa: PLC0415
+    from context_intelligence_server.handlers.data_layer_2.tool_call import (
+        ToolCallHandler,
+    )  # noqa: PLC0415
 
     return PipelineHandlers(
         default=DefaultHandler(services),

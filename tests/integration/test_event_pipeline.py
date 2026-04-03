@@ -87,12 +87,15 @@ def _make_registry_and_worker(
 
 
 class TestFullEventSequence:
-    """Process a realistic session through the simplified pipeline and verify
+    """Process a realistic session through the full pipeline and verify
     graph state at each step.
 
-    The simplified pipeline is: DefaultHandler (always) + SessionHandler
-    (enricher) + ToolCallHandler (enricher).  OrchestratorRun, Step, and
-    ToolExecution nodes no longer exist; cursor state has been removed.
+    The pipeline is: DefaultHandler (always) + five ordered enrichers:
+    SessionHandler, OrchestratorRunHandler, IterationHandler,
+    ContentBlockHandler, ToolCallHandler.  Cursor state (active_iteration_id,
+    pending_tool_block_ids, execution_start_ts) is managed across handlers.
+    ToolCallHandler creates E08/E09/E10 edges when the corresponding cursors
+    are set.
 
     Event sequence:
         session:start → tool:pre → tool:post → session:end
@@ -200,14 +203,15 @@ class TestFullEventSequence:
         assert tc_node["tool_call_id"] == self._TOOL_CALL_ID
         assert tc_node["parallel_group_id"] == self._PARALLEL_GROUP
 
-        # No HAS_TOOL_CALL edge created (Phase A cleanup — no edges from ToolCallHandler)
+        # No HAS_TOOL_CALL edge created — no active_iteration_id cursor set in this sequence
         edge = await services.graph.get_edge(self._SESSION_ID, self._TOOL_CALL_ID)
         assert edge is None
 
     async def test_tool_pre_creates_event_node(self) -> None:
         """After tool:pre DefaultHandler must create a ToolPre Event node with
-        a HAS_EVENT edge from the Session. ToolCallHandler no longer creates
-        edges (Phase A cleanup)."""
+        a HAS_EVENT edge from the Session. ToolCallHandler creates E08/E09/E10
+        edges only when cursors (active_iteration_id, pending_tool_block_ids,
+        parallel_group_id) are set — none are set in this sequence."""
         worker, services = _make_worker_and_services()
         handlers = setup_handlers(services)
 

@@ -1,9 +1,10 @@
-"""Tests for ToolCallHandler — direct tool_call_id node key, SST_EVENT label, no edges.
+"""Tests for ToolCallHandler — direct tool_call_id node key, SST_EVENT label, cursor edges.
 
 Verifies:
 - handled_events == frozenset({'tool:pre', 'tool:post'}) — tool:error excluded
 - ToolCall node ID is the tool_call_id directly ('tc-abc'), not a compound key
-- No edges created by tool:pre or tool:post
+- Edges created by tool:pre only when cursors are set (E08 when active_iteration_id,
+  E09 when pending_tool_block_ids match, E10 when parallel_group_id)
 - SST_EVENT label on all ToolCall nodes
 - result_success / result_output / result_error captured from tool:post
 - Guard: missing session_id or tool_call_id short-circuits without mutation
