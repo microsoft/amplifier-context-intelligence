@@ -133,11 +133,10 @@ class IterationHandler:
         # SOURCED_FROM bridge: Iteration -> data_layer_1 llm:request event
         session_id: str = data.get("session_id", "")
         timestamp: str = data.get("timestamp", "")
-        if session_id and timestamp:
-            data_layer_1_node_id = make_node_id(session_id, "llm:request", timestamp)
-            await self.services.graph.upsert_edge(
-                iteration_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
-            )
+        data_layer_1_node_id = make_node_id(session_id, "llm:request", timestamp)
+        await self.services.graph.upsert_edge(
+            iteration_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
+        )
 
     async def _handle_llm_response(self, data: dict[str, Any]) -> None:
         """Enrich active Iteration with usage fields.
@@ -164,8 +163,7 @@ class IterationHandler:
         # SOURCED_FROM bridge: Iteration -> data_layer_1 llm:response event
         session_id: str = data.get("session_id", "")
         timestamp: str = data.get("timestamp", "")
-        if session_id and timestamp:
-            data_layer_1_node_id = make_node_id(session_id, "llm:response", timestamp)
-            await self.services.graph.upsert_edge(
-                iteration_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
-            )
+        data_layer_1_node_id = make_node_id(session_id, "llm:response", timestamp)
+        await self.services.graph.upsert_edge(
+            iteration_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
+        )

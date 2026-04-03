@@ -245,6 +245,7 @@ class TestLlmRequestUpsertsProperties:
             "llm:request",
             {
                 "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
                 "provider": "anthropic",
                 "model": "claude-3-5-sonnet",
                 "message_count": 5,
@@ -276,6 +277,7 @@ class TestLlmRequestUpsertsProperties:
             "llm:request",
             {
                 "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
                 "provider": "anthropic",
                 "model": "claude-3-5-sonnet",
                 "message_count": 7,
@@ -343,6 +345,7 @@ class TestLlmResponseUpsertsUsage:
             "llm:response",
             {
                 "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:01Z",
                 "usage": {
                     "input_tokens": 1000,
                     "output_tokens": 250,
@@ -375,6 +378,7 @@ class TestLlmResponseUpsertsUsage:
             "llm:response",
             {
                 "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:01Z",
                 "usage": {
                     "input_tokens": 500,
                     "output_tokens": 100,
@@ -406,6 +410,7 @@ class TestLlmResponseUpsertsUsage:
             "llm:response",
             {
                 "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:01Z",
                 # usage key intentionally omitted
             },
         )
