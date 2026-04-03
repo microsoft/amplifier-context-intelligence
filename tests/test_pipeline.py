@@ -170,13 +170,13 @@ def test_setup_handlers_has_enrichers_list() -> None:
 
 
 def test_setup_handlers_enricher_count() -> None:
-    """setup_handlers must return exactly 5 enrichers in Phase B dispatch order."""
+    """setup_handlers must return exactly 8 enrichers (all data_layer_2 enrichers)."""
     from context_intelligence_server.pipeline import setup_handlers
     from context_intelligence_server.services import HookStateService
 
     services = HookStateService(workspace="test")
     result = setup_handlers(services)
-    assert len(result.enrichers) == 5
+    assert len(result.enrichers) == 8
 
 
 def test_setup_handlers_enricher_order() -> None:

@@ -6,7 +6,7 @@ Provides four public exports:
 - ``PipelineHandlers`` — NamedTuple with ``default`` (DefaultHandler) and
   ``enrichers`` (list of ordered enrichers)
 - ``setup_handlers(services)`` — return a PipelineHandlers with DefaultHandler
-  and ``[SessionHandler, OrchestratorRunHandler, IterationHandler, ContentBlockHandler, ToolCallHandler]`` enrichers
+  and all 8 data_layer_2 enrichers
 - ``process_event(worker, event, data, handlers)`` — full pipeline step:
   ensure-session-node → blob processing → always-default dispatch →
   enricher dispatch (for matching events) → terminal flush, all wrapped in a
@@ -58,8 +58,7 @@ def setup_handlers(services: HookStateService) -> PipelineHandlers:
 
     Returns a PipelineHandlers with:
     - ``default``: DefaultHandler instance (always called for every event)
-    - ``enrichers``: [SessionHandler, OrchestratorRunHandler, IterationHandler,
-      ContentBlockHandler, ToolCallHandler] in dispatch order
+    - ``enrichers``: all 8 data_layer_2 enrichers in dispatch order
       (called additionally for events they claim)
 
     All handlers receive the same *services* instance.
@@ -79,6 +78,13 @@ def setup_handlers(services: HookStateService) -> PipelineHandlers:
     from context_intelligence_server.handlers.data_layer_2.tool_call import (
         ToolCallHandler,
     )  # noqa: PLC0415
+    from context_intelligence_server.handlers.data_layer_2.prompt import PromptHandler  # noqa: PLC0415
+    from context_intelligence_server.handlers.data_layer_2.cancellation import (
+        CancellationHandler,
+    )  # noqa: PLC0415
+    from context_intelligence_server.handlers.data_layer_2.context_compaction import (
+        ContextCompactionHandler,
+    )  # noqa: PLC0415
 
     return PipelineHandlers(
         default=DefaultHandler(services),
@@ -88,6 +94,9 @@ def setup_handlers(services: HookStateService) -> PipelineHandlers:
             IterationHandler(services),
             ContentBlockHandler(services),
             ToolCallHandler(services),
+            PromptHandler(services),
+            CancellationHandler(services),
+            ContextCompactionHandler(services),
         ],
     )
 
