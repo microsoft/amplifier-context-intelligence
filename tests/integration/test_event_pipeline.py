@@ -253,10 +253,10 @@ class TestFullEventSequence:
         )
         assert session_to_event is not None
 
-        # No HAS_EVENT edge from ToolCall → Event (Phase A cleanup — ToolCallHandler
-        # no longer creates edges; ToolCall nodes exist standalone without edges)
+        # SOURCED_FROM edge: ToolCall → ToolPreEvent (ToolCallHandler data_layer_2 bridge)
         tc_to_event = await services.graph.get_edge(self._TOOL_CALL_ID, event_node_id)
-        assert tc_to_event is None
+        assert tc_to_event is not None
+        assert tc_to_event["type"] == "SOURCED_FROM"
 
     async def test_tool_post_enriches_tool_call_node(self) -> None:
         """After tool:post the ToolCall node must have ended_at set to T2."""
