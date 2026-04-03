@@ -687,34 +687,7 @@ class TestE10ParallelExecutionEdge:
         # Edge between A and B must exist (in either direction)
         edge_ab = await services.graph.get_edge("tc-a", "tc-b")
         edge_ba = await services.graph.get_edge("tc-b", "tc-a")
-        assert edge_ab is not None or edge_ba is not None
-
-    async def test_e10_edge_has_sst_semantic_near(
-        self, services: HookStateService
-    ) -> None:
-        """E10 edge must have sst_semantic='NEAR'."""
-        handler = ToolCallHandler(services)
-
-        data_a = {
-            "session_id": "s1",
-            "timestamp": "2026-01-01T00:00:00Z",
-            "tool_call_id": "tc-a",
-            "tool_name": "bash",
-            "parallel_group_id": "pg-1",
-        }
-        data_b = {
-            "session_id": "s1",
-            "timestamp": "2026-01-01T00:00:00Z",
-            "tool_call_id": "tc-b",
-            "tool_name": "read_file",
-            "parallel_group_id": "pg-1",
-        }
-        await handler("tool:pre", data_a)
-        await handler("tool:pre", data_b)
-
-        edge = await services.graph.get_edge("tc-a", "tc-b")
-        if edge is None:
-            edge = await services.graph.get_edge("tc-b", "tc-a")
+        edge = edge_ab if edge_ab is not None else edge_ba
         assert edge is not None
         assert edge.get("sst_semantic") == "NEAR"
 
