@@ -6,6 +6,7 @@ Covers:
   '{session_id}::compaction::{timestamp}' with occurred_at
 - E12: Session -[:HAS_COMPACTION {sst_semantic: 'CONTAINS'}]-> ContextCompaction (always)
 - Guard: missing session_id returns continue with zero graph mutations
+- SOURCED_FROM: ContextCompaction -> data_layer_1 event node (context:pre_compact, context:post_compact)
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from context_intelligence_server.handlers.data_layer_2.context_compaction import
     ContextCompactionHandler,
 )
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 
 # ---------------------------------------------------------------------------
@@ -231,3 +233,60 @@ class TestContextCompactionSessionIdGuard:
             {"timestamp": "2026-01-01T00:00:00Z"},
         )
         assert result.action == "continue"
+
+
+# ---------------------------------------------------------------------------
+# 6. TestContextCompactionSourcedFrom
+# ---------------------------------------------------------------------------
+
+
+class TestContextCompactionSourcedFrom:
+    """SOURCED_FROM edges: ContextCompaction -> data_layer_1 event nodes."""
+
+    async def test_pre_compact_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """context:pre_compact must create SOURCED_FROM edge from ContextCompaction to data_layer_1 node."""
+        handler = ContextCompactionHandler(services)
+        timestamp = "2026-01-01T00:00:00Z"
+        await handler(
+            "context:pre_compact",
+            {
+                "session_id": "s1",
+                "timestamp": timestamp,
+            },
+        )
+        compaction_node_id = f"s1::compaction::{timestamp}"
+        data_layer_1_node_id = make_node_id("s1", "context:pre_compact", timestamp)
+        edge = await services.graph.get_edge(compaction_node_id, data_layer_1_node_id)
+        assert edge is not None, (
+            f"SOURCED_FROM edge from '{compaction_node_id}' to '{data_layer_1_node_id}' "
+            "must exist after context:pre_compact"
+        )
+        assert edge.get("type") == "SOURCED_FROM", (
+            f"Edge type must be 'SOURCED_FROM'. Got: {edge.get('type')!r}"
+        )
+
+    async def test_post_compact_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """context:post_compact must create SOURCED_FROM edge from ContextCompaction to data_layer_1 node."""
+        handler = ContextCompactionHandler(services)
+        timestamp = "2026-01-01T00:00:01Z"
+        await handler(
+            "context:post_compact",
+            {
+                "session_id": "s1",
+                "timestamp": timestamp,
+            },
+        )
+        compaction_node_id = f"s1::compaction::{timestamp}"
+        data_layer_1_node_id = make_node_id("s1", "context:post_compact", timestamp)
+        edge = await services.graph.get_edge(compaction_node_id, data_layer_1_node_id)
+        assert edge is not None, (
+            f"SOURCED_FROM edge from '{compaction_node_id}' to '{data_layer_1_node_id}' "
+            "must exist after context:post_compact"
+        )
+        assert edge.get("type") == "SOURCED_FROM", (
+            f"Edge type must be 'SOURCED_FROM'. Got: {edge.get('type')!r}"
+        )

@@ -16,6 +16,7 @@ from typing import Any
 
 from context_intelligence_server.protocol import HookResult
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 
 class ContextCompactionHandler:
@@ -68,6 +69,12 @@ class ContextCompactionHandler:
                 "type": "HAS_COMPACTION",
                 "sst_semantic": "CONTAINS",
             },
+        )
+
+        # SOURCED_FROM bridge: ContextCompaction -> data_layer_1 event
+        data_layer_1_node_id = make_node_id(session_id, event, timestamp)
+        await self.services.graph.upsert_edge(
+            compaction_node_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
         )
 
         return HookResult(action="continue")
