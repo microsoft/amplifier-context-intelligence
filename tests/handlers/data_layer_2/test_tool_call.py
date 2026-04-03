@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from context_intelligence_server.handlers.data_layer_2.tool_call import ToolCallHandler
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +28,9 @@ class TestToolCallHandlerHandledEvents:
 
     def test_handled_events_is_exact_frozenset(self) -> None:
         """handled_events must be exactly frozenset({'tool:pre', 'tool:post', 'tool:error'})."""
-        assert ToolCallHandler.handled_events == frozenset({"tool:pre", "tool:post", "tool:error"})
+        assert ToolCallHandler.handled_events == frozenset(
+            {"tool:pre", "tool:post", "tool:error"}
+        )
 
     def test_tool_error_in_handled_events(self) -> None:
         """tool:error must be in handled_events."""
@@ -249,7 +252,7 @@ class TestToolPreNoEdgesWithoutCursors:
         assert edge is None
 
     async def test_no_has_event_edges(self, services: HookStateService) -> None:
-        """No edges at all must be created by tool:pre."""
+        """Only the SOURCED_FROM edge is created by tool:pre (no HAS_TOOL_CALL, HAS_EVENT, etc.)."""
         handler = ToolCallHandler(services)
 
         data = {
@@ -260,7 +263,7 @@ class TestToolPreNoEdgesWithoutCursors:
         }
         await handler("tool:pre", data)
 
-        assert len(services.graph._edges) == 0
+        assert len(services.graph._edges) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +382,7 @@ class TestToolPostEnrichesToolCall:
     async def test_tool_post_no_has_event_edge(
         self, services: HookStateService
     ) -> None:
-        """Neither tool:pre nor tool:post must create any edges."""
+        """Only SOURCED_FROM edges are created by tool:pre + tool:post (no HAS_TOOL_CALL, etc.)."""
         handler = ToolCallHandler(services)
 
         pre_data = {
@@ -398,7 +401,7 @@ class TestToolPostEnrichesToolCall:
         await handler("tool:pre", pre_data)
         await handler("tool:post", post_data)
 
-        assert len(services.graph._edges) == 0
+        assert len(services.graph._edges) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +557,7 @@ class TestE08HasToolCallEdge:
     async def test_e08_no_edge_when_no_active_iteration(
         self, services: HookStateService
     ) -> None:
-        """E08 edge must NOT be created when active_iteration_id is None (zero edges)."""
+        """E08 edge must NOT be created when active_iteration_id is None (only SOURCED_FROM)."""
         # active_iteration_id is None by default
         assert services.data_layer_2.active_iteration_id is None
         handler = ToolCallHandler(services)
@@ -567,7 +570,7 @@ class TestE08HasToolCallEdge:
         }
         await handler("tool:pre", data)
 
-        assert len(services.graph._edges) == 0
+        assert len(services.graph._edges) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -728,7 +731,7 @@ class TestE10ParallelExecutionEdge:
     async def test_e10_no_edge_when_no_parallel_group_id(
         self, services: HookStateService
     ) -> None:
-        """E10 edge must NOT be created when parallel_group_id is absent."""
+        """E10 edge must NOT be created when parallel_group_id is absent (only SOURCED_FROM)."""
         handler = ToolCallHandler(services)
 
         data = {
@@ -739,7 +742,7 @@ class TestE10ParallelExecutionEdge:
         }
         await handler("tool:pre", data)
 
-        assert len(services.graph._edges) == 0
+        assert len(services.graph._edges) == 1
 
     async def test_e10_different_groups_do_not_link(
         self, services: HookStateService
@@ -848,9 +851,7 @@ class TestToolErrorCompletesToolCall:
         assert node is not None
         assert node["result_error"] == "TimeoutError"
 
-    async def test_tool_error_sets_ended_at(
-        self, services: HookStateService
-    ) -> None:
+    async def test_tool_error_sets_ended_at(self, services: HookStateService) -> None:
         """tool:error must set ended_at matching the error event timestamp."""
         handler = ToolCallHandler(services)
 
@@ -918,3 +919,90 @@ class TestToolErrorCompletesToolCall:
         node = await services.graph.get_node("tc-abc")
         assert node is not None
         assert node["result_error"] == "disk full"
+
+
+# ---------------------------------------------------------------------------
+# 12. TestToolCallSourcedFrom
+# ---------------------------------------------------------------------------
+
+
+class TestToolCallSourcedFrom:
+    """SOURCED_FROM edges bridge ToolCall to data_layer_1 event nodes (with disambiguator)."""
+
+    async def test_tool_pre_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """tool:pre must create a SOURCED_FROM edge to the data_layer_1 tool:pre event node."""
+        handler = ToolCallHandler(services)
+        timestamp = "2026-01-01T00:00:00Z"
+
+        data = {
+            "session_id": "s1",
+            "timestamp": timestamp,
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        await handler("tool:pre", data)
+
+        expected_target = make_node_id("s1", "tool:pre", timestamp, "tc-abc")
+        edge = await services.graph.get_edge("tc-abc", expected_target)
+        assert edge is not None
+        assert edge.get("type") == "SOURCED_FROM"
+
+    async def test_tool_post_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """tool:post must create a SOURCED_FROM edge to the data_layer_1 tool:post event node."""
+        handler = ToolCallHandler(services)
+        pre_timestamp = "2026-01-01T00:00:00Z"
+        post_timestamp = "2026-01-01T00:01:00Z"
+
+        pre_data = {
+            "session_id": "s1",
+            "timestamp": pre_timestamp,
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        post_data = {
+            "session_id": "s1",
+            "timestamp": post_timestamp,
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+
+        await handler("tool:pre", pre_data)
+        await handler("tool:post", post_data)
+
+        expected_target = make_node_id("s1", "tool:post", post_timestamp, "tc-abc")
+        edge = await services.graph.get_edge("tc-abc", expected_target)
+        assert edge is not None
+        assert edge.get("type") == "SOURCED_FROM"
+
+    async def test_tool_error_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """tool:error must create a SOURCED_FROM edge to the data_layer_1 tool:error event node."""
+        handler = ToolCallHandler(services)
+        pre_timestamp = "2026-01-01T00:00:00Z"
+        error_timestamp = "2026-01-01T00:01:00Z"
+
+        pre_data = {
+            "session_id": "s1",
+            "timestamp": pre_timestamp,
+            "tool_call_id": "tc-abc",
+            "tool_name": "bash",
+        }
+        error_data = {
+            "session_id": "s1",
+            "timestamp": error_timestamp,
+            "tool_call_id": "tc-abc",
+            "error": "TimeoutError",
+        }
+
+        await handler("tool:pre", pre_data)
+        await handler("tool:error", error_data)
+
+        expected_target = make_node_id("s1", "tool:error", error_timestamp, "tc-abc")
+        edge = await services.graph.get_edge("tc-abc", expected_target)
+        assert edge is not None
+        assert edge.get("type") == "SOURCED_FROM"

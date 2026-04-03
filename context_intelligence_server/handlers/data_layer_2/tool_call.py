@@ -18,6 +18,7 @@ from typing import Any
 
 from context_intelligence_server.protocol import HookResult
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +55,10 @@ class ToolCallHandler:
         if event == "tool:pre":
             await self._handle_pre(session_id, tool_call_id, timestamp, data)
         elif event == "tool:error":
-            await self._handle_error(tool_call_id, timestamp, data)
+            await self._handle_error(session_id, tool_call_id, timestamp, data)
         else:
             # tool:post — enrich the existing node
-            await self._handle_post(tool_call_id, timestamp, data)
+            await self._handle_post(session_id, tool_call_id, timestamp, data)
 
         return HookResult(action="continue")
 
@@ -114,8 +115,17 @@ class ToolCallHandler:
                 )
             group.append(tool_call_id)
 
+        # SOURCED_FROM bridge: ToolCall -> data_layer_1 tool:pre event (with disambiguator)
+        data_layer_1_node_id = make_node_id(
+            session_id, "tool:pre", timestamp, tool_call_id
+        )
+        await self.services.graph.upsert_edge(
+            tool_call_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
+        )
+
     async def _handle_post(
         self,
+        session_id: str,
         tool_call_id: str,
         timestamp: str,
         data: dict[str, Any],
@@ -131,8 +141,17 @@ class ToolCallHandler:
         }
         await self.services.graph.upsert_node(tool_call_id, node_data)
 
+        # SOURCED_FROM bridge: ToolCall -> data_layer_1 tool:post event (with disambiguator)
+        data_layer_1_node_id = make_node_id(
+            session_id, "tool:post", timestamp, tool_call_id
+        )
+        await self.services.graph.upsert_edge(
+            tool_call_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
+        )
+
     async def _handle_error(
         self,
+        session_id: str,
         tool_call_id: str,
         timestamp: str,
         data: dict[str, Any],
@@ -152,3 +171,11 @@ class ToolCallHandler:
             "result_error": result_error,
         }
         await self.services.graph.upsert_node(tool_call_id, node_data)
+
+        # SOURCED_FROM bridge: ToolCall -> data_layer_1 tool:error event (with disambiguator)
+        data_layer_1_node_id = make_node_id(
+            session_id, "tool:error", timestamp, tool_call_id
+        )
+        await self.services.graph.upsert_edge(
+            tool_call_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
+        )
