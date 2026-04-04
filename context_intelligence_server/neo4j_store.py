@@ -47,6 +47,86 @@ def _validate_identifier(name: str, kind: str) -> None:
         raise ValueError(f"Invalid Neo4j {kind} identifier: {name!r}")
 
 
+async def ensure_neo4j_schema(
+    driver: Any,
+    database: str = "neo4j",
+    workspace: str = "",
+) -> None:
+    """Create Neo4j indexes and constraints idempotently.
+
+    Intended to be called **once at server startup** (before any requests are
+    accepted) so that the uniqueness constraint on Session nodes is active before
+    concurrent ``flush()`` transactions execute ``MERGE``.
+
+    Runs a deduplication pass *first* so that any pre-existing duplicate Session
+    nodes (from a previous run without the constraint) do not block constraint
+    creation.
+
+    Args:
+        driver:    An ``AsyncDriver`` instance created via
+                   ``AsyncGraphDatabase.driver(...)``.
+        database:  Target Neo4j database name (default: ``"neo4j"``).
+        workspace: Reserved for future workspace-scoped schema; currently unused.
+    """
+    async with driver.session(database=database) as session:
+        # ------------------------------------------------------------------
+        # Step 1: deduplicate any pre-existing duplicate Session nodes.
+        # For each duplicate (node_id, workspace) group keep the first node
+        # (as returned by collect()) and DETACH DELETE the remainder.
+        # This MUST run before constraint creation so a dirty graph does not
+        # cause the CREATE CONSTRAINT statement to fail.
+        # ------------------------------------------------------------------
+        try:
+            await session.run(
+                "MATCH (s:Session) "
+                "WITH s.node_id AS nid, s.workspace AS ws, collect(s) AS nodes "
+                "WHERE size(nodes) > 1 "
+                "UNWIND tail(nodes) AS duplicate "
+                "DETACH DELETE duplicate"
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning(
+                "ensure_neo4j_schema: deduplication query failed (non-fatal): %s", exc
+            )
+
+        # ------------------------------------------------------------------
+        # Step 2: create node_id indexes (idempotent via IF NOT EXISTS).
+        # ------------------------------------------------------------------
+        for label in (
+            "Session",
+            "OrchestratorRun",
+            "Step",
+            "ToolExecution",
+            "Event",
+        ):
+            await session.run(
+                f"CREATE INDEX IF NOT EXISTS FOR (n:{label}) ON (n.node_id)"
+            )
+        await session.run(
+            "CREATE INDEX idx_session_workspace IF NOT EXISTS "
+            "FOR (n:Session) ON (n.workspace)"
+        )
+
+        # ------------------------------------------------------------------
+        # Step 3: uniqueness constraint on Session nodes.
+        # Must run AFTER deduplication (step 1) so pre-existing duplicates do
+        # not cause the constraint creation to fail.
+        # Combined with MERGE (n:Session ...) in flush(), makes concurrent
+        # MERGEs atomic and prevents duplicate Session nodes under load.
+        # ------------------------------------------------------------------
+        try:
+            await session.run(
+                "CREATE CONSTRAINT session_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Session) REQUIRE (n.node_id, n.workspace) IS UNIQUE"
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning(
+                "ensure_neo4j_schema: could not create Session uniqueness constraint "
+                "(pre-existing duplicates?): %s",
+                exc,
+            )
+
+
 class Neo4jGraphStore:
     """Neo4j-backed implementation of the GraphStore and QueryableStore protocols.
 
@@ -413,49 +493,16 @@ class Neo4jGraphStore:
     async def _ensure_schema(self) -> None:
         """Create Neo4j indexes and constraints idempotently (runs once per store instance).
 
-        Creates node_id indexes on Session, OrchestratorRun, Step, ToolExecution,
-        and Event labels, plus a named workspace index on Session, plus a uniqueness
-        constraint on (node_id, workspace) to prevent duplicate nodes from concurrent
-        worker flushes.
+        Safety-net for contexts where the FastAPI lifespan is not active (e.g. tests,
+        CLI tools, or direct store use).  The primary schema-initialization path is
+        ``ensure_neo4j_schema()`` called from the lifespan handler *before* the server
+        starts accepting requests, which guarantees the uniqueness constraint is active
+        before any concurrent ``flush()`` transactions execute ``MERGE``.
         """
         if self._schema_initialized:
             return
 
-        async with self._driver.session(database=self._database) as session:
-            for label in (
-                "Session",
-                "OrchestratorRun",
-                "Step",
-                "ToolExecution",
-                "Event",
-            ):
-                await session.run(
-                    f"CREATE INDEX IF NOT EXISTS FOR (n:{label}) ON (n.node_id)"
-                )
-            await session.run(
-                "CREATE INDEX idx_session_workspace IF NOT EXISTS "
-                "FOR (n:Session) ON (n.workspace)"
-            )
-
-            # Uniqueness constraint on Session nodes — prevents duplicate Session nodes from
-            # concurrent worker flushes. Label-required IS UNIQUE (Community-compatible).
-            # Combined with MERGE (n:Session ...) in flush(), makes concurrent MERGEs atomic.
-            try:
-                await session.run(
-                    "CREATE CONSTRAINT session_node_id_workspace_unique IF NOT EXISTS "
-                    "FOR (n:Session) REQUIRE (n.node_id, n.workspace) IS UNIQUE"
-                )
-            except Exception as exc:  # noqa: BLE001
-                # Pre-existing Session nodes may violate the constraint — log and continue.
-                # The server works without it; concurrent duplicate writes are less likely
-                # on a clean database. Run 'MATCH (n:Session) WITH n.node_id, n.workspace,
-                # collect(n) AS ns WHERE size(ns) > 1 FOREACH (d IN tail(ns) | DETACH DELETE d)'
-                # to remove existing duplicates, then restart.
-                _LOG.warning(
-                    "Could not create Session uniqueness constraint (existing duplicates?): %s",
-                    exc,
-                )
-
+        await ensure_neo4j_schema(self._driver, self._database)
         self._schema_initialized = True
 
     def schedule_flush(self) -> None:

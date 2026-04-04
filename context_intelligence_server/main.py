@@ -36,6 +36,7 @@ from context_intelligence_server.models import (
     EventRequest,
     EventResponse,
 )
+from context_intelligence_server.neo4j_store import ensure_neo4j_schema
 from context_intelligence_server.registry import SessionRegistry
 
 _settings = get_settings()
@@ -52,6 +53,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         _settings.neo4j_url,
         auth=(_settings.neo4j_user, _settings.neo4j_password),
     )
+    # Initialize schema (indexes + uniqueness constraints) BEFORE the server starts
+    # accepting requests.  This ensures the Session uniqueness constraint is active
+    # before any concurrent flush() transactions execute MERGE, which prevents the
+    # duplicate-Session-node race condition observed under concurrent upload load.
+    logger.info(
+        "lifespan_startup: initializing Neo4j schema (indexes + uniqueness constraints)"
+    )
+    await ensure_neo4j_schema(app.state.neo4j_driver)
+    logger.info("lifespan_startup: Neo4j schema initialized")
     _skills_dir = Path(__file__).parent / "skills"
     app.state.skill_registry = SkillRegistry()
     if _skills_dir.exists():

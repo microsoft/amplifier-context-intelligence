@@ -533,7 +533,7 @@ class TestSchemaIndexesWorkspace:
         await store._ensure_schema()  # Should not raise
 
     async def test_schema_is_idempotent(self):
-        """Every CREATE INDEX query in _ensure_schema() must use IF NOT EXISTS.
+        """Every CREATE INDEX/CONSTRAINT query in _ensure_schema() must use IF NOT EXISTS.
 
         The Docker Compose stack uses a persistent neo4j_data volume.  When the
         container restarts the Python process starts fresh (_schema_initialized
@@ -542,6 +542,11 @@ class TestSchemaIndexesWorkspace:
         Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists, which
         propagates out of flush() and causes the "Final flush failed during
         close" data-loss path.
+
+        Non-CREATE queries (e.g. the deduplication MATCH ... DETACH DELETE that
+        runs before constraint creation) are excluded from this check — they are
+        idempotent by nature (no-op when no duplicates exist) but do not use the
+        IF NOT EXISTS syntax.
         """
         store = _make_store()
         mock_session = self._make_schema_session()
@@ -553,9 +558,14 @@ class TestSchemaIndexesWorkspace:
             call.args[0] for call in mock_session.run.call_args_list if call.args
         ]
         assert all_queries, "_ensure_schema must issue at least one query"
-        for query in all_queries:
+        # Only CREATE statements must include IF NOT EXISTS; MATCH/data queries are exempt.
+        create_queries = [
+            q for q in all_queries if q.upper().lstrip().startswith("CREATE")
+        ]
+        assert create_queries, "_ensure_schema must issue at least one CREATE query"
+        for query in create_queries:
             assert "IF NOT EXISTS" in query.upper(), (
-                f"Every schema CREATE INDEX must use IF NOT EXISTS so that "
+                f"Every schema CREATE INDEX/CONSTRAINT must use IF NOT EXISTS so that "
                 f"container restarts on a persistent volume do not raise "
                 f"EquivalentSchemaRuleAlreadyExists.  Offending query: {query!r}"
             )
@@ -1283,3 +1293,29 @@ class TestNeo4jGraphStoreFlushNoLabelMerge:
                 f"Constraint must use (n:Session) label syntax, not label-free (n). Got: {q}"
             )
             assert "IS UNIQUE" in q, f"Must use IS UNIQUE syntax. Got: {q}"
+
+
+# ---------------------------------------------------------------------------
+# Startup schema callable — lifespan fix regression guard
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_schema_is_callable_at_startup() -> None:
+    """ensure_neo4j_schema must be importable and callable for lifespan use.
+
+    This test is a regression guard for the concurrency bug where _ensure_schema()
+    was called inside flush() transactions.  Under concurrent upload load, multiple
+    flushes start before any constraint is committed, so the uniqueness constraint is
+    never active when it is needed.
+
+    The fix extracts ensure_neo4j_schema() as a module-level coroutine function so
+    main.py's lifespan handler can call it once at startup, before the server accepts
+    any requests.
+    """
+    import inspect
+
+    from context_intelligence_server.neo4j_store import ensure_neo4j_schema
+
+    assert inspect.iscoroutinefunction(ensure_neo4j_schema), (
+        "ensure_neo4j_schema must be an async function so lifespan can await it"
+    )
