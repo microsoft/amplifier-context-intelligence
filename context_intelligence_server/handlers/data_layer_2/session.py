@@ -87,10 +87,18 @@ class SessionHandler:
         labels: list[str] = existing.get("labels", []) if existing else []
         current_type = _current_type(labels)
 
-        # Always enrich started_at and session identity properties
+        # Always enrich started_at and session identity properties.
+        # IMPORTANT: "Session" MUST be included here so neo4j_store routes this
+        # write to MERGE (n:Session {node_id, workspace}) — the same bucket used
+        # by ensure_session_node.  Without it, the write goes to the label-free
+        # MERGE (n {node_id, workspace}) bucket, which is a DIFFERENT Neo4j
+        # operation.  Under concurrent flushes, both MERGE variants see "no node"
+        # and each creates a separate Neo4j node — two nodes for the same
+        # session_id — which then breaks the uniqueness constraint on flush.
         await self.services.graph.upsert_node(
             session_id,
             {
+                "labels": ["Session"],
                 "started_at": timestamp,
                 "session_id": session_id,
                 "parent_id": parent_id if parent_id else None,
@@ -180,10 +188,15 @@ class SessionHandler:
         labels: list[str] = existing.get("labels", []) if existing else []
         current_type = _current_type(labels)
 
-        # Always enrich started_at, workspace, and session identity properties
+        # Always enrich started_at, workspace, and session identity properties.
+        # IMPORTANT: "Session" MUST be included here for the same reason as
+        # _handle_start — ensures neo4j_store routes this write to
+        # MERGE (n:Session {node_id, workspace}), not the label-free bucket.
+        # See _handle_start comment for full explanation.
         await self.services.graph.upsert_node(
             session_id,
             {
+                "labels": ["Session"],
                 "started_at": timestamp,
                 "workspace": workspace,
                 "session_id": session_id,

@@ -11,6 +11,8 @@ Covers:
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from context_intelligence_server.handlers.data_layer_2.session import (
@@ -18,8 +20,44 @@ from context_intelligence_server.handlers.data_layer_2.session import (
     _TYPE_LABELS,
     _current_type,
 )
-from context_intelligence_server.services import HookStateService
+from context_intelligence_server.services import GraphState, HookStateService
 from context_intelligence_server.utils import make_node_id
+
+
+# ---------------------------------------------------------------------------
+# _RecordingGraphState — spy helper for TestSessionHandlerUsesSessionLabeledMerge
+# ---------------------------------------------------------------------------
+
+
+class _RecordingGraphState(GraphState):
+    """GraphState subclass that records every upsert_node call's arguments.
+
+    Used by TestSessionHandlerUsesSessionLabeledMerge to verify that the
+    initial upsert_node call from _handle_start and _handle_fork includes
+    "Session" in labels — not only via the later set_labels call.
+
+    This matters because neo4j_store.flush() splits nodes into two MERGE
+    buckets based solely on the "labels" key present at upsert_node time:
+
+      "Session" in labels  → MERGE (n:Session {node_id, workspace})
+      "Session" NOT in labels → MERGE (n {node_id, workspace})   ← label-free
+
+    These are independent Neo4j operations.  Without "Session" in the initial
+    upsert_node, a concurrent ensure_session_node flush (which always includes
+    "Session") uses a different MERGE key and creates a second Neo4j node for
+    the same session_id.  The uniqueness constraint on (:Session {node_id,
+    workspace}) cannot prevent this because bare (unlabeled) nodes are not
+    covered by the constraint.
+    """
+
+    def __init__(self, workspace: str = "default") -> None:
+        super().__init__(workspace)
+        self.upsert_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def upsert_node(self, node_id: str, data: dict[str, Any]) -> None:
+        """Record args then delegate to the real implementation."""
+        self.upsert_calls.append((node_id, dict(data)))
+        await super().upsert_node(node_id, data)
 
 
 class TestTypeLabelConstant:
@@ -1591,4 +1629,165 @@ class TestEnsureSessionNodeSessionLabel:
         assert node is not None
         assert "Session" in node.get("labels", []), (
             "Session label must persist across idempotent ensure_session_node calls"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestSessionHandlerUsesSessionLabeledMerge — upsert_node in _handle_start
+#   and _handle_fork must include "Session" so neo4j_store routes to
+#   MERGE (n:Session {node_id, workspace}), not the label-free bucket.
+# ---------------------------------------------------------------------------
+
+
+class TestSessionHandlerUsesSessionLabeledMerge:
+    """_handle_start and _handle_fork must include 'Session' in upsert_node.
+
+    neo4j_store.flush() splits nodes into two MERGE buckets based solely on
+    the labels present in the upsert_node payload:
+
+      "Session" in labels  → MERGE (n:Session {node_id, workspace})
+      "Session" NOT in labels → MERGE (n {node_id, workspace})  ← label-free
+
+    These are INDEPENDENT Neo4j operations.  Without "Session" in the initial
+    upsert_node call, the write goes to the label-free bucket.  A concurrent
+    ensure_session_node flush (which always includes "Session") uses
+    MERGE (n:Session {…}) — a different key — and creates a SECOND Neo4j node
+    for the same session_id.  The uniqueness constraint on
+    (:Session {node_id, workspace}) cannot prevent this because bare
+    (unlabeled) nodes are outside the constraint's scope.
+
+    _RecordingGraphState captures every upsert_node call so these tests can
+    verify the initial upsert includes "Session" — not only via set_labels.
+    """
+
+    async def test_handle_start_upsert_includes_session_label(self) -> None:
+        """_handle_start must pass 'Session' in labels to its upsert_node call.
+
+        Without this, neo4j_store routes the write to the label-free MERGE
+        bucket, diverging from ensure_session_node's Session-labeled MERGE
+        and producing a duplicate Neo4j node under concurrent load.
+        """
+        recording = _RecordingGraphState(workspace="test-workspace")
+        svc = HookStateService(workspace="test-workspace", graph_store=recording)
+        handler = SessionHandler(svc)
+
+        await handler(
+            "session:start",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+
+        # Find all upsert_node calls whose first arg is the session_id
+        session_calls = [
+            data for nid, data in recording.upsert_calls if nid == "s1"
+        ]
+        assert session_calls, (
+            "_handle_start must call upsert_node at least once for the session node"
+        )
+
+        # The first upsert_node call (initial write) must include Session label
+        first_call_data = session_calls[0]
+        assert "labels" in first_call_data, (
+            "_handle_start upsert_node must include a 'labels' key so neo4j_store "
+            "routes it to MERGE (n:Session {…}), not the label-free bucket. "
+            f"Got payload: {first_call_data!r}"
+        )
+        assert "Session" in first_call_data["labels"], (
+            "'Session' must be in _handle_start's upsert_node labels so the write "
+            "uses the same MERGE bucket as ensure_session_node. "
+            f"Got labels: {first_call_data['labels']!r}"
+        )
+
+    async def test_handle_fork_upsert_includes_session_label(self) -> None:
+        """_handle_fork must pass 'Session' in labels to its upsert_node call.
+
+        Same routing requirement as _handle_start — a concurrent
+        ensure_session_node flush with Session-labeled MERGE creates a second
+        Neo4j node if _handle_fork's initial upsert goes to the label-free bucket.
+        """
+        recording = _RecordingGraphState(workspace="test-workspace")
+        svc = HookStateService(workspace="test-workspace", graph_store=recording)
+        handler = SessionHandler(svc)
+
+        await handler(
+            "session:fork",
+            {
+                "session_id": "f1",
+                "parent_id": "p1",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+
+        session_calls = [
+            data for nid, data in recording.upsert_calls if nid == "f1"
+        ]
+        assert session_calls, (
+            "_handle_fork must call upsert_node at least once for the session node"
+        )
+
+        first_call_data = session_calls[0]
+        assert "labels" in first_call_data, (
+            "_handle_fork upsert_node must include a 'labels' key so neo4j_store "
+            "routes it to MERGE (n:Session {…}), not the label-free bucket. "
+            f"Got payload: {first_call_data!r}"
+        )
+        assert "Session" in first_call_data["labels"], (
+            "'Session' must be in _handle_fork's upsert_node labels so the write "
+            "uses the same MERGE bucket as ensure_session_node. "
+            f"Got labels: {first_call_data['labels']!r}"
+        )
+
+    async def test_handle_start_does_not_create_bare_node_when_ensure_session_ran_first(
+        self, services: HookStateService
+    ) -> None:
+        """ensure_session_node then session:start must enrich one node, not create a bare second one.
+
+        This models the exact production scenario that caused
+        Neo.DatabaseError.Schema.ConstraintCreationFailed:
+
+          1. A child session's session:start arrives → ensure_session_node(parent_id, {})
+             is called, creating a Session-labeled stub for the parent.
+          2. The parent session's own session:start arrives → SessionHandler processes it.
+
+        In Neo4j, both flush operations must resolve to the same MERGE key:
+        MERGE (n:Session {node_id, workspace}).  This only holds when the
+        initial upsert_node from _handle_start carries "Session" in labels.
+
+        In the in-memory GraphState (used in tests), node_id is a dict key so
+        true duplicates are impossible.  This test verifies:
+          a) The stub already has 'Session' immediately after ensure_session_node.
+          b) After session:start, 'Session' is still present (not stripped).
+          c) Exactly one entry exists for session_id in _nodes (no phantom second node).
+        """
+        session_id = "merge-dedup-start-test"
+
+        # Step 1: child's event triggers ensure_session_node for parent
+        await services.ensure_session_node(session_id, {})
+
+        stub = await services.graph.get_node(session_id)
+        assert stub is not None, "Stub must be created by ensure_session_node"
+        assert "Session" in stub.get("labels", []), (
+            "Stub from ensure_session_node must carry 'Session' label"
+        )
+
+        # Step 2: parent's own session:start enriches the same node
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {"session_id": session_id, "timestamp": "2026-01-01T00:00:00Z"},
+        )
+
+        # In-memory: exactly one node entry for session_id (no phantom duplicates)
+        matching_ids = [nid for nid in services.graph._nodes if nid == session_id]
+        assert len(matching_ids) == 1, (
+            f"Exactly one internal node entry must exist for '{session_id}'; "
+            f"found {len(matching_ids)}.  In Neo4j, without 'Session' in "
+            "_handle_start's upsert_node call, ensure_session_node and "
+            "session:start use different MERGE keys and produce two nodes."
+        )
+
+        # 'Session' must still be present after session:start enrichment
+        enriched = await services.graph.get_node(session_id)
+        assert enriched is not None
+        assert "Session" in enriched.get("labels", []), (
+            "'Session' label must survive session:start enrichment of the stub"
         )
