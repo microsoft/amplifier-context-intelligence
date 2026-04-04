@@ -1446,6 +1446,149 @@ class TestSourcedFromMountPlan:
         await handler("session:fork", data)
 
         mount_plan_id = "s1::mount_plan"
-        expected_dl1_node_id = make_node_id("s1", "session:fork", "2026-01-01T00:00:00.000Z")
+        expected_dl1_node_id = make_node_id(
+            "s1", "session:fork", "2026-01-01T00:00:00.000Z"
+        )
         assert (mount_plan_id, expected_dl1_node_id) in services.graph._edges
-        assert services.graph._edges[(mount_plan_id, expected_dl1_node_id)]["type"] == "SOURCED_FROM"
+        assert (
+            services.graph._edges[(mount_plan_id, expected_dl1_node_id)]["type"]
+            == "SOURCED_FROM"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestEnsureSessionNodeSessionLabel — ensure_session_node must always include
+#                                     the Session label to prevent Neo4j duplicates
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureSessionNodeSessionLabel:
+    """ensure_session_node must always create nodes with the Session label.
+
+    In neo4j_store.flush(), nodes are split into two MERGE buckets:
+      - "Session" in labels  → MERGE (n:Session {node_id, workspace})
+      - "Session" NOT in labels → MERGE (n {node_id, workspace})  [label-free]
+
+    If ensure_session_node creates a bare node without :Session, the flush
+    routes it to the label-free MERGE bucket.  A subsequent session:start for
+    the same session_id routes to the Session-label MERGE bucket, which cannot
+    find the existing bare node and creates a SECOND Neo4j node.  Result: two
+    nodes sharing identical (node_id, workspace) — duplicate that blocks the
+    uniqueness constraint and surfaces as a Neo4j ConstraintCreationFailed error.
+
+    These tests are regression guards: if ensure_session_node ever stops
+    including "Session" in its node labels, every test here will fail.
+    """
+
+    async def test_ensure_session_node_empty_data_creates_session_label(
+        self, services: HookStateService
+    ) -> None:
+        """ensure_session_node({}) must create a node with 'Session' in labels.
+
+        This is the primary regression guard.  The call site in SessionHandler
+        is ``await services.ensure_session_node(parent_id, {})``.  If the empty
+        dict propagates to upsert_node as-is, the node has no labels and goes
+        into the label-free MERGE bucket in neo4j_store — causing duplicates.
+        """
+        await services.ensure_session_node("stub-parent", {})
+
+        node = await services.graph.get_node("stub-parent")
+        assert node is not None, "ensure_session_node must create the node"
+        assert "Session" in node.get("labels", []), (
+            "ensure_session_node must always include 'Session' in labels so "
+            "neo4j_store routes the node to MERGE (n:Session {...}), not the "
+            "label-free MERGE (n {...}) bucket.  Without this, concurrent "
+            "session:start events for the same session_id create duplicate nodes."
+        )
+
+    async def test_ensure_session_node_includes_session_label_regardless_of_data(
+        self, services: HookStateService
+    ) -> None:
+        """Session label must be present even when data contains other fields."""
+        await services.ensure_session_node(
+            "sess-with-data",
+            {"started_at": "2026-01-01T00:00:00Z", "workspace": "test-ws"},
+        )
+
+        node = await services.graph.get_node("sess-with-data")
+        assert node is not None
+        assert "Session" in node.get("labels", []), (
+            "ensure_session_node must include 'Session' label even when data "
+            "contains other keys — the label must not be sourced from data."
+        )
+
+    async def test_session_start_after_ensure_enriches_not_duplicates(
+        self, services: HookStateService
+    ) -> None:
+        """session:start after ensure_session_node must enrich the stub, not create a second node.
+
+        This models the real production scenario that caused ConstraintCreationFailed:
+          1. Child session's session:start arrives → ensure_session_node(parent_id, {}) called
+          2. Parent session's own session:start arrives → SessionHandler processes it
+
+        In Neo4j, both flush calls must use the same MERGE key: MERGE (n:Session {...}).
+        This is only possible if the stub created in step 1 has :Session label.
+
+        In the in-memory GraphState (used in tests), node_id is a dict key so
+        true duplicates are impossible, but this test verifies:
+          a) The stub stub has :Session immediately after ensure_session_node
+          b) After session:start, the node has both Session + RootSession (enriched)
+          c) Exactly one entry exists in the internal node dict for that ID
+        """
+        parent_id = "parent-dedup-test"
+
+        # Step 1: child's session:start triggers ensure_session_node for parent
+        await services.ensure_session_node(parent_id, {})
+
+        stub = await services.graph.get_node(parent_id)
+        assert stub is not None, "Stub node must be created by ensure_session_node"
+        assert "Session" in stub.get("labels", []), (
+            "Stub created by ensure_session_node must carry 'Session' label — "
+            "this controls which MERGE bucket neo4j_store uses on flush."
+        )
+
+        # Step 2: parent's own session:start arrives — must enrich, not replace
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": parent_id,
+                "timestamp": "2026-01-01T00:00:00.000Z",
+            },
+        )
+
+        enriched = await services.graph.get_node(parent_id)
+        assert enriched is not None
+        assert "Session" in enriched.get("labels", []), (
+            "Session label must survive session:start enrichment"
+        )
+        assert "RootSession" in enriched.get("labels", []), (
+            "session:start (no parent) must add RootSession to the stub node"
+        )
+
+        # Verify single entry in internal node dict — no phantom duplicates
+        matching_ids = [nid for nid in services.graph._nodes if nid == parent_id]
+        assert len(matching_ids) == 1, (
+            f"Exactly one internal node entry must exist for '{parent_id}'; "
+            f"found {len(matching_ids)}.  In Neo4j (without this label fix), "
+            f"ensure_session_node and session:start would use different MERGE "
+            f"keys and produce two nodes."
+        )
+
+    async def test_ensure_session_node_idempotent_second_call_preserves_session_label(
+        self, services: HookStateService
+    ) -> None:
+        """Calling ensure_session_node twice for the same session_id is idempotent.
+
+        The warm cache (_seen_sessions) prevents the second call from hitting
+        the graph store, but the node must still have Session label from the
+        first call.
+        """
+        await services.ensure_session_node("idempotent-sess", {})
+        await services.ensure_session_node("idempotent-sess", {})  # warm cache hit
+
+        node = await services.graph.get_node("idempotent-sess")
+        assert node is not None
+        assert "Session" in node.get("labels", []), (
+            "Session label must persist across idempotent ensure_session_node calls"
+        )
