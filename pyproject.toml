@@ -34,3 +34,8 @@ include = ["context_intelligence_server/**"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = ["neo4j: marks tests as requiring a live Neo4j container (deselect with -m 'not neo4j')"]
+
+[dependency-groups]
+dev = [
+    "docker>=7.1.0",
+]

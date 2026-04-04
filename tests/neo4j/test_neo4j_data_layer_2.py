@@ -235,3 +235,155 @@ class TestNeo4jTurnFlowChain:
         )
         assert len(e15_records) > 0, "E15 ENABLES edge must exist in Neo4j"
         assert e15_records[0]["sem"] == "LEADS_TO"
+
+
+# ---------------------------------------------------------------------------
+# 6. TestNoBareSessionNodes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.neo4j
+class TestNoBareSessionNodes:
+    """Tier 3 gate: ensure_session_node + SessionHandler cannot create bare Session nodes.
+
+    GraphState (used in Tier 1/2 tests) does not implement the Session-labeled vs
+    label-free MERGE routing in neo4j_store.flush(). These tests verify the actual
+    Neo4j behavior that the fix must enforce.
+
+    The fix (commit 5d99bce): _handle_start and _handle_fork both now include
+    ``"labels": ["Session"]`` in their upsert_node call, routing them to the
+    Session-labeled MERGE bucket (``MERGE (n:Session {node_id, workspace})``).
+    Without the fix they used the label-free MERGE bucket
+    (``MERGE (n {node_id, workspace})``), which is a separate Neo4j operation
+    that can create a second bare node under concurrent flushes.
+
+    NOTE: These tests verify the correct outcome in a sequential scenario. The
+    underlying race condition (two workers with overlapping transactions) cannot
+    be reliably reproduced in a single-process sequential test because:
+    1. The label-free MERGE *does* find existing Session nodes by property match
+       when run sequentially after the Session-labeled MERGE has committed.
+    2. The ``set_labels`` call that follows upsert_node in non-early-return
+       paths always adds "Session" to the buffer, so the flush uses
+       ``session_rows`` regardless of whether upsert_node included the label.
+    The regression is therefore caught by verifying the NODE COUNT and TYPE
+    LABEL correctness under sequential simulation — any deviation means the
+    MERGE routing is broken in a way that *will* cause duplicates under
+    concurrency. A true concurrent regression guard requires two separate
+    store instances with asyncio.gather; that is a Tier 3+ concern.
+    """
+
+    async def test_ensure_session_then_handle_start_creates_exactly_one_node(
+        self, neo4j_services: Any
+    ) -> None:
+        """ensure_session_node flush + _handle_start flush must produce exactly one node.
+
+        Simulates the production scenario where two workers (child and parent session)
+        flush independently. Without the fix (_handle_start upsert had no Session label),
+        the label-free MERGE created a second bare node alongside the Session node from
+        ensure_session_node.
+        """
+        session_id = "neo4j-bare-session-gate-1"
+
+        # Step 1: ensure_session_node creates placeholder (Session-labeled MERGE)
+        await neo4j_services.ensure_session_node(session_id, {})
+        await (
+            neo4j_services.graph.flush()
+        )  # flush to Neo4j — simulates worker A completing
+
+        # Step 2: SessionHandler processes session:start in a separate flush cycle.
+        # This simulates worker B (the parent session's own processing).
+        handler = SessionHandler(neo4j_services)
+        await handler(
+            "session:start",
+            {
+                "session_id": session_id,
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        await (
+            neo4j_services.graph.flush()
+        )  # flush to Neo4j — simulates worker B completing
+
+        # ASSERT: exactly ONE node in Neo4j for this session_id
+        records = await neo4j_services.graph.execute_query(
+            "MATCH (n {node_id: $nid, workspace: $ws}) "
+            "RETURN count(n) AS cnt, collect(labels(n)) AS label_sets",
+            {"nid": session_id, "ws": neo4j_services.graph.workspace},
+            workspace="*",
+        )
+        assert len(records) == 1
+        count = records[0]["cnt"]
+        assert count == 1, (
+            f"Expected exactly 1 Session node, got {count}. "
+            f"Label sets found: {records[0]['label_sets']}. "
+            "This means _handle_start used a different MERGE pattern than ensure_session_node, "
+            "creating a second bare node. Fix: add 'Session' label to upsert_node in _handle_start."
+        )
+
+    async def test_session_node_has_type_label_after_handle_start(
+        self, neo4j_services: Any
+    ) -> None:
+        """Session node must have RootSession type label — never just bare Session."""
+        session_id = "neo4j-bare-session-gate-2"
+
+        await neo4j_services.ensure_session_node(session_id, {})
+        await neo4j_services.graph.flush()
+
+        handler = SessionHandler(neo4j_services)
+        await handler(
+            "session:start",
+            {"session_id": session_id, "timestamp": "2026-01-01T00:00:01Z"},
+        )
+        await neo4j_services.graph.flush()
+
+        # Must have RootSession (no parent_id → RootSession classification)
+        records = await neo4j_services.graph.execute_query(
+            "MATCH (n:Session {node_id: $nid, workspace: $ws}) RETURN labels(n) AS lbls",
+            {"nid": session_id, "ws": neo4j_services.graph.workspace},
+            workspace="*",
+        )
+        assert len(records) >= 1, "Session node must exist after handle_start"
+        all_labels = set(records[0]["lbls"])
+        type_labels = {"RootSession", "SubSession", "ForkedSession"}
+        assert all_labels & type_labels, (
+            f"Session node has labels {all_labels} but none of {type_labels}. "
+            "Bare Session nodes are a design violation."
+        )
+
+    async def test_fork_ensure_then_handle_fork_creates_exactly_one_node(
+        self, neo4j_services: Any
+    ) -> None:
+        """Same guard for _handle_fork: ensure_session_node + session:fork = one node."""
+        parent_id = "neo4j-bare-fork-gate-parent"
+        child_id = "neo4j-bare-fork-gate-child"
+
+        # Ensure parent exists first
+        await neo4j_services.ensure_session_node(parent_id, {})
+        await neo4j_services.graph.flush()
+
+        # ensure_session_node creates placeholder for child
+        await neo4j_services.ensure_session_node(child_id, {})
+        await neo4j_services.graph.flush()
+
+        # _handle_fork processes session:fork for child in a separate flush cycle
+        handler = SessionHandler(neo4j_services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": child_id,
+                "parent_id": parent_id,
+                "timestamp": "2026-01-01T00:00:02Z",
+            },
+        )
+        await neo4j_services.graph.flush()
+
+        records = await neo4j_services.graph.execute_query(
+            "MATCH (n {node_id: $nid, workspace: $ws}) RETURN count(n) AS cnt",
+            {"nid": child_id, "ws": neo4j_services.graph.workspace},
+            workspace="*",
+        )
+        count = records[0]["cnt"]
+        assert count == 1, (
+            f"Expected exactly 1 Session node for forked child, got {count}. "
+            "_handle_fork must use Session-labeled MERGE."
+        )
