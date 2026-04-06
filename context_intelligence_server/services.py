@@ -8,9 +8,12 @@
 from __future__ import annotations
 
 import fnmatch
+import logging
 from typing import Any
 
 from context_intelligence_server.handlers.data_layer_2.state import DataLayer2State
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -260,3 +263,27 @@ class HookStateService:
 
         await self.graph.upsert_node(session_id, node_data)
         self._seen_sessions.add(session_id)  # only cache after successful write
+
+    async def touch_session(self, session_id: str, timestamp: str) -> None:
+        """Update last_updated on a Session node if the given timestamp is newer.
+
+        Fetches the current Session node.  If the node does not exist, returns
+        immediately (no ancestor walk).  If last_updated is absent or the given
+        timestamp is strictly greater, upserts last_updated on the node.
+
+        Silently logs and swallows any exception to avoid disrupting the caller.
+        """
+        try:
+            node = await self.graph.get_node(session_id)
+            if node is None:
+                return
+            current = node.get("last_updated")
+            if current is None or timestamp > current:
+                await self.graph.upsert_node(
+                    session_id,
+                    {"labels": ["Session"], "last_updated": timestamp},
+                )
+        except Exception:
+            logger.warning(
+                "touch_session failed for %s @ %s", session_id, timestamp, exc_info=True
+            )
