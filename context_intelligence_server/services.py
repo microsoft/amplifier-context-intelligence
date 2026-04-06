@@ -265,31 +265,33 @@ class HookStateService:
         self._seen_sessions.add(session_id)  # only cache after successful write
 
     async def touch_session(self, session_id: str, timestamp: str) -> None:
-        """Update last_updated on a Session node if the given timestamp is newer.
+        """Update last_updated on a Session node and all ancestor sessions.
 
-        Fetches the current Session node.  If the node does not exist, returns
-        immediately (no ancestor walk).  If last_updated is absent or the given
-        timestamp is strictly greater, upserts last_updated on the node.
-        Then recursively propagates to the parent session if parent_id is set.
+        Walks the parent_id chain iteratively — no recursion depth limit.
+        Stops as soon as an ancestor already has last_updated >= timestamp,
+        since further ancestors are guaranteed to be at least as recent.
 
-        Silently logs and swallows any exception to avoid disrupting the caller.
+        Never raises — errors are logged at WARNING level and the walk stops.
         """
-        try:
-            node = await self.graph.get_node(session_id)
-            if node is None:
-                return
-            current = node.get("last_updated")
-            if current is None or timestamp > current:
+        current_id: str | None = session_id
+        while current_id:
+            try:
+                node = await self.graph.get_node(current_id)
+                if node is None:
+                    break
+                current = node.get("last_updated")
+                if current is not None and timestamp <= current:
+                    break  # ancestor already at or ahead — stop propagating
                 await self.graph.upsert_node(
-                    session_id,
+                    current_id,
                     {"labels": ["Session"], "last_updated": timestamp},
                 )
-                parent_id = (node.get("parent_id") or "").strip()
-                if parent_id:
-                    # parent_id cycles (A→B→A) raise RecursionError,
-                    # which is caught by the enclosing except handler.
-                    await self.touch_session(parent_id, timestamp)
-        except Exception:
-            logger.warning(
-                "touch_session failed for %s @ %s", session_id, timestamp, exc_info=True
-            )
+                current_id = (node.get("parent_id") or "").strip() or None
+            except Exception:
+                logger.warning(
+                    "touch_session failed for %s @ %s",
+                    current_id,
+                    timestamp,
+                    exc_info=True,
+                )
+                break
