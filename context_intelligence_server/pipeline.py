@@ -9,8 +9,9 @@ Provides four public exports:
   and all 8 data_layer_2 enrichers
 - ``process_event(worker, event, data, handlers)`` — full pipeline step:
   ensure-session-node → blob processing → always-default dispatch →
-  enricher dispatch (for matching events) → terminal flush, all wrapped in a
-  broad try/except so the drain loop is never interrupted by handler errors
+  enricher dispatch (for matching events) → touch_session (last_updated) →
+  terminal flush, all wrapped in a broad try/except so the drain loop is
+  never interrupted by handler errors
 """
 
 from __future__ import annotations
@@ -126,7 +127,10 @@ async def process_event(
        Event node in the graph).
     5. For each enricher in ``handlers.enrichers``, if the event is in the
        enricher's ``handled_events``, call the enricher additionally.
-    6. If *event* is in :data:`TERMINAL_EVENTS`, call
+    6. If *session_id* and *timestamp* are present, call
+       ``worker.services.touch_session`` to update ``last_updated`` on the
+       session node and propagate to ancestors.
+    7. If *event* is in :data:`TERMINAL_EVENTS`, call
        ``worker.services.graph.flush`` to persist all buffered writes.
 
     All of the above is wrapped in a single ``try/except Exception`` block so
@@ -166,11 +170,11 @@ async def process_event(
             if event in enricher.handled_events:
                 await enricher(event, data)
 
-        # Step 5b — update last_updated on session and ancestors
+        # Step 6 — update last_updated on session and ancestors
         if session_id and timestamp:
             await worker.services.touch_session(session_id, timestamp)
 
-        # Step 6 — terminal flush
+        # Step 7 — terminal flush
         if event in TERMINAL_EVENTS:
             await worker.services.graph.flush()
 
