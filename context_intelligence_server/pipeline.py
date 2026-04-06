@@ -10,7 +10,8 @@ Provides four public exports:
 - ``process_event(worker, event, data, handlers)`` — full pipeline step:
   ensure-session-node → blob processing → always-default dispatch →
   enricher dispatch (for matching events) → touch_session (last_updated) →
-  terminal flush, all wrapped in a broad try/except so the drain loop is
+  flush strategy (background flush for every event, synchronous flush for
+  terminal events), all wrapped in a broad try/except so the drain loop is
   never interrupted by handler errors
 """
 
@@ -130,8 +131,11 @@ async def process_event(
     6. If *session_id* and *timestamp* are present, call
        ``worker.services.touch_session`` to update ``last_updated`` on the
        session node and propagate to ancestors.
-    7. If *event* is in :data:`TERMINAL_EVENTS`, call
-       ``worker.services.graph.flush`` to persist all buffered writes.
+    7. Flush strategy: call ``worker.services.graph.schedule_flush`` for
+       non-terminal events (background flush, non-blocking) so that buffered
+       writes reach Neo4j without waiting for ``session:end``.  For terminal
+       events (``session:end``) call ``worker.services.graph.flush`` instead
+       so all writes are durable before the session closes.
 
     All of the above is wrapped in a single ``try/except Exception`` block so
     that handler errors are *logged with structured context* but **never
@@ -174,9 +178,13 @@ async def process_event(
         if session_id and timestamp:
             await worker.services.touch_session(session_id, timestamp)
 
-        # Step 7 — terminal flush
+        # Step 7 — flush strategy: background flush after every event so buffered
+        # writes reach Neo4j without waiting for session:end.  Terminal events
+        # flush synchronously so all writes are durable before the session closes.
         if event in TERMINAL_EVENTS:
             await worker.services.graph.flush()
+        else:
+            worker.services.graph.schedule_flush()
 
     except Exception:
         logger.exception(

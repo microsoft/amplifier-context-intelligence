@@ -97,6 +97,16 @@ class GraphStore(Protocol):
         """
         ...
 
+    def schedule_flush(self) -> None:
+        """Schedule a background flush without blocking.
+
+        Implementations must ensure that at most one background flush runs at a
+        time — if a flush is already in progress, this call is a no-op or defers
+        until the current flush completes.  In-memory implementations may treat
+        this as a no-op since all writes are immediately visible.
+        """
+        ...
+
     async def close(self) -> None:
         """Release resources held by this store.
 

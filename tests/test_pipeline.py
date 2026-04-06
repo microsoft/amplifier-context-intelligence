@@ -81,6 +81,7 @@ def mock_worker() -> MagicMock:
     worker.services.touch_session = AsyncMock()
     worker.services.graph = MagicMock()
     worker.services.graph.flush = AsyncMock()
+    worker.services.graph.schedule_flush = MagicMock()
     worker.services.blob_store = None
     return worker
 
@@ -369,6 +370,31 @@ async def test_process_event_non_terminal_does_not_flush(
     data = {"session_id": "sess-123"}
     await process_event(mock_worker, "session:start", data, pipeline_handlers)
     mock_worker.services.graph.flush.assert_not_called()
+
+
+async def test_process_event_non_terminal_calls_schedule_flush(
+    mock_worker: MagicMock,
+    pipeline_handlers: Any,
+) -> None:
+    """Non-terminal events must call graph.schedule_flush() exactly once."""
+    from context_intelligence_server.pipeline import process_event
+
+    data = {"session_id": "sess-123"}
+    await process_event(mock_worker, "session:start", data, pipeline_handlers)
+    mock_worker.services.graph.schedule_flush.assert_called_once()
+
+
+async def test_process_event_terminal_calls_flush_not_schedule_flush(
+    mock_worker: MagicMock,
+    pipeline_handlers: Any,
+) -> None:
+    """session:end must call graph.flush() and must NOT call graph.schedule_flush()."""
+    from context_intelligence_server.pipeline import process_event
+
+    data = {"session_id": "sess-123"}
+    await process_event(mock_worker, "session:end", data, pipeline_handlers)
+    mock_worker.services.graph.flush.assert_called()
+    mock_worker.services.graph.schedule_flush.assert_not_called()
 
 
 # ===========================================================================
