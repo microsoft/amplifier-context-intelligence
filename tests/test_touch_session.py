@@ -154,6 +154,51 @@ async def test_touch_session_propagates_to_grandparent(
     assert grandparent_node.get("last_updated") == "2026-01-01T00:00:20Z"
 
 
+async def test_touch_session_stops_propagation_when_ancestor_is_newer(
+    services: HookStateService,
+) -> None:
+    """Propagation stops at an ancestor whose last_updated is already newer.
+
+    Creates an early-parent Session node with last_updated='2026-01-01T00:00:10Z'
+    and an early-child Session node (no last_updated) whose parent_id points to
+    early-parent.  Calls touch_session on the child with an OLDER timestamp
+    ('2026-01-01T00:00:05Z').
+
+    Expected outcome:
+    - early-child.last_updated is set to '2026-01-01T00:00:05Z' (was null, so it
+      gets written regardless).
+    - early-parent.last_updated remains '2026-01-01T00:00:10Z' — the incoming
+      timestamp is older, so propagation terminates at the parent.
+    """
+    await services.graph.upsert_node(
+        "early-parent",
+        {
+            "labels": ["Session"],
+            "session_id": "early-parent",
+            "last_updated": "2026-01-01T00:00:10Z",
+        },
+    )
+    await services.graph.upsert_node(
+        "early-child",
+        {
+            "labels": ["Session"],
+            "session_id": "early-child",
+            "parent_id": "early-parent",
+        },
+    )
+
+    await services.touch_session("early-child", "2026-01-01T00:00:05Z")
+
+    child_node = await services.graph.get_node("early-child")
+    parent_node = await services.graph.get_node("early-parent")
+
+    assert child_node is not None
+    assert child_node.get("last_updated") == "2026-01-01T00:00:05Z"
+
+    assert parent_node is not None
+    assert parent_node.get("last_updated") == "2026-01-01T00:00:10Z"
+
+
 # Exception swallowing — fault-tolerance contract
 
 
