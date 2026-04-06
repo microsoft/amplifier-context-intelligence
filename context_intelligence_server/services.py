@@ -270,11 +270,20 @@ class HookStateService:
         Walks the parent_id chain iteratively — no recursion depth limit.
         Stops as soon as an ancestor already has last_updated >= timestamp,
         since further ancestors are guaranteed to be at least as recent.
+        A visited set prevents infinite loops on malformed cyclic parent_id
+        chains regardless of graph store read-after-write semantics.
 
         Never raises — errors are logged at WARNING level and the walk stops.
         """
         current_id: str | None = session_id
+        visited: set[str] = set()
         while current_id:
+            if current_id in visited:
+                logger.warning(
+                    "touch_session: cycle detected at %s — stopping walk", current_id
+                )
+                break
+            visited.add(current_id)
             try:
                 node = await self.graph.get_node(current_id)
                 if node is None:

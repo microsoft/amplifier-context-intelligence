@@ -198,6 +198,36 @@ async def test_touch_session_stops_propagation_when_ancestor_is_newer(
     assert parent_node.get("last_updated") == "2026-01-01T00:00:10Z"
 
 
+async def test_touch_session_terminates_on_parent_id_cycle(
+    services: HookStateService,
+) -> None:
+    """touch_session terminates cleanly when parent_id forms a cycle (A → B → A).
+
+    Without an explicit visited-set guard the loop would be infinite if the graph
+    store does not provide immediate read-after-write consistency (e.g. Neo4j with
+    a write buffer).  This test verifies that the function returns in finite time
+    and that both nodes receive last_updated regardless of visit order.
+    """
+    await services.graph.upsert_node(
+        "cycle-a",
+        {"labels": ["Session"], "session_id": "cycle-a", "parent_id": "cycle-b"},
+    )
+    await services.graph.upsert_node(
+        "cycle-b",
+        {"labels": ["Session"], "session_id": "cycle-b", "parent_id": "cycle-a"},
+    )
+
+    # Must return (not hang) and must update both nodes
+    await services.touch_session("cycle-a", "2026-01-01T00:00:30Z")
+
+    node_a = await services.graph.get_node("cycle-a")
+    node_b = await services.graph.get_node("cycle-b")
+    assert node_a is not None
+    assert node_a.get("last_updated") == "2026-01-01T00:00:30Z"
+    assert node_b is not None
+    assert node_b.get("last_updated") == "2026-01-01T00:00:30Z"
+
+
 # Edge cases — no-op and error isolation
 
 
