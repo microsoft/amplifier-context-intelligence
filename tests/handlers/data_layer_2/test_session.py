@@ -1677,9 +1677,7 @@ class TestSessionHandlerUsesSessionLabeledMerge:
         )
 
         # Find all upsert_node calls whose first arg is the session_id
-        session_calls = [
-            data for nid, data in recording.upsert_calls if nid == "s1"
-        ]
+        session_calls = [data for nid, data in recording.upsert_calls if nid == "s1"]
         assert session_calls, (
             "_handle_start must call upsert_node at least once for the session node"
         )
@@ -1717,9 +1715,7 @@ class TestSessionHandlerUsesSessionLabeledMerge:
             },
         )
 
-        session_calls = [
-            data for nid, data in recording.upsert_calls if nid == "f1"
-        ]
+        session_calls = [data for nid, data in recording.upsert_calls if nid == "f1"]
         assert session_calls, (
             "_handle_fork must call upsert_node at least once for the session node"
         )
