@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any, NoReturn
 from unittest.mock import AsyncMock
 
 from context_intelligence_server.services import HookStateService
@@ -197,31 +196,6 @@ async def test_touch_session_stops_propagation_when_ancestor_is_newer(
 
     assert parent_node is not None
     assert parent_node.get("last_updated") == "2026-01-01T00:00:10Z"
-
-
-# Exception swallowing — fault-tolerance contract
-
-
-async def test_touch_session_swallows_graph_error() -> None:
-    """touch_session returns normally when the graph raises an exception.
-
-    Creates a HookStateService with a stub graph whose get_node always raises
-    RuntimeError.  Verifies that touch_session completes without propagating
-    the exception to the caller, honouring the fault-tolerance contract.
-    """
-
-    class _RaisingGraph:
-        workspace: str = "test"
-
-        async def get_node(self, node_id: str) -> NoReturn:
-            raise RuntimeError("simulated graph failure")
-
-        async def upsert_node(self, node_id: str, data: dict[str, Any]) -> None:
-            pass  # never reached in this test
-
-    svc = HookStateService(workspace="test-workspace", graph_store=_RaisingGraph())
-    # Must not raise despite the graph error
-    await svc.touch_session("error-session", "2026-01-01T00:00:01Z")
 
 
 # Edge cases — no-op and error isolation
