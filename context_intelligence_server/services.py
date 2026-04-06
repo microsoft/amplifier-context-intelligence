@@ -270,6 +270,7 @@ class HookStateService:
         Fetches the current Session node.  If the node does not exist, returns
         immediately (no ancestor walk).  If last_updated is absent or the given
         timestamp is strictly greater, upserts last_updated on the node.
+        Then recursively propagates to the parent session if parent_id is set.
 
         Silently logs and swallows any exception to avoid disrupting the caller.
         """
@@ -285,6 +286,8 @@ class HookStateService:
                 )
                 parent_id = (node.get("parent_id") or "").strip()
                 if parent_id:
+                    # parent_id cycles (A→B→A) raise RecursionError,
+                    # which is caught by the enclosing except handler.
                     await self.touch_session(parent_id, timestamp)
         except Exception:
             logger.warning(

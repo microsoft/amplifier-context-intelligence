@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from typing import Any, NoReturn
+from unittest.mock import AsyncMock
+
 from context_intelligence_server.services import HookStateService
 
 
@@ -149,3 +152,62 @@ async def test_touch_session_propagates_to_grandparent(
 
     assert grandparent_node is not None
     assert grandparent_node.get("last_updated") == "2026-01-01T00:00:20Z"
+
+
+# Exception swallowing — fault-tolerance contract
+
+
+async def test_touch_session_swallows_graph_error() -> None:
+    """touch_session returns normally when the graph raises an exception.
+
+    Creates a HookStateService with a stub graph whose get_node always raises
+    RuntimeError.  Verifies that touch_session completes without propagating
+    the exception to the caller, honouring the fault-tolerance contract.
+    """
+
+    class _RaisingGraph:
+        workspace: str = "test"
+
+        async def get_node(self, node_id: str) -> NoReturn:
+            raise RuntimeError("simulated graph failure")
+
+        async def upsert_node(self, node_id: str, data: dict[str, Any]) -> None:
+            pass  # never reached in this test
+
+    svc = HookStateService(workspace="test-workspace", graph_store=_RaisingGraph())
+    # Must not raise despite the graph error
+    await svc.touch_session("error-session", "2026-01-01T00:00:01Z")
+
+
+# Edge cases — no-op and error isolation
+
+
+async def test_touch_session_noop_when_session_absent(
+    services: HookStateService,
+) -> None:
+    """touch_session is a no-op when the target session node does not exist.
+
+    Calls touch_session with a session_id that was never upserted into the graph.
+    Asserts that no exception is raised and that get_node still returns None
+    (i.e. no spurious node was created for the missing session).
+    """
+    # No session node created beforehand — touching should be a silent no-op
+    await services.touch_session("nonexistent", "2026-01-01T00:00:01Z")
+
+    node = await services.graph.get_node("nonexistent")
+    assert node is None
+
+
+async def test_touch_session_swallows_graph_exception(
+    services: HookStateService,
+) -> None:
+    """touch_session swallows exceptions raised by the underlying graph store.
+
+    Replaces services.graph.get_node with an AsyncMock that raises RuntimeError.
+    Verifies that touch_session completes normally without propagating the error,
+    honouring the fault-tolerance contract.
+    """
+    services.graph.get_node = AsyncMock(side_effect=RuntimeError("db down"))
+
+    # Must not raise despite the graph error
+    await services.touch_session("s1", "2026-01-01T00:00:01Z")
