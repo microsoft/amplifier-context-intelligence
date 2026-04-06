@@ -34,6 +34,11 @@ Non-negotiable guarantees for all conforming implementations:
 12. **Runtime checkability** — both ``GraphStore`` and ``QueryableStore`` are
     decorated with ``@runtime_checkable`` so that ``isinstance`` checks work
     at runtime without instantiating the protocol.
+13. **Background flush semantics** — ``schedule_flush`` MUST NOT block the
+    caller.  At most one background flush may run at a time; if a flush is
+    already in progress, the call is a no-op or deferred.  In-memory
+    implementations may treat this as a synchronous no-op since writes are
+    immediately visible without I/O.
 """
 
 from __future__ import annotations
