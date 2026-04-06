@@ -14,6 +14,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1319,3 +1320,101 @@ def test_ensure_schema_is_callable_at_startup() -> None:
     assert inspect.iscoroutinefunction(ensure_neo4j_schema), (
         "ensure_neo4j_schema must be an async function so lifespan can await it"
     )
+
+
+# ---------------------------------------------------------------------------
+# Deadlock prevention: flush() must serialize concurrent callers via asyncio.Lock
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_flush_lock_serializes_concurrent_calls() -> None:
+    """Concurrent flush() calls must serialize — second waits for first to finish.
+
+    Regression guard for the Neo4j deadlock: without an asyncio.Lock two
+    concurrent flush() coroutines can open separate transactions on the same
+    nodes simultaneously, causing a Neo4j deadlock.  The _flush_lock ensures
+    the second caller blocks until the first has committed and released.
+
+    Verification strategy: the first flush() holds its DB session open until
+    an asyncio.Event is set.  The second flush() is launched concurrently.
+    We assert that the second session is only opened AFTER the first has
+    fully completed (i.e. "flush_1_done" precedes "session_2_active" in the
+    execution log).
+    """
+    store = _make_store()
+    store._schema_initialized = True  # skip schema so the lock is the only gate
+
+    order: list[str] = []
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+
+    session_n = [0]  # monotonic counter so each session gets a stable identity
+
+    def make_session() -> object:
+        """Return an async context-manager whose __aenter__ blocks on call 1."""
+        session_n[0] += 1
+        n = session_n[0]
+
+        class ControlledSession:
+            _tx: object = None
+
+            async def __aenter__(self) -> "ControlledSession":
+                order.append(f"session_{n}_start")
+                if n == 1:
+                    first_entered.set()
+                    await release_first.wait()
+                order.append(f"session_{n}_active")
+                tx = AsyncMock()
+                tx.commit = AsyncMock()
+                tx.rollback = AsyncMock()
+                self._tx = tx
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                pass
+
+            async def begin_transaction(self) -> object:
+                return self._tx
+
+        return ControlledSession()
+
+    store._driver.session = MagicMock(side_effect=lambda **_kw: make_session())
+
+    # Seed buffer so the first flush() does real work (not the early-exit path)
+    store._node_buffer["n1"] = {"name": "first"}
+
+    async def run_first() -> None:
+        order.append("flush_1_called")
+        await store.flush()
+        order.append("flush_1_done")
+
+    async def run_second() -> None:
+        # Wait until the first flush is inside its (slow) session
+        await first_entered.wait()
+        # Give the second caller something to flush so it also opens a session
+        store._node_buffer["n2"] = {"name": "second"}
+        order.append("flush_2_called")
+        await store.flush()
+        order.append("flush_2_done")
+
+    async def releaser() -> None:
+        """Release the first session after a short delay."""
+        await first_entered.wait()
+        await asyncio.sleep(0.05)
+        release_first.set()
+
+    await asyncio.gather(run_first(), run_second(), releaser())
+
+    # Both flushes must complete
+    assert "flush_1_done" in order, f"flush_1 never finished. order={order}"
+    assert "flush_2_done" in order, f"flush_2 never finished. order={order}"
+
+    # Core invariant: the second session must NOT open until flush_1 is done.
+    # Without the lock the second session opens while flush_1 is still blocked
+    # (deadlock scenario); with the lock it waits.
+    if "session_2_active" in order:
+        assert order.index("flush_1_done") < order.index("session_2_active"), (
+            "session_2 became active before flush_1 completed — "
+            f"concurrent transactions detected. Execution order: {order}"
+        )

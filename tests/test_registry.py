@@ -403,6 +403,44 @@ class TestPeriodicFlush:
                     "the exception must be caught inside the TimeoutError handler."
                 )
 
+    @pytest.mark.asyncio
+    async def test_timeout_calls_schedule_flush_not_flush_directly(self) -> None:
+        """On queue timeout, drain_worker routes through schedule_flush(), not flush().
+
+        Regression guard for the Neo4j deadlock: calling await flush() directly in
+        the TimeoutError handler could open a second concurrent Neo4j transaction
+        while _background_flush() was still in flight.  schedule_flush() has a
+        single-flight guard (_flush_task.done()) that prevents the overlap.
+        """
+        reg = SessionRegistry()
+        worker = SessionWorker(
+            session_id="test-session",
+            workspace="/workspace/test",
+            services=HookStateService(workspace="/workspace/test"),
+        )
+        # Replace all three methods so we can assert on each independently.
+        # close() is mocked because it calls flush() internally; we don't want
+        # the CancelledError teardown path to pollute the flush() call count.
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        worker.services.graph.schedule_flush = MagicMock()  # type: ignore[method-assign]
+        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
+
+        # Very short timeout so at least one timeout cycle fires quickly
+        task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
+
+        await asyncio.sleep(0.2)  # long enough for multiple timeout cycles
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # schedule_flush must be called (the single-flight-guarded path)
+        worker.services.graph.schedule_flush.assert_called()
+        # flush must NOT be called directly from the timeout handler
+        worker.services.graph.flush.assert_not_called()
+
 
 class TestWorkerActivityTracking:
     """SessionWorker tracks activity: last_event, last_event_time, events_processed."""

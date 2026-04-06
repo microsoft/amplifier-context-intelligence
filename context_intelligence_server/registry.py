@@ -144,13 +144,11 @@ class SessionRegistry:
                     break
 
             except asyncio.TimeoutError:
-                # Periodic fallback flush for disconnected sessions
-                try:
-                    await worker.services.graph.flush()
-                except Exception:
-                    logger.exception(
-                        "periodic_flush_failed for session %s", worker.session_id
-                    )
+                # Periodic fallback flush for disconnected sessions.
+                # Route through schedule_flush() — NOT flush() directly — so the
+                # single-flight guard prevents a concurrent transaction with any
+                # _background_flush task already in flight.
+                worker.services.graph.schedule_flush()
                 # Stale session reaping
                 settings = get_settings()
                 if (

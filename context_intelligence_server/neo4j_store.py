@@ -160,6 +160,7 @@ class Neo4jGraphStore:
         self._schema_initialized: bool = False
         self._closed: bool = False
         self._flush_task = None
+        self._flush_lock: asyncio.Lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # workspace property
@@ -332,6 +333,12 @@ class Neo4jGraphStore:
     async def flush(self) -> None:
         """Persist all buffered writes to Neo4j using UNWIND-based batch Cypher.
 
+        Serializes callers via ``_flush_lock`` so that at most one Neo4j
+        transaction is open at any time for this store.  Without the lock a
+        concurrent caller (e.g. the 30-second periodic timer firing while
+        ``_background_flush`` is mid-transaction) would open a second
+        transaction on the same nodes, which Neo4j resolves as a deadlock.
+
         Optimistically snapshots and clears buffers before writing.  On any
         failure the transaction is rolled back and the buffers are restored
         (merging any writes that arrived during the flush attempt).
@@ -342,6 +349,11 @@ class Neo4jGraphStore:
         (e.g. bare Session created by a child worker, then RootSession written
         by the parent worker's session:end flush).
         """
+        async with self._flush_lock:
+            await self._flush_body()
+
+    async def _flush_body(self) -> None:
+        """Inner flush implementation — must only be called while _flush_lock is held."""
         if not self._node_buffer and not self._edge_buffer and not self._label_patches:
             return  # early exit — nothing to write
 
