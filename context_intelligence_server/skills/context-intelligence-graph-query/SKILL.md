@@ -1,8 +1,13 @@
 ---
 name: context-intelligence-graph-query
-version: 2.0.0
-description: Navigate the context-intelligence property graph — schema, patterns, and discovery queries for both data layers
+description: >
+  Use when querying the context-intelligence property graph for session history,
+  tool call traces, LLM iteration analysis, or execution scale metrics. Covers
+  both data layers, cross-layer SOURCED_FROM joins, SST navigation, blob
+  handling, and 8 verified Cypher patterns.
 license: MIT
+metadata:
+  version: "2.0.0"
 ---
 
 # Context Intelligence Graph Query
