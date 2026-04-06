@@ -1,4 +1,4 @@
-"""Tests for context-intelligence-graph-query.md skill file — Sections 1 and 2.
+"""Tests for context-intelligence-graph-query skill file — Sections 1 and 2.
 
 TDD phase: These tests define what the rewritten skill file must contain.
 They FAIL before the file is rewritten.
@@ -10,7 +10,8 @@ SKILL_FILE = (
     pathlib.Path(__file__).parent.parent
     / "context_intelligence_server"
     / "skills"
-    / "context-intelligence-graph-query.md"
+    / "context-intelligence-graph-query"
+    / "SKILL.md"
 )
 
 
@@ -28,7 +29,7 @@ def test_skill_file_exists() -> None:
 
 
 def test_frontmatter_version_2() -> None:
-    assert "version: 2.0.0" in _content(), "Frontmatter must specify version: 2.0.0"
+    assert 'version: "2.0.0"' in _content(), "Frontmatter must specify version: 2.0.0"
 
 
 def test_frontmatter_name() -> None:
