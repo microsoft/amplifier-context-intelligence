@@ -283,6 +283,9 @@ class HookStateService:
                     session_id,
                     {"labels": ["Session"], "last_updated": timestamp},
                 )
+                parent_id = (node.get("parent_id") or "").strip()
+                if parent_id:
+                    await self.touch_session(parent_id, timestamp)
         except Exception:
             logger.warning(
                 "touch_session failed for %s @ %s", session_id, timestamp, exc_info=True
