@@ -166,6 +166,10 @@ async def process_event(
             if event in enricher.handled_events:
                 await enricher(event, data)
 
+        # Step 5b — update last_updated on session and ancestors
+        if session_id and timestamp:
+            await worker.services.touch_session(session_id, timestamp)
+
         # Step 6 — terminal flush
         if event in TERMINAL_EVENTS:
             await worker.services.graph.flush()

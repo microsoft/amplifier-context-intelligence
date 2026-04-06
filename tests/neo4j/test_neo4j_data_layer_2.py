@@ -186,13 +186,13 @@ class TestNeo4jTurnFlowChain:
         # 1. First prompt
         await prompt_handler(
             "prompt:submit",
-            {"session_id": sid, "timestamp": "t1", "prompt": "hello"},
+            {"session_id": sid, "timestamp": "2026-01-01T00:00:01Z", "prompt": "hello"},
         )
 
         # 2. Execution start (should create E14: Prompt_1 -> OrchestratorRun_1)
         await orch_handler(
             "execution:start",
-            {"session_id": sid, "timestamp": "t2"},
+            {"session_id": sid, "timestamp": "2026-01-01T00:00:02Z"},
         )
 
         # 3. Orchestrator complete (sets last_completed_orch_run_id)
@@ -200,7 +200,7 @@ class TestNeo4jTurnFlowChain:
             "orchestrator:complete",
             {
                 "session_id": sid,
-                "timestamp": "t3",
+                "timestamp": "2026-01-01T00:00:03Z",
                 "orchestrator": "default",
                 "turn_count": 1,
             },
@@ -209,7 +209,7 @@ class TestNeo4jTurnFlowChain:
         # 4. Second prompt (should create E15: OrchestratorRun_1 -> Prompt_2)
         await prompt_handler(
             "prompt:submit",
-            {"session_id": sid, "timestamp": "t4", "prompt": "next"},
+            {"session_id": sid, "timestamp": "2026-01-01T00:00:04Z", "prompt": "next"},
         )
 
         await neo4j_services.graph.flush()

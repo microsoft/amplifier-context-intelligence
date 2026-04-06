@@ -15,6 +15,8 @@ Test coverage:
 - blob processing (blob_processing_called_when_all_conditions_met,
   blob_processing_skipped_without_timestamp, blob_processing_skipped_without_blob_store,
   blob_skip_missing_timestamp_logs_warning)
+- touch_session call site (calls_touch_session, skips_touch_session_without_timestamp,
+  skips_touch_session_without_session_id)
 """
 
 from __future__ import annotations
@@ -76,6 +78,7 @@ def mock_worker() -> MagicMock:
     worker = MagicMock()
     worker.services = MagicMock()
     worker.services.ensure_session_node = AsyncMock()
+    worker.services.touch_session = AsyncMock()
     worker.services.graph = MagicMock()
     worker.services.graph.flush = AsyncMock()
     worker.services.blob_store = None
@@ -528,3 +531,46 @@ async def test_blob_skip_missing_timestamp_logs_warning(
     assert "sess-123" in caplog.text
     assert "tool_call" in caplog.text
     assert "missing timestamp" in caplog.text
+
+
+# ===========================================================================
+# process_event — touch_session call site
+# ===========================================================================
+
+
+async def test_process_event_calls_touch_session(
+    mock_worker: MagicMock,
+    pipeline_handlers: Any,
+) -> None:
+    """process_event must call touch_session with session_id and timestamp."""
+    from context_intelligence_server.pipeline import process_event
+
+    data = {"session_id": "sess-123", "timestamp": "2026-01-01T00:00:01Z"}
+    await process_event(mock_worker, "session:start", data, pipeline_handlers)
+    mock_worker.services.touch_session.assert_called_once_with(
+        "sess-123", "2026-01-01T00:00:01Z"
+    )
+
+
+async def test_process_event_skips_touch_session_without_timestamp(
+    mock_worker: MagicMock,
+    pipeline_handlers: Any,
+) -> None:
+    """process_event must NOT call touch_session when timestamp is absent."""
+    from context_intelligence_server.pipeline import process_event
+
+    data = {"session_id": "sess-123"}  # no timestamp
+    await process_event(mock_worker, "session:start", data, pipeline_handlers)
+    mock_worker.services.touch_session.assert_not_called()
+
+
+async def test_process_event_skips_touch_session_without_session_id(
+    mock_worker: MagicMock,
+    pipeline_handlers: Any,
+) -> None:
+    """process_event must NOT call touch_session when session_id is absent."""
+    from context_intelligence_server.pipeline import process_event
+
+    data = {"timestamp": "2026-01-01T00:00:01Z"}  # no session_id
+    await process_event(mock_worker, "session:start", data, pipeline_handlers)
+    mock_worker.services.touch_session.assert_not_called()
