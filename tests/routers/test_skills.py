@@ -1,4 +1,4 @@
-"""Tests for SkillRegistry — load *.md files and compute SHA-256 ETags."""
+"""Tests for SkillRegistry — load skill-name/SKILL.md packages and compute SHA-256 ETags."""
 
 from __future__ import annotations
 
@@ -15,12 +15,15 @@ from context_intelligence_server.main import lifespan
 
 
 class TestSkillRegistryLoadFromDir:
-    """SkillRegistry.load_from_dir reads *.md files and computes stable SHA-256 ETags."""
+    """SkillRegistry.load_from_dir reads skill-name/SKILL.md packages and computes SHA-256 ETags."""
 
     def test_reads_md_file_content(self, tmp_path: Path) -> None:
-        """load_from_dir stores the content of a .md file keyed by its stem."""
-        skill_file = tmp_path / "my-skill.md"
-        skill_file.write_text("# My Skill\n\nThis is the content.", encoding="utf-8")
+        """load_from_dir stores the content of a SKILL.md keyed by its parent directory name."""
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "# My Skill\n\nThis is the content.", encoding="utf-8"
+        )
 
         registry = SkillRegistry()
         registry.load_from_dir(tmp_path)
@@ -31,10 +34,11 @@ class TestSkillRegistryLoadFromDir:
         assert content == "# My Skill\n\nThis is the content."
 
     def test_computes_sha256_etag(self, tmp_path: Path) -> None:
-        """load_from_dir computes SHA-256 ETags for each .md file."""
+        """load_from_dir computes SHA-256 ETags for each SKILL.md."""
         raw = "# Skill Content"
-        skill_file = tmp_path / "skill-alpha.md"
-        skill_file.write_text(raw, encoding="utf-8")
+        skill_dir = tmp_path / "skill-alpha"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(raw, encoding="utf-8")
 
         registry = SkillRegistry()
         registry.load_from_dir(tmp_path)
@@ -45,21 +49,30 @@ class TestSkillRegistryLoadFromDir:
         expected_etag = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         assert etag == expected_etag
 
-    def test_ignores_non_md_files(self, tmp_path: Path) -> None:
-        """load_from_dir ignores files that are not .md files."""
-        (tmp_path / "skill.md").write_text("# Valid", encoding="utf-8")
-        (tmp_path / "skill.txt").write_text("not a skill", encoding="utf-8")
+    def test_ignores_flat_md_files_and_dirs_without_skill_md(
+        self, tmp_path: Path
+    ) -> None:
+        """load_from_dir only loads skill-name/SKILL.md; flat files and other names are ignored."""
+        # Valid skill: subdirectory with SKILL.md
+        valid_dir = tmp_path / "skill"
+        valid_dir.mkdir()
+        (valid_dir / "SKILL.md").write_text("# Valid", encoding="utf-8")
+
+        # Flat .md files at root are ignored
+        (tmp_path / "skill.md").write_text("ignored flat file", encoding="utf-8")
+        # Directories without SKILL.md are ignored
+        no_skill = tmp_path / "no-skill-md"
+        no_skill.mkdir()
+        (no_skill / "OTHER.md").write_text("ignored", encoding="utf-8")
+        # Other files at root are also ignored
         (tmp_path / "notes.json").write_text('{"key": "value"}', encoding="utf-8")
-        (tmp_path / "README.py").write_text("# python", encoding="utf-8")
 
         registry = SkillRegistry()
         registry.load_from_dir(tmp_path)
 
-        # Only the .md file should be registered
         assert registry.skill_names == frozenset({"skill"})
-        assert registry.get("skill.txt") is None
+        assert registry.get("no-skill-md") is None
         assert registry.get("notes") is None
-        assert registry.get("README") is None
 
     def test_get_returns_none_for_unknown_skill(self, tmp_path: Path) -> None:
         """get() returns None when the skill name is not registered."""
@@ -72,8 +85,9 @@ class TestSkillRegistryLoadFromDir:
     def test_etag_is_stable_for_same_content(self, tmp_path: Path) -> None:
         """ETags are stable: same content always produces the same ETag."""
         content = "# Stable Skill\n\nThis content is deterministic."
-        skill_file = tmp_path / "stable.md"
-        skill_file.write_text(content, encoding="utf-8")
+        skill_dir = tmp_path / "stable"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
 
         registry_a = SkillRegistry()
         registry_a.load_from_dir(tmp_path)
@@ -90,28 +104,47 @@ class TestSkillRegistryLoadFromDir:
         _, etag_b = result_b
         assert etag_a == etag_b
 
-    def test_loads_multiple_files(self, tmp_path: Path) -> None:
-        """load_from_dir registers all .md files in the directory."""
+    def test_loads_multiple_skill_directories(self, tmp_path: Path) -> None:
+        """load_from_dir registers all skill-name/SKILL.md packages in the directory."""
         files = {
             "alpha": "# Alpha Skill",
             "beta": "# Beta Skill",
             "gamma": "# Gamma Skill",
         }
-        for stem, content in files.items():
-            (tmp_path / f"{stem}.md").write_text(content, encoding="utf-8")
+        for name, content in files.items():
+            skill_dir = tmp_path / name
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
 
         registry = SkillRegistry()
         registry.load_from_dir(tmp_path)
 
         assert registry.skill_names == frozenset({"alpha", "beta", "gamma"})
 
-        for stem, content in files.items():
-            result = registry.get(stem)
-            assert result is not None, f"Expected skill '{stem}' to be registered"
+        for name, content in files.items():
+            result = registry.get(name)
+            assert result is not None, f"Expected skill '{name}' to be registered"
             stored_content, etag = result
             assert stored_content == content
             expected_etag = hashlib.sha256(content.encode("utf-8")).hexdigest()
             assert etag == expected_etag
+
+    def test_loads_skill_from_directory_skill_md(self, tmp_path: Path) -> None:
+        """load_from_dir loads SKILL.md from a subdirectory, keyed by directory name."""
+        skill_dir = tmp_path / "context-intelligence-graph-query"
+        skill_dir.mkdir()
+        skill_content = "# Graph Query Skill\n\nThis is the graph query skill."
+        (skill_dir / "SKILL.md").write_text(skill_content, encoding="utf-8")
+
+        registry = SkillRegistry()
+        registry.load_from_dir(tmp_path)
+
+        result = registry.get("context-intelligence-graph-query")
+        assert result is not None
+        content, etag = result
+        assert content == skill_content
+        expected_etag = hashlib.sha256(skill_content.encode("utf-8")).hexdigest()
+        assert etag == expected_etag
 
 
 class TestGetSkill200:
@@ -123,7 +156,9 @@ class TestGetSkill200:
     ) -> None:
         """GET /skills/{skill_name} returns 200 with the skill's markdown content."""
         skill_content = "# My Skill\n\nThis is skill content."
-        (tmp_path / "my-skill.md").write_text(skill_content, encoding="utf-8")
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(skill_content, encoding="utf-8")
 
         registry = SkillRegistry()
         registry.load_from_dir(tmp_path)
@@ -140,7 +175,9 @@ class TestGetSkill200:
     ) -> None:
         """GET /skills/{skill_name} includes an ETag header in the response."""
         skill_content = "# My Skill\n\nETag header test."
-        (tmp_path / "my-skill.md").write_text(skill_content, encoding="utf-8")
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(skill_content, encoding="utf-8")
 
         registry = SkillRegistry()
         registry.load_from_dir(tmp_path)
@@ -157,7 +194,9 @@ class TestGetSkill200:
     ) -> None:
         """The ETag header value is the SHA-256 hex digest of the skill content."""
         skill_content = "# My Skill\n\nSHA-256 verification content."
-        (tmp_path / "my-skill.md").write_text(skill_content, encoding="utf-8")
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(skill_content, encoding="utf-8")
 
         registry = SkillRegistry()
         registry.load_from_dir(tmp_path)
@@ -179,7 +218,9 @@ class TestGetSkill304:
     ) -> None:
         """Second request with matching If-None-Match returns 304 with empty body."""
         skill_content = "# My Skill\n\nETag caching test."
-        (tmp_path / "my-skill.md").write_text(skill_content, encoding="utf-8")
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(skill_content, encoding="utf-8")
 
         registry = SkillRegistry()
         registry.load_from_dir(tmp_path)
@@ -204,7 +245,9 @@ class TestGetSkill304:
     ) -> None:
         """Request with stale If-None-Match returns 200 with full content."""
         skill_content = "# My Skill\n\nStale ETag test."
-        (tmp_path / "my-skill.md").write_text(skill_content, encoding="utf-8")
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(skill_content, encoding="utf-8")
 
         registry = SkillRegistry()
         registry.load_from_dir(tmp_path)

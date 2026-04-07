@@ -16,10 +16,11 @@ router = APIRouter()
 
 
 class SkillRegistry:
-    """Registry of skill definitions loaded from a directory of Markdown files.
+    """Registry of skill definitions loaded from a directory of skill packages.
 
-    Each *.md file is keyed by its stem (filename without extension).
-    An ETag (SHA-256 hex digest) is computed per file for cache-validation support.
+    Each skill lives in its own subdirectory containing a ``SKILL.md`` file.
+    The skill is keyed by the subdirectory name. An ETag (SHA-256 hex digest)
+    is computed per file for cache-validation support.
     """
 
     def __init__(self) -> None:
@@ -27,19 +28,21 @@ class SkillRegistry:
         self._etags: dict[str, str] = {}
 
     def load_from_dir(self, skills_dir: Path) -> None:
-        """Load all *.md files from *skills_dir* into the registry.
+        """Load all ``<skill-name>/SKILL.md`` packages from *skills_dir*.
 
-        Files are processed in sorted order. Each file's content is stored keyed
-        by the file stem; the corresponding ETag is the SHA-256 hex digest of the
-        UTF-8 encoded content.
+        Skills are discovered using the pattern ``*/SKILL.md`` so that each skill
+        must live in its own subdirectory.  Packages are processed in sorted order.
+        Each file's content is stored keyed by the parent directory name (the skill
+        name); the corresponding ETag is the SHA-256 hex digest of the UTF-8
+        encoded content.
 
         Args:
-            skills_dir: Directory to scan for ``*.md`` skill files.
+            skills_dir: Directory to scan for ``<skill-name>/SKILL.md`` packages.
         """
-        for skill_path in sorted(skills_dir.glob("*.md")):
+        for skill_path in sorted(skills_dir.glob("*/SKILL.md")):
             content = skill_path.read_text(encoding="utf-8")
             etag = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            stem = skill_path.stem
+            stem = skill_path.parent.name  # directory name = skill name
             self._content[stem] = content
             self._etags[stem] = etag
 
