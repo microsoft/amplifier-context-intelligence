@@ -488,3 +488,96 @@ class TestDelegationLifecycleEvents:
             "SOURCED_FROM edge must exist from Delegation to data_layer_1 lifecycle event node"
         )
         assert edge.get("type") == "SOURCED_FROM"
+
+
+# ---------------------------------------------------------------------------
+# 7. TestE04ParallelAgentEdges
+# ---------------------------------------------------------------------------
+
+
+class TestE04ParallelAgentEdges:
+    """E04 PARALLEL_AGENT edges between co-spawned delegations within a parallel_group_id."""
+
+    async def test_e04_edge_created_between_two_parallel_delegations(
+        self, services: HookStateService
+    ) -> None:
+        """Two spawns sharing parallel_group_id='pg-1' produce edge delegation_b -> delegation_a with type=PARALLEL_AGENT, sst_semantic=NEAR."""
+        handler = DelegationHandler(services)
+        data_a = {
+            "parent_session_id": "ps1",
+            "tool_call_id": "tc-a",
+            "sub_session_id": "ss-a",
+            "agent": "foundation:explorer",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "parallel_group_id": "pg-1",
+        }
+        data_b = {
+            "parent_session_id": "ps1",
+            "tool_call_id": "tc-b",
+            "sub_session_id": "ss-b",
+            "agent": "foundation:builder",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "parallel_group_id": "pg-1",
+        }
+        await handler("delegate:agent_spawned", data_a)
+        await handler("delegate:agent_spawned", data_b)
+
+        delegation_a_id = "ps1::delegation::tc-a"
+        delegation_b_id = "ps1::delegation::tc-b"
+        edge = await services.graph.get_edge(delegation_b_id, delegation_a_id)
+        assert edge is not None, "E04 edge (delegation_b -> delegation_a) must exist"
+        assert edge.get("type") == "PARALLEL_AGENT"
+        assert edge.get("sst_semantic") == "NEAR"
+
+    async def test_e04_three_parallel_delegations_produce_three_edges(
+        self, services: HookStateService
+    ) -> None:
+        """3 parallel spawns produce exactly 3 PARALLEL_AGENT edges."""
+        handler = DelegationHandler(services)
+        for i, (tc, ss) in enumerate([("tc-a", "ss-a"), ("tc-b", "ss-b"), ("tc-c", "ss-c")]):
+            data = {
+                "parent_session_id": "ps1",
+                "tool_call_id": tc,
+                "sub_session_id": ss,
+                "agent": f"foundation:agent-{i}",
+                "timestamp": f"2026-01-01T00:00:0{i}Z",
+                "parallel_group_id": "pg-1",
+            }
+            await handler("delegate:agent_spawned", data)
+
+        parallel_edges = [
+            edge
+            for edge in services.graph._edges.values()
+            if edge.get("type") == "PARALLEL_AGENT"
+        ]
+        assert len(parallel_edges) == 3
+
+    async def test_e04_no_edge_when_no_parallel_group_id(
+        self, services: HookStateService
+    ) -> None:
+        """Spawn without parallel_group_id produces 0 PARALLEL_AGENT edges."""
+        handler = DelegationHandler(services)
+        data = {
+            "parent_session_id": "ps1",
+            "tool_call_id": "tc-a",
+            "sub_session_id": "ss-a",
+            "agent": "foundation:explorer",
+            "timestamp": "2026-01-01T00:00:00Z",
+        }
+        await handler("delegate:agent_spawned", data)
+
+        parallel_edges = [
+            edge
+            for edge in services.graph._edges.values()
+            if edge.get("type") == "PARALLEL_AGENT"
+        ]
+        assert len(parallel_edges) == 0
+
+    def test_handler_has_parallel_groups_dict(self) -> None:
+        """DelegationHandler instance has _parallel_groups attribute that is a dict."""
+        from context_intelligence_server.services import HookStateService as _HookStateService
+
+        svc = _HookStateService(workspace="test")
+        handler = DelegationHandler(svc)
+        assert hasattr(handler, "_parallel_groups")
+        assert isinstance(handler._parallel_groups, dict)
