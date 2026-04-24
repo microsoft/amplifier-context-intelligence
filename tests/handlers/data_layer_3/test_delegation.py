@@ -360,3 +360,131 @@ class TestDelegationHandlerGuards:
         )
         assert result.action == "continue"
         assert len(services.graph._nodes) == 0
+
+
+# ---------------------------------------------------------------------------
+# 6. TestDelegationLifecycleEvents
+# ---------------------------------------------------------------------------
+
+
+class TestDelegationLifecycleEvents:
+    """Lifecycle events enrich the Delegation node and create a SOURCED_FROM edge."""
+
+    async def test_agent_completed_sets_ended_at(
+        self, services: HookStateService
+    ) -> None:
+        """spawn then complete; node['ended_at'] == completion timestamp."""
+        handler = DelegationHandler(services)
+        spawn_data = {
+            "parent_session_id": "ps1",
+            "tool_call_id": "tc-abc",
+            "sub_session_id": "ss1",
+            "agent": "foundation:explorer",
+            "timestamp": "2026-01-01T00:00:00Z",
+        }
+        await handler("delegate:agent_spawned", spawn_data)
+
+        complete_timestamp = "2026-01-01T01:00:00Z"
+        complete_data = {
+            "parent_session_id": "ps1",
+            "tool_call_id": "tc-abc",
+            "timestamp": complete_timestamp,
+        }
+        await handler("delegate:agent_completed", complete_data)
+
+        node = await services.graph.get_node("ps1::delegation::tc-abc")
+        assert node is not None
+        assert node["ended_at"] == complete_timestamp
+
+    async def test_agent_completed_sets_success_true(
+        self, services: HookStateService
+    ) -> None:
+        """node['success'] is True after delegate:agent_completed."""
+        handler = DelegationHandler(services)
+        complete_data = {
+            "parent_session_id": "ps1",
+            "tool_call_id": "tc-abc",
+            "timestamp": "2026-01-01T01:00:00Z",
+        }
+        await handler("delegate:agent_completed", complete_data)
+
+        node = await services.graph.get_node("ps1::delegation::tc-abc")
+        assert node is not None
+        assert node["success"] is True
+
+    async def test_agent_resumed_sets_resumed_at(
+        self, services: HookStateService
+    ) -> None:
+        """node['resumed_at'] == resume timestamp after delegate:agent_resumed."""
+        handler = DelegationHandler(services)
+        resume_timestamp = "2026-01-01T02:00:00Z"
+        resume_data = {
+            "parent_session_id": "ps1",
+            "tool_call_id": "tc-abc",
+            "timestamp": resume_timestamp,
+        }
+        await handler("delegate:agent_resumed", resume_data)
+
+        node = await services.graph.get_node("ps1::delegation::tc-abc")
+        assert node is not None
+        assert node["resumed_at"] == resume_timestamp
+
+    async def test_agent_cancelled_sets_cancelled_at(
+        self, services: HookStateService
+    ) -> None:
+        """node['cancelled_at'] == cancel timestamp after delegate:agent_cancelled."""
+        handler = DelegationHandler(services)
+        cancel_timestamp = "2026-01-01T03:00:00Z"
+        cancel_data = {
+            "parent_session_id": "ps1",
+            "tool_call_id": "tc-abc",
+            "timestamp": cancel_timestamp,
+        }
+        await handler("delegate:agent_cancelled", cancel_data)
+
+        node = await services.graph.get_node("ps1::delegation::tc-abc")
+        assert node is not None
+        assert node["cancelled_at"] == cancel_timestamp
+
+    async def test_delegate_error_sets_success_false_and_error(
+        self, services: HookStateService
+    ) -> None:
+        """node['success'] is False, node['error']=='SubagentError', node['ended_at'] set."""
+        handler = DelegationHandler(services)
+        error_timestamp = "2026-01-01T04:00:00Z"
+        error_data = {
+            "parent_session_id": "ps1",
+            "tool_call_id": "tc-abc",
+            "timestamp": error_timestamp,
+            "error": "SubagentError",
+        }
+        await handler("delegate:error", error_data)
+
+        node = await services.graph.get_node("ps1::delegation::tc-abc")
+        assert node is not None
+        assert node["success"] is False
+        assert node["error"] == "SubagentError"
+        assert node["ended_at"] == error_timestamp
+
+    async def test_lifecycle_event_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """delegate:agent_completed creates SOURCED_FROM edge using delegation_id as disambiguator."""
+        handler = DelegationHandler(services)
+        complete_timestamp = "2026-01-01T01:00:00Z"
+        complete_data = {
+            "parent_session_id": "ps1",
+            "tool_call_id": "tc-abc",
+            "timestamp": complete_timestamp,
+        }
+        await handler("delegate:agent_completed", complete_data)
+
+        delegation_id = "ps1::delegation::tc-abc"
+        expected_target = make_node_id(
+            "ps1", "delegate:agent_completed", complete_timestamp, delegation_id
+        )
+        edge = await services.graph.get_edge(delegation_id, expected_target)
+        assert edge is not None, (
+            "SOURCED_FROM edge must exist from Delegation to data_layer_1 lifecycle event node"
+        )
+        assert edge.get("type") == "SOURCED_FROM"
