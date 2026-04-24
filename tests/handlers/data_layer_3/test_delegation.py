@@ -534,7 +534,9 @@ class TestE04ParallelAgentEdges:
     ) -> None:
         """3 parallel spawns produce exactly 3 PARALLEL_AGENT edges."""
         handler = DelegationHandler(services)
-        for i, (tc, ss) in enumerate([("tc-a", "ss-a"), ("tc-b", "ss-b"), ("tc-c", "ss-c")]):
+        for i, (tc, ss) in enumerate(
+            [("tc-a", "ss-a"), ("tc-b", "ss-b"), ("tc-c", "ss-c")]
+        ):
             data = {
                 "parent_session_id": "ps1",
                 "tool_call_id": tc,
@@ -575,7 +577,9 @@ class TestE04ParallelAgentEdges:
 
     def test_handler_has_parallel_groups_dict(self) -> None:
         """DelegationHandler instance has _parallel_groups attribute that is a dict."""
-        from context_intelligence_server.services import HookStateService as _HookStateService
+        from context_intelligence_server.services import (
+            HookStateService as _HookStateService,
+        )
 
         svc = _HookStateService(workspace="test")
         handler = DelegationHandler(svc)
