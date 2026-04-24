@@ -267,3 +267,182 @@ class TestE05HasSkillLoadEdge:
 
         skill_load_id = "sess-001::skill::python-standards::2026-01-01T00:00:00Z"
         assert handler._active_skill_nodes.get("python-standards") == skill_load_id
+
+
+# ---------------------------------------------------------------------------
+# 5. TestSkillUnloadedEnriches
+# ---------------------------------------------------------------------------
+
+
+class TestSkillUnloadedEnriches:
+    """skill:unloaded enriches the existing SkillLoad node with ended_at and a SOURCED_FROM edge."""
+
+    def _make_loaded_data(
+        self,
+        session_id: str = "sess-001",
+        skill_name: str = "python-standards",
+        timestamp: str = "2026-01-01T00:00:00Z",
+    ) -> dict:
+        return {
+            "session_id": session_id,
+            "skill_name": skill_name,
+            "timestamp": timestamp,
+            "content_length": 512,
+            "source": "workspace",
+            "version": "1.0.0",
+            "context": "inline",
+            "disable_model_invocation": False,
+            "user_invocable": False,
+        }
+
+    def _make_unloaded_data(
+        self,
+        session_id: str = "sess-001",
+        skill_name: str = "python-standards",
+        timestamp: str = "2026-01-01T01:00:00Z",
+    ) -> dict:
+        return {
+            "session_id": session_id,
+            "skill_name": skill_name,
+            "timestamp": timestamp,
+        }
+
+    async def test_skill_unloaded_sets_ended_at(
+        self, services: HookStateService
+    ) -> None:
+        """skill:unloaded sets ended_at on the SkillLoad node to the unload timestamp."""
+        handler = SkillLoadHandler(services)
+        timestamp_load = "2026-01-01T00:00:00Z"
+        timestamp_unload = "2026-01-01T01:00:00Z"
+        session_id = "sess-001"
+        skill_name = "python-standards"
+
+        await handler(
+            "skill:loaded",
+            self._make_loaded_data(
+                session_id=session_id, skill_name=skill_name, timestamp=timestamp_load
+            ),
+        )
+        await handler(
+            "skill:unloaded",
+            self._make_unloaded_data(
+                session_id=session_id, skill_name=skill_name, timestamp=timestamp_unload
+            ),
+        )
+
+        skill_load_id = f"{session_id}::skill::{skill_name}::{timestamp_load}"
+        node = await services.graph.get_node(skill_load_id)
+        assert node is not None
+        assert node["ended_at"] == timestamp_unload
+
+    async def test_skill_unloaded_creates_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """SOURCED_FROM edge from skill_load_id to make_node_id(session_id, 'skill:unloaded', timestamp_unload, skill_name)."""
+        handler = SkillLoadHandler(services)
+        session_id = "sess-001"
+        skill_name = "python-standards"
+        timestamp_load = "2026-01-01T00:00:00Z"
+        timestamp_unload = "2026-01-01T01:00:00Z"
+
+        await handler(
+            "skill:loaded",
+            self._make_loaded_data(
+                session_id=session_id, skill_name=skill_name, timestamp=timestamp_load
+            ),
+        )
+        await handler(
+            "skill:unloaded",
+            self._make_unloaded_data(
+                session_id=session_id, skill_name=skill_name, timestamp=timestamp_unload
+            ),
+        )
+
+        skill_load_id = f"{session_id}::skill::{skill_name}::{timestamp_load}"
+        expected_target = make_node_id(
+            session_id, "skill:unloaded", timestamp_unload, skill_name
+        )
+        edge = await services.graph.get_edge(skill_load_id, expected_target)
+        assert edge is not None, (
+            "SOURCED_FROM edge must exist from SkillLoad node to data_layer_1 skill:unloaded event"
+        )
+        assert edge.get("type") == "SOURCED_FROM"
+
+    async def test_skill_unloaded_removes_skill_from_cache(
+        self, services: HookStateService
+    ) -> None:
+        """skill_name must be in _active_skill_nodes after load, and removed after unload."""
+        handler = SkillLoadHandler(services)
+        session_id = "sess-001"
+        skill_name = "python-standards"
+
+        await handler(
+            "skill:loaded",
+            self._make_loaded_data(session_id=session_id, skill_name=skill_name),
+        )
+        assert skill_name in handler._active_skill_nodes, (
+            "skill_name must be in _active_skill_nodes after skill:loaded"
+        )
+
+        await handler(
+            "skill:unloaded",
+            self._make_unloaded_data(session_id=session_id, skill_name=skill_name),
+        )
+        assert skill_name not in handler._active_skill_nodes, (
+            "skill_name must be removed from _active_skill_nodes after skill:unloaded"
+        )
+
+    async def test_orphaned_skill_unloaded_is_noop(
+        self, services: HookStateService
+    ) -> None:
+        """Unload without prior load creates 0 nodes and 0 edges (graph completely untouched)."""
+        handler = SkillLoadHandler(services)
+        await handler("skill:unloaded", self._make_unloaded_data())
+
+        assert len(services.graph._nodes) == 0, (
+            "Orphaned skill:unloaded must not create any nodes"
+        )
+        assert len(services.graph._edges) == 0, (
+            "Orphaned skill:unloaded must not create any edges"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 6. TestSkillLoadHandlerGuards
+# ---------------------------------------------------------------------------
+
+
+class TestSkillLoadHandlerGuards:
+    """Handler returns continue with no graph mutations when required fields are missing."""
+
+    async def test_missing_session_id_returns_continue(
+        self, services: HookStateService
+    ) -> None:
+        """Missing session_id returns HookResult(action='continue') with no graph mutations."""
+        handler = SkillLoadHandler(services)
+        data = {"skill_name": "python-standards", "timestamp": "2026-01-01T00:00:00Z"}
+        result = await handler("skill:loaded", data)
+
+        assert result.action == "continue"
+        assert len(services.graph._nodes) == 0, (
+            "No nodes must be created when session_id missing"
+        )
+        assert len(services.graph._edges) == 0, (
+            "No edges must be created when session_id missing"
+        )
+
+    async def test_missing_skill_name_returns_continue(
+        self, services: HookStateService
+    ) -> None:
+        """Missing skill_name returns HookResult(action='continue') with no graph mutations."""
+        handler = SkillLoadHandler(services)
+        data = {"session_id": "sess-001", "timestamp": "2026-01-01T00:00:00Z"}
+        result = await handler("skill:loaded", data)
+
+        assert result.action == "continue"
+        assert len(services.graph._nodes) == 0, (
+            "No nodes must be created when skill_name missing"
+        )
+        assert len(services.graph._edges) == 0, (
+            "No edges must be created when skill_name missing"
+        )
