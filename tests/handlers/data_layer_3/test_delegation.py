@@ -585,3 +585,59 @@ class TestE04ParallelAgentEdges:
         handler = DelegationHandler(svc)
         assert hasattr(handler, "_parallel_groups")
         assert isinstance(handler._parallel_groups, dict)
+
+
+# ---------------------------------------------------------------------------
+# 8. TestE10RecipeStepAttribution
+# ---------------------------------------------------------------------------
+
+
+class TestE10RecipeStepAttribution:
+    """E10 edges from active_recipe_step_id -> Delegation when cursor is set."""
+
+    async def test_e10_edge_created_when_active_recipe_step_set(
+        self, services: HookStateService
+    ) -> None:
+        """Set active_recipe_step_id before spawn; edge exists from step -> delegation with type=TRIGGERED, sst_semantic=LEADS_TO."""
+        services.data_layer_3.active_recipe_step_id = "run-001::step::1"
+        handler = DelegationHandler(services)
+        data = {
+            "parent_session_id": "ps1",
+            "tool_call_id": "tc-abc",
+            "sub_session_id": "ss1",
+            "agent": "foundation:explorer",
+            "timestamp": "2026-01-01T00:00:00Z",
+        }
+        await handler("delegate:agent_spawned", data)
+
+        delegation_id = "ps1::delegation::tc-abc"
+        edge = await services.graph.get_edge("run-001::step::1", delegation_id)
+        assert edge is not None, "E10 edge (RecipeStep -> Delegation) must exist"
+        assert edge.get("type") == "TRIGGERED"
+        assert edge.get("sst_semantic") == "LEADS_TO"
+
+    async def test_e10_no_edge_when_no_active_recipe_step(
+        self, services: HookStateService
+    ) -> None:
+        """No active_recipe_step_id set means no E10 edge; only E03 TRIGGERED edge targets delegation."""
+        assert services.data_layer_3.active_recipe_step_id is None
+        handler = DelegationHandler(services)
+        data = {
+            "parent_session_id": "ps1",
+            "tool_call_id": "tc-abc",
+            "sub_session_id": "ss1",
+            "agent": "foundation:explorer",
+            "timestamp": "2026-01-01T00:00:00Z",
+        }
+        await handler("delegate:agent_spawned", data)
+
+        delegation_id = "ps1::delegation::tc-abc"
+        # Collect all TRIGGERED edges pointing to delegation_id
+        triggered_to_delegation = [
+            (src, dst)
+            for (src, dst), edge in services.graph._edges.items()
+            if dst == delegation_id and edge.get("type") == "TRIGGERED"
+        ]
+        # Only E03 should exist — tool_call_id ("tc-abc") -> delegation_id
+        assert len(triggered_to_delegation) == 1
+        assert triggered_to_delegation[0][0] == "tc-abc"
