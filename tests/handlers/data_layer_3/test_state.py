@@ -46,3 +46,29 @@ class TestDataLayer3StateFieldIsolation:
         assert "recipe_run_1" not in state_b.active_recipe_run_stack, (
             "active_recipe_run_stack must not be shared across DataLayer3State instances"
         )
+
+
+class TestHookStateServiceHasDataLayer3:
+    """HookStateService must expose a data_layer_3 attribute of type DataLayer3State."""
+
+    def test_services_has_data_layer_3_attribute(self) -> None:
+        """HookStateService(workspace='test') has a data_layer_3 attribute."""
+        from context_intelligence_server.services import HookStateService
+
+        services = HookStateService(workspace="test")
+        assert hasattr(services, "data_layer_3")
+
+    def test_data_layer_3_is_data_layer_3_state_instance(self) -> None:
+        """services.data_layer_3 is an instance of DataLayer3State."""
+        from context_intelligence_server.services import HookStateService
+
+        services = HookStateService(workspace="test")
+        assert isinstance(services.data_layer_3, DataLayer3State)
+
+    def test_data_layer_3_defaults_are_clean(self) -> None:
+        """services.data_layer_3 has clean default values on initialisation."""
+        from context_intelligence_server.services import HookStateService
+
+        services = HookStateService(workspace="test")
+        assert services.data_layer_3.active_recipe_run_stack == []
+        assert services.data_layer_3.active_recipe_step_id is None
