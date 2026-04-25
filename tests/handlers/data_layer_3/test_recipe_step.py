@@ -1,10 +1,23 @@
-"""Tests for RecipeStepHandler stub — Phase 2 placeholder.
+"""Tests for RecipeStepHandler — Phase 2 implementation (recipe:step flat steps).
 
 Covers:
-- handled_events == frozenset() (empty — Phase 2 deferred)
-- __init__ accepts services and stores it
-- __call__ returns HookResult(action='continue') for any event
-- satisfies EventHandler protocol
+- handled_events == frozenset of 4 events:
+  'recipe:step', 'recipe:approval', 'recipe:loop_iteration', 'tool:pre'
+- recipe:step creates RecipeStep:SST_EVENT node at {run_id}::step::{current_step}
+  with both 'RecipeStep' and 'SST_EVENT' labels, started_at=timestamp,
+  current_step property
+- step_name extracted from data['steps'][current_step]['name']
+  (e.g. 'build' for index 0, 'deploy' for index 1)
+- falls back to str(current_step) when steps array is empty or out-of-range
+  (IndexError/KeyError/TypeError)
+- creates E08 edge RecipeRun-[HAS_STEP {sst_semantic: CONTAINS}]->RecipeStep
+- creates SOURCED_FROM edge to
+  make_node_id(SESSION_ID, 'recipe:step', timestamp, str(current_step))
+- sets active_recipe_step_id cursor
+- clears previous cursor before setting new (after two sequential steps cursor
+  points to step::1)
+- recipe:step with empty active_recipe_run_stack is no-op (no nodes created,
+  active_recipe_step_id stays None, returns HookResult(action='continue'))
 """
 
 from __future__ import annotations
@@ -12,8 +25,22 @@ from __future__ import annotations
 from context_intelligence_server.handlers.data_layer_3.recipe_step import (
     RecipeStepHandler,
 )
-from context_intelligence_server.protocol import EventHandler, HookResult
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.utils import make_node_id
+
+
+# ---------------------------------------------------------------------------
+# Module-level constants and shared helpers
+# ---------------------------------------------------------------------------
+
+SESSION_ID = "sess-step"
+TIMESTAMP = "2026-01-01T00:00:00Z"
+RUN_ID = f"{SESSION_ID}::recipe_run::{TIMESTAMP}"
+
+
+def _push_run(services: HookStateService, run_id: str = RUN_ID) -> None:
+    """Pre-populate active_recipe_run_stack for tests that need a non-empty stack."""
+    services.data_layer_3.active_recipe_run_stack.append(run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -22,72 +49,370 @@ from context_intelligence_server.services import HookStateService
 
 
 class TestRecipeStepHandlerHandledEvents:
-    """handled_events must be an empty frozenset (Phase 2 stub)."""
+    """handled_events must be a frozenset of exactly 4 events."""
 
     def test_handled_events_is_frozenset(self) -> None:
         """handled_events must be a frozenset."""
         assert isinstance(RecipeStepHandler.handled_events, frozenset)
 
-    def test_handled_events_is_empty(self) -> None:
-        """handled_events must be empty — Phase 2 deferred."""
-        assert RecipeStepHandler.handled_events == frozenset()
+    def test_recipe_step_in_handled_events(self) -> None:
+        """recipe:step must be in handled_events."""
+        assert "recipe:step" in RecipeStepHandler.handled_events
+
+    def test_recipe_approval_in_handled_events(self) -> None:
+        """recipe:approval must be in handled_events."""
+        assert "recipe:approval" in RecipeStepHandler.handled_events
+
+    def test_recipe_loop_iteration_in_handled_events(self) -> None:
+        """recipe:loop_iteration must be in handled_events."""
+        assert "recipe:loop_iteration" in RecipeStepHandler.handled_events
+
+    def test_tool_pre_in_handled_events(self) -> None:
+        """tool:pre must be in handled_events."""
+        assert "tool:pre" in RecipeStepHandler.handled_events
+
+    def test_handled_events_has_exactly_four_events(self) -> None:
+        """handled_events must contain exactly 4 events."""
+        assert len(RecipeStepHandler.handled_events) == 4
 
 
 # ---------------------------------------------------------------------------
-# 2. TestRecipeStepHandlerInit
+# 2. TestRecipeStepHandlerStepCreatesNode
 # ---------------------------------------------------------------------------
 
 
-class TestRecipeStepHandlerInit:
-    """__init__ must accept services and store it."""
+class TestRecipeStepHandlerStepCreatesNode:
+    """recipe:step creates RecipeStep:SST_EVENT node at {run_id}::step::{current_step}."""
 
-    def test_init_stores_services(self) -> None:
-        """RecipeStepHandler.__init__ must store the services argument."""
-        services = HookStateService(workspace="test")
+    async def test_step_creates_recipe_step_node(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:step must create a RecipeStep node at '{run_id}::step::{current_step}'."""
+        _push_run(services)
         handler = RecipeStepHandler(services)
-        assert handler.services is services
+        data = {
+            "session_id": SESSION_ID,
+            "timestamp": TIMESTAMP,
+            "current_step": 0,
+            "steps": [{"name": "build"}, {"name": "deploy"}],
+        }
+        await handler("recipe:step", data)
+
+        step_id = f"{RUN_ID}::step::0"
+        node = await services.graph.get_node(step_id)
+        assert node is not None, f"RecipeStep node must exist at '{step_id}'"
+
+    async def test_step_node_has_recipe_step_label(
+        self, services: HookStateService
+    ) -> None:
+        """RecipeStep node must have 'RecipeStep' in labels."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        data = {
+            "session_id": SESSION_ID,
+            "timestamp": TIMESTAMP,
+            "current_step": 0,
+            "steps": [{"name": "build"}],
+        }
+        await handler("recipe:step", data)
+
+        step_id = f"{RUN_ID}::step::0"
+        node = await services.graph.get_node(step_id)
+        assert node is not None
+        assert "RecipeStep" in node["labels"]
+
+    async def test_step_node_has_sst_event_label(
+        self, services: HookStateService
+    ) -> None:
+        """RecipeStep node must have 'SST_EVENT' in labels."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        data = {
+            "session_id": SESSION_ID,
+            "timestamp": TIMESTAMP,
+            "current_step": 0,
+            "steps": [{"name": "build"}],
+        }
+        await handler("recipe:step", data)
+
+        step_id = f"{RUN_ID}::step::0"
+        node = await services.graph.get_node(step_id)
+        assert node is not None
+        assert "SST_EVENT" in node["labels"]
+
+    async def test_step_node_has_started_at(self, services: HookStateService) -> None:
+        """RecipeStep node must have 'started_at' matching event timestamp."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        data = {
+            "session_id": SESSION_ID,
+            "timestamp": TIMESTAMP,
+            "current_step": 0,
+            "steps": [{"name": "build"}],
+        }
+        await handler("recipe:step", data)
+
+        step_id = f"{RUN_ID}::step::0"
+        node = await services.graph.get_node(step_id)
+        assert node is not None
+        assert node["started_at"] == TIMESTAMP
+
+    async def test_step_node_has_current_step(self, services: HookStateService) -> None:
+        """RecipeStep node must have 'current_step' property."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        data = {
+            "session_id": SESSION_ID,
+            "timestamp": TIMESTAMP,
+            "current_step": 0,
+            "steps": [{"name": "build"}],
+        }
+        await handler("recipe:step", data)
+
+        step_id = f"{RUN_ID}::step::0"
+        node = await services.graph.get_node(step_id)
+        assert node is not None
+        assert node["current_step"] == 0
 
 
 # ---------------------------------------------------------------------------
-# 3. TestRecipeStepHandlerCall
+# 3. TestRecipeStepHandlerStepNameFromSteps
 # ---------------------------------------------------------------------------
 
 
-class TestRecipeStepHandlerCall:
-    """__call__ must return HookResult(action='continue') without mutations."""
+class TestRecipeStepHandlerStepNameFromSteps:
+    """step_name is extracted from data['steps'][current_step]['name']."""
 
-    async def test_call_returns_hook_result(self) -> None:
-        """__call__ must return a HookResult."""
-        services = HookStateService(workspace="test")
+    async def test_step_name_from_steps_index_0(
+        self, services: HookStateService
+    ) -> None:
+        """step_name is 'build' for steps[0]['name'] == 'build'."""
+        _push_run(services)
         handler = RecipeStepHandler(services)
-        result = await handler("recipe:step", {"session_id": "sess-1"})
-        assert isinstance(result, HookResult)
+        data = {
+            "session_id": SESSION_ID,
+            "timestamp": TIMESTAMP,
+            "current_step": 0,
+            "steps": [{"name": "build"}, {"name": "deploy"}],
+        }
+        await handler("recipe:step", data)
 
-    async def test_call_returns_continue(self) -> None:
-        """__call__ must return HookResult with action='continue'."""
-        services = HookStateService(workspace="test")
+        step_id = f"{RUN_ID}::step::0"
+        node = await services.graph.get_node(step_id)
+        assert node is not None
+        assert node["name"] == "build"
+
+    async def test_step_name_from_steps_index_1(
+        self, services: HookStateService
+    ) -> None:
+        """step_name is 'deploy' for steps[1]['name'] == 'deploy'."""
+        _push_run(services)
         handler = RecipeStepHandler(services)
-        result = await handler("recipe:step", {"session_id": "sess-1"})
+        data = {
+            "session_id": SESSION_ID,
+            "timestamp": TIMESTAMP,
+            "current_step": 1,
+            "steps": [{"name": "build"}, {"name": "deploy"}],
+        }
+        await handler("recipe:step", data)
+
+        step_id = f"{RUN_ID}::step::1"
+        node = await services.graph.get_node(step_id)
+        assert node is not None
+        assert node["name"] == "deploy"
+
+    async def test_step_name_fallback_when_steps_empty(
+        self, services: HookStateService
+    ) -> None:
+        """step_name falls back to str(current_step) when steps array is empty (IndexError)."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        data = {
+            "session_id": SESSION_ID,
+            "timestamp": TIMESTAMP,
+            "current_step": 0,
+            "steps": [],
+        }
+        await handler("recipe:step", data)
+
+        step_id = f"{RUN_ID}::step::0"
+        node = await services.graph.get_node(step_id)
+        assert node is not None
+        assert node["name"] == "0"
+
+    async def test_step_name_fallback_when_index_out_of_range(
+        self, services: HookStateService
+    ) -> None:
+        """step_name falls back to str(current_step) when index is out-of-range (IndexError)."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        data = {
+            "session_id": SESSION_ID,
+            "timestamp": TIMESTAMP,
+            "current_step": 5,
+            "steps": [{"name": "build"}],
+        }
+        await handler("recipe:step", data)
+
+        step_id = f"{RUN_ID}::step::5"
+        node = await services.graph.get_node(step_id)
+        assert node is not None
+        assert node["name"] == "5"
+
+    async def test_step_name_fallback_when_no_name_key(
+        self, services: HookStateService
+    ) -> None:
+        """step_name falls back to str(current_step) when step has no 'name' key (KeyError)."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        data = {
+            "session_id": SESSION_ID,
+            "timestamp": TIMESTAMP,
+            "current_step": 0,
+            "steps": [{"id": "step-0"}],  # no 'name' key
+        }
+        await handler("recipe:step", data)
+
+        step_id = f"{RUN_ID}::step::0"
+        node = await services.graph.get_node(step_id)
+        assert node is not None
+        assert node["name"] == "0"
+
+    async def test_step_name_fallback_when_steps_not_a_list(
+        self, services: HookStateService
+    ) -> None:
+        """step_name falls back to str(current_step) when steps is not subscriptable (TypeError)."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        data = {
+            "session_id": SESSION_ID,
+            "timestamp": TIMESTAMP,
+            "current_step": 0,
+            "steps": "not-a-list",  # TypeError on indexing
+        }
+        await handler("recipe:step", data)
+
+        step_id = f"{RUN_ID}::step::0"
+        node = await services.graph.get_node(step_id)
+        assert node is not None
+        assert node["name"] == "0"
+
+
+# ---------------------------------------------------------------------------
+# 4. TestRecipeStepHandlerStepEdges
+# ---------------------------------------------------------------------------
+
+
+class TestRecipeStepHandlerStepEdges:
+    """E08 and SOURCED_FROM edges must be created on recipe:step."""
+
+    async def test_e08_has_step_contains_edge(self, services: HookStateService) -> None:
+        """E08: RecipeRun -[HAS_STEP {sst_semantic: CONTAINS}]-> RecipeStep."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        data = {
+            "session_id": SESSION_ID,
+            "timestamp": TIMESTAMP,
+            "current_step": 0,
+            "steps": [{"name": "build"}],
+        }
+        await handler("recipe:step", data)
+
+        step_id = f"{RUN_ID}::step::0"
+        edge = await services.graph.get_edge(RUN_ID, step_id)
+        assert edge is not None, "E08 edge (RecipeRun -> RecipeStep) must exist"
+        assert edge.get("type") == "HAS_STEP"
+        assert edge.get("sst_semantic") == "CONTAINS"
+
+    async def test_sourced_from_edge_on_recipe_step(
+        self, services: HookStateService
+    ) -> None:
+        """SOURCED_FROM must link RecipeStep to
+        make_node_id(SESSION_ID, 'recipe:step', timestamp, str(current_step))."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        data = {
+            "session_id": SESSION_ID,
+            "timestamp": TIMESTAMP,
+            "current_step": 0,
+            "steps": [{"name": "build"}],
+        }
+        await handler("recipe:step", data)
+
+        step_id = f"{RUN_ID}::step::0"
+        expected_target = make_node_id(SESSION_ID, "recipe:step", TIMESTAMP, "0")
+        edge = await services.graph.get_edge(step_id, expected_target)
+        assert edge is not None, (
+            "SOURCED_FROM edge must exist from RecipeStep to data_layer_1 node"
+        )
+        assert edge.get("type") == "SOURCED_FROM"
+
+
+# ---------------------------------------------------------------------------
+# 5. TestRecipeStepHandlerCursor
+# ---------------------------------------------------------------------------
+
+
+class TestRecipeStepHandlerCursor:
+    """recipe:step sets and clears the active_recipe_step_id cursor."""
+
+    async def test_step_sets_active_recipe_step_id(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:step sets active_recipe_step_id to the step node ID."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        data = {
+            "session_id": SESSION_ID,
+            "timestamp": TIMESTAMP,
+            "current_step": 0,
+            "steps": [{"name": "build"}],
+        }
+        await handler("recipe:step", data)
+
+        step_id = f"{RUN_ID}::step::0"
+        assert services.data_layer_3.active_recipe_step_id == step_id
+
+    async def test_step_clears_previous_cursor_before_setting_new(
+        self, services: HookStateService
+    ) -> None:
+        """After two sequential steps cursor points to step::1 (not step::0)."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+
+        data_step_0 = {
+            "session_id": SESSION_ID,
+            "timestamp": TIMESTAMP,
+            "current_step": 0,
+            "steps": [{"name": "build"}, {"name": "deploy"}],
+        }
+        data_step_1 = {
+            "session_id": SESSION_ID,
+            "timestamp": TIMESTAMP,
+            "current_step": 1,
+            "steps": [{"name": "build"}, {"name": "deploy"}],
+        }
+        await handler("recipe:step", data_step_0)
+        await handler("recipe:step", data_step_1)
+
+        step_1_id = f"{RUN_ID}::step::1"
+        assert services.data_layer_3.active_recipe_step_id == step_1_id
+
+    async def test_step_empty_stack_is_noop(self, services: HookStateService) -> None:
+        """recipe:step with empty active_recipe_run_stack is a no-op:
+        no nodes created, active_recipe_step_id stays None, returns continue."""
+        handler = RecipeStepHandler(services)
+        assert services.data_layer_3.active_recipe_run_stack == []
+
+        result = await handler(
+            "recipe:step",
+            {
+                "session_id": SESSION_ID,
+                "timestamp": TIMESTAMP,
+                "current_step": 0,
+                "steps": [{"name": "build"}],
+            },
+        )
         assert result.action == "continue"
-
-    async def test_call_returns_continue_for_any_event(self) -> None:
-        """__call__ must return continue for any event type."""
-        services = HookStateService(workspace="test")
-        handler = RecipeStepHandler(services)
-        result = await handler("recipe:approval", {"session_id": "sess-1"})
-        assert result.action == "continue"
-
-
-# ---------------------------------------------------------------------------
-# 4. TestRecipeStepHandlerProtocol
-# ---------------------------------------------------------------------------
-
-
-class TestRecipeStepHandlerProtocol:
-    """RecipeStepHandler must satisfy the EventHandler protocol."""
-
-    def test_satisfies_event_handler_protocol(self) -> None:
-        """RecipeStepHandler instance must be an EventHandler."""
-        services = HookStateService(workspace="test")
-        handler = RecipeStepHandler(services)
-        assert isinstance(handler, EventHandler)
+        assert len(services.graph._nodes) == 0
+        assert services.data_layer_3.active_recipe_step_id is None
