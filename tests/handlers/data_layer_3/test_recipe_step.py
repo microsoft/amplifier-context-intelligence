@@ -724,3 +724,68 @@ class TestRecipeStepHandlerLoopIteration:
         result = await handler("recipe:loop_iteration", LOOP_DATA)
         assert result.action == "continue"
         assert len(services.graph._nodes) == 0
+
+
+# ---------------------------------------------------------------------------
+# 8. TestRecipeStepHandlerE11
+# ---------------------------------------------------------------------------
+
+T2 = "2026-01-01T02:00:00Z"
+
+TOOL_PRE_DATA = {
+    "session_id": SESSION_ID,
+    "timestamp": T2,
+    "tool_call_id": "tc-xyz",
+    "tool_name": "bash",
+}
+
+
+class TestRecipeStepHandlerE11:
+    """tool:pre creates E11 TRIGGERED edge from active RecipeStep to ToolCall."""
+
+    async def test_tool_pre_creates_triggered_edge_when_both_present(
+        self, services: HookStateService
+    ) -> None:
+        """tool:pre creates E11 TRIGGERED edge with sst_semantic='LEADS_TO'
+        from active_recipe_step_id to tool_call_id when both are present."""
+        active_step = f"{RUN_ID}::step::0"
+        services.data_layer_3.active_recipe_step_id = active_step
+        handler = RecipeStepHandler(services)
+        await handler("tool:pre", TOOL_PRE_DATA)
+
+        edge = await services.graph.get_edge(active_step, "tc-xyz")
+        assert edge is not None, "E11 TRIGGERED edge must exist from active step to tool_call_id"
+        assert edge.get("type") == "TRIGGERED"
+        assert edge.get("sst_semantic") == "LEADS_TO"
+
+    async def test_tool_pre_no_edge_when_active_step_is_none(
+        self, services: HookStateService
+    ) -> None:
+        """No TRIGGERED edges created when active_recipe_step_id is None."""
+        assert services.data_layer_3.active_recipe_step_id is None
+        handler = RecipeStepHandler(services)
+        await handler("tool:pre", TOOL_PRE_DATA)
+
+        assert len(services.graph._edges) == 0
+
+    async def test_tool_pre_no_edge_when_tool_call_id_missing(
+        self, services: HookStateService
+    ) -> None:
+        """No TRIGGERED edges created when tool_call_id is missing from data."""
+        active_step = f"{RUN_ID}::step::0"
+        services.data_layer_3.active_recipe_step_id = active_step
+        handler = RecipeStepHandler(services)
+        await handler("tool:pre", {"session_id": SESSION_ID, "timestamp": T2})
+
+        assert len(services.graph._edges) == 0
+
+    async def test_tool_pre_never_creates_nodes(
+        self, services: HookStateService
+    ) -> None:
+        """tool:pre never creates nodes — only edges."""
+        active_step = f"{RUN_ID}::step::0"
+        services.data_layer_3.active_recipe_step_id = active_step
+        handler = RecipeStepHandler(services)
+        await handler("tool:pre", TOOL_PRE_DATA)
+
+        assert len(services.graph._nodes) == 0
