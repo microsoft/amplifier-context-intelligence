@@ -692,3 +692,131 @@ class TestRecipeRunHandlerComplete:
         stack = services.data_layer_3.active_recipe_run_stack
         assert len(stack) == 1
         assert stack[0] == "sess-1::recipe_run::2026-01-01T00:00:00Z"
+
+
+# ---------------------------------------------------------------------------
+# 7. TestRecipeRunHandlerApproval
+# ---------------------------------------------------------------------------
+
+SESSION_ID = "sess-approval"
+T0 = "2026-02-01T10:00:00Z"
+T1 = "2026-02-01T10:05:00Z"
+
+APPROVAL_DATA_1 = {
+    "session_id": SESSION_ID,
+    "timestamp": T0,
+    "name": "staged-recipe",
+    "stage_name": "deploy",
+    "status": "waiting_approval",
+    "is_approval_gate": True,
+}
+
+APPROVAL_DATA_2 = {
+    "session_id": SESSION_ID,
+    "timestamp": T1,
+    "stage_name": "verify",
+}
+
+
+class TestRecipeRunHandlerApproval:
+    """recipe:approval (staged recipe) creates RecipeRun on first call only."""
+
+    async def test_approval_empty_stack_creates_recipe_run_node_with_labels(
+        self, services: HookStateService
+    ) -> None:
+        """First recipe:approval with empty stack creates RecipeRun:SST_EVENT node at
+        {SESSION_ID}::recipe_run::{T0} with both 'RecipeRun' and 'SST_EVENT' labels."""
+        handler = RecipeRunHandler(services)
+        await handler("recipe:approval", APPROVAL_DATA_1)
+
+        recipe_run_id = f"{SESSION_ID}::recipe_run::{T0}"
+        node = await services.graph.get_node(recipe_run_id)
+        assert node is not None, f"RecipeRun node must exist at '{recipe_run_id}'"
+        assert "RecipeRun" in node["labels"]
+        assert "SST_EVENT" in node["labels"]
+
+    async def test_approval_creates_recipe_concept_node(
+        self, services: HookStateService
+    ) -> None:
+        """First recipe:approval creates Recipe:SST_CONCEPT node."""
+        handler = RecipeRunHandler(services)
+        await handler("recipe:approval", APPROVAL_DATA_1)
+
+        node = await services.graph.get_node("staged-recipe")
+        assert node is not None, "Recipe:SST_CONCEPT node must exist"
+        assert "Recipe" in node["labels"]
+        assert "SST_CONCEPT" in node["labels"]
+
+    async def test_approval_creates_e06_and_e07_edges(
+        self, services: HookStateService
+    ) -> None:
+        """First recipe:approval creates E06 (HAS_RECIPE_RUN/CONTAINS) and E07 (HAS_RECIPE/EXPRESSES) edges."""
+        handler = RecipeRunHandler(services)
+        await handler("recipe:approval", APPROVAL_DATA_1)
+
+        recipe_run_id = f"{SESSION_ID}::recipe_run::{T0}"
+
+        e06 = await services.graph.get_edge(SESSION_ID, recipe_run_id)
+        assert e06 is not None, "E06 edge (Session -> RecipeRun) must exist"
+        assert e06.get("type") == "HAS_RECIPE_RUN"
+        assert e06.get("sst_semantic") == "CONTAINS"
+
+        e07 = await services.graph.get_edge(recipe_run_id, "staged-recipe")
+        assert e07 is not None, "E07 edge (RecipeRun -> Recipe) must exist"
+        assert e07.get("type") == "HAS_RECIPE"
+        assert e07.get("sst_semantic") == "EXPRESSES"
+
+    async def test_approval_sourced_from_uses_stage_name_disambiguator(
+        self, services: HookStateService
+    ) -> None:
+        """SOURCED_FROM target uses stage_name as disambiguator:
+        make_node_id(SESSION_ID, 'recipe:approval', T0, 'deploy')."""
+        handler = RecipeRunHandler(services)
+        await handler("recipe:approval", APPROVAL_DATA_1)
+
+        recipe_run_id = f"{SESSION_ID}::recipe_run::{T0}"
+        expected_target = make_node_id(SESSION_ID, "recipe:approval", T0, "deploy")
+        edge = await services.graph.get_edge(recipe_run_id, expected_target)
+        assert edge is not None, (
+            f"SOURCED_FROM edge must exist from RecipeRun to {expected_target!r}"
+        )
+        assert edge.get("type") == "SOURCED_FROM"
+
+    async def test_approval_pushes_onto_active_recipe_run_stack(
+        self, services: HookStateService
+    ) -> None:
+        """First recipe:approval pushes recipe_run_id onto active_recipe_run_stack."""
+        handler = RecipeRunHandler(services)
+        assert services.data_layer_3.active_recipe_run_stack == []
+
+        await handler("recipe:approval", APPROVAL_DATA_1)
+
+        recipe_run_id = f"{SESSION_ID}::recipe_run::{T0}"
+        assert recipe_run_id in services.data_layer_3.active_recipe_run_stack
+
+    async def test_second_approval_nonempty_stack_no_new_recipe_run(
+        self, services: HookStateService
+    ) -> None:
+        """Second recipe:approval (stack non-empty) does NOT create a second RecipeRun;
+        stack unchanged, exactly one RecipeRun node exists."""
+        handler = RecipeRunHandler(services)
+        await handler("recipe:approval", APPROVAL_DATA_1)
+
+        # Stack now has one item
+        assert len(services.data_layer_3.active_recipe_run_stack) == 1
+
+        # Send second approval event with a different timestamp and stage
+        await handler("recipe:approval", APPROVAL_DATA_2)
+
+        # Stack should still have exactly one item
+        assert len(services.data_layer_3.active_recipe_run_stack) == 1
+
+        # Exactly one RecipeRun node must exist
+        recipe_run_nodes = [
+            node_id
+            for node_id, node in services.graph._nodes.items()
+            if "RecipeRun" in node.get("labels", [])
+        ]
+        assert len(recipe_run_nodes) == 1, (
+            "Exactly one RecipeRun node must exist after two approval events"
+        )

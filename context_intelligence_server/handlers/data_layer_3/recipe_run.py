@@ -74,7 +74,14 @@ class RecipeRunHandler:
 
         return HookResult(action="continue")
 
-    async def _handle_start(self, session_id: str, data: dict[str, Any]) -> None:
+    async def _handle_start(
+        self,
+        session_id: str,
+        data: dict[str, Any],
+        *,
+        source_event: str = "recipe:start",
+        source_disambiguator: str | None = None,
+    ) -> None:
         """Create RecipeRun node, Recipe concept node, and all start-path edges.
 
         Creates:
@@ -83,11 +90,21 @@ class RecipeRunHandler:
         - Recipe:SST_CONCEPT node keyed by recipe name (MERGE, no SOURCED_FROM)
         - E06: Session -[HAS_RECIPE_RUN {sst_semantic: CONTAINS}]-> RecipeRun
         - E07: RecipeRun -[HAS_RECIPE {sst_semantic: EXPRESSES}]-> Recipe
-        - SOURCED_FROM: RecipeRun -> make_node_id(session_id, 'recipe:start', timestamp)
+        - SOURCED_FROM: RecipeRun -> make_node_id(session_id, source_event, timestamp,
+          source_disambiguator)  — defaults to the recipe:start data_layer_1 event node
         - E09: active_recipe_step_id -[SPAWNED {sst_semantic: LEADS_TO}]-> RecipeRun
           (only when active_recipe_step_id cursor is set)
 
         Pushes recipe_run_id onto active_recipe_run_stack.
+
+        Args:
+            session_id: The session identifier.
+            data: Event payload dict.
+            source_event: Event name used to build the SOURCED_FROM target node ID.
+                Defaults to 'recipe:start'; pass 'recipe:approval' when bootstrapping
+                a run from an approval gate.
+            source_disambiguator: Optional disambiguator appended to the SOURCED_FROM
+                target node ID (e.g. stage_name for approval events).
         """
         timestamp: str = data.get("timestamp", "")
         name: str = data.get("name", "")
@@ -131,8 +148,10 @@ class RecipeRunHandler:
             {"type": "HAS_RECIPE", "sst_semantic": "EXPRESSES"},
         )
 
-        # SOURCED_FROM bridge: RecipeRun -> data_layer_1 recipe:start event
-        data_layer_1_node_id = make_node_id(session_id, "recipe:start", timestamp)
+        # SOURCED_FROM bridge: RecipeRun -> data_layer_1 event node
+        data_layer_1_node_id = make_node_id(
+            session_id, source_event, timestamp, source_disambiguator
+        )
         await self.services.graph.upsert_edge(
             recipe_run_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
         )
@@ -202,6 +221,10 @@ class RecipeRunHandler:
         When the stack is empty, this acts like recipe:start using the approval
         event data to bootstrap the RecipeRun node. When the stack is non-empty,
         this is a no-op (the run already exists).
+
+        The SOURCED_FROM bridge uses 'recipe:approval' as the event name and
+        stage_name (when present) as the disambiguator, so the target node ID is:
+        make_node_id(session_id, 'recipe:approval', timestamp, stage_name)
         """
         stack = self.services.data_layer_3.active_recipe_run_stack
         if stack:
@@ -209,7 +232,13 @@ class RecipeRunHandler:
             return
 
         # First approval with no prior recipe:start — bootstrap the run
-        await self._handle_start(session_id, data)
+        stage_name: str | None = data.get("stage_name")
+        await self._handle_start(
+            session_id,
+            data,
+            source_event="recipe:approval",
+            source_disambiguator=stage_name,
+        )
 
     async def _handle_loop_iteration(
         self, session_id: str, data: dict[str, Any]
