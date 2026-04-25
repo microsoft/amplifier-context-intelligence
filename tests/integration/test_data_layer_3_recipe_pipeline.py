@@ -18,7 +18,6 @@ from typing import Any
 
 from context_intelligence_server.pipeline import process_event, setup_handlers
 from context_intelligence_server.services import HookStateService
-from context_intelligence_server.utils import make_node_id  # noqa: F401
 
 
 # ---------------------------------------------------------------------------

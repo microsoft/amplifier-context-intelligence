@@ -754,7 +754,9 @@ class TestRecipeStepHandlerE11:
         await handler("tool:pre", TOOL_PRE_DATA)
 
         edge = await services.graph.get_edge(active_step, "tc-xyz")
-        assert edge is not None, "E11 TRIGGERED edge must exist from active step to tool_call_id"
+        assert edge is not None, (
+            "E11 TRIGGERED edge must exist from active step to tool_call_id"
+        )
         assert edge.get("type") == "TRIGGERED"
         assert edge.get("sst_semantic") == "LEADS_TO"
 
