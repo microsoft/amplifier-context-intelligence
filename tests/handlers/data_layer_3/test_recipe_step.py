@@ -416,3 +416,155 @@ class TestRecipeStepHandlerCursor:
         assert result.action == "continue"
         assert len(services.graph._nodes) == 0
         assert services.data_layer_3.active_recipe_step_id is None
+
+
+# ---------------------------------------------------------------------------
+# 6. TestRecipeStepHandlerApproval
+# ---------------------------------------------------------------------------
+
+APPROVAL_DATA = {
+    "session_id": SESSION_ID,
+    "timestamp": TIMESTAMP,
+    "stage_name": "deploy",
+    "prompt": "Deploy to production?",
+    "is_approval_gate": True,
+    "status": "waiting_approval",
+}
+
+
+class TestRecipeStepHandlerApproval:
+    """recipe:approval creates RecipeStep:SST_EVENT node keyed by stage_name."""
+
+    async def test_approval_creates_recipe_step_node(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:approval must create RecipeStep node at '{run_id}::step::deploy'."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:approval", APPROVAL_DATA)
+
+        step_id = f"{RUN_ID}::step::deploy"
+        node = await services.graph.get_node(step_id)
+        assert node is not None, f"RecipeStep node must exist at '{step_id}'"
+
+    async def test_approval_node_has_recipe_step_label(
+        self, services: HookStateService
+    ) -> None:
+        """RecipeStep node must have 'RecipeStep' in labels."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:approval", APPROVAL_DATA)
+
+        step_id = f"{RUN_ID}::step::deploy"
+        node = await services.graph.get_node(step_id)
+        assert node is not None
+        assert "RecipeStep" in node["labels"]
+
+    async def test_approval_node_has_sst_event_label(
+        self, services: HookStateService
+    ) -> None:
+        """RecipeStep node must have 'SST_EVENT' in labels."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:approval", APPROVAL_DATA)
+
+        step_id = f"{RUN_ID}::step::deploy"
+        node = await services.graph.get_node(step_id)
+        assert node is not None
+        assert "SST_EVENT" in node["labels"]
+
+    async def test_approval_node_has_stage_name(
+        self, services: HookStateService
+    ) -> None:
+        """RecipeStep node must have stage_name='deploy'."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:approval", APPROVAL_DATA)
+
+        step_id = f"{RUN_ID}::step::deploy"
+        node = await services.graph.get_node(step_id)
+        assert node is not None
+        assert node["stage_name"] == "deploy"
+
+    async def test_approval_node_has_name(self, services: HookStateService) -> None:
+        """RecipeStep node must have name='deploy' (same as stage_name)."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:approval", APPROVAL_DATA)
+
+        step_id = f"{RUN_ID}::step::deploy"
+        node = await services.graph.get_node(step_id)
+        assert node is not None
+        assert node["name"] == "deploy"
+
+    async def test_approval_node_has_prompt(self, services: HookStateService) -> None:
+        """RecipeStep node must have prompt='Deploy to production?'."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:approval", APPROVAL_DATA)
+
+        step_id = f"{RUN_ID}::step::deploy"
+        node = await services.graph.get_node(step_id)
+        assert node is not None
+        assert node["prompt"] == "Deploy to production?"
+
+    async def test_approval_e08_has_step_contains_edge(
+        self, services: HookStateService
+    ) -> None:
+        """E08: RecipeRun -[HAS_STEP {sst_semantic: CONTAINS}]-> RecipeStep."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:approval", APPROVAL_DATA)
+
+        step_id = f"{RUN_ID}::step::deploy"
+        edge = await services.graph.get_edge(RUN_ID, step_id)
+        assert edge is not None, "E08 edge (RecipeRun -> RecipeStep) must exist"
+        assert edge.get("type") == "HAS_STEP"
+        assert edge.get("sst_semantic") == "CONTAINS"
+
+    async def test_approval_sourced_from_edge(self, services: HookStateService) -> None:
+        """SOURCED_FROM must link RecipeStep to
+        make_node_id(SESSION_ID, 'recipe:approval', TIMESTAMP, 'deploy')."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:approval", APPROVAL_DATA)
+
+        step_id = f"{RUN_ID}::step::deploy"
+        expected_target = make_node_id(
+            SESSION_ID, "recipe:approval", TIMESTAMP, "deploy"
+        )
+        edge = await services.graph.get_edge(step_id, expected_target)
+        assert edge is not None, (
+            "SOURCED_FROM edge must exist from RecipeStep to data_layer_1 node"
+        )
+        assert edge.get("type") == "SOURCED_FROM"
+
+    async def test_approval_sets_active_recipe_step_id(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:approval sets active_recipe_step_id to '{run_id}::step::deploy'."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:approval", APPROVAL_DATA)
+
+        step_id = f"{RUN_ID}::step::deploy"
+        assert services.data_layer_3.active_recipe_step_id == step_id
+
+    async def test_approval_clears_cursor_even_on_empty_stack(
+        self, services: HookStateService
+    ) -> None:
+        """Previous cursor is cleared even when empty-stack guard fires.
+
+        Set active_recipe_step_id='old-run::step::5' without _push_run,
+        call handler, assert cursor is None.
+        """
+        # Set cursor without pushing a run onto the stack
+        services.data_layer_3.active_recipe_step_id = "old-run::step::5"
+        # Stack is empty — guard will fire
+        assert services.data_layer_3.active_recipe_run_stack == []
+
+        handler = RecipeStepHandler(services)
+        await handler("recipe:approval", APPROVAL_DATA)
+
+        # Cursor must be cleared (None) even though the stack was empty
+        assert services.data_layer_3.active_recipe_step_id is None

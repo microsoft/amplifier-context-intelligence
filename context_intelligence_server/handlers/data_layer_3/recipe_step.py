@@ -164,6 +164,7 @@ class RecipeStepHandler:
         node_data: dict[str, Any] = {
             "labels": ["RecipeStep", "SST_EVENT"],
             "stage_name": stage_name,
+            "name": stage_name,
             "started_at": timestamp,
         }
         if prompt is not None:
