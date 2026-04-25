@@ -568,3 +568,159 @@ class TestRecipeStepHandlerApproval:
 
         # Cursor must be cleared (None) even though the stack was empty
         assert services.data_layer_3.active_recipe_step_id is None
+
+
+# ---------------------------------------------------------------------------
+# 7. TestRecipeStepHandlerLoopIteration
+# ---------------------------------------------------------------------------
+
+LOOP_DATA = {
+    "session_id": SESSION_ID,
+    "timestamp": TIMESTAMP,
+    "step_id": "while-loop-step",
+    "iteration": 2,
+    "max_iterations": 5,
+    "context_snapshot": {"counter": 2},
+}
+
+LOOP_NODE_ID = f"{RUN_ID}::step::while-loop-step::loop::2"
+
+
+class TestRecipeStepHandlerLoopIteration:
+    """recipe:loop_iteration creates RecipeStep:SST_EVENT node at compound loop ID."""
+
+    async def test_loop_iteration_creates_recipe_step_node(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_iteration must create RecipeStep node at compound loop ID."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:loop_iteration", LOOP_DATA)
+
+        node = await services.graph.get_node(LOOP_NODE_ID)
+        assert node is not None, f"RecipeStep node must exist at '{LOOP_NODE_ID}'"
+
+    async def test_loop_iteration_node_has_recipe_step_label(
+        self, services: HookStateService
+    ) -> None:
+        """RecipeStep node must have 'RecipeStep' in labels."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:loop_iteration", LOOP_DATA)
+
+        node = await services.graph.get_node(LOOP_NODE_ID)
+        assert node is not None
+        assert "RecipeStep" in node["labels"]
+
+    async def test_loop_iteration_node_has_sst_event_label(
+        self, services: HookStateService
+    ) -> None:
+        """RecipeStep node must have 'SST_EVENT' in labels."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:loop_iteration", LOOP_DATA)
+
+        node = await services.graph.get_node(LOOP_NODE_ID)
+        assert node is not None
+        assert "SST_EVENT" in node["labels"]
+
+    async def test_loop_iteration_node_has_name(
+        self, services: HookStateService
+    ) -> None:
+        """RecipeStep node must have name='loop iteration 2'."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:loop_iteration", LOOP_DATA)
+
+        node = await services.graph.get_node(LOOP_NODE_ID)
+        assert node is not None
+        assert node["name"] == "loop iteration 2"
+
+    async def test_loop_iteration_node_has_step_id(
+        self, services: HookStateService
+    ) -> None:
+        """RecipeStep node must have step_id='while-loop-step'."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:loop_iteration", LOOP_DATA)
+
+        node = await services.graph.get_node(LOOP_NODE_ID)
+        assert node is not None
+        assert node["step_id"] == "while-loop-step"
+
+    async def test_loop_iteration_node_has_iteration(
+        self, services: HookStateService
+    ) -> None:
+        """RecipeStep node must have iteration=2."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:loop_iteration", LOOP_DATA)
+
+        node = await services.graph.get_node(LOOP_NODE_ID)
+        assert node is not None
+        assert node["iteration"] == 2
+
+    async def test_loop_iteration_node_has_max_iterations(
+        self, services: HookStateService
+    ) -> None:
+        """RecipeStep node must have max_iterations=5."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:loop_iteration", LOOP_DATA)
+
+        node = await services.graph.get_node(LOOP_NODE_ID)
+        assert node is not None
+        assert node["max_iterations"] == 5
+
+    async def test_loop_iteration_e08_has_step_contains_edge(
+        self, services: HookStateService
+    ) -> None:
+        """E08: RecipeRun -[HAS_STEP {sst_semantic: CONTAINS}]-> RecipeStep."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:loop_iteration", LOOP_DATA)
+
+        edge = await services.graph.get_edge(RUN_ID, LOOP_NODE_ID)
+        assert edge is not None, "E08 edge (RecipeRun -> RecipeStep) must exist"
+        assert edge.get("type") == "HAS_STEP"
+        assert edge.get("sst_semantic") == "CONTAINS"
+
+    async def test_loop_iteration_sourced_from_edge(
+        self, services: HookStateService
+    ) -> None:
+        """SOURCED_FROM must link RecipeStep to
+        make_node_id(SESSION_ID, 'recipe:loop_iteration', TIMESTAMP, 'while-loop-step_2')."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:loop_iteration", LOOP_DATA)
+
+        expected_target = make_node_id(
+            SESSION_ID, "recipe:loop_iteration", TIMESTAMP, "while-loop-step_2"
+        )
+        edge = await services.graph.get_edge(LOOP_NODE_ID, expected_target)
+        assert edge is not None, (
+            "SOURCED_FROM edge must exist from RecipeStep to data_layer_1 node"
+        )
+        assert edge.get("type") == "SOURCED_FROM"
+
+    async def test_loop_iteration_sets_active_recipe_step_id(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_iteration sets active_recipe_step_id to the compound loop ID."""
+        _push_run(services)
+        handler = RecipeStepHandler(services)
+        await handler("recipe:loop_iteration", LOOP_DATA)
+
+        assert services.data_layer_3.active_recipe_step_id == LOOP_NODE_ID
+
+    async def test_loop_iteration_empty_stack_is_noop(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_iteration with empty stack is a no-op:
+        no nodes created, returns HookResult(action='continue')."""
+        handler = RecipeStepHandler(services)
+        assert services.data_layer_3.active_recipe_run_stack == []
+
+        result = await handler("recipe:loop_iteration", LOOP_DATA)
+        assert result.action == "continue"
+        assert len(services.graph._nodes) == 0
