@@ -255,13 +255,19 @@ class RecipeRunHandler:
         recipe_run_id = stack[-1]
         timestamp: str = data.get("timestamp", "")
         iteration: Any = data.get("iteration")
+        step_id: Any = data.get("step_id")
+        max_iterations: Any = data.get("max_iterations")
 
         enrichment: dict[str, Any] = {
             "labels": ["RecipeRun", "SST_EVENT"],
             "last_loop_iteration_at": timestamp,
         }
+        if step_id is not None:
+            enrichment["last_loop_step_id"] = step_id
         if iteration is not None:
             enrichment["last_loop_iteration"] = iteration
+        if max_iterations is not None:
+            enrichment["last_loop_max_iterations"] = max_iterations
 
         await self.services.graph.upsert_node(recipe_run_id, enrichment)
 
@@ -279,13 +285,16 @@ class RecipeRunHandler:
 
         recipe_run_id = stack[-1]
         timestamp: str = data.get("timestamp", "")
-        total_iterations: Any = data.get("total_iterations")
+        iterations_completed: Any = data.get("iterations_completed")
+        results_count: Any = data.get("results_count")
 
         enrichment: dict[str, Any] = {
             "labels": ["RecipeRun", "SST_EVENT"],
             "loop_completed_at": timestamp,
         }
-        if total_iterations is not None:
-            enrichment["total_iterations"] = total_iterations
+        if iterations_completed is not None:
+            enrichment["last_loop_iterations_completed"] = iterations_completed
+        if results_count is not None:
+            enrichment["last_loop_results_count"] = results_count
 
         await self.services.graph.upsert_node(recipe_run_id, enrichment)

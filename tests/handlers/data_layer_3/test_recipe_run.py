@@ -820,3 +820,173 @@ class TestRecipeRunHandlerApproval:
         assert len(recipe_run_nodes) == 1, (
             "Exactly one RecipeRun node must exist after two approval events"
         )
+
+
+# ---------------------------------------------------------------------------
+# 8. TestRecipeRunHandlerLoopIteration
+# ---------------------------------------------------------------------------
+
+LOOP_SESSION_ID = "sess-loop"
+LOOP_T0 = "2026-03-01T10:00:00Z"
+LOOP_T1 = "2026-03-01T10:05:00Z"
+
+LOOP_START_DATA: dict = {
+    "session_id": LOOP_SESSION_ID,
+    "timestamp": LOOP_T0,
+    "name": "loop-recipe",
+    "total_steps": 3,
+    "status": "running",
+}
+
+LOOP_ITER_DATA: dict = {
+    "session_id": LOOP_SESSION_ID,
+    "timestamp": LOOP_T1,
+    "step_id": "while-loop-step",
+    "iteration": 2,
+    "max_iterations": 5,
+    "context_snapshot": {"counter": 2},
+}
+
+LOOP_COMPLETE_DATA: dict = {
+    "session_id": LOOP_SESSION_ID,
+    "timestamp": LOOP_T1,
+    "step_id": "while-loop-step",
+    "iterations_completed": 3,
+    "max_iterations": 5,
+    "results_count": 3,
+}
+
+
+class TestRecipeRunHandlerLoopIteration:
+    """recipe:loop_iteration enriches the top-of-stack RecipeRun node (enrichment-only)."""
+
+    async def test_loop_iteration_sets_last_loop_step_id(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_iteration sets last_loop_step_id='while-loop-step' on RecipeRun."""
+        handler = RecipeRunHandler(services)
+        await handler("recipe:start", LOOP_START_DATA)
+
+        await handler("recipe:loop_iteration", LOOP_ITER_DATA)
+
+        recipe_run_id = f"{LOOP_SESSION_ID}::recipe_run::{LOOP_T0}"
+        node = await services.graph.get_node(recipe_run_id)
+        assert node is not None
+        assert node["last_loop_step_id"] == "while-loop-step"
+
+    async def test_loop_iteration_sets_last_loop_iteration(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_iteration sets last_loop_iteration=2 on RecipeRun."""
+        handler = RecipeRunHandler(services)
+        await handler("recipe:start", LOOP_START_DATA)
+
+        await handler("recipe:loop_iteration", LOOP_ITER_DATA)
+
+        recipe_run_id = f"{LOOP_SESSION_ID}::recipe_run::{LOOP_T0}"
+        node = await services.graph.get_node(recipe_run_id)
+        assert node is not None
+        assert node["last_loop_iteration"] == 2
+
+    async def test_loop_iteration_sets_last_loop_max_iterations(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_iteration sets last_loop_max_iterations=5 on RecipeRun."""
+        handler = RecipeRunHandler(services)
+        await handler("recipe:start", LOOP_START_DATA)
+
+        await handler("recipe:loop_iteration", LOOP_ITER_DATA)
+
+        recipe_run_id = f"{LOOP_SESSION_ID}::recipe_run::{LOOP_T0}"
+        node = await services.graph.get_node(recipe_run_id)
+        assert node is not None
+        assert node["last_loop_max_iterations"] == 5
+
+    async def test_loop_iteration_creates_no_new_nodes(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_iteration must not create any new graph nodes."""
+        handler = RecipeRunHandler(services)
+        await handler("recipe:start", LOOP_START_DATA)
+
+        count_before = len(services.graph._nodes)
+
+        await handler("recipe:loop_iteration", LOOP_ITER_DATA)
+
+        count_after = len(services.graph._nodes)
+        assert count_before == count_after
+
+    async def test_loop_iteration_empty_stack_is_noop(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_iteration with empty stack returns HookResult(action='continue') without mutations."""
+        handler = RecipeRunHandler(services)
+        assert services.data_layer_3.active_recipe_run_stack == []
+
+        result = await handler("recipe:loop_iteration", LOOP_ITER_DATA)
+
+        assert result.action == "continue"
+        assert len(services.graph._nodes) == 0
+
+
+# ---------------------------------------------------------------------------
+# 9. TestRecipeRunHandlerLoopComplete
+# ---------------------------------------------------------------------------
+
+
+class TestRecipeRunHandlerLoopComplete:
+    """recipe:loop_complete enriches the top-of-stack RecipeRun node (enrichment-only)."""
+
+    async def test_loop_complete_sets_last_loop_iterations_completed(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_complete sets last_loop_iterations_completed=3 on RecipeRun."""
+        handler = RecipeRunHandler(services)
+        await handler("recipe:start", LOOP_START_DATA)
+
+        await handler("recipe:loop_complete", LOOP_COMPLETE_DATA)
+
+        recipe_run_id = f"{LOOP_SESSION_ID}::recipe_run::{LOOP_T0}"
+        node = await services.graph.get_node(recipe_run_id)
+        assert node is not None
+        assert node["last_loop_iterations_completed"] == 3
+
+    async def test_loop_complete_sets_last_loop_results_count(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_complete sets last_loop_results_count=3 on RecipeRun."""
+        handler = RecipeRunHandler(services)
+        await handler("recipe:start", LOOP_START_DATA)
+
+        await handler("recipe:loop_complete", LOOP_COMPLETE_DATA)
+
+        recipe_run_id = f"{LOOP_SESSION_ID}::recipe_run::{LOOP_T0}"
+        node = await services.graph.get_node(recipe_run_id)
+        assert node is not None
+        assert node["last_loop_results_count"] == 3
+
+    async def test_loop_complete_creates_no_new_nodes(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_complete must not create any new graph nodes."""
+        handler = RecipeRunHandler(services)
+        await handler("recipe:start", LOOP_START_DATA)
+
+        count_before = len(services.graph._nodes)
+
+        await handler("recipe:loop_complete", LOOP_COMPLETE_DATA)
+
+        count_after = len(services.graph._nodes)
+        assert count_before == count_after
+
+    async def test_loop_complete_empty_stack_is_noop(
+        self, services: HookStateService
+    ) -> None:
+        """recipe:loop_complete with empty stack returns HookResult(action='continue') without mutations."""
+        handler = RecipeRunHandler(services)
+        assert services.data_layer_3.active_recipe_run_stack == []
+
+        result = await handler("recipe:loop_complete", LOOP_COMPLETE_DATA)
+
+        assert result.action == "continue"
+        assert len(services.graph._nodes) == 0
