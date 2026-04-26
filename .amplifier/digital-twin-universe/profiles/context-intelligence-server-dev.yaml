@@ -1,0 +1,164 @@
+# WSL2 prerequisite: Docker/Incus networking conflict fix
+#
+# On WSL2, Docker may fail to start containers due to an IP forwarding
+# conflict with Incus bridge networking.  Apply this fix before launching
+# this profile:
+#
+#   sudo mkdir -p /etc/docker
+#   echo '{"ip-forward-no-drop": true}' | sudo tee /etc/docker/daemon.json
+#
+# Then from PowerShell (to fully restart WSL2 networking):
+#   wsl --shutdown
+#
+# Verify the fix is working:
+#   docker run --rm hello-world
+#
+# This only needs to be done once per WSL2 installation.
+name: context-intelligence-server-dev
+description: >
+  Isolated context-intelligence server stack for development and testing.
+
+  Usage:
+    cd amplifier-context-intelligence && uv build
+    amplifier-digital-twin launch \
+      .amplifier/digital-twin-universe/profiles/context-intelligence-server-dev.yaml \
+      --var WORKSPACE=my-experiment
+
+  Update flow (after rebuilding the wheel):
+    uv build
+    amplifier-digital-twin update <id>
+
+  Variables:
+    WORKSPACE       -- (required) workspace name for tagging session events
+    SERVER_PORT     -- (optional) CI server port, defaults to 8000
+    API_KEY         -- (optional) CI server auth key, auto-generated if omitted
+
+base:
+  image: ubuntu:24.04
+  config:
+    security.nesting: "true"
+
+passthrough:
+  allow_external: true
+  services:
+    - name: anthropic
+      key_env: ANTHROPIC_API_KEY
+    - name: github
+      key_env: GH_TOKEN
+    - name: context-intelligence-auth
+      key_env: AMPLIFIER_CONTEXT_INTELLIGENCE_API_KEY
+
+pypi_overrides:
+  packages:
+    - name: context-intelligence-server
+      wheel_path: ../../../dist/context_intelligence_server-*.whl
+
+provision:
+  setup_cmds:
+    # 1. System dependencies
+    - apt-get update -qq && apt-get install -y -q git curl python3 python3-venv
+
+    # 2. Install uv
+    - curl -LsSf https://astral.sh/uv/install.sh | sh && export PATH="/root/.local/bin:$PATH"
+
+    # 3. Configure git credentials for private GitHub repos
+    - |
+      if [ -n "$GH_TOKEN" ]; then
+        echo "machine github.com login x-token-auth password $GH_TOKEN" > /root/.netrc
+        chmod 600 /root/.netrc
+        git config --global credential.helper store
+      fi
+
+    # 4. Install Docker
+    - |
+      curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+      sh /tmp/get-docker.sh
+      service docker start || true
+      sleep 3
+
+    # 5. Start Neo4j and wait for readiness
+    - |
+      docker run -d --name neo4j-test \
+        -p 7474:7474 -p 7687:7687 \
+        -e NEO4J_AUTH=none \
+        neo4j:5
+      echo "Waiting for Neo4j to become ready..."
+      for i in $(seq 1 30); do
+        if docker exec neo4j-test cypher-shell "RETURN 1" > /dev/null 2>&1; then
+          echo "Neo4j is ready after ${i} attempts"
+          break
+        fi
+        echo "Attempt ${i}/30 — Neo4j not ready, retrying in 2s..."
+        sleep 2
+      done
+
+    # 6. Create venv and install context-intelligence-server
+    - |
+      export PATH="/root/.local/bin:$PATH"
+      uv venv /opt/ci-venv --python python3
+      source /opt/ci-venv/bin/activate
+      uv pip install context-intelligence-server uvicorn
+
+    # 7. Set defaults and start the CI server
+    - |
+      source /opt/ci-venv/bin/activate
+      CI_PORT=${SERVER_PORT:-8000}
+      CI_KEY=${AMPLIFIER_CONTEXT_INTELLIGENCE_API_KEY:-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}
+      CI_WORKSPACE=${WORKSPACE}
+      nohup uvicorn context_intelligence_server.main:app \
+        --host 0.0.0.0 --port $CI_PORT \
+        > /var/log/ci-server.log 2>&1 &
+      sleep 3
+      curl -sf http://localhost:$CI_PORT/status > /dev/null && echo "CI server is up" || echo "WARNING: CI server status check failed"
+      # Persist environment for interactive shells
+      cat >> /root/.bashrc << ENVEOF
+      export PATH="/opt/ci-venv/bin:/root/.local/bin:$PATH"
+      export VIRTUAL_ENV=/opt/ci-venv
+      export AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL=http://localhost:$CI_PORT
+      export AMPLIFIER_CONTEXT_INTELLIGENCE_API_KEY=$CI_KEY
+      export AMPLIFIER_CONTEXT_INTELLIGENCE_WORKSPACE=$CI_WORKSPACE
+      export NEO4J_URL=bolt://localhost:7687
+      ENVEOF
+      # Persist environment for non-interactive exec commands
+      echo "PATH=/opt/ci-venv/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" >> /etc/environment
+      echo "VIRTUAL_ENV=/opt/ci-venv" >> /etc/environment
+      echo "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL=http://localhost:$CI_PORT" >> /etc/environment
+      echo "AMPLIFIER_CONTEXT_INTELLIGENCE_API_KEY=$CI_KEY" >> /etc/environment
+      echo "AMPLIFIER_CONTEXT_INTELLIGENCE_WORKSPACE=$CI_WORKSPACE" >> /etc/environment
+      echo "NEO4J_URL=bolt://localhost:7687" >> /etc/environment
+
+    # 8. Install Amplifier and configure provider + bundle
+    - |
+      export PATH="/root/.local/bin:$PATH"
+      uv tool install git+https://github.com/microsoft/amplifier@main
+      mkdir -p /root/.amplifier
+      cat > /root/.amplifier/settings.yaml << 'EOF'
+      config:
+        providers:
+          - module: provider-anthropic
+            source: git+https://github.com/microsoft/amplifier-module-provider-anthropic@main
+            config:
+              api_key_env: ANTHROPIC_API_KEY
+      EOF
+      amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-context-intelligence@main --app
+      mkdir -p /home/user/project
+
+readiness:
+  - name: neo4j
+    command: docker exec neo4j-test cypher-shell "RETURN 1" && echo "ready"
+  - name: ci-server
+    command: . /etc/environment; curl -sf $AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL/status > /dev/null && echo "ready"
+
+update:
+  refresh_pypi: true
+  cmds:
+    - pkill -f "uvicorn context_intelligence_server" || true
+    - sleep 1
+    - |
+      source /opt/ci-venv/bin/activate
+      . /etc/environment
+      nohup uvicorn context_intelligence_server.main:app \
+        --host 0.0.0.0 --port ${SERVER_PORT:-8000} \
+        > /var/log/ci-server.log 2>&1 &
+      sleep 3
+      curl -sf $AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL/status > /dev/null && echo "CI server restarted"
