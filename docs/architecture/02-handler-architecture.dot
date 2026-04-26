@@ -29,7 +29,7 @@ digraph handler_architecture {
         label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
             <TR><TD><B>PipelineHandlers (NamedTuple)</B></TD></TR>
             <TR><TD>default: DefaultHandler</TD></TR>
-            <TR><TD>enrichers: list[Handler]  &#8212; 8 data_layer_2 enrichers</TD></TR>
+            <TR><TD>enrichers: list[Handler] &#8212; 12 enrichers total (8 data_layer_2 + 4 data_layer_3)</TD></TR>
         </TABLE>>
     ]
 
@@ -235,6 +235,70 @@ digraph handler_architecture {
         ]
     }
 
+    // --- Data Layer 3: Delegation, Skills & Recipes enrichment ---------------
+    subgraph cluster_data_layer_3 {
+        graph [
+            label     = "handlers/data_layer_3/\nDelegation, Skills & Recipes enrichment (4 enrichers)"
+            style     = "filled"
+            color     = "#E65100"
+            fillcolor = "#FFF3E0"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        DelegationHandler [
+            style     = "filled,rounded"
+            fillcolor = "#FFE0B2"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>DelegationHandler [8]</B></TD></TR>
+                <TR><TD>delegate:agent_spawned | completed | resumed | cancelled | error</TD></TR>
+                <TR><TD>Node: :Delegation :SST_EVENT | :Agent :SST_CONCEPT</TD></TR>
+                <TR><TD>Edges: HAS_AGENT (E01) | ENCOMPASSES (E02) | TRIGGERED (E03) | PARALLEL_AGENT (E04)</TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Intra-handler: _parallel_groups dict</I></TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Reads: data_layer_3.active_recipe_step_id</I></TD></TR>
+            </TABLE>>
+        ]
+
+        SkillLoadHandler [
+            style     = "filled,rounded"
+            fillcolor = "#FFE0B2"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>SkillLoadHandler [9]</B></TD></TR>
+                <TR><TD>skill:loaded | skill:unloaded</TD></TR>
+                <TR><TD>Node: :SkillLoad :SST_EVENT</TD></TR>
+                <TR><TD>Edges: HAS_SKILL_LOAD (E05)</TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Intra-handler: _active_skill_nodes dict</I></TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Reads: data_layer_2.active_iteration_id (cross-layer read-only)</I></TD></TR>
+            </TABLE>>
+        ]
+
+        RecipeRunHandler [
+            style     = "filled,rounded"
+            fillcolor = "#FFE0B2"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>RecipeRunHandler [10]</B></TD></TR>
+                <TR><TD>recipe:start | complete | approval | loop_iteration | loop_complete</TD></TR>
+                <TR><TD>Node: :RecipeRun :SST_EVENT | :Recipe :SST_CONCEPT</TD></TR>
+                <TR><TD>Edges: HAS_RECIPE_RUN (E06) | HAS_RECIPE (E07) | SPAWNED (E09)</TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Writes: active_recipe_run_stack (push/pop)</I></TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Reads: active_recipe_step_id</I></TD></TR>
+            </TABLE>>
+        ]
+
+        RecipeStepHandler [
+            style     = "filled,rounded"
+            fillcolor = "#FFE0B2"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>RecipeStepHandler [11]</B></TD></TR>
+                <TR><TD>recipe:step | approval | loop_iteration | tool:pre</TD></TR>
+                <TR><TD>Node: :RecipeStep :SST_EVENT</TD></TR>
+                <TR><TD>Edges: HAS_STEP (E08) | TRIGGERED (E10, E11)</TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Writes: active_recipe_step_id</I></TD></TR>
+                <TR><TD ALIGN="LEFT"><I>Reads: active_recipe_run_stack (peek top)</I></TD></TR>
+            </TABLE>>
+        ]
+    }
+
     // --- DataLayer2State (shared per-session state) --------------------------
     subgraph cluster_state {
         graph [
@@ -257,6 +321,28 @@ digraph handler_architecture {
                 <TR><TD>last_prompt_id: str | None</TD></TR>
                 <TR><TD>last_completed_orch_run_id: str | None</TD></TR>
                 <TR><TD>iteration_count: int</TD></TR>
+            </TABLE>>
+        ]
+    }
+
+    // --- DataLayer3State (shared per-session state) --------------------------
+    subgraph cluster_data_layer_3_state {
+        graph [
+            label     = "handlers/data_layer_3/state.py\nShared per-session cross-handler state"
+            style     = "filled"
+            color     = "#E65100"
+            fillcolor = "#FFF8E1"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        DataLayer3State [
+            style     = "filled,rounded"
+            fillcolor = "#FFCC80"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>DataLayer3State</B></TD></TR>
+                <TR><TD>active_recipe_run_stack: list[str]</TD></TR>
+                <TR><TD>active_recipe_step_id: str | None</TD></TR>
             </TABLE>>
         ]
     }
@@ -309,8 +395,13 @@ digraph handler_architecture {
             fillcolor = "#FFF9C4"
             label     = "yellow = warning / note"
         ]
+        legend_layer3 [
+            style     = "filled,rounded"
+            fillcolor = "#FFE0B2"
+            label     = "orange = foundation layer\n(data_layer_3)"
+        ]
 
-        legend_contract -> legend_capture -> legend_enrich -> legend_state -> legend_http -> legend_warning [style = invis]
+        legend_contract -> legend_capture -> legend_enrich -> legend_state -> legend_http -> legend_warning -> legend_layer3 [style = invis]
     }
 
     // --- Structural edges ----------------------------------------------------
@@ -323,6 +414,10 @@ digraph handler_architecture {
     PipelineHandlers -> PromptHandler              [label = "enrichers[5]"]
     PipelineHandlers -> CancellationHandler        [label = "enrichers[6]"]
     PipelineHandlers -> ContextCompactionHandler   [label = "enrichers[7]"]
+    PipelineHandlers -> DelegationHandler          [label = "enrichers[8]"]
+    PipelineHandlers -> SkillLoadHandler           [label = "enrichers[9]"]
+    PipelineHandlers -> RecipeRunHandler           [label = "enrichers[10]"]
+    PipelineHandlers -> RecipeStepHandler          [label = "enrichers[11]"]
 
     DefaultHandler -> warning_note [style = dotted, color = "#AAAAAA", arrowhead = none]
 
@@ -336,6 +431,10 @@ digraph handler_architecture {
     PromptHandler           -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
     CancellationHandler     -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
     ContextCompactionHandler -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
+    DelegationHandler        -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
+    SkillLoadHandler         -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
+    RecipeRunHandler         -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
+    RecipeStepHandler        -> Protocol [style = dashed, color = "#90CAF9", arrowhead = empty, label = "implements"]
 
     // --- State read / write arrows (constraint=false to preserve layout) -----
     // OrchestratorRunHandler
@@ -409,6 +508,54 @@ digraph handler_architecture {
     ]
     DataLayer2State -> PromptHandler [
         label      = "reads last_completed_orch_run_id"
+        color      = "#2E7D32"
+        fontcolor  = "#2E7D32"
+        style      = "dashed"
+        arrowhead  = open
+        constraint = false
+    ]
+
+    // Layer 3 state read / write arrows
+    RecipeRunHandler -> DataLayer3State [
+        label      = "writes active_recipe_run_stack"
+        color      = "#1565C0"
+        fontcolor  = "#1565C0"
+        style      = "bold"
+        constraint = false
+    ]
+    DataLayer3State -> RecipeRunHandler [
+        label      = "reads active_recipe_step_id"
+        color      = "#2E7D32"
+        fontcolor  = "#2E7D32"
+        style      = "dashed"
+        arrowhead  = open
+        constraint = false
+    ]
+    RecipeStepHandler -> DataLayer3State [
+        label      = "writes active_recipe_step_id"
+        color      = "#1565C0"
+        fontcolor  = "#1565C0"
+        style      = "bold"
+        constraint = false
+    ]
+    DataLayer3State -> RecipeStepHandler [
+        label      = "reads active_recipe_run_stack"
+        color      = "#2E7D32"
+        fontcolor  = "#2E7D32"
+        style      = "dashed"
+        arrowhead  = open
+        constraint = false
+    ]
+    DataLayer3State -> DelegationHandler [
+        label      = "reads active_recipe_step_id"
+        color      = "#2E7D32"
+        fontcolor  = "#2E7D32"
+        style      = "dashed"
+        arrowhead  = open
+        constraint = false
+    ]
+    DataLayer2State -> SkillLoadHandler [
+        label      = "reads active_iteration_id (cross-layer read)"
         color      = "#2E7D32"
         fontcolor  = "#2E7D32"
         style      = "dashed"
