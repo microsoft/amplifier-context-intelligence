@@ -253,11 +253,11 @@ class TestSkillLoadViaFullPipeline:
         assert edge["type"] == "HAS_SKILL_LOAD"
         assert edge["sst_semantic"] == "CONTAINS"
 
-    async def test_skill_loaded_before_iteration_creates_node_but_no_e05(
+    async def test_skill_loaded_before_iteration_connects_to_session(
         self,
     ) -> None:
-        """SkillLoad node exists but 0 HAS_SKILL_LOAD edges when skill:loaded is
-        sent without a prior provider:request (OQ-L3-3 known gap: SkillLoad floats).
+        """SkillLoad node exists and E05 connects to Session when skill:loaded is
+        sent without a prior provider:request (OQ-L3-3 fix: Session is the fallback parent).
         """
         worker, services = _make_worker_and_services()
         handlers = setup_handlers(services)
@@ -299,16 +299,14 @@ class TestSkillLoadViaFullPipeline:
         assert node is not None, f"SkillLoad node must exist at '{skill_load_id}'"
         assert "SkillLoad" in node["labels"]
 
-        # Zero HAS_SKILL_LOAD edges (floats — OQ-L3-3)
-        has_skill_load_edges = [
-            edge
-            for edge in services.graph._edges.values()
-            if edge.get("type") == "HAS_SKILL_LOAD"
-        ]
-        assert len(has_skill_load_edges) == 0, (
-            "No E05 HAS_SKILL_LOAD edges must exist when active_iteration_id is None "
-            "(OQ-L3-3: SkillLoad floats when loaded before first iteration)"
+        # E05 must connect to Session (not float) — OQ-L3-3 fix
+        edge = await services.graph.get_edge(SESSION_ID, skill_load_id)
+        assert edge is not None, (
+            "E05 HAS_SKILL_LOAD edge must exist from Session when no iteration is active "
+            "(OQ-L3-3 fix: Session is the fallback parent)"
         )
+        assert edge["type"] == "HAS_SKILL_LOAD"
+        assert edge["sst_semantic"] == "CONTAINS"
 
     async def test_skill_unloaded_sets_ended_at_via_pipeline(self) -> None:
         """Load at T2 then unload at T3 via pipeline; node['ended_at'] == T3."""

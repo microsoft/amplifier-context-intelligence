@@ -226,11 +226,15 @@ class TestE05HasSkillLoadEdge:
     async def test_e05_created_when_active_iteration_id_set(
         self, services: HookStateService
     ) -> None:
-        """E05: iteration_id -[HAS_SKILL_LOAD {sst_semantic: 'CONTAINS'}]-> skill_load_id when cursor set."""
+        """E05: iteration_id -[HAS_SKILL_LOAD {sst_semantic: 'CONTAINS'}]-> skill_load_id when cursor set.
+
+        Confirms the edge parent is the Iteration, not the Session, even though the
+        session-level fallback is enabled for pre-iteration loads (OQ-L3-3 fix).
+        """
         iteration_id = "sess-001::iteration::1"
         services.data_layer_2.active_iteration_id = iteration_id
         handler = SkillLoadHandler(services)
-        data = self._make_loaded_data()
+        data = self._make_loaded_data(session_id="sess-001")
         await handler("skill:loaded", data)
 
         skill_load_id = "sess-001::skill::python-standards::2026-01-01T00:00:00Z"
@@ -239,23 +243,55 @@ class TestE05HasSkillLoadEdge:
         assert edge.get("type") == "HAS_SKILL_LOAD"
         assert edge.get("sst_semantic") == "CONTAINS"
 
-    async def test_no_e05_when_active_iteration_id_is_none(
+        # Session must NOT be the parent when an iteration is active
+        session_edge = await services.graph.get_edge("sess-001", skill_load_id)
+        assert session_edge is None, (
+            "Session must not be the E05 parent when active_iteration_id is set"
+        )
+
+    async def test_session_is_parent_when_no_active_iteration(
         self, services: HookStateService
     ) -> None:
-        """No E05 edge when active_iteration_id is None — SkillLoad floats (OQ-L3-3)."""
+        """E05 falls back to session_id as parent when active_iteration_id is None (OQ-L3-3 fix)."""
         assert services.data_layer_2.active_iteration_id is None
         handler = SkillLoadHandler(services)
-        data = self._make_loaded_data()
+        data = self._make_loaded_data(session_id="sess-001")
         await handler("skill:loaded", data)
 
-        has_skill_load_edges = [
-            edge
-            for edge in services.graph._edges.values()
-            if edge.get("type") == "HAS_SKILL_LOAD"
-        ]
-        assert len(has_skill_load_edges) == 0, (
-            "No E05 HAS_SKILL_LOAD edge must be created when active_iteration_id is None"
+        skill_load_id = "sess-001::skill::python-standards::2026-01-01T00:00:00Z"
+        edge = await services.graph.get_edge("sess-001", skill_load_id)
+        assert edge is not None, (
+            "E05 HAS_SKILL_LOAD edge must be created from session when active_iteration_id is None"
         )
+        assert edge.get("type") == "HAS_SKILL_LOAD"
+        assert edge.get("sst_semantic") == "CONTAINS"
+
+    async def test_pre_iteration_skill_load_connects_to_session(
+        self, services: HookStateService
+    ) -> None:
+        """When no iteration is active, SkillLoad connects to Session instead."""
+        # active_iteration_id is None by default
+        assert services.data_layer_2.active_iteration_id is None
+        handler = SkillLoadHandler(services)
+        await handler(
+            "skill:loaded",
+            {
+                "session_id": "sess1",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "skill_name": "my-skill",
+                "source": "workspace",
+                "content_length": 100,
+                "version": None,
+                "context": "inline",
+                "disable_model_invocation": False,
+                "user_invocable": True,
+            },
+        )
+        skill_load_id = "sess1::skill::my-skill::2026-01-01T00:00:00Z"
+        edge = await services.graph.get_edge("sess1", skill_load_id)
+        assert edge is not None
+        assert edge["type"] == "HAS_SKILL_LOAD"
+        assert edge["sst_semantic"] == "CONTAINS"
 
     async def test_active_skill_nodes_cache_populated_after_loaded(
         self, services: HookStateService

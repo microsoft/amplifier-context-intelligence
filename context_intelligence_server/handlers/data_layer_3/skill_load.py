@@ -97,15 +97,15 @@ class SkillLoadHandler:
         }
         await self.services.graph.upsert_node(skill_load_id, node_data)
 
-        # E05: Iteration -[HAS_SKILL_LOAD {sst_semantic: 'CONTAINS'}]-> SkillLoad
-        # Only created when there is an active iteration cursor; otherwise floats (OQ-L3-3)
-        iteration_id = self.services.data_layer_2.active_iteration_id
-        if iteration_id is not None:
-            await self.services.graph.upsert_edge(
-                iteration_id,
-                skill_load_id,
-                {"type": "HAS_SKILL_LOAD", "sst_semantic": "CONTAINS"},
-            )
+        # E05: parent -[HAS_SKILL_LOAD {sst_semantic: 'CONTAINS'}]-> SkillLoad
+        # Falls back to session_id when no iteration is active (OQ-L3-3 fix), so no
+        # SkillLoad node ever floats without a parent edge.
+        parent_id = self.services.data_layer_2.active_iteration_id or session_id
+        await self.services.graph.upsert_edge(
+            parent_id,
+            skill_load_id,
+            {"type": "HAS_SKILL_LOAD", "sst_semantic": "CONTAINS"},
+        )
 
         # Cache skill_name -> skill_load_id for use by skill:unloaded
         self._active_skill_nodes[skill_name] = skill_load_id
