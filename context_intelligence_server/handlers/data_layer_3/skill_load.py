@@ -7,8 +7,10 @@ Each skill load lifecycle produces up to two events:
 This handler creates a single SkillLoad node per load instance (keyed by
 '{session_id}::skill::{skill_name}::{timestamp}') with the SST_EVENT label,
 and enriches it with ended_at on skill:unloaded. The E05 edge
-(Iteration -[HAS_SKILL_LOAD]-> SkillLoad) is created when active_iteration_id
-is set at load time.
+(Iteration/Session -[HAS_SKILL_LOAD]-> SkillLoad) is always created.
+When active_iteration_id is set the parent is the Iteration; when no iteration is
+active yet (e.g. auto-loaded skills at session mount) the Session is the fallback
+parent (OQ-L3-3 fix).
 
 Note: skills:discovered is a catalog event (no SkillLoad instance) and is
 handled only by DefaultHandler.
@@ -70,12 +72,13 @@ class SkillLoadHandler:
         skill_name: str,
         data: dict[str, Any],
     ) -> None:
-        """Create SkillLoad node and conditional E05 edge.
+        """Create SkillLoad node and E05 edge with proper parent fallback.
 
         Creates:
         - SkillLoad:SST_EVENT node at compound ID with all 9 lifted fields
-        - E05: Iteration -[HAS_SKILL_LOAD {sst_semantic: 'CONTAINS'}]-> SkillLoad
-          (only when active_iteration_id is set; otherwise SkillLoad floats — OQ-L3-3)
+        - E05: parent -[HAS_SKILL_LOAD {sst_semantic: 'CONTAINS'}]-> SkillLoad
+          where parent = active_iteration_id if set, else session_id (OQ-L3-3 fix:
+          no SkillLoad ever floats without a parent edge)
         - Populates _active_skill_nodes[skill_name] = skill_load_id cache
         - SOURCED_FROM: SkillLoad -> data_layer_1 skill:loaded event
         """

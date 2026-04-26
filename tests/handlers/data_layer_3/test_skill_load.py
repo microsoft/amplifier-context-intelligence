@@ -9,7 +9,7 @@ Covers (Task 7 classes):
 3. TestSkillLoadedSourcedFrom — SOURCED_FROM edge targets
    make_node_id(session_id, 'skill:loaded', timestamp, skill_name)
 4. TestE05HasSkillLoadEdge — E05 created when active_iteration_id set (HAS_SKILL_LOAD/CONTAINS),
-   no E05 when active_iteration_id is None, _active_skill_nodes cache populated after loaded
+   Session is E05 parent when active_iteration_id is None, _active_skill_nodes cache populated after loaded
 """
 
 from __future__ import annotations
