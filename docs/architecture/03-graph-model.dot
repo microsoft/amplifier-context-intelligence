@@ -8,7 +8,7 @@ digraph graph_model {
         ranksep   = 1.6
         fontname  = "Helvetica"
         fontsize  = 11
-        label     = "SST Graph Model \u2014 Complete Neo4j Schema\n(context_intelligence_server/handlers/data_layer_2/)"
+        label     = "SST Graph Model \u2014 Complete Neo4j Schema\n(context_intelligence_server/handlers/data_layer_2/ + handlers/data_layer_3/)"
         labelloc  = t
         labeljust = c
     ]
@@ -261,6 +261,128 @@ digraph graph_model {
         Orchestrator -> MountPlan [style = invis]
     }
 
+    // -- Layer 3 — Delegation cluster -----------------------------------------
+    subgraph cluster_layer3_delegation {
+        graph [
+            label     = "Layer 3 \u2014 Delegation"
+            fontname  = "Helvetica-Bold"
+            fontsize  = 11
+            style     = filled
+            color     = "#FF6F00"
+            fillcolor = "#FFF8E1"
+            penwidth  = 2
+        ]
+
+        Delegation [
+            fillcolor = "#FFE0B2"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:Delegation :SST_EVENT</B></TD></TR>
+                <TR><TD>node_id: {parent_session_id}::delegation::{tool_call_id}</TD></TR>
+                <TR><TD>agent: string</TD></TR>
+                <TR><TD>parent_session_id / sub_session_id / tool_call_id</TD></TR>
+                <TR><TD>parallel_group_id: UUID (optional)</TD></TR>
+                <TR><TD>context_depth / scope / model_role</TD></TR>
+                <TR><TD>started_at / ended_at / success / error</TD></TR>
+            </TABLE>>
+        ]
+
+        Agent [
+            fillcolor = "#FFD54F"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:Agent :SST_CONCEPT</B></TD></TR>
+                <TR><TD>node_id: agent name string (key)</TD></TR>
+                <TR><TD>Shared across sessions</TD></TR>
+                <TR><TD>No SOURCED_FROM (concept node)</TD></TR>
+            </TABLE>>
+        ]
+
+        DelegationPeer [
+            style     = "filled,rounded,dashed"
+            fillcolor = "#FFF0D0"
+            color     = "#E65100"
+            penwidth  = 1.5
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:Delegation :SST_EVENT</B></TD></TR>
+                <TR><TD><I>(parallel peer)</I></TD></TR>
+            </TABLE>>
+        ]
+
+        Agent -> Delegation [style = invis]
+    }
+
+    // -- Layer 3 — Skills cluster ----------------------------------------------
+    subgraph cluster_layer3_skills {
+        graph [
+            label     = "Layer 3 \u2014 Skills"
+            fontname  = "Helvetica-Bold"
+            fontsize  = 11
+            style     = filled
+            color     = "#FF6F00"
+            fillcolor = "#FFF8E1"
+            penwidth  = 2
+        ]
+
+        SkillLoad [
+            fillcolor = "#FFE0B2"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:SkillLoad :SST_EVENT</B></TD></TR>
+                <TR><TD>node_id: {session}::skill::{skill_name}::{ts}</TD></TR>
+                <TR><TD>skill_name / source / version</TD></TR>
+                <TR><TD>content_length / context / auto_loaded</TD></TR>
+                <TR><TD>disable_model_invocation / user_invocable</TD></TR>
+                <TR><TD>started_at / ended_at</TD></TR>
+            </TABLE>>
+        ]
+    }
+
+    // -- Layer 3 — Recipes cluster ---------------------------------------------
+    subgraph cluster_layer3_recipes {
+        graph [
+            label     = "Layer 3 \u2014 Recipes"
+            fontname  = "Helvetica-Bold"
+            fontsize  = 11
+            style     = filled
+            color     = "#FF6F00"
+            fillcolor = "#FFF8E1"
+            penwidth  = 2
+        ]
+
+        RecipeRun [
+            fillcolor = "#FFE0B2"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:RecipeRun :SST_EVENT</B></TD></TR>
+                <TR><TD>node_id: {session}::recipe_run::{ts}</TD></TR>
+                <TR><TD>name / description / total_steps</TD></TR>
+                <TR><TD>status / success</TD></TR>
+                <TR><TD>started_at / ended_at</TD></TR>
+            </TABLE>>
+        ]
+
+        RecipeStep [
+            fillcolor = "#FFE0B2"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:RecipeStep :SST_EVENT</B></TD></TR>
+                <TR><TD>node_id: {recipe_run_id}::step::{current_step_or_stage_name}</TD></TR>
+                <TR><TD>name / current_step</TD></TR>
+                <TR><TD>stage_name (staged recipes only)</TD></TR>
+                <TR><TD>started_at</TD></TR>
+            </TABLE>>
+        ]
+
+        Recipe [
+            fillcolor = "#FFD54F"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:Recipe :SST_CONCEPT</B></TD></TR>
+                <TR><TD>node_id: recipe name string (key)</TD></TR>
+                <TR><TD>Shared across sessions</TD></TR>
+                <TR><TD>No SOURCED_FROM (concept node)</TD></TR>
+            </TABLE>>
+        ]
+
+        Recipe -> RecipeRun   [style = invis]
+        RecipeRun -> RecipeStep [style = invis]
+    }
+
     // -- Edges ----------------------------------------------------------------
 
     // E01: HAS_EXECUTION [CONTAINS] -- Session -> OrchestratorRun
@@ -390,6 +512,101 @@ digraph graph_model {
         constraint = false
     ]
 
+    // -- Layer 3 Edges --------------------------------------------------------
+
+    // L3-E01: HAS_AGENT [EXPRESSES] -- ForkedSession -> Agent
+    ForkedSession -> Agent [
+        label     = "L3-E01: HAS_AGENT\n{sst_semantic: EXPRESSES}"
+        color     = "#2E7D32"
+        fontcolor = "#2E7D32"
+        penwidth  = 2
+    ]
+
+    // L3-E02: ENCOMPASSES [CONTAINS] -- Delegation -> ForkedSession
+    Delegation -> ForkedSession [
+        label     = "L3-E02: ENCOMPASSES\n{sst_semantic: CONTAINS}"
+        color     = "#E65100"
+        fontcolor = "#E65100"
+        penwidth  = 2
+    ]
+
+    // L3-E03: TRIGGERED [LEADS_TO] -- ToolCall -> Delegation
+    ToolCall -> Delegation [
+        label     = "L3-E03: TRIGGERED\n{sst_semantic: LEADS_TO}"
+        color     = "#E53935"
+        fontcolor = "#E53935"
+        penwidth  = 2
+    ]
+
+    // L3-E04: PARALLEL_AGENT [NEAR] -- Delegation <-> DelegationPeer (undirected)
+    Delegation -> DelegationPeer [
+        dir       = none
+        label     = "L3-E04: PARALLEL_AGENT\n{sst_semantic: NEAR}"
+        color     = "#7B1FA2"
+        fontcolor = "#7B1FA2"
+        penwidth  = 2
+        style     = dashed
+    ]
+
+    // L3-E05: HAS_SKILL_LOAD [CONTAINS] -- Iteration -> SkillLoad
+    Iteration -> SkillLoad [
+        label     = "L3-E05: HAS_SKILL_LOAD\n{sst_semantic: CONTAINS}"
+        color     = "#E65100"
+        fontcolor = "#E65100"
+        penwidth  = 2
+    ]
+
+    // L3-E06: HAS_RECIPE_RUN [CONTAINS] -- RootSession -> RecipeRun
+    RootSession -> RecipeRun [
+        label     = "L3-E06: HAS_RECIPE_RUN\n{sst_semantic: CONTAINS}"
+        color     = "#E65100"
+        fontcolor = "#E65100"
+        penwidth  = 2
+    ]
+
+    // L3-E07: HAS_RECIPE [EXPRESSES] -- RecipeRun -> Recipe
+    RecipeRun -> Recipe [
+        label     = "L3-E07: HAS_RECIPE\n{sst_semantic: EXPRESSES}"
+        color     = "#2E7D32"
+        fontcolor = "#2E7D32"
+        penwidth  = 2
+    ]
+
+    // L3-E08: HAS_STEP [CONTAINS] -- RecipeRun -> RecipeStep
+    RecipeRun -> RecipeStep [
+        label     = "L3-E08: HAS_STEP\n{sst_semantic: CONTAINS}"
+        color     = "#E65100"
+        fontcolor = "#E65100"
+        penwidth  = 2
+    ]
+
+    // L3-E09: SPAWNED [LEADS_TO] -- RecipeStep -> RecipeRun (sub-recipe)
+    RecipeStep -> RecipeRun [
+        label     = "L3-E09: SPAWNED\n{sst_semantic: LEADS_TO}\n(sub-recipe)"
+        color     = "#E53935"
+        fontcolor = "#E53935"
+        penwidth  = 1.5
+        style     = dashed
+        constraint = false
+    ]
+
+    // L3-E10: TRIGGERED [LEADS_TO] -- RecipeStep -> Delegation
+    RecipeStep -> Delegation [
+        label     = "L3-E10: TRIGGERED\n{sst_semantic: LEADS_TO}"
+        color     = "#E53935"
+        fontcolor = "#E53935"
+        penwidth  = 1.5
+    ]
+
+    // L3-E11: TRIGGERED [LEADS_TO] -- RecipeStep -> ToolCall
+    RecipeStep -> ToolCall [
+        label     = "L3-E11: TRIGGERED\n{sst_semantic: LEADS_TO}"
+        color     = "#E53935"
+        fontcolor = "#E53935"
+        penwidth  = 1.5
+        constraint = false
+    ]
+
     // -- Notes ----------------------------------------------------------------
     note_turn_cycle [
         shape     = box
@@ -469,6 +686,23 @@ digraph graph_model {
             label     = "Green edge = EXPRESSES semantic\n(attribute / identity link)"
         ]
 
-        legend_sst_event -> legend_sst_thing -> legend_sst_concept -> legend_contains -> legend_leads_to -> legend_near -> legend_expresses [style = invis]
+        legend_l3_event [
+            style     = "filled,rounded"
+            fillcolor = "#FFE0B2"
+            color     = "#FF6F00"
+            fontcolor = "#FF6F00"
+            penwidth  = 2
+            label     = "Amber = Layer 3 :SST_EVENT node\n(data_layer_3 enrichers)"
+        ]
+        legend_l3_concept [
+            style     = "filled,rounded"
+            fillcolor = "#FFD54F"
+            color     = "#FF6F00"
+            fontcolor = "#FF6F00"
+            penwidth  = 2
+            label     = "Gold = Layer 3 :SST_CONCEPT node\n(data_layer_3 enrichers)"
+        ]
+
+        legend_sst_event -> legend_sst_thing -> legend_sst_concept -> legend_contains -> legend_leads_to -> legend_near -> legend_expresses -> legend_l3_event -> legend_l3_concept [style = invis]
     }
 }
