@@ -2,9 +2,10 @@
 name: context-intelligence-graph-query
 description: >
   Use when querying the context-intelligence property graph for session history,
-  tool call traces, LLM iteration analysis, or execution scale metrics. Covers
-  both data layers, cross-layer SOURCED_FROM joins, SST navigation, blob
-  handling, and 8 verified Cypher patterns.
+  tool call traces, LLM iteration analysis, execution scale metrics, agent
+  delegation trees, skill loading, and recipe orchestration. Covers all graph
+  layers, cross-layer SOURCED_FROM joins, SST navigation, blob handling, and
+  verified Cypher patterns.
 license: MIT
 metadata:
   version: "2.0.0"
@@ -18,7 +19,7 @@ every Amplifier session — what happened, when, how things connect, and at what
 
 ---
 
-## Section 1 — What the Graph Gives You (Two Layers)
+## Section 1 — What the Graph Gives You
 
 The graph holds two complementary views of every session.
 
@@ -32,7 +33,9 @@ entities — turns (OrchestratorRun), LLM iterations (Iteration), content blocks
 typed relationships. It answers: *what ran, how, and at what scale.* Conversation
 structure, execution scale, tool correlation, turn-level reasoning.
 
-Both layers coexist in the same graph and are bridged by **SOURCED_FROM** edges — the
+**The foundation layer** surfaces what happens above the kernel: delegation trees (Delegation, Agent), skill loading snapshots (SkillLoad), and recipe orchestration (RecipeRun, RecipeStep, Recipe). It answers: *who delegated to whom, which skills were active, and how recipe steps connect to the tool calls and delegations they triggered.*
+
+All layers coexist in the same graph and are bridged by **SOURCED_FROM** edges — the
 canonical cross-layer connection. Every data layer 2 entity carries one or more
 SOURCED_FROM edges back to the raw data layer 1 events that produced it, giving every
 semantic node a direct provenance link into the original event stream. Use data layer 1
@@ -42,7 +45,7 @@ structure, scale, or causation. Navigate between them with SOURCED_FROM.
 **Layer identification signal:** The `node_id` separator tells you which layer a node
 came from. `__` (double underscore) = data layer 1 node. `::` (double colon) =
 data layer 2 node. A few data layer 2 types use plain identifiers (ToolCall uses
-the provider's tool_call_id directly; Orchestrator uses the orchestrator name string).
+the provider's tool_call_id directly; Orchestrator uses the orchestrator name string). Foundation layer entities use the same `::` separator; concept nodes (`Agent`, `Recipe`) use their name string directly as `node_id`, like `Orchestrator` in data layer 2.
 
 ---
 
@@ -112,6 +115,35 @@ All edges carry an `sst_semantic` property that expresses the relationship's mea
 | `ENABLES` | `LEADS_TO` | OrchestratorRun → Prompt | This run's completion enabled the next prompt |
 | `SOURCED_FROM` | (none) | data_layer_2 entity → data_layer_1 Event | Cross-layer provenance bridge. Every data layer 2 entity has one SOURCED_FROM edge per contributing raw event. No `sst_semantic` — infrastructure, not SST model. |
 
+### Foundation Layer Entity Types
+
+All foundation layer nodes carry a `workspace` property and an SST type label.
+
+| Entity | Labels | SST Type | node_id Format | Key Properties |
+|---|---|---|---|---|
+| Delegation | `:Delegation:SST_EVENT` | Temporal | `{parent_session_id}::delegation::{tool_call_id\|sub_session_id}` | `agent`, `sub_session_id`, `parent_session_id`, `started_at`, `ended_at`, `context_depth`, `context_scope` |
+| Agent | `:Agent:SST_CONCEPT` | Abstract | Agent name string (e.g. `foundation:explorer`) | `agent` |
+| SkillLoad | `:SkillLoad:SST_EVENT` | Temporal | `{session_id}::skill::{skill_name}::{loaded_at_ts}` | `skill_name`, `content_length`, `loaded_at` |
+| RecipeRun | `:RecipeRun:SST_EVENT` | Temporal | `{session_id}::recipe_run::{timestamp}` | `name`, `status`, `current_step`, `total_steps` |
+| RecipeStep | `:RecipeStep:SST_EVENT` | Temporal | `{session_id}::recipe_run::{ts}::step::{N}` | `name`, `status`, `step_id` |
+| Recipe | `:Recipe:SST_CONCEPT` | Abstract | Recipe name string | `name` |
+
+### Foundation Layer Edge Types
+
+| Edge Type | `sst_semantic` | From → To | What It Means |
+|---|---|---|---|
+| `HAS_AGENT` | `EXPRESSES` | Session(sub) → Agent | Sub-session describes its agent type |
+| `ENCOMPASSES` | `CONTAINS` | Delegation → Session(sub) | Delegation encompasses the sub-session lifecycle |
+| `TRIGGERED` | `LEADS_TO` | ToolCall → Delegation | Tool call triggered this delegation |
+| `PARALLEL_AGENT` | `NEAR` | Delegation ↔ Delegation | These delegations ran concurrently |
+| `HAS_SKILL_LOAD` | `CONTAINS` | Iteration → SkillLoad | Iteration contains this skill load |
+| `HAS_RECIPE_RUN` | `CONTAINS` | Session → RecipeRun | Session contains this recipe run |
+| `HAS_RECIPE` | `EXPRESSES` | RecipeRun → Recipe | RecipeRun describes its recipe type |
+| `HAS_STEP` | `CONTAINS` | RecipeRun → RecipeStep | RecipeRun contains these steps |
+| `TRIGGERED` | `LEADS_TO` | RecipeStep → RecipeRun(child) | Step spawned a nested recipe |
+| `TRIGGERED` | `LEADS_TO` | RecipeStep → Delegation | Step triggered this delegation |
+| `TRIGGERED` | `LEADS_TO` | RecipeStep → ToolCall | Step triggered this tool call |
+
 ---
 
 ## Section 3 — SST Navigation (Reasoning by Semantic Type)
@@ -124,11 +156,11 @@ node labels in advance.
 
 Three SST type labels partition the semantic layer:
 
-| SST Label | Meaning | Data Layer 2 Entities |
+| SST Label | Meaning | Entities |
 |---|---|---|
-| `:SST_EVENT` | Temporal, bounded occurrence | Session, OrchestratorRun, Iteration, ContentBlock, ToolCall, Prompt, Cancellation, ContextCompaction |
+| `:SST_EVENT` | Temporal, bounded occurrence | Session, OrchestratorRun, Iteration, ContentBlock, ToolCall, Prompt, Cancellation, ContextCompaction, Delegation, SkillLoad, RecipeRun, RecipeStep |
 | `:SST_THING` | Persistent resource or artifact | MountPlan |
-| `:SST_CONCEPT` | Abstract, reusable identity | Orchestrator |
+| `:SST_CONCEPT` | Abstract, reusable identity | Orchestrator, Agent, Recipe |
 
 **Example — find all temporal events in the last session:**
 
@@ -621,6 +653,44 @@ RETURN iter.iteration_number  AS iteration,
 ORDER BY pre.occurred_at
 ```
 
+### Delegation Tree
+
+Lists every agent delegation in a session: which tool call triggered it, which agent was spawned, and the resulting sub-session.
+
+```cypher
+MATCH (s:Session {workspace: $workspace, node_id: $session_id})
+      -[:HAS_EXECUTION]->(:OrchestratorRun)
+      -[:HAS_PART]->(:Iteration)
+      -[:HAS_TOOL_CALL]->(tc:ToolCall)
+      -[:TRIGGERED]->(d:Delegation)
+RETURN d.agent, d.sub_session_id, d.context_depth,
+       d.started_at, d.ended_at, tc.tool_name AS via_tool
+ORDER BY d.started_at
+```
+
+### Skills Active Per Iteration
+
+```cypher
+MATCH (s:Session {workspace: $workspace, node_id: $session_id})
+      -[:HAS_EXECUTION]->(:OrchestratorRun)
+      -[:HAS_PART]->(iter:Iteration)
+      -[:HAS_SKILL_LOAD]->(sl:SkillLoad)
+RETURN iter.iteration_number, sl.skill_name, sl.content_length, sl.loaded_at
+ORDER BY iter.iteration_number, sl.loaded_at
+```
+
+### Recipe Run Trace
+
+```cypher
+MATCH (s:Session {workspace: $workspace, node_id: $session_id})
+      -[:HAS_RECIPE_RUN]->(rr:RecipeRun)
+      -[:HAS_STEP]->(step:RecipeStep)
+OPTIONAL MATCH (step)-[:TRIGGERED]->(target)
+RETURN rr.name, step.name, step.status,
+       labels(target) AS triggered_type, target.node_id AS triggered_id
+ORDER BY step.step_id
+```
+
 ---
 
 ## Gotchas
@@ -676,3 +746,12 @@ MATCH (n:SST_EVENT) WHERE NOT (n)-[:SOURCED_FROM]->() AND NOT n:Session RETURN l
 
 If this returns results, fall back to Join 2 (ToolCall Direct Match) or Join 3
 (Session Containment) for those sessions.
+
+**8. Foundation layer nodes only exist when those features were used.**
+A session with no delegation, no skills, and no recipes will have no `Delegation`, `SkillLoad`, `RecipeRun`, or `RecipeStep` nodes. Always use `OPTIONAL MATCH` when joining foundation layer entities against arbitrary sessions.
+
+**9. `Agent` and `Recipe` are concept nodes shared across sessions.**
+Unlike `SST_EVENT` entities, `Agent` and `Recipe` nodes are merged by name across the entire workspace. Querying `(a:Agent)` without a session anchor will span all sessions. Scope through the session: reach `Agent` via `HAS_AGENT` from the sub-session, or `Recipe` via `HAS_RECIPE` from a `RecipeRun`.
+
+**10. `SkillLoad` may attach to `Session` directly, not `Iteration`.**
+Skills loaded before the first `provider:request` have no active `Iteration`. The `HAS_SKILL_LOAD` edge then comes from `Session` rather than `Iteration`. Pattern "Skills Active Per Iteration" only returns skills tied to an iteration — add `OPTIONAL MATCH (s)-[:HAS_SKILL_LOAD]->(sl:SkillLoad)` to catch session-level loads.
