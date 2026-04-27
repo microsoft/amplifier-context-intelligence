@@ -122,6 +122,38 @@ digraph pipeline_flow {
         ]
     }
 
+    // -- Enrichers (data_layer_3) -- conditional dispatch ----------------------
+    subgraph cluster_data_layer_3 {
+        graph [
+            label     = "Enrichers [data_layer_3] \u2014 conditional, ADDITIVE dispatch"
+            style     = "filled"
+            color     = "#E65100"
+            fillcolor = "#FFB74D"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        DelegationHandler [
+            label     = "DelegationHandler [8]\ndelegate:agent_spawned|completed|resumed|cancelled|error\nCREATE :Delegation :SST_EVENT | :Agent :SST_CONCEPT\nE01 HAS_AGENT | E02 ENCOMPASSES | E03 TRIGGERED | E04 PARALLEL_AGENT"
+            fillcolor = "#FFE0B2"
+        ]
+
+        SkillLoadHandler [
+            label     = "SkillLoadHandler [9]\nskill:loaded|skill:unloaded\nCREATE :SkillLoad :SST_EVENT\nE05 HAS_SKILL_LOAD"
+            fillcolor = "#FFE0B2"
+        ]
+
+        RecipeRunHandler [
+            label     = "RecipeRunHandler [10]\nrecipe:start|complete|loop_iteration|loop_complete|approval\nCREATE :RecipeRun :SST_EVENT | :Recipe :SST_CONCEPT\nE06 HAS_RECIPE_RUN | E07 HAS_RECIPE | E09 SPAWNED"
+            fillcolor = "#FFE0B2"
+        ]
+
+        RecipeStepHandler [
+            label     = "RecipeStepHandler [11]\nrecipe:step|approval|loop_iteration|tool:pre\nCREATE :RecipeStep :SST_EVENT\nE08 HAS_STEP | E10 TRIGGERED | E11 TRIGGERED"
+            fillcolor = "#FFE0B2"
+        ]
+    }
+
     // -- Terminal check -------------------------------------------------------
     IsTerminal [
         label     = "IsTerminal?\n(session:end)"
@@ -165,6 +197,10 @@ digraph pipeline_flow {
     EnricherLoop    -> PromptHandler             [label = "event_type matches"]
     EnricherLoop    -> CancellationHandler       [label = "event_type matches"]
     EnricherLoop    -> ContextCompactionHandler  [label = "event_type matches"]
+    EnricherLoop    -> DelegationHandler         [label = "event_type matches"]
+    EnricherLoop    -> SkillLoadHandler          [label = "event_type matches"]
+    EnricherLoop    -> RecipeRunHandler          [label = "event_type matches"]
+    EnricherLoop    -> RecipeStepHandler         [label = "event_type matches"]
     EnricherLoop    -> IsTerminal                [label = "no match /\nafter enrichers"]
 
     // Fan-in from enrichers
@@ -176,6 +212,10 @@ digraph pipeline_flow {
     PromptHandler            -> IsTerminal
     CancellationHandler      -> IsTerminal
     ContextCompactionHandler -> IsTerminal
+    DelegationHandler        -> IsTerminal
+    SkillLoadHandler         -> IsTerminal
+    RecipeRunHandler         -> IsTerminal
+    RecipeStepHandler        -> IsTerminal
 
     IsTerminal -> GraphFlush [label = "yes\n(session:end)"]
     IsTerminal -> Done       [label = "no"]
@@ -210,6 +250,11 @@ digraph pipeline_flow {
             style     = "filled"
         ]
 
-        LegendAlways -> LegendClaimed -> LegendDecision [style = invis]
+        LegendLayer3 [
+            label     = "orange = foundation layer\n(data_layer_3)"
+            fillcolor = "#FFE0B2"
+        ]
+
+        LegendAlways -> LegendClaimed -> LegendDecision -> LegendLayer3 [style = invis]
     }
 }

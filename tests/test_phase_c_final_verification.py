@@ -77,7 +77,8 @@ class TestHandlerDirectoryCompleteness:
 
 
 class TestAll8EnrichersRegistered:
-    """setup_handlers must register exactly 8 enrichers in the correct order."""
+    """setup_handlers must register exactly 12 enrichers in the correct order
+    (8 data_layer_2 + 4 data_layer_3)."""
 
     def _get_enrichers(self) -> list:
         from context_intelligence_server.pipeline import setup_handlers
@@ -88,15 +89,15 @@ class TestAll8EnrichersRegistered:
         return list(result.enrichers)
 
     def test_enricher_count_is_8(self) -> None:
-        """Exactly 8 enrichers are registered."""
+        """Exactly 12 enrichers are registered (8 L2 + 4 L3)."""
         enrichers = self._get_enrichers()
-        assert len(enrichers) == 8, (
-            f"Expected 8 enrichers, got {len(enrichers)}: "
+        assert len(enrichers) == 12, (
+            f"Expected 12 enrichers, got {len(enrichers)}: "
             f"{[type(e).__name__ for e in enrichers]}"
         )
 
     def test_complete_enricher_order_all_8(self) -> None:
-        """All 8 enrichers are present in the correct dispatch order."""
+        """All 12 enrichers are present in the correct dispatch order."""
         enrichers = self._get_enrichers()
         expected_names = [
             "SessionHandler",
@@ -107,6 +108,10 @@ class TestAll8EnrichersRegistered:
             "PromptHandler",
             "CancellationHandler",
             "ContextCompactionHandler",
+            "DelegationHandler",
+            "SkillLoadHandler",
+            "RecipeRunHandler",
+            "RecipeStepHandler",
         ]
         actual_names = [type(e).__name__ for e in enrichers]
         assert actual_names == expected_names, (

@@ -174,13 +174,13 @@ def test_setup_handlers_has_enrichers_list() -> None:
 
 
 def test_setup_handlers_enricher_count() -> None:
-    """setup_handlers must return exactly 8 enrichers (all data_layer_2 enrichers)."""
+    """setup_handlers must return exactly 12 enrichers (8 data_layer_2 + 4 data_layer_3)."""
     from context_intelligence_server.pipeline import setup_handlers
     from context_intelligence_server.services import HookStateService
 
     services = HookStateService(workspace="test")
     result = setup_handlers(services)
-    assert len(result.enrichers) == 8
+    assert len(result.enrichers) == 12
 
 
 def test_setup_handlers_enricher_order() -> None:
@@ -206,6 +206,32 @@ def test_setup_handlers_enricher_order() -> None:
     assert isinstance(result.enrichers[2], IterationHandler)
     assert isinstance(result.enrichers[3], ContentBlockHandler)
     assert type(result.enrichers[4]).__name__ == "ToolCallHandler"
+
+
+def test_setup_handlers_l3_enricher_order() -> None:
+    """Layer 3 enrichers must be appended after all Layer 2 enrichers in correct order:
+    [DelegationHandler, SkillLoadHandler, RecipeRunHandler, RecipeStepHandler]."""
+    from context_intelligence_server.pipeline import setup_handlers
+    from context_intelligence_server.handlers.data_layer_3.delegation import (
+        DelegationHandler,
+    )
+    from context_intelligence_server.handlers.data_layer_3.skill_load import (
+        SkillLoadHandler,
+    )
+    from context_intelligence_server.handlers.data_layer_3.recipe_run import (
+        RecipeRunHandler,
+    )
+    from context_intelligence_server.handlers.data_layer_3.recipe_step import (
+        RecipeStepHandler,
+    )
+    from context_intelligence_server.services import HookStateService
+
+    services = HookStateService(workspace="test")
+    result = setup_handlers(services)
+    assert isinstance(result.enrichers[8], DelegationHandler)
+    assert isinstance(result.enrichers[9], SkillLoadHandler)
+    assert isinstance(result.enrichers[10], RecipeRunHandler)
+    assert isinstance(result.enrichers[11], RecipeStepHandler)
 
 
 def test_setup_handlers_all_enrichers_have_handled_events() -> None:

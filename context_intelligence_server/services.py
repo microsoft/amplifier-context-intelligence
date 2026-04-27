@@ -12,6 +12,7 @@ import logging
 from typing import Any
 
 from context_intelligence_server.handlers.data_layer_2.state import DataLayer2State
+from context_intelligence_server.handlers.data_layer_3.state import DataLayer3State
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +201,7 @@ class HookStateService:
         self.blob_store = blob_store
         self._seen_sessions: set[str] = set()
         self.data_layer_2 = DataLayer2State()
+        self.data_layer_3 = DataLayer3State()
 
     # ------------------------------------------------------------------
     # Session node management

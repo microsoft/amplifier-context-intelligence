@@ -5,8 +5,8 @@ Provides four public exports:
 - ``TERMINAL_EVENTS`` — frozenset containing only ``'session:end'``
 - ``PipelineHandlers`` — NamedTuple with ``default`` (DefaultHandler) and
   ``enrichers`` (list of ordered enrichers)
-- ``setup_handlers(services)`` — return a PipelineHandlers with DefaultHandler
-  and all 8 data_layer_2 enrichers
+- ``setup_handlers(services)`` — return a PipelineHandlers with DefaultHandler,
+  all 8 data_layer_2 enrichers, and all 4 data_layer_3 enrichers
 - ``process_event(worker, event, data, handlers)`` — full pipeline step:
   ensure-session-node → blob processing → always-default dispatch →
   enricher dispatch (for matching events) → touch_session (last_updated) →
@@ -60,10 +60,15 @@ def setup_handlers(services: HookStateService) -> PipelineHandlers:
 
     Returns a PipelineHandlers with:
     - ``default``: DefaultHandler instance (always called for every event)
-    - ``enrichers``: all 8 data_layer_2 enrichers in dispatch order
-      (called additionally for events they claim)
+    - ``enrichers``: all 8 data_layer_2 enrichers followed by all 4
+      data_layer_3 enrichers in dispatch order (called additionally for
+      events they claim)
 
     All handlers receive the same *services* instance.
+
+    Layer 3 enrichers are appended after all Layer 2 enrichers to guarantee
+    that ToolCallHandler (Layer 2) creates ToolCall nodes before
+    RecipeStepHandler (Layer 3) creates E11 edges on the same tool:pre event.
     """
     # Local imports to allow tests to stub handlers via sys.modules
     # before they are fully implemented in the handlers package.
@@ -87,6 +92,18 @@ def setup_handlers(services: HookStateService) -> PipelineHandlers:
     from context_intelligence_server.handlers.data_layer_2.context_compaction import (
         ContextCompactionHandler,
     )  # noqa: PLC0415
+    from context_intelligence_server.handlers.data_layer_3.delegation import (
+        DelegationHandler,
+    )  # noqa: PLC0415
+    from context_intelligence_server.handlers.data_layer_3.skill_load import (
+        SkillLoadHandler,
+    )  # noqa: PLC0415
+    from context_intelligence_server.handlers.data_layer_3.recipe_run import (
+        RecipeRunHandler,
+    )  # noqa: PLC0415
+    from context_intelligence_server.handlers.data_layer_3.recipe_step import (
+        RecipeStepHandler,
+    )  # noqa: PLC0415
 
     return PipelineHandlers(
         default=DefaultHandler(services),
@@ -99,6 +116,10 @@ def setup_handlers(services: HookStateService) -> PipelineHandlers:
             PromptHandler(services),
             CancellationHandler(services),
             ContextCompactionHandler(services),
+            DelegationHandler(services),
+            SkillLoadHandler(services),
+            RecipeRunHandler(services),  # stub — implemented in Phase 2
+            RecipeStepHandler(services),  # stub — implemented in Phase 2
         ],
     )
 
