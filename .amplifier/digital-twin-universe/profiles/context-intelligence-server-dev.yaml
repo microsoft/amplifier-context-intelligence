@@ -19,13 +19,11 @@ description: >
   Isolated context-intelligence server stack for development and testing.
 
   Usage:
-    cd amplifier-context-intelligence && uv build
     amplifier-digital-twin launch \
       .amplifier/digital-twin-universe/profiles/context-intelligence-server-dev.yaml \
       --var WORKSPACE=my-experiment
 
-  Update flow (after rebuilding the wheel):
-    uv build
+  Update flow (pulls latest feat/data-layer-3 from GitHub):
     amplifier-digital-twin update <id>
 
   Variables:
@@ -48,10 +46,8 @@ passthrough:
     - name: context-intelligence-auth
       key_env: AMPLIFIER_CONTEXT_INTELLIGENCE_API_KEY
 
-pypi_overrides:
-  packages:
-    - name: context-intelligence-server
-      wheel_path: ../../../dist/context_intelligence_server-*.whl
+# No pypi_overrides — server is installed directly from the feat/data-layer-3 branch
+# via git+https in setup_cmds after GH_TOKEN credentials are configured.
 
 provision:
   setup_cmds:
@@ -67,6 +63,7 @@ provision:
         echo "machine github.com login x-token-auth password $GH_TOKEN" > /root/.netrc
         chmod 600 /root/.netrc
         git config --global credential.helper store
+        git config --global url."https://x-token-auth:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
       fi
 
     # 4. Install Docker
@@ -92,12 +89,17 @@ provision:
         sleep 2
       done
 
-    # 6. Create venv and install context-intelligence-server
+    # 6. Create venv and install context-intelligence-server from GitHub
     - |
       export PATH="/root/.local/bin:$PATH"
       uv venv /opt/ci-venv --python python3
       source /opt/ci-venv/bin/activate
-      uv pip install context-intelligence-server uvicorn
+      if [ -n "$GH_TOKEN" ]; then
+        REPO_URL="git+https://x-token-auth:${GH_TOKEN}@github.com/microsoft/amplifier-context-intelligence.git@feat/data-layer-3"
+      else
+        REPO_URL="git+https://github.com/microsoft/amplifier-context-intelligence.git@feat/data-layer-3"
+      fi
+      uv pip install "$REPO_URL" uvicorn
 
     # 7. Set defaults and start the CI server
     - |
@@ -105,6 +107,8 @@ provision:
       CI_PORT=${SERVER_PORT:-8000}
       CI_KEY=${AMPLIFIER_CONTEXT_INTELLIGENCE_API_KEY:-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}
       CI_WORKSPACE=${WORKSPACE}
+      export AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL=bolt://localhost:7687
+      export AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD=none
       nohup uvicorn context_intelligence_server.main:app \
         --host 0.0.0.0 --port $CI_PORT \
         > /var/log/ci-server.log 2>&1 &
@@ -150,10 +154,12 @@ readiness:
     command: . /etc/environment; curl -sf $AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL/status > /dev/null && echo "ready"
 
 update:
-  refresh_pypi: true
   cmds:
     - pkill -f "uvicorn context_intelligence_server" || true
     - sleep 1
+    - |
+      source /opt/ci-venv/bin/activate
+      uv pip install --upgrade "git+https://github.com/microsoft/amplifier-context-intelligence.git@feat/data-layer-3"
     - |
       source /opt/ci-venv/bin/activate
       . /etc/environment
