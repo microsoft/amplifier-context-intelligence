@@ -8,7 +8,9 @@ Each agent delegation lifecycle produces up to five events:
   delegate:error            — agent failed with an error
 
 This handler creates a single Delegation node per delegation (keyed by
-'{parent_session_id}::delegation::{tool_call_id}') with the SST_EVENT label,
+'{parent_session_id}::delegation::{tool_call_id or sub_session_id}') with the SST_EVENT label,
+Note: tool_call_id may be empty string in some Amplifier versions; sub_session_id is used
+as fallback key in that case.
 and creates an Agent:SST_CONCEPT node per unique agent name (MERGE semantics,
 no SOURCED_FROM edge). Phase B semantic edges (E01, E02, E03, E04, E10) are
 created by _handle_spawned when the corresponding data is present.
@@ -53,13 +55,23 @@ class DelegationHandler:
     async def __call__(self, event: str, data: dict[str, Any]) -> HookResult:
         """Handle a delegate lifecycle event.
 
-        Extracts parent_session_id and tool_call_id; returns continue without
-        mutations if either is missing.
+        Extracts parent_session_id and tool_call_id (or sub_session_id fallback).
+        Returns continue without mutations only if parent_session_id is missing.
+
+        Note: tool_call_id may be an empty string in some Amplifier versions;
+        sub_session_id is used as a stable fallback key in that case so that
+        Delegation nodes are always created for any spawned agent.
         """
         parent_session_id: str | None = data.get("parent_session_id")
-        tool_call_id: str | None = data.get("tool_call_id")
+        if not parent_session_id:
+            return HookResult(action="continue")
 
-        if not parent_session_id or not tool_call_id:
+        # tool_call_id is empty string in some Amplifier versions; fall back to
+        # sub_session_id to keep the Delegation node ID stable and unique.
+        raw_tool_call_id: str = data.get("tool_call_id") or ""
+        sub_session_id_for_fallback: str = data.get("sub_session_id") or ""
+        tool_call_id: str = raw_tool_call_id or sub_session_id_for_fallback
+        if not tool_call_id:
             return HookResult(action="continue")
 
         if event == "delegate:agent_spawned":

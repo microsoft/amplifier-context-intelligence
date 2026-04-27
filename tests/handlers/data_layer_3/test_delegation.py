@@ -344,16 +344,42 @@ class TestDelegationHandlerGuards:
         assert result.action == "continue"
         assert len(services.graph._nodes) == 0
 
-    async def test_missing_tool_call_id_short_circuits(
+    async def test_empty_tool_call_id_falls_back_to_sub_session_id(
         self, services: HookStateService
     ) -> None:
-        """Missing tool_call_id returns continue with no graph mutations."""
+        """Empty tool_call_id uses sub_session_id as fallback key.
+
+        Real Amplifier versions emit tool_call_id='' (empty string) in
+        delegate:agent_spawned.  The handler must still create a Delegation
+        node, using sub_session_id as the compound-key fallback.
+        """
         handler = DelegationHandler(services)
         result = await handler(
             "delegate:agent_spawned",
             {
                 "parent_session_id": "ps1",
                 "sub_session_id": "ss1",
+                "agent": "foundation:explorer",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "tool_call_id": "",  # empty, as emitted by real Amplifier
+            },
+        )
+        assert result.action == "continue"
+        # Delegation node must be created using sub_session_id as fallback key
+        delegation_id = "ps1::delegation::ss1"
+        assert delegation_id in services.graph._nodes
+        assert services.graph._nodes[delegation_id]["agent"] == "foundation:explorer"
+
+    async def test_missing_both_tool_call_id_and_sub_session_id_short_circuits(
+        self, services: HookStateService
+    ) -> None:
+        """Handler short-circuits if both tool_call_id and sub_session_id are absent."""
+        handler = DelegationHandler(services)
+        result = await handler(
+            "delegate:agent_spawned",
+            {
+                "parent_session_id": "ps1",
+                # no tool_call_id, no sub_session_id
                 "agent": "foundation:explorer",
                 "timestamp": "2026-01-01T00:00:00Z",
             },
