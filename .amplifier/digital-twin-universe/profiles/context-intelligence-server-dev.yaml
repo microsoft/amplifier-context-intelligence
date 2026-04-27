@@ -147,6 +147,51 @@ provision:
       amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-context-intelligence@main --app
       mkdir -p /home/user/project
 
+    # 9. Patch settings.yaml: configure hook-context-intelligence to point at local server.
+    #
+    #    Why settings.yaml instead of env vars:
+    #    - /etc/environment variables are NOT exported to child processes by default on Linux.
+    #    - uv tool subprocesses (amplifier run) therefore don't see them via os.environ.
+    #    - settings.yaml is always read by the hook's ConfigResolver as a reliable fallback.
+    #
+    #    Why a non-empty api_key is required:
+    #    - The LoggingHandler checks `if not self._api_key: _dispatch_enabled = False`.
+    #    - An empty string is falsy; dispatch is silently disabled even if server_url is set.
+    #
+    #    Why additional_events is required:
+    #    - The CI bundle's behavior file already lists delegate:agent_spawned etc., BUT the
+    #      settings.yaml overrides section REPLACES the behavior config (not merges it).
+    #    - So we must re-include additional_events here to preserve Layer 3 event capture.
+    - |
+      python3 - << PYEOF
+import re, yaml
+from pathlib import Path
+
+settings_path = Path.home() / ".amplifier/settings.yaml"
+data = yaml.safe_load(settings_path.read_text()) or {}
+
+# Read the CI API key from /etc/environment directly — os.environ misses non-exported vars.
+env_text = Path("/etc/environment").read_text()
+m = re.search(r"AMPLIFIER_CONTEXT_INTELLIGENCE_API_KEY=([^\n]+)", env_text)
+ci_key = m.group(1).strip().strip("\"'") if m else "dev-ci-key"
+
+cfg = data.setdefault("overrides", {}).setdefault("hook-context-intelligence", {}).setdefault("config", {})
+cfg["context_intelligence_server_url"] = "http://localhost:${SERVER_PORT:-8000}"
+cfg["context_intelligence_api_key"] = ci_key
+cfg["workspace"] = "${WORKSPACE}"
+# Re-include additional_events (settings.yaml overrides REPLACE, not merge, the behavior config).
+cfg["additional_events"] = [
+    "delegate:agent_spawned",
+    "delegate:agent_resumed",
+    "delegate:agent_completed",
+    "delegate:agent_cancelled",
+    "delegate:error",
+]
+
+settings_path.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True))
+print(f"hook-context-intelligence configured (key={ci_key[:8]}..., events={len(cfg['additional_events'])})")
+PYEOF
+
 readiness:
   - name: neo4j
     command: docker exec neo4j-test cypher-shell "RETURN 1" && echo "ready"
