@@ -115,7 +115,7 @@ class SkillLoadHandler:
 
         # SOURCED_FROM bridge: SkillLoad -> data_layer_1 skill:loaded event node
         data_layer_1_node_id = make_node_id(
-            session_id, "skill:loaded", timestamp, skill_name
+            session_id, "skill:loaded", timestamp, data.get("tool_call_id")
         )
         await self.services.graph.upsert_edge(
             skill_load_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
@@ -151,7 +151,7 @@ class SkillLoadHandler:
 
         # SOURCED_FROM bridge: SkillLoad -> data_layer_1 skill:unloaded event node
         data_layer_1_node_id = make_node_id(
-            session_id, "skill:unloaded", timestamp, skill_name
+            session_id, "skill:unloaded", timestamp, data.get("tool_call_id")
         )
         await self.services.graph.upsert_edge(
             skill_load_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}

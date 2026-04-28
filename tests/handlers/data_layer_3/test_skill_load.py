@@ -166,12 +166,12 @@ class TestSkillLoadedCreatesNode:
 
 
 class TestSkillLoadedSourcedFrom:
-    """SOURCED_FROM edge must target make_node_id(session_id, 'skill:loaded', timestamp, skill_name)."""
+    """SOURCED_FROM edge must target make_node_id(session_id, 'skill:loaded', timestamp, tool_call_id)."""
 
-    async def test_sourced_from_uses_skill_name_as_disambiguator(
+    async def test_sourced_from_uses_tool_call_id_as_disambiguator(
         self, services: HookStateService
     ) -> None:
-        """SOURCED_FROM edge from SkillLoad node targets make_node_id with skill_name disambiguator."""
+        """SOURCED_FROM edge from SkillLoad node targets make_node_id with tool_call_id (None for skill events)."""
         handler = SkillLoadHandler(services)
         session_id = "sess-001"
         skill_name = "python-standards"
@@ -191,7 +191,7 @@ class TestSkillLoadedSourcedFrom:
 
         skill_load_id = f"{session_id}::skill::{skill_name}::{timestamp}"
         expected_target = make_node_id(
-            session_id, "skill:loaded", timestamp, skill_name
+            session_id, "skill:loaded", timestamp, data.get("tool_call_id")
         )
         edge = await services.graph.get_edge(skill_load_id, expected_target)
         assert edge is not None, (
@@ -374,7 +374,7 @@ class TestSkillUnloadedEnriches:
     async def test_skill_unloaded_creates_sourced_from_edge(
         self, services: HookStateService
     ) -> None:
-        """SOURCED_FROM edge from skill_load_id to make_node_id(session_id, 'skill:unloaded', timestamp_unload, skill_name)."""
+        """SOURCED_FROM edge from skill_load_id to make_node_id(session_id, 'skill:unloaded', timestamp_unload, tool_call_id)."""
         handler = SkillLoadHandler(services)
         session_id = "sess-001"
         skill_name = "python-standards"
@@ -387,16 +387,17 @@ class TestSkillUnloadedEnriches:
                 session_id=session_id, skill_name=skill_name, timestamp=timestamp_load
             ),
         )
+        unloaded_data = self._make_unloaded_data(
+            session_id=session_id, skill_name=skill_name, timestamp=timestamp_unload
+        )
         await handler(
             "skill:unloaded",
-            self._make_unloaded_data(
-                session_id=session_id, skill_name=skill_name, timestamp=timestamp_unload
-            ),
+            unloaded_data,
         )
 
         skill_load_id = f"{session_id}::skill::{skill_name}::{timestamp_load}"
         expected_target = make_node_id(
-            session_id, "skill:unloaded", timestamp_unload, skill_name
+            session_id, "skill:unloaded", timestamp_unload, unloaded_data.get("tool_call_id")
         )
         edge = await services.graph.get_edge(skill_load_id, expected_target)
         assert edge is not None, (
