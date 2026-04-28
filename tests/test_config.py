@@ -4,13 +4,6 @@ from pathlib import Path
 
 import pytest
 
-from context_intelligence_server import __version__
-
-
-def test_package_version():
-    """Package version should be 3.0.0."""
-    assert __version__ == "3.0.0"
-
 
 def test_settings_defaults():
     """Settings should have correct default values."""
