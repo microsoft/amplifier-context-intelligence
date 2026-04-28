@@ -8,8 +8,8 @@ from context_intelligence_server import __version__
 
 
 def test_package_version():
-    """Package version should be 2.0.0."""
-    assert __version__ == "2.0.0"
+    """Package version should be 3.0.0."""
+    assert __version__ == "3.0.0"
 
 
 def test_settings_defaults():

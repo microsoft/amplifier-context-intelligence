@@ -110,6 +110,11 @@ class DelegationHandler:
 
         delegation_id = f"{parent_session_id}::delegation::{tool_call_id}"
 
+        resolved_agent: str = agent
+        if agent == "self":
+            parent = await self.services.graph.get_node(parent_session_id)
+            resolved_agent = (parent or {}).get("agent") or "root-agent"
+
         # Create the Delegation:SST_EVENT node
         node_data: dict[str, Any] = {
             "labels": ["Delegation", "SST_EVENT"],
@@ -127,25 +132,29 @@ class DelegationHandler:
             node_data["context_scope"] = context_scope
         if model_role is not None:
             node_data["model_role"] = model_role
+        if agent == "self":
+            node_data["resolved_agent"] = resolved_agent
+            node_data["is_self_delegation"] = True
 
         await self.services.graph.upsert_node(delegation_id, node_data)
 
         # Create Agent:SST_CONCEPT node — MERGE semantics, NO SOURCED_FROM edge
+        # Agent concept node — use resolved_agent, not raw agent
         await self.services.graph.upsert_node(
-            agent,
+            resolved_agent,
             {
                 "labels": ["Agent", "SST_CONCEPT"],
-                "agent": agent,
+                "agent": resolved_agent,
             },
         )
 
         # Ensure sub-session node exists
-        await self.services.ensure_session_node(sub_session_id, {})
+        await self.services.ensure_session_node(sub_session_id, {"agent": agent})
 
-        # E01: Session(sub) -[:HAS_AGENT {sst_semantic: 'EXPRESSES'}]-> Agent
+        # E01: Session(sub) -[:HAS_AGENT {sst_semantic: 'EXPRESSES'}]-> Agent — use resolved_agent
         await self.services.graph.upsert_edge(
             sub_session_id,
-            agent,
+            resolved_agent,
             {"type": "HAS_AGENT", "sst_semantic": "EXPRESSES"},
         )
 

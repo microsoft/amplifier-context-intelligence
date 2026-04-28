@@ -352,6 +352,8 @@ class TestDelegationHandlerGuards:
         Real Amplifier versions emit tool_call_id='' (empty string) in
         delegate:agent_spawned.  The handler must still create a Delegation
         node, using sub_session_id as the compound-key fallback.
+        When agent='self' and the parent has no agent property, resolved_agent
+        falls back to 'root-agent' and is_self_delegation is set to True.
         """
         handler = DelegationHandler(services)
         result = await handler(
@@ -359,7 +361,7 @@ class TestDelegationHandlerGuards:
             {
                 "parent_session_id": "ps1",
                 "sub_session_id": "ss1",
-                "agent": "foundation:explorer",
+                "agent": "self",
                 "timestamp": "2026-01-01T00:00:00Z",
                 "tool_call_id": "",  # empty, as emitted by real Amplifier
             },
@@ -368,7 +370,9 @@ class TestDelegationHandlerGuards:
         # Delegation node must be created using sub_session_id as fallback key
         delegation_id = "ps1::delegation::ss1"
         assert delegation_id in services.graph._nodes
-        assert services.graph._nodes[delegation_id]["agent"] == "foundation:explorer"
+        assert services.graph._nodes[delegation_id]["agent"] == "self"
+        assert services.graph._nodes[delegation_id]["is_self_delegation"] is True
+        assert services.graph._nodes[delegation_id]["resolved_agent"] == "root-agent"
 
     async def test_missing_both_tool_call_id_and_sub_session_id_short_circuits(
         self, services: HookStateService
@@ -667,3 +671,108 @@ class TestE10RecipeStepAttribution:
         # Only E03 should exist — tool_call_id ("tc-abc") -> delegation_id
         assert len(triggered_to_delegation) == 1
         assert triggered_to_delegation[0][0] == "tc-abc"
+
+
+# ---------------------------------------------------------------------------
+# 9. TestSelfDelegationResolution
+# ---------------------------------------------------------------------------
+
+
+class TestSelfDelegationResolution:
+    """self-delegation agent resolution — agent='self' must resolve to the parent's canonical agent."""
+
+    async def test_self_resolves_from_parent_agent(
+        self, services: HookStateService
+    ) -> None:
+        """agent='self' resolves to parent session's agent property.
+
+        Pre-seed the parent with agent='foundation:explorer' via upsert_node.
+        After spawn:
+        - Delegation node carries agent='self', resolved_agent='foundation:explorer',
+          is_self_delegation=True.
+        - Agent concept node exists at 'foundation:explorer' (not 'self').
+        - HAS_AGENT edge targets 'foundation:explorer'.
+        """
+        await services.graph.upsert_node(
+            "ps-named",
+            {"labels": ["Session"], "agent": "foundation:explorer"},
+        )
+        handler = DelegationHandler(services)
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "parent_session_id": "ps-named",
+                "sub_session_id": "ss-self-1",
+                "agent": "self",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "tool_call_id": "",  # empty — sub_session_id used as fallback key
+            },
+        )
+
+        delegation_id = "ps-named::delegation::ss-self-1"
+        assert services.graph._nodes[delegation_id]["agent"] == "self"
+        assert services.graph._nodes[delegation_id]["resolved_agent"] == "foundation:explorer"
+        assert services.graph._nodes[delegation_id]["is_self_delegation"] is True
+        assert "foundation:explorer" in services.graph._nodes, (
+            "Agent concept node must be at 'foundation:explorer', not 'self'"
+        )
+        assert "self" not in services.graph._nodes, (
+            "No singleton 'self' agent concept node must be created"
+        )
+        assert ("ss-self-1", "foundation:explorer") in services.graph._edges, (
+            "HAS_AGENT edge must target 'foundation:explorer'"
+        )
+
+    async def test_self_falls_back_to_root_agent_when_parent_has_no_agent(
+        self, services: HookStateService
+    ) -> None:
+        """agent='self' with a parent node that has no agent property falls back to 'root-agent'.
+
+        No pre-seeding of the parent node.  get_node returns None ->
+        resolved_agent = 'root-agent'.
+        """
+        handler = DelegationHandler(services)
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "parent_session_id": "ps-root",
+                "sub_session_id": "ss-self-2",
+                "agent": "self",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "tool_call_id": "",  # empty — sub_session_id used as fallback key
+            },
+        )
+
+        delegation_id = "ps-root::delegation::ss-self-2"
+        assert services.graph._nodes[delegation_id]["resolved_agent"] == "root-agent"
+        assert services.graph._nodes[delegation_id]["is_self_delegation"] is True
+        assert "root-agent" in services.graph._nodes, (
+            "Agent concept node must exist at 'root-agent'"
+        )
+        assert "self" not in services.graph._nodes, (
+            "No singleton 'self' agent concept node must be created"
+        )
+
+    async def test_non_self_stores_agent_on_sub_session_node(
+        self, services: HookStateService
+    ) -> None:
+        """Non-self delegation writes the canonical agent name to the sub-session node.
+
+        This validates the write path that all future 'self' resolutions depend on:
+        when a parent session is spawned with a real agent name, that name is stored
+        on the sub-session node via ensure_session_node so that child self-delegations
+        can read it back from get_node(parent_session_id).
+        """
+        handler = DelegationHandler(services)
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "parent_session_id": "ps1",
+                "sub_session_id": "ss-named",
+                "agent": "foundation:explorer",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "tool_call_id": "tc-named",
+            },
+        )
+
+        assert services.graph._nodes["ss-named"]["agent"] == "foundation:explorer"

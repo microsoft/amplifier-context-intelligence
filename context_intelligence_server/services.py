@@ -262,6 +262,8 @@ class HookStateService:
         }
         if "started_at" in data:
             node_data["started_at"] = data["started_at"]
+        if "agent" in data:
+            node_data["agent"] = data["agent"]
 
         await self.graph.upsert_node(session_id, node_data)
         self._seen_sessions.add(session_id)  # only cache after successful write
