@@ -16,6 +16,8 @@ Semantic edges created:
   E07: RecipeRun -[HAS_RECIPE {sst_semantic: EXPRESSES}]-> Recipe
   E09: RecipeStep -[SPAWNED {sst_semantic: LEADS_TO}]-> RecipeRun (when cursor set)
   SOURCED_FROM: RecipeRun -> data_layer_1 event node
+  SPAWNED_RECIPE_RUN: Session(parent) -[SPAWNED_RECIPE_RUN {sst_semantic: LEADS_TO}]-> RecipeRun
+    (only when parent_session_id is present in the recipe:start payload)
 """
 
 from __future__ import annotations
@@ -94,6 +96,8 @@ class RecipeRunHandler:
           source_disambiguator)  — defaults to the recipe:start data_layer_1 event node
         - E09: active_recipe_step_id -[SPAWNED {sst_semantic: LEADS_TO}]-> RecipeRun
           (only when active_recipe_step_id cursor is set)
+        - SPAWNED_RECIPE_RUN: Session(parent) -[SPAWNED_RECIPE_RUN {sst_semantic: LEADS_TO}]-> RecipeRun
+          (only when parent_session_id is present in the recipe:start payload)
 
         Pushes recipe_run_id onto active_recipe_run_stack.
 
@@ -110,6 +114,7 @@ class RecipeRunHandler:
         name: str = data.get("name", "")
         total_steps: Any = data.get("total_steps")
         status: Any = data.get("status")
+        parent_session_id: str | None = data.get("parent_session_id") or None
 
         recipe_run_id = f"{session_id}::recipe_run::{timestamp}"
 
@@ -122,6 +127,7 @@ class RecipeRunHandler:
                 "started_at": timestamp,
                 "total_steps": total_steps,
                 "status": status,
+                **({"parent_session_id": parent_session_id, "is_sub_recipe": True} if parent_session_id else {}),
             },
         )
 
@@ -140,6 +146,16 @@ class RecipeRunHandler:
             recipe_run_id,
             {"type": "HAS_RECIPE_RUN", "sst_semantic": "CONTAINS"},
         )
+
+        # Cross-session sub-recipe lineage: Session(parent) -[SPAWNED_RECIPE_RUN]-> RecipeRun(child)
+        # Defensive — no-op until recipe:start payloads include parent_session_id (pending PR #72)
+        if parent_session_id:
+            await self.services.ensure_session_node(parent_session_id, {})
+            await self.services.graph.upsert_edge(
+                parent_session_id,
+                recipe_run_id,
+                {"type": "SPAWNED_RECIPE_RUN", "sst_semantic": "LEADS_TO"},
+            )
 
         # E07: RecipeRun -[HAS_RECIPE {sst_semantic: EXPRESSES}]-> Recipe
         await self.services.graph.upsert_edge(

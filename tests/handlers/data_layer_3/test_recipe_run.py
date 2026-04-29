@@ -990,3 +990,146 @@ class TestRecipeRunHandlerLoopComplete:
 
         assert result.action == "continue"
         assert len(services.graph._nodes) == 0
+
+
+# ---------------------------------------------------------------------------
+# 10. TestRecipeStartParentSessionId
+# ---------------------------------------------------------------------------
+
+
+class TestRecipeStartParentSessionId:
+    """parent_session_id cross-session lineage on recipe:start."""
+
+    async def test_root_recipe_no_parent_session_id_has_no_extra_properties(
+        self, services: HookStateService
+    ) -> None:
+        """Root recipe (no parent_session_id) must not set parent_session_id or is_sub_recipe on RecipeRun."""
+        handler = RecipeRunHandler(services)
+        data = {
+            "session_id": "sess-root",
+            "timestamp": "2026-05-01T00:00:00Z",
+            "name": "root-recipe",
+            "total_steps": 2,
+            "status": "running",
+        }
+        await handler("recipe:start", data)
+
+        recipe_run_id = "sess-root::recipe_run::2026-05-01T00:00:00Z"
+        node = await services.graph.get_node(recipe_run_id)
+        assert node is not None
+        assert "parent_session_id" not in node
+        assert "is_sub_recipe" not in node
+
+    async def test_root_recipe_no_spawned_recipe_run_edge(
+        self, services: HookStateService
+    ) -> None:
+        """Root recipe (no parent_session_id) must not create a SPAWNED_RECIPE_RUN edge."""
+        handler = RecipeRunHandler(services)
+        data = {
+            "session_id": "sess-root",
+            "timestamp": "2026-05-01T00:00:00Z",
+            "name": "root-recipe",
+            "total_steps": 2,
+            "status": "running",
+        }
+        await handler("recipe:start", data)
+
+        spawned_edges = [
+            (src, dst)
+            for (src, dst), edge in services.graph._edges.items()
+            if edge.get("type") == "SPAWNED_RECIPE_RUN"
+        ]
+        assert len(spawned_edges) == 0, (
+            "No SPAWNED_RECIPE_RUN edge must exist for a root recipe"
+        )
+
+    async def test_sub_recipe_sets_parent_session_id_on_node(
+        self, services: HookStateService
+    ) -> None:
+        """Sub-recipe (parent_session_id present) must set parent_session_id on RecipeRun node."""
+        # Pre-seed parent session node
+        await services.ensure_session_node("parent-session-001", {})
+
+        handler = RecipeRunHandler(services)
+        data = {
+            "session_id": "sess-child",
+            "timestamp": "2026-05-01T00:01:00Z",
+            "name": "sub-recipe",
+            "total_steps": 1,
+            "status": "running",
+            "parent_session_id": "parent-session-001",
+        }
+        await handler("recipe:start", data)
+
+        recipe_run_id = "sess-child::recipe_run::2026-05-01T00:01:00Z"
+        node = await services.graph.get_node(recipe_run_id)
+        assert node is not None
+        assert node["parent_session_id"] == "parent-session-001"
+
+    async def test_sub_recipe_sets_is_sub_recipe_true_on_node(
+        self, services: HookStateService
+    ) -> None:
+        """Sub-recipe (parent_session_id present) must set is_sub_recipe=True on RecipeRun node."""
+        await services.ensure_session_node("parent-session-001", {})
+
+        handler = RecipeRunHandler(services)
+        data = {
+            "session_id": "sess-child",
+            "timestamp": "2026-05-01T00:01:00Z",
+            "name": "sub-recipe",
+            "total_steps": 1,
+            "status": "running",
+            "parent_session_id": "parent-session-001",
+        }
+        await handler("recipe:start", data)
+
+        recipe_run_id = "sess-child::recipe_run::2026-05-01T00:01:00Z"
+        node = await services.graph.get_node(recipe_run_id)
+        assert node is not None
+        assert node["is_sub_recipe"] is True
+
+    async def test_sub_recipe_creates_spawned_recipe_run_edge(
+        self, services: HookStateService
+    ) -> None:
+        """Sub-recipe must create SPAWNED_RECIPE_RUN edge from parent session to RecipeRun."""
+        await services.ensure_session_node("parent-session-001", {})
+
+        handler = RecipeRunHandler(services)
+        data = {
+            "session_id": "sess-child",
+            "timestamp": "2026-05-01T00:01:00Z",
+            "name": "sub-recipe",
+            "total_steps": 1,
+            "status": "running",
+            "parent_session_id": "parent-session-001",
+        }
+        await handler("recipe:start", data)
+
+        recipe_run_id = "sess-child::recipe_run::2026-05-01T00:01:00Z"
+        edge = await services.graph.get_edge("parent-session-001", recipe_run_id)
+        assert edge is not None, (
+            "SPAWNED_RECIPE_RUN edge must exist from parent-session-001 to RecipeRun"
+        )
+        assert edge.get("type") == "SPAWNED_RECIPE_RUN"
+
+    async def test_sub_recipe_spawned_recipe_run_edge_has_leads_to_semantic(
+        self, services: HookStateService
+    ) -> None:
+        """SPAWNED_RECIPE_RUN edge must carry sst_semantic=LEADS_TO."""
+        await services.ensure_session_node("parent-session-001", {})
+
+        handler = RecipeRunHandler(services)
+        data = {
+            "session_id": "sess-child",
+            "timestamp": "2026-05-01T00:01:00Z",
+            "name": "sub-recipe",
+            "total_steps": 1,
+            "status": "running",
+            "parent_session_id": "parent-session-001",
+        }
+        await handler("recipe:start", data)
+
+        recipe_run_id = "sess-child::recipe_run::2026-05-01T00:01:00Z"
+        edge = await services.graph.get_edge("parent-session-001", recipe_run_id)
+        assert edge is not None
+        assert edge.get("sst_semantic") == "LEADS_TO"

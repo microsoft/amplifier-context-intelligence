@@ -590,6 +590,17 @@ digraph graph_model {
         constraint = false
     ]
 
+    // L3-E12: SPAWNED_RECIPE_RUN [LEADS_TO] -- Session(parent) -> RecipeRun (cross-session sub-recipe lineage)
+    // Only present when recipe:start payload includes parent_session_id (pending PR #72)
+    "Session(parent)" -> RecipeRun [
+        label     = "L3-E12: SPAWNED_RECIPE_RUN\n{sst_semantic: LEADS_TO}\n(cross-session, when parent_session_id set)"
+        color     = "#888888"
+        fontcolor = "#888888"
+        penwidth  = 1.5
+        style     = dashed
+        constraint = false
+    ]
+
     // L3-E10: TRIGGERED [LEADS_TO] -- RecipeStep -> Delegation
     RecipeStep -> Delegation [
         label     = "L3-E10: TRIGGERED\n{sst_semantic: LEADS_TO}"
