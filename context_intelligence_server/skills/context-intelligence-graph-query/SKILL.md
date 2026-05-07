@@ -170,6 +170,7 @@ WITH s ORDER BY s.started_at DESC LIMIT 1
 MATCH (s)-[:HAS_EXECUTION|HAS_PART*1..3]->(e:SST_EVENT)
 RETURN labels(e) AS types, e.node_id, e.started_at
 ORDER BY e.started_at
+LIMIT 50
 ```
 
 **Example — find all abstract concepts referenced by a session:**
@@ -205,6 +206,7 @@ containment, and concurrence uniformly.
 MATCH (s:Session {workspace: $workspace, node_id: $session_id})-[r]->(target)
 WHERE r.sst_semantic = 'LEADS_TO'
 RETURN type(r) AS edge_type, r.sst_semantic, labels(target) AS target_type, target.node_id
+LIMIT 50
 ```
 
 **Example — find all concurrent tool calls in the session:**
@@ -520,7 +522,11 @@ RETURN p.started_at           AS turn_start,
        tc.result_success      AS succeeded,
        tc.started_at          AS tool_start
 ORDER BY p.started_at, iter.iteration_number, tc.started_at
+LIMIT 100
 ```
+
+> **Size note:** Run a count query first (`count(tc)`) if the session has more than a few
+> turns. Raise the limit only after confirming the total is manageable. Use SKIP to paginate.
 
 ### Pattern 2 — Tool Usage Per LLM Iteration
 
@@ -536,6 +542,7 @@ RETURN iter.iteration_number  AS iteration,
        collect(tc.tool_name)  AS tools_called,
        count(tc)              AS tool_count
 ORDER BY iter.iteration_number
+LIMIT 50
 ```
 
 ### Pattern 3 — Parallel Tool Groups
@@ -554,6 +561,7 @@ RETURN tc1.parallel_group_id   AS group_id,
        tc2.tool_name            AS tool_b,
        tc1.started_at           AS started_at
 ORDER BY tc1.started_at
+LIMIT 50
 ```
 
 ### Pattern 4 — ContentBlock → ToolCall Causation
@@ -573,6 +581,7 @@ RETURN iter.iteration_number   AS iteration,
        tc.tool_name             AS tool_triggered,
        tc.result_success        AS succeeded
 ORDER BY iter.iteration_number, block.block_index
+LIMIT 100
 ```
 
 ### Pattern 5 — Session Comparison
@@ -611,7 +620,12 @@ RETURN s.node_id              AS session,
        tc.result_error        AS error,
        tc.started_at          AS failed_at
 ORDER BY tc.started_at
+LIMIT 50
 ```
+
+> **Size note:** This query spans ALL sessions in the workspace. Scope to a single session
+> with `AND s.node_id = $session_id` to limit exposure, or add `ORDER BY tc.started_at DESC`
+> to retrieve the most recent failures first.
 
 ### Pattern 7 — Data Layer 1 / Data Layer 2 Cross-Layer Join
 
@@ -630,6 +644,7 @@ RETURN pre.tool_name          AS tool_name,
        tc.result_output       AS output_preview,
        tc.ended_at            AS completed_at
 ORDER BY pre.occurred_at
+LIMIT 50
 ```
 
 ### Pattern 8 — SOURCED_FROM Cross-Layer Navigation
@@ -651,7 +666,11 @@ RETURN iter.iteration_number  AS iteration,
        pre.occurred_at         AS event_fired_at,
        pre.data                AS raw_payload
 ORDER BY pre.occurred_at
+LIMIT 25
 ```
+
+> **Size note:** `pre.data` may be a `ci-blob://` URI or a large JSON string. Limit to 25 rows
+> and follow the blob handling workflow (Section 5) before loading any `data` field.
 
 ### Delegation Tree
 
@@ -666,6 +685,7 @@ MATCH (s:Session {workspace: $workspace, node_id: $session_id})
 RETURN d.agent, d.sub_session_id, d.context_depth,
        d.started_at, d.ended_at, tc.tool_name AS via_tool
 ORDER BY d.started_at
+LIMIT 50
 ```
 
 ### Skills Active Per Iteration
@@ -677,6 +697,7 @@ MATCH (s:Session {workspace: $workspace, node_id: $session_id})
       -[:HAS_SKILL_LOAD]->(sl:SkillLoad)
 RETURN iter.iteration_number, sl.skill_name, sl.content_length, sl.loaded_at
 ORDER BY iter.iteration_number, sl.loaded_at
+LIMIT 100
 ```
 
 ### Recipe Run Trace
@@ -689,7 +710,273 @@ OPTIONAL MATCH (step)-[:TRIGGERED]->(target)
 RETURN rr.name, step.name, step.status,
        labels(target) AS triggered_type, target.node_id AS triggered_id
 ORDER BY step.step_id
+LIMIT 50
 ```
+
+---
+
+## Section 7 — Result Size Management and Pagination
+
+The graph can hold hundreds or thousands of sessions, each containing many events, tool
+calls, and semantic nodes. Returning results without limits is the most common way to
+destroy your context window. Every query must be designed with size in mind.
+
+---
+
+### The Cardinal Rule: Always LIMIT
+
+**Every query that traverses unbounded data MUST include a `LIMIT` clause.** There are
+no exceptions. A session with 50 turns and 300 tool calls will return 300+ rows from an
+unguarded Pattern 1 query. Multiplied across even 10 sessions, that is 3,000+ rows —
+enough to saturate the context window before you have read a single result.
+
+```cypher
+// WRONG — no LIMIT, will return everything
+MATCH (s:Session {workspace: $workspace})
+      -[:HAS_EXECUTION]->(:OrchestratorRun)
+      -[:HAS_PART]->(:Iteration)
+      -[:HAS_TOOL_CALL]->(tc:ToolCall)
+RETURN tc.tool_name, tc.started_at
+
+// CORRECT — bounded
+MATCH (s:Session {workspace: $workspace})
+      -[:HAS_EXECUTION]->(:OrchestratorRun)
+      -[:HAS_PART]->(:Iteration)
+      -[:HAS_TOOL_CALL]->(tc:ToolCall)
+RETURN tc.tool_name, tc.started_at
+ORDER BY tc.started_at
+LIMIT 50
+```
+
+---
+
+### Safe Default LIMIT Values by Query Type
+
+Use these defaults when you do not know the expected result size in advance. Reduce
+further if the query is part of a larger multi-step analysis.
+
+| Query type | Safe default LIMIT | Notes |
+|---|---|---|
+| Session listing | 10 | Very wide rows (many properties) |
+| Tool call listing | 50 | One row per call; can be large per session |
+| Event listing | 25 | `data` field makes rows wide |
+| Iteration listing | 25 | One row per LLM round-trip |
+| Delegation listing | 25 | Usually sparse, but can be large in recipe sessions |
+| Cross-layer joins | 25 | Double the data per row |
+| Aggregation / GROUP BY | 50 | Aggregated rows are lean |
+| Path / hierarchy traversal | 25 | Variable row width |
+| Full conversation trace | 50 | One row per tool call across all turns |
+
+If you need more rows than the safe default, always run a COUNT query first (see below)
+to understand the actual result size before raising the limit.
+
+---
+
+### Count-First Pattern (Always Run Before Wide Queries)
+
+Before executing any query that returns multi-field rows over an unknown population,
+run a count-first query to understand the scale. This costs almost nothing and prevents
+context overflow.
+
+```cypher
+// Step 1 — count first (cheap)
+MATCH (s:Session {workspace: $workspace})
+      -[:HAS_EXECUTION]->(:OrchestratorRun)
+      -[:HAS_PART]->(:Iteration)
+      -[:HAS_TOOL_CALL]->(tc:ToolCall)
+WHERE s.node_id = $session_id
+RETURN count(tc) AS total_tool_calls
+```
+
+```cypher
+// Step 2 — retrieve data only after you know the count
+// If total_tool_calls > 50, use pagination (see SKIP/LIMIT below)
+MATCH (s:Session {workspace: $workspace, node_id: $session_id})
+      -[:HAS_EXECUTION]->(:OrchestratorRun)
+      -[:HAS_PART]->(iter:Iteration)
+      -[:HAS_TOOL_CALL]->(tc:ToolCall)
+RETURN iter.iteration_number, tc.tool_name, tc.result_success, tc.started_at
+ORDER BY tc.started_at
+LIMIT 50
+```
+
+Apply this pattern whenever you are querying a session you have not seen before, or when
+querying across multiple sessions at once.
+
+---
+
+### SKIP + LIMIT Pagination Pattern
+
+When you need more results than the safe default, paginate using `SKIP` and `LIMIT`.
+Never raise the limit beyond 200 rows per page — the context cost of wide rows
+compounds quickly.
+
+```cypher
+// Page 1 — first 50 results
+MATCH (s:Session {workspace: $workspace, node_id: $session_id})
+      -[:HAS_EXECUTION]->(:OrchestratorRun)
+      -[:HAS_PART]->(iter:Iteration)
+      -[:HAS_TOOL_CALL]->(tc:ToolCall)
+RETURN iter.iteration_number, tc.tool_name, tc.result_success, tc.started_at
+ORDER BY tc.started_at
+SKIP 0 LIMIT 50
+
+// Page 2 — next 50
+MATCH (s:Session {workspace: $workspace, node_id: $session_id})
+      -[:HAS_EXECUTION]->(:OrchestratorRun)
+      -[:HAS_PART]->(iter:Iteration)
+      -[:HAS_TOOL_CALL]->(tc:ToolCall)
+RETURN iter.iteration_number, tc.tool_name, tc.result_success, tc.started_at
+ORDER BY tc.started_at
+SKIP 50 LIMIT 50
+```
+
+**Pagination rules:**
+- Always include `ORDER BY` before `SKIP`/`LIMIT` — without it, page boundaries are
+  non-deterministic and you may see duplicate or missing rows across pages.
+- Use a stable, unique sort key (`started_at` + `node_id` as tiebreaker) to guarantee
+  consistent ordering across pages.
+- Stop paginating when the returned row count is less than the page size — that signals
+  the last page.
+
+---
+
+### Progressive Exploration Strategy
+
+For unfamiliar sessions or multi-session queries, always follow a three-phase funnel.
+Going straight to full detail is almost always a mistake.
+
+**Phase 1 — Orient (counts and summaries only)**
+
+```cypher
+// How many sessions, how large?
+MATCH (s:Session {workspace: $workspace})
+OPTIONAL MATCH (s)-[:HAS_EXECUTION]->(:OrchestratorRun)-[:HAS_PART]->(iter:Iteration)
+RETURN s.node_id, s.started_at, s.status, count(iter) AS iteration_count
+ORDER BY s.started_at DESC
+LIMIT 10
+```
+
+**Phase 2 — Scope (aggregated view of the target session)**
+
+```cypher
+// What happened in this session, at a glance?
+MATCH (s:Session {workspace: $workspace, node_id: $session_id})
+OPTIONAL MATCH (s)-[:HAS_EXECUTION]->(:OrchestratorRun)-[:HAS_PART]->(iter:Iteration)
+OPTIONAL MATCH (iter)-[:HAS_TOOL_CALL]->(tc:ToolCall)
+RETURN count(DISTINCT iter) AS iterations,
+       count(DISTINCT tc)   AS tool_calls,
+       sum(CASE WHEN tc.result_success = false THEN 1 ELSE 0 END) AS failures
+```
+
+**Phase 3 — Drill (filtered, bounded detail)**
+
+```cypher
+// Now retrieve the specific rows you need, filtered and limited
+MATCH (s:Session {workspace: $workspace, node_id: $session_id})
+      -[:HAS_EXECUTION]->(:OrchestratorRun)
+      -[:HAS_PART]->(iter:Iteration)
+      -[:HAS_TOOL_CALL]->(tc:ToolCall)
+WHERE tc.result_success = false   -- focus on failures only
+RETURN iter.iteration_number, tc.tool_name, tc.result_error, tc.started_at
+ORDER BY tc.started_at
+LIMIT 25
+```
+
+This funnel ensures you only load detailed rows for the subset you actually need.
+
+---
+
+### Bounding Variable-Length Path Traversal
+
+Variable-length path patterns (`*`, `*1..N`) can fanout explosively on large or deeply
+nested graphs. Always bound them.
+
+```cypher
+// DANGEROUS — unbounded path, will traverse everything reachable
+MATCH (s:Session {workspace: $workspace, node_id: $session_id})
+      -[:HAS_EXECUTION|HAS_PART*]->(descendant)
+RETURN labels(descendant), descendant.node_id
+
+// SAFE — bounded depth (3 hops covers the full Session→Run→Iter→Block hierarchy)
+MATCH (s:Session {workspace: $workspace, node_id: $session_id})
+      -[:HAS_EXECUTION|HAS_PART*1..3]->(descendant)
+RETURN labels(descendant), descendant.node_id
+ORDER BY descendant.started_at
+LIMIT 100
+```
+
+**Recommended depth bounds:**
+- `*1..2` — Session → Run → Iteration (stops before ContentBlock/ToolCall)
+- `*1..3` — Session → Run → Iteration → ContentBlock (full semantic hierarchy)
+- `*1..4` — includes ToolCall via ContentBlock (only if you need CAUSED edges)
+- Avoid `*` or `*1..10` entirely — use explicit typed-edge chains instead.
+
+---
+
+### Filtering Before Returning (Reduce in Graph, Not in Client)
+
+Apply `WHERE` filters inside the Cypher query rather than retrieving all rows and
+filtering in the calling code. Every unneeded row is context tokens wasted.
+
+```cypher
+// INEFFICIENT — retrieve all tool calls, filter in code
+MATCH (s:Session {workspace: $workspace, node_id: $session_id})
+      -[:HAS_EXECUTION]->(:OrchestratorRun)
+      -[:HAS_PART]->(iter:Iteration)
+      -[:HAS_TOOL_CALL]->(tc:ToolCall)
+RETURN tc.tool_name, tc.result_success, tc.started_at
+LIMIT 200
+
+// EFFICIENT — filter in Cypher, return only what you need
+MATCH (s:Session {workspace: $workspace, node_id: $session_id})
+      -[:HAS_EXECUTION]->(:OrchestratorRun)
+      -[:HAS_PART]->(iter:Iteration)
+      -[:HAS_TOOL_CALL]->(tc:ToolCall)
+WHERE tc.tool_name = 'delegate'
+  AND tc.started_at > $cutoff_time
+RETURN tc.tool_name, tc.result_success, tc.started_at
+ORDER BY tc.started_at
+LIMIT 50
+```
+
+**Common filter strategies:**
+- Filter by `session_id` first to scope to one session before retrieving detailed data.
+- Use `tool_name` filters to narrow tool call queries to the tool you care about.
+- Use `started_at` range filters to limit time-based queries.
+- Use `result_success = false` to focus on error analysis.
+- Use `LIMIT 1` with `ORDER BY ... DESC` to get the single most recent item.
+
+---
+
+### Multi-Session Queries: Extra Caution
+
+Queries that span multiple sessions multiply the row count by the number of sessions
+matched. Always add an explicit session count guard or use `WHERE s.node_id IN [...]`
+to constrain to a known set.
+
+```cypher
+// DANGEROUS — matches all sessions in workspace, multiplies rows
+MATCH (s:Session {workspace: $workspace})
+      -[:HAS_EXECUTION]->(:OrchestratorRun)
+      -[:HAS_PART]->(iter:Iteration)
+      -[:HAS_TOOL_CALL]->(tc:ToolCall)
+RETURN s.node_id, tc.tool_name, tc.result_success
+LIMIT 50  // 50 rows across ALL sessions — almost certainly not what you want
+
+// SAFE — one session at a time
+MATCH (s:Session {workspace: $workspace, node_id: $session_id})
+      ...
+
+// SAFE — explicit set of sessions
+MATCH (s:Session {workspace: $workspace})
+WHERE s.node_id IN [$session_a, $session_b, $session_c]
+      ...
+LIMIT 50  // 50 rows across 3 known sessions — controlled
+```
+
+When you do need cross-session analysis, use aggregation (COUNT, collect, GROUP BY)
+to collapse results before returning them, then drill into specific sessions.
 
 ---
 
@@ -755,3 +1042,22 @@ Unlike `SST_EVENT` entities, `Agent` and `Recipe` nodes are merged by name acros
 
 **10. `SkillLoad` may attach to `Session` directly, not `Iteration`.**
 Skills loaded before the first `provider:request` have no active `Iteration`. The `HAS_SKILL_LOAD` edge then comes from `Session` rather than `Iteration`. Pattern "Skills Active Per Iteration" only returns skills tied to an iteration — add `OPTIONAL MATCH (s)-[:HAS_SKILL_LOAD]->(sl:SkillLoad)` to catch session-level loads.
+
+**11. Unbounded queries will destroy your context window.**
+A graph with many sessions is NOT like a small in-memory dataset. Each session can have
+hundreds of tool calls, thousands of events, and dozens of iterations. A query with no
+`LIMIT` clause against the whole workspace can return tens of thousands of rows, saturating
+the context window before any result can be processed. Three mandatory habits:
+
+1. **Always LIMIT.** Every query that traverses tool calls, events, or iterations must have
+   `LIMIT N`. Start at the safe defaults from Section 7. Raise only after counting.
+
+2. **Count before widening.** If you need to understand the full extent of a dataset, run a
+   `count()` aggregation first. The count result is a single number — it costs almost nothing.
+   Then decide whether the actual rows are safe to retrieve.
+
+3. **Anchor on a session before traversing.** The pattern `MATCH (s:Session {workspace: $workspace})`
+   without a `node_id` filter spans every session. Add `node_id: $session_id` or
+   `WHERE s.node_id IN [...]` to constrain the starting set before any traversal.
+
+See Section 7 for the complete size management and pagination reference.
