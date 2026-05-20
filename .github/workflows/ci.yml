@@ -21,7 +21,7 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --dev
 
       - name: Run tests
         run: uv run pytest tests/ -q -m "not neo4j"
