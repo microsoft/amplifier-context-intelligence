@@ -14,7 +14,7 @@ if [ ! -f "${CREDENTIALS_FILE}" ] || [ ! -f "${NEO4J_AUTH_FILE}" ]; then
     API_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 
     cat > "${CREDENTIALS_FILE}.tmp" <<EOF
-neo4j_url: neo4j://neo4j:7687
+neo4j_url: bolt://neo4j:7687
 neo4j_user: neo4j
 neo4j_password: ${NEO4J_PASSWORD}
 api_key: ${API_KEY}

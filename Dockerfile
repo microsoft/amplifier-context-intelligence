@@ -13,4 +13,5 @@ RUN pip install --no-cache-dir .
 
 EXPOSE 8000
 
+ENTRYPOINT ["./docker-entrypoint.sh"]
 CMD ["gunicorn", "context_intelligence_server.main:asgi_app", "--worker-class", "uvicorn.workers.UvicornWorker", "--workers", "1", "--bind", "0.0.0.0:8000", "--timeout", "30", "--graceful-timeout", "10"]

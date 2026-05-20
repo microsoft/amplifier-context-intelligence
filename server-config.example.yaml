@@ -16,16 +16,16 @@
 # "Neo4j URL" chip) so operators can see at a glance which database the
 # server is connected to.
 # -----------------------------------------------------------------------------
-neo4j_url: neo4j://localhost:7687          # bolt/neo4j driver URL — used for all graph queries
+neo4j_url: bolt://localhost:7687           # bolt driver URL — use bolt:// for Community Edition single-node
 neo4j_browser_url: http://localhost:7474  # Neo4j HTTP browser UI — displayed as a clickable link in the web UI
 neo4j_user: neo4j
 neo4j_password: ""          # Empty only for local Neo4j with NEO4J_AUTH=none (dev only).
                              # Docker and production deployments always use a password.
-                             # Run: context-intelligence-server-init to generate one.
+                             # Run: context-intelligence-server init  --neo4j-url bolt://localhost:7687  --neo4j-user neo4j
 
 # -----------------------------------------------------------------------------
 # Authentication
-# Generate with: context-intelligence-server-init
+# Generate with: context-intelligence-server init
 # When set, all API endpoints (except /status) require:
 #   Authorization: Bearer <api_key>
 # When absent or empty, no authentication is required (local dev only).
@@ -36,9 +36,9 @@ api_key: ""                 # Empty or absent = auth disabled (local dev). Set t
 # Storage paths
 # All three directories are created automatically on first start.
 # -----------------------------------------------------------------------------
-blob_path: /home/user/.local/share/ci-server/blobs
-log_path:  /home/user/.local/share/ci-server/logs/server.jsonl
-cursor_path: /home/user/.local/share/ci-server/cursors
+blob_path: ~/amplifier-context-intelligence-server-data-store/blobs
+log_path:  ~/amplifier-context-intelligence-server-data-store/logs/server.jsonl
+cursor_path: ~/amplifier-context-intelligence-server-data-store/cursors
 
 # -----------------------------------------------------------------------------
 # Server bind address
