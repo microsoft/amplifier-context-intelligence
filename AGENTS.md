@@ -1,90 +1,101 @@
-# Amplifier Development Workspace
+# Context Intelligence Server
 
-@amplifier:docs/MODULES.md
-@amplifier:docs/REPOSITORY_RULES.md
+Event-driven telemetry platform for [Amplifier](https://github.com/microsoft/amplifier) sessions.
+Captures session events as structured data and builds a property graph in Neo4j.
+
+## Quick Overview
+
+```
+Amplifier CLI → hook (POST /events) → Ingestion Server (:8000) → Neo4j graph + blob storage
+```
+
+See [README.md](README.md) for full setup instructions.
 
 ---
 
-## This Workspace Uses Submodules
-
-Your code lives HERE as git submodules, NOT in `~/.amplifier/cache/`:
+## Project Structure
 
 ```
-./
-├── AGENTS.md              # This file
-├── SCRATCH.md             # Working memory (create as needed)
-├── amplifier/             # Submodule - EDIT HERE
-├── amplifier-core/        # Submodule - EDIT HERE
-└── amplifier-foundation/  # Submodule - EDIT HERE
+context_intelligence_server/      # FastAPI ingestion server
+├── main.py                       # App factory, routes, lifespan
+├── config.py                     # Settings (YAML + env vars via Pydantic)
+├── pipeline.py                   # Event dispatch pipeline
+├── neo4j_store.py                # Buffered Neo4j writes
+├── blob_store.py                 # Async disk blob storage
+├── handlers/                     # Event handlers (data_layer_1/2/3)
+│   ├── data_layer_1/             # Session/tool-call handlers
+│   ├── data_layer_2/             # Graph enrichment handlers
+│   └── data_layer_3/             # High-level insight handlers
+├── auth.py                       # API key authentication
+├── dashboard.py                  # Dashboard SSE stream
+├── models.py                     # Pydantic request/response models
+└── web/                          # Dashboard HTML + static assets
+
+docs/
+├── architecture/                 # DOT diagrams: pipeline, handlers, graph model
+└── service-setup.md              # Running as a system service
+
+tests/
+├── handlers/                     # Handler unit tests
+├── integration/                  # Pipeline integration tests
+└── neo4j/                        # Tests requiring a live Neo4j instance
 ```
 
-## Clone Repos Eagerly
+---
 
-When you need to explore or modify ANY Amplifier ecosystem code:
+## Running Tests
+
+Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
 
 ```bash
-# Add as submodule immediately - consult MODULES.md for URLs
-git submodule add https://github.com/microsoft/amplifier-module-xyz.git
+uv sync
+uv run pytest tests/ -q                    # All tests (no Neo4j required)
+uv run pytest tests/neo4j/ -q              # Neo4j tests (requires running instance)
 ```
 
-**Don't** read from `~/.amplifier/cache/` - that's the installed CLI's runtime code.
-**Do** clone repos here where changes are git-tracked.
+Most tests run against in-memory fakes. The `tests/neo4j/` suite requires a live Neo4j 5.x instance — see `tests/neo4j/conftest.py` for connection details.
 
-## Workspace Lifecycle
+---
 
-1. **Create**: `amplifier-dev ~/work/feature-name`
-2. **Work**: Changes go in submodules, commit often
-3. **Push**: Push submodule changes to their repos
-4. **Destroy**: `amplifier-dev -d ~/work/feature-name`
+## Running the Server Locally
 
-The workspace is disposable. Your work persists because you push to the repos.
+```bash
+# 1. Start Neo4j (Docker, easiest)
+docker run -d --name neo4j-ci \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=none \
+  neo4j:5.26.22-community
 
-## Testing Local Changes
+# 2. Configure and start the server
+cp server-config.example.yaml server-config.yaml
+# Edit server-config.yaml with your Neo4j connection details
 
-### Option 1: Shadow Environment (Recommended)
-
-For complete isolation, use shadow environments:
-
-```python
-# Create isolated environment with your local changes
-shadow.create(local_sources=[
-    "./amplifier-core:microsoft/amplifier-core",
-    "./amplifier-foundation:microsoft/amplifier-foundation"
-])
-
-# Test in complete isolation
-shadow.exec(shadow_id, "uv tool install git+https://github.com/microsoft/amplifier")
-shadow.exec(shadow_id, "amplifier run 'test my changes'")
-
-# Clean up
-shadow.destroy(shadow_id)
+# 3. Start
+uvicorn context_intelligence_server.main:app --reload
 ```
 
-### Option 2: Local Source Overrides
+Or use Docker Compose to run everything together:
 
-Create `.amplifier/settings.yaml` in this workspace:
-
-```yaml
-sources:
-  amplifier-core:
-    type: local
-    path: ./amplifier-core
-  amplifier-foundation:
-    type: local
-    path: ./amplifier-foundation
+```bash
+./start.sh
 ```
 
-Then `amplifier run` uses your workspace copies.
+---
 
-## Working Memory: SCRATCH.md
+## Key Concepts
 
-For long sessions, maintain a `SCRATCH.md`:
-- Current focus (one sentence)
-- Key decisions made
-- Next actions
+- **Event pipeline** — `POST /events` queues work; handlers process events asynchronously. Each handler is a Python class in `handlers/data_layer_*/`.
+- **Graph model** — 5 node types, 8 edge types. See `docs/architecture/03-graph-model.dot` for the diagram and `docs/architecture/README.md` for the legend.
+- **Blob storage** — Large event payloads are written to disk and referenced by URI to avoid graph bloat.
+- **Configuration** — Pydantic Settings reads from `server-config.yaml` first, then environment variables. See `config.py`.
 
-Prune aggressively - if it doesn't inform the NEXT action, remove it.
+---
 
-## Project Notes
+## Making Changes
 
-[Task-specific notes go here]
+- **New handler**: Add a class to the appropriate `handlers/data_layer_*/` directory, register it in `handlers/__init__.py`.
+- **New API endpoint**: Add a route to `main.py` or a new router under `routers/`.
+- **Configuration**: Add fields to `ServerConfig` in `config.py`. Keep defaults conservative.
+- **Tests**: Every handler should have a unit test in `tests/handlers/`. Integration tests live in `tests/integration/`.
+
+Run `uv run pytest tests/ -q` to verify before committing.
