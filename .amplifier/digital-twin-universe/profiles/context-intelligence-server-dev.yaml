@@ -23,7 +23,7 @@ description: >
       .amplifier/digital-twin-universe/profiles/context-intelligence-server-dev.yaml \
       --var WORKSPACE=my-experiment
 
-  Update flow (pulls latest feat/data-layer-3 from GitHub):
+  Update flow (pulls latest main from GitHub):
     amplifier-digital-twin update <id>
 
   Variables:
@@ -46,7 +46,7 @@ passthrough:
     - name: context-intelligence-auth
       key_env: AMPLIFIER_CONTEXT_INTELLIGENCE_API_KEY
 
-# No pypi_overrides — server is installed directly from the feat/data-layer-3 branch
+# No pypi_overrides — server is installed directly from the main branch
 # via git+https in setup_cmds after GH_TOKEN credentials are configured.
 
 provision:
@@ -57,7 +57,7 @@ provision:
     # 2. Install uv
     - curl -LsSf https://astral.sh/uv/install.sh | sh && export PATH="/root/.local/bin:$PATH"
 
-    # 3. Configure git credentials for private GitHub repos
+    # 3. Configure git credentials for authenticated GitHub access
     - |
       if [ -n "$GH_TOKEN" ]; then
         echo "machine github.com login x-token-auth password $GH_TOKEN" > /root/.netrc
@@ -95,9 +95,9 @@ provision:
       uv venv /opt/ci-venv --python python3
       source /opt/ci-venv/bin/activate
       if [ -n "$GH_TOKEN" ]; then
-        REPO_URL="git+https://x-token-auth:${GH_TOKEN}@github.com/microsoft/amplifier-context-intelligence.git@feat/data-layer-3"
+        REPO_URL="git+https://x-token-auth:${GH_TOKEN}@github.com/microsoft/amplifier-context-intelligence.git@main"
       else
-        REPO_URL="git+https://github.com/microsoft/amplifier-context-intelligence.git@feat/data-layer-3"
+        REPO_URL="git+https://github.com/microsoft/amplifier-context-intelligence.git@main"
       fi
       uv pip install "$REPO_URL" uvicorn
 
@@ -204,7 +204,7 @@ update:
     - sleep 1
     - |
       source /opt/ci-venv/bin/activate
-      uv pip install --upgrade "git+https://github.com/microsoft/amplifier-context-intelligence.git@feat/data-layer-3"
+      uv pip install --upgrade "git+https://github.com/microsoft/amplifier-context-intelligence.git@main"
     - |
       source /opt/ci-venv/bin/activate
       . /etc/environment
