@@ -4,6 +4,7 @@ import asyncio
 import dataclasses
 import time
 from collections import deque
+from collections.abc import AsyncGenerator
 from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -122,8 +123,29 @@ class TestCompletedSession:
 
 
 @pytest.fixture
-def registry() -> SessionRegistry:
-    return SessionRegistry()
+async def registry() -> AsyncGenerator[SessionRegistry, None]:
+    """Isolated SessionRegistry; cancels any orphaned drain tasks on teardown.
+
+    Using an async fixture ensures the event loop is available so we can
+    properly await task cancellation.  This prevents asyncio tasks created by
+    get_or_create() from leaking across tests and stalling the event loop
+    (particularly relevant for Python 3.11 where task cancellation requires
+    the event loop to run).
+    """
+    reg = SessionRegistry()
+    yield reg
+    # Cancel any drain tasks still running at the end of the test
+    for w in list(reg._workers.values()):
+        if w.task and not w.task.done():
+            w.task.cancel()
+    # Gather all tasks (suppress CancelledError/TimeoutError from each)
+    all_tasks = [
+        w.task
+        for w in reg._workers.values()
+        if w.task is not None and not w.task.done()
+    ]
+    if all_tasks:
+        await asyncio.gather(*all_tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio

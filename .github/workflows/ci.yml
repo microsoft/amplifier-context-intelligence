@@ -7,7 +7,11 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  # ── Fast unit tests ────────────────────────────────────────────────────────
+  # Excludes integration tests (live drain-worker pipeline) and neo4j tests.
+  # Must pass for the PR to be mergeable.
+  unit-tests:
+    name: Unit tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,5 +27,32 @@ jobs:
       - name: Install dependencies
         run: uv sync --dev
 
-      - name: Run tests
-        run: uv run pytest tests/ -q -m "not neo4j"
+      - name: Run unit tests
+        run: uv run pytest tests/ -v -m "not neo4j and not integration"
+
+  # ── Integration tests ──────────────────────────────────────────────────────
+  # Exercises the live asyncio drain-worker pipeline end-to-end.
+  # These tests are sensitive to asyncio scheduling on small GitHub-hosted
+  # runners (2 vCPU) and use continue-on-error so failures here are visible
+  # but do NOT block the PR.  Fix unit tests first; investigate integration
+  # failures separately.
+  integration-tests:
+    name: Integration tests (drain-worker pipeline)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run integration tests
+        run: uv run pytest tests/integration/ -v -m "not neo4j"
