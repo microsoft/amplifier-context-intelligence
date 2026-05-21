@@ -29,7 +29,10 @@ include = ["context_intelligence_server/**"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-markers = ["neo4j: marks tests as requiring a live Neo4j container (deselect with -m 'not neo4j')"]
+markers = [
+    "neo4j: marks tests as requiring a live Neo4j container (deselect with -m 'not neo4j')",
+    "integration: marks tests that exercise live async drain-workers or the full HTTP pipeline (deselect with -m 'not integration')",
+]
 timeout = 30
 
 [dependency-groups]

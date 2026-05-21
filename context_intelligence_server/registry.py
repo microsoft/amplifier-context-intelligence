@@ -101,48 +101,17 @@ class SessionRegistry:
         handlers = setup_handlers(worker.services)
 
         while True:
+            # Use asyncio.timeout (Python ≥ 3.11) instead of asyncio.wait_for so
+            # that external task cancellation propagates cleanly.  asyncio.wait_for
+            # has a known Python 3.11 bug where cancelling the outer task while it
+            # is inside wait_for(queue.get(), timeout=T) requires two event-loop
+            # iterations to complete; the second iteration never arrives when a sync
+            # pytest fixture calls task.cancel() without awaiting, leaving orphaned
+            # tasks that deadlock the event loop.  asyncio.timeout does not have
+            # this race condition.
             try:
-                event_tuple = await asyncio.wait_for(
-                    worker.queue.get(), timeout=flush_timeout
-                )
-                event, _workspace, data = event_tuple
-                await self._process_one(worker, event, data, handlers)
-
-                if event == "session:end":
-                    # Drain any tail events already in the queue
-                    while True:
-                        try:
-                            tail_event, _tail_ws, tail_data = worker.queue.get_nowait()
-                            await self._process_one(
-                                worker, tail_event, tail_data, handlers
-                            )
-                        except asyncio.QueueEmpty:
-                            break
-
-                    # Record the completed session
-                    ended_at = time.time()
-                    self._completed.append(
-                        CompletedSession(
-                            session_id=worker.session_id,
-                            workspace=worker.workspace,
-                            started_at=worker.started_at,
-                            ended_at=ended_at,
-                            events_processed=worker.events_processed,
-                            error_count=worker.error_count,
-                            duration_seconds=ended_at - worker.started_at,
-                        )
-                    )
-
-                    try:
-                        await worker.services.graph.close()
-                    except Exception:
-                        logger.exception(
-                            "graph.close failed for session %s", worker.session_id
-                        )
-
-                    self._deregister(worker.session_id)
-                    break
-
+                async with asyncio.timeout(flush_timeout):
+                    event_tuple = await worker.queue.get()
             except asyncio.TimeoutError:
                 # Periodic fallback flush for disconnected sessions.
                 # Route through schedule_flush() — NOT flush() directly — so the
@@ -170,6 +139,7 @@ class SessionRegistry:
                         )
                     self._deregister(worker.session_id)
                     break
+                continue
 
             except asyncio.CancelledError:
                 try:
@@ -179,6 +149,43 @@ class SessionRegistry:
                         "graph.close failed on cancel for session %s",
                         worker.session_id,
                     )
+                break
+
+            # --- happy path: we have an event ---
+            event, _workspace, data = event_tuple
+            await self._process_one(worker, event, data, handlers)
+
+            if event == "session:end":
+                # Drain any tail events already in the queue
+                while True:
+                    try:
+                        tail_event, _tail_ws, tail_data = worker.queue.get_nowait()
+                        await self._process_one(worker, tail_event, tail_data, handlers)
+                    except asyncio.QueueEmpty:
+                        break
+
+                # Record the completed session
+                ended_at = time.time()
+                self._completed.append(
+                    CompletedSession(
+                        session_id=worker.session_id,
+                        workspace=worker.workspace,
+                        started_at=worker.started_at,
+                        ended_at=ended_at,
+                        events_processed=worker.events_processed,
+                        error_count=worker.error_count,
+                        duration_seconds=ended_at - worker.started_at,
+                    )
+                )
+
+                try:
+                    await worker.services.graph.close()
+                except Exception:
+                    logger.exception(
+                        "graph.close failed for session %s", worker.session_id
+                    )
+
+                self._deregister(worker.session_id)
                 break
 
     def start_drain(self, worker: SessionWorker) -> None:
