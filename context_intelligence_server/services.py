@@ -260,8 +260,11 @@ class HookStateService:
             "status": "running",
             "session_id": session_id,  # explicit property — enables direct query without HAS_EVENT traversal
         }
-        if "started_at" in data:
-            node_data["started_at"] = data["started_at"]
+        # Kernel events carry the wall-clock under data["timestamp"]; older callers
+        # may pass an explicit "started_at" — accept either, but never write an empty value.
+        _ts = data.get("timestamp") or data.get("started_at")
+        if _ts:
+            node_data["started_at"] = _ts
         if "agent" in data:
             node_data["agent"] = data["agent"]
 

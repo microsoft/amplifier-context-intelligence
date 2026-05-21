@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from unittest.mock import AsyncMock, patch
 
 from context_intelligence_server.services import (
@@ -627,3 +628,40 @@ class TestEnsureSessionNodeBufferPopulation:
             f"Got labels: {node['labels']!r}"
         )
         assert "Session" in node["labels"]
+
+
+# ---------------------------------------------------------------------------
+# ensure_session_node timestamp-key fix (Bug fix: data["timestamp"] not data["started_at"])
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureSessionNodeTimestampKey:
+    """ensure_session_node picks up started_at from data['timestamp'], not data['started_at'].
+
+    Kernel events carry the wall-clock time under the key 'timestamp'. The previous
+    implementation looked for 'started_at' in the event dict, which never matched
+    — so stub nodes created when session:start was idempotency-cached never had
+    their started_at populated.
+    """
+
+    @pytest.mark.parametrize(
+        "data,expected_started_at",
+        [
+            # Canonical case: event carries data["timestamp"] — gets copied to started_at
+            ({"timestamp": "2026-03-18T14:55:17+00:00"}, "2026-03-18T14:55:17+00:00"),
+            # Forward-compat: explicit data["started_at"] still works as fallback
+            ({"started_at": "2026-04-01T10:00:00+00:00"}, "2026-04-01T10:00:00+00:00"),
+            # No timestamp at all: stub has no started_at (None when fetched)
+            ({}, None),
+            # Empty-string timestamp: skipped, stub has no started_at
+            ({"timestamp": ""}, None),
+        ],
+    )
+    async def test_started_at_set_correctly(
+        self, data: dict, expected_started_at: str | None
+    ) -> None:
+        svc = HookStateService()
+        await svc.ensure_session_node("sess-ts-test", data)
+        node = await svc.graph.get_node("sess-ts-test")
+        assert node is not None
+        assert node.get("started_at") == expected_started_at
