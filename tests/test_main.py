@@ -1,6 +1,7 @@
 """Tests for FastAPI app — GET /status and POST /events endpoints."""
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import socket
@@ -25,12 +26,25 @@ def _clear_idempotency_cache() -> None:
 
 
 def _neo4j_reachable() -> bool:
-    """Return True if Neo4j is reachable at neo4j:7687 (only resolves inside Docker)."""
-    try:
-        with socket.create_connection(("neo4j", 7687), timeout=1):
-            return True
-    except OSError:
-        return False
+    """Return True if Neo4j is reachable at neo4j:7687 (only resolves inside Docker).
+
+    Uses a thread with a hard 2-second total deadline so that slow or
+    absent DNS resolution for the 'neo4j' hostname never blocks the
+    calling thread (e.g. pytest collection on GitHub Actions).
+    """
+
+    def _check() -> bool:
+        try:
+            with socket.create_connection(("neo4j", 7687), timeout=1):
+                return True
+        except OSError:
+            return False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        try:
+            return executor.submit(_check).result(timeout=2)
+        except concurrent.futures.TimeoutError:
+            return False
 
 
 async def test_status_returns_200(client: httpx.AsyncClient) -> None:
