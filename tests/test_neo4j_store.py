@@ -6,7 +6,7 @@ Covers:
 - supported_dialects: includes 'cypher', returns frozenset
 - Buffer operations: upsert_node (add, merge props, merge labels, no duplicate labels),
   upsert_edge (add/merge), get_node (buffer-first, returns copy), get_edge (buffer-first)
-- Static helpers: _sanitize_properties, _convert_timestamps
+- Static helpers: _sanitize_properties
 - Flush: workspace in rows, empty is no-op, clears buffers on success, restores on failure
 - Schema: idempotent, indexes use workspace not graph_forest_name
 - execute_query: injects workspace, wildcard skips injection, unsupported dialect raises ValueError
@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -734,39 +733,30 @@ def test_sanitize_properties_keeps_primitive_lists():
     assert result["tags"] == ["a", "b", "c"]
 
 
+def test_sanitize_properties_strips_empty_string_at_fields():
+    """_sanitize_properties removes *_at keys whose value is an empty string.
+
+    Protects against SET n += row.props overwriting a previously valid
+    timestamp on the existing node with "".
+    """
+    result = Neo4jGraphStore._sanitize_properties({"started_at": "", "name": "node"})
+    assert "started_at" not in result
+    assert result["name"] == "node"
+
+
+def test_sanitize_properties_preserves_non_empty_at_fields():
+    """_sanitize_properties keeps *_at keys with non-empty string values."""
+    result = Neo4jGraphStore._sanitize_properties(
+        {"started_at": "2026-03-18T14:55:17+00:00"}
+    )
+    assert result["started_at"] == "2026-03-18T14:55:17+00:00"
+
+
 # ---------------------------------------------------------------------------
-# Static helper: _convert_timestamps
+# Datetime conversion to Neo4j temporal types is deferred.
+# See DATETIME-MIGRATION.md at the workspace root for the full
+# implementation and backfill strategy.
 # ---------------------------------------------------------------------------
-
-
-def test_convert_timestamps_converts_at_fields():
-    """_convert_timestamps converts *_at ISO strings to datetime objects."""
-    props = {"created_at": "2024-01-15T10:30:00", "name": "node"}
-    result = Neo4jGraphStore._convert_timestamps(props)
-    assert isinstance(result["created_at"], datetime)
-    assert result["name"] == "node"  # Non-timestamp unchanged
-
-
-def test_convert_timestamps_ignores_non_at_fields():
-    """_convert_timestamps does not touch fields not ending in _at."""
-    props = {"category": "2024-01-15T10:30:00", "updated": "2024-02-01"}
-    result = Neo4jGraphStore._convert_timestamps(props)
-    assert result["category"] == "2024-01-15T10:30:00"  # Not converted
-
-
-def test_convert_timestamps_skips_invalid_iso():
-    """_convert_timestamps leaves *_at fields unchanged if they are not valid ISO."""
-    props = {"created_at": "not-a-date"}
-    result = Neo4jGraphStore._convert_timestamps(props)
-    assert result["created_at"] == "not-a-date"  # Unchanged
-
-
-def test_convert_timestamps_does_not_mutate_input():
-    """_convert_timestamps returns a new dict without mutating the input."""
-    props = {"created_at": "2024-01-15T10:30:00"}
-    original = dict(props)
-    Neo4jGraphStore._convert_timestamps(props)
-    assert props == original  # Input not mutated
 
 
 # ---------------------------------------------------------------------------

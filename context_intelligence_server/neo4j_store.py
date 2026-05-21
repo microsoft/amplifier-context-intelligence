@@ -14,7 +14,6 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime
 from typing import Any, LiteralString, cast
 
 from neo4j import AsyncGraphDatabase
@@ -618,6 +617,10 @@ class Neo4jGraphStore:
             if value is None:
                 continue
             if isinstance(value, (str, int, float, bool)):
+                # Never write empty-string timestamps — SET n += row.props would
+                # overwrite a previously valid started_at on the existing node.
+                if isinstance(value, str) and value == "" and key.endswith("_at"):
+                    continue
                 result[key] = value
             elif isinstance(value, list):
                 if all(isinstance(item, (str, int, float, bool)) for item in value):
@@ -628,21 +631,4 @@ class Neo4jGraphStore:
                 result[key] = json.dumps(value)
             else:
                 result[key] = str(value)
-        return result
-
-    @staticmethod
-    def _convert_timestamps(props: dict[str, Any]) -> dict[str, Any]:
-        """Convert ``*_at`` ISO string fields to :class:`datetime` objects.
-
-        Any property whose key ends with ``_at`` and whose value is a valid
-        ISO 8601 string is replaced with the corresponding :class:`datetime`.
-        Invalid strings are left unchanged.  The input dict is not mutated.
-        """
-        result = dict(props)
-        for key, value in result.items():
-            if key.endswith("_at") and isinstance(value, str):
-                try:
-                    result[key] = datetime.fromisoformat(value)
-                except ValueError:
-                    pass
         return result
