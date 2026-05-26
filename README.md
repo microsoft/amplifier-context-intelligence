@@ -165,8 +165,10 @@ neo4j_password: ""          # empty string for NEO4J_AUTH=none instances
 blob_path: /home/you/.local/share/ci-server/blobs
 log_path:  /home/you/.local/share/ci-server/logs/server.jsonl
 
-# Server bind address
-server_host: 127.0.0.1
+# Server bind address — 0.0.0.0 accepts connections from all interfaces,
+# including Docker/Incus container bridges.  Use 127.0.0.1 only if you are
+# certain no containers need to reach this server.
+server_host: 0.0.0.0
 server_port: 8000
 ```
 
@@ -228,6 +230,12 @@ Open [http://localhost:8000](http://localhost:8000) to confirm the server is run
 
 To run the server as an auto-starting background service on Linux (systemd)
 or macOS (launchd), see [docs/service-setup.md](docs/service-setup.md).
+
+---
+
+## Network Access and Security
+
+The server defaults to `server_host: 0.0.0.0`, which binds on **all network interfaces** — loopback, LAN, and any container bridges (Docker, Incus). This is intentional: worker containers and DTU containers use the host's bridge gateway IP to reach the server, and they cannot reach `127.0.0.1` (the host's loopback) from inside a container. On a single-user development machine behind a NAT router or firewall, binding to 0.0.0.0 is safe. If you deploy the server in an environment where port 8000 (or your configured `server_port`) is reachable from untrusted networks, restrict access with a firewall rule to trusted source IPs. Use `server_host: 127.0.0.1` only when you are certain no container processes will ever need to reach the server.
 
 ---
 
