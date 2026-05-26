@@ -44,9 +44,21 @@ cursor_path: ~/amplifier-context-intelligence-server-data-store/cursors
 # Server bind address
 # These two values are combined into the HTTP URL advertised in the web UI
 # (home page "Server URL" chip and dashboard "Server URL" chip).
-# Example: server_host=127.0.0.1 + server_port=8000 → http://127.0.0.1:8000
+# Example: server_host=0.0.0.0 + server_port=8000 → http://0.0.0.0:8000
+#
+# Use 0.0.0.0 (the default) to accept connections from all interfaces,
+# including Docker container bridges and Incus container bridges.
+# This is required when worker containers need to dispatch events to a server
+# running on the host — they cannot reach 127.0.0.1 (host loopback) from
+# inside a container.
+#
+# Security: 0.0.0.0 exposes the server on all network interfaces, including
+# your LAN IP. On a single-user dev machine behind a router or firewall this
+# is acceptable. If you deploy this server where port 8000 is reachable from
+# the public internet, add a firewall rule to restrict access to trusted IPs.
+# Use 127.0.0.1 only if you are certain no containers need to reach the server.
 # -----------------------------------------------------------------------------
-server_host: 127.0.0.1      # Use 0.0.0.0 to accept connections from other machines
+server_host: 0.0.0.0        # Bind to all interfaces (required for container bridge access)
 server_port: 8000
 
 # -----------------------------------------------------------------------------
