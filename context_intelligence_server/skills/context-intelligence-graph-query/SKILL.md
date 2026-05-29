@@ -1075,3 +1075,15 @@ the context window before any result can be processed. Three mandatory habits:
    `WHERE s.node_id IN [...]` to constrain the starting set before any traversal.
 
 See Section 7 for the complete size management and pagination reference.
+
+**12. Temporal comparisons require the `datetime()` wrapper.** Comparing a ZONED DATETIME
+property to a string literal (`WHERE s.started_at > '2026-05-01'`) always evaluates false —
+no error is raised, no results are returned, the query silently produces nothing. Use
+`datetime('2026-05-01')` instead. ORDER BY on temporal columns requires no change. See
+"Temporal Property Types" at the top of Section 2 for the full list of ZONED DATETIME
+properties.
+
+- `duration.between(s.started_at, s.ended_at)` computes elapsed time (session length,
+  tool-call duration) and returns a Neo4j DURATION value (e.g. PT1H30M).
+- `WHERE s.started_at > datetime() - duration('P30D')` enables rolling time-window queries
+  (sessions started in the last 30 days). Both were impossible with string storage.
