@@ -88,7 +88,7 @@ Common event labels: `:ToolPreEvent`, `:ToolPostEvent`, `:ToolErrorEvent`, `:Llm
 |---|---|---|
 | `HAS_FORK` | Session → Session | Parent session forked a child |
 | `HAS_TOOL_CALL` | Session → ToolCall | Session owns a data layer 1 tool call lifecycle node |
-| `HAS_EVENT` | Session → Event | Session owns an event node |
+| `HAS_EVENT` | Session → Event | Session owns an event node. Carries edge property occurred_at (ZONED DATETIME). |
 | `HAS_EVENT` | ToolCall → Event | Tool call owns its lifecycle events |
 
 ### Data Layer 2 Entity Types
@@ -135,10 +135,10 @@ All foundation layer nodes carry a `workspace` property and an SST type label.
 
 | Entity | Labels | SST Type | node_id Format | Key Properties |
 |---|---|---|---|---|
-| Delegation | `:Delegation:SST_EVENT` | Temporal | `{parent_session_id}::delegation::{tool_call_id\|sub_session_id}` | `agent`, `sub_session_id`, `parent_session_id`, `started_at`, `ended_at`, `context_depth`, `context_scope` |
+| Delegation | `:Delegation:SST_EVENT` | Temporal | `{parent_session_id}::delegation::{tool_call_id\|sub_session_id}` | `agent`, `sub_session_id`, `parent_session_id`, started_at (ZONED DATETIME), ended_at (ZONED DATETIME), resumed_at (ZONED DATETIME), when present, cancelled_at (ZONED DATETIME), when present, `context_depth`, `context_scope` |
 | Agent | `:Agent:SST_CONCEPT` | Abstract | Agent name string (e.g. `foundation:explorer`) | `agent` |
 | SkillLoad | `:SkillLoad:SST_EVENT` | Temporal | `{session_id}::skill::{skill_name}::{loaded_at_ts}` | `skill_name`, `content_length`, `loaded_at` |
-| RecipeRun | `:RecipeRun:SST_EVENT` | Temporal | `{session_id}::recipe_run::{timestamp}` | `name`, `status`, `current_step`, `total_steps` |
+| RecipeRun | `:RecipeRun:SST_EVENT` | Temporal | `{session_id}::recipe_run::{timestamp}` | `name`, `status`, `current_step`, `total_steps`, last_loop_iteration_at (ZONED DATETIME), when present, loop_completed_at (ZONED DATETIME), when present |
 | RecipeStep | `:RecipeStep:SST_EVENT` | Temporal | `{session_id}::recipe_run::{ts}::step::{N}` | `name`, `status`, `step_id` |
 | Recipe | `:Recipe:SST_CONCEPT` | Abstract | Recipe name string | `name` |
 
