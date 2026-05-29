@@ -97,14 +97,14 @@ All data layer 2 nodes carry a `workspace` property and an SST type label.
 
 | Entity | Labels | SST Type | node_id Format | Key Properties |
 |---|---|---|---|---|
-| Session | `:Session:SST_EVENT` (+ `:RootSession`/`:SubSession`/`:ForkedSession`) | Temporal | Raw UUID | `started_at`, `ended_at`, `status` |
-| OrchestratorRun | `:OrchestratorRun:SST_EVENT` | Temporal | `{session_id}::orch_run::{started_at}` | `started_at`, `ended_at`, `orchestrator_name` |
-| Iteration | `:Iteration:SST_EVENT` | Temporal | `{session_id}::iteration::{N}` | `iteration_number`, `started_at` |
-| ContentBlock | `:ContentBlock:SST_EVENT` | Temporal | `{session_id}::block::{iteration_N}::{index}` | `block_type`, `block_index` |
-| ToolCall | `:ToolCall:SST_EVENT` | Temporal | `{tool_call_id}` (provider UUID directly) | `tool_name`, `tool_call_id`, `result_success`, `result_error`, `result_output`, `started_at`, `ended_at`, `parallel_group_id` |
-| Prompt | `:Prompt:SST_EVENT` | Temporal | `{session_id}::prompt::{timestamp}` | `prompt_text`, `started_at` |
-| Cancellation | `:Cancellation:SST_EVENT` | Temporal | `{session_id}::cancellation::{timestamp}` | `occurred_at` |
-| ContextCompaction | `:ContextCompaction:SST_EVENT` | Temporal | `{session_id}::compaction::{timestamp}` | `occurred_at` |
+| Session | `:Session:SST_EVENT` (+ `:RootSession`/`:SubSession`/`:ForkedSession`) | Temporal | Raw UUID | `started_at` (ZONED DATETIME), `ended_at` (ZONED DATETIME), `last_updated` (ZONED DATETIME), `status` |
+| OrchestratorRun | `:OrchestratorRun:SST_EVENT` | Temporal | `{session_id}::orch_run::{started_at}` | `started_at` (ZONED DATETIME), `ended_at` (ZONED DATETIME), `completed_at` (ZONED DATETIME, when present), `orchestrator_name` |
+| Iteration | `:Iteration:SST_EVENT` | Temporal | `{session_id}::iteration::{N}` | `iteration_number`, `started_at` (ZONED DATETIME) |
+| ContentBlock | `:ContentBlock:SST_EVENT` | Temporal | `{session_id}::block::{iteration_N}::{index}` | `block_type`, `block_index`, `started_at` (ZONED DATETIME, when present) |
+| ToolCall | `:ToolCall:SST_EVENT` | Temporal | `{tool_call_id}` (provider UUID directly) | `tool_name`, `tool_call_id`, `result_success`, `result_error`, `result_output`, `started_at` (ZONED DATETIME), `ended_at` (ZONED DATETIME), `parallel_group_id` |
+| Prompt | `:Prompt:SST_EVENT` | Temporal | `{session_id}::prompt::{timestamp}` | `prompt_text`, `started_at` (ZONED DATETIME) |
+| Cancellation | `:Cancellation:SST_EVENT` | Temporal | `{session_id}::cancellation::{timestamp}` | `occurred_at` (ZONED DATETIME) |
+| ContextCompaction | `:ContextCompaction:SST_EVENT` | Temporal | `{session_id}::compaction::{timestamp}` | `occurred_at` (ZONED DATETIME) |
 | MountPlan | `:MountPlan:SST_THING` | Resource | `{session_id}::mount_plan` | `mount_plan_data` |
 | Orchestrator | `:Orchestrator:SST_CONCEPT` | Abstract | Orchestrator name string (e.g. `loop-streaming`) | `name` |
 
@@ -115,14 +115,14 @@ All edges carry an `sst_semantic` property that expresses the relationship's mea
 | Edge Type | `sst_semantic` | From → To | What It Means |
 |---|---|---|---|
 | `HAS_EXECUTION` | `CONTAINS` | Session → OrchestratorRun | Session contains this orchestrator run (one per user turn) |
-| `FORKED` | `LEADS_TO` | Session → ForkedSession | Session forked a child session |
+| `FORKED` | `LEADS_TO` | Session → ForkedSession | Session forked a child session. Carries edge property `occurred_at` (ZONED DATETIME). |
 | `HAS_ATTRIBUTE` | `EXPRESSES` | Session → Orchestrator | Session describes its orchestrator type |
 | `HAS_PART` | `CONTAINS` | Session → MountPlan/Prompt/Cancellation | Session contains these parts |
 | `HAS_PART` | `CONTAINS` | OrchestratorRun → Iteration | Run contains these LLM iterations |
 | `HAS_PART` | `CONTAINS` | Iteration → ContentBlock | Iteration contains these content blocks |
 | `HAS_TOOL_CALL` | `CONTAINS` | Iteration → ToolCall | Iteration contains these tool calls |
 | `HAS_COMPACTION` | `CONTAINS` | Session → ContextCompaction | Session contains this compaction event |
-| `HAS_SUBSESSION` | `LEADS_TO` | Session → SubSession | Session leads to a sub-session |
+| `HAS_SUBSESSION` | `LEADS_TO` | Session → SubSession | Session leads to a sub-session. Carries edge property `occurred_at` (ZONED DATETIME). |
 | `CAUSED` | `LEADS_TO` | ContentBlock → ToolCall | This content block triggered this tool call |
 | `PARALLEL_EXECUTION` | `NEAR` | ToolCall ↔ ToolCall | These tool calls ran concurrently in the same parallel group |
 | `TRIGGERS` | `LEADS_TO` | Prompt → OrchestratorRun | This prompt started this orchestrator run |
