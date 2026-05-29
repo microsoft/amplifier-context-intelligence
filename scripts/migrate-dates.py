@@ -269,13 +269,33 @@ def main() -> int:
             "Exits 1 if any pending values exist (blocks deployment)."
         ),
     )
+    parser.add_argument(
+        "--neo4j-url",
+        metavar="URL",
+        default=None,
+        help="Neo4j Bolt URL (overrides server-config.yaml / env var)",
+    )
+    parser.add_argument(
+        "--neo4j-user",
+        metavar="USER",
+        default=None,
+        help="Neo4j username (overrides server-config.yaml / env var)",
+    )
+    parser.add_argument(
+        "--neo4j-password",
+        metavar="PW",
+        default=None,
+        help="Neo4j password (overrides server-config.yaml / env var)",
+    )
     args = parser.parse_args()
 
     settings = get_settings()
-    driver = GraphDatabase.driver(
-        settings.neo4j_url,
-        auth=(settings.neo4j_user, settings.neo4j_password),
-    )
+    neo4j_url = args.neo4j_url or settings.neo4j_url
+    neo4j_user = args.neo4j_user or settings.neo4j_user
+    neo4j_password = args.neo4j_password or settings.neo4j_password
+
+    print(f"Connecting to Neo4j at {neo4j_url} as {neo4j_user}\n")
+    driver = GraphDatabase.driver(neo4j_url, auth=(neo4j_user, neo4j_password))
     try:
         with driver.session() as neo_session:
             if args.dry_run:
