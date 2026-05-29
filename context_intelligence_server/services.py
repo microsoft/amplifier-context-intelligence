@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+from datetime import datetime
 from typing import Any
 
 from context_intelligence_server.handlers.data_layer_2.state import DataLayer2State
@@ -296,7 +297,21 @@ class HookStateService:
                 if node is None:
                     break
                 current = node.get("last_updated")
-                if current is not None and timestamp <= current:
+                # Compare using stdlib datetime only; the store's read path normalises
+                # neo4j.time.DateTime to Python datetime, but the in-memory store returns
+                # whatever was written (often a str), so coerce both sides defensively.
+                # No neo4j.time awareness here.
+                ts = (
+                    datetime.fromisoformat(timestamp)
+                    if isinstance(timestamp, str)
+                    else timestamp
+                )
+                current_dt = (
+                    datetime.fromisoformat(current)
+                    if isinstance(current, str)
+                    else current
+                )
+                if current_dt is not None and ts <= current_dt:
                     break  # ancestor already at or ahead — stop propagating
                 await self.graph.upsert_node(
                     current_id,
