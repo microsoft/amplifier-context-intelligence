@@ -221,3 +221,133 @@ class TestTemporalIdempotency:
             f"but valueType() returned {vt!r}. "
             "The second flush may be writing a raw ISO string that overwrites the datetime."
         )
+
+
+# ---------------------------------------------------------------------------
+# TestTouchSessionReadPath
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.neo4j
+class TestTouchSessionReadPath:
+    """End-to-end integration test for the touch_session read-path + services.py fix.
+
+    Proves that:
+    1. touch_session writes last_updated as a ZONED DATETIME in Neo4j.
+    2. On a subsequent touch_session call, the read path normalises the stored
+       neo4j.time.DateTime back to a Python datetime so the comparison in
+       services.py runs without TypeError.
+    3. An older timestamp does NOT overwrite an existing newer value (skip decision).
+    4. A newer timestamp DOES overwrite the existing value (propagate decision).
+
+    If any touch_session call raises TypeError (datetime vs str or datetime vs
+    neo4j.time.DateTime), Phase 1 read-path normalisation or the services.py
+    comparison fix is incomplete.
+    """
+
+    async def test_touch_session_propagation_decision(
+        self, neo4j_services: Any
+    ) -> None:
+        """touch_session skips older timestamps and applies newer ones without TypeError.
+
+        Sequence:
+        - Write a bare Session node, flush.
+        - touch_session(t1): last_updated must land as ZONED DATETIME NOT NULL.
+        - touch_session(t0, older): last_updated must be unchanged (skip decision,
+          no TypeError on the read-back Python datetime).
+        - touch_session(t2, newer): last_updated must change (propagate decision,
+          still ZONED DATETIME NOT NULL).
+        """
+        sid = "touch-readpath-1"
+
+        # timestamps — t0 < t1 < t2
+        t0 = "2026-01-01T06:00:00Z"
+        t1 = "2026-01-01T12:00:00Z"
+        t2 = "2026-01-02T12:00:00Z"
+
+        # ------------------------------------------------------------------ #
+        # Setup: create bare Session node and flush to Neo4j.                 #
+        # ------------------------------------------------------------------ #
+        await neo4j_services.ensure_session_node(sid, {})
+        await neo4j_services.graph.flush()
+
+        # ------------------------------------------------------------------ #
+        # Step 1: touch_session(t1) — first write, no prior last_updated.    #
+        # Expect: last_updated is written and stored as ZONED DATETIME.       #
+        # ------------------------------------------------------------------ #
+        await neo4j_services.touch_session(sid, t1)
+        await neo4j_services.graph.flush()
+
+        records = await neo4j_services.graph.execute_query(
+            "MATCH (s:Session {node_id: $nid}) "
+            "RETURN valueType(s.last_updated) AS vt, toString(s.last_updated) AS val",
+            {"nid": sid},
+            workspace="*",
+        )
+        assert len(records) == 1, (
+            f"Expected exactly 1 Session node with node_id={sid!r}, "
+            f"got {len(records)} records after touch_session(t1)"
+        )
+        vt = records[0]["vt"]
+        assert vt == "ZONED DATETIME NOT NULL", (
+            f"After touch_session(t1), last_updated must be stored as "
+            f"'ZONED DATETIME NOT NULL' in Neo4j, but valueType() returned {vt!r}. "
+            "Check that _convert_temporal_props converts the ISO string before the flush."
+        )
+        val_after_t1 = records[0]["val"]
+
+        # ------------------------------------------------------------------ #
+        # Step 2: touch_session(t0) — t0 is OLDER than t1.                  #
+        # Expect: last_updated is UNCHANGED (skip decision).                  #
+        # If this raises TypeError, read-path normalisation is incomplete.   #
+        # ------------------------------------------------------------------ #
+        await neo4j_services.touch_session(sid, t0)
+        await neo4j_services.graph.flush()
+
+        records = await neo4j_services.graph.execute_query(
+            "MATCH (s:Session {node_id: $nid}) "
+            "RETURN toString(s.last_updated) AS val",
+            {"nid": sid},
+            workspace="*",
+        )
+        assert len(records) == 1, (
+            f"Expected exactly 1 Session node with node_id={sid!r}, "
+            f"got {len(records)} records after touch_session(t0)"
+        )
+        val_after_t0 = records[0]["val"]
+        assert val_after_t0 == val_after_t1, (
+            f"touch_session(t0={t0!r}) must NOT overwrite last_updated={val_after_t1!r} "
+            f"because t0 is older than t1. Got {val_after_t0!r} instead. "
+            "The skip comparison in services.py failed or a TypeError was swallowed "
+            "and the walk stopped silently without writing."
+        )
+
+        # ------------------------------------------------------------------ #
+        # Step 3: touch_session(t2) — t2 is NEWER than t1.                  #
+        # Expect: last_updated is UPDATED and still ZONED DATETIME NOT NULL. #
+        # ------------------------------------------------------------------ #
+        await neo4j_services.touch_session(sid, t2)
+        await neo4j_services.graph.flush()
+
+        records = await neo4j_services.graph.execute_query(
+            "MATCH (s:Session {node_id: $nid}) "
+            "RETURN valueType(s.last_updated) AS vt, toString(s.last_updated) AS val",
+            {"nid": sid},
+            workspace="*",
+        )
+        assert len(records) == 1, (
+            f"Expected exactly 1 Session node with node_id={sid!r}, "
+            f"got {len(records)} records after touch_session(t2)"
+        )
+        vt_after_t2 = records[0]["vt"]
+        val_after_t2 = records[0]["val"]
+        assert vt_after_t2 == "ZONED DATETIME NOT NULL", (
+            f"After touch_session(t2), last_updated must still be stored as "
+            f"'ZONED DATETIME NOT NULL' in Neo4j, but valueType() returned {vt_after_t2!r}."
+        )
+        assert val_after_t2 != val_after_t1, (
+            f"touch_session(t2={t2!r}) must UPDATE last_updated because t2 is newer "
+            f"than t1. Expected a different value from {val_after_t1!r}, "
+            f"but got {val_after_t2!r}. "
+            "The propagate decision in services.py failed — newer timestamp was not applied."
+        )
