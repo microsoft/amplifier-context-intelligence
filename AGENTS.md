@@ -31,7 +31,7 @@ context_intelligence_server/      # FastAPI ingestion server
 ├── models.py                     # Pydantic request/response models
 └── web/                          # Dashboard HTML + static assets
 
-docs/
+docs/                             # ⚠️ PRODUCT DOCUMENTATION ONLY
 ├── architecture/                 # DOT diagrams: pipeline, handlers, graph model
 └── service-setup.md              # Running as a system service
 
@@ -40,6 +40,10 @@ tests/
 ├── integration/                  # Pipeline integration tests
 └── neo4j/                        # Tests requiring a live Neo4j instance
 ```
+
+**`docs/` is product documentation only.** Architecture diagrams and operational guides
+that ship with the server. Plans, fix designs, and Superpowers-generated documents go in
+the **workspace root `docs/`** (one level up from this repo), never here.
 
 ---
 
@@ -79,6 +83,31 @@ Or use Docker Compose to run everything together:
 ```bash
 ./start.sh
 ```
+
+---
+
+## Key Conventions
+
+### Temporal properties are `ZONED DATETIME`
+
+All temporal properties are stored as native Neo4j ZONED DATETIME, not ISO strings.
+The single source of truth is the `TEMPORAL_PROPS` frozenset in `neo4j_store.py`.
+Adding a temporal property to any handler requires adding its name to `TEMPORAL_PROPS` — forget
+and the value lands as a plain string silently; no error, no warning; temporal predicates
+`WHERE`/`duration.between` then behave inconsistently.
+
+`last_updated` (on Session) is the only temporal field not ending in `_at` and is listed
+deliberately. Do not replace the registry with a `*_at` suffix heuristic — it silently misses
+`last_updated`. Edge `occurred_at` on `HAS_EVENT`, `HAS_SUBSESSION`, `FORKED` is covered by the
+same registry and conversion path; no special-casing needed.
+
+### `neo4j_store.py` is the type boundary
+
+`neo4j.time` driver types (`DateTime`, etc.) must never leave `neo4j_store.py`.
+`_convert_temporal_props` converts Python `datetime` → ZONED DATETIME on write.
+`_normalize_temporal` converts `neo4j.time.DateTime` → Python `datetime` on read.
+`services.py`, `pipeline.py`, and handlers deal in Python stdlib types only and never import
+or reference `neo4j.time`.
 
 ---
 
