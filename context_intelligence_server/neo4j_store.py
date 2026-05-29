@@ -121,12 +121,25 @@ def _convert_temporal_props(props: dict[str, Any]) -> None:
             )
 
 
-def _normalize_temporal(props: dict[str, Any]) -> None:
-    """Convert neo4j.time.DateTime values back to Python ``datetime`` objects.
+def _normalize_temporal(value: Any) -> Any:
+    """Convert neo4j.time.DateTime to Python datetime via .to_native().
 
-    Placeholder — full implementation added in Task 4.
-    Mutates *props* in place; returns ``None``.
+    The Neo4j driver returns temporal properties as neo4j.time.DateTime;
+    convert to Python datetime via .to_native() so no neo4j.time type ever
+    leaves this module; all other values returned unchanged.
+
+    This is the read-path half of the type boundary,
+    _convert_temporal_props is the write-path half.
+
+    Rationale: getattr (not isinstance against neo4j.time.DateTime) avoids
+    importing the driver's temporal class at module top-level and transparently
+    handles Date, Time, and DateTime (all expose .to_native()); plain
+    Python/JSON values have no .to_native() and pass straight through.
     """
+    to_native = getattr(value, "to_native", None)
+    if callable(to_native):
+        return to_native()
+    return value
 
 
 async def ensure_neo4j_schema(

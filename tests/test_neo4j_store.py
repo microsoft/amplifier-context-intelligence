@@ -1480,3 +1480,35 @@ def test_convert_temporal_props_non_registered_key_untouched() -> None:
     props: dict = {"name": "2026-03-18T14:55:17+00:00"}
     _convert_temporal_props(props)
     assert props["name"] == "2026-03-18T14:55:17+00:00"
+
+
+# ---------------------------------------------------------------------------
+# _normalize_temporal (read-path neo4j.time.DateTime → Python datetime)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_temporal_converts_neo4j_datetime() -> None:
+    """_normalize_temporal converts a neo4j.time.DateTime to a Python datetime."""
+    from neo4j.time import DateTime as Neo4jDateTime
+
+    py = datetime(2026, 3, 18, 14, 55, 17, tzinfo=timezone.utc)
+    n4 = Neo4jDateTime.from_native(py)
+    result = _normalize_temporal(n4)
+    assert isinstance(result, datetime)
+    assert result == py
+
+
+def test_normalize_temporal_passes_through_str() -> None:
+    """_normalize_temporal returns strings unchanged."""
+    assert _normalize_temporal("2026-01-01T00:00:01Z") == "2026-01-01T00:00:01Z"
+
+
+def test_normalize_temporal_passes_through_python_datetime() -> None:
+    """_normalize_temporal returns a Python datetime as-is (identity preserved)."""
+    dt = datetime(2026, 3, 18, 14, 55, 17, tzinfo=timezone.utc)
+    assert _normalize_temporal(dt) is dt
+
+
+def test_normalize_temporal_passes_through_int() -> None:
+    """_normalize_temporal returns integers unchanged."""
+    assert _normalize_temporal(42) == 42
