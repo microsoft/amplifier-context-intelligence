@@ -397,7 +397,10 @@ class TestSkillUnloadedEnriches:
 
         skill_load_id = f"{session_id}::skill::{skill_name}::{timestamp_load}"
         expected_target = make_node_id(
-            session_id, "skill:unloaded", timestamp_unload, unloaded_data.get("tool_call_id")
+            session_id,
+            "skill:unloaded",
+            timestamp_unload,
+            unloaded_data.get("tool_call_id"),
         )
         edge = await services.graph.get_edge(skill_load_id, expected_target)
         assert edge is not None, (

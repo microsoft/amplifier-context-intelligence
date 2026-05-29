@@ -127,7 +127,11 @@ class RecipeRunHandler:
                 "started_at": timestamp,
                 "total_steps": total_steps,
                 "status": status,
-                **({"parent_session_id": parent_session_id, "is_sub_recipe": True} if parent_session_id else {}),
+                **(
+                    {"parent_session_id": parent_session_id, "is_sub_recipe": True}
+                    if parent_session_id
+                    else {}
+                ),
             },
         )
 

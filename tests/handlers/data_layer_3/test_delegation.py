@@ -711,7 +711,10 @@ class TestSelfDelegationResolution:
 
         delegation_id = "ps-named::delegation::ss-self-1"
         assert services.graph._nodes[delegation_id]["agent"] == "self"
-        assert services.graph._nodes[delegation_id]["resolved_agent"] == "foundation:explorer"
+        assert (
+            services.graph._nodes[delegation_id]["resolved_agent"]
+            == "foundation:explorer"
+        )
         assert services.graph._nodes[delegation_id]["is_self_delegation"] is True
         assert "foundation:explorer" in services.graph._nodes, (
             "Agent concept node must be at 'foundation:explorer', not 'self'"
