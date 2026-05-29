@@ -96,7 +96,14 @@ Build the image then run with explicit port and volume mounts:
 
 ```bash
 docker build -t context-intelligence-server .
-docker run -d --name context-intelligence-server -p 8000:8000 -v "$HOME/amplifier-context-intelligence-server-data-store:/data" -e AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY=<your-api-key> -e AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL=bolt://your-neo4j:7687 -e AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD=<password> context-intelligence-server
+docker run -d \
+  --name context-intelligence-server \
+  -p 8000:8000 \
+  -v "$HOME/amplifier-context-intelligence-server-data-store:/data" \
+  -e AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY=<your-api-key> \
+  -e AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL=bolt://your-neo4j:7687 \
+  -e AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD=<password> \
+  context-intelligence-server
 ```
 
 Retrieve the generated API key after first run:
