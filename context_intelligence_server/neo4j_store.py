@@ -474,9 +474,9 @@ class Neo4jGraphStore:
 
                     for node_id, data in node_snapshot.items():
                         labels: list[str] = data.get("labels", [])
-                        props = self._sanitize_properties(
-                            {k: v for k, v in data.items() if k != "labels"}
-                        )
+                        node_props = {k: v for k, v in data.items() if k != "labels"}
+                        _convert_temporal_props(node_props)  # ISO str -> datetime, in place
+                        props = self._sanitize_properties(node_props)
                         props["workspace"] = self.workspace
                         row: dict[str, Any] = {"node_id": node_id, "props": props}
 
@@ -553,9 +553,9 @@ class Neo4jGraphStore:
                     edge_groups: dict[str, list[dict[str, Any]]] = {}
                     for (src_id, dst_id), data in edge_snapshot.items():
                         edge_type: str = data.get("type", _DEFAULT_EDGE_TYPE)
-                        props = self._sanitize_properties(
-                            {k: v for k, v in data.items() if k != "type"}
-                        )
+                        edge_props = {k: v for k, v in data.items() if k != "type"}
+                        _convert_temporal_props(edge_props)  # ISO str -> datetime, in place
+                        props = self._sanitize_properties(edge_props)
                         props["workspace"] = self.workspace
                         # Store src_id/dst_id on the relationship so the
                         # get_edge() fallback query (WHERE r.src_id = $src_id
