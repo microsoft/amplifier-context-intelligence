@@ -345,7 +345,7 @@ class Neo4jGraphStore:
             )
             records = result.records
             if records:
-                return dict(records[0]["props"])
+                return {k: _normalize_temporal(v) for k, v in dict(records[0]["props"]).items()}
         except Neo4jError:
             pass
 
@@ -375,7 +375,7 @@ class Neo4jGraphStore:
             )
             records = result.records
             if records:
-                return dict(records[0]["props"])
+                return {k: _normalize_temporal(v) for k, v in dict(records[0]["props"]).items()}
         except Neo4jError:
             pass
 
@@ -690,7 +690,7 @@ class Neo4jGraphStore:
         async with self._driver.session(database=self._database) as session:
             result = await session.run(query, query_params)  # type: ignore[arg-type]
             data = await result.data()
-            return [dict(record) for record in data]
+            return [{k: _normalize_temporal(v) for k, v in dict(record).items()} for record in data]
 
     # ------------------------------------------------------------------
     # Static helpers
