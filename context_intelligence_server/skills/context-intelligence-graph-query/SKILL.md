@@ -77,7 +77,7 @@ Key properties on `:Event` nodes:
 - `session_id` — owning session UUID
 - `workspace` — workspace partition key
 - `event_name` — raw event name (e.g. `tool:pre`)
-- **`data`** — **JSON string** of the original kernel event payload. Not a Cypher map. Parse it before accessing sub-fields. May contain `ci-blob://` URI references for large payloads (see Section 5).
+- **`data`** — **JSON string** of the complete raw kernel event payload from the session JSONL. Not a Cypher map. Dot notation (`e.data.tool_name`) does not work in Cypher. Use lifted properties (`tool_name`, `model`, `tool_call_id`, etc.) which are extracted at ingest time as first-class node properties. When raw payload fields not lifted are needed, retrieve the `data` string and parse with `jq` outside Cypher (see Section 5). May contain `ci-blob://` URI references for large payloads.
 - Plus event-specific lifted properties (e.g. `tool_name`, `tool_call_id` on `:ToolPreEvent`; `model`, `provider` on `:LlmResponseEvent`).
 
 Common event labels: `:ToolPreEvent`, `:ToolPostEvent`, `:ToolErrorEvent`, `:LlmRequestEvent`, `:LlmResponseEvent`, `:PromptSubmitEvent`, `:ExecutionStartEvent`, `:ExecutionEndEvent`, `:DelegateAgentSpawnedEvent`, `:SessionStartEvent`, `:SessionEndEvent`.
