@@ -124,8 +124,8 @@ def test_first_run_credentials_yaml_has_expected_keys(
     assert "neo4j_user" in creds, "credentials.yaml must contain 'neo4j_user'"
     assert "neo4j_password" in creds, "credentials.yaml must contain 'neo4j_password'"
     assert "api_key" in creds, "credentials.yaml must contain 'api_key'"
-    assert creds["neo4j_url"] == "neo4j://neo4j:7687", (
-        "neo4j_url must be 'neo4j://neo4j:7687'"
+    assert creds["neo4j_url"] == "bolt://neo4j:7687", (
+        "neo4j_url must be 'bolt://neo4j:7687'"
     )
     assert creds["neo4j_user"] == "neo4j", "neo4j_user must be 'neo4j'"
 

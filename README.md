@@ -90,6 +90,30 @@ When `api_key` is configured, the dashboard shows an API key prompt on first vis
 
 ---
 
+## Running with Docker (single container)
+
+Build the image then run with explicit port and volume mounts:
+
+```bash
+docker build -t context-intelligence-server .
+docker run -d \
+  --name context-intelligence-server \
+  -p 8000:8000 \
+  -v "$HOME/amplifier-context-intelligence-server-data-store:/data" \
+  -e AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY=<your-api-key> \
+  -e AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL=bolt://your-neo4j:7687 \
+  -e AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD=<password> \
+  context-intelligence-server
+```
+
+Retrieve the generated API key after first run:
+
+```bash
+docker exec context-intelligence-server grep api_key /data/credentials.yaml
+```
+
+---
+
 ## First-Run Setup (Standalone)
 
 Before starting the server for the first time outside Docker, run the init command to generate credentials:
@@ -230,6 +254,12 @@ Open [http://localhost:8000](http://localhost:8000) to confirm the server is run
 
 To run the server as an auto-starting background service on Linux (systemd)
 or macOS (launchd), see [docs/service-setup.md](docs/service-setup.md).
+
+---
+
+## Deploying to Azure
+
+See [docs/azure-deployment.md](docs/azure-deployment.md) for a full guide to deploying as an Azure Container App with automatic HTTPS, persistent storage, and Neo4j on AuraDB.
 
 ---
 

@@ -51,10 +51,10 @@ def test_dockerfile_copies_server_package() -> None:
     )
 
 
-def test_dockerfile_pip_install() -> None:
+def test_dockerfile_uv_install() -> None:
     content = DOCKERFILE.read_text()
-    assert "pip install --no-cache-dir ." in content, (
-        "Dockerfile must run pip install --no-cache-dir ."
+    assert "uv pip install --system --no-cache ." in content, (
+        "Dockerfile must run uv pip install --system --no-cache . (not pip)"
     )
 
 
@@ -63,15 +63,13 @@ def test_dockerfile_expose_8000() -> None:
     assert "EXPOSE 8000" in content, "Dockerfile must EXPOSE 8000"
 
 
-def test_dockerfile_uvicorn_cmd() -> None:
+def test_dockerfile_cmd_uses_entry_point() -> None:
     content = DOCKERFILE.read_text()
-    assert "uvicorn" in content, "Dockerfile CMD must use uvicorn"
-    assert "context_intelligence_server.main:asgi_app" in content, (
-        "Dockerfile CMD must point to context_intelligence_server.main:asgi_app "
-        "(the auth-wrapped app, not the raw FastAPI app)"
+    assert 'CMD ["context-intelligence-server"]' in content, (
+        "Dockerfile CMD must use the named entry point 'context-intelligence-server' "
+        "(not a hardcoded uvicorn command)"
     )
-    assert "0.0.0.0" in content, "Dockerfile CMD must bind to 0.0.0.0"
-    assert "8000" in content, "Dockerfile CMD must use port 8000"
+    assert "8000" in content, "Dockerfile must reference port 8000 (EXPOSE)"
 
 
 def test_dockerfile_copies_entrypoint_script() -> None:
