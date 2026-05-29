@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -23,6 +24,8 @@ import pytest
 from context_intelligence_server.graph_store import GraphStore, QueryableStore
 from context_intelligence_server.neo4j_store import (
     Neo4jGraphStore,
+    _convert_temporal_props,
+    _normalize_temporal,  # noqa: F401 — imported here so Task 4 tests fail correctly
     _validate_identifier,
 )
 
@@ -1408,3 +1411,64 @@ async def test_flush_lock_serializes_concurrent_calls() -> None:
             "session_2 became active before flush_1 completed — "
             f"concurrent transactions detected. Execution order: {order}"
         )
+
+
+# ---------------------------------------------------------------------------
+# _convert_temporal_props (write-path ISO-string → datetime conversion)
+# ---------------------------------------------------------------------------
+
+
+def test_convert_temporal_props_converts_started_at() -> None:
+    """_convert_temporal_props converts started_at ISO string to datetime in place."""
+    props: dict = {"started_at": "2026-03-18T14:55:17+00:00"}
+    result = _convert_temporal_props(props)
+    assert result is None  # mutates in place, returns None
+    assert isinstance(props["started_at"], datetime)
+    assert props["started_at"] == datetime(2026, 3, 18, 14, 55, 17, tzinfo=timezone.utc)
+
+
+def test_convert_temporal_props_converts_last_updated() -> None:
+    """_convert_temporal_props converts last_updated ISO string to datetime."""
+    props: dict = {"last_updated": "2026-01-01T00:00:01Z"}
+    _convert_temporal_props(props)
+    assert isinstance(props["last_updated"], datetime)
+
+
+def test_convert_temporal_props_converts_edge_occurred_at() -> None:
+    """_convert_temporal_props converts occurred_at ISO string to datetime (edge property)."""
+    props: dict = {"occurred_at": "2026-01-01T00:00:01+00:00"}
+    _convert_temporal_props(props)
+    assert isinstance(props["occurred_at"], datetime)
+
+
+def test_convert_temporal_props_malformed_string_unchanged_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """_convert_temporal_props leaves malformed timestamps unchanged and logs a WARNING."""
+    props: dict = {"started_at": "not-a-timestamp"}
+    with caplog.at_level("WARNING"):
+        _convert_temporal_props(props)  # must not raise
+    assert props["started_at"] == "not-a-timestamp"
+    assert any(record.levelname == "WARNING" for record in caplog.records)
+
+
+def test_convert_temporal_props_empty_string_passes_through() -> None:
+    """_convert_temporal_props skips empty string values (passes through unchanged)."""
+    props: dict = {"started_at": ""}
+    _convert_temporal_props(props)
+    assert props["started_at"] == ""
+
+
+def test_convert_temporal_props_existing_datetime_untouched() -> None:
+    """_convert_temporal_props leaves already-datetime values untouched (idempotent)."""
+    dt = datetime(2026, 3, 18, 14, 55, 17, tzinfo=timezone.utc)
+    props: dict = {"started_at": dt}
+    _convert_temporal_props(props)
+    assert props["started_at"] is dt
+
+
+def test_convert_temporal_props_non_registered_key_untouched() -> None:
+    """_convert_temporal_props skips keys not in the TEMPORAL_PROPS registry."""
+    props: dict = {"name": "2026-03-18T14:55:17+00:00"}
+    _convert_temporal_props(props)
+    assert props["name"] == "2026-03-18T14:55:17+00:00"

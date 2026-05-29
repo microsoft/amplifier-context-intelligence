@@ -53,17 +53,19 @@ _DEFAULT_EDGE_TYPE = "RELATED"
 # FUTURE: when the first duration-typed property arrives, convert this frozenset
 #   to TEMPORAL_PROPERTIES: dict[str, type] and add neo4j.time.Duration to the
 #   _sanitize_properties allow-list at that point — not before.
-TEMPORAL_PROPS: frozenset[str] = frozenset({
-    "started_at",
-    "ended_at",
-    "occurred_at",
-    "completed_at",
-    "last_updated",  # only temporal field NOT ending in _at
-    "resumed_at",
-    "cancelled_at",
-    "last_loop_iteration_at",
-    "loop_completed_at",
-})
+TEMPORAL_PROPS: frozenset[str] = frozenset(
+    {
+        "started_at",
+        "ended_at",
+        "occurred_at",
+        "completed_at",
+        "last_updated",  # only temporal field NOT ending in _at
+        "resumed_at",
+        "cancelled_at",
+        "last_loop_iteration_at",
+        "loop_completed_at",
+    }
+)
 
 
 def _validate_identifier(name: str, kind: str) -> None:
@@ -81,6 +83,50 @@ def _validate_identifier(name: str, kind: str) -> None:
     """
     if not _SAFE_IDENTIFIER_RE.match(name):
         raise ValueError(f"Invalid Neo4j {kind} identifier: {name!r}")
+
+
+def _convert_temporal_props(props: dict[str, Any]) -> None:
+    """Parse ISO-8601 strings to Python ``datetime`` objects for registered temporal properties.
+
+    Mutates *props* in place; returns ``None``.
+
+    Rules:
+    - Iterates over ``TEMPORAL_PROPS``; skips keys absent from *props*.
+    - Skips values that are not ``str`` or are empty strings (already ``datetime``
+      or other type, or empty string handled downstream by ``_sanitize_properties``).
+    - Parses non-empty strings via ``datetime.fromisoformat`` (Python 3.11+
+      accepts trailing ``Z`` as a synonym for ``+00:00``).
+    - On ``ValueError``, logs a WARNING including the key and value, leaves the
+      value unchanged, and does NOT raise (non-fatal).
+
+    Must be called as a statement before ``_sanitize_properties``:
+        ``_convert_temporal_props(props)``
+        ``props = Neo4jGraphStore._sanitize_properties(props)``
+    Never chain: ``props = _convert_temporal_props(props)``  — returns ``None``.
+    """
+    for key in TEMPORAL_PROPS:
+        if key not in props:
+            continue
+        value = props[key]
+        if not isinstance(value, str) or value == "":
+            continue
+        try:
+            props[key] = datetime.fromisoformat(value)
+        except ValueError:
+            _LOG.warning(
+                "_convert_temporal_props: could not parse %r=%r as ISO 8601 datetime; "
+                "leaving value unchanged",
+                key,
+                value,
+            )
+
+
+def _normalize_temporal(props: dict[str, Any]) -> None:
+    """Convert neo4j.time.DateTime values back to Python ``datetime`` objects.
+
+    Placeholder — full implementation added in Task 4.
+    Mutates *props* in place; returns ``None``.
+    """
 
 
 async def ensure_neo4j_schema(
