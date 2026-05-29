@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import re
+from datetime import datetime
 from typing import Any, LiteralString, cast
 
 from neo4j import AsyncGraphDatabase
@@ -27,6 +28,42 @@ _LOG = logging.getLogger(__name__)
 
 _SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _DEFAULT_EDGE_TYPE = "RELATED"
+
+# ---------------------------------------------------------------------------
+# Temporal property registry
+# ---------------------------------------------------------------------------
+# Every property name in this set is stored as a Neo4j ZONED DATETIME.
+#
+# On WRITE: _convert_temporal_props() parses ISO strings to Python datetime;
+#   the Neo4j driver then writes those datetime objects as ZONED DATETIME nodes.
+# On READ:  _normalize_temporal() converts neo4j.time.DateTime back to Python
+#   datetime objects.
+#
+# IMPORTANT: neo4j.time types must NEVER leave this module.
+#   services.py, pipeline.py, and handlers deal in Python stdlib types only.
+#
+# RULE: add a name here whenever you add a temporal property to any handler.
+#   Forgetting means the value lands as a plain string silently — no error,
+#   no warning, just wrong data.
+#
+# Note: last_updated is the one field that does NOT follow the *_at convention
+#   and is listed deliberately.  Do NOT replace this explicit set with a suffix
+#   heuristic — a heuristic would silently miss last_updated.
+#
+# FUTURE: when the first duration-typed property arrives, convert this frozenset
+#   to TEMPORAL_PROPERTIES: dict[str, type] and add neo4j.time.Duration to the
+#   _sanitize_properties allow-list at that point — not before.
+TEMPORAL_PROPS: frozenset[str] = frozenset({
+    "started_at",
+    "ended_at",
+    "occurred_at",
+    "completed_at",
+    "last_updated",  # only temporal field NOT ending in _at
+    "resumed_at",
+    "cancelled_at",
+    "last_loop_iteration_at",
+    "loop_completed_at",
+})
 
 
 def _validate_identifier(name: str, kind: str) -> None:
