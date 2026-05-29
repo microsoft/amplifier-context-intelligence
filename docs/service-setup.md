@@ -370,3 +370,95 @@ bypass the browser cache.
 | macOS: plist loaded but service not running | launchd silently failed | Check `server.stderr.log` for startup errors |
 | Events stop dispatching, circuit breaker tripped | `context_intelligence_api_key` missing from `~/.amplifier/settings.yaml` | Add `context_intelligence_api_key: "<key>"` under `overrides.hook-context-intelligence.config` |
 | Dashboard shows "Enter your API key" and won't load | API key prompt is active | Open `server-config.yaml`, find `api_key:`, paste it into the dashboard prompt |
+
+---
+
+## 10. Self-Hosted HTTPS with Caddy (Local / Dev Only)
+
+> **Scope:** This section covers local runs and development cycles only — for users who need HTTPS locally or on a self-hosted VM outside Azure. Production deployments use [Azure Container Apps](azure-deployment.md) which handles TLS automatically. The docker-compose setup exists to support local runs and dev cycles, not production hosting.
+
+### Why Caddy and Not nginx
+
+Caddy issues and renews Let's Encrypt certificates automatically — no certbot sidecar, no cron job, no renewal hook. Compare:
+
+- **nginx**: requires 2 containers (nginx + certbot), a shared volume, a renewal cron job, and an nginx reload hook — 40+ lines of configuration
+- **Caddy**: 3-line Caddyfile, done
+
+Additional Caddy advantages:
+
+- HTTP→HTTPS redirect on by default
+- TLS 1.2+ and modern cipher suites out of the box
+- One addition to docker-compose, zero cert management overhead
+
+nginx remains a valid choice for teams with existing nginx expertise, but carries the certbot-sidecar overhead described above.
+
+### Implementation
+
+Drop a `docker-compose.override.yml` alongside the existing `docker-compose.yml` — no changes to the main compose file are required.
+
+**`docker-compose.override.yml`**
+
+```yaml
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - context-intelligence-server
+    networks:
+      - context-intelligence
+
+volumes:
+  caddy_data:
+  caddy_config:
+```
+
+**`Caddyfile`** (place alongside `docker-compose.yml`):
+
+```
+your-domain.example.com {
+    reverse_proxy context-intelligence-server:8000
+}
+```
+
+Start the stack:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
+```
+
+Caddy fetches and renews the Let's Encrypt certificate automatically.
+
+---
+
+**Local HTTPS without a domain (testing only)**
+
+For local testing where no public domain is available, use Caddy's internal CA:
+
+**`Caddyfile`** (local testing):
+
+```
+localhost {
+    tls internal
+    reverse_proxy context-intelligence-server:8000
+}
+```
+
+Caddy generates a local CA stored in `caddy_data`. To trust it on the host:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.override.yml exec caddy caddy trust
+```
+
+> **Note:** This is local development only — not suitable for production.
+
+---
+
+Finally, update `settings.yaml` with the HTTPS URL — same pattern as the [Azure deployment guide](azure-deployment.md).
