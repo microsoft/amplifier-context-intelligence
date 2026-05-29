@@ -51,6 +51,20 @@ the provider's tool_call_id directly; Orchestrator uses the orchestrator name st
 
 ## Section 2 — Schema Reference
 
+### Temporal Property Types: ZONED DATETIME, Not Strings
+
+**Read this before writing any query that touches a timestamp.** Every `*_at` property (`started_at`, `ended_at`, `occurred_at`, `completed_at`, `resumed_at`, `cancelled_at`, `last_loop_iteration_at`, `loop_completed_at`) and the non-`*_at` field `last_updated` — on nodes AND on the three edge types that carry `occurred_at` (`HAS_EVENT`, `HAS_SUBSESSION`, `FORKED`) — are stored as native Neo4j **`ZONED DATETIME`** values. They are NOT strings.
+
+❌ Wrong: `WHERE s.started_at > '2026-05-01'` — silently returns no results (comparing ZONED DATETIME to string literal always evaluates false; Neo4j raises no error).
+
+✅ Correct: `WHERE s.started_at > datetime('2026-05-01')` — wrap every literal in `datetime(...)`.
+
+✅ `ORDER BY s.started_at` — correct as-is.
+
+✅ `duration.between(s.started_at, s.ended_at)` — now works, returns a Neo4j DURATION value (e.g. PT1H30M).
+
+See Gotcha #12 for the same warning at the point of use, and Section 6 for temporal query patterns.
+
 ### Data Layer 1 Nodes
 
 | Node Label | Description | node_id Format |
