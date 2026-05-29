@@ -25,7 +25,7 @@ from context_intelligence_server.graph_store import GraphStore, QueryableStore
 from context_intelligence_server.neo4j_store import (
     Neo4jGraphStore,
     _convert_temporal_props,
-    _normalize_temporal,  # noqa: F401 — imported here so Task 4 tests fail correctly
+    _normalize_temporal,
     _validate_identifier,
 )
 

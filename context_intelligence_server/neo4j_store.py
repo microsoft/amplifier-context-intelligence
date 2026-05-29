@@ -345,7 +345,10 @@ class Neo4jGraphStore:
             )
             records = result.records
             if records:
-                return {k: _normalize_temporal(v) for k, v in dict(records[0]["props"]).items()}
+                return {
+                    k: _normalize_temporal(v)
+                    for k, v in dict(records[0]["props"]).items()
+                }
         except Neo4jError:
             pass
 
@@ -375,7 +378,10 @@ class Neo4jGraphStore:
             )
             records = result.records
             if records:
-                return {k: _normalize_temporal(v) for k, v in dict(records[0]["props"]).items()}
+                return {
+                    k: _normalize_temporal(v)
+                    for k, v in dict(records[0]["props"]).items()
+                }
         except Neo4jError:
             pass
 
@@ -475,7 +481,9 @@ class Neo4jGraphStore:
                     for node_id, data in node_snapshot.items():
                         labels: list[str] = data.get("labels", [])
                         node_props = {k: v for k, v in data.items() if k != "labels"}
-                        _convert_temporal_props(node_props)  # ISO str -> datetime, in place
+                        _convert_temporal_props(
+                            node_props
+                        )  # ISO str -> datetime, in place
                         props = self._sanitize_properties(node_props)
                         props["workspace"] = self.workspace
                         row: dict[str, Any] = {"node_id": node_id, "props": props}
@@ -554,7 +562,9 @@ class Neo4jGraphStore:
                     for (src_id, dst_id), data in edge_snapshot.items():
                         edge_type: str = data.get("type", _DEFAULT_EDGE_TYPE)
                         edge_props = {k: v for k, v in data.items() if k != "type"}
-                        _convert_temporal_props(edge_props)  # ISO str -> datetime, in place
+                        _convert_temporal_props(
+                            edge_props
+                        )  # ISO str -> datetime, in place
                         props = self._sanitize_properties(edge_props)
                         props["workspace"] = self.workspace
                         # Store src_id/dst_id on the relationship so the
@@ -690,7 +700,12 @@ class Neo4jGraphStore:
         async with self._driver.session(database=self._database) as session:
             result = await session.run(query, query_params)  # type: ignore[arg-type]
             data = await result.data()
-            return [{k: _normalize_temporal(v) for k, v in dict(record).items()} for record in data]
+            # Normalizes only top-level record values; nested temporal values (rare)
+            # must be normalized by callers.
+            return [
+                {k: _normalize_temporal(v) for k, v in dict(record).items()}
+                for record in data
+            ]
 
     # ------------------------------------------------------------------
     # Static helpers
