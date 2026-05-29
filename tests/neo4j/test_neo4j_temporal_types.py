@@ -305,8 +305,7 @@ class TestTouchSessionReadPath:
         await neo4j_services.graph.flush()
 
         records = await neo4j_services.graph.execute_query(
-            "MATCH (s:Session {node_id: $nid}) "
-            "RETURN toString(s.last_updated) AS val",
+            "MATCH (s:Session {node_id: $nid}) RETURN toString(s.last_updated) AS val",
             {"nid": sid},
             workspace="*",
         )
