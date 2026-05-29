@@ -755,6 +755,14 @@ def test_sanitize_properties_preserves_non_empty_at_fields():
     assert result["started_at"] == "2026-03-18T14:55:17+00:00"
 
 
+def test_sanitize_properties_passes_datetime_through():
+    """_sanitize_properties keeps datetime values as-is (not str-coerced)."""
+    dt = datetime(2026, 3, 18, 14, 55, 17, tzinfo=timezone.utc)
+    result = Neo4jGraphStore._sanitize_properties({"started_at": dt})
+    assert result["started_at"] is dt
+    assert isinstance(result["started_at"], datetime)
+
+
 # ---------------------------------------------------------------------------
 # Datetime conversion to Neo4j temporal types is deferred.
 # See DATETIME-MIGRATION.md at the workspace root for the full

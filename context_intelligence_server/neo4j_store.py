@@ -689,7 +689,7 @@ class Neo4jGraphStore:
 
         Rules:
         - ``None`` values are *skipped* (not included in output).
-        - ``str``, ``int``, ``float``, ``bool`` are kept as-is.
+        - ``str``, ``int``, ``float``, ``bool``, ``datetime`` are kept as-is.
         - ``list`` whose items are all primitives (str/int/float/bool) is kept.
         - ``list`` containing non-primitive items is JSON-serialised to a string.
         - ``dict`` values are JSON-serialised to a string.
@@ -699,7 +699,7 @@ class Neo4jGraphStore:
         for key, value in props.items():
             if value is None:
                 continue
-            if isinstance(value, (str, int, float, bool)):
+            if isinstance(value, (str, int, float, bool, datetime)):
                 # Never write empty-string timestamps — SET n += row.props would
                 # overwrite a previously valid started_at on the existing node.
                 if isinstance(value, str) and value == "" and key.endswith("_at"):
