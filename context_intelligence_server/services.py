@@ -298,9 +298,9 @@ class HookStateService:
                     break
                 current = node.get("last_updated")
                 # Compare using stdlib datetime only; the store's read path normalises
-                # neo4j.time.DateTime to Python datetime, but the in-memory store returns
+                # driver DateTime objects to Python datetime, but the in-memory store returns
                 # whatever was written (often a str), so coerce both sides defensively.
-                # No neo4j.time awareness here.
+                # No driver-specific datetime types here.
                 ts = (
                     datetime.fromisoformat(timestamp)
                     if isinstance(timestamp, str)
