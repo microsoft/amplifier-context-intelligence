@@ -891,7 +891,7 @@ MATCH (s:Session {workspace: $workspace, node_id: $session_id})
       -[:HAS_EXECUTION]->(:OrchestratorRun)
       -[:HAS_PART]->(iter:Iteration)
       -[:HAS_TOOL_CALL]->(tc:ToolCall)
-WHERE tc.result_success = false   -- focus on failures only
+WHERE tc.result_success = false   // focus on failures only
 RETURN iter.iteration_number, tc.tool_name, tc.result_error, tc.started_at
 ORDER BY tc.started_at
 LIMIT 25
