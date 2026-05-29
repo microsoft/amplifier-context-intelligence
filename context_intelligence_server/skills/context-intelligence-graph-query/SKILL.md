@@ -73,7 +73,7 @@ See Gotcha #12 for the same warning at the point of use, and Section 6 for tempo
 | `:Event` | Every kernel event. Triple-labeled: `:Event` + `:{Category}Event` + `:{Specific}Event`. | `{session_id}__{event_name}__{epoch_ms}` |
 
 Key properties on `:Event` nodes:
-- `occurred_at` — ISO 8601 timestamp
+- `occurred_at` — **`ZONED DATETIME`** (native Neo4j temporal; compare with `datetime(...)`, not string literals — see "Temporal Property Types" above)
 - `session_id` — owning session UUID
 - `workspace` — workspace partition key
 - `event_name` — raw event name (e.g. `tool:pre`)
