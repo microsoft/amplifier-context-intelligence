@@ -23,7 +23,7 @@ class RecipeLifter(FieldLifter):
             "status",
             "step_id",
             "total_steps",
-            "parent_session_id",   # NEW — lifted from recipe:start for sub-recipe identification
+            "parent_session_id",  # NEW — lifted from recipe:start for sub-recipe identification
         ):
             value = data.get(key)
             if value is not None:

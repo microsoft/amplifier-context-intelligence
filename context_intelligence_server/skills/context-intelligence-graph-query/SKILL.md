@@ -51,6 +51,20 @@ the provider's tool_call_id directly; Orchestrator uses the orchestrator name st
 
 ## Section 2 — Schema Reference
 
+### Temporal Property Types: ZONED DATETIME, Not Strings
+
+**Read this before writing any query that touches a timestamp.** Every `*_at` property (`started_at`, `ended_at`, `occurred_at`, `completed_at`, `resumed_at`, `cancelled_at`, `last_loop_iteration_at`, `loop_completed_at`) and the non-`*_at` field `last_updated` — on nodes AND on the three edge types that carry `occurred_at` (`HAS_EVENT`, `HAS_SUBSESSION`, `FORKED`) — are stored as native Neo4j **`ZONED DATETIME`** values. They are NOT strings.
+
+❌ Wrong: `WHERE s.started_at > '2026-05-01'` — silently returns no results (comparing ZONED DATETIME to string literal always evaluates false; Neo4j raises no error).
+
+✅ Correct: `WHERE s.started_at > datetime('2026-05-01')` — wrap every literal in `datetime(...)`.
+
+✅ `ORDER BY s.started_at` — correct as-is.
+
+✅ `duration.between(s.started_at, s.ended_at)` — now works, returns a Neo4j DURATION value (e.g. PT1H30M).
+
+See Gotcha #12 for the same warning at the point of use, and Section 6 for temporal query patterns.
+
 ### Data Layer 1 Nodes
 
 | Node Label | Description | node_id Format |
@@ -59,11 +73,11 @@ the provider's tool_call_id directly; Orchestrator uses the orchestrator name st
 | `:Event` | Every kernel event. Triple-labeled: `:Event` + `:{Category}Event` + `:{Specific}Event`. | `{session_id}__{event_name}__{epoch_ms}` |
 
 Key properties on `:Event` nodes:
-- `occurred_at` — ISO 8601 timestamp
+- `occurred_at` — **`ZONED DATETIME`** (native Neo4j temporal; compare with `datetime(...)`, not string literals — see "Temporal Property Types" above)
 - `session_id` — owning session UUID
 - `workspace` — workspace partition key
 - `event_name` — raw event name (e.g. `tool:pre`)
-- **`data`** — **JSON string** of the original kernel event payload. Not a Cypher map. Parse it before accessing sub-fields. May contain `ci-blob://` URI references for large payloads (see Section 5).
+- **`data`** — **JSON string** of the complete raw kernel event payload from the session JSONL. Not a Cypher map. Dot notation (`e.data.tool_name`) does not work in Cypher. Use lifted properties (`tool_name`, `model`, `tool_call_id`, etc.) which are extracted at ingest time as first-class node properties. When raw payload fields not lifted are needed, retrieve the `data` string and parse with `jq` outside Cypher (see Section 5). May contain `ci-blob://` URI references for large payloads.
 - Plus event-specific lifted properties (e.g. `tool_name`, `tool_call_id` on `:ToolPreEvent`; `model`, `provider` on `:LlmResponseEvent`).
 
 Common event labels: `:ToolPreEvent`, `:ToolPostEvent`, `:ToolErrorEvent`, `:LlmRequestEvent`, `:LlmResponseEvent`, `:PromptSubmitEvent`, `:ExecutionStartEvent`, `:ExecutionEndEvent`, `:DelegateAgentSpawnedEvent`, `:SessionStartEvent`, `:SessionEndEvent`.
@@ -74,7 +88,7 @@ Common event labels: `:ToolPreEvent`, `:ToolPostEvent`, `:ToolErrorEvent`, `:Llm
 |---|---|---|
 | `HAS_FORK` | Session → Session | Parent session forked a child |
 | `HAS_TOOL_CALL` | Session → ToolCall | Session owns a data layer 1 tool call lifecycle node |
-| `HAS_EVENT` | Session → Event | Session owns an event node |
+| `HAS_EVENT` | Session → Event | Session owns an event node. Carries edge property `occurred_at` (ZONED DATETIME). |
 | `HAS_EVENT` | ToolCall → Event | Tool call owns its lifecycle events |
 
 ### Data Layer 2 Entity Types
@@ -83,14 +97,14 @@ All data layer 2 nodes carry a `workspace` property and an SST type label.
 
 | Entity | Labels | SST Type | node_id Format | Key Properties |
 |---|---|---|---|---|
-| Session | `:Session:SST_EVENT` (+ `:RootSession`/`:SubSession`/`:ForkedSession`) | Temporal | Raw UUID | `started_at`, `ended_at`, `status` |
-| OrchestratorRun | `:OrchestratorRun:SST_EVENT` | Temporal | `{session_id}::orch_run::{started_at}` | `started_at`, `ended_at`, `orchestrator_name` |
-| Iteration | `:Iteration:SST_EVENT` | Temporal | `{session_id}::iteration::{N}` | `iteration_number`, `started_at` |
-| ContentBlock | `:ContentBlock:SST_EVENT` | Temporal | `{session_id}::block::{iteration_N}::{index}` | `block_type`, `block_index` |
-| ToolCall | `:ToolCall:SST_EVENT` | Temporal | `{tool_call_id}` (provider UUID directly) | `tool_name`, `tool_call_id`, `result_success`, `result_error`, `result_output`, `started_at`, `ended_at`, `parallel_group_id` |
-| Prompt | `:Prompt:SST_EVENT` | Temporal | `{session_id}::prompt::{timestamp}` | `prompt_text`, `started_at` |
-| Cancellation | `:Cancellation:SST_EVENT` | Temporal | `{session_id}::cancellation::{timestamp}` | `occurred_at` |
-| ContextCompaction | `:ContextCompaction:SST_EVENT` | Temporal | `{session_id}::compaction::{timestamp}` | `occurred_at` |
+| Session | `:Session:SST_EVENT` (+ `:RootSession`/`:SubSession`/`:ForkedSession`) | Temporal | Raw UUID | `started_at` (ZONED DATETIME), `ended_at` (ZONED DATETIME), `last_updated` (ZONED DATETIME), `status` |
+| OrchestratorRun | `:OrchestratorRun:SST_EVENT` | Temporal | `{session_id}::orch_run::{started_at}` | `started_at` (ZONED DATETIME), `ended_at` (ZONED DATETIME), `completed_at` (ZONED DATETIME, when present), `orchestrator_name` |
+| Iteration | `:Iteration:SST_EVENT` | Temporal | `{session_id}::iteration::{N}` | `iteration_number`, `started_at` (ZONED DATETIME) |
+| ContentBlock | `:ContentBlock:SST_EVENT` | Temporal | `{session_id}::block::{iteration_N}::{index}` | `block_type`, `block_index`, `started_at` (ZONED DATETIME, when present) |
+| ToolCall | `:ToolCall:SST_EVENT` | Temporal | `{tool_call_id}` (provider UUID directly) | `tool_name`, `tool_call_id`, `result_success`, `result_error`, `result_output`, `started_at` (ZONED DATETIME), `ended_at` (ZONED DATETIME), `parallel_group_id` |
+| Prompt | `:Prompt:SST_EVENT` | Temporal | `{session_id}::prompt::{timestamp}` | `prompt_text`, `started_at` (ZONED DATETIME) |
+| Cancellation | `:Cancellation:SST_EVENT` | Temporal | `{session_id}::cancellation::{timestamp}` | `occurred_at` (ZONED DATETIME) |
+| ContextCompaction | `:ContextCompaction:SST_EVENT` | Temporal | `{session_id}::compaction::{timestamp}` | `occurred_at` (ZONED DATETIME) |
 | MountPlan | `:MountPlan:SST_THING` | Resource | `{session_id}::mount_plan` | `mount_plan_data` |
 | Orchestrator | `:Orchestrator:SST_CONCEPT` | Abstract | Orchestrator name string (e.g. `loop-streaming`) | `name` |
 
@@ -101,14 +115,14 @@ All edges carry an `sst_semantic` property that expresses the relationship's mea
 | Edge Type | `sst_semantic` | From → To | What It Means |
 |---|---|---|---|
 | `HAS_EXECUTION` | `CONTAINS` | Session → OrchestratorRun | Session contains this orchestrator run (one per user turn) |
-| `FORKED` | `LEADS_TO` | Session → ForkedSession | Session forked a child session |
+| `FORKED` | `LEADS_TO` | Session → ForkedSession | Session forked a child session. Carries edge property `occurred_at` (ZONED DATETIME). |
 | `HAS_ATTRIBUTE` | `EXPRESSES` | Session → Orchestrator | Session describes its orchestrator type |
 | `HAS_PART` | `CONTAINS` | Session → MountPlan/Prompt/Cancellation | Session contains these parts |
 | `HAS_PART` | `CONTAINS` | OrchestratorRun → Iteration | Run contains these LLM iterations |
 | `HAS_PART` | `CONTAINS` | Iteration → ContentBlock | Iteration contains these content blocks |
 | `HAS_TOOL_CALL` | `CONTAINS` | Iteration → ToolCall | Iteration contains these tool calls |
 | `HAS_COMPACTION` | `CONTAINS` | Session → ContextCompaction | Session contains this compaction event |
-| `HAS_SUBSESSION` | `LEADS_TO` | Session → SubSession | Session leads to a sub-session |
+| `HAS_SUBSESSION` | `LEADS_TO` | Session → SubSession | Session leads to a sub-session. Carries edge property `occurred_at` (ZONED DATETIME). |
 | `CAUSED` | `LEADS_TO` | ContentBlock → ToolCall | This content block triggered this tool call |
 | `PARALLEL_EXECUTION` | `NEAR` | ToolCall ↔ ToolCall | These tool calls ran concurrently in the same parallel group |
 | `TRIGGERS` | `LEADS_TO` | Prompt → OrchestratorRun | This prompt started this orchestrator run |
@@ -121,10 +135,10 @@ All foundation layer nodes carry a `workspace` property and an SST type label.
 
 | Entity | Labels | SST Type | node_id Format | Key Properties |
 |---|---|---|---|---|
-| Delegation | `:Delegation:SST_EVENT` | Temporal | `{parent_session_id}::delegation::{tool_call_id\|sub_session_id}` | `agent`, `sub_session_id`, `parent_session_id`, `started_at`, `ended_at`, `context_depth`, `context_scope` |
+| Delegation | `:Delegation:SST_EVENT` | Temporal | `{parent_session_id}::delegation::{tool_call_id\|sub_session_id}` | `agent`, `sub_session_id`, `parent_session_id`, `started_at` (ZONED DATETIME), `ended_at` (ZONED DATETIME), `resumed_at` (ZONED DATETIME, when present), `cancelled_at` (ZONED DATETIME, when present), `context_depth`, `context_scope` |
 | Agent | `:Agent:SST_CONCEPT` | Abstract | Agent name string (e.g. `foundation:explorer`) | `agent` |
 | SkillLoad | `:SkillLoad:SST_EVENT` | Temporal | `{session_id}::skill::{skill_name}::{loaded_at_ts}` | `skill_name`, `content_length`, `loaded_at` |
-| RecipeRun | `:RecipeRun:SST_EVENT` | Temporal | `{session_id}::recipe_run::{timestamp}` | `name`, `status`, `current_step`, `total_steps` |
+| RecipeRun | `:RecipeRun:SST_EVENT` | Temporal | `{session_id}::recipe_run::{timestamp}` | `name`, `status`, `current_step`, `total_steps`, `last_loop_iteration_at` (ZONED DATETIME, when present), `loop_completed_at` (ZONED DATETIME, when present) |
 | RecipeStep | `:RecipeStep:SST_EVENT` | Temporal | `{session_id}::recipe_run::{ts}::step::{N}` | `name`, `status`, `step_id` |
 | Recipe | `:Recipe:SST_CONCEPT` | Abstract | Recipe name string | `name` |
 
@@ -877,7 +891,7 @@ MATCH (s:Session {workspace: $workspace, node_id: $session_id})
       -[:HAS_EXECUTION]->(:OrchestratorRun)
       -[:HAS_PART]->(iter:Iteration)
       -[:HAS_TOOL_CALL]->(tc:ToolCall)
-WHERE tc.result_success = false   -- focus on failures only
+WHERE tc.result_success = false   // focus on failures only
 RETURN iter.iteration_number, tc.tool_name, tc.result_error, tc.started_at
 ORDER BY tc.started_at
 LIMIT 25
@@ -1061,3 +1075,15 @@ the context window before any result can be processed. Three mandatory habits:
    `WHERE s.node_id IN [...]` to constrain the starting set before any traversal.
 
 See Section 7 for the complete size management and pagination reference.
+
+**12. Temporal comparisons require the `datetime()` wrapper.** Comparing a ZONED DATETIME
+property to a string literal (`WHERE s.started_at > '2026-05-01'`) always evaluates false —
+no error is raised, no results are returned, the query silently produces nothing. Use
+`datetime('2026-05-01')` instead. ORDER BY on temporal columns requires no change. See
+"Temporal Property Types" at the top of Section 2 for the full list of ZONED DATETIME
+properties.
+
+- `duration.between(s.started_at, s.ended_at)` computes elapsed time (session length,
+  tool-call duration) and returns a Neo4j DURATION value (e.g. PT1H30M).
+- `WHERE s.started_at > datetime() - duration('P30D')` enables rolling time-window queries
+  (sessions started in the last 30 days). Both were impossible with string storage.

@@ -29,6 +29,44 @@ _LOG = logging.getLogger(__name__)
 _SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _DEFAULT_EDGE_TYPE = "RELATED"
 
+# ---------------------------------------------------------------------------
+# Temporal property registry
+# ---------------------------------------------------------------------------
+# Every property name in this set is stored as a Neo4j ZONED DATETIME.
+#
+# On WRITE: _convert_temporal_props() parses ISO strings to Python datetime;
+#   the Neo4j driver then writes those datetime objects as ZONED DATETIME nodes.
+# On READ:  _normalize_temporal() converts neo4j.time.DateTime back to Python
+#   datetime objects.
+#
+# IMPORTANT: neo4j.time types must NEVER leave this module.
+#   services.py, pipeline.py, and handlers deal in Python stdlib types only.
+#
+# RULE: add a name here whenever you add a temporal property to any handler.
+#   Forgetting means the value lands as a plain string silently — no error,
+#   no warning, just wrong data.
+#
+# Note: last_updated is the one field that does NOT follow the *_at convention
+#   and is listed deliberately.  Do NOT replace this explicit set with a suffix
+#   heuristic — a heuristic would silently miss last_updated.
+#
+# FUTURE: when the first duration-typed property arrives, convert this frozenset
+#   to TEMPORAL_PROPERTIES: dict[str, type] and add neo4j.time.Duration to the
+#   _sanitize_properties allow-list at that point — not before.
+TEMPORAL_PROPS: frozenset[str] = frozenset(
+    {
+        "started_at",
+        "ended_at",
+        "occurred_at",
+        "completed_at",
+        "last_updated",  # only temporal field NOT ending in _at
+        "resumed_at",
+        "cancelled_at",
+        "last_loop_iteration_at",
+        "loop_completed_at",
+    }
+)
+
 
 def _validate_identifier(name: str, kind: str) -> None:
     """Raise ``ValueError`` if *name* is not a safe Neo4j label / relationship-type identifier.
@@ -45,6 +83,63 @@ def _validate_identifier(name: str, kind: str) -> None:
     """
     if not _SAFE_IDENTIFIER_RE.match(name):
         raise ValueError(f"Invalid Neo4j {kind} identifier: {name!r}")
+
+
+def _convert_temporal_props(props: dict[str, Any]) -> None:
+    """Parse ISO-8601 strings to Python ``datetime`` objects for registered temporal properties.
+
+    Mutates *props* in place; returns ``None``.
+
+    Rules:
+    - Iterates over ``TEMPORAL_PROPS``; skips keys absent from *props*.
+    - Skips values that are not ``str`` or are empty strings (already ``datetime``
+      or other type, or empty string handled downstream by ``_sanitize_properties``).
+    - Parses non-empty strings via ``datetime.fromisoformat`` (Python 3.11+
+      accepts trailing ``Z`` as a synonym for ``+00:00``).
+    - On ``ValueError``, logs a WARNING including the key and value, leaves the
+      value unchanged, and does NOT raise (non-fatal).
+
+    Must be called as a statement before ``_sanitize_properties``:
+        ``_convert_temporal_props(props)``
+        ``props = Neo4jGraphStore._sanitize_properties(props)``
+    Never chain: ``props = _convert_temporal_props(props)``  — returns ``None``.
+    """
+    for key in TEMPORAL_PROPS:
+        if key not in props:
+            continue
+        value = props[key]
+        if not isinstance(value, str) or value == "":
+            continue
+        try:
+            props[key] = datetime.fromisoformat(value)
+        except ValueError:
+            _LOG.warning(
+                "_convert_temporal_props: could not parse %r=%r as ISO 8601 datetime; "
+                "leaving value unchanged",
+                key,
+                value,
+            )
+
+
+def _normalize_temporal(value: Any) -> Any:
+    """Convert neo4j.time.DateTime to Python datetime via .to_native().
+
+    The Neo4j driver returns temporal properties as neo4j.time.DateTime;
+    convert to Python datetime via .to_native() so no neo4j.time type ever
+    leaves this module; all other values returned unchanged.
+
+    This is the read-path half of the type boundary,
+    _convert_temporal_props is the write-path half.
+
+    Rationale: getattr (not isinstance against neo4j.time.DateTime) avoids
+    importing the driver's temporal class at module top-level and transparently
+    handles Date, Time, and DateTime (all expose .to_native()); plain
+    Python/JSON values have no .to_native() and pass straight through.
+    """
+    to_native = getattr(value, "to_native", None)
+    if callable(to_native):
+        return to_native()
+    return value
 
 
 async def ensure_neo4j_schema(
@@ -250,7 +345,10 @@ class Neo4jGraphStore:
             )
             records = result.records
             if records:
-                return dict(records[0]["props"])
+                return {
+                    k: _normalize_temporal(v)
+                    for k, v in dict(records[0]["props"]).items()
+                }
         except Neo4jError:
             pass
 
@@ -280,7 +378,10 @@ class Neo4jGraphStore:
             )
             records = result.records
             if records:
-                return dict(records[0]["props"])
+                return {
+                    k: _normalize_temporal(v)
+                    for k, v in dict(records[0]["props"]).items()
+                }
         except Neo4jError:
             pass
 
@@ -379,9 +480,11 @@ class Neo4jGraphStore:
 
                     for node_id, data in node_snapshot.items():
                         labels: list[str] = data.get("labels", [])
-                        props = self._sanitize_properties(
-                            {k: v for k, v in data.items() if k != "labels"}
-                        )
+                        node_props = {k: v for k, v in data.items() if k != "labels"}
+                        _convert_temporal_props(
+                            node_props
+                        )  # ISO str -> datetime, in place
+                        props = self._sanitize_properties(node_props)
                         props["workspace"] = self.workspace
                         row: dict[str, Any] = {"node_id": node_id, "props": props}
 
@@ -458,9 +561,11 @@ class Neo4jGraphStore:
                     edge_groups: dict[str, list[dict[str, Any]]] = {}
                     for (src_id, dst_id), data in edge_snapshot.items():
                         edge_type: str = data.get("type", _DEFAULT_EDGE_TYPE)
-                        props = self._sanitize_properties(
-                            {k: v for k, v in data.items() if k != "type"}
-                        )
+                        edge_props = {k: v for k, v in data.items() if k != "type"}
+                        _convert_temporal_props(
+                            edge_props
+                        )  # ISO str -> datetime, in place
+                        props = self._sanitize_properties(edge_props)
                         props["workspace"] = self.workspace
                         # Store src_id/dst_id on the relationship so the
                         # get_edge() fallback query (WHERE r.src_id = $src_id
@@ -595,7 +700,12 @@ class Neo4jGraphStore:
         async with self._driver.session(database=self._database) as session:
             result = await session.run(query, query_params)  # type: ignore[arg-type]
             data = await result.data()
-            return [dict(record) for record in data]
+            # Normalizes only top-level record values; nested temporal values (rare)
+            # must be normalized by callers.
+            return [
+                {k: _normalize_temporal(v) for k, v in dict(record).items()}
+                for record in data
+            ]
 
     # ------------------------------------------------------------------
     # Static helpers
@@ -607,7 +717,7 @@ class Neo4jGraphStore:
 
         Rules:
         - ``None`` values are *skipped* (not included in output).
-        - ``str``, ``int``, ``float``, ``bool`` are kept as-is.
+        - ``str``, ``int``, ``float``, ``bool``, ``datetime`` are kept as-is.
         - ``list`` whose items are all primitives (str/int/float/bool) is kept.
         - ``list`` containing non-primitive items is JSON-serialised to a string.
         - ``dict`` values are JSON-serialised to a string.
@@ -617,7 +727,11 @@ class Neo4jGraphStore:
         for key, value in props.items():
             if value is None:
                 continue
-            if isinstance(value, (str, int, float, bool)):
+            if isinstance(value, (str, int, float, bool, datetime)):
+                # Never write empty-string timestamps — SET n += row.props would
+                # overwrite a previously valid started_at on the existing node.
+                if isinstance(value, str) and value == "" and key.endswith("_at"):
+                    continue
                 result[key] = value
             elif isinstance(value, list):
                 if all(isinstance(item, (str, int, float, bool)) for item in value):
@@ -628,21 +742,4 @@ class Neo4jGraphStore:
                 result[key] = json.dumps(value)
             else:
                 result[key] = str(value)
-        return result
-
-    @staticmethod
-    def _convert_timestamps(props: dict[str, Any]) -> dict[str, Any]:
-        """Convert ``*_at`` ISO string fields to :class:`datetime` objects.
-
-        Any property whose key ends with ``_at`` and whose value is a valid
-        ISO 8601 string is replaced with the corresponding :class:`datetime`.
-        Invalid strings are left unchanged.  The input dict is not mutated.
-        """
-        result = dict(props)
-        for key, value in result.items():
-            if key.endswith("_at") and isinstance(value, str):
-                try:
-                    result[key] = datetime.fromisoformat(value)
-                except ValueError:
-                    pass
         return result

@@ -6,7 +6,7 @@ Covers:
 - supported_dialects: includes 'cypher', returns frozenset
 - Buffer operations: upsert_node (add, merge props, merge labels, no duplicate labels),
   upsert_edge (add/merge), get_node (buffer-first, returns copy), get_edge (buffer-first)
-- Static helpers: _sanitize_properties, _convert_timestamps
+- Static helpers: _sanitize_properties
 - Flush: workspace in rows, empty is no-op, clears buffers on success, restores on failure
 - Schema: idempotent, indexes use workspace not graph_forest_name
 - execute_query: injects workspace, wildcard skips injection, unsupported dialect raises ValueError
@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,6 +24,8 @@ import pytest
 from context_intelligence_server.graph_store import GraphStore, QueryableStore
 from context_intelligence_server.neo4j_store import (
     Neo4jGraphStore,
+    _convert_temporal_props,
+    _normalize_temporal,
     _validate_identifier,
 )
 
@@ -734,39 +736,38 @@ def test_sanitize_properties_keeps_primitive_lists():
     assert result["tags"] == ["a", "b", "c"]
 
 
+def test_sanitize_properties_strips_empty_string_at_fields():
+    """_sanitize_properties removes *_at keys whose value is an empty string.
+
+    Protects against SET n += row.props overwriting a previously valid
+    timestamp on the existing node with "".
+    """
+    result = Neo4jGraphStore._sanitize_properties({"started_at": "", "name": "node"})
+    assert "started_at" not in result
+    assert result["name"] == "node"
+
+
+def test_sanitize_properties_preserves_non_empty_at_fields():
+    """_sanitize_properties keeps *_at keys with non-empty string values."""
+    result = Neo4jGraphStore._sanitize_properties(
+        {"started_at": "2026-03-18T14:55:17+00:00"}
+    )
+    assert result["started_at"] == "2026-03-18T14:55:17+00:00"
+
+
+def test_sanitize_properties_passes_datetime_through():
+    """_sanitize_properties keeps datetime values as-is (not str-coerced)."""
+    dt = datetime(2026, 3, 18, 14, 55, 17, tzinfo=timezone.utc)
+    result = Neo4jGraphStore._sanitize_properties({"started_at": dt})
+    assert result["started_at"] is dt
+    assert isinstance(result["started_at"], datetime)
+
+
 # ---------------------------------------------------------------------------
-# Static helper: _convert_timestamps
+# Datetime conversion to Neo4j temporal types is deferred.
+# See DATETIME-MIGRATION.md at the workspace root for the full
+# implementation and backfill strategy.
 # ---------------------------------------------------------------------------
-
-
-def test_convert_timestamps_converts_at_fields():
-    """_convert_timestamps converts *_at ISO strings to datetime objects."""
-    props = {"created_at": "2024-01-15T10:30:00", "name": "node"}
-    result = Neo4jGraphStore._convert_timestamps(props)
-    assert isinstance(result["created_at"], datetime)
-    assert result["name"] == "node"  # Non-timestamp unchanged
-
-
-def test_convert_timestamps_ignores_non_at_fields():
-    """_convert_timestamps does not touch fields not ending in _at."""
-    props = {"category": "2024-01-15T10:30:00", "updated": "2024-02-01"}
-    result = Neo4jGraphStore._convert_timestamps(props)
-    assert result["category"] == "2024-01-15T10:30:00"  # Not converted
-
-
-def test_convert_timestamps_skips_invalid_iso():
-    """_convert_timestamps leaves *_at fields unchanged if they are not valid ISO."""
-    props = {"created_at": "not-a-date"}
-    result = Neo4jGraphStore._convert_timestamps(props)
-    assert result["created_at"] == "not-a-date"  # Unchanged
-
-
-def test_convert_timestamps_does_not_mutate_input():
-    """_convert_timestamps returns a new dict without mutating the input."""
-    props = {"created_at": "2024-01-15T10:30:00"}
-    original = dict(props)
-    Neo4jGraphStore._convert_timestamps(props)
-    assert props == original  # Input not mutated
 
 
 # ---------------------------------------------------------------------------
@@ -1418,3 +1419,96 @@ async def test_flush_lock_serializes_concurrent_calls() -> None:
             "session_2 became active before flush_1 completed — "
             f"concurrent transactions detected. Execution order: {order}"
         )
+
+
+# ---------------------------------------------------------------------------
+# _convert_temporal_props (write-path ISO-string → datetime conversion)
+# ---------------------------------------------------------------------------
+
+
+def test_convert_temporal_props_converts_started_at() -> None:
+    """_convert_temporal_props converts started_at ISO string to datetime in place."""
+    props: dict = {"started_at": "2026-03-18T14:55:17+00:00"}
+    result = _convert_temporal_props(props)
+    assert result is None  # mutates in place, returns None
+    assert isinstance(props["started_at"], datetime)
+    assert props["started_at"] == datetime(2026, 3, 18, 14, 55, 17, tzinfo=timezone.utc)
+
+
+def test_convert_temporal_props_converts_last_updated() -> None:
+    """_convert_temporal_props converts last_updated ISO string to datetime."""
+    props: dict = {"last_updated": "2026-01-01T00:00:01Z"}
+    _convert_temporal_props(props)
+    assert isinstance(props["last_updated"], datetime)
+
+
+def test_convert_temporal_props_converts_edge_occurred_at() -> None:
+    """_convert_temporal_props converts occurred_at ISO string to datetime (edge property)."""
+    props: dict = {"occurred_at": "2026-01-01T00:00:01+00:00"}
+    _convert_temporal_props(props)
+    assert isinstance(props["occurred_at"], datetime)
+
+
+def test_convert_temporal_props_malformed_string_unchanged_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """_convert_temporal_props leaves malformed timestamps unchanged and logs a WARNING."""
+    props: dict = {"started_at": "not-a-timestamp"}
+    with caplog.at_level("WARNING"):
+        _convert_temporal_props(props)  # must not raise
+    assert props["started_at"] == "not-a-timestamp"
+    assert any(record.levelname == "WARNING" for record in caplog.records)
+
+
+def test_convert_temporal_props_empty_string_passes_through() -> None:
+    """_convert_temporal_props skips empty string values (passes through unchanged)."""
+    props: dict = {"started_at": ""}
+    _convert_temporal_props(props)
+    assert props["started_at"] == ""
+
+
+def test_convert_temporal_props_existing_datetime_untouched() -> None:
+    """_convert_temporal_props leaves already-datetime values untouched (idempotent)."""
+    dt = datetime(2026, 3, 18, 14, 55, 17, tzinfo=timezone.utc)
+    props: dict = {"started_at": dt}
+    _convert_temporal_props(props)
+    assert props["started_at"] is dt
+
+
+def test_convert_temporal_props_non_registered_key_untouched() -> None:
+    """_convert_temporal_props skips keys not in the TEMPORAL_PROPS registry."""
+    props: dict = {"name": "2026-03-18T14:55:17+00:00"}
+    _convert_temporal_props(props)
+    assert props["name"] == "2026-03-18T14:55:17+00:00"
+
+
+# ---------------------------------------------------------------------------
+# _normalize_temporal (read-path neo4j.time.DateTime → Python datetime)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_temporal_converts_neo4j_datetime() -> None:
+    """_normalize_temporal converts a neo4j.time.DateTime to a Python datetime."""
+    from neo4j.time import DateTime as Neo4jDateTime
+
+    py = datetime(2026, 3, 18, 14, 55, 17, tzinfo=timezone.utc)
+    n4 = Neo4jDateTime.from_native(py)
+    result = _normalize_temporal(n4)
+    assert isinstance(result, datetime)
+    assert result == py
+
+
+def test_normalize_temporal_passes_through_str() -> None:
+    """_normalize_temporal returns strings unchanged."""
+    assert _normalize_temporal("2026-01-01T00:00:01Z") == "2026-01-01T00:00:01Z"
+
+
+def test_normalize_temporal_passes_through_python_datetime() -> None:
+    """_normalize_temporal returns a Python datetime as-is (identity preserved)."""
+    dt = datetime(2026, 3, 18, 14, 55, 17, tzinfo=timezone.utc)
+    assert _normalize_temporal(dt) is dt
+
+
+def test_normalize_temporal_passes_through_int() -> None:
+    """_normalize_temporal returns integers unchanged."""
+    assert _normalize_temporal(42) == 42

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from unittest.mock import AsyncMock
 
 from context_intelligence_server.services import HookStateService
@@ -260,3 +262,35 @@ async def test_touch_session_swallows_graph_exception(
 
     # Must not raise despite the graph error
     await services.touch_session("s1", "2026-01-01T00:00:01Z")
+
+
+async def test_touch_session_compares_against_datetime_last_updated(
+    services: HookStateService,
+) -> None:
+    """Comparison works when last_updated is a Python datetime (as normalized read path returns).
+
+    The store's read path normalises neo4j.time.DateTime to Python datetime.  The
+    in-memory GraphState returns whatever was written (often a str), so touch_session
+    must handle both sides of the comparison gracefully.  This test proves that a
+    datetime last_updated does not cause TypeError — the timestamp must still advance.
+    """
+    older = datetime(2026, 1, 1, 0, 0, 1, tzinfo=timezone.utc)
+    services.graph.get_node = AsyncMock(
+        return_value={
+            "labels": ["Session"],
+            "session_id": "s-dt",
+            "last_updated": older,  # datetime, as normalized read path returns
+            # no parent_id so walk stops after one iteration
+        }
+    )
+    upserts: list[tuple[str, dict]] = []
+
+    async def _capture(node_id: str, data: dict) -> None:
+        upserts.append((node_id, data))
+
+    services.graph.upsert_node = AsyncMock(side_effect=_capture)
+
+    await services.touch_session("s-dt", "2026-01-01T00:00:05Z")
+
+    assert upserts, "expected last_updated to advance, but no upsert occurred"
+    assert upserts[0][1]["last_updated"] == "2026-01-01T00:00:05Z"
