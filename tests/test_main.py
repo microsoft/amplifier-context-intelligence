@@ -1,10 +1,8 @@
 """Tests for FastAPI app — GET /status and POST /events endpoints."""
 
 import asyncio
-import concurrent.futures
 import contextlib
 import json
-import socket
 from pathlib import Path
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -23,28 +21,6 @@ from tests.conftest import MockNeo4jDriver
 @pytest.fixture(autouse=True)
 def _clear_idempotency_cache() -> None:
     main_module.idempotency_cache.clear()
-
-
-def _neo4j_reachable() -> bool:
-    """Return True if Neo4j is reachable at neo4j:7687 (only resolves inside Docker).
-
-    Uses a thread with a hard 2-second total deadline so that slow or
-    absent DNS resolution for the 'neo4j' hostname never blocks the
-    calling thread (e.g. pytest collection on GitHub Actions).
-    """
-
-    def _check() -> bool:
-        try:
-            with socket.create_connection(("neo4j", 7687), timeout=1):
-                return True
-        except OSError:
-            return False
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        try:
-            return executor.submit(_check).result(timeout=2)
-        except concurrent.futures.TimeoutError:
-            return False
 
 
 async def test_status_returns_200(client: httpx.AsyncClient) -> None:
@@ -90,11 +66,16 @@ async def test_post_events_duplicate_idempotency_key_skips_enqueue(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    worker = MagicMock()
-    worker.queue = AsyncMock()
+    """A duplicate idempotency_key must NOT append a second durable line."""
     monkeypatch.setattr(
-        main_module.registry, "get_or_create", lambda *args, **kwargs: worker
+        main_module.registry, "get_or_create", lambda *args, **kwargs: MagicMock()
     )
+    appended: list[tuple[str, bytes]] = []
+
+    async def _fake_append(worker_key: str, raw: bytes) -> None:
+        appended.append((worker_key, raw))
+
+    monkeypatch.setattr(main_module.registry.queue_manager, "append", _fake_append)
 
     payload = {
         "event": "tool_use",
@@ -110,18 +91,23 @@ async def test_post_events_duplicate_idempotency_key_skips_enqueue(
     assert first.json()["status"] == "queued"
     assert second.status_code == 202
     assert second.json()["status"] == "duplicate"
-    assert worker.queue.put.await_count == 1
+    assert len(appended) == 1
 
 
 async def test_post_events_replay_bypasses_idempotency_guard(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    worker = MagicMock()
-    worker.queue = AsyncMock()
+    """replay=true bypasses the idempotency guard, appending a second line."""
     monkeypatch.setattr(
-        main_module.registry, "get_or_create", lambda *args, **kwargs: worker
+        main_module.registry, "get_or_create", lambda *args, **kwargs: MagicMock()
     )
+    appended: list[tuple[str, bytes]] = []
+
+    async def _fake_append(worker_key: str, raw: bytes) -> None:
+        appended.append((worker_key, raw))
+
+    monkeypatch.setattr(main_module.registry.queue_manager, "append", _fake_append)
 
     payload = {
         "event": "tool_use",
@@ -136,7 +122,7 @@ async def test_post_events_replay_bypasses_idempotency_guard(
     assert first.status_code == 202
     assert replay.status_code == 202
     assert replay.json()["status"] == "queued"
-    assert worker.queue.put.await_count == 2
+    assert len(appended) == 2
 
 
 async def test_post_events_increments_active_sessions(
@@ -174,8 +160,23 @@ async def test_post_events_no_session_id_returns_null(
     assert data["session_id"] is None
 
 
-@pytest.mark.skipif(not _neo4j_reachable(), reason="Neo4j not reachable at neo4j:7687")
-async def test_drain_loop_processes_event(client: httpx.AsyncClient) -> None:
+async def test_drain_loop_processes_event(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A posted event is drained from the durable log by the sticky drainer.
+
+    Migrated off the vestigial in-memory worker.queue (Phase B2, Task 5): the
+    durable drain loop reads from the on-disk QueueManager log, so success is
+    observed by polling that log to empty rather than worker.queue.join().
+    """
+    from context_intelligence_server.neo4j_store import Neo4jGraphStore
+
+    proc = AsyncMock()
+    monkeypatch.setattr("context_intelligence_server.registry.process_event", proc)
+    monkeypatch.setattr(Neo4jGraphStore, "flush", AsyncMock())
+    monkeypatch.setattr(Neo4jGraphStore, "close", AsyncMock())
+
     await client.post(
         "/events",
         json={
@@ -184,9 +185,15 @@ async def test_drain_loop_processes_event(client: httpx.AsyncClient) -> None:
             "data": {"session_id": "sess-drain"},
         },
     )
-    worker = registry.get_or_create("sess-drain", "/ws")
-    await asyncio.wait_for(worker.queue.join(), timeout=5.0)
-    assert worker.queue.empty()
+
+    qm = registry.queue_manager
+    for _ in range(400):
+        await asyncio.sleep(0.01)
+        if (await qm.read_batch("sess-drain", 10)).lines == []:
+            break
+
+    assert (await qm.read_batch("sess-drain", 10)).lines == []
+    assert proc.await_count >= 1
 
 
 async def test_list_blobs_returns_empty_for_session_with_no_blobs(

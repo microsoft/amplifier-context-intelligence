@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -91,6 +92,17 @@ _start_time = time.time()
 registry = SessionRegistry()
 idempotency_cache = EventIdempotencyCache()
 
+# Session-less events are keyed by a per-workspace sentinel stem so that events
+# from distinct workspaces never collide in one durable log (decision #10).
+_NO_SESSION_PREFIX = "_no_session__"
+
+
+def _workspace_slug(workspace: str) -> str:
+    """Return a filesystem-safe slug for a workspace (session-less log stem)."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (workspace or "").lower()).strip("-")
+    return slug or "default"
+
+
 _WEB_DIR = Path(__file__).parent / "web"
 app.mount("/static", StaticFiles(directory=_WEB_DIR / "static"), name="static")
 
@@ -137,8 +149,12 @@ async def _check_neo4j_connected(app_instance: FastAPI) -> bool:
 
 
 @app.post("/events", status_code=202, response_model=EventResponse)
-async def post_events(request: EventRequest, replay: bool = False) -> EventResponse:
+async def post_events(
+    request: EventRequest, http_request: Request, replay: bool = False
+) -> EventResponse:
     session_id = request.data.get("session_id", "")
+    # Idempotency-cache check + replay stay BEFORE the durable append so a
+    # duplicate is rejected without persisting a second log line.
     if request.idempotency_key and not replay:
         is_new = idempotency_cache.check_and_store(request.idempotency_key)
         if not is_new:
@@ -148,8 +164,17 @@ async def post_events(request: EventRequest, replay: bool = False) -> EventRespo
                 session_id,
             )
             return EventResponse(status="duplicate", session_id=session_id or None)
-    worker = registry.get_or_create(session_id, request.workspace)
-    await worker.queue.put((request.event, request.workspace, request.data))
+    # Empty session_id maps to a per-workspace sentinel stem so session-less
+    # events from distinct workspaces never collide in one log (decision #10).
+    worker_key = session_id or (_NO_SESSION_PREFIX + _workspace_slug(request.workspace))
+    # Spawn (or reuse) the sticky drainer keyed by worker_key.
+    registry.get_or_create(worker_key, request.workspace)
+    # Persist the EXACT request body bytes (the raw EventRequest JSON, which
+    # preserves idempotency_key) BEFORE returning 202 — this is the
+    # zero-silent-loss window. The body is compact JSON with no literal newline
+    # bytes, so the newline-delimited log framing is safe.
+    body = await http_request.body()
+    await registry.queue_manager.append(worker_key, body)
     logger.info("event_enqueued: event=%s session_id=%s", request.event, session_id)
     return EventResponse(status="queued", session_id=session_id or None)
 
