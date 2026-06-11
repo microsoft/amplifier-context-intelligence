@@ -9,7 +9,6 @@ introduced — propagation simply re-activates this existing failure surface.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -25,9 +24,6 @@ async def test_propagated_flush_error_increments_error_count_and_ring_buffer(
     """A raised process_event lands in error_count + ring-buffer result='error'."""
     # Real SessionWorker; services is unused because process_event is patched to raise.
     worker = SessionWorker(session_id="s1", workspace="ws1", services=None)  # type: ignore[arg-type]
-    # _process_one's finally calls worker.queue.task_done(); a no-op stub avoids
-    # the "task_done() called too many times" ValueError on an empty queue.
-    worker.queue = SimpleNamespace(task_done=lambda: None)  # type: ignore[assignment]
     assert worker.error_count == 0
 
     async def _boom(*args: Any, **kwargs: Any) -> None:

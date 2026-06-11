@@ -13,6 +13,8 @@ to graph state, covering:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 import types
 from typing import Any
@@ -72,6 +74,7 @@ def _make_registry_and_worker(
     reg = SessionRegistry()
     services = HookStateService(workspace=workspace)
     services.graph.close = AsyncMock()  # type: ignore[method-assign]
+    services.graph.flush = AsyncMock()  # type: ignore[method-assign]
     worker = SessionWorker(
         session_id=session_id,
         workspace=workspace,
@@ -79,6 +82,13 @@ def _make_registry_and_worker(
     )
     reg._register_for_test(worker)
     return reg, worker
+
+
+def _line(event: str, workspace: str, data: dict[str, Any]) -> bytes:
+    """Encode an appended event line exactly as POST /events stores it."""
+    return json.dumps({"event": event, "workspace": workspace, "data": data}).encode(
+        "utf-8"
+    )
 
 
 # ===========================================================================
@@ -575,26 +585,33 @@ class TestSessionEndWorkerCleanup:
             "context_intelligence_server.registry.process_event",
             new_callable=AsyncMock,
         ):
-            reg.start_drain(worker)
-            await worker.queue.put(
-                (
+            await reg.queue_manager.append(
+                SESSION_ID,
+                _line(
                     "session:start",
                     WORKSPACE,
                     {"session_id": SESSION_ID, "timestamp": T0},
-                )
+                ),
             )
-            await worker.queue.put(
-                (
+            await reg.queue_manager.append(
+                SESSION_ID,
+                _line(
                     "prompt:submit",
                     WORKSPACE,
                     {"session_id": SESSION_ID, "timestamp": T1, "prompt": "Hello"},
-                )
+                ),
             )
-            await worker.queue.put(
-                ("session:end", WORKSPACE, {"session_id": SESSION_ID, "timestamp": T6})
+            await reg.queue_manager.append(
+                SESSION_ID,
+                _line(
+                    "session:end",
+                    WORKSPACE,
+                    {"session_id": SESSION_ID, "timestamp": T6},
+                ),
             )
+            reg.start_drain(worker)
             assert worker.task is not None
-            await worker.task
+            await asyncio.wait_for(worker.task, timeout=3.0)
 
         assert reg.active_count() == 0
 
@@ -606,19 +623,25 @@ class TestSessionEndWorkerCleanup:
             "context_intelligence_server.registry.process_event",
             new_callable=AsyncMock,
         ):
-            reg.start_drain(worker)
-            await worker.queue.put(
-                (
+            await reg.queue_manager.append(
+                SESSION_ID,
+                _line(
                     "session:start",
                     WORKSPACE,
                     {"session_id": SESSION_ID, "timestamp": T0},
-                )
+                ),
             )
-            await worker.queue.put(
-                ("session:end", WORKSPACE, {"session_id": SESSION_ID, "timestamp": T6})
+            await reg.queue_manager.append(
+                SESSION_ID,
+                _line(
+                    "session:end",
+                    WORKSPACE,
+                    {"session_id": SESSION_ID, "timestamp": T6},
+                ),
             )
+            reg.start_drain(worker)
             assert worker.task is not None
-            await worker.task
+            await asyncio.wait_for(worker.task, timeout=3.0)
 
         completed = reg.completed_sessions()
         assert len(completed) == 1
@@ -642,19 +665,25 @@ class TestStatusIncludesCompletedSessions:
             "context_intelligence_server.registry.process_event",
             new_callable=AsyncMock,
         ):
-            reg.start_drain(worker)
-            await worker.queue.put(
-                (
+            await reg.queue_manager.append(
+                SESSION_ID,
+                _line(
                     "session:start",
                     WORKSPACE,
                     {"session_id": SESSION_ID, "timestamp": T0},
-                )
+                ),
             )
-            await worker.queue.put(
-                ("session:end", WORKSPACE, {"session_id": SESSION_ID, "timestamp": T6})
+            await reg.queue_manager.append(
+                SESSION_ID,
+                _line(
+                    "session:end",
+                    WORKSPACE,
+                    {"session_id": SESSION_ID, "timestamp": T6},
+                ),
             )
+            reg.start_drain(worker)
             assert worker.task is not None
-            await worker.task
+            await asyncio.wait_for(worker.task, timeout=3.0)
 
         response = build_status_response(reg, time.time() - 60)
         assert "completed_sessions" in response

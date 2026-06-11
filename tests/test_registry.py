@@ -8,7 +8,7 @@ from collections import deque
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -159,8 +159,7 @@ async def test_get_or_create_new_worker(registry: SessionRegistry) -> None:
     assert isinstance(worker, SessionWorker)
     assert worker.session_id == "session-1"
     assert worker.workspace == "/workspace/a"
-    assert isinstance(worker.queue, asyncio.Queue)
-    assert worker.queue.empty()
+    assert worker.task is not None
     assert isinstance(worker.task, asyncio.Task)
 
 
@@ -207,18 +206,6 @@ async def test_remove_nonexistent_is_noop(registry: SessionRegistry) -> None:
     # Should not raise any exception
     registry.remove("nonexistent-session")
     assert registry.active_count() == 0
-
-
-@pytest.mark.asyncio
-async def test_queue_put_get(registry: SessionRegistry) -> None:
-    worker = registry.get_or_create("session-1", "/workspace/a")
-
-    event = ("tool_call", {"tool": "bash", "result": "ok"})
-    await worker.queue.put(event)
-
-    # get() on a non-empty queue returns without yielding — drain task does not interpose
-    retrieved = await worker.queue.get()
-    assert retrieved == event
 
 
 class TestSessionWorkerHasServices:
@@ -277,197 +264,6 @@ class TestSessionWorkerHasServices:
         assert blob_store._root == Path(settings.blob_path)
 
 
-class TestDrainLoopCallsProcessEvent:
-    """drain_worker calls process_event for each dequeued item."""
-
-    @pytest.mark.asyncio
-    async def test_queued_event_is_processed(self) -> None:
-        """process_event is called with (worker, event, data, handlers) when an event is enqueued."""
-        reg = SessionRegistry()
-        worker = SessionWorker(
-            session_id="test-session",
-            workspace="/workspace/test",
-            services=HookStateService(workspace="/workspace/test"),
-        )
-
-        event = "tool_call"
-        workspace = "/workspace/test"
-        data: dict[str, object] = {"session_id": "test-session", "tool": "bash"}
-
-        with patch(
-            "context_intelligence_server.registry.process_event",
-            new_callable=AsyncMock,
-        ) as mock_process:
-            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
-
-            # Enqueue the event tuple
-            await worker.queue.put((event, workspace, data))
-
-            # Yield control so the drain loop can process the item
-            await asyncio.sleep(0.05)
-
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-            mock_process.assert_called_once_with(worker, event, data, ANY)
-
-    @pytest.mark.asyncio
-    async def test_drain_worker_is_method_on_registry(self) -> None:
-        """drain_worker must be an instance method on SessionRegistry."""
-        import inspect
-
-        assert hasattr(SessionRegistry, "drain_worker")
-        assert inspect.iscoroutinefunction(SessionRegistry.drain_worker)
-
-    @pytest.mark.asyncio
-    async def test_shutdown_flush_on_cancelled_error(self) -> None:
-        """graph.close is called when the task is cancelled (shutdown close)."""
-        reg = SessionRegistry()
-        worker = SessionWorker(
-            session_id="test-session",
-            workspace="/workspace/test",
-            services=HookStateService(workspace="/workspace/test"),
-        )
-        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
-
-        task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
-        await asyncio.sleep(0.02)
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-        worker.services.graph.close.assert_awaited_once()
-
-
-class TestPeriodicFlush:
-    """drain_worker calls graph.flush periodically when no events arrive."""
-
-    @pytest.mark.asyncio
-    async def test_timeout_triggers_flush(self) -> None:
-        """graph.flush is called after flush_timeout elapses with no events."""
-        reg = SessionRegistry()
-        worker = SessionWorker(
-            session_id="test-session",
-            workspace="/workspace/test",
-            services=HookStateService(workspace="/workspace/test"),
-        )
-        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
-
-        # Very short timeout so the flush fires quickly
-        task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
-
-        # Wait longer than the timeout to ensure at least one flush cycle fires
-        await asyncio.sleep(0.2)
-
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-        assert worker.services.graph.flush.call_count >= 1
-
-    @pytest.mark.asyncio
-    async def test_flush_timeout_default_is_30s(self) -> None:
-        """drain_worker default flush_timeout is 30 seconds."""
-        import inspect
-
-        sig = inspect.signature(SessionRegistry.drain_worker)
-        assert sig.parameters["flush_timeout"].default == 30.0
-
-    @pytest.mark.asyncio
-    async def test_flush_exception_does_not_kill_drain_worker(self) -> None:
-        """An exception from graph.flush must not kill the drain worker coroutine.
-
-        If flush() raises (e.g. OSError("disk full")), the drain loop should
-        catch the exception, log it, and continue processing events.  The
-        session:end event enqueued after the failing flush must still be
-        consumed and the task must complete normally.
-        """
-        reg = SessionRegistry()
-        worker = SessionWorker(
-            session_id="test-session",
-            workspace="/workspace/test",
-            services=HookStateService(workspace="/workspace/test"),
-        )
-        # First flush call raises, second succeeds
-        worker.services.graph.flush = AsyncMock(  # type: ignore[method-assign]
-            side_effect=[OSError("disk full"), None]
-        )
-        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
-
-        with patch(
-            "context_intelligence_server.registry.process_event",
-            new_callable=AsyncMock,
-        ):
-            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
-
-            # Wait long enough for the flush timeout cycle to fire (the raising one)
-            await asyncio.sleep(0.15)
-
-            # Enqueue session:end — if the drain loop survived it will process this
-            await worker.queue.put(
-                ("session:end", "/workspace/test", {"session_id": "test-session"})
-            )
-
-            # If the drain loop was killed by the OSError, wait_for will timeout
-            try:
-                await asyncio.wait_for(task, timeout=2.0)
-            except asyncio.TimeoutError:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                pytest.fail(
-                    "drain_worker was killed by the OSError raised from flush(); "
-                    "the exception must be caught inside the TimeoutError handler."
-                )
-
-    @pytest.mark.asyncio
-    async def test_timeout_calls_schedule_flush_not_flush_directly(self) -> None:
-        """On queue timeout, drain_worker routes through schedule_flush(), not flush().
-
-        Regression guard for the Neo4j deadlock: calling await flush() directly in
-        the TimeoutError handler could open a second concurrent Neo4j transaction
-        while _background_flush() was still in flight.  schedule_flush() has a
-        single-flight guard (_flush_task.done()) that prevents the overlap.
-        """
-        reg = SessionRegistry()
-        worker = SessionWorker(
-            session_id="test-session",
-            workspace="/workspace/test",
-            services=HookStateService(workspace="/workspace/test"),
-        )
-        # Replace all three methods so we can assert on each independently.
-        # close() is mocked because it calls flush() internally; we don't want
-        # the CancelledError teardown path to pollute the flush() call count.
-        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
-        worker.services.graph.schedule_flush = MagicMock()  # type: ignore[method-assign]
-        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
-
-        # Very short timeout so at least one timeout cycle fires quickly
-        task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
-
-        await asyncio.sleep(0.2)  # long enough for multiple timeout cycles
-
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-        # schedule_flush must be called (the single-flight-guarded path)
-        worker.services.graph.schedule_flush.assert_called()
-        # flush must NOT be called directly from the timeout handler
-        worker.services.graph.flush.assert_not_called()
-
-
 class TestWorkerActivityTracking:
     """SessionWorker tracks activity: last_event, last_event_time, events_processed."""
 
@@ -487,27 +283,32 @@ class TestWorkerActivityTracking:
     async def test_worker_tracking_updated_after_drain(self) -> None:
         """Fields are updated after drain_worker processes an event."""
         reg = SessionRegistry()
+        qm = reg.queue_manager
+        sid = "test-session"
         worker = SessionWorker(
-            session_id="test-session",
+            session_id=sid,
             workspace="/workspace/test",
             services=HookStateService(workspace="/workspace/test"),
         )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
 
         event = "tool_call"
         workspace = "/workspace/test"
-        data: dict[str, object] = {"session_id": "test-session", "tool": "bash"}
+        data: dict[str, object] = {"session_id": sid, "tool": "bash"}
 
         with patch(
             "context_intelligence_server.registry.process_event",
             new_callable=AsyncMock,
         ):
+            await qm.append(sid, _line(event, workspace, data))
             task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
 
-            # Enqueue the event tuple
-            await worker.queue.put((event, workspace, data))
-
-            # Yield control so the drain loop can process the item
-            await asyncio.sleep(0.05)
+            # Poll until the drain loop has committed past the appended line
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if (await qm.read_batch(sid, 10)).lines == []:
+                    break
 
             task.cancel()
             try:
@@ -523,29 +324,35 @@ class TestWorkerActivityTracking:
     async def test_worker_events_processed_increments(self) -> None:
         """events_processed counter increments once per event."""
         reg = SessionRegistry()
+        qm = reg.queue_manager
+        sid = "test-session"
         worker = SessionWorker(
-            session_id="test-session",
+            session_id=sid,
             workspace="/workspace/test",
             services=HookStateService(workspace="/workspace/test"),
         )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
 
         event = "tool_call"
         workspace = "/workspace/test"
-        data: dict[str, object] = {"session_id": "test-session", "tool": "bash"}
+        data: dict[str, object] = {"session_id": sid, "tool": "bash"}
 
         with patch(
             "context_intelligence_server.registry.process_event",
             new_callable=AsyncMock,
         ):
+            # Append three events
+            await qm.append(sid, _line(event, workspace, data))
+            await qm.append(sid, _line(event, workspace, data))
+            await qm.append(sid, _line(event, workspace, data))
             task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
 
-            # Enqueue three events
-            await worker.queue.put((event, workspace, data))
-            await worker.queue.put((event, workspace, data))
-            await worker.queue.put((event, workspace, data))
-
-            # Yield control so the drain loop can process all items
-            await asyncio.sleep(0.1)
+            # Poll until the drain loop has committed past all appended lines
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if (await qm.read_batch(sid, 10)).lines == []:
+                    break
 
             task.cancel()
             try:
@@ -566,15 +373,19 @@ class TestRingBufferEmission:
         from context_intelligence_server.dashboard import EventRingBuffer
 
         reg = SessionRegistry()
+        qm = reg.queue_manager
+        sid = "test-session"
         worker = SessionWorker(
-            session_id="test-session",
+            session_id=sid,
             workspace="/workspace/test",
             services=HookStateService(workspace="/workspace/test"),
         )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
 
         event = "tool_call"
         workspace = "/workspace/test"
-        data: dict[str, object] = {"session_id": "test-session", "tool": "bash"}
+        data: dict[str, object] = {"session_id": sid, "tool": "bash"}
 
         fresh_buffer = EventRingBuffer()
 
@@ -588,10 +399,13 @@ class TestRingBufferEmission:
                 fresh_buffer,
             ),
         ):
+            await qm.append(sid, _line(event, workspace, data))
             task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
 
-            await worker.queue.put((event, workspace, data))
-            await asyncio.sleep(0.05)
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if (await qm.read_batch(sid, 10)).lines == []:
+                    break
 
             task.cancel()
             try:
@@ -697,276 +511,6 @@ class TestDeregister:
             pass
 
 
-class TestWorkerSelfTermination:
-    """drain_worker self-terminates after processing session:end."""
-
-    @pytest.mark.asyncio
-    async def test_session_end_removes_worker_from_registry(self) -> None:
-        """After session:end, worker is removed from _workers without task cancellation."""
-        reg = SessionRegistry()
-        worker = SessionWorker(
-            session_id="test-session",
-            workspace="/workspace/test",
-            services=HookStateService(workspace="/workspace/test"),
-        )
-        reg._workers["test-session"] = worker
-
-        with patch(
-            "context_intelligence_server.registry.process_event",
-            new_callable=AsyncMock,
-        ):
-            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
-            await worker.queue.put(
-                ("session:end", "/workspace/test", {"session_id": "test-session"})
-            )
-            # drain_worker should self-terminate after session:end
-            await asyncio.wait_for(task, timeout=2.0)
-
-        assert "test-session" not in reg._workers
-
-    @pytest.mark.asyncio
-    async def test_session_end_writes_completed_session(self) -> None:
-        """After tool_call + session:end, CompletedSession is written with correct fields."""
-        reg = SessionRegistry()
-        worker = SessionWorker(
-            session_id="test-session",
-            workspace="/workspace/test",
-            services=HookStateService(workspace="/workspace/test"),
-        )
-        reg._workers["test-session"] = worker
-
-        with patch(
-            "context_intelligence_server.registry.process_event",
-            new_callable=AsyncMock,
-        ):
-            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
-            await worker.queue.put(
-                ("tool_call", "/workspace/test", {"session_id": "test-session"})
-            )
-            await worker.queue.put(
-                ("session:end", "/workspace/test", {"session_id": "test-session"})
-            )
-            await asyncio.wait_for(task, timeout=2.0)
-
-        assert len(reg._completed) == 1
-        cs = reg._completed[0]
-        assert cs.session_id == "test-session"
-        assert cs.workspace == "/workspace/test"
-        assert cs.events_processed == 2
-        assert cs.error_count == 0
-        assert cs.ended_at > 0.0
-        assert cs.duration_seconds >= 0.0
-        assert cs.started_at <= cs.ended_at
-
-    @pytest.mark.asyncio
-    async def test_session_end_calls_graph_close(self) -> None:
-        """graph.close is awaited exactly once on session:end."""
-        reg = SessionRegistry()
-        worker = SessionWorker(
-            session_id="test-session",
-            workspace="/workspace/test",
-            services=HookStateService(workspace="/workspace/test"),
-        )
-        reg._workers["test-session"] = worker
-        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
-
-        with patch(
-            "context_intelligence_server.registry.process_event",
-            new_callable=AsyncMock,
-        ):
-            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
-            await worker.queue.put(
-                ("session:end", "/workspace/test", {"session_id": "test-session"})
-            )
-            await asyncio.wait_for(task, timeout=2.0)
-
-        worker.services.graph.close.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_session_end_drains_tail_events(self) -> None:
-        """Events already in the queue after session:end are also processed."""
-        reg = SessionRegistry()
-        worker = SessionWorker(
-            session_id="test-session",
-            workspace="/workspace/test",
-            services=HookStateService(workspace="/workspace/test"),
-        )
-        reg._workers["test-session"] = worker
-
-        processed_events: list[str] = []
-
-        async def mock_process(
-            w: object, event: str, data: object, handlers: object
-        ) -> None:
-            processed_events.append(event)
-
-        with patch(
-            "context_intelligence_server.registry.process_event",
-            side_effect=mock_process,
-        ):
-            # Pre-fill queue: session:end followed by a tail event
-            await worker.queue.put(
-                ("session:end", "/workspace/test", {"session_id": "test-session"})
-            )
-            await worker.queue.put(
-                ("tail_event", "/workspace/test", {"session_id": "test-session"})
-            )
-            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
-            await asyncio.wait_for(task, timeout=2.0)
-
-        assert "session:end" in processed_events
-        assert "tail_event" in processed_events
-
-    @pytest.mark.asyncio
-    async def test_session_end_graph_close_error_still_deregisters(self) -> None:
-        """If graph.close raises RuntimeError, worker is still deregistered and CompletedSession written."""
-        reg = SessionRegistry()
-        worker = SessionWorker(
-            session_id="test-session",
-            workspace="/workspace/test",
-            services=HookStateService(workspace="/workspace/test"),
-        )
-        reg._workers["test-session"] = worker
-        worker.services.graph.close = AsyncMock(  # type: ignore[method-assign]
-            side_effect=RuntimeError("close failed")
-        )
-
-        with patch(
-            "context_intelligence_server.registry.process_event",
-            new_callable=AsyncMock,
-        ):
-            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
-            await worker.queue.put(
-                ("session:end", "/workspace/test", {"session_id": "test-session"})
-            )
-            await asyncio.wait_for(task, timeout=2.0)
-
-        assert "test-session" not in reg._workers
-        assert len(reg._completed) == 1
-
-    @pytest.mark.asyncio
-    async def test_error_count_incremented_on_process_event_failure(self) -> None:
-        """error_count increments when process_event raises; CompletedSession records it."""
-        reg = SessionRegistry()
-        worker = SessionWorker(
-            session_id="test-session",
-            workspace="/workspace/test",
-            services=HookStateService(workspace="/workspace/test"),
-        )
-        reg._workers["test-session"] = worker
-
-        call_count = 0
-
-        async def mock_process(
-            w: object, event: str, data: object, handlers: object
-        ) -> None:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise ValueError("processing error")
-
-        with patch(
-            "context_intelligence_server.registry.process_event",
-            side_effect=mock_process,
-        ):
-            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
-            await worker.queue.put(
-                ("tool_call", "/workspace/test", {"session_id": "test-session"})
-            )
-            await worker.queue.put(
-                ("session:end", "/workspace/test", {"session_id": "test-session"})
-            )
-            await asyncio.wait_for(task, timeout=2.0)
-
-        assert worker.error_count == 1
-        assert len(reg._completed) == 1
-        assert reg._completed[0].error_count == 1
-
-
-class TestStaleSessionReaping:
-    """Stale sessions are reaped when idle > stale_session_timeout."""
-
-    @pytest.mark.asyncio
-    async def test_stale_worker_reaped_after_timeout(self) -> None:
-        """Worker with last_event_time ~5.8 days ago gets graph.close called
-        and is deregistered."""
-        reg = SessionRegistry()
-        worker = SessionWorker(
-            session_id="stale-session",
-            workspace="/workspace/test",
-            services=HookStateService(workspace="/workspace/test"),
-        )
-        # 5.8 days ago > default stale_session_timeout of 5 days (432000 s)
-        worker.last_event_time = time.time() - (5.8 * 24 * 3600)
-        reg._register_for_test(worker)
-        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
-
-        mock_settings = MagicMock()
-        mock_settings.stale_session_timeout = 432000.0  # 5 days
-
-        with patch(
-            "context_intelligence_server.registry.get_settings",
-            return_value=mock_settings,
-        ):
-            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
-            await asyncio.wait_for(task, timeout=2.0)
-
-        assert "stale-session" not in reg._workers
-        worker.services.graph.close.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_stale_session_not_added_to_completed(self) -> None:
-        """Reaped stale sessions are NOT added to the _completed deque."""
-        reg = SessionRegistry()
-        worker = SessionWorker(
-            session_id="stale-session",
-            workspace="/workspace/test",
-            services=HookStateService(workspace="/workspace/test"),
-        )
-        worker.last_event_time = time.time() - (5.8 * 24 * 3600)
-        reg._register_for_test(worker)
-        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
-
-        mock_settings = MagicMock()
-        mock_settings.stale_session_timeout = 432000.0
-
-        with patch(
-            "context_intelligence_server.registry.get_settings",
-            return_value=mock_settings,
-        ):
-            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
-            await asyncio.wait_for(task, timeout=2.0)
-
-        assert len(reg._completed) == 0
-
-    @pytest.mark.asyncio
-    async def test_stale_reap_graph_close_error_still_deregisters(self) -> None:
-        """If graph.close raises during stale reaping, worker is still deregistered."""
-        reg = SessionRegistry()
-        worker = SessionWorker(
-            session_id="stale-session",
-            workspace="/workspace/test",
-            services=HookStateService(workspace="/workspace/test"),
-        )
-        worker.last_event_time = time.time() - (5.8 * 24 * 3600)
-        reg._register_for_test(worker)
-        worker.services.graph.close = AsyncMock(  # type: ignore[method-assign]
-            side_effect=RuntimeError("close failed")
-        )
-
-        mock_settings = MagicMock()
-        mock_settings.stale_session_timeout = 432000.0  # 5 days
-
-        with patch(
-            "context_intelligence_server.registry.get_settings",
-            return_value=mock_settings,
-        ):
-            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
-            await asyncio.wait_for(task, timeout=2.0)
-
-        assert "stale-session" not in reg._workers
-
-
 class TestCancelledErrorCallsClose:
     """CancelledError causes graph.close() (not just flush) to be called."""
 
@@ -1052,11 +596,15 @@ class TestProcessOneLogsException:
         import logging
 
         reg = SessionRegistry()
+        qm = reg.queue_manager
+        sid = "test-session"
         worker = SessionWorker(
-            session_id="test-session",
+            session_id=sid,
             workspace="/workspace/test",
             services=HookStateService(workspace="/workspace/test"),
         )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
 
         async def mock_process(w, event, data, handlers):
             raise ValueError("handler exploded")
@@ -1068,11 +616,14 @@ class TestProcessOneLogsException:
             ),
             caplog.at_level(logging.ERROR, logger="context_intelligence_server"),
         ):
-            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
-            await worker.queue.put(
-                ("tool_call", "/workspace/test", {"session_id": "test-session"})
+            await qm.append(
+                sid, _line("tool_call", "/workspace/test", {"session_id": sid})
             )
-            await asyncio.sleep(0.05)
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if (await qm.read_batch(sid, 10)).lines == []:
+                    break
             task.cancel()
             try:
                 await task
@@ -1207,6 +758,22 @@ class TestDurableDrainLoop:
             except asyncio.CancelledError:
                 pass
 
+    def test_drain_worker_is_method_on_registry(self) -> None:
+        """drain_worker must be an instance coroutine method on SessionRegistry
+        (folded from the queue-era TestDrainLoopCallsProcessEvent)."""
+        import inspect
+
+        assert hasattr(SessionRegistry, "drain_worker")
+        assert inspect.iscoroutinefunction(SessionRegistry.drain_worker)
+
+    def test_flush_timeout_default_is_30s(self) -> None:
+        """drain_worker default flush_timeout is 30 seconds (folded from the
+        queue-era TestPeriodicFlush)."""
+        import inspect
+
+        sig = inspect.signature(SessionRegistry.drain_worker)
+        assert sig.parameters["flush_timeout"].default == 30.0
+
 
 class TestDurableSessionEnd:
     async def test_session_end_finalizes_and_deregisters(
@@ -1232,8 +799,85 @@ class TestDurableSessionEnd:
 
         assert sid not in reg._workers
         assert len(reg._completed) == 1
-        assert reg._completed[0].session_id == sid
+        # CompletedSession field assertions folded from the queue-era
+        # TestWorkerSelfTermination.test_session_end_writes_completed_session.
+        cs = reg._completed[0]
+        assert cs.session_id == sid
+        assert cs.workspace == "/ws"
+        assert cs.events_processed == 2
+        assert cs.error_count == 0
+        assert cs.ended_at > 0.0
+        assert cs.duration_seconds >= 0.0
+        assert cs.started_at <= cs.ended_at
         worker.services.graph.close.assert_awaited_once()
+
+    async def test_session_end_graph_close_error_still_finalizes(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """If graph.close raises, the worker is still deregistered and a
+        CompletedSession is still recorded (folded from the queue-era
+        TestWorkerSelfTermination.test_session_end_graph_close_error_still_deregisters).
+        """
+        reg, qm = reg_qm
+        sid = "s-end-close-err"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        worker.services.graph.close = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("close failed")
+        )
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            await qm.append(sid, _line("session:end", "/ws", {"session_id": sid}))
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            await asyncio.wait_for(task, timeout=3.0)
+
+        assert sid not in reg._workers
+        assert len(reg._completed) == 1
+
+    async def test_error_count_incremented_on_process_event_failure(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """error_count increments when process_event raises; the CompletedSession
+        records it (folded from the queue-era
+        TestWorkerSelfTermination.test_error_count_incremented_on_process_event_failure).
+        """
+        reg, qm = reg_qm
+        sid = "s-end-err-count"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        call_count = 0
+
+        async def mock_process(
+            w: object, event: str, data: object, handlers: object
+        ) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ValueError("processing error")
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            side_effect=mock_process,
+        ):
+            await qm.append(sid, _line("tool_call", "/ws", {"session_id": sid}))
+            await qm.append(sid, _line("session:end", "/ws", {"session_id": sid}))
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            await asyncio.wait_for(task, timeout=3.0)
+
+        assert worker.error_count == 1
+        assert len(reg._completed) == 1
+        assert reg._completed[0].error_count == 1
 
     async def test_session_end_drains_tail_to_eof(
         self, reg_qm: tuple[SessionRegistry, Any]
@@ -1317,6 +961,32 @@ class TestDurableStaleReaping:
         await asyncio.wait_for(task, timeout=3.0)
 
         worker.services.graph.close.assert_awaited()
+        assert sid not in reg._workers
+        # Reaped stale sessions are NOT added to the completed ring (folded from
+        # the queue-era TestStaleSessionReaping.test_stale_session_not_added_to_completed).
+        assert len(reg._completed) == 0
+
+    async def test_stale_reap_graph_close_error_still_deregisters(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """If graph.close raises during stale reaping, the worker is still
+        deregistered (folded from the queue-era
+        TestStaleSessionReaping.test_stale_reap_graph_close_error_still_deregisters).
+        """
+        reg, _qm = reg_qm
+        sid = "s-stale-close-err"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.close = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("close failed")
+        )
+        worker.last_event_time = time.time() - 10_000_000  # far in the past
+        reg._register_for_test(worker)
+
+        task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
+        await asyncio.wait_for(task, timeout=3.0)
+
         assert sid not in reg._workers
 
 
