@@ -1,6 +1,7 @@
 """Session registry — per-session worker management."""
 
 import asyncio
+import json
 import logging
 import time
 from collections import deque
@@ -13,10 +14,13 @@ from context_intelligence_server.config import get_settings
 from context_intelligence_server.dashboard import EventRecord, ring_buffer
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
 from context_intelligence_server.pipeline import process_event, setup_handlers
-from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.queue_manager import Batch, QueueManager
 from context_intelligence_server.services import HookStateService
 
 logger = logging.getLogger("context_intelligence_server")
+
+_DRAIN_MAX_BATCH = 100
+_DRAIN_POLL_INTERVAL = 0.05  # idle poll cadence; bounded by flush_timeout
 
 
 @dataclass
@@ -24,6 +28,11 @@ class SessionWorker:
     session_id: str
     workspace: str
     services: HookStateService
+    # Vestigial in Phase B2: the durable drain loop reads from the on-disk
+    # QueueManager log, NOT this in-memory queue. The field is retained until
+    # the POST /events endpoint (main.py, Task 5) and the dashboard queue_depth
+    # readout are migrated off it; removing it here breaks both before they are
+    # migrated. Tracked as a Task 4a concern (plan ordering gap).
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     task: asyncio.Task | None = None
     last_event: str = ""
@@ -118,111 +127,208 @@ class SessionRegistry:
                     error=error,
                 )
             )
-            worker.queue.task_done()
+
+    async def _flush_barrier(self, worker: SessionWorker) -> None:
+        """The ONE Neo4j-write boundary: a semaphore-gated, awaited flush.
+
+        Acquiring self.write_semaphore caps the number of concurrent Neo4j
+        write transactions across ALL session drainers (the starvation guard).
+        The offset must only ever advance AFTER this returns successfully.
+
+        Correctness of commit-after-flush depends on neo4j_store._flush_body
+        snapshotting+clearing the buffer under _flush_lock and RESTORING it on
+        failure (neo4j_store.py:686-696), plus the empty-buffer early return
+        (:656-657). We do not modify that file; we rely on it here.
+        """
+        async with self.write_semaphore:
+            await worker.services.graph.flush()
 
     async def drain_worker(
         self, worker: SessionWorker, flush_timeout: float = 30.0
     ) -> None:
-        """Background coroutine that drains the session's event queue.
+        """Durable drain loop for one session.
 
-        Initializes handlers once, then loops:
-        - Dequeues events with a timeout of *flush_timeout* seconds.
-        - Dispatches each event via process_event.
-        - On TimeoutError (no events for flush_timeout seconds): calls graph.flush
-          as a periodic fallback for disconnected sessions.
-        - On CancelledError (shutdown): calls graph.close, then exits cleanly.
-        - On session:end: drains tail events, creates CompletedSession,
-          calls graph.close, deregisters the worker, then exits.
+        Reads the next batch after the committed offset, dispatches each line
+        through process_event, then runs the single semaphore-gated flush
+        barrier and commits the offset only on success (the "ack"). A batch
+        that exhausts its retry budget — or that raises during dispatch — is
+        isolated ONE LINE AT A TIME and dead-lettered (never silently dropped).
+        When the log is idle the drainer polls and reaps the session if it has
+        been idle past the stale timeout. The drainer is the SOLE flush trigger
+        (process_event no longer self-flushes, Task 6).
         """
         handlers = setup_handlers(worker.services)
+        qm = self.queue_manager
+        session_id = worker.session_id
+        poll_interval = min(flush_timeout, _DRAIN_POLL_INTERVAL)
+        idle_elapsed = 0.0
+        attempts = 0
 
         while True:
-            # Use asyncio.timeout (Python ≥ 3.11) instead of asyncio.wait_for so
-            # that external task cancellation propagates cleanly.  asyncio.wait_for
-            # has a known Python 3.11 bug where cancelling the outer task while it
-            # is inside wait_for(queue.get(), timeout=T) requires two event-loop
-            # iterations to complete; the second iteration never arrives when a sync
-            # pytest fixture calls task.cancel() without awaiting, leaving orphaned
-            # tasks that deadlock the event loop.  asyncio.timeout does not have
-            # this race condition.
             try:
-                async with asyncio.timeout(flush_timeout):
-                    event_tuple = await worker.queue.get()
-            except asyncio.TimeoutError:
-                # Periodic fallback flush for disconnected sessions.
-                # Route through schedule_flush() — NOT flush() directly — so the
-                # single-flight guard prevents a concurrent transaction with any
-                # _background_flush task already in flight.
-                worker.services.graph.schedule_flush()
-                # Stale session reaping
-                settings = get_settings()
-                if (
-                    worker.last_event_time > 0
-                    and time.time() - worker.last_event_time
-                    > settings.stale_session_timeout
-                ):
-                    logger.info(
-                        "Reaping stale session %s (idle > %s seconds)",
-                        worker.session_id,
-                        settings.stale_session_timeout,
+                batch = await qm.read_batch(session_id, max_items=_DRAIN_MAX_BATCH)
+
+                if not batch.lines:
+                    await asyncio.sleep(poll_interval)
+                    idle_elapsed += poll_interval
+                    if idle_elapsed >= flush_timeout:
+                        idle_elapsed = 0.0
+                        settings = get_settings()
+                        if (
+                            worker.last_event_time > 0
+                            and time.time() - worker.last_event_time
+                            > settings.stale_session_timeout
+                        ):
+                            logger.info(
+                                "Reaping stale session %s (idle > %s seconds)",
+                                session_id,
+                                settings.stale_session_timeout,
+                            )
+                            await self._safe_close(worker)
+                            self._deregister(session_id)
+                            return
+                    continue
+
+                idle_elapsed = 0.0
+
+                # --- dispatch + durable write barrier, one error path ---
+                try:
+                    saw_terminal = await self._process_batch(worker, batch, handlers)
+                    await self._flush_barrier(worker)
+                except asyncio.CancelledError:
+                    await self._safe_close(worker)
+                    return
+                except Exception:
+                    attempts += 1
+                    logger.exception(
+                        "drain_batch_failed session=%s attempt=%d",
+                        session_id,
+                        attempts,
                     )
-                    try:
-                        await worker.services.graph.close()
-                    except Exception:
-                        logger.exception(
-                            "graph.close failed for stale session %s",
-                            worker.session_id,
-                        )
-                    self._deregister(worker.session_id)
-                    break
-                continue
+                    if attempts >= self._max_delivery_attempts:
+                        # Budget spent -> isolate the batch ONE LINE AT A TIME,
+                        # dead-letter the offending line(s), advance past all.
+                        await self._handle_exhausted_batch(worker, batch, handlers)
+                        attempts = 0
+                        continue
+                    # Budget NOT yet spent: back off one poll interval before
+                    # re-reading the SAME offset (offset is not committed; the
+                    # idempotent MERGE makes the replay a no-op). The backoff
+                    # avoids a tight Neo4j-hammering retry loop on a transient
+                    # deadlock and keeps retries on the loop's poll cadence.
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                attempts = 0
+                await qm.commit(session_id, batch.end_offset)
+
+                if saw_terminal:
+                    await self._finalize_session(worker, handlers)
+                    return
 
             except asyncio.CancelledError:
-                try:
-                    await worker.services.graph.close()
-                except Exception:
-                    logger.exception(
-                        "graph.close failed on cancel for session %s",
-                        worker.session_id,
-                    )
-                break
+                await self._safe_close(worker)
+                return
 
-            # --- happy path: we have an event ---
-            event, _workspace, data = event_tuple
+    @staticmethod
+    def _parse_line(raw: bytes) -> tuple[str, str, dict[str, Any]]:
+        """Decode an appended event line (raw EventRequest JSON)."""
+        obj = json.loads(raw.decode("utf-8"))
+        return obj["event"], obj.get("workspace", ""), obj.get("data", {})
+
+    async def _process_batch(
+        self, worker: SessionWorker, batch: Batch, handlers: Any
+    ) -> bool:
+        """Dispatch each line in the batch; return True if it contained a
+        terminal (session:end) event."""
+        from context_intelligence_server.pipeline import TERMINAL_EVENTS  # noqa: PLC0415
+
+        saw_terminal = False
+        for raw in batch.lines:
+            event, _workspace, data = self._parse_line(raw)
             await self._process_one(worker, event, data, handlers)
+            if event in TERMINAL_EVENTS:
+                saw_terminal = True
+        return saw_terminal
 
-            if event == "session:end":
-                # Drain any tail events already in the queue
-                while True:
-                    try:
-                        tail_event, _tail_ws, tail_data = worker.queue.get_nowait()
-                        await self._process_one(worker, tail_event, tail_data, handlers)
-                    except asyncio.QueueEmpty:
-                        break
+    async def _handle_exhausted_batch(
+        self, worker: SessionWorker, batch: Batch, handlers: Any
+    ) -> None:
+        """Reprocess a poison batch ONE LINE AT A TIME (linear isolation).
 
-                # Record the completed session
-                ended_at = time.time()
-                self._completed.append(
-                    CompletedSession(
-                        session_id=worker.session_id,
-                        workspace=worker.workspace,
-                        started_at=worker.started_at,
-                        ended_at=ended_at,
-                        events_processed=worker.events_processed,
-                        error_count=worker.error_count,
-                        duration_seconds=ended_at - worker.started_at,
-                    )
-                )
+        Each line is dispatched + flushed individually under the write
+        semaphore. A line that still fails (parse error, handler error, or
+        repeated flush failure) is dead-lettered with its error AND its write
+        residue is discarded from the store buffer (COE blocker, decision #13);
+        good lines flush normally. Every line advances the offset past itself
+        (commit), so the whole batch is accounted for. No silent loss, no
+        binary shrink, no cross-line contamination.
+        """
+        qm = self.queue_manager
+        session_id = worker.session_id
+        # The failed BATCH flush left its writes resident in the store buffer
+        # (_flush_body restores on failure, neo4j_store.py:686-696). Discard that
+        # accumulated residue so the FIRST isolated line flushes from a clean
+        # buffer — otherwise the poison line's residue contaminates line 1.
+        worker.services.graph.discard_buffer()
+        offset = batch.start_offset
+        for raw in batch.lines:
+            line_end = offset + len(raw) + 1  # +1 for the newline read_batch strips
+            try:
+                event, _ws, data = self._parse_line(raw)
+                await self._process_one(worker, event, data, handlers)
+                await self._flush_barrier(worker)
+            except Exception as exc:
+                await qm.dead_letter(session_id, raw + b"\n", str(exc))
+                # COE blocker (decision #13): drop the failed line's residue so
+                # it cannot contaminate the NEXT line's flush. A successful flush
+                # clears the buffer itself; only the failure path needs this.
+                worker.services.graph.discard_buffer()
+            await qm.commit(session_id, line_end)
+            offset = line_end
 
-                try:
-                    await worker.services.graph.close()
-                except Exception:
-                    logger.exception(
-                        "graph.close failed for session %s", worker.session_id
-                    )
-
-                self._deregister(worker.session_id)
+    async def _finalize_session(self, worker: SessionWorker, handlers: Any) -> None:
+        """session:end seen: drain any tail lines read-to-EOF, then record the
+        CompletedSession, close the graph, deregister, and DELETE the drained
+        logs. Panel finding #7: if a tail flush fails, do NOT finalize — return
+        without recording/closing so the drainer retries (no tail loss)."""
+        qm = self.queue_manager
+        session_id = worker.session_id
+        while True:
+            tail = await qm.read_batch(session_id, max_items=_DRAIN_MAX_BATCH)
+            if not tail.lines:
                 break
+            try:
+                await self._process_batch(worker, tail, handlers)
+                await self._flush_barrier(worker)
+            except Exception:
+                logger.exception("finalize_tail_flush_failed session=%s", session_id)
+                return  # NOT finalized: keep worker alive, leave tail uncommitted
+            await qm.commit(session_id, tail.end_offset)
+
+        ended_at = time.time()
+        self._completed.append(
+            CompletedSession(
+                session_id=session_id,
+                workspace=worker.workspace,
+                started_at=worker.started_at,
+                ended_at=ended_at,
+                events_processed=worker.events_processed,
+                error_count=worker.error_count,
+                duration_seconds=ended_at - worker.started_at,
+            )
+        )
+        await self._safe_close(worker)
+        self._deregister(session_id)
+        # Panel finding #5: reclaim disk — a fully drained, finalized session no
+        # longer needs its .log/.offset. Keep .dead.jsonl (retained dead-letter).
+        await qm.delete_drained(session_id)
+
+    async def _safe_close(self, worker: SessionWorker) -> None:
+        try:
+            await worker.services.graph.close()
+        except Exception:
+            logger.exception("graph.close failed for session %s", worker.session_id)
 
     def start_drain(self, worker: SessionWorker) -> None:
         if worker.task is None or worker.task.done():

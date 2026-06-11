@@ -182,6 +182,24 @@ class QueueManager:
 
         await asyncio.to_thread(_append)
 
+    async def delete_drained(self, session_id: str) -> None:
+        """Remove the drained .log and .offset for a fully-finalized session.
+
+        The .dead.jsonl (if any) is intentionally KEPT — dead-letters are
+        retained for later inspection/replay (Phase C). Idempotent: missing
+        files are ignored.
+        """
+        self._validate_session_id(session_id)
+
+        def _delete() -> None:
+            for p in (self._log_path(session_id), self._offset_path(session_id)):
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
+
+        await asyncio.to_thread(_delete)
+
     async def read_dead_letters(self, session_id: str) -> list[dict]:
         """Return all dead-letter records for ``session_id`` in append order.
 

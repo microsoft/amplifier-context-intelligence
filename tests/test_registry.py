@@ -2,10 +2,12 @@
 
 import asyncio
 import dataclasses
+import json
 import time
 from collections import deque
 from collections.abc import AsyncGenerator
 from pathlib import Path
+from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -1114,3 +1116,295 @@ class TestRegistryOwnsDurableInfra:
 
         # Idempotent: a second access returns the same instance.
         assert reg.write_semaphore is sem
+
+
+# ---------------------------------------------------------------------------
+# Task 4a: Durable drain loop (QueueManager-backed)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def reg_qm() -> AsyncGenerator[tuple[SessionRegistry, Any], None]:
+    """A SessionRegistry whose durable infra is rooted under the per-test
+    queues dir (via safe_settings -> tmp_path). Cancels drain tasks on teardown."""
+    reg = SessionRegistry()
+    yield reg, reg.queue_manager
+    for w in list(reg._workers.values()):
+        if w.task and not w.task.done():
+            w.task.cancel()
+    tasks = [w.task for w in reg._workers.values() if w.task and not w.task.done()]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _line(event: str, workspace: str, data: dict) -> bytes:
+    """Encode an appended event line exactly as POST /events stores it."""
+    return json.dumps({"event": event, "workspace": workspace, "data": data}).encode(
+        "utf-8"
+    )
+
+
+class TestDurableDrainLoop:
+    async def test_appended_line_is_processed_and_offset_committed(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """A line appended to the log is dispatched to process_event, then the
+        offset is committed (advanced past it)."""
+        reg, qm = reg_qm
+        sid = "s-drain"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ) as mock_process:
+            await qm.append(sid, _line("tool:pre", "/ws", {"session_id": sid}))
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if (await qm.read_batch(sid, 10)).lines == []:
+                    break
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        mock_process.assert_awaited()
+        assert (await qm.read_batch(sid, 10)).lines == []  # offset advanced to EOF
+        worker.services.graph.flush.assert_awaited()
+
+    async def test_offset_not_committed_when_flush_fails(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """If the flush barrier raises, the offset is NOT advanced (the line
+        stays in the log for re-processing) until the retry budget is spent."""
+        reg, qm = reg_qm
+        sid = "s-fail"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("DeadlockDetected")
+        )
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            await qm.append(sid, _line("tool:pre", "/ws", {"session_id": sid}))
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            await asyncio.sleep(0.1)  # allow a couple of failed retry passes
+            assert (await qm.read_batch(sid, 10)).lines != []  # still pending
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+
+class TestDurableSessionEnd:
+    async def test_session_end_finalizes_and_deregisters(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        reg, qm = reg_qm
+        sid = "s-end"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            await qm.append(sid, _line("tool:pre", "/ws", {"session_id": sid}))
+            await qm.append(sid, _line("session:end", "/ws", {"session_id": sid}))
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            await asyncio.wait_for(task, timeout=3.0)
+
+        assert sid not in reg._workers
+        assert len(reg._completed) == 1
+        assert reg._completed[0].session_id == sid
+        worker.services.graph.close.assert_awaited_once()
+
+    async def test_session_end_drains_tail_to_eof(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """Lines appended after session:end (tail) are drained read-to-EOF."""
+        reg, qm = reg_qm
+        sid = "s-tail"
+        processed: list[str] = []
+
+        async def _capture(w: object, event: str, data: object, h: object) -> None:
+            processed.append(event)
+
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event", side_effect=_capture
+        ):
+            await qm.append(sid, _line("session:end", "/ws", {"session_id": sid}))
+            await qm.append(sid, _line("tail_event", "/ws", {"session_id": sid}))
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            await asyncio.wait_for(task, timeout=3.0)
+
+        assert "session:end" in processed
+        assert "tail_event" in processed
+
+    async def test_tail_flush_failure_does_not_finalize(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """Panel finding #7: if the session:end tail flush raises, the session
+        is NOT finalized — no CompletedSession, not closed, not deregistered —
+        so the drainer can retry rather than lose the tail."""
+        reg, qm = reg_qm
+        sid = "s-tail-fail"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("DeadlockDetected")
+        )
+        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            await qm.append(sid, _line("session:end", "/ws", {"session_id": sid}))
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            await asyncio.sleep(0.2)
+            # Not finalized: still registered, not completed, not closed.
+            assert sid in reg._workers
+            assert len(reg._completed) == 0
+            worker.services.graph.close.assert_not_awaited()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+
+class TestDurableStaleReaping:
+    async def test_idle_periodic_check_and_stale_reap(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        reg, _qm = reg_qm
+        sid = "s-stale"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
+        worker.last_event_time = time.time() - 10_000_000  # far in the past
+        reg._register_for_test(worker)
+
+        # Tiny flush_timeout so the idle branch fires its stale check quickly.
+        task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
+        await asyncio.wait_for(task, timeout=3.0)
+
+        worker.services.graph.close.assert_awaited()
+        assert sid not in reg._workers
+
+
+class _AccumBufferGraph:
+    """FAITHFUL model of a real store's accumulating buffer (NOT a hollow mock).
+
+    Unlike a mock that raises on the "current event", this models what a real
+    Neo4jGraphStore actually does: writes ACCUMULATE in a buffer; flush() fails
+    while the poison node is RESIDENT in that buffer (and _flush_body restores
+    it on failure, so it stays resident); a SUCCESSFUL flush clears the buffer;
+    discard_buffer() clears it without flushing. This is the mechanism the COE
+    blocker is about — so the test exercises the real contamination path.
+    """
+
+    def __init__(self) -> None:
+        self.workspace = "/ws"
+        self.buffer: set[str] = set()  # keyed like _node_buffer (idempotent)
+        self.flushed: list[str] = []
+        self.discards = 0
+
+    async def flush(self) -> None:
+        if not self.buffer:
+            return  # empty-buffer early return (mirrors neo4j_store :656-657)
+        if "poison" in self.buffer:
+            # Non-transient rejection. _flush_body restores the buffer on
+            # failure, so the residue STAYS resident -> contamination unless
+            # discard_buffer() is called on the give-up path.
+            raise RuntimeError("poison node rejected by store")
+        self.flushed.extend(sorted(self.buffer))
+        self.buffer.clear()  # success clears
+
+    def discard_buffer(self) -> None:
+        self.buffer.clear()
+        self.discards += 1
+
+    async def close(self) -> None:
+        pass
+
+
+class TestDurableLinearPoisonIsolation:
+    async def test_only_the_poison_line_is_dead_lettered_clean_buffer(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """In a batch [good1, poison, good2] against a FAITHFUL accumulating
+        buffer, isolation flushes+commits the good lines and dead-letters ONLY
+        the poison line — and the good lines actually PERSIST (proving the
+        poison residue did NOT contaminate them). This fails without the
+        discard_buffer() calls in _handle_exhausted_batch (decision #13):
+        without them, good1's flush re-includes the resident poison and good1
+        is wrongly dead-lettered too.
+        """
+        reg, qm = reg_qm
+        sid = "poison-iso"
+
+        fake = _AccumBufferGraph()
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph = fake  # type: ignore[assignment]
+
+        async def _process(w: object, event: str, data: object, h: object) -> None:
+            # process_event buffers the line's write (here: the event name).
+            fake.buffer.add(event)
+
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event", side_effect=_process
+        ):
+            await qm.append(sid, _line("good1", "/ws", {"session_id": sid}))
+            await qm.append(sid, _line("poison", "/ws", {"session_id": sid}))
+            await qm.append(sid, _line("good2", "/ws", {"session_id": sid}))
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            for _ in range(400):
+                await asyncio.sleep(0.01)
+                if (await qm.read_batch(sid, 10)).lines == []:
+                    break
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        dead = await qm.read_dead_letters(sid)
+        assert len(dead) == 1
+        assert json.loads(dead[0]["payload"])["event"] == "poison"
+        # The good lines actually persisted (no contamination from poison).
+        assert fake.flushed == ["good1", "good2"]
+        # discard_buffer was exercised on the give-up path(s).
+        assert fake.discards >= 1
+        assert (await qm.read_batch(sid, 10)).lines == []  # offset advanced past all 3

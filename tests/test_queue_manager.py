@@ -222,3 +222,19 @@ async def test_dead_letter_rejects_unsafe_session_id(qm, bad_id):
 async def test_read_dead_letters_rejects_unsafe_session_id(qm, bad_id):
     with pytest.raises(ValueError):
         await qm.read_dead_letters(bad_id)
+
+
+async def test_delete_drained_removes_log_and_offset_keeps_dead(tmp_path) -> None:
+    from context_intelligence_server.queue_manager import QueueManager
+
+    qm = QueueManager(queues_dir=tmp_path)
+    await qm.append("s", b"line")
+    await qm.commit("s", 5)
+    await qm.dead_letter("s", b"bad\n", "boom")
+
+    await qm.delete_drained("s")
+
+    assert not (tmp_path / "s.log").exists()
+    assert not (tmp_path / "s.offset").exists()
+    assert (tmp_path / "s.dead.jsonl").exists()  # retained
+    assert len(await qm.read_dead_letters("s")) == 1
