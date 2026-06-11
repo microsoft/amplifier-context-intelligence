@@ -24,6 +24,7 @@ session_id contract:
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,3 +54,16 @@ class QueueManager:
     def __init__(self, queues_dir: Path):
         self._dir = Path(queues_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
+
+    def _log_path(self, session_id: str) -> Path:
+        return self._dir / f"{session_id}.log"
+
+    async def append(self, session_id: str, raw: bytes) -> None:
+        line = raw if raw.endswith(b"\n") else raw + b"\n"
+        path = self._log_path(session_id)
+
+        def _append() -> None:
+            with open(path, "ab") as f:
+                f.write(line)
+
+        await asyncio.to_thread(_append)

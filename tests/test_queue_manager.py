@@ -25,3 +25,15 @@ def test_batch_holds_its_fields():
     assert batch.lines == [b"a", b"b"]
     assert batch.start_offset == 0
     assert batch.end_offset == 4
+
+
+async def test_append_writes_line_with_trailing_newline(qm, tmp_path):
+    await qm.append("s1", b'{"e":1}')
+    log = tmp_path / "queues" / "s1.log"
+    assert log.read_bytes() == b'{"e":1}\n'
+
+
+async def test_append_does_not_double_newline(qm, tmp_path):
+    await qm.append("s1", b'{"e":1}\n')
+    log = tmp_path / "queues" / "s1.log"
+    assert log.read_bytes() == b'{"e":1}\n'
