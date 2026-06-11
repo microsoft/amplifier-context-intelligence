@@ -148,3 +148,27 @@ async def test_dead_letter_appends_and_reads_back(qm):
 
 async def test_read_dead_letters_empty_when_none(qm):
     assert await qm.read_dead_letters("nobody") == []
+
+
+@pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])
+async def test_read_batch_rejects_unsafe_session_id(qm, bad_id):
+    with pytest.raises(ValueError):
+        await qm.read_batch(bad_id, max_items=1)
+
+
+@pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])
+async def test_commit_rejects_unsafe_session_id(qm, bad_id):
+    with pytest.raises(ValueError):
+        await qm.commit(bad_id, 0)
+
+
+@pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])
+async def test_dead_letter_rejects_unsafe_session_id(qm, bad_id):
+    with pytest.raises(ValueError):
+        await qm.dead_letter(bad_id, b"x", error="e")
+
+
+@pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])
+async def test_read_dead_letters_rejects_unsafe_session_id(qm, bad_id):
+    with pytest.raises(ValueError):
+        await qm.read_dead_letters(bad_id)
