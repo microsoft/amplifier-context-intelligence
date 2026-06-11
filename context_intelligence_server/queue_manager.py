@@ -58,7 +58,18 @@ class QueueManager:
     def _log_path(self, session_id: str) -> Path:
         return self._dir / f"{session_id}.log"
 
+    @staticmethod
+    def _validate_session_id(session_id: str) -> None:
+        if (
+            not session_id
+            or "/" in session_id
+            or "\\" in session_id
+            or "\0" in session_id
+        ):
+            raise ValueError(f"Invalid session_id: {session_id!r}")
+
     async def append(self, session_id: str, raw: bytes) -> None:
+        self._validate_session_id(session_id)
         line = raw if raw.endswith(b"\n") else raw + b"\n"
         path = self._log_path(session_id)
 

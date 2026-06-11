@@ -37,3 +37,9 @@ async def test_append_does_not_double_newline(qm, tmp_path):
     await qm.append("s1", b'{"e":1}\n')
     log = tmp_path / "queues" / "s1.log"
     assert log.read_bytes() == b'{"e":1}\n'
+
+
+@pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])
+async def test_append_rejects_unsafe_session_id(qm, bad_id):
+    with pytest.raises(ValueError):
+        await qm.append(bad_id, b"x")
