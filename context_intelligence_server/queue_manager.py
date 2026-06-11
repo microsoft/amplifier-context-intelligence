@@ -117,21 +117,22 @@ class QueueManager:
 
         def _read() -> Batch:
             start = self._read_committed_offset(session_id)
+            lines: list[bytes] = []
+            consumed = 0
             try:
                 with open(path, "rb") as f:
                     f.seek(start)
-                    data = f.read()
+                    while len(lines) < max_items:
+                        raw = f.readline()
+                        if not raw or not raw.endswith(b"\n"):
+                            # EOF, or a torn trailing line with no newline yet:
+                            # ignore the partial line and stop on a line boundary.
+                            break
+                        lines.append(raw[:-1])
+                        consumed += len(raw)
             except FileNotFoundError:
-                data = b""
-            lines: list[bytes] = []
-            pos = 0
-            while len(lines) < max_items:
-                nl = data.find(b"\n", pos)
-                if nl == -1:
-                    break
-                lines.append(data[pos:nl])
-                pos = nl + 1
-            return Batch(session_id, lines, start, start + pos)
+                pass
+            return Batch(session_id, lines, start, start + consumed)
 
         return await asyncio.to_thread(_read)
 

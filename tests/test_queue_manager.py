@@ -73,6 +73,56 @@ async def test_read_batch_ignores_torn_trailing_line(qm, tmp_path):
     assert batch.end_offset == len(b"complete1\ncomplete2\n")
 
 
+async def test_read_batch_does_not_read_entire_tail(qm, tmp_path, monkeypatch):
+    import builtins
+
+    # ~90 KB log: 10,000 lines of 8 payload bytes + newline = 9 bytes each.
+    log_path = tmp_path / "queues" / "s1.log"
+    log_path.write_bytes(b"".join(b"x" * 8 + b"\n" for _ in range(10_000)))
+
+    bytes_read = {"total": 0}
+    real_open = builtins.open
+
+    class _CountingFile:
+        """Wraps a file object, tallying bytes returned by read/readline."""
+
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        def read(self, *args, **kwargs):
+            data = self._wrapped.read(*args, **kwargs)
+            bytes_read["total"] += len(data)
+            return data
+
+        def readline(self, *args, **kwargs):
+            data = self._wrapped.readline(*args, **kwargs)
+            bytes_read["total"] += len(data)
+            return data
+
+        def __getattr__(self, name):
+            return getattr(self._wrapped, name)
+
+        def __enter__(self):
+            self._wrapped.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._wrapped.__exit__(*exc)
+
+    def counting_open(file, *args, **kwargs):
+        f = real_open(file, *args, **kwargs)
+        if str(file) == str(log_path):
+            return _CountingFile(f)
+        return f
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+
+    batch = await qm.read_batch("s1", max_items=100)
+    assert len(batch.lines) == 100
+    # Whole-tail read would pull ~90 KB; a bounded read pulls only ~100 lines.
+    assert bytes_read["total"] < 50_000
+
+
 async def test_read_batch_empty_for_unknown_session(qm):
     batch = await qm.read_batch("never-written", max_items=10)
     assert batch.lines == []
