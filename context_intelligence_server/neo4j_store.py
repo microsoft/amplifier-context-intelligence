@@ -314,6 +314,9 @@ async def _write_batch(
             )
 
     # Session nodes: MERGE by Session label + uniqueness constraint (atomic under concurrency)
+    # Lock-order hygiene: sort by stable key so every writer acquires node locks in one
+    # global order, preventing the out-of-order lock cycle that causes deadlocks.
+    session_rows.sort(key=lambda r: r["node_id"])
     if session_rows:
         res = await tx.run(
             "UNWIND $rows AS row "
@@ -324,6 +327,7 @@ async def _write_batch(
         await res.consume()
 
     # Non-session nodes: label-free MERGE (no constraint needed — single-worker owned)
+    other_rows.sort(key=lambda r: r["node_id"])
     if other_rows:
         res = await tx.run(
             "UNWIND $rows AS row "
@@ -336,6 +340,7 @@ async def _write_batch(
     # Set all labels for labeled nodes (primary + extra in one SET per node).
     # For Session nodes, Session label is already set by the MERGE above — this
     # adds any additional type labels (RootSession, SubSession, ForkedSession, etc.)
+    label_assignments.sort(key=lambda i: i["node_id"])
     for item in label_assignments:
         labels_str = ":".join(item["labels"])
         res = await tx.run(
@@ -400,6 +405,7 @@ async def _write_batch(
             f"MERGE (src)-[r:{edge_type}]->(dst) "
             f"SET r += row.props"
         )
+        rows.sort(key=lambda r: (r["src_id"], r["dst_id"]))
         res = await tx.run(
             edge_merge_query,  # type: ignore[arg-type]
             rows=rows,
