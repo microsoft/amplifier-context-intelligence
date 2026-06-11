@@ -54,3 +54,12 @@ async def test_read_batch_returns_lines_fifo(qm):
     assert batch.lines == [b"one", b"two", b"three"]
     assert batch.start_offset == 0
     assert batch.end_offset == len(b"one\ntwo\nthree\n")
+
+
+async def test_read_batch_respects_max_items(qm):
+    for i in range(5):
+        await qm.append("s1", f"line{i}".encode())
+    batch = await qm.read_batch("s1", max_items=2)
+    assert batch.lines == [b"line0", b"line1"]
+    assert batch.end_offset == len(b"line0\nline1\n")
+    assert batch.start_offset == 0
