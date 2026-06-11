@@ -71,3 +71,10 @@ async def test_read_batch_ignores_torn_trailing_line(qm, tmp_path):
     batch = await qm.read_batch("s1", max_items=10)
     assert batch.lines == [b"complete1", b"complete2"]
     assert batch.end_offset == len(b"complete1\ncomplete2\n")
+
+
+async def test_read_batch_empty_for_unknown_session(qm):
+    batch = await qm.read_batch("never-written", max_items=10)
+    assert batch.lines == []
+    assert batch.start_offset == 0
+    assert batch.end_offset == 0

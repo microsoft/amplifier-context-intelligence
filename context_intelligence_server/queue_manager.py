@@ -96,9 +96,12 @@ class QueueManager:
 
         def _read() -> Batch:
             start = self._read_committed_offset(session_id)
-            with open(path, "rb") as f:
-                f.seek(start)
-                data = f.read()
+            try:
+                with open(path, "rb") as f:
+                    f.seek(start)
+                    data = f.read()
+            except FileNotFoundError:
+                data = b""
             lines: list[bytes] = []
             pos = 0
             while len(lines) < max_items:
