@@ -40,6 +40,12 @@ blob_path: ~/amplifier-context-intelligence-server-data-store/blobs
 log_path:  ~/amplifier-context-intelligence-server-data-store/logs/server.jsonl
 cursor_path: ~/amplifier-context-intelligence-server-data-store/cursors
 
+# Durable ingest queue (persist-then-202): each session gets an append-log under
+# queues_path so events survive a crash between the 202 ACK and the Neo4j write.
+queues_path: /data/queues          # Durable per-session append-logs; mirrors blob_path
+write_concurrency: 8               # Max concurrent Neo4j write flushes across all session drainers (starvation guard)
+max_delivery_attempts: 5           # Flush retries for one batch before its offending line is dead-lettered
+
 # -----------------------------------------------------------------------------
 # Server bind address
 # These two values are combined into the HTTP URL advertised in the web UI

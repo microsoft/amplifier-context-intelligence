@@ -378,6 +378,9 @@ Values are resolved with this priority (highest first):
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_USER` | `neo4j_user` | `neo4j` | Neo4j username |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD` | `neo4j_password` | `password` | Neo4j password |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH` | `blob_path` | `/data/blobs` | Blob storage root directory |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_QUEUES_PATH` | `queues_path` | `/data/queues` | Directory for the durable per-session append-logs (persist-then-202 ingest); mirrors `blob_path`. |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_WRITE_CONCURRENCY` | `write_concurrency` | `8` | Max concurrent Neo4j write flushes across all session drainers (starvation guard). |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_MAX_DELIVERY_ATTEMPTS` | `max_delivery_attempts` | `5` | Flush retries for one batch before its offending line is dead-lettered. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_PATH` | `log_path` | `/data/logs/server.jsonl` | Structured log file path |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_LEVEL` | `log_level` | `INFO` | Log level (`DEBUG`/`INFO`/`WARNING`/`ERROR`) |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVER_HOST` | `server_host` | `0.0.0.0` | Bind host |
