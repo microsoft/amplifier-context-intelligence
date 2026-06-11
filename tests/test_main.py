@@ -886,6 +886,110 @@ async def test_lifespan_creates_and_closes_driver(
 
 
 # ---------------------------------------------------------------------------
+# Lifespan crash-recovery + workers==1 guard tests (Phase B2)
+# ---------------------------------------------------------------------------
+
+
+def _patched_lifespan_deps() -> Any:
+    """Return the patch context managers that stub the lifespan's Neo4j deps."""
+    mock_driver = MagicMock()
+    mock_driver.close = AsyncMock()
+    return mock_driver
+
+
+async def test_lifespan_recovers_and_respawns_drainers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lifespan respawns a drainer for each session with an undrained line,
+    using the workspace parsed from that session's first log line."""
+    sid = "sess-recover"
+    qm = registry.queue_manager
+    body = json.dumps(
+        {
+            "event": "tool_use",
+            "workspace": "/recovered-ws",
+            "data": {"session_id": sid},
+        }
+    ).encode("utf-8")
+    await qm.append(sid, body)
+
+    spawned: list[tuple[str, str]] = []
+    monkeypatch.setattr(registry, "get_or_create", lambda s, w: spawned.append((s, w)))
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=AsyncMock(),
+        ),
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+    assert (sid, "/recovered-ws") in spawned
+
+
+async def test_lifespan_skips_recovery_for_empty_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session whose first line has an empty workspace is NOT respawned
+    (spawning a workspace='' worker would violate the non-empty-workspace
+    invariant)."""
+    sid = "sess-empty-ws"
+    qm = registry.queue_manager
+    body = json.dumps(
+        {
+            "event": "tool_use",
+            "workspace": "",
+            "data": {"session_id": sid},
+        }
+    ).encode("utf-8")
+    await qm.append(sid, body)
+
+    spawned: list[tuple[str, str]] = []
+    monkeypatch.setattr(registry, "get_or_create", lambda s, w: spawned.append((s, w)))
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=AsyncMock(),
+        ),
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+    assert spawned == []
+
+
+def test_validate_single_worker_trips_on_effective_web_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_validate_single_worker fails loud when effective WEB_CONCURRENCY != 1."""
+    monkeypatch.setenv("WEB_CONCURRENCY", "4")
+    with pytest.raises((RuntimeError, SystemExit)):
+        main_module._validate_single_worker()
+
+
+def test_validate_single_worker_passes_when_effective_is_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_validate_single_worker returns 1 when WEB_CONCURRENCY is unset."""
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    assert main_module._validate_single_worker() == 1
+
+
+# ---------------------------------------------------------------------------
 # /status neo4j_connected field tests
 # ---------------------------------------------------------------------------
 
