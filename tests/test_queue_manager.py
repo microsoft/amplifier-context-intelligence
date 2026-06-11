@@ -63,3 +63,11 @@ async def test_read_batch_respects_max_items(qm):
     assert batch.lines == [b"line0", b"line1"]
     assert batch.end_offset == len(b"line0\nline1\n")
     assert batch.start_offset == 0
+
+
+async def test_read_batch_ignores_torn_trailing_line(qm, tmp_path):
+    log = tmp_path / "queues" / "s1.log"
+    log.write_bytes(b"complete1\ncomplete2\nTORN_PARTIAL")
+    batch = await qm.read_batch("s1", max_items=10)
+    assert batch.lines == [b"complete1", b"complete2"]
+    assert batch.end_offset == len(b"complete1\ncomplete2\n")
