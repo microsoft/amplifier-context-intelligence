@@ -198,8 +198,13 @@ async def process_event(
             await worker.services.touch_session(session_id, timestamp)
 
     except Exception:
-        # Benign per-event handler errors (steps 2-6) are logged with
-        # structured context but swallowed so the drain loop survives.
+        # Phase B2 (USER DECISION option a): a handler error in steps 2-6
+        # (ensure_session_node, blob processing, the default handler that
+        # creates the raw :Event node, the enrichers, or touch_session) has no
+        # genuinely-benign condition to swallow. Swallowing it here let the
+        # drainer commit the offset past a never-persisted event (silent loss).
+        # Log with structured context, then RE-RAISE so the drainer routes this
+        # line to dead-letter instead of acking it. No "fourth state".
         logger.exception(
             "pipeline: unhandled error processing event",
             extra={
@@ -207,6 +212,7 @@ async def process_event(
                 "session_id": session_id,
             },
         )
+        raise
 
     # NOTE (Task 6): process_event no longer self-flushes. The drainer
     # (registry.drain_worker) owns the SINGLE semaphore-gated flush barrier per

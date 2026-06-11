@@ -412,18 +412,22 @@ async def test_process_event_non_terminal_does_not_self_flush(
 # ===========================================================================
 
 
-async def test_process_event_handler_exception_does_not_propagate(
+async def test_process_event_default_handler_exception_propagates(
     mock_worker: MagicMock,
     default_handler: _StubDefaultHandler,
 ) -> None:
-    """Handler exceptions must be swallowed so the drain loop continues."""
+    """Phase B2: a default-handler (step 4) error must PROPAGATE so the drainer
+    can dead-letter the line instead of committing the offset past a
+    never-persisted event (no silent loss)."""
     from context_intelligence_server.pipeline import PipelineHandlers, process_event
 
     default_handler._mock_call = AsyncMock(side_effect=RuntimeError("boom!"))
     handlers = PipelineHandlers(default=default_handler, enrichers=[])  # type: ignore[arg-type]
 
-    # Must NOT raise
-    await process_event(mock_worker, "some:event", {"session_id": "sess-123"}, handlers)
+    with pytest.raises(RuntimeError, match="boom!"):
+        await process_event(
+            mock_worker, "some:event", {"session_id": "sess-123"}, handlers
+        )
 
 
 # NOTE (Task 6): test_process_event_flush_exception_propagates was removed.
@@ -434,20 +438,23 @@ async def test_process_event_handler_exception_does_not_propagate(
 # failure). There is no longer a step-7 flush inside process_event to assert on.
 
 
-async def test_process_event_ensure_session_exception_does_not_propagate(
+async def test_process_event_propagates_handler_error(
     mock_worker: MagicMock,
     pipeline_handlers: Any,
 ) -> None:
-    """ensure_session_node exceptions must be absorbed."""
+    """Phase B2 (USER DECISION option a): a handler error in steps 2-6 must
+    PROPAGATE, not be swallowed — here ensure_session_node (step 2) raises and
+    process_event must re-raise so the drainer routes the line to dead-letter
+    rather than committing the offset past a never-persisted event."""
     from context_intelligence_server.pipeline import process_event
 
     mock_worker.services.ensure_session_node = AsyncMock(
-        side_effect=RuntimeError("db down")
+        side_effect=RuntimeError("boom")
     )
     data = {"session_id": "sess-123"}
 
-    # Must NOT raise
-    await process_event(mock_worker, "session:start", data, pipeline_handlers)
+    with pytest.raises(RuntimeError, match="boom"):
+        await process_event(mock_worker, "session:start", data, pipeline_handlers)
 
 
 # ===========================================================================
@@ -463,6 +470,7 @@ async def test_blob_processing_called_when_all_conditions_met(
 
     worker = MagicMock()
     worker.services.ensure_session_node = AsyncMock()
+    worker.services.touch_session = AsyncMock()
     worker.services.graph = MagicMock()
     worker.services.graph.flush = AsyncMock()
     worker.services.blob_store = MagicMock()  # truthy blob_store
@@ -522,6 +530,7 @@ async def test_blob_processing_skipped_without_blob_store(
 
     worker = MagicMock()
     worker.services.ensure_session_node = AsyncMock()
+    worker.services.touch_session = AsyncMock()
     worker.services.graph = MagicMock()
     worker.services.graph.flush = AsyncMock()
     worker.services.blob_store = None  # falsy blob_store

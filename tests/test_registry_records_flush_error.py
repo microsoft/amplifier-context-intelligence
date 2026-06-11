@@ -32,9 +32,14 @@ async def test_propagated_flush_error_increments_error_count_and_ring_buffer(
     # registry.py imports process_event into its own namespace, so patch it there.
     monkeypatch.setattr(registry_module, "process_event", _boom)
 
-    await SessionRegistry()._process_one(
-        worker, "session:end", {"session_id": "s1"}, handlers=None
-    )
+    # Phase B2 (Task 7): _process_one now RE-RAISES after recording the failure
+    # to its existing surfaces, so the drainer can dead-letter the line instead
+    # of committing the offset past a never-persisted event. The recording in
+    # the except/finally still happens; the raise just propagates afterwards.
+    with pytest.raises(RuntimeError, match="DeadlockDetected"):
+        await SessionRegistry()._process_one(
+            worker, "session:end", {"session_id": "s1"}, handlers=None
+        )
 
     # Existing failure surface #1: the worker's error counter.
     assert worker.error_count == 1

@@ -116,6 +116,7 @@ class SessionRegistry:
             result = "error"
             error = str(exc)
             worker.error_count += 1
+            raise  # Phase B2: propagate so the drainer dead-letters this line
         finally:
             ring_buffer.add(
                 EventRecord(

@@ -1191,3 +1191,55 @@ class TestGlobalWriteSemaphoreRealPath:
         assert 1 <= peak <= 2
         # No flush left in flight after all drainers stopped.
         assert in_flight == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 7 (Phase B2, USER DECISION option a): a handler error inside
+# process_event must PROPAGATE so the drainer dead-letters that line instead of
+# committing the offset past a never-persisted event (no silent loss, no
+# "fourth state"). Reuses the same poison-isolation path as a flush failure.
+# ---------------------------------------------------------------------------
+
+
+class TestHandlerErrorClose:
+    async def test_handler_error_is_dead_lettered_not_silently_committed(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """When process_event (a handler step) raises for a line, that line is
+        dead-lettered after the retry budget is spent — NOT silently committed
+        past. The offset still advances (the batch is accounted for), but the
+        offending event lands in the dead-letter log with its payload intact.
+        """
+        reg, qm = reg_qm
+        sid = "handler-err"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        # Flush is mocked so the barrier never touches Neo4j; the failure here
+        # comes from the HANDLER (process_event), not the flush.
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("handler boom"),
+        ):
+            await qm.append(sid, _line("tool:pre", "/ws", {"session_id": sid}))
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            for _ in range(400):
+                await asyncio.sleep(0.01)
+                if (await qm.read_batch(sid, 10)).lines == []:
+                    break
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # The poison line is dead-lettered (not silently dropped/committed past).
+        dead = await qm.read_dead_letters(sid)
+        assert len(dead) == 1
+        assert json.loads(dead[0]["payload"])["event"] == "tool:pre"
+        # Offset advanced past the dead-lettered line — the batch is accounted for.
+        assert (await qm.read_batch(sid, 10)).lines == []

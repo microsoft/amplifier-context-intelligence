@@ -20,6 +20,8 @@ import types
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from context_intelligence_server.dashboard import build_status_response
 from context_intelligence_server.pipeline import process_event, setup_handlers
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
@@ -386,39 +388,45 @@ class TestWorkspaceSetCorrectly:
 
 
 class TestHandlerErrorIsolation:
-    """Malformed events must not crash the pipeline.
+    """Malformed events must PROPAGATE out of process_event.
 
-    process_event wraps all handler logic in a broad try/except; even
-    exceptions caused by bad data (e.g. an empty timestamp that fails
-    datetime.fromisoformat) must be swallowed.
+    Phase B2 (USER DECISION option a): process_event no longer swallows handler
+    errors. An exception caused by bad data (e.g. an empty timestamp that fails
+    datetime.fromisoformat) propagates so the drainer can dead-letter that line
+    instead of committing the offset past a never-persisted event. Per-event
+    isolation (continue after a bad line) is now a DRAINER responsibility,
+    covered by tests/test_registry.py::TestHandlerErrorClose; at the
+    process_event level a fresh good event still succeeds (it is stateless).
     """
 
-    async def test_bad_timestamp_does_not_crash_pipeline(self) -> None:
-        """An empty timestamp string causes make_node_id to raise, but
-        process_event must catch the exception and not propagate it."""
+    async def test_bad_timestamp_propagates(self) -> None:
+        """An empty timestamp string causes make_node_id to raise inside a
+        handler; process_event must PROPAGATE (not swallow) the exception."""
         worker, services = _make_worker_and_services()
         handlers = setup_handlers(services)
 
         # prompt:submit with empty timestamp will crash make_node_id inside
         # OrchestratorRunHandler (after ensure_session_node creates the session).
-        # process_event must catch and swallow the exception.
+        # process_event must re-raise so the drainer can dead-letter the line.
         data: dict[str, str] = {"session_id": SESSION_ID, "timestamp": ""}
 
-        # Must NOT raise
-        await process_event(worker, "prompt:submit", data, handlers)
+        with pytest.raises(Exception):  # noqa: B017 - any handler error must propagate
+            await process_event(worker, "prompt:submit", data, handlers)
 
-    async def test_pipeline_continues_processing_after_bad_event(self) -> None:
-        """After a bad event, subsequent well-formed events must still be processed."""
+    async def test_good_event_succeeds_after_bad_event(self) -> None:
+        """A bad event propagates, but a subsequent well-formed event still
+        processes successfully (process_event is stateless per call)."""
         worker, services = _make_worker_and_services()
         handlers = setup_handlers(services)
 
-        # Bad event — must not raise
-        await process_event(
-            worker,
-            "prompt:submit",
-            {"session_id": SESSION_ID, "timestamp": ""},
-            handlers,
-        )
+        # Bad event — propagates
+        with pytest.raises(Exception):  # noqa: B017 - any handler error must propagate
+            await process_event(
+                worker,
+                "prompt:submit",
+                {"session_id": SESSION_ID, "timestamp": ""},
+                handlers,
+            )
 
         # Good event immediately after — must succeed and mutate graph
         await process_event(
