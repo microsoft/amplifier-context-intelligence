@@ -335,13 +335,24 @@ def _make_flush_mocks():
     """Return (mock_tx, mock_session) configured for flush testing.
 
     ``mock_session.__aenter__`` is explicitly configured to return ``mock_session``
-    so that ``async with driver.session(...) as session:`` yields the same object
-    whose attributes (``begin_transaction``, ``run``) we can assert on.
+    so that ``async with driver.session(...) as session:`` yields the same object.
+
+    The store now persists batches through the driver-managed transaction API
+    (``await db_session.execute_write(_write_batch, *args)``), so ``execute_write``
+    is wired to drive the supplied write function against ``mock_tx`` exactly as
+    the real driver drives it against a managed transaction:
+    ``await fn(mock_tx, *args, **kwargs)``.  This keeps the ``mock_tx.run(...)``
+    calls captured for assertions and preserves failure injection (set a
+    ``side_effect`` on ``mock_tx.run`` and it propagates out of ``flush()``).
     """
     mock_tx = AsyncMock()
+
+    async def _execute_write(fn, *args, **kwargs):
+        return await fn(mock_tx, *args, **kwargs)
+
     mock_session = AsyncMock()
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.begin_transaction = AsyncMock(return_value=mock_tx)
+    mock_session.execute_write = AsyncMock(side_effect=_execute_write)
     return mock_tx, mock_session
 
 
@@ -1247,10 +1258,16 @@ class TestNeo4jGraphStoreFlushNoLabelMerge:
         mock_tx = AsyncMock()
         mock_tx.run = AsyncMock(side_effect=capture)
         mock_tx.commit = AsyncMock()
+
+        async def _execute_write(fn, *args, **kwargs):
+            # Drive the managed-transaction write function against mock_tx,
+            # mirroring the real driver's execute_write(fn, *args) contract.
+            return await fn(mock_tx, *args, **kwargs)
+
         mock_db_session = AsyncMock()
         mock_db_session.__aenter__ = AsyncMock(return_value=mock_db_session)
         mock_db_session.__aexit__ = AsyncMock(return_value=False)
-        mock_db_session.begin_transaction = AsyncMock(return_value=mock_tx)
+        mock_db_session.execute_write = AsyncMock(side_effect=_execute_write)
         store._driver.session = MagicMock(return_value=mock_db_session)
 
         from unittest.mock import patch as mock_patch
@@ -1375,8 +1392,12 @@ async def test_flush_lock_serializes_concurrent_calls() -> None:
             async def __aexit__(self, *args: object) -> None:
                 pass
 
-            async def begin_transaction(self) -> object:
-                return self._tx
+            async def execute_write(
+                self, fn, *args: object, **kwargs: object
+            ) -> object:
+                # Driver-managed transaction: drive the write function against the
+                # captured tx exactly as the real driver does (await fn(tx, *args)).
+                return await fn(self._tx, *args, **kwargs)
 
         return ControlledSession()
 
