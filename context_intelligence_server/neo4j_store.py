@@ -221,6 +221,24 @@ async def ensure_neo4j_schema(
                 exc,
             )
 
+        # ------------------------------------------------------------------
+        # Step 4: uniqueness constraint on Event nodes.
+        # Mirrors the Session constraint above so that idempotent
+        # MERGE (n:Event ...) in flush() is atomic under concurrency and
+        # cannot create duplicate Event nodes when multiple writers race.
+        # ------------------------------------------------------------------
+        try:
+            await session.run(
+                "CREATE CONSTRAINT event_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Event) REQUIRE (n.node_id, n.workspace) IS UNIQUE"
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning(
+                "ensure_neo4j_schema: could not create Event uniqueness constraint "
+                "(pre-existing duplicates?): %s",
+                exc,
+            )
+
 
 class Neo4jGraphStore:
     """Neo4j-backed implementation of the GraphStore and QueryableStore protocols.

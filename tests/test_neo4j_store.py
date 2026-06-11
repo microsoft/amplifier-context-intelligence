@@ -1291,8 +1291,8 @@ class TestNeo4jGraphStoreFlushNoLabelMerge:
 
         assert constraint_queries, "Must have at least one constraint creation query"
         for q in constraint_queries:
-            assert "(n:Session)" in q or "(n:Session " in q, (
-                f"Constraint must use (n:Session) label syntax, not label-free (n). Got: {q}"
+            assert "FOR (n:" in q, (
+                f"Constraint must use label-based FOR (n:Label) syntax, not label-free (n). Got: {q}"
             )
             assert "IS UNIQUE" in q, f"Must use IS UNIQUE syntax. Got: {q}"
 
