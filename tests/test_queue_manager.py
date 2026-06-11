@@ -78,3 +78,34 @@ async def test_read_batch_empty_for_unknown_session(qm):
     assert batch.lines == []
     assert batch.start_offset == 0
     assert batch.end_offset == 0
+
+
+async def test_commit_advances_offset(qm):
+    await qm.append("s1", b"a")
+    await qm.append("s1", b"b")
+    first = await qm.read_batch("s1", max_items=1)
+    await qm.commit("s1", first.end_offset)
+    await qm.append("s1", b"c")
+    second = await qm.read_batch("s1", max_items=10)
+    assert second.lines == [b"b", b"c"]
+    assert second.start_offset == first.end_offset
+
+
+async def test_commit_persists_across_a_new_instance(tmp_path):
+    qdir = tmp_path / "queues"
+    qm1 = QueueManager(queues_dir=qdir)
+    await qm1.append("s1", b"a")
+    await qm1.append("s1", b"b")
+    batch = await qm1.read_batch("s1", max_items=1)
+    await qm1.commit("s1", batch.end_offset)
+    qm2 = QueueManager(queues_dir=qdir)  # simulate restart
+    resumed = await qm2.read_batch("s1", max_items=10)
+    assert resumed.lines == [b"b"]
+
+
+async def test_commit_is_atomic_no_temp_leftover(qm, tmp_path):
+    await qm.append("s1", b"a")
+    await qm.commit("s1", 2)
+    qdir = tmp_path / "queues"
+    assert (qdir / "s1.offset").read_text("utf-8") == "2"
+    assert list(qdir.glob("*.tmp")) == []

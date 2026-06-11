@@ -25,6 +25,7 @@ session_id contract:
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -113,3 +114,21 @@ class QueueManager:
             return Batch(session_id, lines, start, start + pos)
 
         return await asyncio.to_thread(_read)
+
+    async def commit(self, session_id: str, new_offset: int) -> None:
+        """Atomically and durably persist ``new_offset`` (the ack).
+
+        Writes the offset to a temp file and uses ``os.replace`` for an atomic
+        rename, so a reader never observes a torn or partial offset file. No
+        ``fsync`` is issued here: this gives process-crash durability, while
+        power-loss durability is deferred to Phase B3 (fsync group-commit).
+        """
+        self._validate_session_id(session_id)
+        final = self._offset_path(session_id)
+        tmp = self._dir / f"{session_id}.offset.tmp"
+
+        def _commit() -> None:
+            tmp.write_text(str(new_offset), encoding="utf-8")
+            os.replace(tmp, final)
+
+        await asyncio.to_thread(_commit)
