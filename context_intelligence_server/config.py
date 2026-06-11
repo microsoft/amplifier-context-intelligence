@@ -119,6 +119,14 @@ class Settings(BaseSettings):
     # Storage paths
     # -------------------------------------------------------------------------
     blob_path: str = "/data/blobs"
+    queues_path: str = "/data/queues"
+
+    # -------------------------------------------------------------------------
+    # Durable ingest queue
+    # -------------------------------------------------------------------------
+    # Conservative working defaults pending tuning (design Open Question 4).
+    write_concurrency: int = 8  # global cap on concurrent Neo4j-write flushes
+    max_delivery_attempts: int = 5  # flush retries for one batch before dead-letter
 
     # -------------------------------------------------------------------------
     # Logging

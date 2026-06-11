@@ -61,6 +61,16 @@ def test_session_timeout_defaults():
     assert s.stale_session_timeout == 432000.0
 
 
+def test_settings_has_durable_queue_defaults():
+    """Settings should expose conservative durable-queue defaults."""
+    from context_intelligence_server.config import Settings
+
+    s = Settings()
+    assert s.queues_path == "/data/queues"
+    assert s.write_concurrency == 8
+    assert s.max_delivery_attempts == 5
+
+
 # ---------------------------------------------------------------------------
 # YAML config file tests
 # ---------------------------------------------------------------------------

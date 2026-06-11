@@ -92,10 +92,13 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
 
     class _SettingsProxy:
         blob_path: str = _real.blob_path
+        queues_path: str = str(tmp_path / "queues")
         neo4j_url: str = _real.neo4j_url
         neo4j_user: str = _real.neo4j_user
         neo4j_password: str = _real.neo4j_password
         stale_session_timeout: float = _real.stale_session_timeout
+        write_concurrency: int = _real.write_concurrency
+        max_delivery_attempts: int = _real.max_delivery_attempts
 
     with patch(
         "context_intelligence_server.registry.get_settings",
