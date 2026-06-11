@@ -132,3 +132,22 @@ class QueueManager:
             os.replace(tmp, final)
 
         await asyncio.to_thread(_commit)
+
+    async def active_sessions(self) -> list[str]:
+        """Return sorted session_ids with undrained data.
+
+        A session is "active" when its committed offset is strictly less than
+        the byte length of its ``.log`` file (i.e. there are appended bytes
+        that have not yet been committed). Fully-committed sessions are
+        excluded. The result is sorted by session_id.
+        """
+
+        def _scan() -> list[str]:
+            result: list[str] = []
+            for log in sorted(self._dir.glob("*.log")):
+                session_id = log.stem
+                if self._read_committed_offset(session_id) < log.stat().st_size:
+                    result.append(session_id)
+            return result
+
+        return await asyncio.to_thread(_scan)

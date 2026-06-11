@@ -109,3 +109,12 @@ async def test_commit_is_atomic_no_temp_leftover(qm, tmp_path):
     qdir = tmp_path / "queues"
     assert (qdir / "s1.offset").read_text("utf-8") == "2"
     assert list(qdir.glob("*.tmp")) == []
+
+
+async def test_active_sessions_excludes_fully_committed(qm):
+    await qm.append("s_active", b"x")  # appended, never committed -> undrained
+    await qm.append("s_done", b"y")
+    done = await qm.read_batch("s_done", max_items=10)
+    await qm.commit("s_done", done.end_offset)  # drained
+    active = await qm.active_sessions()
+    assert active == ["s_active"]
