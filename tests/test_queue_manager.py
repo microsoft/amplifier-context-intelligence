@@ -118,3 +118,15 @@ async def test_active_sessions_excludes_fully_committed(qm):
     await qm.commit("s_done", done.end_offset)  # drained
     active = await qm.active_sessions()
     assert active == ["s_active"]
+
+
+async def test_recover_empty_dir_is_safe(qm):
+    assert await qm.recover() == []
+
+
+async def test_recover_reports_session_with_uncommitted_complete_line(qm, tmp_path):
+    log = tmp_path / "queues" / "s1.log"
+    log.write_bytes(b"a\nb\nTORN")  # two complete lines + torn tail
+    assert await qm.recover() == ["s1"]
+    await qm.commit("s1", 4)  # past 'a\nb\n' == 4 bytes
+    assert await qm.recover() == []  # only torn tail remains -> not recoverable

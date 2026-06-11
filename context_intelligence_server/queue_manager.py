@@ -70,6 +70,20 @@ class QueueManager:
         text = text.strip()
         return int(text) if text else 0
 
+    def _complete_data_end(self, session_id: str) -> int:
+        """Byte position after the last complete (newline-terminated) line.
+
+        A torn trailing line (bytes after the final newline) is ignored: the
+        returned offset is one past the last ``\\n``, or 0 when the log is
+        missing or contains no complete line.
+        """
+        try:
+            data = self._log_path(session_id).read_bytes()
+        except FileNotFoundError:
+            return 0
+        last_nl = data.rfind(b"\n")
+        return last_nl + 1 if last_nl != -1 else 0
+
     @staticmethod
     def _validate_session_id(session_id: str) -> None:
         if (
@@ -147,6 +161,31 @@ class QueueManager:
             for log in sorted(self._dir.glob("*.log")):
                 session_id = log.stem
                 if self._read_committed_offset(session_id) < log.stat().st_size:
+                    result.append(session_id)
+            return result
+
+        return await asyncio.to_thread(_scan)
+
+    async def recover(self) -> list[str]:
+        """Return sorted session_ids that have a complete unprocessed line.
+
+        A session is recoverable when its committed offset is strictly less
+        than the end of its complete (newline-terminated) data, i.e. at least
+        one whole line remains to be processed. A torn trailing line (bytes
+        after the final newline) is ignored, so a session whose only remaining
+        data is a partial line is NOT reported.
+
+        This method is idempotent, safe on an empty directory, and performs no
+        drainer logic; respawning drainers for the reported sessions is Phase
+        B2.
+        """
+
+        def _scan() -> list[str]:
+            result: list[str] = []
+            for log in sorted(self._dir.glob("*.log")):
+                session_id = log.stem
+                committed = self._read_committed_offset(session_id)
+                if committed < self._complete_data_end(session_id):
                     result.append(session_id)
             return result
 
