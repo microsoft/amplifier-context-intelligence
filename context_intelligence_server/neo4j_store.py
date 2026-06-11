@@ -264,7 +264,13 @@ class Neo4jGraphStore:
             workspace: Workspace to scope writes to.  ``None`` resolves to
                        ``"default"`` via the ``workspace`` property.
         """
-        self._driver = AsyncGraphDatabase.driver(uri, auth=auth)
+        # Explicit auto-retry budget for transient errors (e.g. deadlocks) so the
+        # managed-transaction retry window is deliberate and reviewable rather than
+        # relying on the driver default implicitly. 30.0s is a working default;
+        # design Open Question #3 — verify driver 6.1.0 backoff constants before tuning.
+        self._driver = AsyncGraphDatabase.driver(
+            uri, auth=auth, max_transaction_retry_time=30.0
+        )
         self._database = database
         self._workspace = workspace
         self._node_buffer: dict[str, dict[str, Any]] = {}
