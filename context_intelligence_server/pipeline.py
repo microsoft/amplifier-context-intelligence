@@ -163,10 +163,8 @@ async def process_event(
     propagate** — the drain loop must continue regardless of per-event
     failures.
     """
-    session_id: str | None = None
+    session_id: str | None = data.get("session_id") if isinstance(data, dict) else None
     try:
-        session_id = data.get("session_id") if isinstance(data, dict) else None
-
         # Step 2 — ensure Session node exists for known sessions
         if session_id:
             await worker.services.ensure_session_node(session_id, data)
@@ -199,15 +197,11 @@ async def process_event(
         if session_id and timestamp:
             await worker.services.touch_session(session_id, timestamp)
 
-        # Step 7 — flush strategy: background flush after every event so buffered
-        # writes reach Neo4j without waiting for session:end.  Terminal events
-        # flush synchronously so all writes are durable before the session closes.
-        if event in TERMINAL_EVENTS:
-            await worker.services.graph.flush()
-        else:
-            worker.services.graph.schedule_flush()
-
     except Exception:
+        # Benign per-event handler errors (steps 2-6) are logged with
+        # structured context but swallowed so the drain loop survives.
+        # We short-circuit here (return) so the step-7 flush is skipped for a
+        # batch that errored, matching the prior skip-flush-on-error behavior.
         logger.exception(
             "pipeline: unhandled error processing event",
             extra={
@@ -215,3 +209,14 @@ async def process_event(
                 "session_id": session_id,
             },
         )
+        return
+
+    # Step 7 — flush strategy lives OUTSIDE the try/except so a Neo4j write
+    # failure propagates to registry._process_one instead of being swallowed.
+    # Background flush after every event so buffered writes reach Neo4j without
+    # waiting for session:end.  Terminal events flush synchronously so all
+    # writes are durable before the session closes.
+    if event in TERMINAL_EVENTS:
+        await worker.services.graph.flush()
+    else:
+        worker.services.graph.schedule_flush()

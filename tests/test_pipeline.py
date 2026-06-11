@@ -442,11 +442,17 @@ async def test_process_event_handler_exception_does_not_propagate(
     await process_event(mock_worker, "some:event", {"session_id": "sess-123"}, handlers)
 
 
-async def test_process_event_flush_exception_does_not_propagate(
+async def test_process_event_flush_exception_propagates(
     mock_worker: MagicMock,
     pipeline_handlers: Any,
 ) -> None:
-    """Even if graph.flush raises, process_event must not propagate the error."""
+    """A flush (step 7) failure MUST propagate so dropped batches are not silent.
+
+    Phase A correctness fix: the step-7 flush lives outside the broad try/except,
+    so a Neo4j write failure reaches registry._process_one instead of being
+    logged as 'unhandled' and swallowed. (Benign per-event handler errors in
+    steps 2-6 are still swallowed — see test_process_event_handler_exception_does_not_propagate.)
+    """
     from context_intelligence_server.pipeline import process_event
 
     mock_worker.services.graph.flush = AsyncMock(
@@ -454,8 +460,8 @@ async def test_process_event_flush_exception_does_not_propagate(
     )
     data = {"session_id": "sess-123"}
 
-    # Must NOT raise
-    await process_event(mock_worker, "session:end", data, pipeline_handlers)
+    with pytest.raises(RuntimeError):
+        await process_event(mock_worker, "session:end", data, pipeline_handlers)
 
 
 async def test_process_event_ensure_session_exception_does_not_propagate(
