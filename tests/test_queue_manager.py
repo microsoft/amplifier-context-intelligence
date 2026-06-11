@@ -43,3 +43,14 @@ async def test_append_does_not_double_newline(qm, tmp_path):
 async def test_append_rejects_unsafe_session_id(qm, bad_id):
     with pytest.raises(ValueError):
         await qm.append(bad_id, b"x")
+
+
+async def test_read_batch_returns_lines_fifo(qm):
+    await qm.append("s1", b"one")
+    await qm.append("s1", b"two")
+    await qm.append("s1", b"three")
+    batch = await qm.read_batch("s1", max_items=10)
+    assert batch.session_id == "s1"
+    assert batch.lines == [b"one", b"two", b"three"]
+    assert batch.start_offset == 0
+    assert batch.end_offset == len(b"one\ntwo\nthree\n")

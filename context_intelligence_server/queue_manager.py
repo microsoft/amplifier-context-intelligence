@@ -58,6 +58,17 @@ class QueueManager:
     def _log_path(self, session_id: str) -> Path:
         return self._dir / f"{session_id}.log"
 
+    def _offset_path(self, session_id: str) -> Path:
+        return self._dir / f"{session_id}.offset"
+
+    def _read_committed_offset(self, session_id: str) -> int:
+        try:
+            text = self._offset_path(session_id).read_text("utf-8")
+        except FileNotFoundError:
+            return 0
+        text = text.strip()
+        return int(text) if text else 0
+
     @staticmethod
     def _validate_session_id(session_id: str) -> None:
         if (
@@ -78,3 +89,24 @@ class QueueManager:
                 f.write(line)
 
         await asyncio.to_thread(_append)
+
+    async def read_batch(self, session_id: str, max_items: int) -> Batch:
+        self._validate_session_id(session_id)
+        path = self._log_path(session_id)
+
+        def _read() -> Batch:
+            start = self._read_committed_offset(session_id)
+            with open(path, "rb") as f:
+                f.seek(start)
+                data = f.read()
+            lines: list[bytes] = []
+            pos = 0
+            while len(lines) < max_items:
+                nl = data.find(b"\n", pos)
+                if nl == -1:
+                    break
+                lines.append(data[pos:nl])
+                pos = nl + 1
+            return Batch(session_id, lines, start, start + pos)
+
+        return await asyncio.to_thread(_read)
