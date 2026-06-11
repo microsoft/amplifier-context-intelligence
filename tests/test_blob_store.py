@@ -304,3 +304,47 @@ async def test_dump_uses_asyncio_to_thread_for_copy2(
 def test_blob_store_protocol_conformance(store: AsyncDiskBlobStore) -> None:
     """AsyncDiskBlobStore conforms to the BlobStore protocol."""
     assert isinstance(store, BlobStore)
+
+
+# ---------------------------------------------------------------------------
+# Atomic / durable write
+# ---------------------------------------------------------------------------
+
+
+async def test_write_is_atomic_no_torn_file_on_failure(
+    store: AsyncDiskBlobStore, tmp_path: Path
+) -> None:
+    """A failure during os.replace leaves no torn final file and no temp siblings."""
+    session_id = "sess-atomic"
+    key = "k1"
+
+    with patch(
+        "context_intelligence_server.blob_store.os.replace",
+        side_effect=OSError("simulated replace failure"),
+    ):
+        with pytest.raises(OSError):
+            await store.write(session_id, key, {"v": 1})
+
+    final_path = store.blob_path(session_id, key)
+    # No torn file observable at the final path.
+    assert not final_path.exists()
+    # No leftover *.tmp siblings in the blobs dir.
+    blobs_dir = final_path.parent
+    if blobs_dir.exists():
+        assert list(blobs_dir.glob("*.tmp")) == []
+
+
+async def test_write_replaces_atomically_on_success(
+    store: AsyncDiskBlobStore,
+) -> None:
+    """On success the final file has the exact JSON, no temp remains, URI is correct."""
+    session_id = "sess-atomic"
+    key = "k2"
+
+    uri = await store.write(session_id, key, {"v": 1})
+
+    assert uri == "ci-blob://sess-atomic/k2"
+    final_path = store.blob_path(session_id, key)
+    assert final_path.read_text(encoding="utf-8") == '{"v": 1}'
+    # No leftover temp files.
+    assert list(final_path.parent.glob("*.tmp")) == []
