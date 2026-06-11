@@ -240,6 +240,149 @@ async def ensure_neo4j_schema(
             )
 
 
+async def _write_batch(
+    tx: Any,
+    node_snapshot: dict[str, dict[str, Any]],
+    edge_snapshot: dict[tuple[str, str], dict[str, Any]],
+    patch_snapshot: list[dict[str, Any]],
+    workspace: str,
+) -> None:
+    """Execute one buffered batch of node, label, and edge writes on ``tx``.
+
+    Operates on the supplied managed-transaction object ``tx``; it never opens
+    or commits a transaction itself, so the same coroutine can run inside either
+    a raw ``begin_transaction()`` block or a driver-managed ``execute_write``.
+
+    Idempotency rule #1: the batch is captured by the caller *before* this
+    coroutine is invoked (the snapshots are passed as parameters and never read
+    from a mutable buffer here), so this is a pure function of its parameters.
+    The driver may therefore safely re-run it on a transient error
+    (``TransientError`` / ``DeadlockDetected``) without corrupting state.
+
+    Every Cypher result is consumed (``await res.consume()``) rather than
+    returned, so this coroutine never leaks a raw ``Result`` object across the
+    transaction boundary.
+    """
+    # ---- nodes ---- (Session nodes use label-aware MERGE + uniqueness constraint)
+    session_rows: list[dict[str, Any]] = []  # have Session label
+    other_rows: list[dict[str, Any]] = []  # everything else
+    label_assignments: list[dict[str, Any]] = []
+
+    for node_id, data in node_snapshot.items():
+        labels: list[str] = data.get("labels", [])
+        node_props = {k: v for k, v in data.items() if k != "labels"}
+        _convert_temporal_props(node_props)  # ISO str -> datetime, in place
+        props = Neo4jGraphStore._sanitize_properties(node_props)
+        props["workspace"] = workspace
+        row: dict[str, Any] = {"node_id": node_id, "props": props}
+
+        if "Session" in labels:
+            session_rows.append(row)
+        else:
+            other_rows.append(row)
+
+        if labels:
+            for label in labels:
+                _validate_identifier(label, "label")
+            label_assignments.append(
+                {"node_id": node_id, "labels": sorted(set(labels))}
+            )
+
+    # Session nodes: MERGE by Session label + uniqueness constraint (atomic under concurrency)
+    if session_rows:
+        res = await tx.run(
+            "UNWIND $rows AS row "
+            "MERGE (n:Session {node_id: row.node_id, workspace: row.props.workspace}) "
+            "SET n += row.props",
+            rows=session_rows,
+        )
+        await res.consume()
+
+    # Non-session nodes: label-free MERGE (no constraint needed — single-worker owned)
+    if other_rows:
+        res = await tx.run(
+            "UNWIND $rows AS row "
+            "MERGE (n {node_id: row.node_id, workspace: row.props.workspace}) "
+            "SET n += row.props",
+            rows=other_rows,
+        )
+        await res.consume()
+
+    # Set all labels for labeled nodes (primary + extra in one SET per node).
+    # For Session nodes, Session label is already set by the MERGE above — this
+    # adds any additional type labels (RootSession, SubSession, ForkedSession, etc.)
+    for item in label_assignments:
+        labels_str = ":".join(item["labels"])
+        res = await tx.run(
+            cast(
+                LiteralString,
+                f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) "
+                f"SET n:{labels_str}",
+            ),
+            node_id=item["node_id"],
+            workspace=workspace,
+        )
+        await res.consume()
+
+    # ---- label patches (must run AFTER node writes — nodes must exist in Neo4j before MATCH) ----
+    for lp in patch_snapshot:
+        pid = lp["node_id"]
+        for label in lp.get("remove", []):
+            _validate_identifier(label, "label")
+            res = await tx.run(
+                cast(
+                    LiteralString,
+                    f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) REMOVE n:{label}",
+                ),
+                node_id=pid,
+                workspace=workspace,
+            )
+            await res.consume()
+        for label in lp.get("add", []):
+            _validate_identifier(label, "label")
+            res = await tx.run(
+                cast(
+                    LiteralString,
+                    f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) SET n:{label}",
+                ),
+                node_id=pid,
+                workspace=workspace,
+            )
+            await res.consume()
+
+    # ---- edges ----
+    edge_groups: dict[str, list[dict[str, Any]]] = {}
+    for (src_id, dst_id), data in edge_snapshot.items():
+        edge_type: str = data.get("type", _DEFAULT_EDGE_TYPE)
+        edge_props = {k: v for k, v in data.items() if k != "type"}
+        _convert_temporal_props(edge_props)  # ISO str -> datetime, in place
+        props = Neo4jGraphStore._sanitize_properties(edge_props)
+        props["workspace"] = workspace
+        # Store src_id/dst_id on the relationship so the
+        # get_edge() fallback query (WHERE r.src_id = $src_id
+        # AND r.dst_id = $dst_id) can locate it after a flush.
+        props["src_id"] = src_id
+        props["dst_id"] = dst_id
+        row = {"src_id": src_id, "dst_id": dst_id, "props": props}
+        edge_groups.setdefault(edge_type, []).append(row)
+
+    for edge_type, rows in edge_groups.items():
+        _validate_identifier(edge_type, "edge_type")
+        edge_merge_query = (  # type: ignore[assignment]
+            f"UNWIND $rows AS row "
+            f"MATCH (src {{node_id: row.src_id, workspace: $workspace}}) "
+            f"MATCH (dst {{node_id: row.dst_id, workspace: $workspace}}) "
+            f"MERGE (src)-[r:{edge_type}]->(dst) "
+            f"SET r += row.props"
+        )
+        res = await tx.run(
+            edge_merge_query,  # type: ignore[arg-type]
+            rows=rows,
+            workspace=workspace,
+        )
+        await res.consume()
+
+
 class Neo4jGraphStore:
     """Neo4j-backed implementation of the GraphStore and QueryableStore protocols.
 
@@ -497,122 +640,13 @@ class Neo4jGraphStore:
             async with self._driver.session(database=self._database) as db_session:
                 tx = await db_session.begin_transaction()
                 try:
-                    # ---- nodes ---- (Session nodes use label-aware MERGE + uniqueness constraint)
-                    session_rows: list[dict[str, Any]] = []  # have Session label
-                    other_rows: list[dict[str, Any]] = []  # everything else
-                    label_assignments: list[dict[str, Any]] = []
-
-                    for node_id, data in node_snapshot.items():
-                        labels: list[str] = data.get("labels", [])
-                        node_props = {k: v for k, v in data.items() if k != "labels"}
-                        _convert_temporal_props(
-                            node_props
-                        )  # ISO str -> datetime, in place
-                        props = self._sanitize_properties(node_props)
-                        props["workspace"] = self.workspace
-                        row: dict[str, Any] = {"node_id": node_id, "props": props}
-
-                        if "Session" in labels:
-                            session_rows.append(row)
-                        else:
-                            other_rows.append(row)
-
-                        if labels:
-                            for label in labels:
-                                _validate_identifier(label, "label")
-                            label_assignments.append(
-                                {"node_id": node_id, "labels": sorted(set(labels))}
-                            )
-
-                    # Session nodes: MERGE by Session label + uniqueness constraint (atomic under concurrency)
-                    if session_rows:
-                        await tx.run(
-                            "UNWIND $rows AS row "
-                            "MERGE (n:Session {node_id: row.node_id, workspace: row.props.workspace}) "
-                            "SET n += row.props",
-                            rows=session_rows,
-                        )
-
-                    # Non-session nodes: label-free MERGE (no constraint needed — single-worker owned)
-                    if other_rows:
-                        await tx.run(
-                            "UNWIND $rows AS row "
-                            "MERGE (n {node_id: row.node_id, workspace: row.props.workspace}) "
-                            "SET n += row.props",
-                            rows=other_rows,
-                        )
-
-                    # Set all labels for labeled nodes (primary + extra in one SET per node).
-                    # For Session nodes, Session label is already set by the MERGE above — this
-                    # adds any additional type labels (RootSession, SubSession, ForkedSession, etc.)
-                    for item in label_assignments:
-                        labels_str = ":".join(item["labels"])
-                        await tx.run(
-                            cast(
-                                LiteralString,
-                                f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) "
-                                f"SET n:{labels_str}",
-                            ),
-                            node_id=item["node_id"],
-                            workspace=self.workspace,
-                        )
-
-                    # ---- label patches (must run AFTER node writes — nodes must exist in Neo4j before MATCH) ----
-                    for lp in patch_snapshot:
-                        pid = lp["node_id"]
-                        for label in lp.get("remove", []):
-                            _validate_identifier(label, "label")
-                            await tx.run(
-                                cast(
-                                    LiteralString,
-                                    f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) REMOVE n:{label}",
-                                ),
-                                node_id=pid,
-                                workspace=self.workspace,
-                            )
-                        for label in lp.get("add", []):
-                            _validate_identifier(label, "label")
-                            await tx.run(
-                                cast(
-                                    LiteralString,
-                                    f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) SET n:{label}",
-                                ),
-                                node_id=pid,
-                                workspace=self.workspace,
-                            )
-
-                    # ---- edges ----
-                    edge_groups: dict[str, list[dict[str, Any]]] = {}
-                    for (src_id, dst_id), data in edge_snapshot.items():
-                        edge_type: str = data.get("type", _DEFAULT_EDGE_TYPE)
-                        edge_props = {k: v for k, v in data.items() if k != "type"}
-                        _convert_temporal_props(
-                            edge_props
-                        )  # ISO str -> datetime, in place
-                        props = self._sanitize_properties(edge_props)
-                        props["workspace"] = self.workspace
-                        # Store src_id/dst_id on the relationship so the
-                        # get_edge() fallback query (WHERE r.src_id = $src_id
-                        # AND r.dst_id = $dst_id) can locate it after a flush.
-                        props["src_id"] = src_id
-                        props["dst_id"] = dst_id
-                        row = {"src_id": src_id, "dst_id": dst_id, "props": props}
-                        edge_groups.setdefault(edge_type, []).append(row)
-
-                    for edge_type, rows in edge_groups.items():
-                        _validate_identifier(edge_type, "edge_type")
-                        edge_merge_query = (  # type: ignore[assignment]
-                            f"UNWIND $rows AS row "
-                            f"MATCH (src {{node_id: row.src_id, workspace: $workspace}}) "
-                            f"MATCH (dst {{node_id: row.dst_id, workspace: $workspace}}) "
-                            f"MERGE (src)-[r:{edge_type}]->(dst) "
-                            f"SET r += row.props"
-                        )
-                        await tx.run(
-                            edge_merge_query,  # type: ignore[arg-type]
-                            rows=rows,
-                            workspace=self.workspace,
-                        )
+                    await _write_batch(
+                        tx,
+                        node_snapshot,
+                        edge_snapshot,
+                        patch_snapshot,
+                        self.workspace,
+                    )
 
                     await tx.commit()
                     success = True
