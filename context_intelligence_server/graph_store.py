@@ -39,6 +39,11 @@ Non-negotiable guarantees for all conforming implementations:
     already in progress, the call is a no-op or deferred.  In-memory
     implementations may treat this as a synchronous no-op since writes are
     immediately visible without I/O.
+14. **Buffer discard semantics** — ``discard_buffer`` drops all buffered writes
+    without persisting them.  It MUST NOT perform I/O and MUST NOT raise.  It is
+    the dead-letter primitive used to isolate a poison write so it does not
+    remain resident and re-enter the next flush.  In-memory implementations with
+    no backing store may treat this as a no-op.
 """
 
 from __future__ import annotations

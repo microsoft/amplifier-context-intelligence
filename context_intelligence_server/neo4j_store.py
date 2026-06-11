@@ -695,6 +695,27 @@ class Neo4jGraphStore:
                 merged_patches = patch_snapshot + self._label_patches
                 self._label_patches = merged_patches
 
+    def discard_buffer(self) -> None:
+        """Drop all buffered writes without persisting them (no driver I/O).
+
+        Clears ``_node_buffer``, ``_edge_buffer`` and ``_label_patches`` in
+        memory.  Unlike ``flush``, this performs no Neo4j transaction and never
+        restores buffers.  It is the dead-letter primitive used to isolate a
+        poison line: a failed write's nodes/edges/label-patches stay resident in
+        the buffers (``_flush_body`` restores them on failure), so without a
+        discard primitive a dead-lettered line would remain resident and the
+        next good line's flush would re-include it — cascading dead-letters of
+        otherwise-good events.
+
+        Safety note (LOW severity): this method is intentionally NOT guarded by
+        ``_flush_lock``.  That is safe ONLY because the drainer is the sole flush
+        trigger (Task 6); if another concurrent flush path is ever reintroduced,
+        this method must take ``_flush_lock`` to avoid racing buffer mutation.
+        """
+        self._node_buffer = {}
+        self._edge_buffer = {}
+        self._label_patches = []
+
     async def _ensure_schema(self) -> None:
         """Create Neo4j indexes and constraints idempotently (runs once per store instance).
 

@@ -1533,3 +1533,30 @@ def test_normalize_temporal_passes_through_python_datetime() -> None:
 def test_normalize_temporal_passes_through_int() -> None:
     """_normalize_temporal returns integers unchanged."""
     assert _normalize_temporal(42) == 42
+
+
+# ---------------------------------------------------------------------------
+# discard_buffer (Phase B2 — COE blocker for line-by-line poison isolation)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_discard_buffer_clears_all_buffers_without_flushing():
+    """discard_buffer clears node/edge/label buffers with no driver I/O."""
+    store = _make_store()
+    await store.upsert_node("n1", {"name": "Alice"})
+    await store.upsert_edge("src", "dst", {"type": "KNOWS"})
+    await store.set_labels("n1", remove_labels=[], add_labels=["Person"])
+
+    # Sanity: buffers populated before discard
+    assert store._node_buffer
+    assert store._edge_buffer
+    assert store._label_patches
+
+    store._driver = AsyncMock()  # type: ignore[assignment]
+    store.discard_buffer()
+
+    assert store._node_buffer == {}
+    assert store._edge_buffer == {}
+    assert store._label_patches == []
+    store._driver.session.assert_not_called()

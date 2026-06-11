@@ -41,6 +41,9 @@ class MinimalGraphStore:
     def schedule_flush(self) -> None:
         pass
 
+    def discard_buffer(self) -> None:
+        pass
+
     async def close(self) -> None:
         pass
 
@@ -97,6 +100,9 @@ class MinimalQueryableStore:
         pass
 
     def schedule_flush(self) -> None:
+        pass
+
+    def discard_buffer(self) -> None:
         pass
 
     async def close(self) -> None:
