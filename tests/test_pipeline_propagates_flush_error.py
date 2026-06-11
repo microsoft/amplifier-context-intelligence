@@ -1,17 +1,18 @@
-"""Tests for the flush-failure propagation contract in process_event.
+"""Tests for per-event error isolation in process_event.
 
-Phase A correctness fix: a Neo4j flush failure (step 7) must propagate to
-registry._process_one so the dropped batch is no longer silently swallowed,
-while benign per-event handler errors (steps 2-6) stay swallowed so the drain
-loop survives.
+Task 6 update: process_event no longer flushes (the drainer's gated
+``_flush_barrier`` is the sole Neo4j-write trigger). The old
+"flush failure propagates out of process_event" contract therefore no longer
+exists here — flush-failure handling is now a drainer contract, covered by
+tests/test_registry.py::TestDurableDrainLoop::test_offset_not_committed_when_flush_fails.
+What remains true here: benign per-event handler errors (steps 2-6) stay
+swallowed so the drain loop survives, and process_event never schedules a flush.
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
-
-import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -73,19 +74,16 @@ def _handlers(default: Any = None) -> Any:
 # ---------------------------------------------------------------------------
 
 
-async def test_flush_error_propagates_on_terminal_event() -> None:
-    """A flush failure on session:end must propagate (not be swallowed)."""
-    from context_intelligence_server.pipeline import process_event
-
-    worker = _make_worker(RuntimeError("DeadlockDetected: retries exhausted"))
-    data = {"session_id": "s1", "timestamp": "2026-06-11T12:00:00+00:00"}
-
-    with pytest.raises(RuntimeError):
-        await process_event(worker, "session:end", data, _handlers())  # type: ignore[arg-type]
+# NOTE (Task 6): test_flush_error_propagates_on_terminal_event was removed.
+# process_event no longer flushes — the drainer's gated _flush_barrier is the
+# sole Neo4j-write trigger. Flush-failure propagation is now a drainer contract
+# covered by tests/test_registry.py::TestDurableDrainLoop
+# ::test_offset_not_committed_when_flush_fails.
 
 
 async def test_benign_handler_error_is_swallowed_on_non_terminal_event() -> None:
-    """A benign per-event handler error must NOT propagate and must skip flush."""
+    """A benign per-event handler error must NOT propagate, and process_event
+    must never schedule a flush (Task 6: process_event does not self-flush)."""
     from context_intelligence_server.pipeline import process_event
 
     worker = _make_worker()  # no flush_exc
@@ -95,5 +93,5 @@ async def test_benign_handler_error_is_swallowed_on_non_terminal_event() -> None
     # Must NOT raise
     await process_event(worker, "user:prompt", data, handlers)  # type: ignore[arg-type]
 
-    # Steps 1-6 errored, so step 7 flush was skipped.
+    # process_event never schedules a flush (the drainer owns the barrier).
     assert worker.services.graph.scheduled is False

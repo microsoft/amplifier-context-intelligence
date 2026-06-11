@@ -370,56 +370,40 @@ async def test_process_event_missing_session_id_skips_ensure_but_dispatches(
 
 
 # ===========================================================================
-# process_event — terminal flush
+# process_event — no self-flush (Task 6: drainer owns the flush barrier)
 # ===========================================================================
 
 
-async def test_process_event_session_end_triggers_flush(
+async def test_process_event_terminal_does_not_self_flush(
     mock_worker: MagicMock,
     pipeline_handlers: Any,
 ) -> None:
-    """session:end is a terminal event and must trigger graph.flush."""
+    """Task 6: process_event no longer self-flushes. Even for the terminal
+    ``session:end`` event it must NOT call ``graph.flush`` or
+    ``graph.schedule_flush`` — the drainer's gated ``_flush_barrier`` is now
+    the SOLE Neo4j-write trigger (commit-after-flush per batch)."""
     from context_intelligence_server.pipeline import process_event
 
     data = {"session_id": "sess-123"}
     await process_event(mock_worker, "session:end", data, pipeline_handlers)
-    mock_worker.services.graph.flush.assert_called()
+    mock_worker.services.graph.flush.assert_not_called()
+    mock_worker.services.graph.schedule_flush.assert_not_called()
 
 
-async def test_process_event_non_terminal_does_not_flush(
+async def test_process_event_non_terminal_does_not_self_flush(
     mock_worker: MagicMock,
     pipeline_handlers: Any,
 ) -> None:
-    """Non-terminal events must NOT call graph.flush."""
+    """Task 6: non-terminal events must NOT call ``graph.flush`` or
+    ``graph.schedule_flush``. The previously un-gated background
+    ``schedule_flush()`` per event is removed so the shared write semaphore
+    (acquired only inside the drainer's ``_flush_barrier``) actually bounds
+    concurrent writes."""
     from context_intelligence_server.pipeline import process_event
 
     data = {"session_id": "sess-123"}
     await process_event(mock_worker, "session:start", data, pipeline_handlers)
     mock_worker.services.graph.flush.assert_not_called()
-
-
-async def test_process_event_non_terminal_calls_schedule_flush(
-    mock_worker: MagicMock,
-    pipeline_handlers: Any,
-) -> None:
-    """Non-terminal events must call graph.schedule_flush() exactly once."""
-    from context_intelligence_server.pipeline import process_event
-
-    data = {"session_id": "sess-123"}
-    await process_event(mock_worker, "session:start", data, pipeline_handlers)
-    mock_worker.services.graph.schedule_flush.assert_called_once()
-
-
-async def test_process_event_terminal_calls_flush_not_schedule_flush(
-    mock_worker: MagicMock,
-    pipeline_handlers: Any,
-) -> None:
-    """session:end must call graph.flush() and must NOT call graph.schedule_flush()."""
-    from context_intelligence_server.pipeline import process_event
-
-    data = {"session_id": "sess-123"}
-    await process_event(mock_worker, "session:end", data, pipeline_handlers)
-    mock_worker.services.graph.flush.assert_called()
     mock_worker.services.graph.schedule_flush.assert_not_called()
 
 
@@ -442,26 +426,12 @@ async def test_process_event_handler_exception_does_not_propagate(
     await process_event(mock_worker, "some:event", {"session_id": "sess-123"}, handlers)
 
 
-async def test_process_event_flush_exception_propagates(
-    mock_worker: MagicMock,
-    pipeline_handlers: Any,
-) -> None:
-    """A flush (step 7) failure MUST propagate so dropped batches are not silent.
-
-    Phase A correctness fix: the step-7 flush lives outside the broad try/except,
-    so a Neo4j write failure reaches registry._process_one instead of being
-    logged as 'unhandled' and swallowed. (Benign per-event handler errors in
-    steps 2-6 are still swallowed — see test_process_event_handler_exception_does_not_propagate.)
-    """
-    from context_intelligence_server.pipeline import process_event
-
-    mock_worker.services.graph.flush = AsyncMock(
-        side_effect=RuntimeError("flush exploded")
-    )
-    data = {"session_id": "sess-123"}
-
-    with pytest.raises(RuntimeError):
-        await process_event(mock_worker, "session:end", data, pipeline_handlers)
+# NOTE (Task 6): test_process_event_flush_exception_propagates was removed.
+# process_event no longer flushes at all — the drainer's gated _flush_barrier is
+# the sole write trigger, so flush-failure-propagation is now a drainer contract
+# covered by tests/test_registry.py::TestDurableDrainLoop
+# ::test_offset_not_committed_when_flush_fails (offset NOT committed on flush
+# failure). There is no longer a step-7 flush inside process_event to assert on.
 
 
 async def test_process_event_ensure_session_exception_does_not_propagate(

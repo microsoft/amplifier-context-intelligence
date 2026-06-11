@@ -1078,3 +1078,116 @@ class TestDurableLinearPoisonIsolation:
         # discard_buffer was exercised on the give-up path(s).
         assert fake.discards >= 1
         assert (await qm.read_batch(sid, 10)).lines == []  # offset advanced past all 3
+
+
+# ---------------------------------------------------------------------------
+# Task 6: drainer is the SOLE flush trigger -> the global write semaphore
+# actually bounds concurrent Neo4j writes (real process_event, real barrier)
+# ---------------------------------------------------------------------------
+
+
+class TestGlobalWriteSemaphoreRealPath:
+    """The shared write semaphore must cap concurrent Neo4j flushes when the
+    REAL drain path is exercised end to end.
+
+    Before Task 6, process_event self-flushed every non-terminal event via the
+    UN-gated background ``schedule_flush()`` (pipeline.py:222), so the
+    semaphore-gated ``_flush_barrier`` was a near no-op under multi-session
+    replay. Now process_event no longer self-flushes; the drainer's gated
+    ``_flush_barrier`` is the ONLY write trigger, so the semaphore truly bounds
+    concurrency. This test drives the REAL process_event (NOT mocked) and the
+    REAL ``_flush_barrier``, stubbing only the store's ``flush`` as a slow
+    counter, and proves both that flushes execute AND that they are capped.
+    """
+
+    async def test_concurrent_flushes_capped_driving_real_process_event(
+        self, tmp_path: Path
+    ) -> None:
+        import context_intelligence_server.config as cfg
+        import context_intelligence_server.registry as reg_mod
+
+        class _S:
+            blob_path = str(tmp_path / "blobs")
+            queues_path = str(tmp_path / "queues")
+            neo4j_url = "bolt://unused:7687"
+            neo4j_user = "neo4j"
+            neo4j_password = "unused"  # noqa: S105 - test stub, not a real secret
+            stale_session_timeout = 3600.0
+            write_concurrency = 2
+            max_delivery_attempts = 3
+
+        in_flight = 0
+        peak = 0
+        flush_count = 0
+        guard = asyncio.Lock()
+
+        async def _slow_flush() -> None:
+            nonlocal in_flight, peak, flush_count
+            async with guard:
+                in_flight += 1
+                peak = max(peak, in_flight)
+                flush_count += 1
+            await asyncio.sleep(0.02)  # widen the window for overlap
+            async with guard:
+                in_flight -= 1
+
+        # Patch BOTH the config module's get_settings and the registry's
+        # imported reference so the lazily-built infra is sized to
+        # write_concurrency=2 regardless of which name reads it.
+        with (
+            patch.object(cfg, "get_settings", return_value=_S()),
+            patch.object(reg_mod, "get_settings", return_value=_S()),
+        ):
+            reg = SessionRegistry()
+            qm = reg.queue_manager  # builds infra -> semaphore capacity == 2
+
+            workers: list[SessionWorker] = []
+            for i in range(6):
+                sid = f"sem-{i}"
+                worker = SessionWorker(
+                    session_id=sid,
+                    workspace="/ws",
+                    services=HookStateService(workspace="/ws"),
+                )
+                # Stub ONLY the store flush as a slow concurrency counter.
+                worker.services.graph.flush = _slow_flush  # type: ignore[method-assign]
+                # Stub close so cancel-time _safe_close does NOT route through the
+                # (ungated) GraphState.close -> flush path and pollute the peak.
+                worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
+                reg._register_for_test(worker)
+                await qm.append(
+                    sid,
+                    _line(
+                        "tool:pre",
+                        "/ws",
+                        {"session_id": sid, "timestamp": "2026-06-11T12:00:00+00:00"},
+                    ),
+                )
+                workers.append(worker)
+
+            tasks = [
+                asyncio.create_task(reg.drain_worker(w, flush_timeout=10.0))
+                for w in workers
+            ]
+            try:
+                for _ in range(200):
+                    await asyncio.sleep(0.02)
+                    drained = True
+                    for w in workers:
+                        if (await qm.read_batch(w.session_id, 10)).lines != []:
+                            drained = False
+                            break
+                    if drained and flush_count >= 6:
+                        break
+            finally:
+                for t in tasks:
+                    t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        # COE R-c: a bare ``peak <= 2`` passes vacuously at peak == 0, so we
+        # must FIRST prove flush actually executed (one barrier flush per line).
+        assert flush_count >= 6
+        # ...and that the semaphore capped overlap at its capacity of 2.
+        assert 1 <= peak <= 2
+        # No flush left in flight after all drainers stopped.
+        assert in_flight == 0
