@@ -130,3 +130,21 @@ async def test_recover_reports_session_with_uncommitted_complete_line(qm, tmp_pa
     assert await qm.recover() == ["s1"]
     await qm.commit("s1", 4)  # past 'a\nb\n' == 4 bytes
     assert await qm.recover() == []  # only torn tail remains -> not recoverable
+
+
+async def test_dead_letter_appends_and_reads_back(qm):
+    await qm.dead_letter("s1", b"poison-1", error="deadlock budget exhausted")
+    await qm.dead_letter("s1", b"poison-2", error="validation failed")
+    records = await qm.read_dead_letters("s1")
+    assert [r["payload"] for r in records] == ["poison-1", "poison-2"]
+    assert [r["error"] for r in records] == [
+        "deadlock budget exhausted",
+        "validation failed",
+    ]
+    assert all("ts" in r for r in records)
+    batch = await qm.read_batch("s1", max_items=10)
+    assert batch.lines == []  # main log untouched
+
+
+async def test_read_dead_letters_empty_when_none(qm):
+    assert await qm.read_dead_letters("nobody") == []

@@ -25,7 +25,10 @@ session_id contract:
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -61,6 +64,9 @@ class QueueManager:
 
     def _offset_path(self, session_id: str) -> Path:
         return self._dir / f"{session_id}.offset"
+
+    def _dead_path(self, session_id: str) -> Path:
+        return self._dir / f"{session_id}.dead.jsonl"
 
     def _read_committed_offset(self, session_id: str) -> int:
         try:
@@ -146,6 +152,50 @@ class QueueManager:
             os.replace(tmp, final)
 
         await asyncio.to_thread(_commit)
+
+    async def dead_letter(self, session_id: str, raw: bytes, error: str) -> None:
+        """Append one dead-letter record for an unprocessable batch line.
+
+        The original line is stored under ``payload`` as a UTF-8 string when it
+        decodes cleanly; otherwise the raw bytes are stored base64-encoded under
+        ``payload_b64`` (so non-UTF-8 payloads are never silently dropped). Each
+        record also carries a ``ts`` (epoch seconds) and the ``error`` string.
+
+        This is the dead-letter PRIMITIVE only. The poison-isolation POLICY
+        (deciding WHEN to dead-letter a line) is Phase B2. The main ``.log`` and
+        ``.offset`` files are untouched.
+        """
+        self._validate_session_id(session_id)
+        payload = raw[:-1] if raw.endswith(b"\n") else raw
+        record: dict = {"ts": time.time(), "error": error}
+        try:
+            record["payload"] = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            record["payload_b64"] = base64.b64encode(payload).decode("ascii")
+        line = (json.dumps(record) + "\n").encode("utf-8")
+        path = self._dead_path(session_id)
+
+        def _append() -> None:
+            with open(path, "ab") as f:
+                f.write(line)
+
+        await asyncio.to_thread(_append)
+
+    async def read_dead_letters(self, session_id: str) -> list[dict]:
+        """Return all dead-letter records for ``session_id`` in append order.
+
+        Returns an empty list when no dead-letter file exists.
+        """
+        self._validate_session_id(session_id)
+
+        def _read() -> list[dict]:
+            try:
+                text = self._dead_path(session_id).read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return []
+            return [json.loads(ln) for ln in text.splitlines() if ln.strip()]
+
+        return await asyncio.to_thread(_read)
 
     async def active_sessions(self) -> list[str]:
         """Return sorted session_ids with undrained data.
