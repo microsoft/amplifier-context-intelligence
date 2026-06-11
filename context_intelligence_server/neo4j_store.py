@@ -186,7 +186,32 @@ async def ensure_neo4j_schema(
 
         # ------------------------------------------------------------------
         # Step 2: create node_id indexes (idempotent via IF NOT EXISTS).
+        # ``CREATE INDEX ... IF NOT EXISTS`` is idempotent for serial callers,
+        # but two callers racing on a fresh database can both pass the existence
+        # check and then collide, surfacing
+        # ``Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists``. Because
+        # multiple independent stores auto-run this on their first concurrent
+        # flush (each store has its own ``_schema_initialized`` flag), that race
+        # is reachable. The colliding rule is exactly the one we wanted, so the
+        # error is benign — swallow it (mirroring the constraint handling below)
+        # while re-raising any other schema error.
         # ------------------------------------------------------------------
+        async def _create_index(statement: str) -> None:
+            try:
+                await session.run(statement)
+            except Neo4jError as exc:
+                if (
+                    exc.code
+                    == "Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists"
+                ):
+                    _LOG.debug(
+                        "ensure_neo4j_schema: index already exists (concurrent "
+                        "create race, benign): %s",
+                        statement,
+                    )
+                else:
+                    raise
+
         for label in (
             "Session",
             "OrchestratorRun",
@@ -194,10 +219,10 @@ async def ensure_neo4j_schema(
             "ToolExecution",
             "Event",
         ):
-            await session.run(
+            await _create_index(
                 f"CREATE INDEX IF NOT EXISTS FOR (n:{label}) ON (n.node_id)"
             )
-        await session.run(
+        await _create_index(
             "CREATE INDEX idx_session_workspace IF NOT EXISTS "
             "FOR (n:Session) ON (n.workspace)"
         )
@@ -637,22 +662,21 @@ class Neo4jGraphStore:
         try:
             await self._ensure_schema()
 
+            # Driver-managed transaction: execute_write owns commit/rollback and
+            # auto-retries transient failures (TransientError / DeadlockDetected)
+            # up to max_transaction_retry_time. Safe because _write_batch is a pure
+            # function of its snapshot parameters (idempotency rule #1) and every
+            # write is an idempotent MERGE backed by uniqueness constraints
+            # (rules #2/#3), so re-running the batch cannot corrupt or duplicate state.
             async with self._driver.session(database=self._database) as db_session:
-                tx = await db_session.begin_transaction()
-                try:
-                    await _write_batch(
-                        tx,
-                        node_snapshot,
-                        edge_snapshot,
-                        patch_snapshot,
-                        self.workspace,
-                    )
-
-                    await tx.commit()
-                    success = True
-                except Exception:
-                    await tx.rollback()
-                    raise
+                await db_session.execute_write(
+                    _write_batch,
+                    node_snapshot,
+                    edge_snapshot,
+                    patch_snapshot,
+                    self.workspace,
+                )
+            success = True
         finally:
             if not success:
                 # Restore buffers: snapshot base + any new writes since flush started
