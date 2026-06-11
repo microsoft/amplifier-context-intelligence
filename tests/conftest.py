@@ -113,6 +113,10 @@ def reset_registry() -> Generator[None, None, None]:
     registry._workers.clear()
     if hasattr(registry, "_completed"):
         registry._completed.clear()
+    # Reset durable infra so each test rebuilds it against its own tmp_path
+    # queues dir (the module-level registry is constructed once at import).
+    registry._queue_manager = None
+    registry._write_semaphore = None
     yield
     # Explicitly cancel running drain tasks before clearing so teardown intent is clear
     for w in list(registry._workers.values()):
@@ -121,6 +125,8 @@ def reset_registry() -> Generator[None, None, None]:
     registry._workers.clear()
     if hasattr(registry, "_completed"):
         registry._completed.clear()
+    registry._queue_manager = None
+    registry._write_semaphore = None
 
 
 @pytest.fixture

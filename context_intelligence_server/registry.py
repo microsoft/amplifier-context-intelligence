@@ -5,6 +5,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
@@ -12,6 +13,7 @@ from context_intelligence_server.config import get_settings
 from context_intelligence_server.dashboard import EventRecord, ring_buffer
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
 from context_intelligence_server.pipeline import process_event, setup_handlers
+from context_intelligence_server.queue_manager import QueueManager
 from context_intelligence_server.services import HookStateService
 
 logger = logging.getLogger("context_intelligence_server")
@@ -48,6 +50,40 @@ class SessionRegistry:
     def __init__(self) -> None:
         self._workers: dict[str, SessionWorker] = {}
         self._completed: deque[CompletedSession] = deque(maxlen=100)
+        # Durable-ingest infrastructure, built lazily on first use. The
+        # module-level registry singleton is constructed at import time,
+        # before the per-test settings patch applies, so we cannot read
+        # settings here — see _ensure_infra().
+        self._queue_manager: QueueManager | None = None
+        self._write_semaphore: asyncio.Semaphore | None = None
+        self._max_delivery_attempts: int = 0
+
+    def _ensure_infra(self) -> None:
+        """Build the shared QueueManager + write semaphore on first use.
+
+        Lazy: reads get_settings() at call time (not at __init__) so that the
+        infrastructure is rooted at the settings in effect when first accessed.
+        Idempotent: only the first call constructs; subsequent calls are no-ops.
+        """
+        if self._queue_manager is None:
+            settings = get_settings()
+            self._queue_manager = QueueManager(queues_dir=Path(settings.queues_path))
+            self._write_semaphore = asyncio.Semaphore(settings.write_concurrency)
+            self._max_delivery_attempts = settings.max_delivery_attempts
+
+    @property
+    def queue_manager(self) -> QueueManager:
+        """The single shared on-disk QueueManager owned by this registry."""
+        self._ensure_infra()
+        assert self._queue_manager is not None
+        return self._queue_manager
+
+    @property
+    def write_semaphore(self) -> asyncio.Semaphore:
+        """The single shared global cap on concurrent Neo4j-write flushes."""
+        self._ensure_infra()
+        assert self._write_semaphore is not None
+        return self._write_semaphore
 
     async def _process_one(
         self,

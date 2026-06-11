@@ -10,8 +10,10 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
+import context_intelligence_server.registry as registry_module
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
+from context_intelligence_server.queue_manager import QueueManager
 from context_intelligence_server.registry import (
     CompletedSession,
     SessionRegistry,
@@ -1077,3 +1079,38 @@ class TestProcessOneLogsException:
         assert "process_one_failed" in caplog.text
         assert "test-session" in caplog.text
         assert "tool_call" in caplog.text
+
+
+class TestRegistryOwnsDurableInfra:
+    """SessionRegistry lazily owns a shared QueueManager + global write semaphore.
+
+    The infra is built lazily (on first access) because the module-level
+    registry singleton is constructed at import time, before the per-test
+    ``safe_settings`` patch applies. Accessing it lazily lets each test get
+    infra rooted at its own ``tmp_path`` queues dir.
+    """
+
+    def test_queue_manager_is_lazy_and_rooted_at_settings(self) -> None:
+        """queue_manager is a QueueManager rooted at settings.queues_path, idempotent."""
+        reg = SessionRegistry()
+        qm = reg.queue_manager
+        assert isinstance(qm, QueueManager)
+
+        # Built from the (patched) settings the registry sees.
+        settings = registry_module.get_settings()
+        assert qm._dir == Path(settings.queues_path)
+
+        # Idempotent: a second access returns the same instance (no rebuild).
+        assert reg.queue_manager is qm
+
+    def test_write_semaphore_capacity_matches_settings(self) -> None:
+        """write_semaphore is an asyncio.Semaphore sized to settings.write_concurrency, idempotent."""
+        reg = SessionRegistry()
+        sem = reg.write_semaphore
+        assert isinstance(sem, asyncio.Semaphore)
+
+        settings = registry_module.get_settings()
+        assert sem._value == settings.write_concurrency
+
+        # Idempotent: a second access returns the same instance.
+        assert reg.write_semaphore is sem
