@@ -288,7 +288,7 @@ class SessionHandler:
 
         # Terminal event — flush directly. There is no hot path after
         # session:end; all buffered data must reach the backing store before
-        # the process can exit. schedule_flush() is for intermediate events only.
+        # the process can exit.
         await self.services.graph.flush()
 
     async def _create_mount_plan(

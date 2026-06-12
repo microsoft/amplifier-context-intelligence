@@ -26,18 +26,14 @@ import pytest
 
 
 class _Graph:
-    """Graph stub: flush() raises flush_exc if set; schedule_flush() marks scheduled."""
+    """Graph stub: flush() raises flush_exc if set."""
 
     def __init__(self, flush_exc: Exception | None = None) -> None:
         self.flush_exc = flush_exc
-        self.scheduled = False
 
     async def flush(self) -> None:
         if self.flush_exc is not None:
             raise self.flush_exc
-
-    def schedule_flush(self) -> None:
-        self.scheduled = True
 
 
 async def _noop(*args: Any, **kwargs: Any) -> None:
@@ -99,6 +95,3 @@ async def test_handler_error_propagates_on_non_terminal_event() -> None:
     # The handler error must propagate out of process_event.
     with pytest.raises(ValueError, match="benign handler boom"):
         await process_event(worker, "user:prompt", data, handlers)  # type: ignore[arg-type]
-
-    # process_event never schedules a flush (the drainer owns the barrier).
-    assert worker.services.graph.scheduled is False

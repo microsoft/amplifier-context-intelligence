@@ -81,7 +81,6 @@ def mock_worker() -> MagicMock:
     worker.services.touch_session = AsyncMock()
     worker.services.graph = MagicMock()
     worker.services.graph.flush = AsyncMock()
-    worker.services.graph.schedule_flush = MagicMock()
     worker.services.blob_store = None
     return worker
 
@@ -379,32 +378,29 @@ async def test_process_event_terminal_does_not_self_flush(
     pipeline_handlers: Any,
 ) -> None:
     """Task 6: process_event no longer self-flushes. Even for the terminal
-    ``session:end`` event it must NOT call ``graph.flush`` or
-    ``graph.schedule_flush`` — the drainer's gated ``_flush_barrier`` is now
-    the SOLE Neo4j-write trigger (commit-after-flush per batch)."""
+    ``session:end`` event it must NOT call ``graph.flush`` — the drainer's
+    gated ``_flush_barrier`` is now the SOLE Neo4j-write trigger
+    (commit-after-flush per batch)."""
     from context_intelligence_server.pipeline import process_event
 
     data = {"session_id": "sess-123"}
     await process_event(mock_worker, "session:end", data, pipeline_handlers)
     mock_worker.services.graph.flush.assert_not_called()
-    mock_worker.services.graph.schedule_flush.assert_not_called()
 
 
 async def test_process_event_non_terminal_does_not_self_flush(
     mock_worker: MagicMock,
     pipeline_handlers: Any,
 ) -> None:
-    """Task 6: non-terminal events must NOT call ``graph.flush`` or
-    ``graph.schedule_flush``. The previously un-gated background
-    ``schedule_flush()`` per event is removed so the shared write semaphore
-    (acquired only inside the drainer's ``_flush_barrier``) actually bounds
-    concurrent writes."""
+    """Task 6: non-terminal events must NOT call ``graph.flush``. The
+    previously un-gated background per-event flush is removed so the shared
+    write semaphore (acquired only inside the drainer's ``_flush_barrier``)
+    actually bounds concurrent writes."""
     from context_intelligence_server.pipeline import process_event
 
     data = {"session_id": "sess-123"}
     await process_event(mock_worker, "session:start", data, pipeline_handlers)
     mock_worker.services.graph.flush.assert_not_called()
-    mock_worker.services.graph.schedule_flush.assert_not_called()
 
 
 # ===========================================================================

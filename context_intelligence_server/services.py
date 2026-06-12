@@ -162,9 +162,6 @@ class GraphState:
     # Flush / close (no-ops for in-memory store)
     # ------------------------------------------------------------------
 
-    def schedule_flush(self) -> None:
-        """No-op: no background I/O for an in-memory store."""
-
     def discard_buffer(self) -> None:
         """No-op: in-memory store has no flush buffer to discard."""
 

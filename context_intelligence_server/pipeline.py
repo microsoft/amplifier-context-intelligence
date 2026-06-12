@@ -152,11 +152,10 @@ async def process_event(
     6. If *session_id* and *timestamp* are present, call
        ``worker.services.touch_session`` to update ``last_updated`` on the
        session node and propagate to ancestors.
-    7. Flush strategy: call ``worker.services.graph.schedule_flush`` for
-       non-terminal events (background flush, non-blocking) so that buffered
-       writes reach Neo4j without waiting for ``session:end``.  For terminal
-       events (``session:end``) call ``worker.services.graph.flush`` instead
-       so all writes are durable before the session closes.
+    7. Flush strategy: ``process_event`` does NOT flush.  The drainer
+       (``registry.drain_worker``) owns the single semaphore-gated flush
+       barrier per batch, and terminal-event (``session:end``) durability is
+       handled there before the session closes.
 
     All of the above is wrapped in a single ``try/except Exception`` block so
     that handler errors are *logged with structured context* but **never
@@ -217,9 +216,10 @@ async def process_event(
     # NOTE (Task 6): process_event no longer self-flushes. The drainer
     # (registry.drain_worker) owns the SINGLE semaphore-gated flush barrier per
     # batch (commit-after-flush via registry._flush_barrier). This intentionally
-    # removed the previously un-gated background ``schedule_flush()`` that ran
-    # for every non-terminal event — under multi-session replay that un-gated
-    # path made the shared write semaphore a near no-op. Routing every Neo4j
+    # removed the previous un-gated per-event background flush that ran outside
+    # the write semaphore for every non-terminal event — under multi-session
+    # replay that un-gated path made the shared write semaphore a near no-op.
+    # Routing every Neo4j
     # write through the gated barrier is what makes the semaphore actually bound
     # concurrent writes. ``TERMINAL_EVENTS`` stays defined for the drainer
     # (registry._process_batch imports it to detect session:end).

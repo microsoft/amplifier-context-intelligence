@@ -452,7 +452,6 @@ class Neo4jGraphStore:
         self._label_patches: list[dict[str, Any]] = []
         self._schema_initialized: bool = False
         self._closed: bool = False
-        self._flush_task = None
         self._flush_lock: asyncio.Lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -634,9 +633,8 @@ class Neo4jGraphStore:
 
         Serializes callers via ``_flush_lock`` so that at most one Neo4j
         transaction is open at any time for this store.  Without the lock a
-        concurrent caller (e.g. the 30-second periodic timer firing while
-        ``_background_flush`` is mid-transaction) would open a second
-        transaction on the same nodes, which Neo4j resolves as a deadlock.
+        concurrent caller could open a second transaction on the same nodes,
+        which Neo4j resolves as a deadlock.
 
         Optimistically snapshots and clears buffers before writing.  On any
         failure the transaction is rolled back and the buffers are restored
@@ -731,31 +729,12 @@ class Neo4jGraphStore:
         await ensure_neo4j_schema(self._driver, self._database)
         self._schema_initialized = True
 
-    def schedule_flush(self) -> None:
-        """Schedule a background flush task if none is currently running."""
-        if self._flush_task is None or self._flush_task.done():
-            self._flush_task = asyncio.create_task(self._background_flush())
-
-    async def _background_flush(self) -> None:
-        """Invoke ``flush`` and log any exceptions (does not propagate)."""
-        try:
-            await self.flush()
-        except Exception:
-            _LOG.exception("Background flush failed")
-
     async def close(self) -> None:
         """Flush pending writes, await any background task, and close the driver.
 
         Handles event-loop mismatch gracefully when closing the driver from a
         different loop context.  Sets ``_closed`` on completion.
         """
-        # Await any in-flight background flush
-        if self._flush_task is not None and not self._flush_task.done():
-            try:
-                await self._flush_task
-            except Exception:
-                pass
-
         # Final flush to persist remaining buffer contents
         try:
             await self.flush()

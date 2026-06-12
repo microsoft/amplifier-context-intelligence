@@ -1090,8 +1090,8 @@ class TestGlobalWriteSemaphoreRealPath:
     """The shared write semaphore must cap concurrent Neo4j flushes when the
     REAL drain path is exercised end to end.
 
-    Before Task 6, process_event self-flushed every non-terminal event via the
-    UN-gated background ``schedule_flush()`` (pipeline.py:222), so the
+    Before the sole-drainer change, process_event self-flushed every
+    non-terminal event via an un-gated background per-event flush, so the
     semaphore-gated ``_flush_barrier`` was a near no-op under multi-session
     replay. Now process_event no longer self-flushes; the drainer's gated
     ``_flush_barrier`` is the ONLY write trigger, so the semaphore truly bounds
