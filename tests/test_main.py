@@ -125,6 +125,38 @@ async def test_post_events_replay_bypasses_idempotency_guard(
     assert len(appended) == 2
 
 
+async def test_post_events_increments_accepted_counter(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A durably-accepted event increments the registry accepted_total (D2)."""
+    from context_intelligence_server.queue_manager import QueueManager
+
+    # Point the registry at a tmp queue dir so the durable append is isolated.
+    monkeypatch.setattr(
+        main_module.registry, "_queue_manager", QueueManager(queues_dir=tmp_path)
+    )
+    monkeypatch.setattr(
+        main_module.registry, "get_or_create", lambda *args, **kwargs: MagicMock()
+    )
+
+    before = main_module.registry.pipeline_counters()["accepted_total"]
+
+    response = await client.post(
+        "/events",
+        json={
+            "event": "tool_use",
+            "workspace": "/ws",
+            "data": {"session_id": "sess-accepted"},
+        },
+    )
+
+    assert response.status_code == 202
+    after = main_module.registry.pipeline_counters()["accepted_total"]
+    assert after == before + 1
+
+
 async def test_post_events_increments_active_sessions(
     client: httpx.AsyncClient,
 ) -> None:

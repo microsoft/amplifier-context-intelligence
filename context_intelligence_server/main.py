@@ -207,6 +207,7 @@ async def post_events(
     # bytes, so the newline-delimited log framing is safe.
     body = await http_request.body()
     await registry.queue_manager.append(worker_key, body)
+    registry.record_accepted()  # count the durably-accepted event
     logger.info("event_enqueued: event=%s session_id=%s", request.event, session_id)
     return EventResponse(status="queued", session_id=session_id or None)
 
