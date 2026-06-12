@@ -28,6 +28,7 @@ from context_intelligence_server.auth import BearerTokenMiddleware
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.dashboard import build_status_response
+from context_intelligence_server.routers.queues import router as queues_router
 from context_intelligence_server.routers.skills import SkillRegistry
 from context_intelligence_server.routers.skills import router as skills_router
 from context_intelligence_server.routers.version import router as version_router
@@ -131,6 +132,7 @@ app = FastAPI(
 )
 app.include_router(skills_router)
 app.include_router(version_router)
+app.include_router(queues_router)
 _start_time = time.time()
 registry = SessionRegistry()
 # Expose the registry singleton on app.state so routers can read it via
