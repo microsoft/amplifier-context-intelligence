@@ -495,6 +495,9 @@ a, button { transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1); }
 
 @media (max-width: 760px) {
   .actions { flex-direction: column; align-items: stretch; }
+  /* Cap error/worker columns so the dead-letter table fits within the viewport;
+     desktop keeps the wider 22rem default. Ellipsis + title tooltip retain full text. */
+  .dl-key, .dl-error { max-width: 12rem; }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════

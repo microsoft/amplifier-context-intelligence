@@ -61,3 +61,20 @@ describe('narrow-width action button stacking', () => {
     );
   });
 });
+
+// ── narrow-width dead-letter column cap ──────────────────────────────────────
+describe('narrow-width dead-letter column cap', () => {
+  test('theme.css caps .dl-key and .dl-error to max-width: 12rem inside the 760px media query', () => {
+    // Source-grep: the 760px block must narrow the error/worker columns so the
+    // dead-letter table's max-content width drops below the ~650px client width
+    // at a 700px viewport — both Replay and Purge buttons visible without scroll.
+    // Default (wide) max-width: 22rem is preserved outside the media query.
+    const idx = css.indexOf('@media (max-width: 760px)');
+    const narrowBlock = idx >= 0 ? css.slice(idx) : '';
+    assert.ok(
+      narrowBlock.includes('.dl-key') && narrowBlock.includes('max-width: 12rem'),
+      'theme.css @media (max-width: 760px) block must cap .dl-key/.dl-error at max-width: 12rem ' +
+      'so the dead-letter table fits within a narrow viewport (action buttons fully visible without scroll)'
+    );
+  });
+});
