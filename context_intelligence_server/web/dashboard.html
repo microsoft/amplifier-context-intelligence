@@ -31,6 +31,7 @@
       </div>
       <a href="/">Home</a>
       <a href="/dashboard" class="active">Dashboard</a>
+      <a href="/queues">Queues</a>
       <a href="/docs" target="_blank">API</a>
       <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()">&#x263E;</button>
     </nav>
@@ -57,6 +58,14 @@
       <div class="stat-chip"><span class="stat-label">Neo4j Browser</span><span class="stat-value"><a id="neo4j-browser-url" href="#" target="_blank" style="font-size:0.78rem;font-family:monospace;color:var(--primary);">&mdash;</a></span></div>
       <div class="stat-chip"><span class="stat-label">Version</span><span class="stat-value" id="dash-version">&mdash;</span></div>
     </div>
+
+    <!-- Pipeline health hint -->
+    <a href="/queues" class="health-hint" role="status" aria-live="polite">
+      <span class="pill" id="hint-pill">Pipeline OK</span>
+      <span class="hint-stat">In queue <strong id="hint-inqueue">&mdash;</strong></span>
+      <span class="badge badge-error" id="hint-dead" style="display:none;">Dead-letter 0</span>
+      <span class="hint-arrow">Queues &amp; Storage &rarr;</span>
+    </a>
 
     <!-- Active sessions -->
     <p class="section-label">Active sessions</p>

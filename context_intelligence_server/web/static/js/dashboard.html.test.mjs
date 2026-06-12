@@ -182,3 +182,46 @@ describe('Auth gate script', () => {
     );
   });
 });
+
+// ── Pipeline health hint (C2) ──────────────────────────────────────────────
+
+describe('Pipeline health hint (C2)', () => {
+  test('has a Queues nav link (href="/queues")', () => {
+    assert.ok(
+      html.includes('href="/queues"'),
+      'Should have a nav link to /queues'
+    );
+  });
+
+  test('has a health-hint strip', () => {
+    assert.ok(
+      html.includes('class="health-hint"'),
+      'Should have a strip with class="health-hint"'
+    );
+  });
+
+  test('health-hint strip contains hint-pill/hint-inqueue/hint-dead ids', () => {
+    assert.ok(html.includes('id="hint-pill"'), 'Should have id="hint-pill"');
+    assert.ok(html.includes('id="hint-inqueue"'), 'Should have id="hint-inqueue"');
+    assert.ok(html.includes('id="hint-dead"'), 'Should have id="hint-dead"');
+  });
+
+  test('health-hint strip is an accessible live region', () => {
+    const idx = html.indexOf('class="health-hint"');
+    assert.ok(idx !== -1, 'health-hint strip must exist');
+    // Inspect the opening tag of the strip
+    const open = html.slice(Math.max(0, idx - 100), idx + 100);
+    assert.ok(
+      /role="status"[^>]*aria-live="polite"|aria-live="polite"[^>]*role="status"/.test(open),
+      'health-hint strip should have role="status" and aria-live="polite"'
+    );
+  });
+
+  test('hint-pill span has no literal dot glyph (fix C: .pill::before draws it)', () => {
+    const idx = html.indexOf('id="hint-pill"');
+    assert.ok(idx !== -1, 'hint-pill must exist');
+    const slice = html.slice(idx, idx + 80);
+    assert.ok(!slice.includes('●'), 'hint-pill should not contain a literal ● glyph');
+    assert.ok(!/\u25CF/i.test(slice), 'hint-pill should not contain a literal U+25CF glyph');
+  });
+});
