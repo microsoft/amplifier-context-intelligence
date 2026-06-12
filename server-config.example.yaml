@@ -38,7 +38,6 @@ api_key: ""                 # Empty or absent = auth disabled (local dev). Set t
 # -----------------------------------------------------------------------------
 blob_path: ~/amplifier-context-intelligence-server-data-store/blobs
 log_path:  ~/amplifier-context-intelligence-server-data-store/logs/server.jsonl
-cursor_path: ~/amplifier-context-intelligence-server-data-store/cursors
 
 # Durable ingest queue (persist-then-202): each session gets an append-log under
 # queues_path so events survive a crash between the 202 ACK and the Neo4j write.
@@ -76,5 +75,4 @@ log_level: INFO              # DEBUG | INFO | WARNING | ERROR
 # Session lifecycle timeouts (seconds)
 # -----------------------------------------------------------------------------
 dashboard_inactive_timeout: 1800.0    # 30 min  — hide session from dashboard
-stale_session_timeout: 432000.0       # 5 days  — reap worker, persist cursors
-cursor_persist_ttl: 15552000.0        # 180 days — delete cursor files from disk
+stale_session_timeout: 432000.0       # 5 days  — reap idle session worker

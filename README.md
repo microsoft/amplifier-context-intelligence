@@ -8,16 +8,24 @@ An event-driven telemetry platform for [Amplifier](https://github.com/microsoft/
 Amplifier CLI sessions
        |
        |  hook-context-intelligence (thin forwarder)
-       |  POST /events {event, workspace, data}
+       |  POST /events {event, workspace, data}  ->  202 Accepted (persist-then-202)
        v
 +------------------------------------------+        +----------------------+
-| Ingestion Server (:8000)                 | bolt   | Neo4j                |
-| - Event processing pipeline              |------->| :7687  bolt/driver   |
-| - Blob storage (large payloads to disk)  |        | :7474  browser UI    |
-| - Dashboard + API docs                   |        | Property graph       |
-| - Cypher proxy                           |        | 5 node / 8 edge types|
-+------------------------------------------+        +----------------------+
+| Ingestion Server (:8000)                 |        | Neo4j                |
+| - Durable per-session append-log (queue) |        | :7687  bolt/driver   |
+| - Async drainer -> batched Neo4j flush   | bolt   | :7474  browser UI    |
+|   under a global write semaphore         |------->| Property graph       |
+| - Retry + dead-letter + crash recovery   |        | 5 node / 8 edge types|
+| - Blob storage (large payloads to disk)  |        +----------------------+
+| - Dashboard + API docs + Cypher proxy    |
++------------------------------------------+
 ```
+
+`POST /events` appends the raw event to a durable per-session append-log and returns `202`
+immediately; an async single drainer per session processes batches and flushes them to Neo4j
+under a global write semaphore, retrying transient/deadlock failures and dead-lettering poison
+events. See [docs/architecture/05-durable-ingest-queue.png](docs/architecture/05-durable-ingest-queue.png)
+for the full ingest/drain flow.
 
 ---
 
@@ -406,8 +414,9 @@ The Docker Compose stack uses bind mounts under `$HOME/amplifier-context-intelli
 | Neo4j graph | `~/amplifier-context-intelligence-server-data-store/neo4j` | Property graph database |
 | Blobs | `~/amplifier-context-intelligence-server-data-store/blobs` | Event blob JSON files |
 | Logs | `~/amplifier-context-intelligence-server-data-store/logs` | Rotating JSONL log files |
+| Queues | `~/amplifier-context-intelligence-server-data-store/queues` | Durable per-session append-logs (`.log`, `.offset`, `.dead.jsonl`) |
 
-Graph data and blob data survive container rebuilds and restarts. The ingestion server's in-memory counters (completed sessions, recent events) reset on process restart — the Neo4j graph is the durable record.
+Graph data, blob data, and the durable per-session queues survive container rebuilds and restarts. On startup the server replays any unprocessed queue lines and re-seeds its conservation counters (accepted/written/in-queue/dead) from disk, so in-flight events are recovered rather than lost across a restart. The durable per-session logs — not just Neo4j — are the record for events that have been accepted but not yet written to the graph.
 
 **Safe operations:**
 ```bash
@@ -486,12 +495,20 @@ uv run pytest tests/ -q
 ```
 amplifier-context-intelligence/
 ├── context_intelligence_server/         # Ingestion server (FastAPI)
-│   ├── main.py                          # Routes, lifespan, static files
+│   ├── main.py                          # App factory, lifespan, static files
 │   ├── config.py                        # Pydantic Settings + YAML source
-│   ├── pipeline.py                      # Event dispatch pipeline
-│   ├── neo4j_store.py                   # Neo4jGraphStore (buffered writes)
+│   ├── queue_manager.py                 # Durable per-session append-log (persist-then-202)
+│   ├── registry.py                      # Per-session drainers (drain_worker, write semaphore, retry/dead-letter)
+│   ├── services.py                      # Service wiring / lifecycle
+│   ├── pipeline.py                      # Per-event dispatch spine (invoked by the drainer)
+│   ├── neo4j_store.py                   # Neo4jGraphStore (managed-tx writes)
+│   ├── graph_store.py                   # Graph store protocol / abstraction
 │   ├── blob_store.py                    # AsyncDiskBlobStore
-│   ├── handlers/                        # DefaultHandler, SessionHandler, ToolCallHandler + field_lifters/
+│   ├── idempotency.py                   # Idempotent MERGE / dedupe helpers
+│   ├── auth.py                          # Bearer-token API authentication
+│   ├── dashboard.py                     # Dashboard SSE stream
+│   ├── routers/                         # API routers: queues.py, skills.py, version.py
+│   ├── handlers/                        # Event handlers: data_layer_1/2/3/ + field_lifters/
 │   └── web/                             # Dashboard HTML + static assets
 ├── server-config.example.yaml           # Configuration file template
 ├── docker-compose.yml                   # 2-service stack (server + neo4j)

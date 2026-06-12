@@ -1,0 +1,393 @@
+digraph durable_ingest_queue {
+    // -- Global defaults ----------------------------------------------------------
+    graph [
+        rankdir   = TB
+        splines   = ortho
+        compound  = true
+        nodesep   = 0.55
+        ranksep   = 0.75
+        fontname  = "Helvetica"
+        fontsize  = 11
+        label     = "Durable Ingest Queue & Drain Loop\n(main.py + queue_manager.py + registry.py)"
+        labelloc  = t
+        labeljust = c
+    ]
+    node [
+        fontname = "Helvetica"
+        fontsize = 11
+        style    = "filled,rounded"
+        shape    = box
+    ]
+    edge [
+        fontname = "Helvetica"
+        fontsize = 10
+    ]
+
+    // ============================================================
+    // PHASE 1 \u2014 HTTP Layer (synchronous, returns fast)
+    // ============================================================
+    subgraph cluster_http {
+        graph [
+            label     = "HTTP Layer (main.py)"
+            style     = "filled"
+            color     = "#1565C0"
+            fillcolor = "#E3F2FD"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        PostEvents [
+            label     = "POST /events"
+            shape     = oval
+            fillcolor = "#E3F2FD"
+        ]
+
+        IdempotencyHit [
+            label     = "Idempotency hit?\n(idempotency_key seen before)"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        ReturnCached [
+            label     = "Return cached 202"
+            fillcolor = "#F5F5F5"
+        ]
+
+        CachedExit [
+            label     = "202 (already accepted)"
+            shape     = oval
+            fillcolor = "#E3F2FD"
+        ]
+
+        WorkerKey [
+            label     = "worker_key = session_id\nelse _no_session__<workspace-slug>"
+            fillcolor = "#F5F5F5"
+        ]
+
+        GetOrCreate [
+            label     = "registry.get_or_create(worker_key)\n(spawn sticky drainer if new)"
+            fillcolor = "#F5F5F5"
+        ]
+
+        QueueAppend [
+            label     = "QueueManager.append(worker_key, raw_body)\nPERSIST-FIRST: append line to <key>.log\n(zero-silent-loss window)"
+            fillcolor = "#C8E6C9"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
+        ]
+
+        RecordAccepted [
+            label     = "registry.record_accepted()"
+            fillcolor = "#F5F5F5"
+        ]
+
+        Http202 [
+            label     = "Return 202 {status: queued}"
+            shape     = oval
+            fillcolor = "#E3F2FD"
+        ]
+    }
+
+    // ============================================================
+    // PHASE 2 \u2014 Per-session drainer (single sticky async task)
+    // ============================================================
+    subgraph cluster_drainer {
+        graph [
+            label     = "Per-session drainer (registry.drain_worker)\n\u2014 single sticky async task per worker_key"
+            style     = "filled"
+            color     = "#2E7D32"
+            fillcolor = "#F1F8E9"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        ReadBatch [
+            label     = "read_batch()\n(complete lines after committed offset)"
+            fillcolor = "#F5F5F5"
+        ]
+
+        ProcessBatch [
+            label     = "process batch \u2192 build graph writes\n(handlers/enrichers \u2014 see diagram 01)"
+            fillcolor = "#F5F5F5"
+        ]
+
+        FlushBarrier [
+            label     = "_flush_barrier()\nasync with write_semaphore (cap=write_concurrency)\ngraph.flush() \u2192 Neo4j"
+            fillcolor = "#C8E6C9"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
+        ]
+
+        FlushOk [
+            label     = "flush ok?"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        CommitAndRecord [
+            label     = "commit(end_offset)\nrecord_written(n)"
+            fillcolor = "#F5F5F5"
+        ]
+
+        MaxAttempts [
+            label     = "attempts >=\nmax_delivery_attempts?"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        WriteRetry [
+            label     = "record_write_retry()\nsleep, retry same offset\n(idempotent MERGE)"
+            fillcolor = "#F5F5F5"
+        ]
+
+        HandleExhausted [
+            label     = "_handle_exhausted_batch()\nreplay line-by-line; on poison:\nqueue_manager.dead_letter(line) + discard_buffer()\nadvance offset past each line"
+            fillcolor = "#FFCCBC"
+        ]
+
+        DeadLetterOut [
+            label     = "\u2192 <key>.dead.jsonl"
+            fillcolor = "#F5F5F5"
+        ]
+    }
+
+    // ============================================================
+    // DURABLE FILES
+    // ============================================================
+    subgraph cluster_files {
+        graph [
+            label     = "Durable queue files (<queues_path>/<worker_key>.*)"
+            style     = "dashed"
+            color     = "#795548"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        { rank = same; FileLog; FileOffset; FileDeadLetter }
+
+        FileLog [
+            label     = "<key>.log\nappend-only, newline-delimited\nraw EventRequest JSON"
+            shape     = note
+            style     = filled
+            fillcolor = "#FFF8E1"
+        ]
+
+        FileOffset [
+            label     = "<key>.offset\nlast committed byte position\n(atomic os.replace)"
+            shape     = note
+            style     = filled
+            fillcolor = "#FFF8E1"
+        ]
+
+        FileDeadLetter [
+            label     = "<key>.dead.jsonl\npoison records {ts, error, payload}"
+            shape     = note
+            style     = filled
+            fillcolor = "#FFCCBC"
+        ]
+
+        FileLog -> FileOffset -> FileDeadLetter [style = invis]
+    }
+
+    // ============================================================
+    // CRASH RECOVERY (startup, main.py lifespan)
+    // ============================================================
+    subgraph cluster_recovery {
+        graph [
+            label     = "Crash recovery (startup, main.py lifespan)"
+            style     = "filled"
+            color     = "#6A1B9A"
+            fillcolor = "#F3E5F5"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        ReconcileDead [
+            label     = "recovery_reconcile_dead()\n(advance past already-dead-lettered pending lines\n\u2014 closes the dead_letter\u2192commit crash window)"
+            fillcolor = "#E1BEE7"
+        ]
+
+        SeedCounts [
+            label     = "recovery_seed_counts()\nseed accepted/written from disk\nso residual==0 at startup"
+            fillcolor = "#E1BEE7"
+        ]
+
+        RecoverSpawn [
+            label     = "recover()\nrespawn a drainer per session\nwith unprocessed lines"
+            fillcolor = "#E1BEE7"
+        ]
+
+        WorkersGuard [
+            label     = "workers==1 guard\n(_validate_single_worker)"
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        ReconcileDead -> SeedCounts -> RecoverSpawn
+        RecoverSpawn   -> WorkersGuard [style = dotted, color = "#AAAAAA", arrowhead = none]
+    }
+
+    // ============================================================
+    // OBSERVABILITY
+    // ============================================================
+    subgraph cluster_observability {
+        graph [
+            label     = "Observability"
+            style     = "filled"
+            color     = "#0277BD"
+            fillcolor = "#E1F5FE"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        PipelineMetrics [
+            label     = "registry.pipeline_metrics()\naccepted / written / replayed / write_retries\nin_queue / dead_letter / residual / degraded"
+            fillcolor = "#B3E5FC"
+        ]
+
+        StatusEndpoint [
+            label     = "GET /status .metrics\n(unauthenticated, aggregate-only)"
+            fillcolor = "#B3E5FC"
+        ]
+
+        QueuesEndpoint [
+            label     = "routers/queues.py (authenticated: Bearer)\nGET /queues/dead-letter\nPOST .../{worker_key}/replay\nPOST .../{worker_key}/purge"
+            fillcolor = "#B3E5FC"
+        ]
+
+        PipelineMetrics -> StatusEndpoint
+        PipelineMetrics -> QueuesEndpoint [style = invis]
+    }
+
+    // ============================================================
+    // PHASE 1 edges
+    // ============================================================
+    PostEvents      -> IdempotencyHit
+    IdempotencyHit  -> ReturnCached   [label = "yes"]
+    ReturnCached    -> CachedExit
+    IdempotencyHit  -> WorkerKey      [label = "no"]
+    WorkerKey       -> GetOrCreate
+    GetOrCreate     -> QueueAppend
+    QueueAppend     -> RecordAccepted
+    RecordAccepted  -> Http202
+
+    // ============================================================
+    // PHASE 2 edges
+    // ============================================================
+    ReadBatch       -> ProcessBatch
+    ProcessBatch    -> FlushBarrier
+    FlushBarrier    -> FlushOk
+    FlushOk         -> CommitAndRecord [label = "yes"]
+    FlushOk         -> MaxAttempts     [label = "no"]
+    CommitAndRecord -> ReadBatch       [label = "next batch", constraint = false]
+    MaxAttempts     -> WriteRetry      [label = "no"]
+    MaxAttempts     -> HandleExhausted [label = "yes"]
+    WriteRetry      -> FlushBarrier    [label = "retry", constraint = false]
+    HandleExhausted -> DeadLetterOut
+    DeadLetterOut   -> ReadBatch       [label = "resume", constraint = false]
+
+    // Recovery spawns drainer(s) at startup
+    RecoverSpawn    -> ReadBatch [
+        style      = dashed
+        color      = "#6A1B9A"
+        fontcolor  = "#6A1B9A"
+        label      = "spawns drainer\nper session"
+        constraint = false
+    ]
+
+    // ============================================================
+    // DURABLE FILE edges (dashed \u2014 annotate the side-effects)
+    // ============================================================
+    QueueAppend      -> FileLog    [
+        style      = dashed
+        color      = "#795548"
+        fontcolor  = "#795548"
+        label      = "append"
+        constraint = false
+    ]
+    CommitAndRecord  -> FileOffset [
+        style      = dashed
+        color      = "#795548"
+        fontcolor  = "#795548"
+        label      = "commit\n(atomic)"
+        constraint = false
+    ]
+    HandleExhausted  -> FileDeadLetter [
+        style      = dashed
+        color      = "#795548"
+        fontcolor  = "#795548"
+        label      = "dead_letter"
+        constraint = false
+    ]
+
+    // Drainer reads from the log (async consumption side)
+    FileLog          -> ReadBatch [
+        style      = dashed
+        color      = "#795548"
+        fontcolor  = "#795548"
+        label      = "drainer\nreads"
+        constraint = false
+    ]
+
+    // ============================================================
+    // OBSERVABILITY edges
+    // ============================================================
+    QueuesEndpoint   -> FileDeadLetter [
+        style      = dashed
+        color      = "#0277BD"
+        fontcolor  = "#0277BD"
+        label      = "reads"
+        arrowhead  = open
+        constraint = false
+    ]
+    QueuesEndpoint   -> FileLog [
+        style      = dashed
+        color      = "#0277BD"
+        fontcolor  = "#0277BD"
+        label      = "replay\n(re-append)"
+        constraint = false
+    ]
+
+    // ============================================================
+    // LEGEND
+    // ============================================================
+    subgraph cluster_legend {
+        graph [
+            label     = "Legend"
+            fontsize  = 10
+            fontname  = "Helvetica"
+            style     = "dashed"
+            color     = "#AAAAAA"
+        ]
+        node [fontsize = 10]
+
+        LegGreen [
+            label     = "critical durability point"
+            fillcolor = "#C8E6C9"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
+        ]
+        LegDiamond [
+            label     = "decision"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+        LegFile [
+            label     = "durable file"
+            shape     = note
+            style     = filled
+            fillcolor = "#FFF8E1"
+        ]
+        LegOval [
+            label     = "HTTP boundary"
+            shape     = oval
+            fillcolor = "#E3F2FD"
+        ]
+
+        LegGreen -> LegDiamond -> LegFile -> LegOval [style = invis]
+    }
+}
