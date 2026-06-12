@@ -1116,3 +1116,43 @@ async def test_status_includes_neo4j_connected_false_when_no_driver(
     assert response.status_code == 200
     data = response.json()
     assert data["neo4j_connected"] is False
+
+
+# ---------------------------------------------------------------------------
+# /status pipeline metrics block (D3)
+# ---------------------------------------------------------------------------
+
+
+async def test_status_includes_metrics_block(client: httpx.AsyncClient) -> None:
+    """/status carries the additive aggregate-only pipeline metrics block.
+
+    The block is additive (existing status keys remain) and aggregate-only:
+    because /status is unauthenticated it must NOT expose the per-key table,
+    the dead-letter listing, or the deferred oldest_unflushed_age signal.
+    """
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+
+    # Additive: existing status keys still present.
+    assert "active_sessions" in data
+    assert "sessions" in data
+
+    # Aggregate metrics block present with the conservation fields.
+    metrics = data["metrics"]
+    for key in (
+        "accepted_total",
+        "written_total",
+        "replayed_total",
+        "write_retries_total",
+        "in_queue_total",
+        "dead_letter_total",
+        "residual",
+        "degraded",
+    ):
+        assert key in metrics
+
+    # Deferred / authenticated-only fields must be absent.
+    assert "oldest_unflushed_age" not in metrics
+    assert "per_key" not in metrics
+    assert "dead_letters" not in data

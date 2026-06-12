@@ -180,6 +180,10 @@ async def get_status(request: Request) -> dict[str, Any]:
     response["neo4j_connected"] = await _check_neo4j_connected(request.app)
     response["neo4j_url"] = _settings.neo4j_url
     response["neo4j_browser_url"] = _settings.neo4j_browser_url
+    # Additive, aggregate-only conservation metrics (D3). /status is
+    # unauthenticated, so this block must NOT carry the per-key table or the
+    # dead-letter listing — both are authenticated-only.
+    response["metrics"] = await registry.pipeline_metrics()
     return response
 
 
