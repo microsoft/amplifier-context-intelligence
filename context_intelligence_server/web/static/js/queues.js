@@ -92,3 +92,222 @@ export async function purgeWorker(workerKey) {
   if (!res.ok) throw _httpError('purge', res);
   return res.json();
 }
+
+// ── Module-scope render helpers (pure, safe to define in any environment) ────
+
+// escapeAttr(s) — escape the five characters that break HTML attribute/text
+// contexts. Worker keys and error strings are server-supplied, so we escape
+// before interpolating them into innerHTML / attribute values.
+function escapeAttr(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+// fmtTs(ts) — render a unix-seconds timestamp as a locale string. null/'' (no
+// timestamp) renders an em-dash; non-positive or unparseable values fall back
+// to the em-dash too rather than throwing.
+function fmtTs(ts) {
+  if (ts === null || ts === '' || ts === undefined) return '—';
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  try {
+    return new Date(n * 1000).toLocaleString();
+  } catch {
+    return '—';
+  }
+}
+
+// ── Browser-only block ───────────────────────────────────────────────────────
+// Guarded by IS_BROWSER so importing queues.js under node (for the pure-helper
+// tests) never touches the DOM. Everything below renders the invariant card,
+// totals chips, and the dead-letter table, polls /status + /queues every 3s,
+// and wires the Replay/Purge actions with honest feedback and a poll-vs-confirm
+// guard (C2) so the poll can never wipe an open Purge confirmation.
+const IS_BROWSER = typeof document !== 'undefined';
+
+if (IS_BROWSER) {
+  let lastEntries = [];
+
+  // onAuthLost() — auth failure (401): drop the stored key and re-show the auth
+  // overlay. NEVER render an all-clear state during an auth failure (U2).
+  function onAuthLost() {
+    try { localStorage.removeItem('ci_api_key'); } catch { /* ignore */ }
+    const overlay = document.getElementById('auth-overlay');
+    if (overlay) overlay.style.display = '';
+  }
+
+  // renderInvariant(metrics) — S2: the equation tail carries the number, the
+  // badge carries the word/colour. No standalone invariant-result element.
+  function renderInvariant(metrics) {
+    const inv = computeInvariant(metrics);
+    const card = document.getElementById('invariant-card');
+    const eq = document.getElementById('invariant-eq');
+    const badge = document.getElementById('invariant-badge');
+    if (card) {
+      card.className = inv.cardClass;
+      card.setAttribute('aria-label', inv.aria);
+    }
+    if (eq) eq.textContent = inv.equation;
+    if (badge) {
+      badge.className = inv.badgeClass;
+      badge.textContent = inv.badgeText;
+    }
+  }
+
+  // renderTotals(metrics) — build the totals chips into #totals-row.
+  function renderTotals(metrics) {
+    const row = document.getElementById('totals-row');
+    if (!row) return;
+    row.innerHTML = computeTotals(metrics)
+      .map(t => `<span class="stat-chip">${escapeAttr(t.label)}: ${escapeAttr(t.value)}</span>`)
+      .join('');
+  }
+
+  // actionsCellHtml(d) — Replay + Purge buttons for one dead-letter row.
+  function actionsCellHtml(d) {
+    const key = escapeAttr(d.workerKey);
+    return `<td class="actions" data-key="${key}">`
+      + `<button class="btn btn-primary" data-action="replay" data-key="${key}" `
+      + `aria-label="Replay dead-lettered events for ${key}">Replay</button>`
+      + `<button class="btn btn-danger" data-action="purge" data-key="${key}" `
+      + `aria-label="Purge dead-lettered events for ${key}">Purge</button>`
+      + `</td>`;
+  }
+
+  // renderDeadLetters(entries) — render the dead-letter table body. C2 poll
+  // guard: if an inline Purge confirm is open, bail out so the 3s poll cannot
+  // wipe an irreversible-action confirmation out from under the user.
+  function renderDeadLetters(entries) {
+    const body = document.getElementById('dead-letter-body');
+    if (!body) return;
+    if (body.querySelector('.actions[data-confirming]')) return; // C2: confirm open
+    lastEntries = entries || [];
+    if (lastEntries.length === 0) {
+      body.innerHTML = `<tr class="table-empty"><td class="all-clear" colspan="4">`
+        + `● No dead letters — all clear</td></tr>`;
+      return;
+    }
+    body.innerHTML = lastEntries.map(entry => {
+      const d = deadLetterRowData(entry);
+      const key = escapeAttr(d.workerKey);
+      const err = escapeAttr(d.lastError);
+      return `<tr>`
+        + `<td class="mono dl-key" title="${key}">${key}</td>`
+        + `<td>${escapeAttr(d.itemCount)}</td>`
+        + `<td class="result-error dl-error" title="${err}">${err}</td>`
+        + `<td>${escapeAttr(fmtTs(d.lastTs))}</td>`
+        + actionsCellHtml(d)
+        + `</tr>`;
+    }).join('');
+  }
+
+  // renderDeadLetterError() — a failed dead-letter LOAD renders a distinct
+  // "couldn't load" row, NOT an all-clear teal row (U2). Respects the C2 guard.
+  function renderDeadLetterError() {
+    const body = document.getElementById('dead-letter-body');
+    if (!body) return;
+    if (body.querySelector('.actions[data-confirming]')) return; // C2: confirm open
+    body.innerHTML = `<tr class="table-empty"><td class="result-error" colspan="4">`
+      + `Couldn't load dead-letter queues — retrying…</td></tr>`;
+  }
+
+  // showRowBadge(workerKey, text, cls) — replace a row's actions cell with a
+  // single status badge (honest feedback after an action completes).
+  function showRowBadge(workerKey, text, cls) {
+    const body = document.getElementById('dead-letter-body');
+    if (!body) return;
+    const cell = body.querySelector(`.actions[data-key="${escapeAttr(workerKey)}"]`);
+    if (cell) cell.innerHTML = `<span class="badge ${cls}">${escapeAttr(text)}</span>`;
+  }
+
+  // handleActionError(err, workerKey) — U2 error honesty. 401 → auth lost;
+  // 400 → distinct 'Invalid'; anything else → 'Failed — retry'.
+  function handleActionError(err, workerKey) {
+    if (err && err.status === 401) {
+      onAuthLost();
+    } else if (err && err.status === 400) {
+      showRowBadge(workerKey, 'Invalid', 'badge-error');
+    } else {
+      showRowBadge(workerKey, 'Failed — retry', 'badge-error');
+    }
+  }
+
+  // beginPurgeConfirm(cell, workerKey) — replace the action buttons with an
+  // inline confirm (Purge is irreversible). Marks the cell data-confirming so
+  // the poll guard leaves it alone, and moves focus to Cancel (Focus-to-Cancel).
+  function beginPurgeConfirm(cell, workerKey) {
+    const key = escapeAttr(workerKey);
+    cell.setAttribute('data-confirming', '1');
+    cell.innerHTML = `<span class="confirm-q">Purge ${key}?</span>`
+      + `<button class="btn btn-danger" data-action="purge-confirm" data-key="${key}">Confirm</button>`
+      + `<button class="btn" data-action="purge-cancel" data-key="${key}" id="purge-cancel">Cancel</button>`;
+    const cancel = cell.querySelector('#purge-cancel');
+    if (cancel) cancel.focus();
+  }
+
+  // refresh() — one poll cycle: status drives the invariant + totals; the
+  // dead-letter list drives the table. Status and table failures are isolated
+  // so a status hiccup never blanks the table and vice versa.
+  async function refresh() {
+    try {
+      const metrics = await fetchStatus();
+      renderInvariant(metrics);
+      renderTotals(metrics);
+    } catch (e) {
+      console.error('status refresh failed', e);
+    }
+    try {
+      const dl = await fetchDeadLetters();
+      renderDeadLetters(dl.dead_letters || []);
+    } catch (err) {
+      if (err && err.status === 401) onAuthLost();
+      else renderDeadLetterError();
+    }
+  }
+
+  // Event delegation for the dead-letter table actions.
+  const body = document.getElementById('dead-letter-body');
+  if (body) {
+    body.addEventListener('click', async (ev) => {
+      const btn = ev.target.closest('button[data-action]');
+      if (!btn) return;
+      const action = btn.getAttribute('data-action');
+      const key = btn.getAttribute('data-key');
+      const cell = btn.closest('.actions');
+
+      if (action === 'replay') {
+        try {
+          const r = await replayWorker(key);
+          showRowBadge(key, `Re-enqueued ${r.replayed ?? 0}`, 'badge-primary');
+        } catch (err) {
+          handleActionError(err, key);
+        }
+      } else if (action === 'purge') {
+        if (cell) beginPurgeConfirm(cell, key);
+      } else if (action === 'purge-confirm') {
+        try {
+          const r = await purgeWorker(key);
+          showRowBadge(key, `Purged ${r.purged ?? 0}`, 'badge-primary');
+        } catch (err) {
+          handleActionError(err, key);
+        }
+      } else if (action === 'purge-cancel') {
+        renderDeadLetters(lastEntries);
+      }
+    });
+
+    // Esc cancels an open inline confirm.
+    body.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && body.querySelector('.actions[data-confirming]')) {
+        renderDeadLetters(lastEntries);
+      }
+    });
+  }
+
+  refresh();
+  setInterval(refresh, 3000);
+}

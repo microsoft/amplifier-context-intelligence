@@ -221,3 +221,58 @@ describe('deadLetterRowData()', () => {
     assert.deepEqual(row, { workerKey: '', itemCount: 0, lastError: '', lastTs: null });
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────────
+// queues.js source wiring — browser-only render + 3s poll + actions (C2)
+// Source-asserted: importing queues.js in node MUST NOT run the DOM block, so
+// we read the file as text and assert the browser wiring is present.
+// ───────────────────────────────────────────────────────────────────────────
+
+describe('queues.js source wiring', () => {
+  const src = readFileSync(new URL('./queues.js', import.meta.url), 'utf8');
+
+  test('polls refresh every 3 seconds via setInterval', () => {
+    assert.match(src, /setInterval\(\s*refresh\s*,\s*3000\s*\)/);
+  });
+
+  test('guards DOM code with a typeof document check (importable in node)', () => {
+    assert.ok(src.includes("typeof document !== 'undefined'"), 'missing IS_BROWSER guard');
+  });
+
+  test('renders the invariant/totals/dead-letter elements by id', () => {
+    for (const id of ['invariant-card', 'invariant-eq', 'invariant-badge', 'totals-row', 'dead-letter-body']) {
+      assert.ok(src.includes(`'${id}'`), `missing element id '${id}'`);
+    }
+  });
+
+  test('S2: no standalone invariant-result element', () => {
+    assert.ok(!src.includes("getElementById('invariant-result')"), 'invariant-result must not exist (S2)');
+  });
+
+  test('C2 poll guard: re-render early-returns while a Purge confirm is open', () => {
+    assert.ok(src.includes("querySelector('.actions[data-confirming]')"), 'missing poll-vs-confirm guard');
+  });
+
+  test('U1 honest feedback: consumes the response integer for Replay and Purge', () => {
+    assert.ok(src.includes('Re-enqueued'), "missing 'Re-enqueued' feedback");
+    assert.ok(src.includes('Purged'), "missing 'Purged' feedback");
+    assert.ok(src.includes('.replayed'), 'must read .replayed from response');
+    assert.ok(src.includes('.purged'), 'must read .purged from response');
+  });
+
+  test('U2 error honesty: 401 clears key + reshows auth overlay; 400 distinct Invalid', () => {
+    assert.ok(src.includes("removeItem('ci_api_key')"), '401 must clear ci_api_key');
+    assert.ok(src.includes("getElementById('auth-overlay')"), '401 must re-show auth overlay');
+    assert.ok(src.includes('Invalid'), "400 must show distinct 'Invalid' message");
+  });
+
+  test('Focus-to-Cancel: focus moves to the Cancel button after confirm', () => {
+    assert.ok(src.includes('purge-cancel'), 'missing purge-cancel control');
+    assert.ok(src.includes('.focus()'), 'must move focus to Cancel');
+  });
+
+  test('wires actions through replayWorker/purgeWorker', () => {
+    assert.ok(src.includes('replayWorker('), 'must call replayWorker');
+    assert.ok(src.includes('purgeWorker('), 'must call purgeWorker');
+  });
+});
