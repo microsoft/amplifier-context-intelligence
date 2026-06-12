@@ -276,3 +276,36 @@ describe('queues.js source wiring', () => {
     assert.ok(src.includes('purgeWorker('), 'must call purgeWorker');
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// queues.html source — page shell (head, auth overlay, topnav, invariant card,
+// totals row, dead-letter table). Test lives in web/static/js/, so
+// ../../queues.html resolves to web/queues.html.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('queues.html source', () => {
+  const html = readFileSync(new URL('../../queues.html', import.meta.url), 'utf8');
+
+  test('includes the invariant/totals/dead-letter element ids', () => {
+    for (const id of ['invariant-card', 'invariant-eq', 'invariant-badge', 'totals-row', 'dead-letter-body']) {
+      assert.ok(html.includes(`id="${id}"`), `missing element id "${id}"`);
+    }
+  });
+
+  test('S2: has NO standalone invariant-result element', () => {
+    assert.ok(!html.includes('id="invariant-result"'), 'invariant-result must not exist (S2)');
+  });
+
+  test('marks the Queues nav link active', () => {
+    assert.match(html, /<a href="\/queues" class="active">Queues<\/a>/);
+  });
+
+  test('loads queues.js as a module', () => {
+    assert.match(html, /src="\/static\/js\/queues\.js"/);
+    assert.match(html, /<script type="module" src="\/static\/js\/queues\.js">/);
+  });
+
+  test('wraps the dead-letter table in a .table-scroll div', () => {
+    assert.ok(html.includes('class="table-scroll"'), 'dead-letter table must be wrapped in .table-scroll');
+  });
+});
