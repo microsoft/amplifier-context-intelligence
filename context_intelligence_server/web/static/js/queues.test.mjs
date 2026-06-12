@@ -30,7 +30,7 @@ const okFetch = async (url, options = {}) => {
 globalThis.fetch = okFetch;
 
 // ── Import module under test (after globals are in place) ────────────────────
-const { fetchDeadLetters, replayWorker, purgeWorker } = await import('./queues.js');
+const { fetchDeadLetters, replayWorker, purgeWorker, computeInvariant } = await import('./queues.js');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function resetFetchCalls() { capturedFetchCalls = []; }
@@ -125,5 +125,52 @@ describe('fetch wrappers surface HTTP status on failure (U2)', () => {
     } finally {
       globalThis.fetch = okFetch;
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// computeInvariant() — calm/loud state keyed off backend `degraded` flag (C3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('computeInvariant()', () => {
+  test('balanced: residual 0, dead 0, degraded false → calm card', () => {
+    const r = computeInvariant({ accepted: 10, written: 7, in_queue: 3, dead: 0, residual: 0, degraded: false });
+    assert.equal(r.residualText, '0');
+    assert.equal(r.badgeText, 'Balanced ✓');
+    assert.equal(r.badgeClass, 'badge badge-primary');
+    assert.equal(r.cardClass, 'card invariant');
+    assert.equal(r.aria, 'Pipeline balanced');
+    assert.equal(r.equation, '10 − 7 − 3 − 0 = 0');
+  });
+
+  test('accounted-but-pending: residual 0, dead>0, degraded true → dead-lettered loud', () => {
+    const r = computeInvariant({ accepted: 10, written: 7, in_queue: 2, dead: 1, residual: 0, degraded: true });
+    assert.equal(r.residualText, '0');
+    assert.equal(r.badgeText, '1 DEAD-LETTERED');
+    assert.equal(r.badgeClass, 'badge badge-error');
+    assert.equal(r.cardClass, 'card invariant degraded');
+    assert.equal(r.aria, '1 events dead-lettered — accounted for, needs attention');
+    assert.equal(r.equation, '10 − 7 − 2 − 1 = 0');
+  });
+
+  test('true loss: residual +3 → off-by loud', () => {
+    const r = computeInvariant({ accepted: 10, written: 4, in_queue: 3, dead: 0, residual: 3, degraded: true });
+    assert.equal(r.residualText, '+3');
+    assert.equal(r.badgeText, 'OFF BY 3 — INVESTIGATE');
+    assert.equal(r.badgeClass, 'badge badge-error');
+    assert.equal(r.cardClass, 'card invariant degraded');
+    assert.equal(r.aria, 'Pipeline off by 3 events — investigate possible event loss');
+  });
+
+  test('negative residual: residual -2 → off-by with abs value, signed text', () => {
+    const r = computeInvariant({ accepted: 5, written: 5, in_queue: 1, dead: 1, residual: -2, degraded: true });
+    assert.equal(r.residualText, '-2');
+    assert.equal(r.badgeText, 'OFF BY 2 — INVESTIGATE');
+  });
+
+  test('derives degraded from residual/dead when flag absent', () => {
+    const r = computeInvariant({ accepted: 10, written: 7, in_queue: 2, dead: 1, residual: 0 });
+    assert.equal(r.cardClass, 'card invariant degraded');
+    assert.equal(r.badgeText, '1 DEAD-LETTERED');
   });
 });
