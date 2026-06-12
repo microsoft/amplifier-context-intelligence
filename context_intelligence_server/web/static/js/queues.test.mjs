@@ -30,7 +30,7 @@ const okFetch = async (url, options = {}) => {
 globalThis.fetch = okFetch;
 
 // ── Import module under test (after globals are in place) ────────────────────
-const { fetchDeadLetters, replayWorker, purgeWorker, computeInvariant } = await import('./queues.js');
+const { fetchDeadLetters, replayWorker, purgeWorker, computeInvariant, computeTotals, deadLetterRowData } = await import('./queues.js');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function resetFetchCalls() { capturedFetchCalls = []; }
@@ -172,5 +172,52 @@ describe('computeInvariant()', () => {
     const r = computeInvariant({ accepted: 10, written: 7, in_queue: 2, dead: 1, residual: 0 });
     assert.equal(r.cardClass, 'card invariant degraded');
     assert.equal(r.badgeText, '1 DEAD-LETTERED');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// computeTotals() — only Replayed + Write retries chips (rest live in equation)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('computeTotals()', () => {
+  test('maps ONLY Replayed and Write retries from metrics', () => {
+    const totals = computeTotals({
+      accepted_total: 1,
+      written_total: 2,
+      replayed_total: 3,
+      write_retries_total: 4,
+      in_queue_total: 5,
+      dead_letter_total: 6,
+    });
+    const labels = totals.map(t => t.label);
+    const values = totals.map(t => t.value);
+    assert.deepEqual(labels, ['Replayed', 'Write retries']);
+    assert.deepEqual(values, [3, 4]);
+    // redundant chips (already in the invariant equation / dead-letter table) are dropped
+    for (const dropped of ['Accepted', 'Written', 'In queue', 'Dead-letter', 'Oldest unflushed']) {
+      assert.ok(!labels.includes(dropped), `${dropped} should NOT be a chip`);
+    }
+  });
+
+  test('defaults missing metrics to 0', () => {
+    const totals = computeTotals({});
+    const values = totals.map(t => t.value);
+    assert.deepEqual(values, [0, 0]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// deadLetterRowData() — maps a dead-letter entry to row fields
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('deadLetterRowData()', () => {
+  test('maps worker_key/item_count/last_error/last_ts', () => {
+    const row = deadLetterRowData({ worker_key: 'k1', item_count: 4, last_error: 'boom', last_ts: 1700000000 });
+    assert.deepEqual(row, { workerKey: 'k1', itemCount: 4, lastError: 'boom', lastTs: 1700000000 });
+  });
+
+  test('applies defaults for missing fields (lastTs null)', () => {
+    const row = deadLetterRowData({});
+    assert.deepEqual(row, { workerKey: '', itemCount: 0, lastError: '', lastTs: null });
   });
 });

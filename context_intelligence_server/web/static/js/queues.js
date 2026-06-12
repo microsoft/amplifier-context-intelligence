@@ -43,6 +43,30 @@ export function computeInvariant(metrics) {
   return { equation, residualText, badgeText, badgeClass, cardClass, aria };
 }
 
+// computeTotals(metrics) — chips for the two totals NOT already shown in the
+// invariant equation. Accepted/Written/In-queue/Dead-letter all appear in the
+// equation (dead-letter also has its own table), so only Replayed and Write
+// retries get chips here. Missing metrics default to 0.
+export function computeTotals(metrics) {
+  const m = metrics || {};
+  return [
+    { label: 'Replayed', value: m.replayed_total ?? 0 },
+    { label: 'Write retries', value: m.write_retries_total ?? 0 },
+  ];
+}
+
+// deadLetterRowData(entry) — maps a dead-letter API entry to row fields.
+// lastTs defaults to null (absence of a timestamp), other fields to empty/0.
+export function deadLetterRowData(entry) {
+  const e = entry || {};
+  return {
+    workerKey: e.worker_key ?? '',
+    itemCount: e.item_count ?? 0,
+    lastError: e.last_error ?? '',
+    lastTs: e.last_ts ?? null,
+  };
+}
+
 function _httpError(label, res) {
   const err = new Error(`${label} failed: ${res.status}`);
   err.status = res.status;
