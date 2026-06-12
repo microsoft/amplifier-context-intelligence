@@ -264,6 +264,37 @@ async def test_derive_all_stats_counts_pending_and_dead(qm):
         assert "oldest_unflushed_age" not in entry  # deferred to C2
 
 
+async def test_dead_letter_keys_lists_only_keys_with_dead_files(qm):
+    # 'live' has only main-log data, no dead-letter file -> excluded.
+    await qm.append("live", b"x")
+    # Two keys with dead-letter files; appended out of order to prove sorting.
+    await qm.dead_letter("zeta", b"poison", error="boom")
+    await qm.dead_letter("alpha", b"poison", error="boom")
+
+    assert await qm.dead_letter_keys() == ["alpha", "zeta"]
+
+
+async def test_purge_dead_letters_removes_file_and_returns_count(qm, tmp_path):
+    await qm.dead_letter("s1", b"poison-1", error="boom")
+    await qm.dead_letter("s1", b"poison-2", error="boom")
+
+    removed = await qm.purge_dead_letters("s1")
+
+    assert removed == 2
+    assert await qm.read_dead_letters("s1") == []
+    assert not (tmp_path / "queues" / "s1.dead.jsonl").exists()
+
+
+async def test_purge_dead_letters_missing_file_returns_zero(qm):
+    assert await qm.purge_dead_letters("nobody") == 0
+
+
+@pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])
+async def test_purge_dead_letters_rejects_unsafe_session_id(qm, bad_id):
+    with pytest.raises(ValueError):
+        await qm.purge_dead_letters(bad_id)
+
+
 async def test_derive_all_stats_caches_within_ttl(qm, monkeypatch):
     await qm.append("s1", b"a")
 

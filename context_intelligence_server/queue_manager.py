@@ -348,3 +348,41 @@ class QueueManager:
         self._stats_cache = stats
         self._stats_cache_at = now
         return stats
+
+    async def dead_letter_keys(self) -> list[str]:
+        """Return sorted worker keys that have a ``.dead.jsonl`` file.
+
+        Keys with only main-log data (no dead-letter file) are excluded.
+        ``Path.name`` is sliced by the ``.dead.jsonl`` suffix to recover the
+        bare worker key (``Path.stem`` would only strip ``.jsonl``).
+        """
+
+        def _scan() -> list[str]:
+            return sorted(
+                dead.name[: -len(".dead.jsonl")]
+                for dead in self._dir.glob("*.dead.jsonl")
+            )
+
+        return await asyncio.to_thread(_scan)
+
+    async def purge_dead_letters(self, worker_key: str) -> int:
+        """Delete the dead-letter file for ``worker_key`` and return the count.
+
+        Counts the dead-letter records via ``_count_dead``, then unlinks the
+        ``.dead.jsonl`` file. Returns the number of records removed (0 when no
+        dead-letter file exists). Raises ``ValueError`` for an unsafe key.
+
+        Deletion is routed exclusively through this method: callers must never
+        touch the filesystem directly.
+        """
+        self._validate_session_id(worker_key)
+
+        def _purge() -> int:
+            count = self._count_dead(worker_key)
+            try:
+                self._dead_path(worker_key).unlink()
+            except FileNotFoundError:
+                pass
+            return count
+
+        return await asyncio.to_thread(_purge)
