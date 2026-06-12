@@ -76,8 +76,7 @@ Open [http://localhost:8000](http://localhost:8000) — this is the single navig
 | Route | Content |
 |-------|---------| 
 | `/` | Landing page with navigation cards |
-| `/dashboard` | Live session monitoring, event history, log stream |
-| `/queues` | Queues & Storage — pipeline conservation invariant, totals, and dead-letter management (Replay/Purge). |
+| `/dashboard` | Live session monitoring, event history, log stream, and an in-page Queues tab |
 | `/docs` | Swagger API documentation |
 
 The home page and dashboard both show:
@@ -89,7 +88,7 @@ Both URLs are displayed verbatim from the configuration. If Neo4j is on a remote
 
 When `api_key` is configured, the dashboard shows an API key prompt on first visit — enter the key from `credentials.yaml`.
 
-The dashboard surfaces a pipeline-health hint (Pipeline OK / DEGRADED + dead-letter count) linking to the Queues page. The `/queues` page is auth-exempt (so it can prompt for an API key); its `/queues/*` data endpoints require a Bearer token.
+The dashboard has an in-page Queues tab (Overview | Queues) showing the pipeline conservation invariant, totals, and dead-letter management (Replay/Purge). The dashboard's single auth overlay gates everything; the `/queues/*` data endpoints require a Bearer token. There is no separate `/queues` page.
 
 ---
 
@@ -330,7 +329,6 @@ All settings live in `~/.amplifier/settings.yaml` under `overrides.hook-context-
 | `GET` | `/blobs/{session_id}` | List all blob URIs for a session |
 | `GET` | `/blobs/{session_id}/{key}` | Retrieve a stored blob |
 | `POST` | `/cypher` | Proxy a Cypher query to Neo4j |
-| `GET` | `/queues` | Queues & Storage page — pipeline conservation invariant, totals, dead-letter management (auth-exempt so it can prompt for an API key) |
 | `GET` | `/queues/dead-letter` | List dead-letter queues — `worker_key`, `item_count`, `last_error`, `last_ts` (requires `Authorization: Bearer`) |
 | `POST` | `/queues/dead-letter/{worker_key}/replay` | Re-enqueue a worker's dead-letter records then purge; returns count re-enqueued (requires `Authorization: Bearer`) |
 | `POST` | `/queues/dead-letter/{worker_key}/purge` | Permanently delete a worker's dead-letter records; returns count purged (requires `Authorization: Bearer`) |
