@@ -1,6 +1,5 @@
 """Tests for EventRingBuffer and build_status_response in dashboard.py."""
 
-import asyncio
 import time
 from unittest.mock import MagicMock, patch
 
@@ -133,12 +132,10 @@ class TestBuildStatusResponse:
         recent_time = time.time()
 
         # Inject a worker directly into the internal dict (no async setup needed)
-        queue: asyncio.Queue[object] = asyncio.Queue()
         worker = SessionWorker(
             session_id="sess-abc",
             workspace="/home/user/project",
             services=HookStateService(workspace="/home/user/project"),
-            queue=queue,
             last_event="tool_call",
             last_event_time=recent_time,
             events_processed=42,
@@ -154,7 +151,6 @@ class TestBuildStatusResponse:
         sess = response["sessions"][0]
         assert sess["session_id"] == "sess-abc"
         assert sess["workspace"] == "/home/user/project"
-        assert sess["queue_depth"] == 0
         assert sess["last_event"] == "tool_call"
         assert sess["last_event_time"] == recent_time
         assert sess["events_processed"] == 42
@@ -291,7 +287,6 @@ def _make_worker(session_id: str, last_event_time: float) -> SessionWorker:
         session_id=session_id,
         workspace="/ws",
         services=HookStateService(workspace="/ws"),
-        queue=asyncio.Queue(),
         last_event_time=last_event_time,
     )
 

@@ -414,7 +414,6 @@ async def test_status_session_detail_after_event(client: httpx.AsyncClient) -> N
     assert "sess-detail" in session_ids
     sess = next(s for s in data["sessions"] if s["session_id"] == "sess-detail")
     assert sess["workspace"] == "/ws-detail"
-    assert "queue_depth" in sess
     assert "events_processed" in sess
 
 

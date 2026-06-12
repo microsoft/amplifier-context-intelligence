@@ -86,7 +86,7 @@ async function refresh() {
     const sb = document.getElementById('sessions-body');
     if (sb) sb.innerHTML = (data.sessions || []).map(s =>
       `<tr><td>${truncate(s.session_id, 20)}</td><td>${truncate(s.workspace, 28)}</td>` +
-      `<td>${s.queue_depth}</td><td>${(s.last_event || '-')}</td><td>${s.events_processed}</td></tr>`
+      `<td>${(s.last_event || '-')}</td><td>${s.events_processed}</td></tr>`
     ).join('');
 
     const cb = document.getElementById('completed-body');

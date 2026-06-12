@@ -28,12 +28,6 @@ class SessionWorker:
     session_id: str
     workspace: str
     services: HookStateService
-    # Vestigial in Phase B2: the durable drain loop reads from the on-disk
-    # QueueManager log, NOT this in-memory queue. The field is retained until
-    # the POST /events endpoint (main.py, Task 5) and the dashboard queue_depth
-    # readout are migrated off it; removing it here breaks both before they are
-    # migrated. Tracked as a Task 4a concern (plan ordering gap).
-    queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     task: asyncio.Task | None = None
     last_event: str = ""
     last_event_time: float = 0.0
