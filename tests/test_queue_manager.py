@@ -393,6 +393,61 @@ async def test_recovery_seed_counts_crash_window_residual_zero(qm):
     assert residual == 0
 
 
+# --- recovery_reconcile_dead (D2): close the dead_letter->commit crash window ---
+
+
+async def test_recovery_reconcile_dead_advances_past_already_dead_pending(qm):
+    # Crash window: a pending (uncommitted) line that was ALREADY dead-lettered.
+    # Reconcile must advance the committed offset past it so the respawned
+    # drainer does not re-read and re-dead-letter it.
+    await qm.append("s1", b"poison")
+    await qm.dead_letter("s1", b"poison", error="boom")
+
+    skipped = await qm.recovery_reconcile_dead()
+
+    assert skipped == 1
+    batch = await qm.read_batch("s1", max_items=10)
+    assert batch.lines == []  # offset advanced past the dead-but-pending line
+
+
+async def test_recovery_reconcile_dead_stops_at_first_non_dead(qm):
+    # Leading poison line is dead-lettered; a healthy line follows it.
+    # Reconcile skips the leading poison and STOPS at the healthy line.
+    await qm.append("s1", b"poison")
+    await qm.append("s1", b"good")
+    await qm.dead_letter("s1", b"poison", error="boom")
+
+    skipped = await qm.recovery_reconcile_dead()
+
+    assert skipped == 1
+    batch = await qm.read_batch("s1", max_items=10)
+    assert batch.lines == [b"good"]  # healthy line is still delivered
+
+
+async def test_recovery_reconcile_dead_noop_without_dead_file(qm):
+    # No dead-letter file -> nothing to reconcile, line still delivered.
+    await qm.append("s1", b"line")
+
+    skipped = await qm.recovery_reconcile_dead()
+
+    assert skipped == 0
+    batch = await qm.read_batch("s1", max_items=10)
+    assert batch.lines == [b"line"]  # untouched
+
+
+async def test_recovery_reconcile_then_seed_keeps_residual_zero(qm):
+    # Reconcile then seed then derive must leave residual == 0.
+    await qm.append("s1", b"poison")
+    await qm.dead_letter("s1", b"poison", error="boom")
+
+    await qm.recovery_reconcile_dead()
+    accepted, written = await qm.recovery_seed_counts()
+    stats = await qm.derive_all_stats()
+
+    residual = accepted - written - stats["in_queue_total"] - stats["dead_total"]
+    assert residual == 0
+
+
 async def test_recovery_seed_counts_replay_window_residual_zero(qm):
     # Replay: a committed line was dead-lettered, then re-appended for retry.
     # log = [line0 committed][line0 re-appended pending]. C=1, P=1, D=1.

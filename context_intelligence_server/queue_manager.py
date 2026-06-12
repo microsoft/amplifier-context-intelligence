@@ -438,3 +438,84 @@ class QueueManager:
             return accepted, written
 
         return await asyncio.to_thread(_seed)
+
+    def _dead_payload_set(self, worker_key: str) -> set[bytes]:
+        """Return the set of original raw line bytes recorded as dead-letters.
+
+        Each dead-letter record stores the original line (sans trailing
+        newline) either as ``payload`` (a UTF-8 string) or ``payload_b64``
+        (base64 of non-UTF-8 bytes). This mirrors ``dead_letter`` and rebuilds
+        the raw line bytes so a reconcile pass can match them against pending
+        log lines. Returns an empty set when no dead-letter file exists.
+        """
+        try:
+            text = self._dead_path(worker_key).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return set()
+        payloads: set[bytes] = set()
+        for ln in text.splitlines():
+            if not ln.strip():
+                continue
+            record = json.loads(ln)
+            if "payload" in record:
+                payloads.add(record["payload"].encode("utf-8"))
+            elif "payload_b64" in record:
+                payloads.add(base64.b64decode(record["payload_b64"]))
+        return payloads
+
+    async def recovery_reconcile_dead(self) -> int:
+        """Advance committed offsets past leading already-dead pending lines.
+
+        Closes the dead_letter->commit crash window (D2). When the process
+        crashes after a poison line was dead-lettered but before the commit
+        advanced past it, the line remains pending in the ``.log``. A naively
+        respawned drainer would re-read it, re-dead-letter it, and permanently
+        corrupt the dead count. This pass steps the committed offset over each
+        LEADING pending line whose raw bytes already appear in the dead-letter
+        file, stopping at the first non-dead pending line.
+
+        Per worker key with a ``.log`` and a non-empty dead-payload set, walk
+        from the committed offset toward the end of complete data: for each
+        leading line whose raw bytes are in the dead-payload set, advance past
+        it (``skipped += 1``); stop at the first non-dead pending line. If the
+        offset advanced, persist it atomically (tmp + ``os.replace``, mirroring
+        ``commit``). Returns the total number of lines skipped across all keys.
+
+        Covers both the crash window (dead_letter then crash before commit) and
+        the replay window (re-append then crash before purge).
+
+        Ordering is load-bearing: this MUST run ONCE at startup, BEFORE
+        ``recovery_seed_counts`` and BEFORE drainers respawn.
+        """
+
+        def _reconcile() -> int:
+            total_skipped = 0
+            for key in self._all_worker_keys():
+                dead_payloads = self._dead_payload_set(key)
+                if not dead_payloads:
+                    continue
+                log_path = self._log_path(key)
+                if not log_path.exists():
+                    continue
+                committed = self._read_committed_offset(key)
+                complete_end = self._complete_data_end(key)
+                pos = committed
+                with open(log_path, "rb") as f:
+                    f.seek(committed)
+                    while pos < complete_end:
+                        raw = f.readline()
+                        if not raw or not raw.endswith(b"\n"):
+                            break
+                        if raw[:-1] not in dead_payloads:
+                            break
+                        pos += len(raw)
+                        total_skipped += 1
+                if pos > committed:
+                    final = self._offset_path(key)
+                    tmp = self._dir / f"{key}.offset.tmp"
+                    tmp.write_text(str(pos), encoding="utf-8")
+                    os.replace(tmp, final)
+            self._stats_cache = None
+            return total_skipped
+
+        return await asyncio.to_thread(_reconcile)
