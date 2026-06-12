@@ -440,6 +440,7 @@ a, button { transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1); }
 
 /* ── Wide tables: horizontal scroll + ellipsis caps ── */
 .table-scroll { overflow-x: auto; }
+.table-scroll > .data-table { min-width: max-content; }
 .dl-key,
 .dl-error {
   max-width: 22rem;
