@@ -386,3 +386,55 @@ class QueueManager:
             return count
 
         return await asyncio.to_thread(_purge)
+
+    async def recovery_seed_counts(self) -> tuple[int, int]:
+        """Seed the conservation counters so residual == 0 by construction.
+
+        Returns ``(accepted_seed, written_seed)`` to re-initialise the
+        accepted/written conservation counters after a crash. Derived purely
+        from disk so the invariant ``accepted == written + in_queue + dead``
+        holds with a zero residual the instant the counters are seeded.
+
+        Per worker key, from disk:
+
+        - ``C`` = complete lines below the committed offset
+        - ``P`` = complete lines between the committed offset and the end of
+          complete data (== ``in_queue``)
+        - ``D`` = dead-letter records
+
+        Formula::
+
+            written_seed  = max(0, C - D)
+            accepted_seed = written_seed + P + D
+
+        The ``max(0, ...)`` clamp is load-bearing. In a crash/replay window a
+        dead-but-pending line (dead-lettered, but whose commit has not yet
+        advanced past it) makes ``C - D`` go negative. The naive formula
+        ``accepted = C + P`` / ``written = C - D`` yields a negative written
+        count -- residual ``-1``, a false DEGRADED. Clamping written to zero
+        and counting the line in BOTH ``P`` and ``D`` absorbs it into
+        ``accepted_seed`` so the residual stays exactly zero.
+
+        Ordering is load-bearing: this MUST run AFTER ``recovery_reconcile_dead``
+        in the lifespan so the dead-letter counts it reads are already settled.
+        """
+
+        def _seed() -> tuple[int, int]:
+            accepted = 0
+            written = 0
+            for key in self._all_worker_keys():
+                committed = self._read_committed_offset(key)
+                complete_end = self._complete_data_end(key)
+                dead = self._count_dead(key)
+                try:
+                    data = self._log_path(key).read_bytes()
+                except FileNotFoundError:
+                    data = b""
+                before = data[:committed].count(b"\n")
+                pending = data[committed:complete_end].count(b"\n")
+                written_seed = max(0, before - dead)
+                accepted += written_seed + pending + dead
+                written += written_seed
+            return accepted, written
+
+        return await asyncio.to_thread(_seed)

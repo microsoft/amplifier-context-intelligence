@@ -315,3 +315,98 @@ async def test_derive_all_stats_caches_within_ttl(qm, monkeypatch):
     qm._stats_cache_at = time.monotonic() - (qm._stats_cache_ttl + 1.0)
     await qm.derive_all_stats()
     assert calls["n"] == 2
+
+
+# --- recovery_seed_counts (D2): residual-0-by-construction crash-recovery seed ---
+
+
+async def test_recovery_seed_counts_pending_and_committed(qm):
+    # C=2 committed lines, P=1 pending line, D=0 dead. Each "x\n" is 2 bytes.
+    await qm.append("s1", b"a")
+    await qm.append("s1", b"b")
+    await qm.append("s1", b"c")
+    await qm.commit("s1", 4)  # commit the first two complete lines
+
+    accepted, written = await qm.recovery_seed_counts()
+
+    # written_seed = max(0, 2-0)=2; accepted_seed = 2 + 1 + 0 = 3
+    assert (accepted, written) == (3, 2)
+
+
+async def test_recovery_seed_counts_committed_includes_dead(qm):
+    # C=1 committed, P=0 pending, D=1 dead. before-dead == 0.
+    await qm.append("s2", b"a")
+    await qm.commit("s2", 2)
+    await qm.dead_letter("s2", b"a", error="boom")
+
+    accepted, written = await qm.recovery_seed_counts()
+
+    # written_seed = max(0, 1-1)=0; accepted_seed = 0 + 0 + 1 = 1
+    assert (accepted, written) == (1, 0)
+
+
+async def test_recovery_seed_counts_dead_only_after_log_reclaimed(qm):
+    # No .log file (drained/reclaimed); only a dead-letter remains. D=1.
+    await qm.dead_letter("s3", b"poison", error="boom")
+
+    accepted, written = await qm.recovery_seed_counts()
+
+    # before=0, pending=0, dead=1 -> written=max(0,-1)=0; accepted=0+0+1=1
+    assert (accepted, written) == (1, 0)
+
+
+async def test_recovery_seed_counts_residual_is_zero_mixed_shape(qm):
+    # Key A: 2 committed + 1 pending, no dead.
+    await qm.append("a", b"1")
+    await qm.append("a", b"2")
+    await qm.append("a", b"3")
+    await qm.commit("a", 4)
+    # Key B: 1 committed + 1 dead.
+    await qm.append("b", b"x")
+    await qm.commit("b", 2)
+    await qm.dead_letter("b", b"x", error="boom")
+    # Key C: dead-only (log reclaimed).
+    await qm.dead_letter("c", b"poison", error="boom")
+
+    accepted, written = await qm.recovery_seed_counts()
+    stats = await qm.derive_all_stats()
+
+    residual = accepted - written - stats["in_queue_total"] - stats["dead_total"]
+    assert residual == 0
+
+
+async def test_recovery_seed_counts_crash_window_residual_zero(qm):
+    # Crash before commit advanced: the dead-lettered line is STILL pending in
+    # the log (committed offset 0). C=0, P=1, D=1 -> before-dead == -1.
+    # The naive formula (written=before-dead) yields written==-1 (false
+    # DEGRADED). The clamp must keep written at 0 and residual at 0.
+    await qm.append("s5", b"a")  # pending, never committed
+    await qm.dead_letter("s5", b"a", error="boom")  # same line dead-lettered
+
+    accepted, written = await qm.recovery_seed_counts()
+
+    assert written == 0  # NOT -1 (the crash-window trap)
+    assert accepted == 2  # written_seed(0) + pending(1) + dead(1)
+
+    stats = await qm.derive_all_stats()
+    residual = accepted - written - stats["in_queue_total"] - stats["dead_total"]
+    assert residual == 0
+
+
+async def test_recovery_seed_counts_replay_window_residual_zero(qm):
+    # Replay: a committed line was dead-lettered, then re-appended for retry.
+    # log = [line0 committed][line0 re-appended pending]. C=1, P=1, D=1.
+    # The re-appended line is absorbed into accepted_seed (counted in P and D).
+    await qm.append("s6", b"a")
+    await qm.commit("s6", 2)
+    await qm.dead_letter("s6", b"a", error="boom")
+    await qm.append("s6", b"a")  # re-append the dead line for replay
+
+    accepted, written = await qm.recovery_seed_counts()
+
+    # written_seed = max(0, 1-1)=0; accepted_seed = 0 + 1 + 1 = 2
+    assert (accepted, written) == (2, 0)
+
+    stats = await qm.derive_all_stats()
+    residual = accepted - written - stats["in_queue_total"] - stats["dead_total"]
+    assert residual == 0
