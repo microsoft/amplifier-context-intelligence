@@ -31,6 +31,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,9 @@ class QueueManager:
     def __init__(self, queues_dir: Path):
         self._dir = Path(queues_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
+        self._stats_cache: dict[str, Any] | None = None
+        self._stats_cache_at: float = 0.0
+        self._stats_cache_ttl: float = 1.0
 
     def _log_path(self, session_id: str) -> Path:
         return self._dir / f"{session_id}.log"
@@ -259,3 +263,88 @@ class QueueManager:
             return result
 
         return await asyncio.to_thread(_scan)
+
+    def _count_dead(self, worker_key: str) -> int:
+        """Count complete (newline-terminated) dead-letter lines for a key.
+
+        Returns 0 when no dead-letter file exists. Dead-letter records are
+        always written newline-terminated, so counting newlines yields the
+        number of complete records.
+        """
+        try:
+            data = self._dead_path(worker_key).read_bytes()
+        except FileNotFoundError:
+            return 0
+        return data.count(b"\n")
+
+    def _all_worker_keys(self) -> list[str]:
+        """Return the sorted union of ``.log`` and ``.dead.jsonl`` stems.
+
+        ``Path.stem`` only strips the final suffix, so for ``s1.dead.jsonl`` it
+        returns ``s1.dead``; the ``.dead.jsonl`` suffix is sliced explicitly to
+        recover the bare worker key.
+        """
+        keys: set[str] = set()
+        for log in self._dir.glob("*.log"):
+            keys.add(log.stem)
+        for dead in self._dir.glob("*.dead.jsonl"):
+            keys.add(dead.name[: -len(".dead.jsonl")])
+        return sorted(keys)
+
+    async def derive_all_stats(self) -> dict[str, Any]:
+        """Derive live queue stats purely from disk, with a short TTL cache.
+
+        Returns an aggregate of per-worker ``in_queue`` (complete, uncommitted
+        log lines) and ``dead`` (dead-letter records), plus ``in_queue_total``
+        and ``dead_total``. No counters are stored: every value is derived from
+        the files on disk.
+
+        ``in_queue`` is computed with a TAIL READ -- seek to the committed
+        offset and read only committed->EOF, then count newlines up to the last
+        ``\\n`` (a torn trailing line has no newline and is not counted). The
+        whole-file is never read. Results are cached for ``_stats_cache_ttl``
+        seconds (monotonic clock) because ``/status`` polls every ~3s; the tail
+        read plus the cache keep that path cheap under load.
+
+        ``oldest_unflushed_age`` is deferred to C2 and is intentionally NOT
+        computed or returned here.
+        """
+        now = time.monotonic()
+        if (
+            self._stats_cache is not None
+            and (now - self._stats_cache_at) < self._stats_cache_ttl
+        ):
+            return self._stats_cache
+
+        def _all() -> dict[str, Any]:
+            per_key: list[dict[str, Any]] = []
+            in_queue_total = 0
+            dead_total = 0
+            for worker_key in self._all_worker_keys():
+                committed = self._read_committed_offset(worker_key)
+                in_queue = 0
+                try:
+                    with open(self._log_path(worker_key), "rb") as f:
+                        f.seek(committed)
+                        data = f.read()
+                    last_nl = data.rfind(b"\n")
+                    if last_nl != -1:
+                        in_queue = data[: last_nl + 1].count(b"\n")
+                except FileNotFoundError:
+                    in_queue = 0
+                dead = self._count_dead(worker_key)
+                per_key.append(
+                    {"worker_key": worker_key, "in_queue": in_queue, "dead": dead}
+                )
+                in_queue_total += in_queue
+                dead_total += dead
+            return {
+                "per_key": per_key,
+                "in_queue_total": in_queue_total,
+                "dead_total": dead_total,
+            }
+
+        stats = await asyncio.to_thread(_all)
+        self._stats_cache = stats
+        self._stats_cache_at = now
+        return stats

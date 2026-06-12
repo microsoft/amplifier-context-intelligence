@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from context_intelligence_server.queue_manager import Batch, QueueManager
@@ -238,3 +240,47 @@ async def test_delete_drained_removes_log_and_offset_keeps_dead(tmp_path) -> Non
     assert not (tmp_path / "s.offset").exists()
     assert (tmp_path / "s.dead.jsonl").exists()  # retained
     assert len(await qm.read_dead_letters("s")) == 1
+
+
+async def test_derive_all_stats_counts_pending_and_dead(qm):
+    # s1: two complete pending (uncommitted) lines, no dead letters.
+    await qm.append("s1", b"a")
+    await qm.append("s1", b"b")
+    # s2: no pending log data, one dead letter.
+    await qm.dead_letter("s2", b"poison", error="boom")
+
+    stats = await qm.derive_all_stats()
+
+    assert stats["in_queue_total"] == 2
+    assert stats["dead_total"] == 1
+    assert "oldest_unflushed_age" not in stats  # deferred to C2
+
+    by_key = {entry["worker_key"]: entry for entry in stats["per_key"]}
+    assert by_key["s1"]["in_queue"] == 2
+    assert by_key["s1"]["dead"] == 0
+    assert by_key["s2"]["in_queue"] == 0
+    assert by_key["s2"]["dead"] == 1
+    for entry in stats["per_key"]:
+        assert "oldest_unflushed_age" not in entry  # deferred to C2
+
+
+async def test_derive_all_stats_caches_within_ttl(qm, monkeypatch):
+    await qm.append("s1", b"a")
+
+    calls = {"n": 0}
+    real = qm._all_worker_keys
+
+    def counting():
+        calls["n"] += 1
+        return real()
+
+    monkeypatch.setattr(qm, "_all_worker_keys", counting)
+
+    await qm.derive_all_stats()
+    await qm.derive_all_stats()  # within TTL -> served from cache
+    assert calls["n"] == 1
+
+    # Age the cache past the TTL; the next call must recompute.
+    qm._stats_cache_at = time.monotonic() - (qm._stats_cache_ttl + 1.0)
+    await qm.derive_all_stats()
+    assert calls["n"] == 2
