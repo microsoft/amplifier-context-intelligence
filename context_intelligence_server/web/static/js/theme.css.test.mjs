@@ -38,3 +38,26 @@ describe('table-scroll narrow-width fix', () => {
     );
   });
 });
+
+// ── narrow-width action button stacking fix ────────────────────────────────
+describe('narrow-width action button stacking', () => {
+  test('theme.css has @media (max-width: 760px) block', () => {
+    assert.ok(
+      css.includes('@media (max-width: 760px)'),
+      'theme.css must contain @media (max-width: 760px) — missing responsive stacking rule for action buttons at narrow widths'
+    );
+  });
+
+  test('theme.css stacks .actions flex-direction:column inside the 760px media query', () => {
+    // Source-grep: the 760px block must apply flex-direction:column to .actions.
+    // flex-direction:column exists elsewhere in the file, so we slice from the
+    // @media start and check both .actions and flex-direction:column appear
+    // within that block — not just anywhere in the file.
+    const idx = css.indexOf('@media (max-width: 760px)');
+    const narrowBlock = idx >= 0 ? css.slice(idx) : '';
+    assert.ok(
+      narrowBlock.includes('.actions') && narrowBlock.includes('flex-direction: column'),
+      'theme.css @media (max-width: 760px) block must set flex-direction: column on .actions'
+    );
+  });
+});
