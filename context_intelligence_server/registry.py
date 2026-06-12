@@ -289,6 +289,7 @@ class SessionRegistry:
                     return
                 except Exception:
                     attempts += 1
+                    self.record_write_retry()
                     logger.exception(
                         "drain_batch_failed session=%s attempt=%d",
                         session_id,
@@ -310,6 +311,7 @@ class SessionRegistry:
 
                 attempts = 0
                 await qm.commit(session_id, batch.end_offset)
+                self.record_written(len(batch.lines))
 
                 if saw_terminal:
                     await self._finalize_session(worker, handlers)
@@ -367,6 +369,7 @@ class SessionRegistry:
                 event, _ws, data = self._parse_line(raw)
                 await self._process_one(worker, event, data, handlers)
                 await self._flush_barrier(worker)
+                self.record_written(1)
             except Exception as exc:
                 await qm.dead_letter(session_id, raw + b"\n", str(exc))
                 # COE blocker (decision #13): drop the failed line's residue so
@@ -394,6 +397,7 @@ class SessionRegistry:
                 logger.exception("finalize_tail_flush_failed session=%s", session_id)
                 return  # NOT finalized: keep worker alive, leave tail uncommitted
             await qm.commit(session_id, tail.end_offset)
+            self.record_written(len(tail.lines))
 
         ended_at = time.time()
         self._completed.append(

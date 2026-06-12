@@ -1361,3 +1361,141 @@ class TestPipelineMetrics:
         assert metrics["residual"] == 0
         assert metrics["dead_letter_total"] == 1
         assert metrics["degraded"] is True
+
+
+# ---------------------------------------------------------------------------
+# Task 7 (D2): written/retry counter increments wired into the drainer at the
+# four real commit/retry sites: (1) normal-path commit, (2) retry on flush
+# failure, (3) per-line success during exhausted-batch isolation, and (4) the
+# finalize tail commit. These prove the live conservation counters actually
+# advance on the real drain paths (not just via the record_* primitives).
+# ---------------------------------------------------------------------------
+
+
+class TestWrittenCounterWiring:
+    async def test_normal_commit_increments_written(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """drain_worker drives a 2-line batch through the normal commit path:
+        written_total == 2 after the batch is processed and committed.
+
+        Fails with assert 0 == 2 before the record_written wiring at the
+        normal-path commit site."""
+        reg, qm = reg_qm
+        sid = "wcw-normal"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            await qm.append(sid, _line("tool:pre", "/ws", {"session_id": sid}))
+            await qm.append(sid, _line("tool:post", "/ws", {"session_id": sid}))
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if (await qm.read_batch(sid, 10)).lines == []:
+                    break
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert reg.pipeline_counters()["written_total"] == 2
+
+    async def test_retry_increments_write_retries(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """A failed flush barrier (transient deadlock proxy) increments
+        write_retries_total on each retry pass before the budget is spent."""
+        reg, qm = reg_qm
+        sid = "wcw-retry"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("DeadlockDetected")
+        )
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            await qm.append(sid, _line("tool:pre", "/ws", {"session_id": sid}))
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            await asyncio.sleep(0.1)  # allow a couple of failed retry passes
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert reg.pipeline_counters()["write_retries_total"] >= 1
+
+    async def test_exhausted_batch_per_line_success_increments_written(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """During linear poison isolation, each line that flushes successfully
+        increments written_total by 1; the dead-lettered poison line does not.
+        For [good1, poison, good2] -> written_total == 2."""
+        reg, qm = reg_qm
+        sid = "wcw-exhausted"
+
+        fake = _AccumBufferGraph()
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph = fake  # type: ignore[assignment]
+
+        async def _process(w: object, event: str, data: object, h: object) -> None:
+            fake.buffer.add(event)
+
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event", side_effect=_process
+        ):
+            await qm.append(sid, _line("good1", "/ws", {"session_id": sid}))
+            await qm.append(sid, _line("poison", "/ws", {"session_id": sid}))
+            await qm.append(sid, _line("good2", "/ws", {"session_id": sid}))
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            for _ in range(400):
+                await asyncio.sleep(0.01)
+                if (await qm.read_batch(sid, 10)).lines == []:
+                    break
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert reg.pipeline_counters()["written_total"] == 2
+
+    async def test_finalize_tail_commit_increments_written(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """_finalize_session drains a tail line, flushes, commits, and records
+        it: written_total == 1 after a single tail line is finalized."""
+        reg, qm = reg_qm
+        sid = "wcw-finalize"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            await qm.append(sid, _line("tail_event", "/ws", {"session_id": sid}))
+            await reg._finalize_session(worker, handlers={})
+
+        assert reg.pipeline_counters()["written_total"] == 1
