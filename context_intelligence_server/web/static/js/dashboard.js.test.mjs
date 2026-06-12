@@ -190,3 +190,107 @@ describe('dashboard.js pipeline health hint (C2)', () => {
     );
   });
 });
+
+// Queues tab wiring (C2 re-arch)
+
+describe('dashboard.js Queues tab wiring (C2 re-arch)', () => {
+  test('imports the queues panel from ./queues-panel.js', () => {
+    assert.ok(
+      jsSource.includes("from './queues-panel.js'"),
+      'dashboard.js should import from ./queues-panel.js'
+    );
+    assert.ok(
+      jsSource.includes('renderQueues') &&
+        jsSource.includes('fetchDeadLetters') &&
+        jsSource.includes('renderDeadLetters'),
+      'dashboard.js should import renderQueues/fetchDeadLetters/renderDeadLetters'
+    );
+  });
+
+  test('does NOT import or use a tabView helper (inline switching — T-A)', () => {
+    assert.ok(
+      !jsSource.includes('tabView'),
+      'dashboard.js must switch tabs inline, with no tabView helper'
+    );
+  });
+
+  test('refresh() passes the WHOLE status to renderQueues(data)', () => {
+    assert.ok(
+      jsSource.includes('renderQueues(data)'),
+      'refresh() should call renderQueues(data) with the whole status object'
+    );
+  });
+
+  test('panel extracts .metrics (whole-status binding documented/used)', () => {
+    assert.ok(
+      jsSource.includes('.metrics'),
+      'dashboard.js should reference .metrics (panel extracts metrics from status)'
+    );
+  });
+
+  test('tracks activeTab state', () => {
+    assert.ok(
+      jsSource.includes('activeTab'),
+      'dashboard.js should track an activeTab variable'
+    );
+  });
+
+  test('defines an inline setTab(name) switcher', () => {
+    assert.ok(
+      /function setTab\s*\(/.test(jsSource) || /setTab\s*=\s*\(/.test(jsSource) ||
+        jsSource.includes('setTab('),
+      'dashboard.js should define an inline setTab(name) switcher'
+    );
+  });
+
+  test('setTab toggles both panels (overview + queues)', () => {
+    assert.ok(
+      jsSource.includes('panel-overview') && jsSource.includes('panel-queues'),
+      'setTab should toggle #panel-overview and #panel-queues'
+    );
+  });
+
+  test('setTab updates aria-selected and active class', () => {
+    assert.ok(
+      jsSource.includes('aria-selected'),
+      'setTab should set aria-selected on the tab buttons'
+    );
+    assert.ok(
+      jsSource.includes("classList.toggle('active'"),
+      'setTab should toggle the active class on the tab buttons'
+    );
+  });
+
+  test('dead-letter fetch is gated on activeTab === "queues"', () => {
+    assert.ok(
+      jsSource.includes("activeTab === 'queues'"),
+      'dead-letter fetch should be gated on activeTab === queues'
+    );
+    assert.ok(
+      jsSource.includes('fetchDeadLetters(') && jsSource.includes('renderDeadLetters('),
+      'refresh() should call fetchDeadLetters() and renderDeadLetters() when on the queues tab'
+    );
+  });
+
+  test('wires dead-letter actions and the hint-go-queues shortcut', () => {
+    assert.ok(
+      jsSource.includes('wireDeadLetterActions('),
+      'dashboard.js should call wireDeadLetterActions(...)'
+    );
+    assert.ok(
+      jsSource.includes('hint-go-queues'),
+      'dashboard.js should wire the hint-go-queues shortcut to the queues tab'
+    );
+  });
+
+  test('onAuthLost re-shows the single centered auth overlay', () => {
+    assert.ok(
+      jsSource.includes('onAuthLost'),
+      'dashboard.js should define an onAuthLost handler'
+    );
+    assert.ok(
+      jsSource.includes('auth-overlay'),
+      'onAuthLost should reference the auth-overlay element'
+    );
+  });
+});

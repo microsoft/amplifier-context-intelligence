@@ -1,4 +1,5 @@
 import { fetchStatus, postCypher } from './api.js';
+import { renderQueues, fetchDeadLetters, renderDeadLetters, renderDeadLetterError, wireDeadLetterActions } from './queues-panel.js';
 
 function timeAgo(ts) {
   if (!ts) return '-';
@@ -68,6 +69,40 @@ function toggleDetail(sessionId, workspace, row) {
 }
 
 // ── Status polling ────────────────────────────────────────────────────────
+let activeTab = 'overview';
+
+function onAuthLost() {
+  try { localStorage.removeItem('ci_api_key'); } catch { /* storage unavailable */ }
+  const overlay = document.getElementById('auth-overlay');
+  if (overlay) overlay.style.display = '';
+}
+
+function setTab(name) {
+  activeTab = name;
+  const queues = name === 'queues';
+  const panelOverview = document.getElementById('panel-overview');
+  if (panelOverview) panelOverview.hidden = queues;
+  const panelQueues = document.getElementById('panel-queues');
+  if (panelQueues) panelQueues.hidden = !queues;
+  const tabOverview = document.getElementById('tab-overview');
+  if (tabOverview) {
+    tabOverview.classList.toggle('active', !queues);
+    tabOverview.setAttribute('aria-selected', String(!queues));
+  }
+  const tabQueues = document.getElementById('tab-queues');
+  if (tabQueues) {
+    tabQueues.classList.toggle('active', queues);
+    tabQueues.setAttribute('aria-selected', String(queues));
+  }
+  window.scrollTo(0, 0);
+  if (queues) refresh();
+}
+
+document.getElementById('tab-overview')?.addEventListener('click', () => setTab('overview'));
+document.getElementById('tab-queues')?.addEventListener('click', () => setTab('queues'));
+document.getElementById('hint-go-queues')?.addEventListener('click', () => setTab('queues'));
+wireDeadLetterActions({ onAuthLost });
+
 async function refresh() {
   try {
     const data = await fetchStatus();
@@ -130,6 +165,17 @@ async function refresh() {
     if (hintDead) {
       hintDead.style.display = hint.deadVisible ? 'inline-flex' : 'none';
       hintDead.textContent = hint.deadText;
+    }
+
+    renderQueues(data);
+    if (activeTab === 'queues') {
+      try {
+        const dl = await fetchDeadLetters();
+        renderDeadLetters(dl.dead_letters || []);
+      } catch (err) {
+        if (err && err.status === 401) onAuthLost();
+        else renderDeadLetterError();
+      }
     }
   } catch (err) {
     console.error('Status refresh failed:', err);
