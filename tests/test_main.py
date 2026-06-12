@@ -1156,3 +1156,15 @@ async def test_status_includes_metrics_block(client: httpx.AsyncClient) -> None:
     assert "oldest_unflushed_age" not in metrics
     assert "per_key" not in metrics
     assert "dead_letters" not in data
+
+
+# ---------------------------------------------------------------------------
+# /queues observability page (C2)
+# ---------------------------------------------------------------------------
+
+
+async def test_queues_page_returns_html(client: httpx.AsyncClient) -> None:
+    response = await client.get("/queues")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "invariant-card" in response.text
