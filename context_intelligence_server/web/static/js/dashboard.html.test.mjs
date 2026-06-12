@@ -185,36 +185,106 @@ describe('Auth gate script', () => {
 
 // ── Pipeline health hint (C2) ──────────────────────────────────────────────
 
-describe('Pipeline health hint (C2)', () => {
-  test('has a Queues nav link (href="/queues")', () => {
+const indexPath = join(__dir, '../../index.html');
+const indexHtml = readFileSync(indexPath, 'utf-8');
+
+describe('In-dashboard Queues tab (C2)', () => {
+  test('dashboard.html has NO /queues link anywhere', () => {
     assert.ok(
-      html.includes('href="/queues"'),
-      'Should have a nav link to /queues'
+      !html.includes('href="/queues"'),
+      'dashboard.html must not contain any href="/queues" (Queues is now an in-page tab)'
     );
   });
 
-  test('has a health-hint strip', () => {
+  test('index.html has NO /queues link', () => {
     assert.ok(
-      html.includes('class="health-hint"'),
-      'Should have a strip with class="health-hint"'
+      !indexHtml.includes('href="/queues"'),
+      'index.html must not contain any href="/queues"'
     );
   });
 
-  test('health-hint strip contains hint-pill/hint-inqueue/hint-dead ids', () => {
+  test('has a tab bar with role="tablist"', () => {
+    assert.ok(html.includes('class="tab-bar"'), 'Should have a tab bar with class="tab-bar"');
+    const idx = html.indexOf('class="tab-bar"');
+    const open = html.slice(Math.max(0, idx - 120), idx + 120);
+    assert.ok(open.includes('role="tablist"'), 'tab-bar should have role="tablist"');
+  });
+
+  test('has Overview and Queues tab buttons with ids + data-tab', () => {
+    assert.ok(html.includes('id="tab-overview"'), 'Should have id="tab-overview"');
+    assert.ok(html.includes('id="tab-queues"'), 'Should have id="tab-queues"');
+    assert.ok(html.includes('data-tab="overview"'), 'Should have data-tab="overview"');
+    assert.ok(html.includes('data-tab="queues"'), 'Should have data-tab="queues"');
+  });
+
+  test('Queues tab button has role=tab + aria-controls=panel-queues + aria-selected', () => {
+    const idx = html.indexOf('id="tab-queues"');
+    assert.ok(idx !== -1, 'tab-queues must exist');
+    const open = html.slice(Math.max(0, idx - 160), idx + 200);
+    assert.ok(open.includes('role="tab"'), 'tab-queues should have role="tab"');
+    assert.ok(open.includes('aria-controls="panel-queues"'), 'tab-queues should have aria-controls="panel-queues"');
+    assert.ok(open.includes('aria-selected'), 'tab-queues should have aria-selected');
+  });
+
+  test('has #panel-overview and #panel-queues tabpanels', () => {
+    assert.ok(html.includes('id="panel-overview"'), 'Should have id="panel-overview"');
+    assert.ok(html.includes('id="panel-queues"'), 'Should have id="panel-queues"');
+  });
+
+  test('Queues panel is hidden by default', () => {
+    const idx = html.indexOf('id="panel-queues"');
+    assert.ok(idx !== -1, 'panel-queues must exist');
+    const open = html.slice(Math.max(0, idx - 160), idx + 160);
+    assert.ok(open.includes('hidden'), 'panel-queues should carry the hidden attribute by default');
+  });
+
+  test('stat chips stay outside panels: #neo4j-status appears before #panel-overview (D-3)', () => {
+    const statsIdx = html.indexOf('id="neo4j-status"');
+    const panelIdx = html.indexOf('id="panel-overview"');
+    assert.ok(statsIdx !== -1, 'neo4j-status must exist');
+    assert.ok(panelIdx !== -1, 'panel-overview must exist');
+    assert.ok(
+      statsIdx < panelIdx,
+      'neo4j-status (global stat chips) must appear before panel-overview so it shows on both tabs'
+    );
+  });
+
+  test('Queues panel carries invariant + totals + dead-letter ids', () => {
+    for (const id of ['invariant-card', 'invariant-eq', 'invariant-badge', 'totals-row', 'dead-letter-body']) {
+      assert.ok(html.includes(`id="${id}"`), `Should have id="${id}"`);
+    }
+  });
+
+  test('health-hint strip is present with hint ids', () => {
+    assert.ok(html.includes('class="health-hint"'), 'Should have class="health-hint"');
     assert.ok(html.includes('id="hint-pill"'), 'Should have id="hint-pill"');
     assert.ok(html.includes('id="hint-inqueue"'), 'Should have id="hint-inqueue"');
     assert.ok(html.includes('id="hint-dead"'), 'Should have id="hint-dead"');
   });
 
-  test('health-hint strip is an accessible live region', () => {
+  test('health-hint stays inside the Overview panel (between panel-overview and panel-queues)', () => {
+    const overviewIdx = html.indexOf('id="panel-overview"');
+    const hintIdx = html.indexOf('class="health-hint"');
+    const queuesIdx = html.indexOf('id="panel-queues"');
+    assert.ok(overviewIdx !== -1 && hintIdx !== -1 && queuesIdx !== -1, 'all three anchors must exist');
+    assert.ok(
+      overviewIdx < hintIdx && hintIdx < queuesIdx,
+      'health-hint should live inside the Overview panel'
+    );
+  });
+
+  test('health-hint is an accessible live region', () => {
     const idx = html.indexOf('class="health-hint"');
     assert.ok(idx !== -1, 'health-hint strip must exist');
-    // Inspect the opening tag of the strip
-    const open = html.slice(Math.max(0, idx - 100), idx + 100);
+    const open = html.slice(Math.max(0, idx - 120), idx + 120);
     assert.ok(
       /role="status"[^>]*aria-live="polite"|aria-live="polite"[^>]*role="status"/.test(open),
       'health-hint strip should have role="status" and aria-live="polite"'
     );
+  });
+
+  test('health-hint Queues affordance is a tab-switch button id="hint-go-queues" (not a link)', () => {
+    assert.ok(html.includes('id="hint-go-queues"'), 'Should have a tab-switch button id="hint-go-queues"');
   });
 
   test('hint-pill span has no literal dot glyph (fix C: .pill::before draws it)', () => {
@@ -223,5 +293,13 @@ describe('Pipeline health hint (C2)', () => {
     const slice = html.slice(idx, idx + 80);
     assert.ok(!slice.includes('●'), 'hint-pill should not contain a literal ● glyph');
     assert.ok(!/\u25CF/i.test(slice), 'hint-pill should not contain a literal U+25CF glyph');
+  });
+
+  test('all four dashboard tables are wrapped in .table-scroll (D-2)', () => {
+    const scrollCount = (html.match(/class="[^"]*\btable-scroll\b[^"]*"/g) || []).length;
+    assert.ok(
+      scrollCount >= 4,
+      `Expected at least 4 .table-scroll wrappers (Active/Completed/Recent/Dead-letter), found ${scrollCount}`
+    );
   });
 });

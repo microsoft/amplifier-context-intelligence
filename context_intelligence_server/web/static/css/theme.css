@@ -489,4 +489,43 @@ a, button { transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1); }
 
 @media (prefers-reduced-motion: reduce) {
   .btn { transition: none; }
+  .tab { transition: none; }
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Two-tab dashboard (Overview | Queues) — C2
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Tab bar ── */
+.tab-bar {
+  display: flex;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1.5rem;
+}
+/* D-1: explicit 0.8rem — `font: inherit` rendered the body's 1rem, oversizing tabs */
+.tab {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted-foreground);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 0.5rem 0.9rem;
+  margin-bottom: -1px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.tab:hover { color: var(--foreground); }
+/* Teal-underline active idiom — distinct from the grey topnav pill buttons */
+.tab.active {
+  color: var(--foreground);
+  border-bottom-color: var(--primary);
+}
+.tab:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+
+/* D-4: kill the ~3.25rem dead space above the first label in the Queues tab */
+.tab-panel > .section-label:first-child { margin-top: 0.5rem; }
+
+/* D-2: keep table headers on one line; .table-scroll gives the overflow escape hatch */
+.data-table th { white-space: nowrap; }
