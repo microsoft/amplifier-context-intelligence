@@ -81,6 +81,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # session that still has an undrained, complete line. The workspace is
     # parsed from that session's FIRST log line so the respawned worker is
     # bound to the same workspace it was originally created with.
+    #
+    # Conservation-counter recovery runs FIRST, and its two steps are
+    # order-load-bearing: reconcile MUST precede seed. recovery_reconcile_dead
+    # advances committed offsets past already-dead pending lines so the
+    # dead-letter counts are settled; only then does recovery_seed_counts read
+    # disk to reconstruct the accepted/written baseline. Seeding before
+    # reconciling would leave a residual==1 false DEGRADED. Both run before the
+    # respawn loop so the respawned drainers start from a conserved baseline.
+    await registry.queue_manager.recovery_reconcile_dead()
+    _accepted_seed, _written_seed = await registry.queue_manager.recovery_seed_counts()
+    registry.seed_counters(_accepted_seed, _written_seed)
     recovered = await registry.queue_manager.recover()
     respawned = 0
     for sid in recovered:
@@ -122,6 +133,10 @@ app.include_router(skills_router)
 app.include_router(version_router)
 _start_time = time.time()
 registry = SessionRegistry()
+# Expose the registry singleton on app.state so routers can read it via
+# request.app.state.registry instead of importing the module-level name
+# (avoids a circular import between main and the routers package).
+app.state.registry = registry
 idempotency_cache = EventIdempotencyCache()
 
 # Session-less events are keyed by a per-workspace sentinel stem so that events

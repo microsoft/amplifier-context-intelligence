@@ -1003,6 +1003,49 @@ async def test_lifespan_skips_recovery_for_empty_workspace(
     assert spawned == []
 
 
+async def test_registry_exposed_on_app_state() -> None:
+    """The module registry singleton is exposed on app.state for routers.
+
+    Routers read the singleton via request.app.state.registry rather than
+    importing the module-level name (avoids a circular import).
+    """
+    assert main_module.app.state.registry is main_module.registry
+
+
+async def test_lifespan_seeds_counters_from_disk(tmp_path: Path) -> None:
+    """A fresh registry reusing a queue dir seeds conservation counters to a
+    zero residual: 1 committed + 1 pending line yields accepted=2, written=1,
+    in_queue=1, residual=0 after reconcile -> seed_counts -> seed_counters.
+    """
+    from context_intelligence_server.queue_manager import QueueManager
+    from context_intelligence_server.registry import SessionRegistry
+
+    # Seed a queue dir with one committed line and one still-pending line.
+    seed_qm = QueueManager(queues_dir=tmp_path)
+    sid = "sess-seed"
+    line1 = json.dumps({"event": "a", "workspace": "/ws", "data": {}}).encode("utf-8")
+    line2 = json.dumps({"event": "b", "workspace": "/ws", "data": {}}).encode("utf-8")
+    await seed_qm.append(sid, line1)
+    await seed_qm.append(sid, line2)
+    committed = len(line1) + 1  # +1 for the appended trailing newline
+    await seed_qm.commit(sid, committed)
+
+    # Fresh registry reusing the same on-disk queue dir.
+    reg = SessionRegistry()
+    reg._queue_manager = QueueManager(queues_dir=tmp_path)
+
+    # Production order: reconcile dead lines BEFORE seeding the counts.
+    await reg.queue_manager.recovery_reconcile_dead()
+    accepted_seed, written_seed = await reg.queue_manager.recovery_seed_counts()
+    reg.seed_counters(accepted_seed, written_seed)
+
+    metrics = await reg.pipeline_metrics()
+    assert metrics["accepted_total"] == 2
+    assert metrics["written_total"] == 1
+    assert metrics["in_queue_total"] == 1
+    assert metrics["residual"] == 0
+
+
 def test_validate_single_worker_trips_on_effective_web_concurrency(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
