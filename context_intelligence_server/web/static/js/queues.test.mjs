@@ -309,3 +309,16 @@ describe('queues.html source', () => {
     assert.ok(html.includes('class="table-scroll"'), 'dead-letter table must be wrapped in .table-scroll');
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────────
+// index.html nav — landing page topnav must link to /queues (before API).
+// Test lives in web/static/js/, so ../../index.html resolves to web/index.html.
+// ───────────────────────────────────────────────────────────────────────────
+
+describe('index.html nav', () => {
+  const html = readFileSync(new URL('../../index.html', import.meta.url), 'utf8');
+
+  test('index.html topnav must link to /queues', () => {
+    assert.ok(html.includes('href="/queues"'), 'index.html topnav must link to /queues');
+  });
+});
