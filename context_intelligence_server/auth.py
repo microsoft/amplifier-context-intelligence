@@ -13,7 +13,6 @@ _EXEMPT_PATHS: frozenset[str] = frozenset(
         "/logs/stream",
         "/",
         "/dashboard",
-        "/queues",
         "/docs",
         "/openapi.json",
     }

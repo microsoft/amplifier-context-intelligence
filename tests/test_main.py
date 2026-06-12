@@ -1159,29 +1159,8 @@ async def test_status_includes_metrics_block(client: httpx.AsyncClient) -> None:
 
 
 # ---------------------------------------------------------------------------
-# /queues observability page (C2)
+# /queues/* data endpoints stay authenticated (C1; survives the C2 page removal)
 # ---------------------------------------------------------------------------
-
-
-async def test_queues_page_returns_html(client: httpx.AsyncClient) -> None:
-    response = await client.get("/queues")
-    assert response.status_code == 200
-    assert "text/html" in response.headers["content-type"]
-    assert "invariant-card" in response.text
-
-
-# ---------------------------------------------------------------------------
-# /queues auth exemption (C2) — middleware-level via auth_client
-# ---------------------------------------------------------------------------
-
-
-async def test_queues_page_exempt_from_auth(auth_client: httpx.AsyncClient) -> None:
-    """The /queues PAGE must load through the auth middleware without a token,
-    so its in-page auth overlay can prompt for a key."""
-    response = await auth_client.get("/queues")
-    assert response.status_code == 200
-    assert "text/html" in response.headers["content-type"]
-    assert "invariant-card" in response.text
 
 
 async def test_queues_data_endpoint_still_requires_auth(

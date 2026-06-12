@@ -176,11 +176,6 @@ async def dashboard() -> FileResponse:
     return FileResponse(_WEB_DIR / "dashboard.html")
 
 
-@app.get("/queues", response_class=HTMLResponse)
-async def queues_page() -> FileResponse:
-    return FileResponse(_WEB_DIR / "queues.html")
-
-
 @app.get("/status")
 async def get_status(request: Request) -> dict[str, Any]:
     response = build_status_response(registry, _start_time)
