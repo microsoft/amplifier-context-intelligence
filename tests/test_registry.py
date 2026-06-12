@@ -1243,3 +1243,48 @@ class TestHandlerErrorClose:
         assert json.loads(dead[0]["payload"])["event"] == "tool:pre"
         # Offset advanced past the dead-lettered line — the batch is accounted for.
         assert (await qm.read_batch(sid, 10)).lines == []
+
+
+# ---------------------------------------------------------------------------
+# Task 5 (D2): live conservation counters on SessionRegistry. These feed the
+# pipeline-conservation snapshot in /status so silently-dropped events become
+# observable (accepted vs written vs replayed, plus write retries).
+# ---------------------------------------------------------------------------
+
+
+class TestPipelineCounters:
+    def test_counters_start_at_zero(self) -> None:
+        """A fresh registry reports all four conservation counters at zero."""
+        reg = SessionRegistry()
+        counters = reg.pipeline_counters()
+        assert counters == {
+            "accepted_total": 0,
+            "written_total": 0,
+            "replayed_total": 0,
+            "write_retries_total": 0,
+        }
+
+    def test_record_methods(self) -> None:
+        """record_* methods increment their respective counters."""
+        reg = SessionRegistry()
+        reg.record_accepted()  # default n=1
+        reg.record_accepted()  # default n=1 -> accepted == 2
+        reg.record_written(3)
+        reg.record_replayed(2)
+        reg.record_write_retry()
+
+        counters = reg.pipeline_counters()
+        assert counters["accepted_total"] == 2
+        assert counters["written_total"] == 3
+        assert counters["replayed_total"] == 2
+        assert counters["write_retries_total"] == 1
+
+    def test_seed_counters_adds(self) -> None:
+        """seed_counters ADDS a crash-recovery baseline (does not replace)."""
+        reg = SessionRegistry()
+        reg.record_accepted()  # accepted == 1
+        reg.seed_counters(accepted=10, written=7)
+
+        counters = reg.pipeline_counters()
+        assert counters["accepted_total"] == 11
+        assert counters["written_total"] == 7

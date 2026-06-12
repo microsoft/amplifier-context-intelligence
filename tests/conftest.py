@@ -117,6 +117,12 @@ def reset_registry() -> Generator[None, None, None]:
     # queues dir (the module-level registry is constructed once at import).
     registry._queue_manager = None
     registry._write_semaphore = None
+    # Zero the live pipeline-conservation counters on the shared singleton so
+    # each test starts from a clean conservation baseline (D2).
+    registry._accepted_total = 0
+    registry._written_total = 0
+    registry._replayed_total = 0
+    registry._write_retries_total = 0
     yield
     # Explicitly cancel running drain tasks before clearing so teardown intent is clear
     for w in list(registry._workers.values()):

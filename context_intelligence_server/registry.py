@@ -60,6 +60,15 @@ class SessionRegistry:
         self._queue_manager: QueueManager | None = None
         self._write_semaphore: asyncio.Semaphore | None = None
         self._max_delivery_attempts: int = 0
+        # Live pipeline-conservation counters (D2): make silently-dropped
+        # events observable via /status. accepted = events admitted to the
+        # log; written = events persisted to Neo4j; replayed = events
+        # re-driven from the log on recovery; write_retries = transient
+        # write retries attempted by the drainer.
+        self._accepted_total: int = 0
+        self._written_total: int = 0
+        self._replayed_total: int = 0
+        self._write_retries_total: int = 0
 
     def _ensure_infra(self) -> None:
         """Build the shared QueueManager + write semaphore on first use.
@@ -87,6 +96,42 @@ class SessionRegistry:
         self._ensure_infra()
         assert self._write_semaphore is not None
         return self._write_semaphore
+
+    def record_accepted(self, n: int = 1) -> None:
+        """Count events admitted to the durable log (ingest accepted)."""
+        self._accepted_total += n
+
+    def record_written(self, n: int) -> None:
+        """Count events successfully persisted to Neo4j."""
+        self._written_total += n
+
+    def record_replayed(self, n: int) -> None:
+        """Count events re-driven from the log during recovery."""
+        self._replayed_total += n
+
+    def record_write_retry(self) -> None:
+        """Count a single transient Neo4j-write retry attempt."""
+        self._write_retries_total += 1
+
+    def seed_counters(self, accepted: int, written: int) -> None:
+        """ADD a crash-recovery baseline to the accepted/written counters.
+
+        On startup the server reconstructs how many events were already
+        accepted/written before the crash and seeds those totals so the live
+        conservation snapshot stays correct across restarts. This ADDS to the
+        running counters rather than replacing them.
+        """
+        self._accepted_total += accepted
+        self._written_total += written
+
+    def pipeline_counters(self) -> dict[str, int]:
+        """Snapshot of the live conservation counters (sync, no disk I/O)."""
+        return {
+            "accepted_total": self._accepted_total,
+            "written_total": self._written_total,
+            "replayed_total": self._replayed_total,
+            "write_retries_total": self._write_retries_total,
+        }
 
     async def _process_one(
         self,
