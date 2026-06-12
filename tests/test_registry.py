@@ -1288,3 +1288,76 @@ class TestPipelineCounters:
         counters = reg.pipeline_counters()
         assert counters["accepted_total"] == 11
         assert counters["written_total"] == 7
+
+
+# ---------------------------------------------------------------------------
+# Task 6 (D2/D3): SessionRegistry.pipeline_metrics() assembles the live
+# conservation counters with disk-derived queue/dead aggregates into a single
+# health block (residual + degraded). This is the /status aggregate that makes
+# silent loss observable. LIVE per-process measure (not an all-time audit):
+# finalized logs are deleted by delete_drained, so this is valid only under the
+# single-worker guarantee. oldest_unflushed_age is DEFERRED to C2.
+# ---------------------------------------------------------------------------
+
+
+class TestPipelineMetrics:
+    async def test_metrics_block_shape_and_residual(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """With 2 pending lines, accepted=5/written=3, replayed=1, retry=1:
+        in_queue_total==2, dead_letter_total==0, residual==0 (conserved),
+        degraded False, and oldest_unflushed_age is absent (deferred to C2)."""
+        reg, qm = reg_qm
+        sid = "metrics-shape"
+        # Two complete, uncommitted lines -> in_queue_total == 2.
+        await qm.append(sid, _line("tool:pre", "/ws", {"session_id": sid}))
+        await qm.append(sid, _line("tool:post", "/ws", {"session_id": sid}))
+
+        reg.seed_counters(accepted=5, written=3)
+        reg.record_replayed(1)
+        reg.record_write_retry()
+
+        metrics = await reg.pipeline_metrics()
+
+        assert metrics["accepted_total"] == 5
+        assert metrics["written_total"] == 3
+        assert metrics["replayed_total"] == 1
+        assert metrics["write_retries_total"] == 1
+        assert metrics["in_queue_total"] == 2
+        assert metrics["dead_letter_total"] == 0
+        assert metrics["residual"] == 0
+        assert metrics["degraded"] is False
+        assert "oldest_unflushed_age" not in metrics
+
+    async def test_nonzero_residual_is_degraded(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """accepted=4/written=1 with no pending and no dead -> residual==3
+        (events neither written nor queued nor dead): degraded True."""
+        reg, _qm = reg_qm
+        reg.seed_counters(accepted=4, written=1)
+
+        metrics = await reg.pipeline_metrics()
+
+        assert metrics["in_queue_total"] == 0
+        assert metrics["dead_letter_total"] == 0
+        assert metrics["residual"] == 3
+        assert metrics["degraded"] is True
+
+    async def test_dead_letters_force_degraded_even_at_zero_residual(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """1 dead letter + accepted=1/written=0: residual==0 (accounted for by
+        the dead letter), but a nonzero dead_letter_total still forces
+        degraded True."""
+        reg, qm = reg_qm
+        sid = "metrics-dead"
+        await qm.dead_letter(sid, _line("bad", "/ws", {"session_id": sid}), "boom")
+
+        reg.seed_counters(accepted=1, written=0)
+
+        metrics = await reg.pipeline_metrics()
+
+        assert metrics["residual"] == 0
+        assert metrics["dead_letter_total"] == 1
+        assert metrics["degraded"] is True

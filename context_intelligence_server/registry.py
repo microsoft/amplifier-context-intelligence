@@ -133,6 +133,55 @@ class SessionRegistry:
             "write_retries_total": self._write_retries_total,
         }
 
+    async def pipeline_metrics(self) -> dict[str, Any]:
+        """Assemble the pipeline-conservation health block for /status (D2/D3).
+
+        Combines the live in-memory counters (pipeline_counters) with the
+        disk-derived queue/dead aggregate (queue_manager.derive_all_stats) into
+        a single conservation view. The residual is the count of accepted
+        events that are neither persisted, nor still queued, nor dead-lettered:
+
+            residual = accepted - written - in_queue - dead
+
+        A nonzero residual means events were silently dropped; ``degraded`` is
+        True whenever the residual is nonzero OR any line has been dead-lettered
+        (dead letters are accounted-for losses, but still a degraded state).
+
+        IMPORTANT caveats:
+        - This is a LIVE per-process measure, not an all-time audit. Finalized
+          session logs are deleted by ``delete_drained``, so their accepted /
+          written / in_queue contributions leave the disk-derived aggregate.
+          The in-memory accepted/written counters persist, so the residual
+          stays conserved for the lifetime of the process (seeded across
+          restarts via ``seed_counters``).
+        - It is only valid under the single-worker (single-process) guarantee:
+          one writer owns the counters and the on-disk queues.
+        - ``write_retries_total`` is the transient/deadlock proxy — the closest
+          observable signal for retried (e.g. DeadlockDetected) writes.
+        - ``deadlock_detected_total`` and ``events_failed_total`` are
+          intentionally omitted: neither is cleanly trackable at this layer.
+        - ``oldest_unflushed_age`` is DEFERRED to C2 and is intentionally
+          absent from this block.
+        """
+        agg = await self.queue_manager.derive_all_stats()
+        counters = self.pipeline_counters()
+        in_queue = agg["in_queue_total"]
+        dead = agg["dead_total"]
+        residual = (
+            counters["accepted_total"] - counters["written_total"] - in_queue - dead
+        )
+        degraded = residual != 0 or dead > 0
+        return {
+            "accepted_total": counters["accepted_total"],
+            "written_total": counters["written_total"],
+            "replayed_total": counters["replayed_total"],
+            "write_retries_total": counters["write_retries_total"],
+            "in_queue_total": in_queue,
+            "dead_letter_total": dead,
+            "residual": residual,
+            "degraded": degraded,
+        }
+
     async def _process_one(
         self,
         worker: SessionWorker,
