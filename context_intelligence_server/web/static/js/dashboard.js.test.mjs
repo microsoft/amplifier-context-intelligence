@@ -121,3 +121,72 @@ describe('dashboard.js neo4j status DOM update (behavioral)', () => {
     );
   });
 });
+
+// Pipeline health hint (C2)
+
+describe('dashboard.js pipeline health hint (C2)', () => {
+  test('exports a pure computeHint(metrics) helper', () => {
+    assert.ok(
+      jsSource.includes('export function computeHint('),
+      'dashboard.js should export a computeHint(metrics) function'
+    );
+  });
+
+  test('uses "Pipeline OK" pill text for healthy state', () => {
+    assert.ok(
+      jsSource.includes('Pipeline OK'),
+      'computeHint should produce "Pipeline OK" pill text when not degraded'
+    );
+  });
+
+  test('uses "DEGRADED" pill text for degraded state', () => {
+    assert.ok(
+      jsSource.includes('DEGRADED'),
+      'computeHint should produce "DEGRADED" pill text when degraded'
+    );
+  });
+
+  test('uses "pill degraded" class for degraded state', () => {
+    assert.ok(
+      jsSource.includes('pill degraded'),
+      'computeHint should produce "pill degraded" class when degraded'
+    );
+  });
+
+  test('does NOT prepend a literal dot glyph to pill text (fix C: .pill::before draws the dot)', () => {
+    assert.ok(
+      !jsSource.includes('\u25cf Pipeline OK'),
+      'pill text must not contain a literal glyph before "Pipeline OK"'
+    );
+    assert.ok(
+      !jsSource.includes('\u25cf DEGRADED'),
+      'pill text must not contain a literal glyph before "DEGRADED"'
+    );
+  });
+
+  test('refresh() calls computeHint', () => {
+    assert.ok(
+      jsSource.includes('computeHint('),
+      'refresh() should call computeHint'
+    );
+  });
+
+  test('refresh() wires the hint-pill element', () => {
+    assert.ok(jsSource.includes('hint-pill'), 'refresh() should update hint-pill');
+  });
+
+  test('refresh() wires the hint-inqueue element', () => {
+    assert.ok(jsSource.includes('hint-inqueue'), 'refresh() should update hint-inqueue');
+  });
+
+  test('refresh() wires the hint-dead element', () => {
+    assert.ok(jsSource.includes('hint-dead'), 'refresh() should update hint-dead');
+  });
+
+  test('renders "Dead-letter N" badge text', () => {
+    assert.ok(
+      jsSource.includes('Dead-letter '),
+      'computeHint should produce "Dead-letter " badge text'
+    );
+  });
+});

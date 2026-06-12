@@ -21,6 +21,22 @@ function escapeAttr(s) {
     .replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+// Pure pipeline-health hint derivation. Pill text carries NO literal dot
+// glyph — .pill::before draws the dot (fix C).
+export function computeHint(metrics) {
+  const m = metrics || {};
+  const degraded = !!m.degraded;
+  const dead = m.dead_letter_total ?? 0;
+  return {
+    degraded,
+    pillText: degraded ? 'DEGRADED' : 'Pipeline OK',
+    pillClass: degraded ? 'pill degraded' : 'pill',
+    inQueue: m.in_queue_total ?? 0,
+    deadVisible: dead > 0,
+    deadText: `Dead-letter ${dead}`,
+  };
+}
+
 // ── Neo4j row expand ──────────────────────────────────────────────────────
 document.getElementById('completed-body')?.addEventListener('click', e => {
   const row = e.target.closest('tr.clickable');
@@ -104,6 +120,17 @@ async function refresh() {
       `<td>${truncate(e.session_id, 20)}</td><td>${truncate(e.workspace, 28)}</td>` +
       `<td class="${e.result === 'ok' ? 'result-ok' : 'result-error'}">${e.result}</td></tr>`
     ).join('');
+
+    const hint = computeHint(data.metrics || {});
+    const hintPill = document.getElementById('hint-pill');
+    if (hintPill) { hintPill.textContent = hint.pillText; hintPill.className = hint.pillClass; }
+    const hintInQueue = document.getElementById('hint-inqueue');
+    if (hintInQueue) hintInQueue.textContent = hint.inQueue;
+    const hintDead = document.getElementById('hint-dead');
+    if (hintDead) {
+      hintDead.style.display = hint.deadVisible ? 'inline-flex' : 'none';
+      hintDead.textContent = hint.deadText;
+    }
   } catch (err) {
     console.error('Status refresh failed:', err);
   }
