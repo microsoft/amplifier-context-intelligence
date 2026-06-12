@@ -372,3 +372,121 @@ a, button { transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1); }
   max-height: 480px;
   overflow-y: auto;
 }
+
+/* ════════════════════════════════════════════════════════════════
+   C2 — Observability UI (health hint, invariants, action buttons)
+   Tokens only. Folds in design-lens fixes A–G.
+   ════════════════════════════════════════════════════════════════ */
+
+/* ── Health hint strip (links to observability detail) ── */
+.health-hint {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+  padding: 0.75rem 1rem;
+  text-decoration: none;
+  color: var(--muted-foreground);
+  font-size: 0.85rem;
+}
+.health-hint:hover { color: var(--foreground); }
+.health-hint .hint-stat strong { color: var(--foreground); font-weight: 600; }
+.health-hint .hint-arrow { margin-left: auto; color: var(--primary); }
+
+/* Fix F — zero the strip's pill/badge margins so the flex row aligns */
+.health-hint .pill { margin-bottom: 0; }
+.health-hint .badge { margin-left: 0; }
+
+/* Fix C source — the single dot lives on .pill::before (theme.css:364);
+   the degraded modifier flips both dot and text to destructive. */
+.pill.degraded { color: var(--destructive); }
+.pill.degraded::before { background: var(--destructive); }
+
+/* ── Invariant cards ── */
+.invariant {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-bottom: 1.5rem;
+}
+.invariant-legend { font-size: 0.85rem; color: var(--muted-foreground); }
+.invariant-eq {
+  font-family: var(--font-mono);
+  font-size: 1.2rem;
+  font-weight: 600;
+  color: var(--foreground);
+}
+.invariant-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+/* Fix A — .badge is display:none by default (JS-toggled); always-on badges
+   in invariant rows and action result slots must be forced visible. */
+.invariant-row .badge,
+.actions .badge { display: inline-flex; }
+
+/* Fix E — degraded ring LAYERS over the .card frosted drop-shadow
+   (theme.css:117), it does not replace it. */
+.invariant.degraded {
+  box-shadow: 0 0 0 1px var(--destructive),
+              0 24px 80px -50px oklch(0.145 0.005 255 / 40%);
+}
+
+/* Fix D — monospace cells (e.g. worker_key) */
+.mono { font-family: var(--font-mono); }
+
+/* ── Wide tables: horizontal scroll + ellipsis caps ── */
+.table-scroll { overflow-x: auto; }
+.dl-key,
+.dl-error {
+  max-width: 22rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Action buttons (Replay / Purge / confirm) ── */
+.actions {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+.btn {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  padding: 0.45rem 0.9rem;
+  border-radius: 0.6rem; /* Fix G — system small-control scale */
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--foreground);
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+  cursor: pointer;
+}
+.btn:hover { background: var(--muted); }
+.btn:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+.btn-primary {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+.btn-primary:hover { background: color-mix(in oklch, var(--primary) 12%, transparent); }
+.btn-danger {
+  border-color: var(--destructive);
+  color: var(--destructive);
+}
+.btn-danger:hover { background: color-mix(in oklch, var(--destructive) 12%, transparent); }
+.confirm-q { font-size: 0.85rem; color: var(--muted-foreground); }
+
+/* ── Empty-state cells ── */
+.table-empty td { color: var(--muted-foreground); }
+/* Fix B — raise specificity (0-1-1) so the positive empty state renders teal */
+.table-empty td.all-clear { color: var(--primary); font-weight: 500; }
+
+@media (prefers-reduced-motion: reduce) {
+  .btn { transition: none; }
+}
