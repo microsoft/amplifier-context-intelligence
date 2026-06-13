@@ -208,9 +208,7 @@ class TestSnapshotRestore:
 class TestIdempotencyAndDryRunNoop:
     """apply_repair is idempotent; dry-run after a successful apply reports zero."""
 
-    def test_apply_twice_second_is_noop(
-        self, neo4j_container: dict[str, Any]
-    ) -> None:
+    def test_apply_twice_second_is_noop(self, neo4j_container: dict[str, Any]) -> None:
         driver = _driver(neo4j_container)
         try:
             with driver.session() as s:
