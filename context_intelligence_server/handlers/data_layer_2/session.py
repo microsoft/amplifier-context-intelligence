@@ -139,16 +139,12 @@ class SessionHandler:
         parent_id = (data.get("parent_id") or "").strip()
         existing = await self.services.graph.get_node(session_id)
         labels: list[str] = existing.get("labels", []) if existing else []
+        _warn_if_dual_terminal(labels, session_id)
         current_type = _current_type(labels)
 
-        # Always enrich started_at and session identity properties.
-        # IMPORTANT: "Session" MUST be included here so neo4j_store routes this
-        # write to MERGE (n:Session {node_id, workspace}) — the same bucket used
-        # by ensure_session_node.  Without it, the write goes to the label-free
-        # MERGE (n {node_id, workspace}) bucket, which is a DIFFERENT Neo4j
-        # operation.  Under concurrent flushes, both MERGE variants see "no node"
-        # and each creates a separate Neo4j node — two nodes for the same
-        # session_id — which then breaks the uniqueness constraint on flush.
+        # Always enrich started_at and session identity. "Session" MUST be in
+        # labels so neo4j_store routes this to MERGE (n:Session {...}), the same
+        # bucket as ensure_session_node.
         await self.services.graph.upsert_node(
             session_id,
             {
@@ -165,62 +161,31 @@ class SessionHandler:
             session_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
         )
 
-        # ForkedSession: fully terminal — preserve classification, no edge creation
-        if current_type == "ForkedSession":
-            return
-
-        # SubSession: terminal upward — preserve classification, no further changes
-        if current_type == "SubSession":
-            return
-
-        # RootSession + no parent: stable — no reclassification needed
-        if current_type == "RootSession" and not parent_id:
-            return
-
-        # RootSession + parent: reclassify to SubSession, drop RootSession
-        if current_type == "RootSession" and parent_id:
-            await self.services.graph.set_labels(
-                session_id,
-                remove_labels=["RootSession"],
-                add_labels=["SubSession", "SST_EVENT"],
-            )
-            await self.services.ensure_session_node(parent_id, {})
-            await self.services.graph.upsert_edge(
-                parent_id,
-                session_id,
-                {
-                    "type": "HAS_SUBSESSION",
-                    "sst_semantic": "LEADS_TO",
-                    "occurred_at": timestamp,
-                },
-            )
-            return
-
-        # bare + parent: add SubSession (include Session base label for new nodes)
-        if parent_id:
-            await self.services.graph.set_labels(
-                session_id,
-                remove_labels=[],
-                add_labels=["Session", "SubSession", "SST_EVENT"],
-            )
-            await self.services.ensure_session_node(parent_id, {})
-            await self.services.graph.upsert_edge(
-                parent_id,
-                session_id,
-                {
-                    "type": "HAS_SUBSESSION",
-                    "sst_semantic": "LEADS_TO",
-                    "occurred_at": timestamp,
-                },
-            )
-            return
-
-        # bare + no parent: add RootSession (include Session base label for new nodes)
-        await self.services.graph.set_labels(
-            session_id,
-            remove_labels=[],
-            add_labels=["RootSession", "Session", "SST_EVENT"],
+        # Label decision is owned by the state machine.
+        transition = self._label_machine.classify(
+            current_type, "start", bool(parent_id)
         )
+        if transition.add or transition.remove:
+            await self.services.graph.set_labels(
+                session_id,
+                remove_labels=transition.remove,
+                add_labels=transition.add,
+            )
+
+        # Edge rule: a session becoming a SubSession under a parent gets a
+        # HAS_SUBSESSION edge. Covers both Root->Sub and bare->Sub. Root (no
+        # parent) and the terminal no-ops create no edge.
+        if "SubSession" in transition.add and parent_id:
+            await self.services.ensure_session_node(parent_id, {})
+            await self.services.graph.upsert_edge(
+                parent_id,
+                session_id,
+                {
+                    "type": "HAS_SUBSESSION",
+                    "sst_semantic": "LEADS_TO",
+                    "occurred_at": timestamp,
+                },
+            )
 
     async def _handle_fork(
         self,
