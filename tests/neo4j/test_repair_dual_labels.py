@@ -14,6 +14,8 @@ defined here.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from neo4j import GraphDatabase
 
@@ -98,3 +100,31 @@ def _edge_count(session, rel: str, child_id: str) -> int:
     if record is None:
         return 0
     return int(record["cnt"])
+
+
+from scripts import repair_dual_labels as repair  # noqa: E402
+
+
+@pytest.mark.neo4j
+class TestDryRun:
+    """Dry-run reports counts and session_ids and mutates nothing."""
+
+    def test_dry_run_reports_and_does_not_mutate(
+        self, neo4j_container: dict[str, Any]
+    ) -> None:
+        driver = _driver(neo4j_container)
+        try:
+            with driver.session() as s:
+                _seed_dual_node(s, "child-a", "parent-a")
+                _seed_dual_node(s, "child-b", "parent-b")
+                report = repair.count_dual(s, WORKSPACE)
+                assert report["node_count"] == 2
+                assert report["edge_count"] == 2
+                assert sorted(report["session_ids"]) == ["child-a", "child-b"]
+            # assert nothing changed
+            with driver.session() as s:
+                assert "SubSession" in _labels(s, "child-a")
+                assert "ForkedSession" in _labels(s, "child-a")
+                assert _edge_count(s, "HAS_SUBSESSION", "child-a") == 1
+        finally:
+            driver.close()
