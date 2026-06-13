@@ -16,7 +16,9 @@ from typing import Any
 import pytest
 
 from context_intelligence_server.handlers.data_layer_2.session import (
+    LabelTransition,
     SessionHandler,
+    SessionLabelStateMachine,
     _TYPE_LABELS,
     _current_type,
 )
@@ -1939,3 +1941,68 @@ class TestSessionHandlerUsesSessionLabeledMerge:
         assert "Session" in enriched.get("labels", []), (
             "'Session' label must survive session:start enrichment of the stub"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestClassifyMatrix — exhaustive unit matrix for SessionLabelStateMachine.classify()
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyMatrix:
+    """Exhaustive unit matrix for SessionLabelStateMachine.classify().
+
+    21 cells covering all (event, current_type, has_parent) combinations.
+    Pure unit test — no fixtures, no Neo4j.
+    The test fails at collection with ImportError because LabelTransition
+    and SessionLabelStateMachine do not yet exist.  This IS the RED.
+    """
+
+    CASES: list[tuple[str, str | None, bool, list[str], list[str]]] = [
+        # (event, current_type, has_parent, add, remove)
+        # ------------------------------------------------------------------
+        # event=start
+        # ------------------------------------------------------------------
+        ("start", "ForkedSession", True,  [],                                    []),
+        ("start", "ForkedSession", False, [],                                    []),
+        ("start", "SubSession",    True,  [],                                    []),
+        ("start", "SubSession",    False, [],                                    []),
+        ("start", "RootSession",   False, [],                                    []),
+        ("start", "RootSession",   True,  ["SubSession", "SST_EVENT"],           ["RootSession"]),
+        ("start", None,            True,  ["Session", "SubSession", "SST_EVENT"], []),
+        ("start", None,            False, ["RootSession", "Session", "SST_EVENT"], []),
+        # ------------------------------------------------------------------
+        # event=fork
+        # ------------------------------------------------------------------
+        ("fork",  "ForkedSession", True,  [],                                    []),
+        ("fork",  "ForkedSession", False, [],                                    []),
+        ("fork",  "RootSession",   True,  ["ForkedSession", "SST_EVENT"],        ["RootSession"]),
+        ("fork",  "RootSession",   False, ["ForkedSession", "SST_EVENT"],        ["RootSession"]),
+        ("fork",  "SubSession",    True,  ["ForkedSession", "SST_EVENT"],        ["SubSession"]),
+        ("fork",  "SubSession",    False, ["ForkedSession", "SST_EVENT"],        ["SubSession"]),
+        ("fork",  None,            True,  ["Session", "ForkedSession", "SST_EVENT"], []),
+        ("fork",  None,            False, ["Session", "ForkedSession", "SST_EVENT"], []),
+        # ------------------------------------------------------------------
+        # event=end
+        # ------------------------------------------------------------------
+        ("end",   None,            True,  ["SubSession", "SST_EVENT"],           []),
+        ("end",   None,            False, ["RootSession", "SST_EVENT"],          []),
+        ("end",   "RootSession",   True,  [],                                    []),
+        ("end",   "SubSession",    False, [],                                    []),
+        ("end",   "ForkedSession", True,  [],                                    []),
+    ]
+
+    @pytest.mark.parametrize(
+        "event, current_type, has_parent, add, remove",
+        CASES,
+    )
+    def test_classify_cell(
+        self,
+        event: str,
+        current_type: str | None,
+        has_parent: bool,
+        add: list[str],
+        remove: list[str],
+    ) -> None:
+        sm = SessionLabelStateMachine()
+        t = sm.classify(current_type=current_type, event=event, has_parent=has_parent)
+        assert t == LabelTransition(add=add, remove=remove)
