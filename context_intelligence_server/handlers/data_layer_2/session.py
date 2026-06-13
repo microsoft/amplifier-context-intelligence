@@ -281,16 +281,20 @@ class SessionHandler:
         # classify the session now using parent_id from the end event data.
         existing = await self.services.graph.get_node(session_id)
         labels: list[str] = existing.get("labels", []) if existing else []
-        if _current_type(labels) is None:
-            parent_id = (data.get("parent_id") or "").strip()
-            fallback = "SubSession" if parent_id else "RootSession"
+        _warn_if_dual_terminal(labels, session_id)
+        parent_id = (data.get("parent_id") or "").strip()
+        transition = self._label_machine.classify(
+            _current_type(labels), "end", bool(parent_id)
+        )
+        if transition.add or transition.remove:
             await self.services.graph.set_labels(
-                session_id, remove_labels=[], add_labels=[fallback, "SST_EVENT"]
+                session_id,
+                remove_labels=transition.remove,
+                add_labels=transition.add,
             )
 
-        # Terminal event — flush directly. There is no hot path after
-        # session:end; all buffered data must reach the backing store before
-        # the process can exit.
+        # Terminal event: flush directly. There is no hot path after session:end;
+        # all buffered data must reach the backing store before the process exits.
         await self.services.graph.flush()
 
     async def _create_mount_plan(
