@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import Any
 
 from context_intelligence_server.protocol import HookResult
@@ -28,6 +29,12 @@ def _current_type(labels: list[str]) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class LabelTransition:
+    add: list[str] = field(default_factory=list)
+    remove: list[str] = field(default_factory=list)
+
+
 class SessionLabelStateMachine:
     """State machine for session type label transitions.
 
@@ -35,9 +42,40 @@ class SessionLabelStateMachine:
     ForkedSession > SubSession > RootSession in specificity (terminal ordering).
     """
 
-    def __init__(self) -> None:
-        # Phase B: state machine logic will move here from SessionHandler
-        pass
+    def classify(
+        self, current_type: str | None, event: str, has_parent: bool
+    ) -> LabelTransition:
+        if event == "start":
+            if current_type in ("ForkedSession", "SubSession"):
+                return LabelTransition()
+            if current_type == "RootSession":
+                if has_parent:
+                    return LabelTransition(
+                        add=["SubSession", "SST_EVENT"], remove=["RootSession"]
+                    )
+                return LabelTransition()
+            # bare session (current_type is None)
+            if has_parent:
+                return LabelTransition(add=["Session", "SubSession", "SST_EVENT"])
+            return LabelTransition(add=["RootSession", "Session", "SST_EVENT"])
+
+        if event == "fork":
+            if current_type == "ForkedSession":
+                return LabelTransition()
+            if current_type in ("RootSession", "SubSession"):
+                return LabelTransition(
+                    add=["ForkedSession", "SST_EVENT"], remove=[current_type]
+                )
+            # bare session (current_type is None)
+            return LabelTransition(add=["Session", "ForkedSession", "SST_EVENT"])
+
+        if event == "end":
+            if current_type is not None:
+                return LabelTransition()
+            fallback = "SubSession" if has_parent else "RootSession"
+            return LabelTransition(add=[fallback, "SST_EVENT"])
+
+        raise ValueError(f"classify() received unknown event: {event!r}")
 
 
 class SessionHandler:
