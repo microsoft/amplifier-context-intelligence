@@ -130,15 +130,112 @@ def run_dry_run(session, workspace: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Mutating operations — defined in Tasks 5 / 6.
-# Referenced here so main() can dispatch to them; name resolution is deferred
-# to call time, so Python does not complain about forward references.
+# Mutating operations
 # ---------------------------------------------------------------------------
 
 
-# snapshot(session, workspace) -> dict          -- Task 5
-# apply_repair(session, workspace) -> int       -- Task 5
-# restore_snapshot(session, snap) -> None       -- Task 6
+def snapshot(session, workspace: str) -> dict:
+    """Capture affected nodes AND their HAS_SUBSESSION edges before repair.
+
+    A stripped label is recomputable but a deleted edge is not, so both are
+    captured here before apply_repair mutates anything.
+
+    Returns:
+        {
+            "workspace": str,
+            "nodes": list[str],   # node_id of every dual-labelled node
+            "edges": list[{       # every HAS_SUBSESSION edge into those nodes
+                "parent_id": str,
+                "child_id": str,
+                "props": dict,
+            }],
+        }
+    """
+    result = session.run(
+        "MATCH (n:SubSession:ForkedSession {workspace:$ws}) RETURN n.node_id AS sid",
+        ws=workspace,
+    )
+    nodes = [record["sid"] for record in result]
+
+    result2 = session.run(
+        "MATCH (p)-[r:HAS_SUBSESSION]->(n:SubSession:ForkedSession {workspace:$ws})"
+        " RETURN p.node_id AS pid, n.node_id AS cid, properties(r) AS props",
+        ws=workspace,
+    )
+    edges = [
+        {
+            "parent_id": record["pid"],
+            "child_id": record["cid"],
+            "props": dict(record["props"]),
+        }
+        for record in result2
+    ]
+
+    return {"workspace": workspace, "nodes": nodes, "edges": edges}
+
+
+def apply_repair(session, workspace: str) -> int:
+    """Heal each dual-labelled node atomically with a compare-and-set guard.
+
+    Collects all dual-labelled node IDs first, then repairs each one
+    individually.  The WHERE guard ``n:SubSession AND n:ForkedSession``
+    acts as a compare-and-set: a concurrent writer that already changed the
+    label set causes the guard to skip that node, so the repair never
+    clobbers a live write.
+
+    Returns:
+        int: total number of nodes healed.
+    """
+    result = session.run(
+        "MATCH (n:SubSession:ForkedSession {workspace:$ws}) RETURN n.node_id AS sid",
+        ws=workspace,
+    )
+    ids = [record["sid"] for record in result]
+
+    healed = 0
+    for node_id in ids:
+        res = session.run(
+            "MATCH (n {node_id:$id, workspace:$ws})"
+            " WHERE n:SubSession AND n:ForkedSession"
+            " REMOVE n:SubSession"
+            " WITH n"
+            " OPTIONAL MATCH (p)-[r:HAS_SUBSESSION]->(n)"
+            " DELETE r"
+            " RETURN count(n) AS healed",
+            id=node_id,
+            ws=workspace,
+        )
+        record = res.single()
+        if record:
+            healed += record["healed"]
+
+    return healed
+
+
+def restore_snapshot(session, workspace: str, snap: dict) -> None:
+    """Restore labels and HAS_SUBSESSION edges from a snapshot.
+
+    Used to roll back a bad --apply run.  Restores BOTH the SubSession
+    label AND the non-recomputable HAS_SUBSESSION relationships captured
+    by snapshot().
+    """
+    for sid in snap.get("nodes", []):
+        session.run(
+            "MATCH (n {node_id:$id, workspace:$ws}) SET n:SubSession",
+            id=sid,
+            ws=workspace,
+        )
+
+    for edge in snap.get("edges", []):
+        session.run(
+            "MATCH (p {node_id:$pid, workspace:$ws}), (c {node_id:$cid, workspace:$ws})"
+            " MERGE (p)-[r:HAS_SUBSESSION]->(c)"
+            " SET r += $props",
+            pid=edge["parent_id"],
+            cid=edge["child_id"],
+            ws=workspace,
+            props=edge["props"],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +316,8 @@ def main() -> int:
             if args.restore:
                 with open(args.restore) as fh:
                     snap = json.load(fh)
-                restore_snapshot(neo4j_session, snap)
+                workspace = snap.get("workspace", args.workspace)
+                restore_snapshot(neo4j_session, workspace, snap)
                 return 0
 
             if args.dry_run:
