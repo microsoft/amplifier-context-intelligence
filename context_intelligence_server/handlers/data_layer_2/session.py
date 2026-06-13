@@ -199,19 +199,16 @@ class SessionHandler:
 
         if not parent_id:
             log.warning(
-                "session:fork for %r has no parent_id — orphaned fork", session_id
+                "session:fork for %r has no parent_id, orphaned fork", session_id
             )
 
-        # Get existing node to determine current type
         existing = await self.services.graph.get_node(session_id)
         labels: list[str] = existing.get("labels", []) if existing else []
+        _warn_if_dual_terminal(labels, session_id)
         current_type = _current_type(labels)
 
-        # Always enrich started_at, workspace, and session identity properties.
-        # IMPORTANT: "Session" MUST be included here for the same reason as
-        # _handle_start — ensures neo4j_store routes this write to
-        # MERGE (n:Session {node_id, workspace}), not the label-free bucket.
-        # See _handle_start comment for full explanation.
+        # Always enrich. "Session" MUST be in labels for the same MERGE-bucket
+        # reason as _handle_start.
         await self.services.graph.upsert_node(
             session_id,
             {
@@ -229,40 +226,24 @@ class SessionHandler:
             session_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
         )
 
-        # ForkedSession: fully terminal — preserve classification, return immediately
-        if current_type == "ForkedSession":
-            await self._create_mount_plan(session_id, data_layer_1_node_id)
-            return
-
-        # RootSession or SubSession: reclassify to ForkedSession, rectify edge
-        if current_type in ("RootSession", "SubSession"):
+        transition = self._label_machine.classify(
+            current_type, "fork", bool(parent_id)
+        )
+        if transition.add or transition.remove:
             await self.services.graph.set_labels(
                 session_id,
-                remove_labels=[current_type],
-                add_labels=["ForkedSession", "SST_EVENT"],
+                remove_labels=transition.remove,
+                add_labels=transition.add,
             )
-            if parent_id:
-                self.services.graph.remove_edge(parent_id, session_id)
-                await self.services.ensure_session_node(parent_id, {})
-                await self.services.graph.upsert_edge(
-                    parent_id,
-                    session_id,
-                    {
-                        "type": "FORKED",
-                        "sst_semantic": "LEADS_TO",
-                        "occurred_at": timestamp,
-                    },
-                )
-            await self._create_mount_plan(session_id, data_layer_1_node_id)
-            return
 
-        # bare: add Session + ForkedSession labels (include Session base label for new nodes)
-        await self.services.graph.set_labels(
-            session_id,
-            remove_labels=[],
-            add_labels=["Session", "ForkedSession", "SST_EVENT"],
-        )
-        if parent_id:
+        # Edge rule: a session becoming a ForkedSession under a parent gets a
+        # FORKED edge. If this was a reclassification of an already-typed
+        # Root/Sub node, drop the stale parent edge FIRST. Keyed on current_type
+        # (not transition.remove) to mirror the legacy code exactly. The terminal
+        # ForkedSession no-op has empty transition.add, so creates no edge.
+        if "ForkedSession" in transition.add and parent_id:
+            if current_type in ("RootSession", "SubSession"):
+                self.services.graph.remove_edge(parent_id, session_id)
             await self.services.ensure_session_node(parent_id, {})
             await self.services.graph.upsert_edge(
                 parent_id,
@@ -273,6 +254,8 @@ class SessionHandler:
                     "occurred_at": timestamp,
                 },
             )
+
+        # MountPlan companion ALWAYS created on fork, including the no-op case.
         await self._create_mount_plan(session_id, data_layer_1_node_id)
 
     async def _handle_end(
