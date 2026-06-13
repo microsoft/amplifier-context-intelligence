@@ -105,6 +105,31 @@ def _edge_count(session, rel: str, child_id: str) -> int:
 from scripts import repair_dual_labels as repair  # noqa: E402
 
 
+# ---------------------------------------------------------------------------
+# Per-test isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_neo4j(neo4j_container: dict) -> None:  # type: ignore[return]
+    """Delete all nodes and edges before each test for complete isolation.
+
+    The ``neo4j_container`` fixture is session-scoped (one container per test
+    run), so data seeded in one test accumulates and can break later tests.
+    This autouse fixture runs BEFORE every test in this module and wipes the
+    container clean so each test starts from an empty database.
+    """
+    driver = GraphDatabase.driver(
+        neo4j_container["bolt_url"],
+        auth=(neo4j_container["user"], neo4j_container["password"]),
+    )
+    try:
+        with driver.session() as s:
+            s.run("MATCH (n) DETACH DELETE n")
+    finally:
+        driver.close()
+
+
 @pytest.mark.neo4j
 class TestDryRun:
     """Dry-run reports counts and session_ids and mutates nothing."""
