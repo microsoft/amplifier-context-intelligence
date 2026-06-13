@@ -128,3 +128,27 @@ class TestDryRun:
                 assert _edge_count(s, "HAS_SUBSESSION", "child-a") == 1
         finally:
             driver.close()
+
+
+@pytest.mark.neo4j
+class TestApplyPostState:
+    """apply_repair heals a dual node to the canonical single label and single edge."""
+
+    def test_apply_strips_subsession_and_deletes_has_subsession(
+        self, neo4j_container: dict[str, Any]
+    ) -> None:
+        driver = _driver(neo4j_container)
+        try:
+            with driver.session() as s:
+                _seed_dual_node(s, "child-a", "parent-a")
+                repair.snapshot(s, WORKSPACE)
+                healed = repair.apply_repair(s, WORKSPACE)
+                assert healed == 1
+                labels = _labels(s, "child-a")
+                assert "ForkedSession" in labels
+                assert "SubSession" not in labels
+                assert _edge_count(s, "HAS_SUBSESSION", "child-a") == 0
+                assert _edge_count(s, "FORKED", "child-a") == 1
+                assert repair.count_dual(s, WORKSPACE)["node_count"] == 0
+        finally:
+            driver.close()
