@@ -1006,6 +1006,158 @@ class TestSessionLabelStateMachine:
         assert node["ended_at"] == "2026-01-01T01:00:00Z"
         assert "RootSession" not in node["labels"]
 
+    # ---- mount-plan-on-every-fork gap assertions ----
+
+    async def test_fork_bare_creates_mount_plan(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork on a bare child creates child::mount_plan companion node."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.ensure_session_node("child", {})
+        await handler(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {},
+            },
+        )
+        mount_plan = await services.graph.get_node("child::mount_plan")
+        assert mount_plan is not None
+
+    async def test_fork_forkedsession_noop_still_creates_mount_plan(
+        self, services: HookStateService
+    ) -> None:
+        """(ForkedSession, fork) -> TERMINAL label no-op, but mount_plan is still created."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.graph.upsert_node(
+            "child", {"labels": ["ForkedSession", "Session"]}
+        )
+        await services.graph.upsert_edge("parent", "child", {"type": "FORKED"})
+        await handler(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "metadata": {},
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "ForkedSession" in node["labels"]
+        mount_plan = await services.graph.get_node("child::mount_plan")
+        assert mount_plan is not None
+
+    # ---- edge no-ops on terminal starts gap assertions ----
+
+    async def test_start_subsession_new_parent_creates_no_second_edge(
+        self, services: HookStateService
+    ) -> None:
+        """(SubSession, start, new parent) -> label unchanged, no edge to new parent."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("p2", {})
+        await services.graph.upsert_node("child", {"labels": ["SubSession", "Session"]})
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "p2",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "SubSession" in node["labels"]
+        edge = await services.graph.get_edge("p2", "child")
+        assert edge is None
+
+    async def test_start_forkedsession_new_parent_creates_no_edge(
+        self, services: HookStateService
+    ) -> None:
+        """(ForkedSession, start, new parent) -> label unchanged, no edge to new parent."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("p2", {})
+        await services.graph.upsert_node(
+            "child", {"labels": ["ForkedSession", "Session"]}
+        )
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "p2",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "ForkedSession" in node["labels"]
+        edge = await services.graph.get_edge("p2", "child")
+        assert edge is None
+
+    # ---- already-typed session:end no-op gap assertion ----
+
+    async def test_end_already_typed_is_noop(
+        self, services: HookStateService
+    ) -> None:
+        """session:end on an already-typed (RootSession) node does not reclassify."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("s1", {})
+        await handler(
+            "session:start",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+        await handler(
+            "session:end",
+            {"session_id": "s1", "timestamp": "2026-01-01T01:00:00Z"},
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        assert "RootSession" in node["labels"]
+        assert "SubSession" not in node["labels"]
+
+    # ---- full resulting label-set gap assertions ----
+
+    async def test_start_bare_no_parent_full_label_set(
+        self, services: HookStateService
+    ) -> None:
+        """(bare, start, no parent) -> exactly one type label: RootSession."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("s1", {})
+        await handler(
+            "session:start",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        terminals = {label for label in node["labels"] if label in _TYPE_LABELS}
+        assert terminals == {"RootSession"}
+
+    async def test_fork_sub_full_label_set(
+        self, services: HookStateService
+    ) -> None:
+        """(SubSession, fork) -> exactly one type label: ForkedSession."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.graph.upsert_node("child", {"labels": ["SubSession", "Session"]})
+        await services.graph.upsert_edge("parent", "child", {"type": "HAS_SUBSESSION"})
+        await handler(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {},
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        terminals = {label for label in node["labels"] if label in _TYPE_LABELS}
+        assert terminals == {"ForkedSession"}
+
 
 # ---------------------------------------------------------------------------
 # TestSessionNodeProperties — session_id / parent_id on Session nodes
