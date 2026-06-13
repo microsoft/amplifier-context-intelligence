@@ -949,6 +949,38 @@ async def test_get_node_fallback_queries_by_node_id_property():
     )
 
 
+async def test_get_node_fallback_includes_labels():
+    """Post-flush fallback must return node labels under a 'labels' key.
+
+    The Neo4j fallback previously returned properties(n) only, which EXCLUDES
+    labels. A handler reading a label-blind node resolves current_type to None
+    and adds a second type label. The fallback must also return labels(n),
+    merged into the dict under 'labels', matching the in-buffer shape.
+
+    FAILS before fix  -> result has no 'labels' key.
+    PASSES after fix  -> result['labels'] contains the node's labels.
+    """
+    store = _make_store()
+    store._node_buffer = {}  # simulate post-flush: buffer is empty
+
+    record = {
+        "props": {"node_id": "child-1", "session_id": "child-1"},
+        "lbls": ["Session", "ForkedSession", "SST_EVENT"],
+    }
+    mock_result = MagicMock()
+    mock_result.records = [record]
+    store._driver.execute_query = AsyncMock(return_value=mock_result)  # type: ignore[attr-defined]
+
+    result = await store.get_node("child-1")
+
+    assert result is not None
+    assert "labels" in result, (
+        f"get_node fallback must return a 'labels' key; got keys {sorted(result.keys())}"
+    )
+    assert "ForkedSession" in result["labels"]
+    assert "Session" in result["labels"]
+
+
 # ---------------------------------------------------------------------------
 # Bug 2 — flush() must store src_id/dst_id on edge props so get_edge fallback works
 # ---------------------------------------------------------------------------
