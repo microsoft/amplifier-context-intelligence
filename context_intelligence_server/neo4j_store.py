@@ -536,16 +536,20 @@ class Neo4jGraphStore:
         try:
             result = await self._driver.execute_query(
                 "MATCH (n) WHERE n.node_id = $id AND n.workspace = $workspace "
-                "RETURN properties(n) AS props",
+                "RETURN properties(n) AS props, labels(n) AS lbls",
                 {"id": node_id, "workspace": self.workspace},
                 database_=self._database,
             )
             records = result.records
             if records:
-                return {
+                node = {
                     k: _normalize_temporal(v)
                     for k, v in dict(records[0]["props"]).items()
                 }
+                # Merge true node labels so handlers see current_type across a
+                # flush boundary, matching the in-buffer get_node shape.
+                node["labels"] = list(records[0]["lbls"])
+                return node
         except Neo4jError:
             pass
 
