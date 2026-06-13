@@ -29,6 +29,22 @@ def _current_type(labels: list[str]) -> str | None:
     return None
 
 
+def _warn_if_dual_terminal(labels: list[str], session_id: str) -> None:
+    """Log a WARNING when a node presents more than one terminal label.
+
+    This is a logging-only guard — it mutates nothing.  A node with two
+    terminal labels is an eradicated state; if one ever reappears, this
+    surfaces it rather than silently converging.
+    """
+    terminals = [label for label in labels if label in _TYPE_LABELS]
+    if len(terminals) > 1:
+        logger.warning(
+            "session %s presents multiple terminal labels %s; expected at most one (RootSession|SubSession|ForkedSession)",
+            session_id,
+            terminals,
+        )
+
+
 @dataclass(frozen=True)
 class LabelTransition:
     add: list[str] = field(default_factory=list)

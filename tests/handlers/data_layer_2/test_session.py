@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
@@ -21,6 +22,7 @@ from context_intelligence_server.handlers.data_layer_2.session import (
     SessionLabelStateMachine,
     _TYPE_LABELS,
     _current_type,
+    _warn_if_dual_terminal,
 )
 from context_intelligence_server.services import GraphState, HookStateService
 from context_intelligence_server.utils import make_node_id
@@ -2006,3 +2008,25 @@ class TestClassifyMatrix:
         sm = SessionLabelStateMachine()
         t = sm.classify(current_type=current_type, event=event, has_parent=has_parent)
         assert t == LabelTransition(add=add, remove=remove)
+
+
+# ---------------------------------------------------------------------------
+# TestDualTerminalGuard
+# ---------------------------------------------------------------------------
+
+
+class TestDualTerminalGuard:
+    """_warn_if_dual_terminal emits a WARNING when >1 terminal label is present."""
+
+    def test_warns_on_dual_terminal_labels(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING):
+            _warn_if_dual_terminal(["Session", "RootSession", "SubSession"], "sX")
+        assert any(
+            r.levelno == logging.WARNING and "sX" in r.message
+            for r in caplog.records
+        )
+
+    def test_no_warning_for_single_terminal(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING):
+            _warn_if_dual_terminal(["Session", "RootSession"], "sY")
+        assert not caplog.records
