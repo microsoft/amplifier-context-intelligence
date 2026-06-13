@@ -209,3 +209,53 @@ class TestIdempotencyAndDryRunNoop:
                 assert repair.run_dry_run(s, WORKSPACE) == 0
         finally:
             driver.close()
+
+
+@pytest.mark.neo4j
+class TestCompareAndSetGuard:
+    """apply_repair skips nodes whose label set changed after the snapshot was taken.
+
+    Deterministically exercises the read-modify-write race: between snapshot()
+    and apply_repair() a concurrent writer changes a node's label set so it no
+    longer satisfies the 'both labels' predicate.  The WHERE guard
+    ``n:SubSession AND n:ForkedSession`` inside apply_repair must skip the node
+    so the repair never clobbers a live write.
+    """
+
+    def test_guard_skips_node_whose_labels_changed_after_snapshot(
+        self, neo4j_container: dict[str, Any]
+    ) -> None:
+        driver = _driver(neo4j_container)
+        try:
+            with driver.session() as s:
+                # Seed a dual-labelled node exactly as the live bug produces.
+                _seed_dual_node(s, "child-a", "parent-a")
+
+                # Take a snapshot while the node still carries both labels.
+                snap = repair.snapshot(s, WORKSPACE)
+                assert "child-a" in snap["nodes"]
+
+                # Simulate a concurrent writer that changes the label set
+                # AFTER the snapshot but BEFORE apply_repair runs.
+                # Removing :ForkedSession means child-a no longer satisfies the
+                # 'both labels' predicate that apply_repair uses as its guard.
+                s.run(
+                    "MATCH (n {node_id: 'child-a', workspace: $ws})"
+                    " REMOVE n:ForkedSession",
+                    {"ws": WORKSPACE},
+                )
+
+                # apply_repair must skip child-a because the label set changed.
+                healed = repair.apply_repair(s, WORKSPACE)
+
+                # Guard skipped the node: nothing was healed.
+                assert healed == 0
+
+                # :SubSession was NOT stripped — the concurrent writer's state
+                # is intact.
+                assert "SubSession" in _labels(s, "child-a")
+
+                # HAS_SUBSESSION edge was NOT deleted out from under the writer.
+                assert _edge_count(s, "HAS_SUBSESSION", "child-a") == 1
+        finally:
+            driver.close()
