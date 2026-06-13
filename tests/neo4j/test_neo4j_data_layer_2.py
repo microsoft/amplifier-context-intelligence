@@ -387,3 +387,56 @@ class TestNoBareSessionNodes:
             f"Expected exactly 1 Session node for forked child, got {count}. "
             "_handle_fork must use Session-labeled MERGE."
         )
+
+
+# ---------------------------------------------------------------------------
+# 8. TestNeo4jForkEdgeRectification
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.neo4j
+class TestNeo4jForkEdgeRectification:
+    """After Sub to Forked, the child has exactly one incoming parent edge and
+    it is FORKED. This is the seam the in-memory fake cannot see: it keys edges
+    by (src, dst), so FORKED would overwrite HAS_SUBSESSION and mask a missing
+    remove_edge. Real Neo4j keeps both types unless remove_edge actually runs.
+    """
+
+    async def test_sub_to_fork_has_single_forked_parent_edge(
+        self, neo4j_services: Any
+    ) -> None:
+        await neo4j_services.ensure_session_node("rect-parent", {})
+        handler = SessionHandler(neo4j_services)
+
+        # First make the child a SubSession under the parent (HAS_SUBSESSION).
+        await handler(
+            "session:start",
+            {
+                "session_id": "rect-child",
+                "parent_id": "rect-parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        # Then fork it: must reclassify to ForkedSession and rectify the edge.
+        await handler(
+            "session:fork",
+            {
+                "session_id": "rect-child",
+                "parent_id": "rect-parent",
+                "timestamp": "2026-01-01T00:00:01Z",
+            },
+        )
+        await neo4j_services.graph.flush()
+
+        records = await neo4j_services.graph.execute_query(
+            "MATCH (p:Session)-[r]->(c:Session) "
+            "WHERE c.session_id = $sid AND p.session_id = $pid "
+            "RETURN type(r) AS rel_type",
+            {"sid": "rect-child", "pid": "rect-parent"},
+            workspace="*",
+        )
+        rel_types = sorted(rec["rel_type"] for rec in records)
+        assert rel_types == ["FORKED"], (
+            "Sub to Forked must leave exactly one parent edge of type FORKED; "
+            f"a leftover HAS_SUBSESSION means remove_edge did not run. Got: {rel_types}"
+        )
