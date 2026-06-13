@@ -61,10 +61,28 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from typing import Any
 
 from neo4j import GraphDatabase
+from neo4j.time import Date, DateTime, Duration, Time
 
 from context_intelligence_server.config import get_settings
+
+
+_NEO4J_TEMPORAL = (Date, DateTime, Time, Duration)
+
+
+def _json_safe(value: Any) -> Any:
+    """Make a Neo4j property value JSON-serialisable.
+
+    Edge properties read via ``properties(r)`` can include Neo4j temporal
+    types (``occurred_at`` is a ZONED DATETIME).  ``json.dump`` cannot
+    serialise those, so convert any Neo4j temporal to its ISO-8601 string.
+    All other values pass through unchanged.
+    """
+    if isinstance(value, _NEO4J_TEMPORAL):
+        return value.iso_format()
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +184,7 @@ def snapshot(session, workspace: str) -> dict:
         {
             "parent_id": record["pid"],
             "child_id": record["cid"],
-            "props": dict(record["props"]),
+            "props": {k: _json_safe(v) for k, v in dict(record["props"]).items()},
         }
         for record in result2
     ]
@@ -227,14 +245,26 @@ def restore_snapshot(session, workspace: str, snap: dict) -> None:
         )
 
     for edge in snap.get("edges", []):
+        props = dict(edge["props"])
+        # occurred_at lives in the live graph as a ZONED DATETIME but was
+        # serialised to an ISO string for JSON.  Rebuild it as a real datetime
+        # so the restored edge matches production (AGENTS.md temporal
+        # convention), not a plain string.
+        occurred_at = props.pop("occurred_at", None)
+        set_temporal = (
+            " SET r.occurred_at = datetime($occurred_at)"
+            if occurred_at is not None
+            else ""
+        )
         session.run(
             "MATCH (p {node_id:$pid, workspace:$ws}), (c {node_id:$cid, workspace:$ws})"
             " MERGE (p)-[r:HAS_SUBSESSION]->(c)"
-            " SET r += $props",
+            " SET r += $props" + set_temporal,
             pid=edge["parent_id"],
             cid=edge["child_id"],
             ws=workspace,
-            props=edge["props"],
+            props=props,
+            occurred_at=occurred_at,
         )
 
 

@@ -14,10 +14,12 @@ defined here.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
 from neo4j import GraphDatabase
+from neo4j.time import DateTime as Neo4jDateTime
 
 WORKSPACE = "test"
 
@@ -280,5 +282,64 @@ class TestCompareAndSetGuard:
 
                 # HAS_SUBSESSION edge was NOT deleted out from under the writer.
                 assert _edge_count(s, "HAS_SUBSESSION", "child-a") == 1
+        finally:
+            driver.close()
+
+
+@pytest.mark.neo4j
+class TestSnapshotTemporalSerialization:
+    """snapshot() must JSON-serialize, and restore must rebuild, temporal edge props.
+
+    Mirrors the live data shape: a HAS_SUBSESSION edge carries ``occurred_at``
+    as a Neo4j ZONED DATETIME.  The earlier seed helper set no temporal prop, so
+    json.dump never saw a Neo4j temporal and the bug stayed hidden.  This test
+    seeds the real shape and exercises the full
+    snapshot -> json.dump -> json.load -> restore round-trip.
+    """
+
+    def test_snapshot_json_round_trip_restores_datetime_edge(
+        self, neo4j_container: dict[str, Any], tmp_path: Any
+    ) -> None:
+        driver = _driver(neo4j_container)
+        try:
+            with driver.session() as s:
+                _seed_dual_node(s, "child-a", "parent-a")
+                # Mirror production: HAS_SUBSESSION carries occurred_at as a
+                # ZONED DATETIME, not a string.
+                s.run(
+                    "MATCH (p)-[r:HAS_SUBSESSION]->"
+                    "(c {node_id: 'child-a', workspace: $ws})"
+                    " SET r.occurred_at = datetime('2026-06-13T10:00:00Z')",
+                    {"ws": WORKSPACE},
+                )
+
+                snap = repair.snapshot(s, WORKSPACE)
+
+                # The actual bug: json.dump must not choke on a Neo4j temporal.
+                snap_path = tmp_path / "snap.json"
+                with open(snap_path, "w") as fh:
+                    json.dump(snap, fh)
+                loaded = json.loads(snap_path.read_text())
+
+                repair.apply_repair(s, WORKSPACE)
+                assert _edge_count(s, "HAS_SUBSESSION", "child-a") == 0
+
+                repair.restore_snapshot(s, WORKSPACE, loaded)
+                assert _edge_count(s, "HAS_SUBSESSION", "child-a") == 1
+
+                # occurred_at must come back as a real ZONED DATETIME, not a
+                # plain string (AGENTS.md temporal convention).
+                rec = s.run(
+                    "MATCH (p)-[r:HAS_SUBSESSION]->"
+                    "(c {node_id: 'child-a', workspace: $ws})"
+                    " RETURN r.occurred_at AS oa",
+                    {"ws": WORKSPACE},
+                ).single()
+                assert isinstance(rec["oa"], Neo4jDateTime)
+                assert (rec["oa"].year, rec["oa"].month, rec["oa"].day) == (
+                    2026,
+                    6,
+                    13,
+                )
         finally:
             driver.close()
