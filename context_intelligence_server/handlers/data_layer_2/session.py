@@ -226,9 +226,7 @@ class SessionHandler:
             session_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
         )
 
-        transition = self._label_machine.classify(
-            current_type, "fork", bool(parent_id)
-        )
+        transition = self._label_machine.classify(current_type, "fork", bool(parent_id))
         if transition.add or transition.remove:
             await self.services.graph.set_labels(
                 session_id,

@@ -1104,9 +1104,7 @@ class TestSessionLabelStateMachine:
 
     # ---- already-typed session:end no-op gap assertion ----
 
-    async def test_end_already_typed_is_noop(
-        self, services: HookStateService
-    ) -> None:
+    async def test_end_already_typed_is_noop(self, services: HookStateService) -> None:
         """session:end on an already-typed (RootSession) node does not reclassify."""
         handler = SessionHandler(services)
         await services.ensure_session_node("s1", {})
@@ -1140,9 +1138,7 @@ class TestSessionLabelStateMachine:
         terminals = {label for label in node["labels"] if label in _TYPE_LABELS}
         assert terminals == {"RootSession"}
 
-    async def test_fork_sub_full_label_set(
-        self, services: HookStateService
-    ) -> None:
+    async def test_fork_sub_full_label_set(self, services: HookStateService) -> None:
         """(SubSession, fork) -> exactly one type label: ForkedSession."""
         handler = SessionHandler(services)
         await services.ensure_session_node("parent", {})
@@ -1964,33 +1960,33 @@ class TestClassifyMatrix:
         # ------------------------------------------------------------------
         # event=start
         # ------------------------------------------------------------------
-        ("start", "ForkedSession", True,  [],                                    []),
-        ("start", "ForkedSession", False, [],                                    []),
-        ("start", "SubSession",    True,  [],                                    []),
-        ("start", "SubSession",    False, [],                                    []),
-        ("start", "RootSession",   False, [],                                    []),
-        ("start", "RootSession",   True,  ["SubSession", "SST_EVENT"],           ["RootSession"]),
-        ("start", None,            True,  ["Session", "SubSession", "SST_EVENT"], []),
-        ("start", None,            False, ["RootSession", "Session", "SST_EVENT"], []),
+        ("start", "ForkedSession", True, [], []),
+        ("start", "ForkedSession", False, [], []),
+        ("start", "SubSession", True, [], []),
+        ("start", "SubSession", False, [], []),
+        ("start", "RootSession", False, [], []),
+        ("start", "RootSession", True, ["SubSession", "SST_EVENT"], ["RootSession"]),
+        ("start", None, True, ["Session", "SubSession", "SST_EVENT"], []),
+        ("start", None, False, ["RootSession", "Session", "SST_EVENT"], []),
         # ------------------------------------------------------------------
         # event=fork
         # ------------------------------------------------------------------
-        ("fork",  "ForkedSession", True,  [],                                    []),
-        ("fork",  "ForkedSession", False, [],                                    []),
-        ("fork",  "RootSession",   True,  ["ForkedSession", "SST_EVENT"],        ["RootSession"]),
-        ("fork",  "RootSession",   False, ["ForkedSession", "SST_EVENT"],        ["RootSession"]),
-        ("fork",  "SubSession",    True,  ["ForkedSession", "SST_EVENT"],        ["SubSession"]),
-        ("fork",  "SubSession",    False, ["ForkedSession", "SST_EVENT"],        ["SubSession"]),
-        ("fork",  None,            True,  ["Session", "ForkedSession", "SST_EVENT"], []),
-        ("fork",  None,            False, ["Session", "ForkedSession", "SST_EVENT"], []),
+        ("fork", "ForkedSession", True, [], []),
+        ("fork", "ForkedSession", False, [], []),
+        ("fork", "RootSession", True, ["ForkedSession", "SST_EVENT"], ["RootSession"]),
+        ("fork", "RootSession", False, ["ForkedSession", "SST_EVENT"], ["RootSession"]),
+        ("fork", "SubSession", True, ["ForkedSession", "SST_EVENT"], ["SubSession"]),
+        ("fork", "SubSession", False, ["ForkedSession", "SST_EVENT"], ["SubSession"]),
+        ("fork", None, True, ["Session", "ForkedSession", "SST_EVENT"], []),
+        ("fork", None, False, ["Session", "ForkedSession", "SST_EVENT"], []),
         # ------------------------------------------------------------------
         # event=end
         # ------------------------------------------------------------------
-        ("end",   None,            True,  ["SubSession", "SST_EVENT"],           []),
-        ("end",   None,            False, ["RootSession", "SST_EVENT"],          []),
-        ("end",   "RootSession",   True,  [],                                    []),
-        ("end",   "SubSession",    False, [],                                    []),
-        ("end",   "ForkedSession", True,  [],                                    []),
+        ("end", None, True, ["SubSession", "SST_EVENT"], []),
+        ("end", None, False, ["RootSession", "SST_EVENT"], []),
+        ("end", "RootSession", True, [], []),
+        ("end", "SubSession", False, [], []),
+        ("end", "ForkedSession", True, [], []),
     ]
 
     @pytest.mark.parametrize(
@@ -2018,15 +2014,18 @@ class TestClassifyMatrix:
 class TestDualTerminalGuard:
     """_warn_if_dual_terminal emits a WARNING when >1 terminal label is present."""
 
-    def test_warns_on_dual_terminal_labels(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_warns_on_dual_terminal_labels(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         with caplog.at_level(logging.WARNING):
             _warn_if_dual_terminal(["Session", "RootSession", "SubSession"], "sX")
         assert any(
-            r.levelno == logging.WARNING and "sX" in r.message
-            for r in caplog.records
+            r.levelno == logging.WARNING and "sX" in r.message for r in caplog.records
         )
 
-    def test_no_warning_for_single_terminal(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_no_warning_for_single_terminal(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         with caplog.at_level(logging.WARNING):
             _warn_if_dual_terminal(["Session", "RootSession"], "sY")
         assert not caplog.records
