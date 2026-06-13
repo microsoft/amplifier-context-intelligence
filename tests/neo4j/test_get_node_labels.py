@@ -48,3 +48,57 @@ class TestGetNodeReturnsLabelsAfterFlush:
             f"fallback must return labels; got keys {sorted(node.keys())}"
         )
         assert "ForkedSession" in node["labels"]
+
+
+from context_intelligence_server.handlers.data_layer_2.session import (  # noqa: E402
+    SessionHandler,
+)
+
+
+async def _neo4j_labels(services: Any, node_id: str) -> list[str]:
+    rows = await services.graph.execute_query(
+        "MATCH (n) WHERE n.node_id = $id AND n.workspace = $workspace "
+        "RETURN labels(n) AS lbls",
+        {"id": node_id, "workspace": services.graph.workspace},
+        workspace="*",
+    )
+    return list(rows[0]["lbls"]) if rows else []
+
+
+@pytest.mark.neo4j
+class TestForkFlushStartSingleLabel:
+    """fork -> flush -> start must leave exactly one terminal label."""
+
+    async def test_fork_flush_start_yields_single_label(
+        self, neo4j_services: Any
+    ) -> None:
+        handler = SessionHandler(neo4j_services)
+        parent_id = "parent-session-t02"
+        child_id = "child-session-t02"
+
+        await handler(
+            "session:fork",
+            {
+                "session_id": child_id,
+                "parent_id": parent_id,
+                "timestamp": "2026-01-01T10:00:00Z",
+            },
+        )
+        # Flush lands between the two OS-process events in production.
+        await neo4j_services.graph.flush()
+
+        await handler(
+            "session:start",
+            {
+                "session_id": child_id,
+                "parent_id": parent_id,
+                "timestamp": "2026-01-01T10:00:01Z",
+            },
+        )
+        await neo4j_services.graph.flush()
+
+        labels = await _neo4j_labels(neo4j_services, child_id)
+        assert "ForkedSession" in labels, f"expected ForkedSession in {labels}"
+        assert "SubSession" not in labels, (
+            f"dual-label regression: node carries both terminal labels: {labels}"
+        )
