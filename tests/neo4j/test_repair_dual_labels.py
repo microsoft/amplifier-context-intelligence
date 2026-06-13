@@ -152,3 +152,28 @@ class TestApplyPostState:
                 assert repair.count_dual(s, WORKSPACE)["node_count"] == 0
         finally:
             driver.close()
+
+
+@pytest.mark.neo4j
+class TestSnapshotRestore:
+    """restore_snapshot recovers BOTH the SubSession label AND the HAS_SUBSESSION edge."""
+
+    def test_restore_recovers_relationships(
+        self, neo4j_container: dict[str, Any]
+    ) -> None:
+        driver = _driver(neo4j_container)
+        try:
+            with driver.session() as s:
+                _seed_dual_node(s, "child-a", "parent-a")
+                snap = repair.snapshot(s, WORKSPACE)
+                repair.apply_repair(s, WORKSPACE)
+                # Post-heal: stray label and edge must be gone
+                assert _edge_count(s, "HAS_SUBSESSION", "child-a") == 0
+                assert "SubSession" not in _labels(s, "child-a")
+                # Restore from snapshot
+                repair.restore_snapshot(s, WORKSPACE, snap)
+                # Both the label and the non-recomputable relationship must be back
+                assert "SubSession" in _labels(s, "child-a")
+                assert _edge_count(s, "HAS_SUBSESSION", "child-a") == 1
+        finally:
+            driver.close()
