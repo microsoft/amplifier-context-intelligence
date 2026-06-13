@@ -177,3 +177,35 @@ class TestSnapshotRestore:
                 assert _edge_count(s, "HAS_SUBSESSION", "child-a") == 1
         finally:
             driver.close()
+
+
+@pytest.mark.neo4j
+class TestIdempotencyAndDryRunNoop:
+    """apply_repair is idempotent; dry-run after a successful apply reports zero."""
+
+    def test_apply_twice_second_is_noop(
+        self, neo4j_container: dict[str, Any]
+    ) -> None:
+        driver = _driver(neo4j_container)
+        try:
+            with driver.session() as s:
+                _seed_dual_node(s, "child-a", "parent-a")
+                first = repair.apply_repair(s, WORKSPACE)
+                second = repair.apply_repair(s, WORKSPACE)
+                assert first == 1
+                assert second == 0
+                assert repair.count_dual(s, WORKSPACE)["node_count"] == 0
+        finally:
+            driver.close()
+
+    def test_dry_run_after_apply_reports_zero(
+        self, neo4j_container: dict[str, Any]
+    ) -> None:
+        driver = _driver(neo4j_container)
+        try:
+            with driver.session() as s:
+                _seed_dual_node(s, "child-a", "parent-a")
+                repair.apply_repair(s, WORKSPACE)
+                assert repair.run_dry_run(s, WORKSPACE) == 0
+        finally:
+            driver.close()
