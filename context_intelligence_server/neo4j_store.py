@@ -67,6 +67,40 @@ TEMPORAL_PROPS: frozenset[str] = frozenset(
     }
 )
 
+# ---------------------------------------------------------------------------
+# Terminal-label lattice
+# ---------------------------------------------------------------------------
+# The three terminal Session-type labels form a strict lattice:
+#   ForkedSession > SubSession > RootSession
+#
+# _LATTICE_NORMALIZATION is appended (in-line) to any Cypher SET statement
+# that adds at least one terminal label.  Running the normalization inside the
+# SAME Cypher statement as the SET ensures the node write-lock is still held
+# when the CASE WHEN conditions are evaluated, so the later-committing writer
+# in a concurrent two-drainer race always normalises to exactly one terminal.
+#
+# Race-safety guarantee (READ_COMMITTED):
+#   The naive "WHERE NOT n:ForkedSession … SET n:SubSession" pattern evaluates
+#   the guard at MATCH time and can re-introduce a dual if a SubSession SET
+#   commits after a concurrent ForkedSession SET.  By placing the REMOVE
+#   AFTER the SET (separated only by WITH n), the lock is already held before
+#   the CASE WHEN is evaluated, so no interleaving can escape normalisation.
+#
+# Invariants:
+#   • n:ForkedSession  → REMOVE n:SubSession, REMOVE n:RootSession
+#   • n:SubSession     → REMOVE n:RootSession  (only when ForkedSession absent)
+_TERMINAL_LABELS: frozenset[str] = frozenset(
+    {"ForkedSession", "SubSession", "RootSession"}
+)
+_LATTICE_NORMALIZATION = (
+    " WITH n"
+    " FOREACH (_ IN CASE WHEN n:ForkedSession THEN [1] ELSE [] END |"
+    " REMOVE n:SubSession REMOVE n:RootSession)"
+    " WITH n"
+    " FOREACH (_ IN CASE WHEN n:SubSession THEN [1] ELSE [] END |"
+    " REMOVE n:RootSession)"
+)
+
 
 def _validate_identifier(name: str, kind: str) -> None:
     """Raise ``ValueError`` if *name* is not a safe Neo4j label / relationship-type identifier.
@@ -340,15 +374,20 @@ async def _write_batch(
     # Set all labels for labeled nodes (primary + extra in one SET per node).
     # For Session nodes, Session label is already set by the MERGE above — this
     # adds any additional type labels (RootSession, SubSession, ForkedSession, etc.)
+    # Lattice normalisation: whenever a terminal label is included in the SET, the
+    # _LATTICE_NORMALIZATION suffix is appended to the SAME Cypher statement so the
+    # node write-lock is held before the CASE WHEN conditions are evaluated.  This
+    # prevents the concurrent-writer dual-label race (see _LATTICE_NORMALIZATION).
     label_assignments.sort(key=lambda i: i["node_id"])
     for item in label_assignments:
         labels_str = ":".join(item["labels"])
+        cypher = (
+            f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) SET n:{labels_str}"
+        )
+        if set(item["labels"]) & _TERMINAL_LABELS:
+            cypher += _LATTICE_NORMALIZATION
         res = await tx.run(
-            cast(
-                LiteralString,
-                f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) "
-                f"SET n:{labels_str}",
-            ),
+            cast(LiteralString, cypher),
             node_id=item["node_id"],
             workspace=workspace,
         )
@@ -370,11 +409,15 @@ async def _write_batch(
             await res.consume()
         for label in lp.get("add", []):
             _validate_identifier(label, "label")
+            # Lattice normalisation for patch-adds of terminal labels: same lock-first
+            # guarantee — append the normalization to the SET statement.
+            cypher = (
+                f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) SET n:{label}"
+            )
+            if label in _TERMINAL_LABELS:
+                cypher += _LATTICE_NORMALIZATION
             res = await tx.run(
-                cast(
-                    LiteralString,
-                    f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) SET n:{label}",
-                ),
+                cast(LiteralString, cypher),
                 node_id=pid,
                 workspace=workspace,
             )
