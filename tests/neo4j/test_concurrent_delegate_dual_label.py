@@ -185,7 +185,7 @@ class TestForkBeforeStartConcurrentWithParentDrainer:
         # --- Verify ---
         final_labels = await _neo4j_labels(child_store, child_id)
         terminals = [
-            l for l in final_labels if l in ("RootSession", "SubSession", "ForkedSession")
+            label for label in final_labels if label in ("RootSession", "SubSession", "ForkedSession")
         ]
 
         assert len(terminals) <= 1, (
@@ -283,7 +283,7 @@ class TestStartBeforeForkConcurrentWithParentDrainer:
 
         final_labels = await _neo4j_labels(child_store, child_id)
         terminals = [
-            l for l in final_labels if l in ("RootSession", "SubSession", "ForkedSession")
+            label for label in final_labels if label in ("RootSession", "SubSession", "ForkedSession")
         ]
 
         assert len(terminals) <= 1, (
@@ -334,7 +334,7 @@ class TestSameBatchForkAndStart:
         await store.flush()
 
         labels = await _neo4j_labels(store, child_id)
-        terminals = [l for l in labels if l in ("RootSession", "SubSession", "ForkedSession")]
+        terminals = [label for label in labels if label in ("RootSession", "SubSession", "ForkedSession")]
         assert len(terminals) <= 1, (
             f"Dual label in same-batch fork→start: {terminals} in {labels}"
         )
@@ -371,7 +371,7 @@ class TestSameBatchForkAndStart:
         await store.flush()
 
         labels = await _neo4j_labels(store, child_id)
-        terminals = [l for l in labels if l in ("RootSession", "SubSession", "ForkedSession")]
+        terminals = [label for label in labels if label in ("RootSession", "SubSession", "ForkedSession")]
         assert len(terminals) <= 1, (
             f"Dual label in same-batch start→fork: {terminals} in {labels}"
         )
@@ -467,9 +467,9 @@ class TestAdversarialConcurrentWrites:
         try:
             final_labels = await _neo4j_labels(verify, child_id)
             terminals = [
-                l
-                for l in final_labels
-                if l in ("RootSession", "SubSession", "ForkedSession")
+                label
+                for label in final_labels
+                if label in ("RootSession", "SubSession", "ForkedSession")
             ]
 
             # This assertion is INVERTED from the usual: we EXPECT this might fail
