@@ -98,8 +98,15 @@ class SessionLabelStateMachine:
         if event == "end":
             if current_type is not None:
                 return LabelTransition()
-            fallback = "SubSession" if has_parent else "RootSession"
-            return LabelTransition(add=[fallback, "SST_EVENT"])
+            # Bare session: session:start/fork was permanently lost.  Rather than
+            # fabricating a real terminal (Sub/Root), mark it explicitly so it
+            # stays outside the clean terminal space and surfaces as a health signal.
+            #
+            # NOTE: if a real start/fork ever arrives AFTER this end (out-of-order,
+            # vanishingly rare), _handle_start/_handle_fork will classify normally
+            # and add the real terminal.  IncompleteSession may then coexist as an
+            # audit trail — that is acceptable; no special stripping is needed.
+            return LabelTransition(add=["IncompleteSession", "SST_EVENT"])
 
         raise ValueError(f"classify() received unknown event: {event!r}")
 
@@ -300,10 +307,18 @@ class SessionHandler:
         )
 
         # Stub recovery: if session:start was permanently missed (bare Session),
-        # classify the session now using parent_id from the end event data.
+        # mark the session as IncompleteSession instead of fabricating a real
+        # terminal label (Sub/Root).  This keeps the guess out of the clean
+        # Root/Sub/Forked terminal space and surfaces a health signal.
         transition = self._label_machine.classify(
             _current_type(labels), "end", bool(parent_id)
         )
+        if "IncompleteSession" in transition.add:
+            logger.warning(
+                "session %s reached end with no start/fork event; "
+                "marked IncompleteSession (recovered)",
+                session_id,
+            )
         if transition.add or transition.remove:
             await self.services.graph.set_labels(
                 session_id,
