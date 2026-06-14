@@ -42,20 +42,50 @@ def neo4j_container() -> Generator[dict[str, Any], None, None]:
     """
     try:
         import docker  # type: ignore[import-untyped]
+        from docker.errors import APIError  # type: ignore[import-untyped]
     except ImportError:
         pytest.skip("docker package not installed — skip Neo4j tests")
 
     client = docker.from_env()
-    http_port = _get_free_port()
-    bolt_port = _get_free_port()
 
-    container = client.containers.run(
-        "neo4j:5.26.22-community",
-        environment={"NEO4J_AUTH": "neo4j/testpassword"},
-        ports={"7474/tcp": http_port, "7687/tcp": bolt_port},
-        detach=True,
-        remove=True,
-    )
+    # Start the container, retrying on the transient docker port-allocation flake.
+    #
+    # On busy hosts (notably Docker Desktop / WSL2) the daemon intermittently
+    # rejects the port forward with:
+    #   APIError: 500 ... ports are not available: exposing port TCP
+    #   0.0.0.0:<p> -> 127.0.0.1:0: /forwards/expose returned unexpected status: 500
+    # This is pure infrastructure noise — the requested host port could not be
+    # bound at that instant — NOT a test or product failure.  A 100-run
+    # classification of the concurrent dual-label adversarial test measured
+    # 97 pass / 0 dual / 3 of exactly this port-allocation error; without this
+    # retry those 3 surface as spurious red and mask the (deterministic) real
+    # result.  Re-pick fresh free ports and retry a few times before giving up.
+    container = None
+    http_port = bolt_port = 0
+    last_exc: Exception | None = None
+    for _attempt in range(5):
+        http_port = _get_free_port()
+        bolt_port = _get_free_port()
+        try:
+            container = client.containers.run(
+                "neo4j:5.26.22-community",
+                environment={"NEO4J_AUTH": "neo4j/testpassword"},
+                ports={"7474/tcp": http_port, "7687/tcp": bolt_port},
+                detach=True,
+                remove=True,
+            )
+            break
+        except APIError as exc:
+            # Only swallow the port-allocation flake; re-raise anything else.
+            if "ports are not available" not in str(exc):
+                raise
+            last_exc = exc
+            time.sleep(1)
+    if container is None:
+        pytest.fail(
+            f"Neo4j container could not acquire host ports after 5 attempts "
+            f"(transient docker port-allocation flake): {last_exc}"
+        )
 
     # Wait for Neo4j readiness (up to 60 seconds)
     for _ in range(60):
