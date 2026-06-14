@@ -259,6 +259,20 @@ class SessionHandler:
     async def _handle_end(
         self, session_id: str, timestamp: str, data: dict[str, Any]
     ) -> None:
+        # Read the session's current labels BEFORE writing the end-event upsert.
+        # After a flush (the drainer flushes between event batches) the node
+        # buffer is empty, so get_node falls through to Neo4j and returns the
+        # real persisted type label (SubSession / ForkedSession).  If we upsert
+        # first, that upsert creates a fresh buffer entry holding only
+        # ["Session", "SST_EVENT"], which SHADOWS the persisted type on the
+        # buffer-first get_node read -> _current_type reads None -> stub-recovery
+        # spuriously adds RootSession (a dual terminal label).  Reading first
+        # mirrors _handle_start and _handle_fork, which both read before writing.
+        existing = await self.services.graph.get_node(session_id)
+        labels: list[str] = existing.get("labels", []) if existing else []
+        _warn_if_dual_terminal(labels, session_id)
+        parent_id = (data.get("parent_id") or "").strip()
+
         await self.services.graph.upsert_node(
             session_id,
             {
@@ -277,10 +291,6 @@ class SessionHandler:
 
         # Stub recovery: if session:start was permanently missed (bare Session),
         # classify the session now using parent_id from the end event data.
-        existing = await self.services.graph.get_node(session_id)
-        labels: list[str] = existing.get("labels", []) if existing else []
-        _warn_if_dual_terminal(labels, session_id)
-        parent_id = (data.get("parent_id") or "").strip()
         transition = self._label_machine.classify(
             _current_type(labels), "end", bool(parent_id)
         )
