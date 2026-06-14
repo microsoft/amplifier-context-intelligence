@@ -45,6 +45,16 @@ def _warn_if_dual_terminal(labels: list[str], session_id: str) -> None:
         )
 
 
+def _parent_of(data: dict[str, Any]) -> str:
+    """Canonical parent session id from an event payload.
+
+    amplifier-core emits session:fork with key "parent" (_session_init.py),
+    while event enrichment also carries "parent_id". Accept either so the
+    server never depends on which key a client sends. Empty string = no parent.
+    """
+    return (data.get("parent_id") or data.get("parent") or "").strip()
+
+
 @dataclass(frozen=True)
 class LabelTransition:
     add: list[str] = field(default_factory=list)
@@ -136,7 +146,7 @@ class SessionHandler:
     async def _handle_start(
         self, session_id: str, timestamp: str, data: dict[str, Any]
     ) -> None:
-        parent_id = (data.get("parent_id") or "").strip()
+        parent_id = _parent_of(data)
         existing = await self.services.graph.get_node(session_id)
         labels: list[str] = existing.get("labels", []) if existing else []
         _warn_if_dual_terminal(labels, session_id)
@@ -194,7 +204,7 @@ class SessionHandler:
         data: dict[str, Any],
         log: EventLogContext,
     ) -> None:
-        parent_id = (data.get("parent_id") or "").strip()
+        parent_id = _parent_of(data)
         workspace = data.get("workspace") or self.services.graph.workspace
 
         if not parent_id:
@@ -271,7 +281,7 @@ class SessionHandler:
         existing = await self.services.graph.get_node(session_id)
         labels: list[str] = existing.get("labels", []) if existing else []
         _warn_if_dual_terminal(labels, session_id)
-        parent_id = (data.get("parent_id") or "").strip()
+        parent_id = _parent_of(data)
 
         await self.services.graph.upsert_node(
             session_id,

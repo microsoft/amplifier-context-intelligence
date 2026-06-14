@@ -22,6 +22,7 @@ from context_intelligence_server.handlers.data_layer_2.session import (
     SessionLabelStateMachine,
     _TYPE_LABELS,
     _current_type,
+    _parent_of,
     _warn_if_dual_terminal,
 )
 from context_intelligence_server.services import GraphState, HookStateService
@@ -297,16 +298,16 @@ class TestSessionFork:
         )
         assert edge["type"] != "HAS_SUBSESSION", "Fork edge must NOT be HAS_SUBSESSION"
 
-    async def test_fork_uses_parent_id_not_parent_key(
+    async def test_fork_accepts_both_parent_id_and_parent_keys(
         self, services: HookStateService
     ) -> None:
-        """Fork canonical key is parent_id; legacy 'parent' key must be ignored.
+        """Fork accepts both 'parent_id' (enriched) and 'parent' (emitter) keys.
 
-        Positive case: parent_id creates an edge.
-        Negative case: legacy 'parent' key alone must NOT create an edge.
+        amplifier-core emits "parent" only; enrichment adds "parent_id".
+        Both must create a FORKED edge.
         """
         handler = SessionHandler(services)
-        # Positive: using parent_id (canonical) creates an edge
+        # Case A: parent_id (enriched payload) creates a FORKED edge
         await handler(
             "session:fork",
             {
@@ -315,22 +316,23 @@ class TestSessionFork:
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        # Edge must exist parent→child when parent_id is provided
-        edge = await services.graph.get_edge("p1", "f1")
-        assert edge is not None
+        edge_a = await services.graph.get_edge("p1", "f1")
+        assert edge_a is not None, "parent_id key must create a FORKED edge"
+        assert edge_a.get("type") == "FORKED"
 
-        # Negative: legacy 'parent' key alone must NOT create any edge
+        # Case B: parent (emitter key, no parent_id) also creates a FORKED edge
         handler2 = SessionHandler(services)
         await handler2(
             "session:fork",
             {
                 "session_id": "f2",
-                "parent": "p2",  # legacy key — must be ignored
+                "parent": "p2",  # emitter key — must be accepted
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        legacy_edge = await services.graph.get_edge("p2", "f2")
-        assert legacy_edge is None, "legacy 'parent' key must not create an edge"
+        edge_b = await services.graph.get_edge("p2", "f2")
+        assert edge_b is not None, "emitter 'parent' key must also create a FORKED edge"
+        assert edge_b.get("type") == "FORKED"
 
     async def test_fork_missing_parent_id_creates_node_no_edge(
         self, services: HookStateService
@@ -2028,4 +2030,222 @@ class TestDualTerminalGuard:
     ) -> None:
         with caplog.at_level(logging.WARNING):
             _warn_if_dual_terminal(["Session", "RootSession"], "sY")
-        assert not caplog.records
+
+
+# ---------------------------------------------------------------------------
+# TestParentKeyCompat — accept "parent" OR "parent_id" in event payloads
+#
+# amplifier-core emits session:fork with key "parent" only (_session_init.py:284).
+# Event enrichment also stamps "parent_id" so real traffic works today.
+# These tests prove the handler accepts the documented emitter shape ("parent"
+# key only) without depending on enrichment.
+#
+# RED before _parent_of helper; GREEN after.
+# ---------------------------------------------------------------------------
+
+
+class TestParentKeyCompat:
+    """session handlers must accept 'parent' key (amplifier-core emitter shape).
+
+    amplifier-core's fork emitter writes ``"parent": parent_id`` only.
+    Event enrichment adds ``parent_id`` on the wire, but handlers must not
+    depend on that enrichment — they must read whichever key is present.
+    """
+
+    # ----- session:start with "parent" key only (no "parent_id") -----
+
+    async def test_start_parent_key_only_creates_subsession(
+        self, services: HookStateService
+    ) -> None:
+        """session:start with 'parent' key only must classify child as SubSession.
+
+        This is the real amplifier-core emitter payload shape for child sessions.
+        FAILS before _parent_of; PASSES after.
+        """
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent": "P",  # emitter key — no parent_id
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "SubSession" in node["labels"], (
+            "session:start with 'parent' key (no parent_id) must classify child as SubSession"
+        )
+        assert "RootSession" not in node["labels"]
+
+    async def test_start_parent_key_only_creates_has_subsession_edge(
+        self, services: HookStateService
+    ) -> None:
+        """session:start with 'parent' key only must create HAS_SUBSESSION edge P->child.
+
+        FAILS before _parent_of; PASSES after.
+        """
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent": "P",  # emitter key — no parent_id
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        edge = await services.graph.get_edge("P", "child")
+        assert edge is not None, (
+            "session:start with 'parent' key (no parent_id) must create HAS_SUBSESSION edge P->child"
+        )
+        assert edge.get("type") == "HAS_SUBSESSION"
+
+    # ----- session:fork with "parent" key only (no "parent_id") -----
+
+    async def test_fork_parent_key_only_creates_forked_session(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork with 'parent' key only must classify child as ForkedSession.
+
+        This is the real amplifier-core emitter payload shape for forked sessions.
+        FAILS before _parent_of; PASSES after.
+        """
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "fork1",
+                "parent": "P",  # emitter key — no parent_id
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("fork1")
+        assert node is not None
+        assert "ForkedSession" in node["labels"], (
+            "session:fork with 'parent' key (no parent_id) must classify child as ForkedSession"
+        )
+        assert "SubSession" not in node["labels"]
+        assert "RootSession" not in node["labels"]
+
+    async def test_fork_parent_key_only_creates_forked_edge(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork with 'parent' key only must create FORKED edge P->fork1.
+
+        FAILS before _parent_of; PASSES after.
+        """
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "fork1",
+                "parent": "P",  # emitter key — no parent_id
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        edge = await services.graph.get_edge("P", "fork1")
+        assert edge is not None, (
+            "session:fork with 'parent' key (no parent_id) must create FORKED edge P->fork1"
+        )
+        assert edge.get("type") == "FORKED"
+
+    # ----- Regressions: enriched "parent_id" key still works -----
+
+    async def test_start_parent_id_key_still_works(
+        self, services: HookStateService
+    ) -> None:
+        """Regression: session:start with enriched 'parent_id' key still classifies as SubSession."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "P",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "SubSession" in node["labels"]
+        edge = await services.graph.get_edge("P", "child")
+        assert edge is not None
+        assert edge.get("type") == "HAS_SUBSESSION"
+
+    async def test_fork_parent_id_key_still_works(
+        self, services: HookStateService
+    ) -> None:
+        """Regression: session:fork with enriched 'parent_id' key still classifies as ForkedSession."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "fork1",
+                "parent_id": "P",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("fork1")
+        assert node is not None
+        assert "ForkedSession" in node["labels"]
+        edge = await services.graph.get_edge("P", "fork1")
+        assert edge is not None
+        assert edge.get("type") == "FORKED"
+
+    # ----- Bare start: neither key -> RootSession, no parent edge -----
+
+    async def test_start_no_parent_key_creates_root_session(
+        self, services: HookStateService
+    ) -> None:
+        """session:start with neither 'parent' nor 'parent_id' must create RootSession."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "root",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("root")
+        assert node is not None
+        assert "RootSession" in node["labels"]
+        assert "SubSession" not in node["labels"]
+
+
+# ---------------------------------------------------------------------------
+# TestParentOfHelper — unit tests for the _parent_of() helper
+# ---------------------------------------------------------------------------
+
+
+class TestParentOfHelper:
+    """Unit tests for the _parent_of() module-level helper.
+
+    Covers all key-precedence and whitespace-stripping cases without the
+    overhead of a full handler invocation.
+    """
+
+    def test_parent_id_key_returned(self) -> None:
+        assert _parent_of({"parent_id": "abc"}) == "abc"
+
+    def test_parent_key_returned_when_no_parent_id(self) -> None:
+        assert _parent_of({"parent": "xyz"}) == "xyz"
+
+    def test_parent_id_wins_over_parent(self) -> None:
+        """parent_id takes precedence when both keys are present (enriched payload)."""
+        assert _parent_of({"parent_id": "id-val", "parent": "p-val"}) == "id-val"
+
+    def test_empty_parent_id_falls_through_to_parent(self) -> None:
+        """Empty string parent_id must fall through to 'parent'."""
+        assert _parent_of({"parent_id": "", "parent": "p-val"}) == "p-val"
+
+    def test_none_parent_id_falls_through_to_parent(self) -> None:
+        """None parent_id must fall through to 'parent'."""
+        assert _parent_of({"parent_id": None, "parent": "p-val"}) == "p-val"
+
+    def test_neither_key_returns_empty_string(self) -> None:
+        assert _parent_of({}) == ""
+
+    def test_parent_id_whitespace_is_stripped(self) -> None:
+        assert _parent_of({"parent_id": "  abc  "}) == "abc"
+
+    def test_parent_whitespace_is_stripped(self) -> None:
+        assert _parent_of({"parent": "  xyz  "}) == "xyz"
