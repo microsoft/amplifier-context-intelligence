@@ -82,7 +82,7 @@ digraph pipeline_flow {
         ]
 
         SessionHandler [
-            label     = "SessionHandler [0]\nsession:start | session:fork | session:end\nMERGE session metadata\nupsert workspace / repo context\nE02 FORKED | E13 HAS_SUBSESSION"
+            label     = "SessionHandler [0]\nsession:start | session:fork | session:end\nMERGE session metadata\nupsert workspace / repo context\nE02 FORKED | E13 HAS_SUBSESSION\n\u26a0 session:end with no prior start/fork \u2192 :IncompleteSession\n(health marker; has_terminal:false; WARNING logged)"
             fillcolor = "#F3E5F5"
         ]
 

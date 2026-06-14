@@ -146,7 +146,7 @@ digraph handler_architecture {
             label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
                 <TR><TD><B>SessionHandler [0]</B></TD></TR>
                 <TR><TD>session:start | session:fork | session:end</TD></TR>
-                <TR><TD>Labels: RootSession | SubSession | ForkedSession</TD></TR>
+                <TR><TD>Labels: RootSession | SubSession | ForkedSession | IncompleteSession (end-only recovery)</TD></TR>
                 <TR><TD>Edges: HAS_SUBSESSION (E13) | FORKED (E02)</TD></TR>
             </TABLE>>
         ]

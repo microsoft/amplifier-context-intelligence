@@ -117,7 +117,7 @@ or reference `neo4j.time`.
 ## Key Concepts
 
 - **Event pipeline** — `POST /events` persists the raw event to a durable per-session append-log (`queue_manager.py`) and returns `202` immediately (persist-then-202). A single drainer per session (`registry.py`) processes batches and flushes them to Neo4j under a global write semaphore, with transient/deadlock retry, dead-letter isolation of poison events, and crash recovery (replay + counter re-seed) on startup. Each handler invoked by the per-event dispatch spine is a Python class in `handlers/data_layer_*/`.
-- **Graph model** — 5 node types, 8 edge types. See `docs/architecture/03-graph-model.dot` for the diagram and `docs/architecture/README.md` for the legend.
+- **Graph model** — session sub-labels: `RootSession`, `SubSession`, `ForkedSession`, `IncompleteSession` (health marker; not a terminal). Full schema with all node and edge types: see `docs/architecture/03-graph-model.dot` and `docs/architecture/README.md`.
 - **Blob storage** — Large event payloads are written to disk and referenced by URI to avoid graph bloat.
 - **Configuration** — Pydantic Settings reads from `server-config.yaml` first, then environment variables. See `config.py`.
 

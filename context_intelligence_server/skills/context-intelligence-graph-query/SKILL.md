@@ -69,7 +69,7 @@ See Gotcha #12 for the same warning at the point of use, and Section 6 for tempo
 
 | Node Label | Description | node_id Format |
 |---|---|---|
-| `:Session` | One Amplifier session. Sub-labels: `:RootSession`, `:ForkedSession`. | Raw UUID |
+| `:Session` | One Amplifier session. Sub-labels: `:RootSession`, `:SubSession`, `:ForkedSession`, `:IncompleteSession`. | Raw UUID |
 | `:Event` | Every kernel event. Triple-labeled: `:Event` + `:{Category}Event` + `:{Specific}Event`. | `{session_id}__{event_name}__{epoch_ms}` |
 
 Key properties on `:Event` nodes:
@@ -97,7 +97,7 @@ All data layer 2 nodes carry a `workspace` property and an SST type label.
 
 | Entity | Labels | SST Type | node_id Format | Key Properties |
 |---|---|---|---|---|
-| Session | `:Session:SST_EVENT` (+ `:RootSession`/`:SubSession`/`:ForkedSession`) | Temporal | Raw UUID | `started_at` (ZONED DATETIME), `ended_at` (ZONED DATETIME), `last_updated` (ZONED DATETIME), `status` |
+| Session | `:Session:SST_EVENT` (+ `:RootSession`/`:SubSession`/`:ForkedSession`/`:IncompleteSession`) | Temporal | Raw UUID | `started_at` (ZONED DATETIME), `ended_at` (ZONED DATETIME), `last_updated` (ZONED DATETIME), `status` |
 | OrchestratorRun | `:OrchestratorRun:SST_EVENT` | Temporal | `{session_id}::orch_run::{started_at}` | `started_at` (ZONED DATETIME), `ended_at` (ZONED DATETIME), `completed_at` (ZONED DATETIME, when present), `orchestrator_name` |
 | Iteration | `:Iteration:SST_EVENT` | Temporal | `{session_id}::iteration::{N}` | `iteration_number`, `started_at` (ZONED DATETIME) |
 | ContentBlock | `:ContentBlock:SST_EVENT` | Temporal | `{session_id}::block::{iteration_N}::{index}` | `block_type`, `block_index`, `started_at` (ZONED DATETIME, when present) |
@@ -1087,3 +1087,19 @@ properties.
   tool-call duration) and returns a Neo4j DURATION value (e.g. PT1H30M).
 - `WHERE s.started_at > datetime() - duration('P30D')` enables rolling time-window queries
   (sessions started in the last 30 days). Both were impossible with string storage.
+
+**13. `IncompleteSession` is a health marker, not a terminal label.**
+A session node carrying `:IncompleteSession` reached `session:end` with no prior `session:start`
+or `session:fork` event captured. It carries **none** of the terminal labels (`:RootSession`,
+`:SubSession`, `:ForkedSession`) and has `has_terminal: false`. It is not a stub for a lost root
+session — it is a health signal. A spike in the count indicates upstream event loss. Count them
+with:
+
+```cypher
+MATCH (s:Session:IncompleteSession) RETURN count(s)
+```
+
+Do not treat `:IncompleteSession` nodes as `:RootSession`. Filter them out of normal terminal-
+session queries with `WHERE NOT s:IncompleteSession`, or check `has_terminal: false` on the
+session node. A WARNING is logged at ingest time: "reached end with no start/fork event; marked
+IncompleteSession (recovered)".

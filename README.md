@@ -441,6 +441,7 @@ All nodes carry a `workspace` property for multi-workspace isolation.
 | Label | Created by | Key properties |
 |-------|-----------|----------------|
 | `Session` + `RootSession`/`SubSession`/`ForkedSession` | `session:start`, `session:fork` | `node_id`, `status`, `started_at` |
+| `Session` + `IncompleteSession` | `session:end` with no prior start/fork | `node_id`, `has_terminal: false`; health signal — spike indicates upstream event loss; WARNING logged at ingest; not a terminal type |
 | `ToolCall` | `tool:pre` | `node_id` (session__tool_call__tool_call_id), `tool_name`, `tool_call_id` |
 | `Event` + derived label | unclaimed events | `node_id`, `event_type` |
 
