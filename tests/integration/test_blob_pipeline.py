@@ -139,9 +139,12 @@ class TestBlobPipelineEndToEnd:
             },
         )
 
-        worker = registry._workers[session_id]
-        # Must complete within 10 seconds (timeout raises asyncio.TimeoutError)
-        await asyncio.wait_for(worker.queue.join(), timeout=10.0)
+        # Poll the durable log until the drain loop has committed past every
+        # appended line (durable equivalent of the old worker.queue.join()).
+        for _ in range(500):
+            if (await registry.queue_manager.read_batch(session_id, 10)).lines == []:
+                break
+            await asyncio.sleep(0.02)
 
     @pytest.mark.skipif(
         not _neo4j_reachable(), reason="Neo4j not reachable at neo4j:7687"
@@ -175,8 +178,12 @@ class TestBlobPipelineEndToEnd:
         # ----------------------------------------------------------------
         # Step 2: Wait for drain loop to process (asyncio.wait_for, 10s)
         # ----------------------------------------------------------------
-        worker = registry._workers[session_id]
-        await asyncio.wait_for(worker.queue.join(), timeout=10.0)
+        # Poll the durable log until the drain loop has committed past every
+        # appended line (durable equivalent of the old worker.queue.join()).
+        for _ in range(500):
+            if (await registry.queue_manager.read_batch(session_id, 10)).lines == []:
+                break
+            await asyncio.sleep(0.02)
 
         # ----------------------------------------------------------------
         # Step 3: GET /blobs/{session_id} → at least 1 URI with '__result'

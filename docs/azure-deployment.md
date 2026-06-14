@@ -144,6 +144,7 @@ az containerapp create \
     "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE=/data/credentials.yaml" \
     "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH=/data/blobs" \
     "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_PATH=/data/logs/server.jsonl" \
+    "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_QUEUES_PATH=/data/queues" \
   --registry-server "${ACR_LOGIN}" \
   --registry-username "${ACR_USER}" \
   --registry-password "${ACR_PASS}" \
@@ -219,6 +220,10 @@ az containerapp update \
 Files mounted to `/data/`, this persists across restarts. All sensitive values
 supplied via Container Apps secrets override the yaml (env vars take precedence in
 the config system), so the auto-generated values in the file are safely ignored.
+
+> **Note:** `QUEUES_PATH` must point at the mounted `/data` Azure Files volume (durable
+> storage) — it holds events that have been accepted (`202`) but not yet written to Neo4j;
+> placing it on the container's ephemeral filesystem would lose in-flight events on restart.
 
 ## HTTPS and Connecting the Amplifier Bundle
 

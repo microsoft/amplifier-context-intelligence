@@ -92,10 +92,13 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
 
     class _SettingsProxy:
         blob_path: str = _real.blob_path
+        queues_path: str = str(tmp_path / "queues")
         neo4j_url: str = _real.neo4j_url
         neo4j_user: str = _real.neo4j_user
         neo4j_password: str = _real.neo4j_password
         stale_session_timeout: float = _real.stale_session_timeout
+        write_concurrency: int = _real.write_concurrency
+        max_delivery_attempts: int = _real.max_delivery_attempts
 
     with patch(
         "context_intelligence_server.registry.get_settings",
@@ -110,6 +113,16 @@ def reset_registry() -> Generator[None, None, None]:
     registry._workers.clear()
     if hasattr(registry, "_completed"):
         registry._completed.clear()
+    # Reset durable infra so each test rebuilds it against its own tmp_path
+    # queues dir (the module-level registry is constructed once at import).
+    registry._queue_manager = None
+    registry._write_semaphore = None
+    # Zero the live pipeline-conservation counters on the shared singleton so
+    # each test starts from a clean conservation baseline (D2).
+    registry._accepted_total = 0
+    registry._written_total = 0
+    registry._replayed_total = 0
+    registry._write_retries_total = 0
     yield
     # Explicitly cancel running drain tasks before clearing so teardown intent is clear
     for w in list(registry._workers.values()):
@@ -118,6 +131,8 @@ def reset_registry() -> Generator[None, None, None]:
     registry._workers.clear()
     if hasattr(registry, "_completed"):
         registry._completed.clear()
+    registry._queue_manager = None
+    registry._write_semaphore = None
 
 
 @pytest.fixture

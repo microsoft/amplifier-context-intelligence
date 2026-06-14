@@ -78,15 +78,23 @@ async def test_touch_session_ignores_older_timestamp(
     assert node.get("last_updated") == "2026-01-01T00:00:05Z"
 
 
-# Ancestor propagation — child activity updates parent and grandparent
+# Single-node contract — child activity NEVER propagates to ancestors
+#
+# Phase A removed the parent_id ancestor walk: it SET last_updated on the shared
+# root :Session node for every child event, so many independent writers contended
+# on that one node's exclusive lock — the Neo4j deadlock that silently dropped
+# events.  touch_session now updates only the direct session node.  These tests
+# were previously "propagation" tests; they now assert the single-node contract.
 
 
-async def test_touch_session_propagates_to_parent(services: HookStateService) -> None:
-    """Child activity propagates last_updated to the parent session node.
+async def test_touch_session_does_not_propagate_to_parent(
+    services: HookStateService,
+) -> None:
+    """Child activity must NOT touch the parent session node (single-node contract).
 
     Creates a parent Session node (no parent_id) and a child Session node with
     parent_id='prop-parent'.  Calls touch_session on the child and asserts that the
-    parent node's last_updated is also updated.
+    child is updated but the parent's last_updated is left untouched.
     """
     await services.graph.upsert_node(
         "prop-parent",
@@ -106,17 +114,17 @@ async def test_touch_session_propagates_to_parent(services: HookStateService) ->
     assert child_node.get("last_updated") == "2026-01-01T00:00:10Z"
 
     assert parent_node is not None
-    assert parent_node.get("last_updated") == "2026-01-01T00:00:10Z"
+    assert parent_node.get("last_updated") is None
 
 
-async def test_touch_session_propagates_to_grandparent(
+async def test_touch_session_does_not_propagate_to_grandparent(
     services: HookStateService,
 ) -> None:
-    """Child activity propagates last_updated through the full ancestor chain.
+    """Child activity must NOT walk the ancestor chain (single-node contract).
 
     Creates a prop-grandparent→prop-parent→prop-grandchild chain (3 Session nodes
     with parent_id links).  Calls touch_session on the grandchild and asserts that
-    all three nodes (grandchild, parent, grandparent) have last_updated updated.
+    only the grandchild is updated — parent and grandparent are left untouched.
     """
     await services.graph.upsert_node(
         "prop-grandparent",
@@ -149,66 +157,20 @@ async def test_touch_session_propagates_to_grandparent(
     assert grandchild_node.get("last_updated") == "2026-01-01T00:00:20Z"
 
     assert parent_node is not None
-    assert parent_node.get("last_updated") == "2026-01-01T00:00:20Z"
+    assert parent_node.get("last_updated") is None
 
     assert grandparent_node is not None
-    assert grandparent_node.get("last_updated") == "2026-01-01T00:00:20Z"
+    assert grandparent_node.get("last_updated") is None
 
 
-async def test_touch_session_stops_propagation_when_ancestor_is_newer(
+async def test_touch_session_ignores_parent_id_no_cycle_traversal(
     services: HookStateService,
 ) -> None:
-    """Propagation stops at an ancestor whose last_updated is already newer.
+    """touch_session never traverses parent_id, so cyclic chains are irrelevant.
 
-    Creates an early-parent Session node with last_updated='2026-01-01T00:00:10Z'
-    and an early-child Session node (no last_updated) whose parent_id points to
-    early-parent.  Calls touch_session on the child with an OLDER timestamp
-    ('2026-01-01T00:00:05Z').
-
-    Expected outcome:
-    - early-child.last_updated is set to '2026-01-01T00:00:05Z' (was null, so it
-      gets written regardless).
-    - early-parent.last_updated remains '2026-01-01T00:00:10Z' — the incoming
-      timestamp is older, so propagation terminates at the parent.
-    """
-    await services.graph.upsert_node(
-        "early-parent",
-        {
-            "labels": ["Session"],
-            "session_id": "early-parent",
-            "last_updated": "2026-01-01T00:00:10Z",
-        },
-    )
-    await services.graph.upsert_node(
-        "early-child",
-        {
-            "labels": ["Session"],
-            "session_id": "early-child",
-            "parent_id": "early-parent",
-        },
-    )
-
-    await services.touch_session("early-child", "2026-01-01T00:00:05Z")
-
-    child_node = await services.graph.get_node("early-child")
-    parent_node = await services.graph.get_node("early-parent")
-
-    assert child_node is not None
-    assert child_node.get("last_updated") == "2026-01-01T00:00:05Z"
-
-    assert parent_node is not None
-    assert parent_node.get("last_updated") == "2026-01-01T00:00:10Z"
-
-
-async def test_touch_session_terminates_on_parent_id_cycle(
-    services: HookStateService,
-) -> None:
-    """touch_session terminates cleanly when parent_id forms a cycle (A → B → A).
-
-    Without an explicit visited-set guard the loop would be infinite if the graph
-    store does not provide immediate read-after-write consistency (e.g. Neo4j with
-    a write buffer).  This test verifies that the function returns in finite time
-    and that both nodes receive last_updated regardless of visit order.
+    Creates a cycle-a → cycle-b → cycle-a parent_id loop.  Touching cycle-a updates
+    only cycle-a; cycle-b is never visited because there is no ancestor walk.  This
+    confirms the single-node contract makes the old infinite-loop concern moot.
     """
     await services.graph.upsert_node(
         "cycle-a",
@@ -219,7 +181,6 @@ async def test_touch_session_terminates_on_parent_id_cycle(
         {"labels": ["Session"], "session_id": "cycle-b", "parent_id": "cycle-a"},
     )
 
-    # Must return (not hang) and must update both nodes
     await services.touch_session("cycle-a", "2026-01-01T00:00:30Z")
 
     node_a = await services.graph.get_node("cycle-a")
@@ -227,7 +188,7 @@ async def test_touch_session_terminates_on_parent_id_cycle(
     assert node_a is not None
     assert node_a.get("last_updated") == "2026-01-01T00:00:30Z"
     assert node_b is not None
-    assert node_b.get("last_updated") == "2026-01-01T00:00:30Z"
+    assert node_b.get("last_updated") is None
 
 
 # Edge cases — no-op and error isolation

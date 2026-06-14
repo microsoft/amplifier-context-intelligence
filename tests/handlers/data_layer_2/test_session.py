@@ -11,14 +11,18 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
 
 from context_intelligence_server.handlers.data_layer_2.session import (
+    LabelTransition,
     SessionHandler,
+    SessionLabelStateMachine,
     _TYPE_LABELS,
     _current_type,
+    _warn_if_dual_terminal,
 )
 from context_intelligence_server.services import GraphState, HookStateService
 from context_intelligence_server.utils import make_node_id
@@ -1006,6 +1010,154 @@ class TestSessionLabelStateMachine:
         assert node["ended_at"] == "2026-01-01T01:00:00Z"
         assert "RootSession" not in node["labels"]
 
+    # ---- mount-plan-on-every-fork gap assertions ----
+
+    async def test_fork_bare_creates_mount_plan(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork on a bare child creates child::mount_plan companion node."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.ensure_session_node("child", {})
+        await handler(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {},
+            },
+        )
+        mount_plan = await services.graph.get_node("child::mount_plan")
+        assert mount_plan is not None
+
+    async def test_fork_forkedsession_noop_still_creates_mount_plan(
+        self, services: HookStateService
+    ) -> None:
+        """(ForkedSession, fork) -> TERMINAL label no-op, but mount_plan is still created."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.graph.upsert_node(
+            "child", {"labels": ["ForkedSession", "Session"]}
+        )
+        await services.graph.upsert_edge("parent", "child", {"type": "FORKED"})
+        await handler(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "metadata": {},
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "ForkedSession" in node["labels"]
+        mount_plan = await services.graph.get_node("child::mount_plan")
+        assert mount_plan is not None
+
+    # ---- edge no-ops on terminal starts gap assertions ----
+
+    async def test_start_subsession_new_parent_creates_no_second_edge(
+        self, services: HookStateService
+    ) -> None:
+        """(SubSession, start, new parent) -> label unchanged, no edge to new parent."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("p2", {})
+        await services.graph.upsert_node("child", {"labels": ["SubSession", "Session"]})
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "p2",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "SubSession" in node["labels"]
+        edge = await services.graph.get_edge("p2", "child")
+        assert edge is None
+
+    async def test_start_forkedsession_new_parent_creates_no_edge(
+        self, services: HookStateService
+    ) -> None:
+        """(ForkedSession, start, new parent) -> label unchanged, no edge to new parent."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("p2", {})
+        await services.graph.upsert_node(
+            "child", {"labels": ["ForkedSession", "Session"]}
+        )
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "p2",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "ForkedSession" in node["labels"]
+        edge = await services.graph.get_edge("p2", "child")
+        assert edge is None
+
+    # ---- already-typed session:end no-op gap assertion ----
+
+    async def test_end_already_typed_is_noop(self, services: HookStateService) -> None:
+        """session:end on an already-typed (RootSession) node does not reclassify."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("s1", {})
+        await handler(
+            "session:start",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+        await handler(
+            "session:end",
+            {"session_id": "s1", "timestamp": "2026-01-01T01:00:00Z"},
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        assert "RootSession" in node["labels"]
+        assert "SubSession" not in node["labels"]
+
+    # ---- full resulting label-set gap assertions ----
+
+    async def test_start_bare_no_parent_full_label_set(
+        self, services: HookStateService
+    ) -> None:
+        """(bare, start, no parent) -> exactly one type label: RootSession."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("s1", {})
+        await handler(
+            "session:start",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        terminals = {label for label in node["labels"] if label in _TYPE_LABELS}
+        assert terminals == {"RootSession"}
+
+    async def test_fork_sub_full_label_set(self, services: HookStateService) -> None:
+        """(SubSession, fork) -> exactly one type label: ForkedSession."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.graph.upsert_node("child", {"labels": ["SubSession", "Session"]})
+        await services.graph.upsert_edge("parent", "child", {"type": "HAS_SUBSESSION"})
+        await handler(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {},
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        terminals = {label for label in node["labels"] if label in _TYPE_LABELS}
+        assert terminals == {"ForkedSession"}
+
 
 # ---------------------------------------------------------------------------
 # TestSessionNodeProperties — session_id / parent_id on Session nodes
@@ -1787,3 +1939,93 @@ class TestSessionHandlerUsesSessionLabeledMerge:
         assert "Session" in enriched.get("labels", []), (
             "'Session' label must survive session:start enrichment of the stub"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestClassifyMatrix — exhaustive unit matrix for SessionLabelStateMachine.classify()
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyMatrix:
+    """Exhaustive unit matrix for SessionLabelStateMachine.classify().
+
+    21 cells covering all (event, current_type, has_parent) combinations.
+    Pure unit test — no fixtures, no Neo4j.
+    The test fails at collection with ImportError because LabelTransition
+    and SessionLabelStateMachine do not yet exist.  This IS the RED.
+    """
+
+    CASES: list[tuple[str, str | None, bool, list[str], list[str]]] = [
+        # (event, current_type, has_parent, add, remove)
+        # ------------------------------------------------------------------
+        # event=start
+        # ------------------------------------------------------------------
+        ("start", "ForkedSession", True, [], []),
+        ("start", "ForkedSession", False, [], []),
+        ("start", "SubSession", True, [], []),
+        ("start", "SubSession", False, [], []),
+        ("start", "RootSession", False, [], []),
+        ("start", "RootSession", True, ["SubSession", "SST_EVENT"], ["RootSession"]),
+        ("start", None, True, ["Session", "SubSession", "SST_EVENT"], []),
+        ("start", None, False, ["RootSession", "Session", "SST_EVENT"], []),
+        # ------------------------------------------------------------------
+        # event=fork
+        # ------------------------------------------------------------------
+        ("fork", "ForkedSession", True, [], []),
+        ("fork", "ForkedSession", False, [], []),
+        ("fork", "RootSession", True, ["ForkedSession", "SST_EVENT"], ["RootSession"]),
+        ("fork", "RootSession", False, ["ForkedSession", "SST_EVENT"], ["RootSession"]),
+        ("fork", "SubSession", True, ["ForkedSession", "SST_EVENT"], ["SubSession"]),
+        ("fork", "SubSession", False, ["ForkedSession", "SST_EVENT"], ["SubSession"]),
+        ("fork", None, True, ["Session", "ForkedSession", "SST_EVENT"], []),
+        ("fork", None, False, ["Session", "ForkedSession", "SST_EVENT"], []),
+        # ------------------------------------------------------------------
+        # event=end
+        # ------------------------------------------------------------------
+        ("end", None, True, ["SubSession", "SST_EVENT"], []),
+        ("end", None, False, ["RootSession", "SST_EVENT"], []),
+        ("end", "RootSession", True, [], []),
+        ("end", "SubSession", False, [], []),
+        ("end", "ForkedSession", True, [], []),
+    ]
+
+    @pytest.mark.parametrize(
+        "event, current_type, has_parent, add, remove",
+        CASES,
+    )
+    def test_classify_cell(
+        self,
+        event: str,
+        current_type: str | None,
+        has_parent: bool,
+        add: list[str],
+        remove: list[str],
+    ) -> None:
+        sm = SessionLabelStateMachine()
+        t = sm.classify(current_type=current_type, event=event, has_parent=has_parent)
+        assert t == LabelTransition(add=add, remove=remove)
+
+
+# ---------------------------------------------------------------------------
+# TestDualTerminalGuard
+# ---------------------------------------------------------------------------
+
+
+class TestDualTerminalGuard:
+    """_warn_if_dual_terminal emits a WARNING when >1 terminal label is present."""
+
+    def test_warns_on_dual_terminal_labels(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            _warn_if_dual_terminal(["Session", "RootSession", "SubSession"], "sX")
+        assert any(
+            r.levelno == logging.WARNING and "sX" in r.message for r in caplog.records
+        )
+
+    def test_no_warning_for_single_terminal(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            _warn_if_dual_terminal(["Session", "RootSession"], "sY")
+        assert not caplog.records

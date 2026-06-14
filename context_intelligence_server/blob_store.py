@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -144,7 +145,22 @@ class AsyncDiskBlobStore:
 
         def _write() -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(value), encoding="utf-8")
+            data = json.dumps(value)
+            tmp_fd, tmp_name = tempfile.mkstemp(
+                dir=str(path.parent), prefix=f"{key}.", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_name, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except FileNotFoundError:
+                    pass
+                raise
 
         await asyncio.to_thread(_write)
         return self._make_uri(session_id, key)

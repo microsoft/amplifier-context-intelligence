@@ -109,7 +109,7 @@ with all required settings. Do not run it again after the server is in use
 
 ```bash
 DATA_DIR="$HOME/amplifier-context-intelligence-server-data-store"
-mkdir -p "${DATA_DIR}/blobs" "${DATA_DIR}/logs" "${DATA_DIR}/cursors"
+mkdir -p "${DATA_DIR}/blobs" "${DATA_DIR}/logs" "${DATA_DIR}/queues"
 
 context-intelligence-server init \
   --config-path       ~/.config/context-intelligence/server-config.yaml \
@@ -119,7 +119,6 @@ context-intelligence-server init \
   --neo4j-password    "<your-neo4j-password>" \
   --blob-path         "${DATA_DIR}/blobs" \
   --log-path          "${DATA_DIR}/logs/server.jsonl" \
-  --cursor-path       "${DATA_DIR}/cursors" \
   --server-host       0.0.0.0 \
   --server-port       8000
 ```
@@ -178,13 +177,13 @@ grouped into three categories below.
 |-----|---------|---------|
 | `blob_path` | `~/amplifier-context-intelligence-server-data-store/blobs` | Event payload storage (binary blobs from tool outputs) |
 | `log_path` | `~/amplifier-context-intelligence-server-data-store/logs/server.jsonl` | Structured JSONL server log |
-| `cursor_path` | `~/amplifier-context-intelligence-server-data-store/cursors` | Session cursor state (enables resumption of event replay) |
+| `queues_path` | `~/amplifier-context-intelligence-server-data-store/queues` | Durable per-session ingest queues (`.log`/`.offset`/`.dead.jsonl`) |
 
 ### Create storage directories
 
 ```bash
 DATA_DIR="$HOME/amplifier-context-intelligence-server-data-store"
-mkdir -p "${DATA_DIR}/blobs" "${DATA_DIR}/logs" "${DATA_DIR}/cursors"
+mkdir -p "${DATA_DIR}/blobs" "${DATA_DIR}/logs" "${DATA_DIR}/queues"
 ```
 
 ---

@@ -1,4 +1,4 @@
-function authHeaders() {
+export function authHeaders() {
   const token = localStorage.getItem('ci_api_key');
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers['Authorization'] = `Bearer ${token}`;

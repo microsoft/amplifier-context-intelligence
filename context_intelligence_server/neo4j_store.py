@@ -186,7 +186,32 @@ async def ensure_neo4j_schema(
 
         # ------------------------------------------------------------------
         # Step 2: create node_id indexes (idempotent via IF NOT EXISTS).
+        # ``CREATE INDEX ... IF NOT EXISTS`` is idempotent for serial callers,
+        # but two callers racing on a fresh database can both pass the existence
+        # check and then collide, surfacing
+        # ``Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists``. Because
+        # multiple independent stores auto-run this on their first concurrent
+        # flush (each store has its own ``_schema_initialized`` flag), that race
+        # is reachable. The colliding rule is exactly the one we wanted, so the
+        # error is benign — swallow it (mirroring the constraint handling below)
+        # while re-raising any other schema error.
         # ------------------------------------------------------------------
+        async def _create_index(statement: str) -> None:
+            try:
+                await session.run(statement)
+            except Neo4jError as exc:
+                if (
+                    exc.code
+                    == "Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists"
+                ):
+                    _LOG.debug(
+                        "ensure_neo4j_schema: index already exists (concurrent "
+                        "create race, benign): %s",
+                        statement,
+                    )
+                else:
+                    raise
+
         for label in (
             "Session",
             "OrchestratorRun",
@@ -194,10 +219,10 @@ async def ensure_neo4j_schema(
             "ToolExecution",
             "Event",
         ):
-            await session.run(
+            await _create_index(
                 f"CREATE INDEX IF NOT EXISTS FOR (n:{label}) ON (n.node_id)"
             )
-        await session.run(
+        await _create_index(
             "CREATE INDEX idx_session_workspace IF NOT EXISTS "
             "FOR (n:Session) ON (n.workspace)"
         )
@@ -220,6 +245,173 @@ async def ensure_neo4j_schema(
                 "(pre-existing duplicates?): %s",
                 exc,
             )
+
+        # ------------------------------------------------------------------
+        # Step 4: uniqueness constraint on Event nodes.
+        # Mirrors the Session constraint above so that idempotent
+        # MERGE (n:Event ...) in flush() is atomic under concurrency and
+        # cannot create duplicate Event nodes when multiple writers race.
+        # ------------------------------------------------------------------
+        try:
+            await session.run(
+                "CREATE CONSTRAINT event_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Event) REQUIRE (n.node_id, n.workspace) IS UNIQUE"
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning(
+                "ensure_neo4j_schema: could not create Event uniqueness constraint "
+                "(pre-existing duplicates?): %s",
+                exc,
+            )
+
+
+async def _write_batch(
+    tx: Any,
+    node_snapshot: dict[str, dict[str, Any]],
+    edge_snapshot: dict[tuple[str, str], dict[str, Any]],
+    patch_snapshot: list[dict[str, Any]],
+    workspace: str,
+) -> None:
+    """Execute one buffered batch of node, label, and edge writes on ``tx``.
+
+    Operates on the supplied managed-transaction object ``tx``; it never opens
+    or commits a transaction itself, so the same coroutine can run inside either
+    a raw ``begin_transaction()`` block or a driver-managed ``execute_write``.
+
+    Idempotency rule #1: the batch is captured by the caller *before* this
+    coroutine is invoked (the snapshots are passed as parameters and never read
+    from a mutable buffer here), so this is a pure function of its parameters.
+    The driver may therefore safely re-run it on a transient error
+    (``TransientError`` / ``DeadlockDetected``) without corrupting state.
+
+    Every Cypher result is consumed (``await res.consume()``) rather than
+    returned, so this coroutine never leaks a raw ``Result`` object across the
+    transaction boundary.
+    """
+    # ---- nodes ---- (Session nodes use label-aware MERGE + uniqueness constraint)
+    session_rows: list[dict[str, Any]] = []  # have Session label
+    other_rows: list[dict[str, Any]] = []  # everything else
+    label_assignments: list[dict[str, Any]] = []
+
+    for node_id, data in node_snapshot.items():
+        labels: list[str] = data.get("labels", [])
+        node_props = {k: v for k, v in data.items() if k != "labels"}
+        _convert_temporal_props(node_props)  # ISO str -> datetime, in place
+        props = Neo4jGraphStore._sanitize_properties(node_props)
+        props["workspace"] = workspace
+        row: dict[str, Any] = {"node_id": node_id, "props": props}
+
+        if "Session" in labels:
+            session_rows.append(row)
+        else:
+            other_rows.append(row)
+
+        if labels:
+            for label in labels:
+                _validate_identifier(label, "label")
+            label_assignments.append(
+                {"node_id": node_id, "labels": sorted(set(labels))}
+            )
+
+    # Session nodes: MERGE by Session label + uniqueness constraint (atomic under concurrency)
+    # Lock-order hygiene: sort by stable key so every writer acquires node locks in one
+    # global order, preventing the out-of-order lock cycle that causes deadlocks.
+    session_rows.sort(key=lambda r: r["node_id"])
+    if session_rows:
+        res = await tx.run(
+            "UNWIND $rows AS row "
+            "MERGE (n:Session {node_id: row.node_id, workspace: row.props.workspace}) "
+            "SET n += row.props",
+            rows=session_rows,
+        )
+        await res.consume()
+
+    # Non-session nodes: label-free MERGE (no constraint needed — single-worker owned)
+    other_rows.sort(key=lambda r: r["node_id"])
+    if other_rows:
+        res = await tx.run(
+            "UNWIND $rows AS row "
+            "MERGE (n {node_id: row.node_id, workspace: row.props.workspace}) "
+            "SET n += row.props",
+            rows=other_rows,
+        )
+        await res.consume()
+
+    # Set all labels for labeled nodes (primary + extra in one SET per node).
+    # For Session nodes, Session label is already set by the MERGE above — this
+    # adds any additional type labels (RootSession, SubSession, ForkedSession, etc.)
+    label_assignments.sort(key=lambda i: i["node_id"])
+    for item in label_assignments:
+        labels_str = ":".join(item["labels"])
+        res = await tx.run(
+            cast(
+                LiteralString,
+                f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) "
+                f"SET n:{labels_str}",
+            ),
+            node_id=item["node_id"],
+            workspace=workspace,
+        )
+        await res.consume()
+
+    # ---- label patches (must run AFTER node writes — nodes must exist in Neo4j before MATCH) ----
+    for lp in patch_snapshot:
+        pid = lp["node_id"]
+        for label in lp.get("remove", []):
+            _validate_identifier(label, "label")
+            res = await tx.run(
+                cast(
+                    LiteralString,
+                    f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) REMOVE n:{label}",
+                ),
+                node_id=pid,
+                workspace=workspace,
+            )
+            await res.consume()
+        for label in lp.get("add", []):
+            _validate_identifier(label, "label")
+            res = await tx.run(
+                cast(
+                    LiteralString,
+                    f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) SET n:{label}",
+                ),
+                node_id=pid,
+                workspace=workspace,
+            )
+            await res.consume()
+
+    # ---- edges ----
+    edge_groups: dict[str, list[dict[str, Any]]] = {}
+    for (src_id, dst_id), data in edge_snapshot.items():
+        edge_type: str = data.get("type", _DEFAULT_EDGE_TYPE)
+        edge_props = {k: v for k, v in data.items() if k != "type"}
+        _convert_temporal_props(edge_props)  # ISO str -> datetime, in place
+        props = Neo4jGraphStore._sanitize_properties(edge_props)
+        props["workspace"] = workspace
+        # Store src_id/dst_id on the relationship so the
+        # get_edge() fallback query (WHERE r.src_id = $src_id
+        # AND r.dst_id = $dst_id) can locate it after a flush.
+        props["src_id"] = src_id
+        props["dst_id"] = dst_id
+        row = {"src_id": src_id, "dst_id": dst_id, "props": props}
+        edge_groups.setdefault(edge_type, []).append(row)
+
+    for edge_type, rows in edge_groups.items():
+        _validate_identifier(edge_type, "edge_type")
+        edge_merge_query = (  # type: ignore[assignment]
+            f"UNWIND $rows AS row "
+            f"MATCH (src {{node_id: row.src_id, workspace: $workspace}}) "
+            f"MATCH (dst {{node_id: row.dst_id, workspace: $workspace}}) "
+            f"MERGE (src)-[r:{edge_type}]->(dst) "
+            f"SET r += row.props"
+        )
+        rows.sort(key=lambda r: (r["src_id"], r["dst_id"]))
+        res = await tx.run(
+            edge_merge_query,  # type: ignore[arg-type]
+            rows=rows,
+            workspace=workspace,
+        )
+        await res.consume()
 
 
 class Neo4jGraphStore:
@@ -246,7 +438,13 @@ class Neo4jGraphStore:
             workspace: Workspace to scope writes to.  ``None`` resolves to
                        ``"default"`` via the ``workspace`` property.
         """
-        self._driver = AsyncGraphDatabase.driver(uri, auth=auth)
+        # Explicit auto-retry budget for transient errors (e.g. deadlocks) so the
+        # managed-transaction retry window is deliberate and reviewable rather than
+        # relying on the driver default implicitly. 30.0s is a working default;
+        # design Open Question #3 — verify driver 6.1.0 backoff constants before tuning.
+        self._driver = AsyncGraphDatabase.driver(
+            uri, auth=auth, max_transaction_retry_time=30.0
+        )
         self._database = database
         self._workspace = workspace
         self._node_buffer: dict[str, dict[str, Any]] = {}
@@ -254,7 +452,6 @@ class Neo4jGraphStore:
         self._label_patches: list[dict[str, Any]] = []
         self._schema_initialized: bool = False
         self._closed: bool = False
-        self._flush_task = None
         self._flush_lock: asyncio.Lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -339,16 +536,20 @@ class Neo4jGraphStore:
         try:
             result = await self._driver.execute_query(
                 "MATCH (n) WHERE n.node_id = $id AND n.workspace = $workspace "
-                "RETURN properties(n) AS props",
+                "RETURN properties(n) AS props, labels(n) AS lbls",
                 {"id": node_id, "workspace": self.workspace},
                 database_=self._database,
             )
             records = result.records
             if records:
-                return {
+                node = {
                     k: _normalize_temporal(v)
                     for k, v in dict(records[0]["props"]).items()
                 }
+                # Merge true node labels so handlers see current_type across a
+                # flush boundary, matching the in-buffer get_node shape.
+                node["labels"] = list(records[0]["lbls"])
+                return node
         except Neo4jError:
             pass
 
@@ -436,9 +637,8 @@ class Neo4jGraphStore:
 
         Serializes callers via ``_flush_lock`` so that at most one Neo4j
         transaction is open at any time for this store.  Without the lock a
-        concurrent caller (e.g. the 30-second periodic timer firing while
-        ``_background_flush`` is mid-transaction) would open a second
-        transaction on the same nodes, which Neo4j resolves as a deadlock.
+        concurrent caller could open a second transaction on the same nodes,
+        which Neo4j resolves as a deadlock.
 
         Optimistically snapshots and clears buffers before writing.  On any
         failure the transaction is rolled back and the buffers are restored
@@ -470,131 +670,21 @@ class Neo4jGraphStore:
         try:
             await self._ensure_schema()
 
+            # Driver-managed transaction: execute_write owns commit/rollback and
+            # auto-retries transient failures (TransientError / DeadlockDetected)
+            # up to max_transaction_retry_time. Safe because _write_batch is a pure
+            # function of its snapshot parameters (idempotency rule #1) and every
+            # write is an idempotent MERGE backed by uniqueness constraints
+            # (rules #2/#3), so re-running the batch cannot corrupt or duplicate state.
             async with self._driver.session(database=self._database) as db_session:
-                tx = await db_session.begin_transaction()
-                try:
-                    # ---- nodes ---- (Session nodes use label-aware MERGE + uniqueness constraint)
-                    session_rows: list[dict[str, Any]] = []  # have Session label
-                    other_rows: list[dict[str, Any]] = []  # everything else
-                    label_assignments: list[dict[str, Any]] = []
-
-                    for node_id, data in node_snapshot.items():
-                        labels: list[str] = data.get("labels", [])
-                        node_props = {k: v for k, v in data.items() if k != "labels"}
-                        _convert_temporal_props(
-                            node_props
-                        )  # ISO str -> datetime, in place
-                        props = self._sanitize_properties(node_props)
-                        props["workspace"] = self.workspace
-                        row: dict[str, Any] = {"node_id": node_id, "props": props}
-
-                        if "Session" in labels:
-                            session_rows.append(row)
-                        else:
-                            other_rows.append(row)
-
-                        if labels:
-                            for label in labels:
-                                _validate_identifier(label, "label")
-                            label_assignments.append(
-                                {"node_id": node_id, "labels": sorted(set(labels))}
-                            )
-
-                    # Session nodes: MERGE by Session label + uniqueness constraint (atomic under concurrency)
-                    if session_rows:
-                        await tx.run(
-                            "UNWIND $rows AS row "
-                            "MERGE (n:Session {node_id: row.node_id, workspace: row.props.workspace}) "
-                            "SET n += row.props",
-                            rows=session_rows,
-                        )
-
-                    # Non-session nodes: label-free MERGE (no constraint needed — single-worker owned)
-                    if other_rows:
-                        await tx.run(
-                            "UNWIND $rows AS row "
-                            "MERGE (n {node_id: row.node_id, workspace: row.props.workspace}) "
-                            "SET n += row.props",
-                            rows=other_rows,
-                        )
-
-                    # Set all labels for labeled nodes (primary + extra in one SET per node).
-                    # For Session nodes, Session label is already set by the MERGE above — this
-                    # adds any additional type labels (RootSession, SubSession, ForkedSession, etc.)
-                    for item in label_assignments:
-                        labels_str = ":".join(item["labels"])
-                        await tx.run(
-                            cast(
-                                LiteralString,
-                                f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) "
-                                f"SET n:{labels_str}",
-                            ),
-                            node_id=item["node_id"],
-                            workspace=self.workspace,
-                        )
-
-                    # ---- label patches (must run AFTER node writes — nodes must exist in Neo4j before MATCH) ----
-                    for lp in patch_snapshot:
-                        pid = lp["node_id"]
-                        for label in lp.get("remove", []):
-                            _validate_identifier(label, "label")
-                            await tx.run(
-                                cast(
-                                    LiteralString,
-                                    f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) REMOVE n:{label}",
-                                ),
-                                node_id=pid,
-                                workspace=self.workspace,
-                            )
-                        for label in lp.get("add", []):
-                            _validate_identifier(label, "label")
-                            await tx.run(
-                                cast(
-                                    LiteralString,
-                                    f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) SET n:{label}",
-                                ),
-                                node_id=pid,
-                                workspace=self.workspace,
-                            )
-
-                    # ---- edges ----
-                    edge_groups: dict[str, list[dict[str, Any]]] = {}
-                    for (src_id, dst_id), data in edge_snapshot.items():
-                        edge_type: str = data.get("type", _DEFAULT_EDGE_TYPE)
-                        edge_props = {k: v for k, v in data.items() if k != "type"}
-                        _convert_temporal_props(
-                            edge_props
-                        )  # ISO str -> datetime, in place
-                        props = self._sanitize_properties(edge_props)
-                        props["workspace"] = self.workspace
-                        # Store src_id/dst_id on the relationship so the
-                        # get_edge() fallback query (WHERE r.src_id = $src_id
-                        # AND r.dst_id = $dst_id) can locate it after a flush.
-                        props["src_id"] = src_id
-                        props["dst_id"] = dst_id
-                        row = {"src_id": src_id, "dst_id": dst_id, "props": props}
-                        edge_groups.setdefault(edge_type, []).append(row)
-
-                    for edge_type, rows in edge_groups.items():
-                        _validate_identifier(edge_type, "edge_type")
-                        edge_merge_query = (  # type: ignore[assignment]
-                            f"UNWIND $rows AS row "
-                            f"MATCH (src {{node_id: row.src_id, workspace: $workspace}}) "
-                            f"MATCH (dst {{node_id: row.dst_id, workspace: $workspace}}) "
-                            f"MERGE (src)-[r:{edge_type}]->(dst) "
-                            f"SET r += row.props"
-                        )
-                        await tx.run(
-                            edge_merge_query,  # type: ignore[arg-type]
-                            rows=rows,
-                            workspace=self.workspace,
-                        )
-
-                    await tx.commit()
-                    success = True
-                except Exception:
-                    await tx.rollback()
-                    raise
+                await db_session.execute_write(
+                    _write_batch,
+                    node_snapshot,
+                    edge_snapshot,
+                    patch_snapshot,
+                    self.workspace,
+                )
+            success = True
         finally:
             if not success:
                 # Restore buffers: snapshot base + any new writes since flush started
@@ -606,6 +696,27 @@ class Neo4jGraphStore:
                 self._edge_buffer = merged_edges
                 merged_patches = patch_snapshot + self._label_patches
                 self._label_patches = merged_patches
+
+    def discard_buffer(self) -> None:
+        """Drop all buffered writes without persisting them (no driver I/O).
+
+        Clears ``_node_buffer``, ``_edge_buffer`` and ``_label_patches`` in
+        memory.  Unlike ``flush``, this performs no Neo4j transaction and never
+        restores buffers.  It is the dead-letter primitive used to isolate a
+        poison line: a failed write's nodes/edges/label-patches stay resident in
+        the buffers (``_flush_body`` restores them on failure), so without a
+        discard primitive a dead-lettered line would remain resident and the
+        next good line's flush would re-include it — cascading dead-letters of
+        otherwise-good events.
+
+        Safety note (LOW severity): this method is intentionally NOT guarded by
+        ``_flush_lock``.  That is safe ONLY because the drainer is the sole flush
+        trigger (Task 6); if another concurrent flush path is ever reintroduced,
+        this method must take ``_flush_lock`` to avoid racing buffer mutation.
+        """
+        self._node_buffer = {}
+        self._edge_buffer = {}
+        self._label_patches = []
 
     async def _ensure_schema(self) -> None:
         """Create Neo4j indexes and constraints idempotently (runs once per store instance).
@@ -622,31 +733,12 @@ class Neo4jGraphStore:
         await ensure_neo4j_schema(self._driver, self._database)
         self._schema_initialized = True
 
-    def schedule_flush(self) -> None:
-        """Schedule a background flush task if none is currently running."""
-        if self._flush_task is None or self._flush_task.done():
-            self._flush_task = asyncio.create_task(self._background_flush())
-
-    async def _background_flush(self) -> None:
-        """Invoke ``flush`` and log any exceptions (does not propagate)."""
-        try:
-            await self.flush()
-        except Exception:
-            _LOG.exception("Background flush failed")
-
     async def close(self) -> None:
         """Flush pending writes, await any background task, and close the driver.
 
         Handles event-loop mismatch gracefully when closing the driver from a
         different loop context.  Sets ``_closed`` on completion.
         """
-        # Await any in-flight background flush
-        if self._flush_task is not None and not self._flush_task.done():
-            try:
-                await self._flush_task
-            except Exception:
-                pass
-
         # Final flush to persist remaining buffer contents
         try:
             await self.flush()

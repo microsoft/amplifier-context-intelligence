@@ -29,7 +29,7 @@ globalThis.fetch = async (url, options = {}) => {
 };
 
 // ── Import module under test (after globals are in place) ────────────────────
-const { fetchStatus, postCypher } = await import('./api.js');
+const { fetchStatus, postCypher, authHeaders } = await import('./api.js');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function resetFetchCalls() { capturedFetchCalls = []; }
@@ -163,5 +163,30 @@ describe('postCypher()', () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// authHeaders()
+// ───────────────────────────────────────────────────────────────────────────
+
+describe('authHeaders()', () => {
+  beforeEach(() => { resetLocalStorage(); });
+
+  test('is exported', () => {
+    assert.equal(typeof authHeaders, 'function');
+  });
+
+  test('returns Bearer token and Content-Type when token is stored', () => {
+    localStorage.setItem('ci_api_key', 'tok-xyz');
+    const headers = authHeaders();
+    assert.equal(headers['Authorization'], 'Bearer tok-xyz');
+    assert.equal(headers['Content-Type'], 'application/json');
+  });
+
+  test('omits Authorization but keeps Content-Type when no token', () => {
+    const headers = authHeaders();
+    assert.ok(!headers['Authorization']);
+    assert.equal(headers['Content-Type'], 'application/json');
   });
 });

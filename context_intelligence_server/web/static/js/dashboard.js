@@ -1,4 +1,5 @@
 import { fetchStatus, postCypher } from './api.js';
+import { renderQueues, fetchDeadLetters, renderDeadLetters, renderDeadLetterError, wireDeadLetterActions } from './queues-panel.js';
 
 function timeAgo(ts) {
   if (!ts) return '-';
@@ -19,6 +20,22 @@ function escapeAttr(s) {
   return String(s)
     .replace(/&/g, '&amp;').replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Pure pipeline-health hint derivation. Pill text carries NO literal dot
+// glyph — .pill::before draws the dot (fix C).
+export function computeHint(metrics) {
+  const m = metrics || {};
+  const degraded = !!m.degraded;
+  const dead = m.dead_letter_total ?? 0;
+  return {
+    degraded,
+    pillText: degraded ? 'DEGRADED' : 'Pipeline OK',
+    pillClass: degraded ? 'pill degraded' : 'pill',
+    inQueue: m.in_queue_total ?? 0,
+    deadVisible: dead > 0,
+    deadText: `Dead-letter ${dead}`,
+  };
 }
 
 // ── Neo4j row expand ──────────────────────────────────────────────────────
@@ -52,6 +69,40 @@ function toggleDetail(sessionId, workspace, row) {
 }
 
 // ── Status polling ────────────────────────────────────────────────────────
+let activeTab = 'overview';
+
+function onAuthLost() {
+  try { localStorage.removeItem('ci_api_key'); } catch { /* storage unavailable */ }
+  const overlay = document.getElementById('auth-overlay');
+  if (overlay) overlay.style.display = '';
+}
+
+function setTab(name) {
+  activeTab = name;
+  const queues = name === 'queues';
+  const panelOverview = document.getElementById('panel-overview');
+  if (panelOverview) panelOverview.hidden = queues;
+  const panelQueues = document.getElementById('panel-queues');
+  if (panelQueues) panelQueues.hidden = !queues;
+  const tabOverview = document.getElementById('tab-overview');
+  if (tabOverview) {
+    tabOverview.classList.toggle('active', !queues);
+    tabOverview.setAttribute('aria-selected', String(!queues));
+  }
+  const tabQueues = document.getElementById('tab-queues');
+  if (tabQueues) {
+    tabQueues.classList.toggle('active', queues);
+    tabQueues.setAttribute('aria-selected', String(queues));
+  }
+  window.scrollTo(0, 0);
+  if (queues) refresh();
+}
+
+document.getElementById('tab-overview')?.addEventListener('click', () => setTab('overview'));
+document.getElementById('tab-queues')?.addEventListener('click', () => setTab('queues'));
+document.getElementById('hint-go-queues')?.addEventListener('click', () => setTab('queues'));
+wireDeadLetterActions({ onAuthLost });
+
 async function refresh() {
   try {
     const data = await fetchStatus();
@@ -86,7 +137,7 @@ async function refresh() {
     const sb = document.getElementById('sessions-body');
     if (sb) sb.innerHTML = (data.sessions || []).map(s =>
       `<tr><td>${truncate(s.session_id, 20)}</td><td>${truncate(s.workspace, 28)}</td>` +
-      `<td>${s.queue_depth}</td><td>${(s.last_event || '-')}</td><td>${s.events_processed}</td></tr>`
+      `<td>${(s.last_event || '-')}</td><td>${s.events_processed}</td></tr>`
     ).join('');
 
     const cb = document.getElementById('completed-body');
@@ -104,6 +155,28 @@ async function refresh() {
       `<td>${truncate(e.session_id, 20)}</td><td>${truncate(e.workspace, 28)}</td>` +
       `<td class="${e.result === 'ok' ? 'result-ok' : 'result-error'}">${e.result}</td></tr>`
     ).join('');
+
+    const hint = computeHint(data.metrics || {});
+    const hintPill = document.getElementById('hint-pill');
+    if (hintPill) { hintPill.textContent = hint.pillText; hintPill.className = hint.pillClass; }
+    const hintInQueue = document.getElementById('hint-inqueue');
+    if (hintInQueue) hintInQueue.textContent = hint.inQueue;
+    const hintDead = document.getElementById('hint-dead');
+    if (hintDead) {
+      hintDead.style.display = hint.deadVisible ? 'inline-flex' : 'none';
+      hintDead.textContent = hint.deadText;
+    }
+
+    renderQueues(data);
+    if (activeTab === 'queues') {
+      try {
+        const dl = await fetchDeadLetters();
+        renderDeadLetters(dl.dead_letters || []);
+      } catch (err) {
+        if (err && err.status === 401) onAuthLost();
+        else renderDeadLetterError();
+      }
+    }
   } catch (err) {
     console.error('Status refresh failed:', err);
   }
