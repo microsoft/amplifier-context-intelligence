@@ -335,13 +335,24 @@ def _make_flush_mocks():
     """Return (mock_tx, mock_session) configured for flush testing.
 
     ``mock_session.__aenter__`` is explicitly configured to return ``mock_session``
-    so that ``async with driver.session(...) as session:`` yields the same object
-    whose attributes (``begin_transaction``, ``run``) we can assert on.
+    so that ``async with driver.session(...) as session:`` yields the same object.
+
+    The store now persists batches through the driver-managed transaction API
+    (``await db_session.execute_write(_write_batch, *args)``), so ``execute_write``
+    is wired to drive the supplied write function against ``mock_tx`` exactly as
+    the real driver drives it against a managed transaction:
+    ``await fn(mock_tx, *args, **kwargs)``.  This keeps the ``mock_tx.run(...)``
+    calls captured for assertions and preserves failure injection (set a
+    ``side_effect`` on ``mock_tx.run`` and it propagates out of ``flush()``).
     """
     mock_tx = AsyncMock()
+
+    async def _execute_write(fn, *args, **kwargs):
+        return await fn(mock_tx, *args, **kwargs)
+
     mock_session = AsyncMock()
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.begin_transaction = AsyncMock(return_value=mock_tx)
+    mock_session.execute_write = AsyncMock(side_effect=_execute_write)
     return mock_tx, mock_session
 
 
@@ -938,6 +949,38 @@ async def test_get_node_fallback_queries_by_node_id_property():
     )
 
 
+async def test_get_node_fallback_includes_labels():
+    """Post-flush fallback must return node labels under a 'labels' key.
+
+    The Neo4j fallback previously returned properties(n) only, which EXCLUDES
+    labels. A handler reading a label-blind node resolves current_type to None
+    and adds a second type label. The fallback must also return labels(n),
+    merged into the dict under 'labels', matching the in-buffer shape.
+
+    FAILS before fix  -> result has no 'labels' key.
+    PASSES after fix  -> result['labels'] contains the node's labels.
+    """
+    store = _make_store()
+    store._node_buffer = {}  # simulate post-flush: buffer is empty
+
+    record = {
+        "props": {"node_id": "child-1", "session_id": "child-1"},
+        "lbls": ["Session", "ForkedSession", "SST_EVENT"],
+    }
+    mock_result = MagicMock()
+    mock_result.records = [record]
+    store._driver.execute_query = AsyncMock(return_value=mock_result)  # type: ignore[attr-defined]
+
+    result = await store.get_node("child-1")
+
+    assert result is not None
+    assert "labels" in result, (
+        f"get_node fallback must return a 'labels' key; got keys {sorted(result.keys())}"
+    )
+    assert "ForkedSession" in result["labels"]
+    assert "Session" in result["labels"]
+
+
 # ---------------------------------------------------------------------------
 # Bug 2 — flush() must store src_id/dst_id on edge props so get_edge fallback works
 # ---------------------------------------------------------------------------
@@ -1247,10 +1290,16 @@ class TestNeo4jGraphStoreFlushNoLabelMerge:
         mock_tx = AsyncMock()
         mock_tx.run = AsyncMock(side_effect=capture)
         mock_tx.commit = AsyncMock()
+
+        async def _execute_write(fn, *args, **kwargs):
+            # Drive the managed-transaction write function against mock_tx,
+            # mirroring the real driver's execute_write(fn, *args) contract.
+            return await fn(mock_tx, *args, **kwargs)
+
         mock_db_session = AsyncMock()
         mock_db_session.__aenter__ = AsyncMock(return_value=mock_db_session)
         mock_db_session.__aexit__ = AsyncMock(return_value=False)
-        mock_db_session.begin_transaction = AsyncMock(return_value=mock_tx)
+        mock_db_session.execute_write = AsyncMock(side_effect=_execute_write)
         store._driver.session = MagicMock(return_value=mock_db_session)
 
         from unittest.mock import patch as mock_patch
@@ -1291,8 +1340,8 @@ class TestNeo4jGraphStoreFlushNoLabelMerge:
 
         assert constraint_queries, "Must have at least one constraint creation query"
         for q in constraint_queries:
-            assert "(n:Session)" in q or "(n:Session " in q, (
-                f"Constraint must use (n:Session) label syntax, not label-free (n). Got: {q}"
+            assert "FOR (n:" in q, (
+                f"Constraint must use label-based FOR (n:Label) syntax, not label-free (n). Got: {q}"
             )
             assert "IS UNIQUE" in q, f"Must use IS UNIQUE syntax. Got: {q}"
 
@@ -1375,8 +1424,12 @@ async def test_flush_lock_serializes_concurrent_calls() -> None:
             async def __aexit__(self, *args: object) -> None:
                 pass
 
-            async def begin_transaction(self) -> object:
-                return self._tx
+            async def execute_write(
+                self, fn, *args: object, **kwargs: object
+            ) -> object:
+                # Driver-managed transaction: drive the write function against the
+                # captured tx exactly as the real driver does (await fn(tx, *args)).
+                return await fn(self._tx, *args, **kwargs)
 
         return ControlledSession()
 
@@ -1512,3 +1565,30 @@ def test_normalize_temporal_passes_through_python_datetime() -> None:
 def test_normalize_temporal_passes_through_int() -> None:
     """_normalize_temporal returns integers unchanged."""
     assert _normalize_temporal(42) == 42
+
+
+# ---------------------------------------------------------------------------
+# discard_buffer (Phase B2 — COE blocker for line-by-line poison isolation)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_discard_buffer_clears_all_buffers_without_flushing():
+    """discard_buffer clears node/edge/label buffers with no driver I/O."""
+    store = _make_store()
+    await store.upsert_node("n1", {"name": "Alice"})
+    await store.upsert_edge("src", "dst", {"type": "KNOWS"})
+    await store.set_labels("n1", remove_labels=[], add_labels=["Person"])
+
+    # Sanity: buffers populated before discard
+    assert store._node_buffer
+    assert store._edge_buffer
+    assert store._label_patches
+
+    store._driver = AsyncMock()  # type: ignore[assignment]
+    store.discard_buffer()
+
+    assert store._node_buffer == {}
+    assert store._edge_buffer == {}
+    assert store._label_patches == []
+    store._driver.session.assert_not_called()

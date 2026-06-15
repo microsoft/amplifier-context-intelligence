@@ -162,8 +162,8 @@ class GraphState:
     # Flush / close (no-ops for in-memory store)
     # ------------------------------------------------------------------
 
-    def schedule_flush(self) -> None:
-        """No-op: no background I/O for an in-memory store."""
+    def discard_buffer(self) -> None:
+        """No-op: in-memory store has no flush buffer to discard."""
 
     async def flush(self) -> None:
         """No-op: no backing store to persist to."""
@@ -273,56 +273,49 @@ class HookStateService:
         self._seen_sessions.add(session_id)  # only cache after successful write
 
     async def touch_session(self, session_id: str, timestamp: str) -> None:
-        """Update last_updated on a Session node and all ancestor sessions.
+        """Update last_updated on the direct Session node only.
 
-        Walks the parent_id chain iteratively — no recursion depth limit.
-        Stops as soon as an ancestor already has last_updated >= timestamp,
-        since further ancestors are guaranteed to be at least as recent.
-        A visited set prevents infinite loops on malformed cyclic parent_id
-        chains regardless of graph store read-after-write semantics.
+        Updates exactly one node — the session named by *session_id*.  There is
+        deliberately NO ancestor/parent_id propagation: the previous parent-chain
+        walk SET last_updated on the shared root :Session node for every child
+        event, so many independent writers contended on that one node's exclusive
+        lock — the source of the Neo4j deadlock that silently dropped events.
+        Root/session attributes (started_at/status/parent_id) are written once at
+        session:start by SessionHandler, and staleness reaping uses
+        worker.last_event_time — neither depends on ancestor last_updated — so
+        dropping propagation costs nothing while removing the contention hot spot.
 
-        Never raises — errors are logged at WARNING level and the walk stops.
+        Skips the write when the stored last_updated is already at or ahead of
+        *timestamp*.  Never raises — errors are logged at WARNING level.
         """
-        current_id: str | None = session_id
-        visited: set[str] = set()
-        while current_id:
-            if current_id in visited:
-                logger.warning(
-                    "touch_session: cycle detected at %s — stopping walk", current_id
-                )
-                break
-            visited.add(current_id)
-            try:
-                node = await self.graph.get_node(current_id)
-                if node is None:
-                    break
-                current = node.get("last_updated")
-                # Compare using stdlib datetime only; the store's read path normalises
-                # driver DateTime objects to Python datetime, but the in-memory store returns
-                # whatever was written (often a str), so coerce both sides defensively.
-                # No driver-specific datetime types here.
-                ts = (
-                    datetime.fromisoformat(timestamp)
-                    if isinstance(timestamp, str)
-                    else timestamp
-                )
-                current_dt = (
-                    datetime.fromisoformat(current)
-                    if isinstance(current, str)
-                    else current
-                )
-                if current_dt is not None and ts <= current_dt:
-                    break  # ancestor already at or ahead — stop propagating
-                await self.graph.upsert_node(
-                    current_id,
-                    {"labels": ["Session"], "last_updated": timestamp},
-                )
-                current_id = (node.get("parent_id") or "").strip() or None
-            except Exception:
-                logger.warning(
-                    "touch_session failed for %s @ %s",
-                    current_id,
-                    timestamp,
-                    exc_info=True,
-                )
-                break
+        try:
+            node = await self.graph.get_node(session_id)
+            if node is None:
+                return
+            current = node.get("last_updated")
+            # Compare using stdlib datetime only; the store's read path normalises
+            # driver DateTime objects to Python datetime, but the in-memory store returns
+            # whatever was written (often a str), so coerce both sides defensively.
+            # No driver-specific datetime types here.
+            ts = (
+                datetime.fromisoformat(timestamp)
+                if isinstance(timestamp, str)
+                else timestamp
+            )
+            current_dt = (
+                datetime.fromisoformat(current) if isinstance(current, str) else current
+            )
+            if current_dt is not None and ts <= current_dt:
+                return  # already at or ahead — nothing to write
+            # Update only the direct node — never the ancestor/root chain.
+            await self.graph.upsert_node(
+                session_id,
+                {"labels": ["Session"], "last_updated": timestamp},
+            )
+        except Exception:
+            logger.warning(
+                "touch_session failed for %s @ %s",
+                session_id,
+                timestamp,
+                exc_info=True,
+            )

@@ -67,8 +67,24 @@ digraph graph_model {
             </TABLE>>
         ]
 
-        RootSession -> SubSession    [style = invis]
-        RootSession -> ForkedSession [style = invis]
+        IncompleteSession [
+            fillcolor = "#FFF3E0"
+            color     = "#E65100"
+            penwidth  = 1.5
+            style     = "filled,rounded,dashed"
+            label     = <<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="3">
+                <TR><TD><B>:IncompleteSession :Session :SST_EVENT</B></TD></TR>
+                <TR><TD><I>NOT a terminal label</I></TD></TR>
+                <TR><TD>node_id: session UUID</TD></TR>
+                <TR><TD>has_terminal: false</TD></TR>
+                <TR><TD><I>session:end arrived with no prior start/fork</I></TD></TR>
+                <TR><TD><I>WARNING logged; health signal only</I></TD></TR>
+            </TABLE>>
+        ]
+
+        RootSession -> SubSession       [style = invis]
+        RootSession -> ForkedSession    [style = invis]
+        ForkedSession -> IncompleteSession [style = invis]
     }
 
     // -- Execution cluster ----------------------------------------------------
@@ -631,11 +647,12 @@ digraph graph_model {
         style     = filled
         fillcolor = "#FFCCBC"
         penwidth  = 2
-        label     = "\u26a0 Fork Guard (classification is permanent)\nsession:fork \u2192 ForkedSession + FORKED edge (E02)\nsession:start with parent_id \u2192 SubSession + HAS_SUBSESSION (E13)\nForkedSession does NOT carry SubSession label.\nsession:start after fork only enriches started_at."
+        label     = "\u26a0 Fork Guard (classification is permanent)\nsession:fork \u2192 ForkedSession + FORKED edge (E02)\nsession:start with parent_id \u2192 SubSession + HAS_SUBSESSION (E13)\nForkedSession does NOT carry SubSession label.\nsession:start after fork only enriches started_at.\nsession:end with no prior start/fork \u2192 IncompleteSession\n(not a terminal; has_terminal:false; WARNING logged; health signal)"
     ]
 
-    OrchestratorRun -> note_turn_cycle [style = dotted, color = "#AAAAAA", arrowhead = none, constraint = false]
-    RootSession     -> note_fork_guard  [style = dotted, color = "#AAAAAA", arrowhead = none, constraint = false]
+    OrchestratorRun   -> note_turn_cycle [style = dotted, color = "#AAAAAA", arrowhead = none, constraint = false]
+    RootSession       -> note_fork_guard [style = dotted, color = "#AAAAAA", arrowhead = none, constraint = false]
+    IncompleteSession -> note_fork_guard [style = dotted, color = "#AAAAAA", arrowhead = none, constraint = false]
 
     // -- Legend ---------------------------------------------------------------
     subgraph cluster_legend {

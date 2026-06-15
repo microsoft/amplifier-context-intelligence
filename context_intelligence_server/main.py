@@ -3,6 +3,8 @@
 import asyncio
 import json
 import logging
+import os
+import re
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -26,6 +28,7 @@ from context_intelligence_server.auth import BearerTokenMiddleware
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.dashboard import build_status_response
+from context_intelligence_server.routers.queues import router as queues_router
 from context_intelligence_server.routers.skills import SkillRegistry
 from context_intelligence_server.routers.skills import router as skills_router
 from context_intelligence_server.routers.version import router as version_router
@@ -75,6 +78,48 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "lifespan_startup: skills directory not found at %s; skill_registry will be empty",
             _skills_dir,
         )
+    # Crash recovery (decisions #5/#6): on startup, respawn one drainer per
+    # session that still has an undrained, complete line. The workspace is
+    # parsed from that session's FIRST log line so the respawned worker is
+    # bound to the same workspace it was originally created with.
+    #
+    # Conservation-counter recovery runs FIRST, and its two steps are
+    # order-load-bearing: reconcile MUST precede seed. recovery_reconcile_dead
+    # advances committed offsets past already-dead pending lines so the
+    # dead-letter counts are settled; only then does recovery_seed_counts read
+    # disk to reconstruct the accepted/written baseline. Seeding before
+    # reconciling would leave a residual==1 false DEGRADED. Both run before the
+    # respawn loop so the respawned drainers start from a conserved baseline.
+    await registry.queue_manager.recovery_reconcile_dead()
+    _accepted_seed, _written_seed = await registry.queue_manager.recovery_seed_counts()
+    registry.seed_counters(_accepted_seed, _written_seed)
+    recovered = await registry.queue_manager.recover()
+    respawned = 0
+    for sid in recovered:
+        batch = await registry.queue_manager.read_batch(sid, max_items=1)
+        if not batch.lines:
+            continue
+        try:
+            obj = json.loads(batch.lines[0])
+            workspace = obj.get("workspace", "")
+        except (ValueError, KeyError):
+            workspace = ""
+        if not workspace:
+            # Panel finding #10: never spawn a workspace='' worker — it would
+            # violate the EventRequest non-empty-workspace invariant (422). A
+            # torn or empty-workspace first line is skipped, not recovered.
+            logger.warning(
+                "recovery_skipped session=%s: torn or empty workspace in first line",
+                sid,
+            )
+            continue
+        registry.get_or_create(sid, workspace)
+        respawned += 1
+    logger.info(
+        "lifespan_startup: crash recovery respawned %d/%d drainers",
+        respawned,
+        len(recovered),
+    )
     try:
         yield
     finally:
@@ -87,9 +132,25 @@ app = FastAPI(
 )
 app.include_router(skills_router)
 app.include_router(version_router)
+app.include_router(queues_router)
 _start_time = time.time()
 registry = SessionRegistry()
+# Expose the registry singleton on app.state so routers can read it via
+# request.app.state.registry instead of importing the module-level name
+# (avoids a circular import between main and the routers package).
+app.state.registry = registry
 idempotency_cache = EventIdempotencyCache()
+
+# Session-less events are keyed by a per-workspace sentinel stem so that events
+# from distinct workspaces never collide in one durable log (decision #10).
+_NO_SESSION_PREFIX = "_no_session__"
+
+
+def _workspace_slug(workspace: str) -> str:
+    """Return a filesystem-safe slug for a workspace (session-less log stem)."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (workspace or "").lower()).strip("-")
+    return slug or "default"
+
 
 _WEB_DIR = Path(__file__).parent / "web"
 app.mount("/static", StaticFiles(directory=_WEB_DIR / "static"), name="static")
@@ -121,6 +182,10 @@ async def get_status(request: Request) -> dict[str, Any]:
     response["neo4j_connected"] = await _check_neo4j_connected(request.app)
     response["neo4j_url"] = _settings.neo4j_url
     response["neo4j_browser_url"] = _settings.neo4j_browser_url
+    # Additive, aggregate-only conservation metrics (D3). /status is
+    # unauthenticated, so this block must NOT carry the per-key table or the
+    # dead-letter listing — both are authenticated-only.
+    response["metrics"] = await registry.pipeline_metrics()
     return response
 
 
@@ -137,8 +202,12 @@ async def _check_neo4j_connected(app_instance: FastAPI) -> bool:
 
 
 @app.post("/events", status_code=202, response_model=EventResponse)
-async def post_events(request: EventRequest, replay: bool = False) -> EventResponse:
+async def post_events(
+    request: EventRequest, http_request: Request, replay: bool = False
+) -> EventResponse:
     session_id = request.data.get("session_id", "")
+    # Idempotency-cache check + replay stay BEFORE the durable append so a
+    # duplicate is rejected without persisting a second log line.
     if request.idempotency_key and not replay:
         is_new = idempotency_cache.check_and_store(request.idempotency_key)
         if not is_new:
@@ -148,8 +217,18 @@ async def post_events(request: EventRequest, replay: bool = False) -> EventRespo
                 session_id,
             )
             return EventResponse(status="duplicate", session_id=session_id or None)
-    worker = registry.get_or_create(session_id, request.workspace)
-    await worker.queue.put((request.event, request.workspace, request.data))
+    # Empty session_id maps to a per-workspace sentinel stem so session-less
+    # events from distinct workspaces never collide in one log (decision #10).
+    worker_key = session_id or (_NO_SESSION_PREFIX + _workspace_slug(request.workspace))
+    # Spawn (or reuse) the sticky drainer keyed by worker_key.
+    registry.get_or_create(worker_key, request.workspace)
+    # Persist the EXACT request body bytes (the raw EventRequest JSON, which
+    # preserves idempotency_key) BEFORE returning 202 — this is the
+    # zero-silent-loss window. The body is compact JSON with no literal newline
+    # bytes, so the newline-delimited log framing is safe.
+    body = await http_request.body()
+    await registry.queue_manager.append(worker_key, body)
+    registry.record_accepted()  # count the durably-accepted event
     logger.info("event_enqueued: event=%s session_id=%s", request.event, session_id)
     return EventResponse(status="queued", session_id=session_id or None)
 
@@ -244,15 +323,61 @@ def main() -> None:
         run()
 
 
+def _effective_worker_count() -> int:
+    """Return the worker count gunicorn will actually honor from WEB_CONCURRENCY.
+
+    WEB_CONCURRENCY is gunicorn's own env override for the worker count, so it
+    is the single source of truth for how many worker processes will run. Unset
+    means 1; a non-integer value is treated as 1 (with a warning) rather than
+    crashing on a malformed env var.
+    """
+    raw = os.environ.get("WEB_CONCURRENCY")
+    if raw is None:
+        return 1
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "WEB_CONCURRENCY=%r is not an integer; treating effective workers as 1",
+            raw,
+        )
+        return 1
+
+
+def _validate_single_worker(workers: int | None = None) -> int:
+    """Fail loud unless exactly one worker will run; return that worker count.
+
+    The durable drainer assumes exactly one drainer per session per process, so
+    more than one worker process would split a session's drainer across
+    processes and reintroduce the loss this design eliminates. When ``workers``
+    is None the effective count is read from WEB_CONCURRENCY (the value gunicorn
+    honors) so the guard and the live config can never diverge.
+    """
+    effective = workers if workers is not None else _effective_worker_count()
+    if effective != 1:
+        raise RuntimeError(
+            f"context-intelligence-server requires exactly one worker, got {effective}. "
+            "The durable drainer assumes one drainer per session per process; unset "
+            "WEB_CONCURRENCY or set WEB_CONCURRENCY=1. Multi-process operation needs a "
+            "distributed backend (Open Q7)."
+        )
+    return effective
+
+
 def run() -> None:
     """Start the server using gunicorn + uvicorn worker for graceful SIGTERM shutdown."""
     from gunicorn.app.base import BaseApplication
+
+    # Read WEB_CONCURRENCY and fail loud if it would run != 1 worker. The same
+    # value is fed into gunicorn below so the guard and the live config are one
+    # source of truth (they can never diverge).
+    workers = _validate_single_worker()
 
     class _App(BaseApplication):
         def load_config(self) -> None:
             for key, value in {
                 "bind": f"{_settings.server_host}:{_settings.server_port}",
-                "workers": 1,
+                "workers": workers,
                 "worker_class": "uvicorn.workers.UvicornWorker",
                 "timeout": 30,
                 "graceful_timeout": 10,

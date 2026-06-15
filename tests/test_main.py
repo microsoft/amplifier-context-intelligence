@@ -1,10 +1,8 @@
 """Tests for FastAPI app — GET /status and POST /events endpoints."""
 
 import asyncio
-import concurrent.futures
 import contextlib
 import json
-import socket
 from pathlib import Path
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -23,28 +21,6 @@ from tests.conftest import MockNeo4jDriver
 @pytest.fixture(autouse=True)
 def _clear_idempotency_cache() -> None:
     main_module.idempotency_cache.clear()
-
-
-def _neo4j_reachable() -> bool:
-    """Return True if Neo4j is reachable at neo4j:7687 (only resolves inside Docker).
-
-    Uses a thread with a hard 2-second total deadline so that slow or
-    absent DNS resolution for the 'neo4j' hostname never blocks the
-    calling thread (e.g. pytest collection on GitHub Actions).
-    """
-
-    def _check() -> bool:
-        try:
-            with socket.create_connection(("neo4j", 7687), timeout=1):
-                return True
-        except OSError:
-            return False
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        try:
-            return executor.submit(_check).result(timeout=2)
-        except concurrent.futures.TimeoutError:
-            return False
 
 
 async def test_status_returns_200(client: httpx.AsyncClient) -> None:
@@ -90,11 +66,16 @@ async def test_post_events_duplicate_idempotency_key_skips_enqueue(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    worker = MagicMock()
-    worker.queue = AsyncMock()
+    """A duplicate idempotency_key must NOT append a second durable line."""
     monkeypatch.setattr(
-        main_module.registry, "get_or_create", lambda *args, **kwargs: worker
+        main_module.registry, "get_or_create", lambda *args, **kwargs: MagicMock()
     )
+    appended: list[tuple[str, bytes]] = []
+
+    async def _fake_append(worker_key: str, raw: bytes) -> None:
+        appended.append((worker_key, raw))
+
+    monkeypatch.setattr(main_module.registry.queue_manager, "append", _fake_append)
 
     payload = {
         "event": "tool_use",
@@ -110,18 +91,23 @@ async def test_post_events_duplicate_idempotency_key_skips_enqueue(
     assert first.json()["status"] == "queued"
     assert second.status_code == 202
     assert second.json()["status"] == "duplicate"
-    assert worker.queue.put.await_count == 1
+    assert len(appended) == 1
 
 
 async def test_post_events_replay_bypasses_idempotency_guard(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    worker = MagicMock()
-    worker.queue = AsyncMock()
+    """replay=true bypasses the idempotency guard, appending a second line."""
     monkeypatch.setattr(
-        main_module.registry, "get_or_create", lambda *args, **kwargs: worker
+        main_module.registry, "get_or_create", lambda *args, **kwargs: MagicMock()
     )
+    appended: list[tuple[str, bytes]] = []
+
+    async def _fake_append(worker_key: str, raw: bytes) -> None:
+        appended.append((worker_key, raw))
+
+    monkeypatch.setattr(main_module.registry.queue_manager, "append", _fake_append)
 
     payload = {
         "event": "tool_use",
@@ -136,7 +122,39 @@ async def test_post_events_replay_bypasses_idempotency_guard(
     assert first.status_code == 202
     assert replay.status_code == 202
     assert replay.json()["status"] == "queued"
-    assert worker.queue.put.await_count == 2
+    assert len(appended) == 2
+
+
+async def test_post_events_increments_accepted_counter(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A durably-accepted event increments the registry accepted_total (D2)."""
+    from context_intelligence_server.queue_manager import QueueManager
+
+    # Point the registry at a tmp queue dir so the durable append is isolated.
+    monkeypatch.setattr(
+        main_module.registry, "_queue_manager", QueueManager(queues_dir=tmp_path)
+    )
+    monkeypatch.setattr(
+        main_module.registry, "get_or_create", lambda *args, **kwargs: MagicMock()
+    )
+
+    before = main_module.registry.pipeline_counters()["accepted_total"]
+
+    response = await client.post(
+        "/events",
+        json={
+            "event": "tool_use",
+            "workspace": "/ws",
+            "data": {"session_id": "sess-accepted"},
+        },
+    )
+
+    assert response.status_code == 202
+    after = main_module.registry.pipeline_counters()["accepted_total"]
+    assert after == before + 1
 
 
 async def test_post_events_increments_active_sessions(
@@ -174,8 +192,23 @@ async def test_post_events_no_session_id_returns_null(
     assert data["session_id"] is None
 
 
-@pytest.mark.skipif(not _neo4j_reachable(), reason="Neo4j not reachable at neo4j:7687")
-async def test_drain_loop_processes_event(client: httpx.AsyncClient) -> None:
+async def test_drain_loop_processes_event(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A posted event is drained from the durable log by the sticky drainer.
+
+    Migrated off the vestigial in-memory worker.queue (Phase B2, Task 5): the
+    durable drain loop reads from the on-disk QueueManager log, so success is
+    observed by polling that log to empty rather than worker.queue.join().
+    """
+    from context_intelligence_server.neo4j_store import Neo4jGraphStore
+
+    proc = AsyncMock()
+    monkeypatch.setattr("context_intelligence_server.registry.process_event", proc)
+    monkeypatch.setattr(Neo4jGraphStore, "flush", AsyncMock())
+    monkeypatch.setattr(Neo4jGraphStore, "close", AsyncMock())
+
     await client.post(
         "/events",
         json={
@@ -184,9 +217,15 @@ async def test_drain_loop_processes_event(client: httpx.AsyncClient) -> None:
             "data": {"session_id": "sess-drain"},
         },
     )
-    worker = registry.get_or_create("sess-drain", "/ws")
-    await asyncio.wait_for(worker.queue.join(), timeout=5.0)
-    assert worker.queue.empty()
+
+    qm = registry.queue_manager
+    for _ in range(400):
+        await asyncio.sleep(0.01)
+        if (await qm.read_batch("sess-drain", 10)).lines == []:
+            break
+
+    assert (await qm.read_batch("sess-drain", 10)).lines == []
+    assert proc.await_count >= 1
 
 
 async def test_list_blobs_returns_empty_for_session_with_no_blobs(
@@ -407,7 +446,6 @@ async def test_status_session_detail_after_event(client: httpx.AsyncClient) -> N
     assert "sess-detail" in session_ids
     sess = next(s for s in data["sessions"] if s["session_id"] == "sess-detail")
     assert sess["workspace"] == "/ws-detail"
-    assert "queue_depth" in sess
     assert "events_processed" in sess
 
 
@@ -879,6 +917,153 @@ async def test_lifespan_creates_and_closes_driver(
 
 
 # ---------------------------------------------------------------------------
+# Lifespan crash-recovery + workers==1 guard tests (Phase B2)
+# ---------------------------------------------------------------------------
+
+
+def _patched_lifespan_deps() -> Any:
+    """Return the patch context managers that stub the lifespan's Neo4j deps."""
+    mock_driver = MagicMock()
+    mock_driver.close = AsyncMock()
+    return mock_driver
+
+
+async def test_lifespan_recovers_and_respawns_drainers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lifespan respawns a drainer for each session with an undrained line,
+    using the workspace parsed from that session's first log line."""
+    sid = "sess-recover"
+    qm = registry.queue_manager
+    body = json.dumps(
+        {
+            "event": "tool_use",
+            "workspace": "/recovered-ws",
+            "data": {"session_id": sid},
+        }
+    ).encode("utf-8")
+    await qm.append(sid, body)
+
+    spawned: list[tuple[str, str]] = []
+    monkeypatch.setattr(registry, "get_or_create", lambda s, w: spawned.append((s, w)))
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=AsyncMock(),
+        ),
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+    assert (sid, "/recovered-ws") in spawned
+
+
+async def test_lifespan_skips_recovery_for_empty_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session whose first line has an empty workspace is NOT respawned
+    (spawning a workspace='' worker would violate the non-empty-workspace
+    invariant)."""
+    sid = "sess-empty-ws"
+    qm = registry.queue_manager
+    body = json.dumps(
+        {
+            "event": "tool_use",
+            "workspace": "",
+            "data": {"session_id": sid},
+        }
+    ).encode("utf-8")
+    await qm.append(sid, body)
+
+    spawned: list[tuple[str, str]] = []
+    monkeypatch.setattr(registry, "get_or_create", lambda s, w: spawned.append((s, w)))
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=AsyncMock(),
+        ),
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+    assert spawned == []
+
+
+async def test_registry_exposed_on_app_state() -> None:
+    """The module registry singleton is exposed on app.state for routers.
+
+    Routers read the singleton via request.app.state.registry rather than
+    importing the module-level name (avoids a circular import).
+    """
+    assert main_module.app.state.registry is main_module.registry
+
+
+async def test_lifespan_seeds_counters_from_disk(tmp_path: Path) -> None:
+    """A fresh registry reusing a queue dir seeds conservation counters to a
+    zero residual: 1 committed + 1 pending line yields accepted=2, written=1,
+    in_queue=1, residual=0 after reconcile -> seed_counts -> seed_counters.
+    """
+    from context_intelligence_server.queue_manager import QueueManager
+    from context_intelligence_server.registry import SessionRegistry
+
+    # Seed a queue dir with one committed line and one still-pending line.
+    seed_qm = QueueManager(queues_dir=tmp_path)
+    sid = "sess-seed"
+    line1 = json.dumps({"event": "a", "workspace": "/ws", "data": {}}).encode("utf-8")
+    line2 = json.dumps({"event": "b", "workspace": "/ws", "data": {}}).encode("utf-8")
+    await seed_qm.append(sid, line1)
+    await seed_qm.append(sid, line2)
+    committed = len(line1) + 1  # +1 for the appended trailing newline
+    await seed_qm.commit(sid, committed)
+
+    # Fresh registry reusing the same on-disk queue dir.
+    reg = SessionRegistry()
+    reg._queue_manager = QueueManager(queues_dir=tmp_path)
+
+    # Production order: reconcile dead lines BEFORE seeding the counts.
+    await reg.queue_manager.recovery_reconcile_dead()
+    accepted_seed, written_seed = await reg.queue_manager.recovery_seed_counts()
+    reg.seed_counters(accepted_seed, written_seed)
+
+    metrics = await reg.pipeline_metrics()
+    assert metrics["accepted_total"] == 2
+    assert metrics["written_total"] == 1
+    assert metrics["in_queue_total"] == 1
+    assert metrics["residual"] == 0
+
+
+def test_validate_single_worker_trips_on_effective_web_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_validate_single_worker fails loud when effective WEB_CONCURRENCY != 1."""
+    monkeypatch.setenv("WEB_CONCURRENCY", "4")
+    with pytest.raises((RuntimeError, SystemExit)):
+        main_module._validate_single_worker()
+
+
+def test_validate_single_worker_passes_when_effective_is_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_validate_single_worker returns 1 when WEB_CONCURRENCY is unset."""
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    assert main_module._validate_single_worker() == 1
+
+
+# ---------------------------------------------------------------------------
 # /status neo4j_connected field tests
 # ---------------------------------------------------------------------------
 
@@ -931,3 +1116,57 @@ async def test_status_includes_neo4j_connected_false_when_no_driver(
     assert response.status_code == 200
     data = response.json()
     assert data["neo4j_connected"] is False
+
+
+# ---------------------------------------------------------------------------
+# /status pipeline metrics block (D3)
+# ---------------------------------------------------------------------------
+
+
+async def test_status_includes_metrics_block(client: httpx.AsyncClient) -> None:
+    """/status carries the additive aggregate-only pipeline metrics block.
+
+    The block is additive (existing status keys remain) and aggregate-only:
+    because /status is unauthenticated it must NOT expose the per-key table,
+    the dead-letter listing, or the deferred oldest_unflushed_age signal.
+    """
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+
+    # Additive: existing status keys still present.
+    assert "active_sessions" in data
+    assert "sessions" in data
+
+    # Aggregate metrics block present with the conservation fields.
+    metrics = data["metrics"]
+    for key in (
+        "accepted_total",
+        "written_total",
+        "replayed_total",
+        "write_retries_total",
+        "in_queue_total",
+        "dead_letter_total",
+        "residual",
+        "degraded",
+    ):
+        assert key in metrics
+
+    # Deferred / authenticated-only fields must be absent.
+    assert "oldest_unflushed_age" not in metrics
+    assert "per_key" not in metrics
+    assert "dead_letters" not in data
+
+
+# ---------------------------------------------------------------------------
+# /queues/* data endpoints stay authenticated (C1; survives the C2 page removal)
+# ---------------------------------------------------------------------------
+
+
+async def test_queues_data_endpoint_still_requires_auth(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """The /queues/* data endpoints stay protected — exempting the page must
+    NOT exempt the data routes."""
+    response = await auth_client.get("/queues/dead-letter")
+    assert response.status_code == 401

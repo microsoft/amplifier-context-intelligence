@@ -19,13 +19,16 @@ See [README.md](README.md) for full setup instructions.
 context_intelligence_server/      # FastAPI ingestion server
 ├── main.py                       # App factory, routes, lifespan
 ├── config.py                     # Settings (YAML + env vars via Pydantic)
-├── pipeline.py                   # Event dispatch pipeline
-├── neo4j_store.py                # Buffered Neo4j writes
+├── queue_manager.py              # Durable per-session append-log (persist-then-202)
+├── registry.py                   # Per-session drainers (drain_worker, write semaphore, retry/dead-letter)
+├── pipeline.py                   # Per-event dispatch spine (invoked by the drainer)
+├── neo4j_store.py                # Managed-transaction Neo4j writes
 ├── blob_store.py                 # Async disk blob storage
 ├── handlers/                     # Event handlers (data_layer_1/2/3)
 │   ├── data_layer_1/             # Session/tool-call handlers
 │   ├── data_layer_2/             # Graph enrichment handlers
 │   └── data_layer_3/             # High-level insight handlers
+├── routers/                      # API routers (queues.py = dead-letter inspect/replay/purge)
 ├── auth.py                       # API key authentication
 ├── dashboard.py                  # Dashboard SSE stream
 ├── models.py                     # Pydantic request/response models
@@ -113,8 +116,8 @@ or reference `neo4j.time`.
 
 ## Key Concepts
 
-- **Event pipeline** — `POST /events` queues work; handlers process events asynchronously. Each handler is a Python class in `handlers/data_layer_*/`.
-- **Graph model** — 5 node types, 8 edge types. See `docs/architecture/03-graph-model.dot` for the diagram and `docs/architecture/README.md` for the legend.
+- **Event pipeline** — `POST /events` persists the raw event to a durable per-session append-log (`queue_manager.py`) and returns `202` immediately (persist-then-202). A single drainer per session (`registry.py`) processes batches and flushes them to Neo4j under a global write semaphore, with transient/deadlock retry, dead-letter isolation of poison events, and crash recovery (replay + counter re-seed) on startup. Each handler invoked by the per-event dispatch spine is a Python class in `handlers/data_layer_*/`.
+- **Graph model** — session sub-labels: `RootSession`, `SubSession`, `ForkedSession`, `IncompleteSession` (health marker; not a terminal). Full schema with all node and edge types: see `docs/architecture/03-graph-model.dot` and `docs/architecture/README.md`.
 - **Blob storage** — Large event payloads are written to disk and referenced by URI to avoid graph bloat.
 - **Configuration** — Pydantic Settings reads from `server-config.yaml` first, then environment variables. See `config.py`.
 

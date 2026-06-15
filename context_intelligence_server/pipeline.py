@@ -9,10 +9,10 @@ Provides four public exports:
   all 8 data_layer_2 enrichers, and all 4 data_layer_3 enrichers
 - ``process_event(worker, event, data, handlers)`` — full pipeline step:
   ensure-session-node → blob processing → always-default dispatch →
-  enricher dispatch (for matching events) → touch_session (last_updated) →
-  flush strategy (background flush for every event, synchronous flush for
-  terminal events), all wrapped in a broad try/except so the drain loop is
-  never interrupted by handler errors
+  enricher dispatch (for matching events) → touch_session (last_updated),
+  all wrapped in a broad try/except so the drain loop is never interrupted
+  by handler errors. process_event does NOT flush (Task 6): the drainer's
+  gated ``_flush_barrier`` is the sole Neo4j-write trigger.
 """
 
 from __future__ import annotations
@@ -152,21 +152,18 @@ async def process_event(
     6. If *session_id* and *timestamp* are present, call
        ``worker.services.touch_session`` to update ``last_updated`` on the
        session node and propagate to ancestors.
-    7. Flush strategy: call ``worker.services.graph.schedule_flush`` for
-       non-terminal events (background flush, non-blocking) so that buffered
-       writes reach Neo4j without waiting for ``session:end``.  For terminal
-       events (``session:end``) call ``worker.services.graph.flush`` instead
-       so all writes are durable before the session closes.
+    7. Flush strategy: ``process_event`` does NOT flush.  The drainer
+       (``registry.drain_worker``) owns the single semaphore-gated flush
+       barrier per batch, and terminal-event (``session:end``) durability is
+       handled there before the session closes.
 
     All of the above is wrapped in a single ``try/except Exception`` block so
     that handler errors are *logged with structured context* but **never
     propagate** — the drain loop must continue regardless of per-event
     failures.
     """
-    session_id: str | None = None
+    session_id: str | None = data.get("session_id") if isinstance(data, dict) else None
     try:
-        session_id = data.get("session_id") if isinstance(data, dict) else None
-
         # Step 2 — ensure Session node exists for known sessions
         if session_id:
             await worker.services.ensure_session_node(session_id, data)
@@ -199,15 +196,14 @@ async def process_event(
         if session_id and timestamp:
             await worker.services.touch_session(session_id, timestamp)
 
-        # Step 7 — flush strategy: background flush after every event so buffered
-        # writes reach Neo4j without waiting for session:end.  Terminal events
-        # flush synchronously so all writes are durable before the session closes.
-        if event in TERMINAL_EVENTS:
-            await worker.services.graph.flush()
-        else:
-            worker.services.graph.schedule_flush()
-
     except Exception:
+        # Phase B2 (USER DECISION option a): a handler error in steps 2-6
+        # (ensure_session_node, blob processing, the default handler that
+        # creates the raw :Event node, the enrichers, or touch_session) has no
+        # genuinely-benign condition to swallow. Swallowing it here let the
+        # drainer commit the offset past a never-persisted event (silent loss).
+        # Log with structured context, then RE-RAISE so the drainer routes this
+        # line to dead-letter instead of acking it. No "fourth state".
         logger.exception(
             "pipeline: unhandled error processing event",
             extra={
@@ -215,3 +211,15 @@ async def process_event(
                 "session_id": session_id,
             },
         )
+        raise
+
+    # NOTE (Task 6): process_event no longer self-flushes. The drainer
+    # (registry.drain_worker) owns the SINGLE semaphore-gated flush barrier per
+    # batch (commit-after-flush via registry._flush_barrier). This intentionally
+    # removed the previous un-gated per-event background flush that ran outside
+    # the write semaphore for every non-terminal event — under multi-session
+    # replay that un-gated path made the shared write semaphore a near no-op.
+    # Routing every Neo4j
+    # write through the gated barrier is what makes the semaphore actually bound
+    # concurrent writes. ``TERMINAL_EVENTS`` stays defined for the drainer
+    # (registry._process_batch imports it to detect session:end).

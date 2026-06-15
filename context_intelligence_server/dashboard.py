@@ -112,7 +112,6 @@ def build_status_response(
         {
             "session_id": worker.session_id,
             "workspace": worker.workspace,
-            "queue_depth": worker.queue.qsize(),
             "last_event": worker.last_event,
             "last_event_time": worker.last_event_time,
             "events_processed": worker.events_processed,

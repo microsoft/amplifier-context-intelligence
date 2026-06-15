@@ -122,14 +122,6 @@ async def test_graph_state_flush_close_noop():
     assert node["name"] == "Alice"
 
 
-def test_graph_state_schedule_flush_is_noop():
-    """schedule_flush() is a synchronous no-op — must not raise or have side effects."""
-    state = GraphState()
-    state.schedule_flush()  # must not raise
-    # No observable state change — nodes buffer is untouched
-    assert state._nodes == {}
-
-
 def test_graph_state_no_graph_forest_name():
     """GraphState must not expose graph_forest_name or _graph_forest_name."""
     state = GraphState()
@@ -665,3 +657,17 @@ class TestEnsureSessionNodeTimestampKey:
         node = await svc.graph.get_node("sess-ts-test")
         assert node is not None
         assert node.get("started_at") == expected_started_at
+
+
+@pytest.mark.asyncio
+async def test_graphstate_discard_buffer_is_noop():
+    """GraphState.discard_buffer is a no-op: must not raise, must not drop data."""
+    state = GraphState()
+    await state.upsert_node("n1", {"name": "Alice"})
+
+    state.discard_buffer()  # must not raise
+
+    # In-memory store has no flush/discard semantics — node still present
+    node = await state.get_node("n1")
+    assert node is not None
+    assert node["name"] == "Alice"

@@ -34,11 +34,11 @@ Non-negotiable guarantees for all conforming implementations:
 12. **Runtime checkability** — both ``GraphStore`` and ``QueryableStore`` are
     decorated with ``@runtime_checkable`` so that ``isinstance`` checks work
     at runtime without instantiating the protocol.
-13. **Background flush semantics** — ``schedule_flush`` MUST NOT block the
-    caller.  At most one background flush may run at a time; if a flush is
-    already in progress, the call is a no-op or deferred.  In-memory
-    implementations may treat this as a synchronous no-op since writes are
-    immediately visible without I/O.
+13. **Buffer discard semantics** — ``discard_buffer`` drops all buffered writes
+    without persisting them.  It MUST NOT perform I/O and MUST NOT raise.  It is
+    the dead-letter primitive used to isolate a poison write so it does not
+    remain resident and re-enter the next flush.  In-memory implementations with
+    no backing store may treat this as a no-op.
 """
 
 from __future__ import annotations
@@ -99,16 +99,6 @@ class GraphStore(Protocol):
         Failure MUST NOT propagate as an exception to event handlers;
         implementations must handle errors internally (log and swallow).
         After a successful flush the buffer is cleared.
-        """
-        ...
-
-    def schedule_flush(self) -> None:
-        """Schedule a background flush without blocking.
-
-        Implementations must ensure that at most one background flush runs at a
-        time — if a flush is already in progress, this call is a no-op or defers
-        until the current flush completes.  In-memory implementations may treat
-        this as a no-op since all writes are immediately visible.
         """
         ...
 

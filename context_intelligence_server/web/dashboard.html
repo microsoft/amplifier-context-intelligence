@@ -58,51 +58,101 @@
       <div class="stat-chip"><span class="stat-label">Version</span><span class="stat-value" id="dash-version">&mdash;</span></div>
     </div>
 
-    <!-- Active sessions -->
-    <p class="section-label">Active sessions</p>
-    <div class="card sessions-scroll-container" style="padding:0;overflow:hidden;">
-      <table class="data-table">
-        <thead><tr>
-          <th>Session</th><th>Workspace</th><th>Queue</th><th>Last Event</th><th>Processed</th>
-        </tr></thead>
-        <tbody id="sessions-body"></tbody>
-      </table>
+    <!-- Tab bar (stat chips above stay outside the panels so Neo4j status shows on both tabs) -->
+    <div class="tab-bar" role="tablist" aria-label="Dashboard sections">
+      <button type="button" class="tab active" id="tab-overview" data-tab="overview" role="tab" aria-controls="panel-overview" aria-selected="true">Overview</button>
+      <button type="button" class="tab" id="tab-queues" data-tab="queues" role="tab" aria-controls="panel-queues" aria-selected="false">Queues</button>
     </div>
 
-    <!-- Completed sessions -->
-    <p class="section-label">Completed sessions <span style="font-size:0.7em;color:var(--muted-foreground);font-weight:400;text-transform:none;letter-spacing:0;">(click to expand Neo4j graph)</span></p>
-    <div class="card" style="padding:0;overflow:hidden;max-height:20rem;overflow-y:auto;">
-      <table class="data-table">
-        <thead><tr>
-          <th>Session</th><th>Workspace</th><th>Duration</th><th>Events</th><th>Errors</th><th>Ended</th>
-        </tr></thead>
-        <tbody id="completed-body"></tbody>
-      </table>
-    </div>
-
-    <!-- Recent events -->
-    <p class="section-label">Recent events</p>
-    <div class="card" style="padding:0;overflow:hidden;max-height:24rem;overflow-y:auto;">
-      <table class="data-table">
-        <thead><tr>
-          <th>Time</th><th>Event</th><th>Session</th><th>Workspace</th><th>Result</th>
-        </tr></thead>
-        <tbody id="events-body"></tbody>
-      </table>
-    </div>
-
-    <!-- Log viewer -->
-    <div class="log-panel">
-      <p class="section-label" style="display:flex;align-items:center;">
-        Server logs
-        <span id="log-error-badge" class="badge badge-error" style="display:none;">0 errors</span>
-      </p>
-      <div class="log-controls">
-        <input id="log-filter" class="log-filter" type="text" placeholder="Filter logs&hellip;" />
-        <button id="log-toggle" class="log-btn">Pause</button>
+    <!-- Overview tab -->
+    <section id="panel-overview" class="tab-panel" role="tabpanel" aria-labelledby="tab-overview">
+      <!-- Pipeline health hint -->
+      <div class="health-hint" role="status" aria-live="polite">
+        <span class="pill" id="hint-pill">Pipeline OK</span>
+        <span class="hint-stat">In queue <strong id="hint-inqueue">&mdash;</strong></span>
+        <span class="badge badge-error" id="hint-dead" style="display:none;">Dead-letter 0</span>
+        <button type="button" id="hint-go-queues" class="hint-arrow" style="margin-left:auto;background:none;border:none;cursor:pointer;color:var(--primary);font:inherit;">Queues &amp; Storage &rarr;</button>
       </div>
-      <div id="log-container" class="log-container"></div>
-    </div>
+
+      <!-- Active sessions -->
+      <p class="section-label">Active sessions</p>
+      <div class="card sessions-scroll-container" style="padding:0;overflow:hidden;">
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead><tr>
+              <th>Session</th><th>Workspace</th><th>Last Event</th><th>Processed</th>
+            </tr></thead>
+            <tbody id="sessions-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Completed sessions -->
+      <p class="section-label">Completed sessions <span style="font-size:0.7em;color:var(--muted-foreground);font-weight:400;text-transform:none;letter-spacing:0;">(click to expand Neo4j graph)</span></p>
+      <div class="card" style="padding:0;overflow:hidden;max-height:20rem;overflow-y:auto;">
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead><tr>
+              <th>Session</th><th>Workspace</th><th>Duration</th><th>Events</th><th>Errors</th><th>Ended</th>
+            </tr></thead>
+            <tbody id="completed-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Recent events -->
+      <p class="section-label">Recent events</p>
+      <div class="card" style="padding:0;overflow:hidden;max-height:24rem;overflow-y:auto;">
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead><tr>
+              <th>Time</th><th>Event</th><th>Session</th><th>Workspace</th><th>Result</th>
+            </tr></thead>
+            <tbody id="events-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Log viewer -->
+      <div class="log-panel">
+        <p class="section-label" style="display:flex;align-items:center;">
+          Server logs
+          <span id="log-error-badge" class="badge badge-error" style="display:none;">0 errors</span>
+        </p>
+        <div class="log-controls">
+          <input id="log-filter" class="log-filter" type="text" placeholder="Filter logs&hellip;" />
+          <button id="log-toggle" class="log-btn">Pause</button>
+        </div>
+        <div id="log-container" class="log-container"></div>
+      </div>
+    </section>
+
+    <!-- Queues tab (populated by queues-panel.js) -->
+    <section id="panel-queues" class="tab-panel" role="tabpanel" aria-labelledby="tab-queues" hidden>
+      <p class="section-label">Pipeline invariant</p>
+      <div class="invariant card" id="invariant-card">
+        <span class="invariant-legend">accepted &minus; written &minus; in-queue &minus; dead-letter = residual</span>
+        <div class="invariant-row">
+          <span class="invariant-eq" id="invariant-eq">&mdash;</span>
+          <span class="badge" id="invariant-badge">&mdash;</span>
+        </div>
+      </div>
+
+      <p class="section-label">Queue totals</p>
+      <div id="totals-row" style="display:flex;gap:0.75rem;flex-wrap:wrap;margin-bottom:1.5rem;"></div>
+
+      <p class="section-label">Dead-letter queues</p>
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead><tr>
+              <th>Worker</th><th>Count</th><th>Last error</th><th>Actions</th>
+            </tr></thead>
+            <tbody id="dead-letter-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
   </div>
 
   <script type="module" src="/static/js/dashboard.js"></script>

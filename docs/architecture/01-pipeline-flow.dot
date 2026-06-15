@@ -8,7 +8,7 @@ digraph pipeline_flow {
         ranksep   = 0.7
         fontname  = "Helvetica"
         fontsize  = 11
-        label     = "Per-Event Execution Spine\n(context_intelligence_server/pipeline.py)"
+        label     = "Per-Event Processing Spine (within the drainer)\n(context_intelligence_server/pipeline.py \u2014 invoked by registry.drain_worker)"
         labelloc  = t
         labeljust = c
     ]
@@ -25,7 +25,7 @@ digraph pipeline_flow {
 
     // -- Entry ----------------------------------------------------------------
     EventReceived [
-        label     = "Event Received"
+        label     = "Batch line\n(read by drainer \u2014 see diagram 05)"
         shape     = oval
         fillcolor = "#E3F2FD"
     ]
@@ -82,7 +82,7 @@ digraph pipeline_flow {
         ]
 
         SessionHandler [
-            label     = "SessionHandler [0]\nsession:start | session:fork | session:end\nMERGE session metadata\nupsert workspace / repo context\nE02 FORKED | E13 HAS_SUBSESSION"
+            label     = "SessionHandler [0]\nsession:start | session:fork | session:end\nMERGE session metadata\nupsert workspace / repo context\nE02 FORKED | E13 HAS_SUBSESSION\n\u26a0 session:end with no prior start/fork \u2192 :IncompleteSession\n(health marker; has_terminal:false; WARNING logged)"
             fillcolor = "#F3E5F5"
         ]
 
@@ -164,7 +164,7 @@ digraph pipeline_flow {
 
     // -- Flush ----------------------------------------------------------------
     GraphFlush [
-        label     = "GraphFlush\ngraph.flush()\ncommit all pending writes"
+        label     = "_flush_barrier()\n(per batch, write-semaphore gated \u2014\nsee diagram 05)"
         fillcolor = "#FFCCBC"
     ]
 
@@ -218,7 +218,7 @@ digraph pipeline_flow {
     RecipeStepHandler        -> IsTerminal
 
     IsTerminal -> GraphFlush [label = "yes\n(session:end)"]
-    IsTerminal -> Done       [label = "no"]
+    IsTerminal -> GraphFlush [label = "no\n(every batch)"]
 
     GraphFlush -> Done
 

@@ -11,14 +11,19 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
 
 from context_intelligence_server.handlers.data_layer_2.session import (
+    LabelTransition,
     SessionHandler,
+    SessionLabelStateMachine,
     _TYPE_LABELS,
     _current_type,
+    _parent_of,
+    _warn_if_dual_terminal,
 )
 from context_intelligence_server.services import GraphState, HookStateService
 from context_intelligence_server.utils import make_node_id
@@ -293,16 +298,16 @@ class TestSessionFork:
         )
         assert edge["type"] != "HAS_SUBSESSION", "Fork edge must NOT be HAS_SUBSESSION"
 
-    async def test_fork_uses_parent_id_not_parent_key(
+    async def test_fork_accepts_both_parent_id_and_parent_keys(
         self, services: HookStateService
     ) -> None:
-        """Fork canonical key is parent_id; legacy 'parent' key must be ignored.
+        """Fork accepts both 'parent_id' (enriched) and 'parent' (emitter) keys.
 
-        Positive case: parent_id creates an edge.
-        Negative case: legacy 'parent' key alone must NOT create an edge.
+        amplifier-core emits "parent" only; enrichment adds "parent_id".
+        Both must create a FORKED edge.
         """
         handler = SessionHandler(services)
-        # Positive: using parent_id (canonical) creates an edge
+        # Case A: parent_id (enriched payload) creates a FORKED edge
         await handler(
             "session:fork",
             {
@@ -311,22 +316,23 @@ class TestSessionFork:
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        # Edge must exist parent→child when parent_id is provided
-        edge = await services.graph.get_edge("p1", "f1")
-        assert edge is not None
+        edge_a = await services.graph.get_edge("p1", "f1")
+        assert edge_a is not None, "parent_id key must create a FORKED edge"
+        assert edge_a.get("type") == "FORKED"
 
-        # Negative: legacy 'parent' key alone must NOT create any edge
+        # Case B: parent (emitter key, no parent_id) also creates a FORKED edge
         handler2 = SessionHandler(services)
         await handler2(
             "session:fork",
             {
                 "session_id": "f2",
-                "parent": "p2",  # legacy key — must be ignored
+                "parent": "p2",  # emitter key — must be accepted
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        legacy_edge = await services.graph.get_edge("p2", "f2")
-        assert legacy_edge is None, "legacy 'parent' key must not create an edge"
+        edge_b = await services.graph.get_edge("p2", "f2")
+        assert edge_b is not None, "emitter 'parent' key must also create a FORKED edge"
+        assert edge_b.get("type") == "FORKED"
 
     async def test_fork_missing_parent_id_creates_node_no_edge(
         self, services: HookStateService
@@ -965,10 +971,14 @@ class TestSessionLabelStateMachine:
 
     # ---- _handle_end stub recovery ----
 
-    async def test_end_bare_no_parent_fallback_root(
+    async def test_end_bare_no_parent_marks_incomplete_session(
         self, services: HookStateService
     ) -> None:
-        """session:end for bare Session with no parent_id -> RootSession fallback"""
+        """session:end for bare Session with no parent_id -> IncompleteSession marker (not RootSession).
+
+        Old behavior: fallback to RootSession (fabricated terminal).
+        New behavior: IncompleteSession (honest marker — keeps guess out of terminal space).
+        """
         handler = SessionHandler(services)
         assert hasattr(handler, "_label_machine"), (
             "SessionHandler must delegate to SessionLabelStateMachine"
@@ -980,13 +990,22 @@ class TestSessionLabelStateMachine:
         )
         node = await services.graph.get_node("s1")
         assert node is not None
-        assert "RootSession" in node["labels"]
+        assert "IncompleteSession" in node["labels"], (
+            "Bare-at-end session (no prior start/fork) must receive IncompleteSession, not RootSession"
+        )
+        assert "RootSession" not in node["labels"], (
+            "Bare-at-end session must NOT receive fabricated RootSession"
+        )
         assert node["ended_at"] == "2026-01-01T01:00:00Z"
 
-    async def test_end_bare_with_parent_fallback_subsession(
+    async def test_end_bare_with_parent_marks_incomplete_session(
         self, services: HookStateService
     ) -> None:
-        """session:end for bare Session with parent_id -> SubSession fallback"""
+        """session:end for bare Session with parent_id -> IncompleteSession marker (not SubSession).
+
+        Old behavior: fallback to SubSession (fabricated terminal based on has_parent).
+        New behavior: IncompleteSession regardless of has_parent — no guessing.
+        """
         handler = SessionHandler(services)
         assert hasattr(handler, "_label_machine"), (
             "SessionHandler must delegate to SessionLabelStateMachine"
@@ -1002,9 +1021,162 @@ class TestSessionLabelStateMachine:
         )
         node = await services.graph.get_node("s1")
         assert node is not None
-        assert "SubSession" in node["labels"]
+        assert "IncompleteSession" in node["labels"], (
+            "Bare-at-end session with parent_id must receive IncompleteSession, not SubSession"
+        )
+        assert "SubSession" not in node["labels"], (
+            "Bare-at-end session must NOT receive fabricated SubSession"
+        )
         assert node["ended_at"] == "2026-01-01T01:00:00Z"
         assert "RootSession" not in node["labels"]
+
+    # ---- mount-plan-on-every-fork gap assertions ----
+
+    async def test_fork_bare_creates_mount_plan(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork on a bare child creates child::mount_plan companion node."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.ensure_session_node("child", {})
+        await handler(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {},
+            },
+        )
+        mount_plan = await services.graph.get_node("child::mount_plan")
+        assert mount_plan is not None
+
+    async def test_fork_forkedsession_noop_still_creates_mount_plan(
+        self, services: HookStateService
+    ) -> None:
+        """(ForkedSession, fork) -> TERMINAL label no-op, but mount_plan is still created."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.graph.upsert_node(
+            "child", {"labels": ["ForkedSession", "Session"]}
+        )
+        await services.graph.upsert_edge("parent", "child", {"type": "FORKED"})
+        await handler(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "metadata": {},
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "ForkedSession" in node["labels"]
+        mount_plan = await services.graph.get_node("child::mount_plan")
+        assert mount_plan is not None
+
+    # ---- edge no-ops on terminal starts gap assertions ----
+
+    async def test_start_subsession_new_parent_creates_no_second_edge(
+        self, services: HookStateService
+    ) -> None:
+        """(SubSession, start, new parent) -> label unchanged, no edge to new parent."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("p2", {})
+        await services.graph.upsert_node("child", {"labels": ["SubSession", "Session"]})
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "p2",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "SubSession" in node["labels"]
+        edge = await services.graph.get_edge("p2", "child")
+        assert edge is None
+
+    async def test_start_forkedsession_new_parent_creates_no_edge(
+        self, services: HookStateService
+    ) -> None:
+        """(ForkedSession, start, new parent) -> label unchanged, no edge to new parent."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("p2", {})
+        await services.graph.upsert_node(
+            "child", {"labels": ["ForkedSession", "Session"]}
+        )
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "p2",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "ForkedSession" in node["labels"]
+        edge = await services.graph.get_edge("p2", "child")
+        assert edge is None
+
+    # ---- already-typed session:end no-op gap assertion ----
+
+    async def test_end_already_typed_is_noop(self, services: HookStateService) -> None:
+        """session:end on an already-typed (RootSession) node does not reclassify."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("s1", {})
+        await handler(
+            "session:start",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+        await handler(
+            "session:end",
+            {"session_id": "s1", "timestamp": "2026-01-01T01:00:00Z"},
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        assert "RootSession" in node["labels"]
+        assert "SubSession" not in node["labels"]
+
+    # ---- full resulting label-set gap assertions ----
+
+    async def test_start_bare_no_parent_full_label_set(
+        self, services: HookStateService
+    ) -> None:
+        """(bare, start, no parent) -> exactly one type label: RootSession."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("s1", {})
+        await handler(
+            "session:start",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        terminals = {label for label in node["labels"] if label in _TYPE_LABELS}
+        assert terminals == {"RootSession"}
+
+    async def test_fork_sub_full_label_set(self, services: HookStateService) -> None:
+        """(SubSession, fork) -> exactly one type label: ForkedSession."""
+        handler = SessionHandler(services)
+        await services.ensure_session_node("parent", {})
+        await services.graph.upsert_node("child", {"labels": ["SubSession", "Session"]})
+        await services.graph.upsert_edge("parent", "child", {"type": "HAS_SUBSESSION"})
+        await handler(
+            "session:fork",
+            {
+                "session_id": "child",
+                "parent_id": "parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "metadata": {},
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        terminals = {label for label in node["labels"] if label in _TYPE_LABELS}
+        assert terminals == {"ForkedSession"}
 
 
 # ---------------------------------------------------------------------------
@@ -1786,4 +1958,523 @@ class TestSessionHandlerUsesSessionLabeledMerge:
         assert enriched is not None
         assert "Session" in enriched.get("labels", []), (
             "'Session' label must survive session:start enrichment of the stub"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestClassifyMatrix — exhaustive unit matrix for SessionLabelStateMachine.classify()
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyMatrix:
+    """Exhaustive unit matrix for SessionLabelStateMachine.classify().
+
+    21 cells covering all (event, current_type, has_parent) combinations.
+    Pure unit test — no fixtures, no Neo4j.
+    The test fails at collection with ImportError because LabelTransition
+    and SessionLabelStateMachine do not yet exist.  This IS the RED.
+    """
+
+    CASES: list[tuple[str, str | None, bool, list[str], list[str]]] = [
+        # (event, current_type, has_parent, add, remove)
+        # ------------------------------------------------------------------
+        # event=start
+        # ------------------------------------------------------------------
+        ("start", "ForkedSession", True, [], []),
+        ("start", "ForkedSession", False, [], []),
+        ("start", "SubSession", True, [], []),
+        ("start", "SubSession", False, [], []),
+        ("start", "RootSession", False, [], []),
+        ("start", "RootSession", True, ["SubSession", "SST_EVENT"], ["RootSession"]),
+        ("start", None, True, ["Session", "SubSession", "SST_EVENT"], []),
+        ("start", None, False, ["RootSession", "Session", "SST_EVENT"], []),
+        # ------------------------------------------------------------------
+        # event=fork
+        # ------------------------------------------------------------------
+        ("fork", "ForkedSession", True, [], []),
+        ("fork", "ForkedSession", False, [], []),
+        ("fork", "RootSession", True, ["ForkedSession", "SST_EVENT"], ["RootSession"]),
+        ("fork", "RootSession", False, ["ForkedSession", "SST_EVENT"], ["RootSession"]),
+        ("fork", "SubSession", True, ["ForkedSession", "SST_EVENT"], ["SubSession"]),
+        ("fork", "SubSession", False, ["ForkedSession", "SST_EVENT"], ["SubSession"]),
+        ("fork", None, True, ["Session", "ForkedSession", "SST_EVENT"], []),
+        ("fork", None, False, ["Session", "ForkedSession", "SST_EVENT"], []),
+        # ------------------------------------------------------------------
+        # event=end
+        # ------------------------------------------------------------------
+        # Bare sessions (no prior start/fork) receive IncompleteSession marker,
+        # not a fabricated Root/Sub terminal.  has_parent is irrelevant here —
+        # the server never guesses; it marks and surfaces the health signal.
+        ("end", None, True, ["IncompleteSession", "SST_EVENT"], []),
+        ("end", None, False, ["IncompleteSession", "SST_EVENT"], []),
+        ("end", "RootSession", True, [], []),
+        ("end", "SubSession", False, [], []),
+        ("end", "ForkedSession", True, [], []),
+    ]
+
+    @pytest.mark.parametrize(
+        "event, current_type, has_parent, add, remove",
+        CASES,
+    )
+    def test_classify_cell(
+        self,
+        event: str,
+        current_type: str | None,
+        has_parent: bool,
+        add: list[str],
+        remove: list[str],
+    ) -> None:
+        sm = SessionLabelStateMachine()
+        t = sm.classify(current_type=current_type, event=event, has_parent=has_parent)
+        assert t == LabelTransition(add=add, remove=remove)
+
+
+# ---------------------------------------------------------------------------
+# TestDualTerminalGuard
+# ---------------------------------------------------------------------------
+
+
+class TestDualTerminalGuard:
+    """_warn_if_dual_terminal emits a WARNING when >1 terminal label is present."""
+
+    def test_warns_on_dual_terminal_labels(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            _warn_if_dual_terminal(["Session", "RootSession", "SubSession"], "sX")
+        assert any(
+            r.levelno == logging.WARNING and "sX" in r.message for r in caplog.records
+        )
+
+    def test_no_warning_for_single_terminal(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            _warn_if_dual_terminal(["Session", "RootSession"], "sY")
+
+
+# ---------------------------------------------------------------------------
+# TestParentKeyCompat — accept "parent" OR "parent_id" in event payloads
+#
+# amplifier-core emits session:fork with key "parent" only (_session_init.py:284).
+# Event enrichment also stamps "parent_id" so real traffic works today.
+# These tests prove the handler accepts the documented emitter shape ("parent"
+# key only) without depending on enrichment.
+#
+# RED before _parent_of helper; GREEN after.
+# ---------------------------------------------------------------------------
+
+
+class TestParentKeyCompat:
+    """session handlers must accept 'parent' key (amplifier-core emitter shape).
+
+    amplifier-core's fork emitter writes ``"parent": parent_id`` only.
+    Event enrichment adds ``parent_id`` on the wire, but handlers must not
+    depend on that enrichment — they must read whichever key is present.
+    """
+
+    # ----- session:start with "parent" key only (no "parent_id") -----
+
+    async def test_start_parent_key_only_creates_subsession(
+        self, services: HookStateService
+    ) -> None:
+        """session:start with 'parent' key only must classify child as SubSession.
+
+        This is the real amplifier-core emitter payload shape for child sessions.
+        FAILS before _parent_of; PASSES after.
+        """
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent": "P",  # emitter key — no parent_id
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "SubSession" in node["labels"], (
+            "session:start with 'parent' key (no parent_id) must classify child as SubSession"
+        )
+        assert "RootSession" not in node["labels"]
+
+    async def test_start_parent_key_only_creates_has_subsession_edge(
+        self, services: HookStateService
+    ) -> None:
+        """session:start with 'parent' key only must create HAS_SUBSESSION edge P->child.
+
+        FAILS before _parent_of; PASSES after.
+        """
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent": "P",  # emitter key — no parent_id
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        edge = await services.graph.get_edge("P", "child")
+        assert edge is not None, (
+            "session:start with 'parent' key (no parent_id) must create HAS_SUBSESSION edge P->child"
+        )
+        assert edge.get("type") == "HAS_SUBSESSION"
+
+    # ----- session:fork with "parent" key only (no "parent_id") -----
+
+    async def test_fork_parent_key_only_creates_forked_session(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork with 'parent' key only must classify child as ForkedSession.
+
+        This is the real amplifier-core emitter payload shape for forked sessions.
+        FAILS before _parent_of; PASSES after.
+        """
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "fork1",
+                "parent": "P",  # emitter key — no parent_id
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("fork1")
+        assert node is not None
+        assert "ForkedSession" in node["labels"], (
+            "session:fork with 'parent' key (no parent_id) must classify child as ForkedSession"
+        )
+        assert "SubSession" not in node["labels"]
+        assert "RootSession" not in node["labels"]
+
+    async def test_fork_parent_key_only_creates_forked_edge(
+        self, services: HookStateService
+    ) -> None:
+        """session:fork with 'parent' key only must create FORKED edge P->fork1.
+
+        FAILS before _parent_of; PASSES after.
+        """
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "fork1",
+                "parent": "P",  # emitter key — no parent_id
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        edge = await services.graph.get_edge("P", "fork1")
+        assert edge is not None, (
+            "session:fork with 'parent' key (no parent_id) must create FORKED edge P->fork1"
+        )
+        assert edge.get("type") == "FORKED"
+
+    # ----- Regressions: enriched "parent_id" key still works -----
+
+    async def test_start_parent_id_key_still_works(
+        self, services: HookStateService
+    ) -> None:
+        """Regression: session:start with enriched 'parent_id' key still classifies as SubSession."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "child",
+                "parent_id": "P",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("child")
+        assert node is not None
+        assert "SubSession" in node["labels"]
+        edge = await services.graph.get_edge("P", "child")
+        assert edge is not None
+        assert edge.get("type") == "HAS_SUBSESSION"
+
+    async def test_fork_parent_id_key_still_works(
+        self, services: HookStateService
+    ) -> None:
+        """Regression: session:fork with enriched 'parent_id' key still classifies as ForkedSession."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "fork1",
+                "parent_id": "P",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("fork1")
+        assert node is not None
+        assert "ForkedSession" in node["labels"]
+        edge = await services.graph.get_edge("P", "fork1")
+        assert edge is not None
+        assert edge.get("type") == "FORKED"
+
+    # ----- Bare start: neither key -> RootSession, no parent edge -----
+
+    async def test_start_no_parent_key_creates_root_session(
+        self, services: HookStateService
+    ) -> None:
+        """session:start with neither 'parent' nor 'parent_id' must create RootSession."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "root",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("root")
+        assert node is not None
+        assert "RootSession" in node["labels"]
+        assert "SubSession" not in node["labels"]
+
+
+# ---------------------------------------------------------------------------
+# TestParentOfHelper — unit tests for the _parent_of() helper
+# ---------------------------------------------------------------------------
+
+
+class TestParentOfHelper:
+    """Unit tests for the _parent_of() module-level helper.
+
+    Covers all key-precedence and whitespace-stripping cases without the
+    overhead of a full handler invocation.
+    """
+
+    def test_parent_id_key_returned(self) -> None:
+        assert _parent_of({"parent_id": "abc"}) == "abc"
+
+    def test_parent_key_returned_when_no_parent_id(self) -> None:
+        assert _parent_of({"parent": "xyz"}) == "xyz"
+
+    def test_parent_id_wins_over_parent(self) -> None:
+        """parent_id takes precedence when both keys are present (enriched payload)."""
+        assert _parent_of({"parent_id": "id-val", "parent": "p-val"}) == "id-val"
+
+    def test_empty_parent_id_falls_through_to_parent(self) -> None:
+        """Empty string parent_id must fall through to 'parent'."""
+        assert _parent_of({"parent_id": "", "parent": "p-val"}) == "p-val"
+
+    def test_none_parent_id_falls_through_to_parent(self) -> None:
+        """None parent_id must fall through to 'parent'."""
+        assert _parent_of({"parent_id": None, "parent": "p-val"}) == "p-val"
+
+    def test_neither_key_returns_empty_string(self) -> None:
+        assert _parent_of({}) == ""
+
+    def test_parent_id_whitespace_is_stripped(self) -> None:
+        assert _parent_of({"parent_id": "  abc  "}) == "abc"
+
+    def test_parent_whitespace_is_stripped(self) -> None:
+        assert _parent_of({"parent": "  xyz  "}) == "xyz"
+
+
+# ---------------------------------------------------------------------------
+# TestCurrentTypeIgnoresIncompleteSession
+# ---------------------------------------------------------------------------
+
+
+class TestCurrentTypeIgnoresIncompleteSession:
+    """_current_type must return None when only IncompleteSession is present.
+
+    IncompleteSession is a non-terminal marker label, NOT a type label.
+    It must be invisible to _current_type so that:
+      - The node is still considered 'bare' for future start/fork arrivals.
+      - The lattice (Root > Sub > Forked) is unaffected.
+
+    RED: fails before IncompleteSession exists (but _current_type ignores it
+    by construction — any label not in the hard-coded ForkedSession/SubSession/
+    RootSession check is already a no-op). These tests act as a regression guard.
+    """
+
+    def test_returns_none_for_incomplete_session_label(self) -> None:
+        """Bare node with only IncompleteSession must not appear typed."""
+        assert _current_type(["Session", "IncompleteSession"]) is None
+
+    def test_returns_none_for_incomplete_session_and_sst_event(self) -> None:
+        """IncompleteSession + SST_EVENT must not affect the None result."""
+        assert _current_type(["Session", "IncompleteSession", "SST_EVENT"]) is None
+
+    def test_incomplete_session_not_in_type_labels(self) -> None:
+        """IncompleteSession must NOT appear in _TYPE_LABELS (terminal set)."""
+        assert "IncompleteSession" not in _TYPE_LABELS
+
+
+# ---------------------------------------------------------------------------
+# TestIncompleteSessionMarker
+# ---------------------------------------------------------------------------
+
+
+class TestIncompleteSessionMarker:
+    """Bare-at-end sessions receive IncompleteSession marker, not a fabricated terminal.
+
+    RED: The two matrix cases (end, None, *) still assert SubSession/RootSession
+    before this change.  These handler-level tests directly assert the new contract.
+    GREEN: after classify()'s end+None branch returns IncompleteSession instead.
+    """
+
+    async def test_bare_end_only_session_has_incomplete_marker(
+        self, services: HookStateService
+    ) -> None:
+        """session:end on a bare session must add IncompleteSession, not Root/Sub."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:end",
+            {"session_id": "s-bare", "timestamp": "2026-01-01T01:00:00Z"},
+        )
+        node = await services.graph.get_node("s-bare")
+        assert node is not None
+        assert "IncompleteSession" in node["labels"], (
+            "Bare-at-end session must receive IncompleteSession marker"
+        )
+
+    async def test_bare_end_only_session_has_no_terminal_labels(
+        self, services: HookStateService
+    ) -> None:
+        """Bare-at-end session must carry NONE of Root/Sub/Forked."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:end",
+            {"session_id": "s-bare", "timestamp": "2026-01-01T01:00:00Z"},
+        )
+        node = await services.graph.get_node("s-bare")
+        assert node is not None
+        for terminal in ("RootSession", "SubSession", "ForkedSession"):
+            assert terminal not in node["labels"], (
+                f"Bare-at-end session must NOT carry fabricated terminal {terminal!r}"
+            )
+
+    async def test_bare_end_with_parent_gets_incomplete_not_subsession(
+        self, services: HookStateService
+    ) -> None:
+        """End-only session with parent data also gets IncompleteSession, never SubSession.
+
+        Old code: classify(None, 'end', has_parent=True) -> SubSession.
+        New code: always IncompleteSession regardless of has_parent.
+        """
+        handler = SessionHandler(services)
+        await handler(
+            "session:end",
+            {
+                "session_id": "s-bare",
+                "parent_id": "some-parent",
+                "timestamp": "2026-01-01T01:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("s-bare")
+        assert node is not None
+        assert "IncompleteSession" in node["labels"], (
+            "Even with parent_id, bare-at-end must not fabricate SubSession — "
+            "use IncompleteSession instead"
+        )
+        assert "SubSession" not in node["labels"], (
+            "SubSession must NOT be fabricated at stub-recovery"
+        )
+
+    async def test_bare_end_has_sst_event_label(
+        self, services: HookStateService
+    ) -> None:
+        """Bare-at-end session must still carry SST_EVENT (graph-queryable)."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:end",
+            {"session_id": "s-bare", "timestamp": "2026-01-01T01:00:00Z"},
+        )
+        node = await services.graph.get_node("s-bare")
+        assert node is not None
+        assert "SST_EVENT" in node["labels"], (
+            "SST_EVENT must be present so the node is queryable in graph scans"
+        )
+
+    async def test_ended_session_with_real_terminal_unchanged(
+        self, services: HookStateService
+    ) -> None:
+        """session:end on a properly-classified ForkedSession must not add IncompleteSession."""
+        handler = SessionHandler(services)
+        # Classify via fork first
+        await handler(
+            "session:fork",
+            {
+                "session_id": "s-fork",
+                "parent_id": "p1",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        # Then end it
+        await handler(
+            "session:end",
+            {"session_id": "s-fork", "timestamp": "2026-01-01T01:00:00Z"},
+        )
+        node = await services.graph.get_node("s-fork")
+        assert node is not None
+        assert "ForkedSession" in node["labels"], "Real terminal must be preserved"
+        assert "IncompleteSession" not in node["labels"], (
+            "IncompleteSession must NOT be added to a properly-classified ForkedSession"
+        )
+
+    async def test_ended_root_session_unchanged(
+        self, services: HookStateService
+    ) -> None:
+        """session:end on a RootSession-classified session must not add IncompleteSession."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {"session_id": "s-root", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+        await handler(
+            "session:end",
+            {"session_id": "s-root", "timestamp": "2026-01-01T01:00:00Z"},
+        )
+        node = await services.graph.get_node("s-root")
+        assert node is not None
+        assert "RootSession" in node["labels"]
+        assert "IncompleteSession" not in node["labels"], (
+            "IncompleteSession must NOT be added to a properly-classified RootSession"
+        )
+
+    async def test_incomplete_session_emits_warning_log(
+        self, services: HookStateService, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """session:end on a bare session must emit a WARNING health-signal log."""
+        handler = SessionHandler(services)
+        with caplog.at_level(logging.WARNING):
+            await handler(
+                "session:end",
+                {"session_id": "bare-warn", "timestamp": "2026-01-01T01:00:00Z"},
+            )
+        assert any(
+            r.levelno == logging.WARNING
+            and "bare-warn" in r.message
+            and "IncompleteSession" in r.message
+            for r in caplog.records
+        ), (
+            "session:end on bare session must emit WARNING containing session_id "
+            "and 'IncompleteSession' as a health signal for upstream event loss"
+        )
+
+    async def test_current_type_returns_none_for_incomplete_session_node(
+        self, services: HookStateService
+    ) -> None:
+        """After bare-end marks IncompleteSession, _current_type still returns None.
+
+        This ensures a late-arriving start/fork for the same session_id will still
+        get properly classified (IncompleteSession is invisible to the type lattice).
+        """
+        handler = SessionHandler(services)
+        await handler(
+            "session:end",
+            {"session_id": "s-check", "timestamp": "2026-01-01T01:00:00Z"},
+        )
+        node = await services.graph.get_node("s-check")
+        assert node is not None
+        labels = node["labels"]
+        assert "IncompleteSession" in labels, (
+            "Precondition: node must carry IncompleteSession after bare end"
+        )
+        assert _current_type(labels) is None, (
+            "_current_type must ignore IncompleteSession and return None, "
+            "so a late start/fork can still classify the session normally"
         )
