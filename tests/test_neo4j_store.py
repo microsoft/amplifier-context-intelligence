@@ -1639,3 +1639,34 @@ def test_init_defaults_when_params_omitted():
     store = _make_store()
     assert store._flush_chunk_rows == 100
     assert store._flush_chunk_bytes == 4_194_304
+
+
+# ---------------------------------------------------------------------------
+# _serialized_row_size tests
+# ---------------------------------------------------------------------------
+
+
+def test_serialized_row_size_uses_serialized_form_not_len():
+    """_serialized_row_size measures JSON bytes, not element count.
+
+    A len()-based estimator on a dict/list returns the key/element count (3 for
+    fat below), which is blind to fat nested payloads.  The serialized form of
+    fat is several thousand bytes.
+    """
+    from context_intelligence_server.neo4j_store import _serialized_row_size
+
+    fat = {
+        "messages": ["x" * 2000],
+        "context_snapshot": {"a": "y" * 2000},
+        "k": 1,
+    }
+    # len(fat) == 3; the serialized form is >> 3000 bytes
+    assert _serialized_row_size(fat) > 3000
+
+
+def test_serialized_row_size_handles_unjsonable_value():
+    """Non-JSON-serializable values fall back to str() length and never crash."""
+    from context_intelligence_server.neo4j_store import _serialized_row_size
+
+    result = _serialized_row_size({"ts": datetime(2026, 6, 18)})
+    assert result > 0

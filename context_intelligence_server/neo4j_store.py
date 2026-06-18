@@ -299,6 +299,24 @@ async def ensure_neo4j_schema(
             )
 
 
+def _serialized_row_size(value: Any) -> int:
+    """Return a cheap conservative proxy for the serialized byte size of *value*.
+
+    Uses ``json.dumps(value, default=str)`` so that non-JSON-serialisable values
+    (e.g. ``datetime`` objects) are converted via ``str()`` rather than raising.
+    This measures the *serialized* form — not ``len()`` on a dict/list, which
+    returns the number of keys/elements and is blind to fat nested payloads such
+    as large ``messages`` arrays or ``context_snapshot`` dicts.
+
+    Not an exact wire-byte count (no encoding overhead, no Neo4j framing), but a
+    consistent, crash-free lower bound suitable for chunk-size decisions.
+    """
+    try:
+        return len(json.dumps(value, default=str))
+    except (TypeError, ValueError):
+        return len(str(value))
+
+
 async def _write_batch(
     tx: Any,
     node_snapshot: dict[str, dict[str, Any]],
