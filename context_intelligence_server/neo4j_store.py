@@ -780,7 +780,22 @@ class Neo4jGraphStore:
             await self._flush_body()
 
     async def _flush_body(self) -> None:
-        """Inner flush implementation — must only be called while _flush_lock is held."""
+        """Inner flush implementation — must only be called while _flush_lock is held.
+
+        Phased, dual-bounded, per-chunk-committed coordinator.  Splits each buffer
+        into row/byte-bounded chunks and commits each chunk in its own
+        execute_write (independent Neo4j transaction), eliminating the memory-cap
+        OOM caused by sending the entire buffer in a single transaction.
+
+        Phase order: nodes → label patches → edges.  This ordering preserves the
+        invariant that label patches can only reference nodes already committed to
+        Neo4j, and edges can only reference nodes already committed.
+
+        On any chunk failure the full snapshot is merged back into the live buffers
+        (restoring the entire un-flushed batch for the next attempt) and the
+        exception is re-raised so the caller's offset never advances on a partial
+        flush.
+        """
         if not self._node_buffer and not self._edge_buffer and not self._label_patches:
             return  # early exit — nothing to write
 
@@ -792,25 +807,46 @@ class Neo4jGraphStore:
         patch_snapshot = self._label_patches
         self._label_patches = []
 
+        rows = self._flush_chunk_rows
+        byts = self._flush_chunk_bytes
         success = False
         try:
             await self._ensure_schema()
 
-            # Driver-managed transaction: execute_write owns commit/rollback and
-            # auto-retries transient failures (TransientError / DeadlockDetected)
-            # up to max_transaction_retry_time. Safe because _write_batch is a pure
-            # function of its snapshot parameters (idempotency rule #1) and every
-            # write is an idempotent MERGE backed by uniqueness constraints
-            # (rules #2/#3), so re-running the batch cannot corrupt or duplicate state.
-            async with self._driver.session(database=self._database) as db_session:
-                await db_session.execute_write(
-                    _write_batch,
-                    node_snapshot,
-                    edge_snapshot,
-                    patch_snapshot,
-                    self.workspace,
-                )
+            # Phase 1: nodes — each chunk is its own execute_write (independent commit).
+            # Do NOT wrap multiple chunks in one explicit transaction — that would
+            # re-collapse the memory bound and defeat the chunking.
+            for chunk in _chunk_dict(node_snapshot, rows, byts):
+                async with self._driver.session(database=self._database) as db_session:
+                    await db_session.execute_write(
+                        _write_batch, chunk, {}, [], self.workspace
+                    )
+
+            # Phase 2: label patches — each chunk is its own execute_write.
+            for chunk in _chunk_list(patch_snapshot, rows, byts):
+                async with self._driver.session(database=self._database) as db_session:
+                    await db_session.execute_write(
+                        _write_batch, {}, {}, chunk, self.workspace
+                    )
+
+            # Phase 3: edges — each chunk is its own execute_write.
+            for chunk in _chunk_dict(edge_snapshot, rows, byts):
+                async with self._driver.session(database=self._database) as db_session:
+                    await db_session.execute_write(
+                        _write_batch, {}, chunk, [], self.workspace
+                    )
+
             success = True
+        except Exception:
+            _LOG.error(
+                "flush_chunk_failed workspace=%s nodes=%d edges=%d patches=%d;"
+                " restoring full snapshot and re-raising",
+                self.workspace,
+                len(node_snapshot),
+                len(edge_snapshot),
+                len(patch_snapshot),
+            )
+            raise
         finally:
             if not success:
                 # Restore buffers: snapshot base + any new writes since flush started
@@ -820,8 +856,7 @@ class Neo4jGraphStore:
                 merged_edges = dict(edge_snapshot)
                 merged_edges.update(self._edge_buffer)
                 self._edge_buffer = merged_edges
-                merged_patches = patch_snapshot + self._label_patches
-                self._label_patches = merged_patches
+                self._label_patches = patch_snapshot + self._label_patches
 
     def discard_buffer(self) -> None:
         """Drop all buffered writes without persisting them (no driver I/O).
