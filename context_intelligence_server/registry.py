@@ -490,6 +490,22 @@ class SessionRegistry:
         """Return the list of all active SessionWorker objects."""
         return list(self._workers.values())
 
+    def orphaned_sessions(self) -> list[SessionWorker]:
+        """Return workers that are still registered but whose drain task has
+        finished — the silent-stall signal for #278.
+
+        A worker is orphaned iff it is in _workers AND its task has completed
+        (task.done()). This catches the finalization-path orphan (a tail flush
+        failure returns early without deregistering, so the task completes but
+        the worker is never removed) and any unhandled exception that escapes
+        the drain loop. Deterministic and instant — no timer, no threshold.
+        """
+        return [
+            worker
+            for worker in self._workers.values()
+            if worker.task is not None and worker.task.done()
+        ]
+
     def active_count(self) -> int:
         return len(self._workers)
 

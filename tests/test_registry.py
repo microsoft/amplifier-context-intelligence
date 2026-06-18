@@ -1591,3 +1591,57 @@ class TestFlushBarrierStampsLiveness:
 
         worker.services.graph.flush.assert_awaited_once()
         assert worker.last_successful_flush >= before
+
+
+# ---------------------------------------------------------------------------
+# Task 3 (Phase 2, #278): orphaned_sessions() predicate
+# ---------------------------------------------------------------------------
+
+
+def _make_worker(sid: str) -> SessionWorker:
+    """Minimal SessionWorker for orphan-detection tests."""
+    return SessionWorker(
+        session_id=sid,
+        workspace="/ws",
+        services=HookStateService(workspace="/ws"),
+    )
+
+
+class TestOrphanedSessions:
+    """SessionRegistry.orphaned_sessions() returns workers whose drain task
+    has completed but which are still registered."""
+
+    async def test_completed_task_worker_is_orphaned(self) -> None:
+        """A worker whose asyncio task has finished is reported as orphaned."""
+        registry = SessionRegistry()
+        worker = _make_worker("orphan-1")
+        # Create a task that completes immediately and await it so .done() → True
+        worker.task = asyncio.create_task(asyncio.sleep(0))
+        await worker.task  # drive the event loop until the task is done
+        registry._register_for_test(worker)
+
+        orphans = registry.orphaned_sessions()
+
+        assert worker in orphans
+        assert [w.session_id for w in orphans] == ["orphan-1"]
+
+    async def test_live_task_worker_is_not_orphaned(self) -> None:
+        """A worker whose asyncio task is still running is NOT orphaned."""
+        registry = SessionRegistry()
+        worker = _make_worker("live-1")
+        worker.task = asyncio.create_task(asyncio.sleep(60))
+        registry._register_for_test(worker)
+
+        try:
+            assert registry.orphaned_sessions() == []
+        finally:
+            worker.task.cancel()
+
+    async def test_no_task_worker_is_not_orphaned(self) -> None:
+        """A worker with task=None (never started) is NOT orphaned."""
+        registry = SessionRegistry()
+        worker = _make_worker("notask-1")
+        worker.task = None
+        registry._register_for_test(worker)
+
+        assert registry.orphaned_sessions() == []
