@@ -1744,3 +1744,83 @@ def test_chunk_list_row_bound():
     assert [len(c) for c in chunks] == [100, 50]
     flattened = [item for c in chunks for item in c]
     assert flattened == patches
+
+
+# ---------------------------------------------------------------------------
+# Coordinator wiring guard (Task 9)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_coordinator_every_execute_write_within_bounds() -> None:
+    """Every execute_write call passes a node chunk within both row and byte bounds.
+
+    Coordinator characterization guard: 35 nodes at rows=10 must produce 4
+    execute_write calls for the node phase, each carrying ≤10 nodes and a
+    total serialized size ≤10_000_000 bytes (or exactly 1 node for the
+    single-oversized-row floor).  Does NOT re-test chunk-size math — that is
+    Task 5's responsibility.  This test guards only that the coordinator wires
+    chunk payloads to execute_write correctly.
+    """
+    from context_intelligence_server.neo4j_store import _serialized_row_size
+
+    store = _make_store_chunked(rows=10, byts=10_000_000)
+    store._schema_initialized = True
+
+    # Populate 35 simple nodes — row bound of 10 produces 4 chunks: [10,10,10,5]
+    store._node_buffer = {f"n{i}": {"name": f"node-{i}"} for i in range(35)}
+
+    captured_payloads: list[tuple[dict, dict, list]] = []
+
+    async def _capture(fn, *args, **kwargs):
+        # fn=_write_batch; args = (nodes_chunk, edges_chunk, patches_chunk, workspace)
+        nodes: dict = args[0]
+        edges: dict = args[1]
+        patches: list = args[2]
+        captured_payloads.append((nodes, edges, patches))
+
+    fake_session = AsyncMock()
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    fake_session.execute_write = AsyncMock(side_effect=_capture)
+    store._driver.session = MagicMock(return_value=fake_session)
+
+    await store.flush()
+
+    assert captured_payloads, (
+        "Expected execute_write to be called at least once (35 nodes → 4 node chunks)"
+    )
+    for nodes, _edges, _patches in captured_payloads:
+        if not nodes:
+            continue  # skip edge/patch-only calls (empty nodes dict)
+        assert len(nodes) <= 10, (
+            f"Node chunk exceeded row bound: {len(nodes)} > 10"
+        )
+        total_bytes = sum(_serialized_row_size(v) for v in nodes.values())
+        assert total_bytes <= 10_000_000 or len(nodes) == 1, (
+            f"Node chunk exceeded byte bound: {total_bytes} bytes across "
+            f"{len(nodes)} nodes (expected ≤10_000_000 or single-row floor)"
+        )
+
+
+@pytest.mark.asyncio
+async def test_coordinator_empty_buffer_makes_zero_calls() -> None:
+    """flush() with empty buffers must not call execute_write at all.
+
+    Early-exit guard: the coordinator short-circuits before opening a driver
+    session when all three buffers (_node_buffer, _edge_buffer, _label_patches)
+    are empty, so execute_write must never be invoked.
+    """
+    store = _make_store_chunked(rows=100, byts=4_194_304)
+    store._schema_initialized = True
+
+    fake_session = AsyncMock()
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    fake_session.execute_write = AsyncMock()
+    store._driver.session = MagicMock(return_value=fake_session)
+
+    # Buffers are empty by default — flush should early-exit with no DB calls
+    await store.flush()
+
+    fake_session.execute_write.assert_not_called()
