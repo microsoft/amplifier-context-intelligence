@@ -471,6 +471,8 @@ class Neo4jGraphStore:
         auth: tuple | None = None,
         database: str = "neo4j",
         workspace: str | None = None,
+        flush_chunk_rows: int = 100,
+        flush_chunk_bytes: int = 4_194_304,
     ) -> None:
         """Initialise the store and create the async Neo4j driver.
 
@@ -496,6 +498,8 @@ class Neo4jGraphStore:
         self._schema_initialized: bool = False
         self._closed: bool = False
         self._flush_lock: asyncio.Lock = asyncio.Lock()
+        self._flush_chunk_rows: int = max(1, flush_chunk_rows)
+        self._flush_chunk_bytes: int = max(1, flush_chunk_bytes)
 
     # ------------------------------------------------------------------
     # workspace property

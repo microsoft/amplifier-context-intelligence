@@ -1592,3 +1592,50 @@ async def test_discard_buffer_clears_all_buffers_without_flushing():
     assert store._edge_buffer == {}
     assert store._label_patches == []
     store._driver.session.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# flush_chunk_rows / flush_chunk_bytes constructor params (Task 3)
+# ---------------------------------------------------------------------------
+
+
+def _make_store_chunked(rows: int, byts: int) -> Neo4jGraphStore:
+    """Create a Neo4jGraphStore with explicit chunk-size knobs."""
+    with patch(
+        "context_intelligence_server.neo4j_store.AsyncGraphDatabase"
+    ) as mock_adb:
+        mock_driver = AsyncMock()
+        mock_adb.driver.return_value = mock_driver
+        store = Neo4jGraphStore(
+            uri="bolt://localhost:7687",
+            auth=("neo4j", "password"),
+            workspace="test",
+            flush_chunk_rows=rows,
+            flush_chunk_bytes=byts,
+        )
+    return store
+
+
+def test_init_stores_chunk_bounds():
+    """flush_chunk_rows=50 and flush_chunk_bytes=1024 are stored unchanged."""
+    store = _make_store_chunked(50, 1024)
+    assert store._flush_chunk_rows == 50
+    assert store._flush_chunk_bytes == 1024
+
+
+def test_init_clamps_nonpositive_bounds_to_one():
+    """Zero and negative values are clamped to 1 so chunks are never empty."""
+    store_zero = _make_store_chunked(0, 0)
+    assert store_zero._flush_chunk_rows == 1
+    assert store_zero._flush_chunk_bytes == 1
+
+    store_neg = _make_store_chunked(-5, -100)
+    assert store_neg._flush_chunk_rows == 1
+    assert store_neg._flush_chunk_bytes == 1
+
+
+def test_init_defaults_when_params_omitted():
+    """When flush_chunk_rows/bytes are omitted the defaults are 100 / 4_194_304."""
+    store = _make_store()
+    assert store._flush_chunk_rows == 100
+    assert store._flush_chunk_bytes == 4_194_304
