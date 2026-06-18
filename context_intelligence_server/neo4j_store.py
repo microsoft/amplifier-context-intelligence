@@ -180,7 +180,9 @@ def _normalize_temporal(value: Any) -> Any:
 # Benign schema-error allow-list for constraint creation.
 # ---------------------------------------------------------------------------
 # These four codes are the ONLY ones treated as benign when CREATE CONSTRAINT
-# fails. Every one is kept deliberately, and none can mask data corruption:
+# fails — benign concurrent-create-race / already-exists codes (incl.
+# DeadlockDetected from a concurrent CREATE CONSTRAINT race). Every one is kept
+# deliberately, and none can mask data corruption:
 #
 #   * Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists
 #   * Neo.TransientError.Transaction.DeadlockDetected
@@ -193,11 +195,18 @@ def _normalize_temporal(value: Any) -> Any:
 #     deliberately NOT in this set and is surfaced at ERROR.
 #   - IndexWithNameAlreadyExists is the actual production-observed symptom of a
 #     concurrent-schema race (a backing index already present).
+#   - DeadlockDetected is NOT an "already exists" signal: it is the empirically
+#     verified CONCURRENT-CREATE RACE loser — a second worker issuing the same
+#     CREATE CONSTRAINT at the same time loses the deadlock. It is benign because
+#     the winner creates the constraint.
 #   - EquivalentSchemaRuleAlreadyExists and DeadlockDetected were reproduced by
 #     an empirical spike on neo4j:5.26.22-community / driver 6.1.0.
 #
-# Mirrors the benign-code handling in _create_index above (kept DRY by sharing
-# the EquivalentSchemaRuleAlreadyExists rationale).
+# Note: this benign-code set is NOT shared with _create_index above, which keys
+# only off EquivalentSchemaRuleAlreadyExists. What the constraint blocks below
+# and _create_index DO share (after widening _create_index) is the DriverError
+# tolerance: a non-Neo4jError connectivity DriverError is logged and swallowed
+# rather than re-raised into the flush path.
 _BENIGN_SCHEMA_CODES: frozenset[str] = frozenset(
     {
         "Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists",
@@ -265,9 +274,10 @@ async def ensure_neo4j_schema(
         async def _create_index(statement: str) -> None:
             try:
                 await session.run(statement)
-            except Neo4jError as exc:
+            except (Neo4jError, DriverError) as exc:
                 if (
-                    exc.code
+                    isinstance(exc, Neo4jError)
+                    and exc.code
                     == "Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists"
                 ):
                     _LOG.debug(
@@ -275,8 +285,23 @@ async def ensure_neo4j_schema(
                         "create race, benign): %s",
                         statement,
                     )
-                else:
+                elif isinstance(exc, Neo4jError):
+                    # A dangerous Neo4jError code we do not recognise as benign.
                     raise
+                else:
+                    # A connectivity DriverError that is NOT a Neo4jError
+                    # (ServiceUnavailable / SessionExpired). It has no meaningful
+                    # .code for our allow-list. Crucially, we continue rather than
+                    # re-raise: index creation runs on the flush path via
+                    # _ensure_schema (BEFORE the constraint steps), and a re-raise
+                    # would be counted as a flush failure and could dead-letter real
+                    # events. This mirrors the DriverError tolerance in the
+                    # constraint blocks below.
+                    _LOG.error(
+                        "ensure_neo4j_schema: could not create index (connectivity "
+                        "error); continuing without it: %s",
+                        exc,
+                    )
 
         for label in (
             "Session",

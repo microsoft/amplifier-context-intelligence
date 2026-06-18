@@ -2242,3 +2242,90 @@ class TestSchemaConstraintAllowList:
         assert store._node_buffer == {}, (
             "Buffer must be cleared (success path) — not restored on failure."
         )
+
+    async def test_connectivity_driver_error_on_index_surfaced_no_raise(self, caplog):
+        """ServiceUnavailable (a DriverError) on CREATE INDEX (the _create_index path).
+
+        The INDEX-creation steps run BEFORE the constraint steps, so a connectivity
+        DriverError (ServiceUnavailable / SessionExpired, NOT a Neo4jError) during
+        index creation would otherwise propagate out of ensure_neo4j_schema and
+        dead-letter real events on the flush path — reached even before the
+        constraint hardening. It must be caught, logged at ERROR, and MUST NOT
+        propagate out of ensure_neo4j_schema.
+        """
+        from neo4j.exceptions import ServiceUnavailable
+
+        err = ServiceUnavailable("connection refused")
+
+        async def _run(query, *args, **kwargs):
+            if "CREATE INDEX" in query:
+                raise err
+            return AsyncMock()
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.run = AsyncMock(side_effect=_run)
+
+        mock_driver = MagicMock()
+        mock_driver.session = MagicMock(return_value=mock_session)
+
+        with caplog.at_level(logging.DEBUG):
+            await ensure_neo4j_schema(mock_driver)  # MUST NOT raise
+
+        assert any(
+            r.levelno >= logging.ERROR and "index" in r.getMessage().lower()
+            for r in caplog.records
+        ), (
+            "ServiceUnavailable on index creation must surface at ERROR. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
+    async def test_connectivity_error_on_index_step_does_not_dead_letter(self, caplog):
+        """END-TO-END: a ServiceUnavailable on the INDEX step must not dead-letter.
+
+        The schema session raises ServiceUnavailable (a DriverError) on CREATE
+        INDEX but succeeds on dedup/constraint; the node-write transaction must
+        still run and the node buffer must be cleared (success path), proving the
+        connectivity error did not propagate out of flush() and trigger
+        restore-on-failure + dead-lettering.
+        """
+        from neo4j.exceptions import ServiceUnavailable
+
+        store = _make_store()
+        store._schema_initialized = False
+
+        err = ServiceUnavailable("connection refused")
+
+        async def _schema_run(query, *args, **kwargs):
+            if "CREATE INDEX" in query:
+                raise err
+            return AsyncMock()
+
+        schema_session = AsyncMock()
+        schema_session.__aenter__ = AsyncMock(return_value=schema_session)
+        schema_session.run = AsyncMock(side_effect=_schema_run)
+
+        mock_tx, write_session = _make_flush_mocks()
+
+        store._driver.session = MagicMock(
+            side_effect=[schema_session, write_session, write_session, write_session]
+        )
+
+        await store.upsert_node("n1", {"labels": ["Session"], "name": "test"})
+
+        with caplog.at_level(logging.DEBUG):
+            await store.flush()  # MUST NOT raise
+
+        assert any(
+            r.levelno >= logging.ERROR and "index" in r.getMessage().lower()
+            for r in caplog.records
+        ), (
+            "Expected an ERROR record mentioning the index on the flush path. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+        assert mock_tx.run.await_count >= 1, (
+            "Node-write transaction must still run despite the connectivity error."
+        )
+        assert store._node_buffer == {}, (
+            "Buffer must be cleared (success path) — not restored on failure."
+        )
