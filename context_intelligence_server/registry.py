@@ -358,7 +358,8 @@ class SessionRegistry:
         qm = self.queue_manager
         session_id = worker.session_id
         # The failed BATCH flush left its writes resident in the store buffer
-        # (_flush_body restores on failure, neo4j_store.py:686-696). Discard that
+        # (_flush_body restores the un-committed remainder on failure; see
+        # neo4j_store.py:_flush_body). Discard that
         # accumulated residue so the FIRST isolated line flushes from a clean
         # buffer — otherwise the poison line's residue contaminates line 1.
         worker.services.graph.discard_buffer()
@@ -441,6 +442,7 @@ class SessionRegistry:
             neo4j_store = Neo4jGraphStore(
                 uri=settings.neo4j_url,
                 auth=neo4j_auth,
+                flush_chunk_size=settings.neo4j_flush_chunk_size,
             )
             self._workers[session_id] = SessionWorker(
                 session_id=session_id,

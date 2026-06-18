@@ -99,6 +99,7 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
         stale_session_timeout: float = _real.stale_session_timeout
         write_concurrency: int = _real.write_concurrency
         max_delivery_attempts: int = _real.max_delivery_attempts
+        neo4j_flush_chunk_size: int = _real.neo4j_flush_chunk_size
 
     with patch(
         "context_intelligence_server.registry.get_settings",

@@ -127,6 +127,9 @@ class Settings(BaseSettings):
     # Conservative working defaults pending tuning (design Open Question 4).
     write_concurrency: int = 8  # global cap on concurrent Neo4j-write flushes
     max_delivery_attempts: int = 5  # flush retries for one batch before dead-letter
+    neo4j_flush_chunk_size: int = (
+        200  # max nodes/edges/patches per Neo4j sub-transaction (bounds tx memory)
+    )
 
     # -------------------------------------------------------------------------
     # Logging

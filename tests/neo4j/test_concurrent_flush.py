@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 from neo4j import AsyncGraphDatabase
 
+import context_intelligence_server.neo4j_store as _cis_store_mod
 from context_intelligence_server.neo4j_store import (
     Neo4jGraphStore,
     ensure_neo4j_schema,
@@ -419,4 +420,197 @@ async def test_durable_poison_isolation_no_contamination(
         )
     finally:
         await verify.close()
+        await store.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase C chunked-flush tests
+# ---------------------------------------------------------------------------
+
+
+async def test_chunked_flush_writes_all_in_bounded_chunks(
+    neo4j_container: dict[str, Any],
+) -> None:
+    """Buffer 500 nodes + 200 edges, flush_chunk_size=50: all items written to
+    Neo4j, no single _write_batch call exceeds 50 items, expected call count.
+
+    Correctness check: every node and edge is present after flush.
+    Chunk-bound check: each execute_write call received ≤ 50 items per category
+    (verified by wrapping _write_batch to record per-call counts while still
+    forwarding to the real implementation).
+    """
+    auth = (neo4j_container["user"], neo4j_container["password"])
+    bolt = neo4j_container["bolt_url"]
+    run = uuid.uuid4().hex[:8]
+    ws = f"chunked-{run}"
+    chunk_size = 50
+
+    store = Neo4jGraphStore(
+        uri=bolt, auth=auth, workspace=ws, flush_chunk_size=chunk_size
+    )
+
+    # 500 nodes
+    node_ids = [f"node-{run}-{i}" for i in range(500)]
+    for nid in node_ids:
+        await store.upsert_node(nid, {"labels": ["TestNode"], "run": run})
+
+    # 200 edges: node-i → node-(i+1) for i in 0..199
+    for i in range(200):
+        await store.upsert_edge(node_ids[i], node_ids[i + 1], {"type": "TEST_EDGE"})
+
+    # Wrap _write_batch to record per-call item counts while still writing.
+    call_counts: list[tuple[int, int, int]] = []  # (n_nodes, n_edges, n_patches)
+    original_write_batch = _cis_store_mod._write_batch
+
+    async def recording_write_batch(
+        tx: Any,
+        nodes: dict[str, Any],
+        edges: dict[Any, Any],
+        patches: list[Any],
+        workspace: str,
+    ) -> None:
+        call_counts.append((len(nodes), len(edges), len(patches)))
+        await original_write_batch(tx, nodes, edges, patches, workspace)
+
+    _cis_store_mod._write_batch = recording_write_batch  # type: ignore[assignment]
+    try:
+        await store.flush()
+    finally:
+        _cis_store_mod._write_batch = original_write_batch
+
+    # (a) Correctness: all 500 nodes and 200 edges present in Neo4j
+    verify = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+    try:
+        node_rows = await verify.execute_query(
+            "MATCH (n:TestNode) WHERE n.run = $run AND n.workspace = $ws "
+            "RETURN count(n) AS c",
+            {"run": run, "ws": ws},
+            workspace="*",
+        )
+        assert node_rows[0]["c"] == 500, (
+            f"node loss: expected 500, found {node_rows[0]['c']}"
+        )
+        edge_rows = await verify.execute_query(
+            "MATCH ()-[r:TEST_EDGE]->() WHERE r.workspace = $ws RETURN count(r) AS c",
+            {"ws": ws},
+            workspace="*",
+        )
+        assert edge_rows[0]["c"] == 200, (
+            f"edge loss: expected 200, found {edge_rows[0]['c']}"
+        )
+    finally:
+        await verify.close()
+        await store.close()
+
+    # (b) No call exceeded chunk_size items (categories are mutually exclusive per call)
+    for n_nodes, n_edges, n_patches in call_counts:
+        total = n_nodes + n_edges + n_patches
+        assert total <= chunk_size, (
+            f"chunk overflow: call carried {n_nodes} nodes, {n_edges} edges, "
+            f"{n_patches} patches (total {total} > {chunk_size})"
+        )
+
+    # Expected: 500/50=10 node calls + 200/50=4 edge calls + 0 patch calls = 14
+    assert len(call_counts) == 14, (
+        f"expected 14 chunk calls, got {len(call_counts)}: {call_counts}"
+    )
+
+
+async def test_chunked_flush_partial_failure_restores_only_remainder(
+    neo4j_container: dict[str, Any],
+) -> None:
+    """3rd execute_write call raises; first 2 chunks (all 100 nodes) are durable;
+    buffer holds only the un-written remainder (all 100 edges, no nodes); second
+    flush() drains the remainder cleanly with all 100 edges in Neo4j.
+
+    This directly tests the grow-spiral prevention guarantee: the restore set
+    shrinks with every committed chunk so the buffer can never regrow from
+    partial-failure restoration.
+    """
+    auth = (neo4j_container["user"], neo4j_container["password"])
+    bolt = neo4j_container["bolt_url"]
+    run = uuid.uuid4().hex[:8]
+    ws = f"partial-{run}"
+    chunk_size = 50
+
+    store = Neo4jGraphStore(
+        uri=bolt, auth=auth, workspace=ws, flush_chunk_size=chunk_size
+    )
+
+    # 100 nodes (2 chunks of 50)
+    node_ids = [f"node-{run}-{i}" for i in range(100)]
+    for nid in node_ids:
+        await store.upsert_node(nid, {"labels": ["TestNode"], "run": run})
+
+    # 100 edges (2 chunks of 50): node-i → node-(i+1) for i in 0..98, plus
+    # node-0 → node-99 to reach exactly 100
+    for i in range(99):
+        await store.upsert_edge(node_ids[i], node_ids[i + 1], {"type": "CHAIN"})
+    await store.upsert_edge(node_ids[0], node_ids[99], {"type": "CHAIN"})
+
+    # Inject a failure on the 3rd execute_write call (first edge chunk).
+    original_write_batch = _cis_store_mod._write_batch
+    call_count = 0
+
+    async def failing_write_batch(
+        tx: Any,
+        nodes: dict[str, Any],
+        edges: dict[Any, Any],
+        patches: list[Any],
+        workspace: str,
+    ) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 3:
+            raise RuntimeError("injected failure on 3rd chunk")
+        await original_write_batch(tx, nodes, edges, patches, workspace)
+
+    _cis_store_mod._write_batch = failing_write_batch  # type: ignore[assignment]
+    try:
+        with pytest.raises(Exception, match="injected failure"):
+            await store.flush()
+    finally:
+        _cis_store_mod._write_batch = original_write_batch
+
+    # First 2 chunks (all 100 nodes) are durably present in Neo4j.
+    verify1 = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+    try:
+        node_rows = await verify1.execute_query(
+            "MATCH (n:TestNode) WHERE n.run = $run AND n.workspace = $ws "
+            "RETURN count(n) AS c",
+            {"run": run, "ws": ws},
+            workspace="*",
+        )
+        assert node_rows[0]["c"] == 100, (
+            f"expected 100 durable nodes after partial failure, "
+            f"found {node_rows[0]['c']}"
+        )
+    finally:
+        await verify1.close()
+
+    # Buffer holds ONLY the un-written remainder: all 100 edges, no nodes.
+    assert len(store._node_buffer) == 0, (
+        f"node buffer should be empty (all committed), "
+        f"found {len(store._node_buffer)} items"
+    )
+    assert len(store._edge_buffer) == 100, (
+        f"edge buffer should hold 100 un-committed edges, "
+        f"found {len(store._edge_buffer)}"
+    )
+
+    # Second flush drains the remainder; all 100 edges now in Neo4j.
+    await store.flush()
+
+    verify2 = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+    try:
+        edge_rows = await verify2.execute_query(
+            "MATCH ()-[r:CHAIN]->() WHERE r.workspace = $ws RETURN count(r) AS c",
+            {"ws": ws},
+            workspace="*",
+        )
+        assert edge_rows[0]["c"] == 100, (
+            f"expected 100 edges after second flush, found {edge_rows[0]['c']}"
+        )
+    finally:
+        await verify2.close()
         await store.close()

@@ -471,15 +471,21 @@ class Neo4jGraphStore:
         auth: tuple | None = None,
         database: str = "neo4j",
         workspace: str | None = None,
+        flush_chunk_size: int = 200,
     ) -> None:
         """Initialise the store and create the async Neo4j driver.
 
         Args:
-            uri:       Bolt/neo4j URI, e.g. ``bolt://localhost:7687``.
-            auth:      ``(username, password)`` tuple, or ``None`` for no-auth.
-            database:  Target Neo4j database name (default: ``"neo4j"``).
-            workspace: Workspace to scope writes to.  ``None`` resolves to
-                       ``"default"`` via the ``workspace`` property.
+            uri:              Bolt/neo4j URI, e.g. ``bolt://localhost:7687``.
+            auth:             ``(username, password)`` tuple, or ``None`` for no-auth.
+            database:         Target Neo4j database name (default: ``"neo4j"``).
+            workspace:        Workspace to scope writes to.  ``None`` resolves to
+                              ``"default"`` via the ``workspace`` property.
+            flush_chunk_size: Maximum number of nodes, edges, or label-patches per
+                              Neo4j sub-transaction.  Bounds transaction memory so a
+                              single oversized flush cannot exhaust
+                              ``dbms.memory.transaction.total.max``.  Must be >= 1
+                              (enforced via ``max(1, ...)``).
         """
         # Explicit auto-retry budget for transient errors (e.g. deadlocks) so the
         # managed-transaction retry window is deliberate and reviewable rather than
@@ -496,6 +502,7 @@ class Neo4jGraphStore:
         self._schema_initialized: bool = False
         self._closed: bool = False
         self._flush_lock: asyncio.Lock = asyncio.Lock()
+        self._flush_chunk_size: int = max(1, flush_chunk_size)
 
     # ------------------------------------------------------------------
     # workspace property
@@ -697,11 +704,31 @@ class Neo4jGraphStore:
             await self._flush_body()
 
     async def _flush_body(self) -> None:
-        """Inner flush implementation — must only be called while _flush_lock is held."""
+        """Inner flush implementation — must only be called while _flush_lock is held.
+
+        Writes the buffered snapshot in bounded sub-transactions of at most
+        ``self._flush_chunk_size`` items, preventing a single oversized transaction
+        from exhausting ``dbms.memory.transaction.total.max``.
+
+        Write order is nodes → edges → label-patches.  This ordering is required
+        for referential integrity: edge ``MATCH`` requires both endpoint nodes to
+        exist in Neo4j, and label-patch ``MATCH`` requires the node to exist.
+
+        Each chunk calls ``execute_write(_write_batch, ...)`` independently; only
+        the category for that phase is non-empty (the others receive ``{}``/``[]``).
+        ``_write_batch`` is unchanged — it is a pure function of its parameters.
+
+        Failure handling: on any chunk failure only the un-committed remainder
+        (from the failing chunk onward, for every category not yet started) is
+        merged back into the live buffers with new-write-wins semantics.  Chunks
+        already committed are durable and idempotent (MERGE semantics) so they are
+        NOT restored — the buffer can only shrink across retries, preventing the
+        grow-spiral that caused OOM under sustained backpressure.
+        """
         if not self._node_buffer and not self._edge_buffer and not self._label_patches:
             return  # early exit — nothing to write
 
-        # Snapshot and clear buffers optimistically
+        # Snapshot and clear buffers optimistically (reference-swap, O(1))
         node_snapshot = self._node_buffer
         edge_snapshot = self._edge_buffer
         self._node_buffer = {}
@@ -709,36 +736,68 @@ class Neo4jGraphStore:
         patch_snapshot = self._label_patches
         self._label_patches = []
 
+        node_items = list(node_snapshot.items())
+        edge_items = list(edge_snapshot.items())
+        chunk = self._flush_chunk_size
+
+        # Track the committed frontier: each counter advances only after a
+        # successful execute_write so a failing chunk's items stay in the
+        # restore set.
+        node_done = 0
+        edge_done = 0
+        patch_done = 0
+
         success = False
         try:
             await self._ensure_schema()
 
-            # Driver-managed transaction: execute_write owns commit/rollback and
-            # auto-retries transient failures (TransientError / DeadlockDetected)
-            # up to max_transaction_retry_time. Safe because _write_batch is a pure
-            # function of its snapshot parameters (idempotency rule #1) and every
-            # write is an idempotent MERGE backed by uniqueness constraints
-            # (rules #2/#3), so re-running the batch cannot corrupt or duplicate state.
-            async with self._driver.session(database=self._database) as db_session:
-                await db_session.execute_write(
-                    _write_batch,
-                    node_snapshot,
-                    edge_snapshot,
-                    patch_snapshot,
-                    self.workspace,
-                )
+            # Phase 1 — node chunks (all before any edge or patch chunk)
+            while node_done < len(node_items):
+                node_chunk = dict(node_items[node_done : node_done + chunk])
+                async with self._driver.session(database=self._database) as db_session:
+                    await db_session.execute_write(
+                        _write_batch, node_chunk, {}, [], self.workspace
+                    )
+                node_done += len(node_chunk)
+
+            # Phase 2 — edge chunks (all nodes committed before first edge chunk)
+            while edge_done < len(edge_items):
+                edge_chunk = dict(edge_items[edge_done : edge_done + chunk])
+                async with self._driver.session(database=self._database) as db_session:
+                    await db_session.execute_write(
+                        _write_batch, {}, edge_chunk, [], self.workspace
+                    )
+                edge_done += len(edge_chunk)
+
+            # Phase 3 — label-patch chunks
+            while patch_done < len(patch_snapshot):
+                patch_chunk = patch_snapshot[patch_done : patch_done + chunk]
+                async with self._driver.session(database=self._database) as db_session:
+                    await db_session.execute_write(
+                        _write_batch, {}, {}, patch_chunk, self.workspace
+                    )
+                patch_done += len(patch_chunk)
+
             success = True
         finally:
             if not success:
-                # Restore buffers: snapshot base + any new writes since flush started
-                merged_nodes = dict(node_snapshot)
+                # Restore only the un-committed remainder: items from the
+                # failing chunk onward for each category.  Merge with any new
+                # writes that arrived during the flush (new writes win) — same
+                # semantics as the original single-transaction restore path.
+                remainder_nodes = dict(node_items[node_done:])
+                remainder_edges = dict(edge_items[edge_done:])
+                remainder_patches = patch_snapshot[patch_done:]
+
+                merged_nodes = dict(remainder_nodes)
                 merged_nodes.update(self._node_buffer)
                 self._node_buffer = merged_nodes
-                merged_edges = dict(edge_snapshot)
+
+                merged_edges = dict(remainder_edges)
                 merged_edges.update(self._edge_buffer)
                 self._edge_buffer = merged_edges
-                merged_patches = patch_snapshot + self._label_patches
-                self._label_patches = merged_patches
+
+                self._label_patches = remainder_patches + self._label_patches
 
     def discard_buffer(self) -> None:
         """Drop all buffered writes without persisting them (no driver I/O).
