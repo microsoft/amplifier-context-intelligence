@@ -387,6 +387,12 @@ class SessionRegistry:
                 self.record_written(1)
             except Exception as exc:
                 await qm.dead_letter(session_id, raw + b"\n", str(exc))
+                logger.warning(
+                    "dead_letter session=%s error=%s",
+                    session_id,
+                    exc,
+                    extra={"session_id": session_id},
+                )
                 # COE blocker (decision #13): drop the failed line's residue so
                 # it cannot contaminate the NEXT line's flush. A successful flush
                 # clears the buffer itself; only the failure path needs this.

@@ -10,7 +10,7 @@ from collections import deque
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -405,6 +405,45 @@ class TestBatchCommittedDebugLog:
             and getattr(r, "session_id", None) == sid
         ]
         assert records, "expected a DEBUG batch_committed record with session_id"
+
+
+class TestDeadLetterWarning:
+    """The dead-letter path emits ONE WARNING per dead-lettered line (rare,
+    accounted-for data loss that must be visible in prod)."""
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_logs_warning_with_session_id(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        reg = SessionRegistry()
+        sid = "sess-dead"
+        worker = SessionWorker(
+            session_id=sid,
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+        reg._register_for_test(worker)
+        reg.queue_manager.dead_letter = AsyncMock()  # type: ignore[method-assign]
+        reg.queue_manager.commit = AsyncMock()  # type: ignore[method-assign]
+
+        # A malformed line makes _parse_line raise inside _handle_exhausted_batch,
+        # triggering the dead-letter path.
+        poison = MagicMock()
+        poison.lines = [b"{ this is not valid json"]
+        poison.start_offset = 0
+
+        with caplog.at_level(logging.WARNING, logger="context_intelligence_server"):
+            await reg._handle_exhausted_batch(worker, poison, handlers=MagicMock())
+
+        reg.queue_manager.dead_letter.assert_awaited()
+        records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "dead_letter" in r.getMessage()
+            and getattr(r, "session_id", None) == sid
+        ]
+        assert records, "expected a WARNING dead_letter record with session_id"
 
 
 class TestRingBufferEmission:
