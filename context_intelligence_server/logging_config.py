@@ -1,5 +1,6 @@
 """Logging configuration with stdout and rotating file handlers."""
 
+import json
 import logging
 import logging.handlers
 import sys
@@ -7,9 +8,41 @@ from pathlib import Path
 
 from context_intelligence_server.config import get_settings
 
-_LOG_FORMAT = '{"time": "%(asctime)s", "level": "%(levelname)s", "logger": "%(name)s", "message": "%(message)s"}'
 _MAX_BYTES = 10 * 1024 * 1024
 _BACKUP_COUNT = 5
+
+
+class JsonFormatter(logging.Formatter):
+    """Serialize each log record to exactly one physical JSON line.
+
+    Promotes session_id (and only session_id) to a top-level key. Folds any
+    exc_info into a single-line 'exc' string field so multi-line tracebacks
+    never break a record across physical lines. Never raises: on any failure it
+    emits a minimal valid-JSON record instead.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        try:
+            obj = {
+                "time": self.formatTime(record),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+            }
+            session_id = getattr(record, "session_id", None)
+            if session_id is not None:
+                obj["session_id"] = session_id
+            if record.exc_info:
+                obj["exc"] = self.formatException(record.exc_info)
+            return json.dumps(obj, default=str)
+        except Exception:
+            fallback = {
+                "time": "",
+                "level": getattr(record, "levelname", "ERROR"),
+                "logger": getattr(record, "name", ""),
+                "message": "log record formatting failed",
+            }
+            return json.dumps(fallback)
 
 
 def setup_logging() -> None:
@@ -32,7 +65,7 @@ def setup_logging() -> None:
     # Ensure parent directory exists
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    formatter = logging.Formatter(_LOG_FORMAT)
+    formatter = JsonFormatter()
 
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)

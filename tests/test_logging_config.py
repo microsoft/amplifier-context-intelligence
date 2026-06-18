@@ -1,5 +1,6 @@
 """Tests for logging_config module with stdout + rotating file handlers."""
 
+import io
 import json
 import logging
 import logging.handlers
@@ -239,4 +240,75 @@ class TestSetupLogging:
             assert handler_count_after_second == handler_count_after_first, (
                 f"Second setup_logging() call added handlers: "
                 f"before={handler_count_after_first}, after={handler_count_after_second}"
+            )
+
+    def test_configured_stdout_handler_emits_one_line_json(self) -> None:
+        """The REAL configured stdout handler must emit exactly one physical JSON line per record.
+
+        Routes hostile records through the production-wired stdout StreamHandler
+        (not a test-built Formatter) so a regression where the handler is still
+        wired to the old %-formatter cannot ship tests-green with the bug live.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = str(Path(tmpdir) / "server.jsonl")
+            mock_settings = self._make_mock_settings(log_path, log_level="DEBUG")
+
+            with patch(
+                "context_intelligence_server.logging_config.get_settings",
+                return_value=mock_settings,
+            ):
+                from context_intelligence_server.logging_config import setup_logging
+
+                setup_logging()
+
+            root_logger = logging.getLogger()
+            stdout_handlers = [
+                h
+                for h in root_logger.handlers
+                if isinstance(h, logging.StreamHandler)
+                and not isinstance(h, logging.handlers.RotatingFileHandler)
+                and h.stream is sys.stdout
+            ]
+            assert len(stdout_handlers) >= 1, "Expected a configured stdout StreamHandler"
+            stdout_handler = stdout_handlers[0]
+
+            # Swap the configured handler's stream to capture its output.
+            capture = io.StringIO()
+            stdout_handler.setStream(capture)
+
+            logger = logging.getLogger("context_intelligence_server")
+
+            # Record 1: hostile message with quote, real newline, backslash + session_id
+            logger.warning(
+                'hostile "quote" \n newline \\ backslash',
+                extra={"session_id": "sess-x"},
+            )
+
+            # Record 2: an exception record with a multi-line traceback
+            try:
+                raise ValueError("boom\nwith embedded newline")
+            except ValueError:
+                logger.exception("explosion happened", extra={"session_id": "sess-y"})
+
+            # Record 3: non-serializable session_id value
+            logger.warning("plain message", extra={"session_id": object()})
+
+            for handler in root_logger.handlers:
+                handler.flush()
+
+            output = capture.getvalue()
+            lines = [line for line in output.splitlines() if line.strip()]
+            assert len(lines) == 3, (
+                f"Expected exactly 3 physical JSON lines, got {len(lines)}: {lines!r}"
+            )
+
+            parsed = [json.loads(line) for line in lines]
+            for obj in parsed:
+                assert "session_id" in obj, f"Expected 'session_id' key, got: {obj}"
+                assert "event" not in obj, f"Did not expect 'event' key, got: {obj}"
+
+            exc_record = parsed[1]
+            assert "exc" in exc_record, f"Exception record should have 'exc', got: {exc_record}"
+            assert "Traceback" in exc_record["exc"], (
+                f"Folded exc field should contain traceback, got: {exc_record['exc']!r}"
             )
