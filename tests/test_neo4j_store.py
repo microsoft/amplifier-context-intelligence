@@ -1704,7 +1704,9 @@ def test_chunk_dict_byte_bound():
     snapshot = {str(i): {"blob": blob} for i in range(6)}
     chunks = list(_chunk_dict(snapshot, max_rows=1000, max_bytes=5000))
 
-    assert all(len(c) <= 2 for c in chunks), f"Expected all chunks <=2 rows, got {[len(c) for c in chunks]}"
+    assert all(len(c) <= 2 for c in chunks), (
+        f"Expected all chunks <=2 rows, got {[len(c) for c in chunks]}"
+    )
     assert len(chunks) >= 3, f"Expected >=3 chunks, got {len(chunks)}"
     # No loss
     merged = {}
@@ -1723,9 +1725,15 @@ def test_chunk_dict_one_row_floor():
     }
     chunks = list(_chunk_dict(snapshot, max_rows=1000, max_bytes=1000))
 
-    assert len(chunks) == 2, f"Expected 2 chunks, got {len(chunks)}: {[list(c.keys()) for c in chunks]}"
-    assert list(chunks[0].keys()) == ["big"], f"Expected chunk[0] to contain only 'big', got {list(chunks[0].keys())}"
-    assert list(chunks[1].keys()) == ["small"], f"Expected chunk[1] to contain only 'small', got {list(chunks[1].keys())}"
+    assert len(chunks) == 2, (
+        f"Expected 2 chunks, got {len(chunks)}: {[list(c.keys()) for c in chunks]}"
+    )
+    assert list(chunks[0].keys()) == ["big"], (
+        f"Expected chunk[0] to contain only 'big', got {list(chunks[0].keys())}"
+    )
+    assert list(chunks[1].keys()) == ["small"], (
+        f"Expected chunk[1] to contain only 'small', got {list(chunks[1].keys())}"
+    )
 
 
 def test_chunk_dict_empty_yields_nothing():
@@ -1796,9 +1804,7 @@ async def test_coordinator_every_execute_write_within_bounds() -> None:
     for nodes, _edges, _patches in captured_payloads:
         if not nodes:
             continue  # skip edge/patch-only calls (empty nodes dict)
-        assert len(nodes) <= 10, (
-            f"Node chunk exceeded row bound: {len(nodes)} > 10"
-        )
+        assert len(nodes) <= 10, f"Node chunk exceeded row bound: {len(nodes)} > 10"
         total_bytes = sum(_serialized_row_size(v) for v in nodes.values())
         assert total_bytes <= 10_000_000 or len(nodes) == 1, (
             f"Node chunk exceeded byte bound: {total_bytes} bytes across "
@@ -2146,6 +2152,92 @@ class TestSchemaConstraintAllowList:
         )
         assert mock_tx.run.await_count >= 1, (
             "Node-write transaction must still run despite the constraint failure."
+        )
+        assert store._node_buffer == {}, (
+            "Buffer must be cleared (success path) — not restored on failure."
+        )
+
+    async def test_connectivity_driver_error_surfaced_at_error_no_raise(self, caplog):
+        """ServiceUnavailable (a DriverError, NOT a Neo4jError) on CREATE CONSTRAINT.
+
+        Connectivity errors (ServiceUnavailable / SessionExpired) inherit from
+        DriverError, not Neo4jError.  They must be caught, logged at ERROR, and
+        MUST NOT propagate out of ensure_neo4j_schema — otherwise a connectivity
+        drop on the flush path would be counted as a flush failure and dead-letter
+        real events.
+        """
+        from neo4j.exceptions import ServiceUnavailable
+
+        err = ServiceUnavailable("connection refused")
+
+        async def _run(query, *args, **kwargs):
+            if "CREATE CONSTRAINT" in query:
+                raise err
+            return AsyncMock()
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.run = AsyncMock(side_effect=_run)
+
+        mock_driver = MagicMock()
+        mock_driver.session = MagicMock(return_value=mock_session)
+
+        with caplog.at_level(logging.DEBUG):
+            await ensure_neo4j_schema(mock_driver)  # MUST NOT raise
+
+        assert any(
+            r.levelno >= logging.ERROR and "constraint" in r.getMessage().lower()
+            for r in caplog.records
+        ), (
+            "ServiceUnavailable on constraint creation must surface at ERROR. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
+    async def test_connectivity_error_on_flush_path_does_not_dead_letter(self, caplog):
+        """END-TO-END: a ServiceUnavailable on the flush path must not dead-letter.
+
+        The schema session raises ServiceUnavailable (a DriverError) on CREATE
+        CONSTRAINT but succeeds on dedup/index; the node-write transaction must
+        still run and the node buffer must be cleared (success path), proving the
+        connectivity error did not propagate out of flush() and trigger
+        restore-on-failure + dead-lettering.
+        """
+        from neo4j.exceptions import ServiceUnavailable
+
+        store = _make_store()
+        store._schema_initialized = False
+
+        err = ServiceUnavailable("connection refused")
+
+        async def _schema_run(query, *args, **kwargs):
+            if "CREATE CONSTRAINT" in query:
+                raise err
+            return AsyncMock()
+
+        schema_session = AsyncMock()
+        schema_session.__aenter__ = AsyncMock(return_value=schema_session)
+        schema_session.run = AsyncMock(side_effect=_schema_run)
+
+        mock_tx, write_session = _make_flush_mocks()
+
+        store._driver.session = MagicMock(
+            side_effect=[schema_session, write_session, write_session, write_session]
+        )
+
+        await store.upsert_node("n1", {"labels": ["Session"], "name": "test"})
+
+        with caplog.at_level(logging.DEBUG):
+            await store.flush()  # MUST NOT raise
+
+        assert any(
+            r.levelno >= logging.ERROR and "constraint" in r.getMessage().lower()
+            for r in caplog.records
+        ), (
+            "Expected an ERROR record mentioning the constraint on the flush path. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+        assert mock_tx.run.await_count >= 1, (
+            "Node-write transaction must still run despite the connectivity error."
         )
         assert store._node_buffer == {}, (
             "Buffer must be cleared (success path) — not restored on failure."

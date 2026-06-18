@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Any, Generator, LiteralString, cast
 
 from neo4j import AsyncGraphDatabase
-from neo4j.exceptions import Neo4jError
+from neo4j.exceptions import DriverError, Neo4jError
 
 _LOG = logging.getLogger(__name__)
 
@@ -305,19 +305,27 @@ async def ensure_neo4j_schema(
                 "CREATE CONSTRAINT session_node_id_workspace_unique IF NOT EXISTS "
                 "FOR (n:Session) REQUIRE (n.node_id, n.workspace) IS UNIQUE"
             )
-        except Neo4jError as exc:
-            if exc.code in _BENIGN_SCHEMA_CODES:
+        except (Neo4jError, DriverError) as exc:
+            if isinstance(exc, Neo4jError) and exc.code in _BENIGN_SCHEMA_CODES:
                 _LOG.debug(
                     "ensure_neo4j_schema: Session uniqueness constraint already "
                     "present (benign concurrent-schema race, code=%s)",
                     exc.code,
                 )
             else:
+                # Either a dangerous Neo4jError code (e.g. ConstraintCreationFailed)
+                # or a connectivity DriverError that is NOT a Neo4jError
+                # (ServiceUnavailable / SessionExpired). The latter has no meaningful
+                # .code for our allow-list, so report it generically. Crucially, we
+                # continue rather than re-raise: this runs on the flush path via
+                # _ensure_schema, and a re-raise would be counted as a flush failure
+                # and could dead-letter real events.
+                code = exc.code if isinstance(exc, Neo4jError) else None
                 _LOG.error(
                     "ensure_neo4j_schema: could not create Session uniqueness "
                     "constraint (code=%s); continuing without it — duplicate Session "
                     "data may be present: %s",
-                    exc.code,
+                    code,
                     exc,
                 )
 
@@ -332,19 +340,27 @@ async def ensure_neo4j_schema(
                 "CREATE CONSTRAINT event_node_id_workspace_unique IF NOT EXISTS "
                 "FOR (n:Event) REQUIRE (n.node_id, n.workspace) IS UNIQUE"
             )
-        except Neo4jError as exc:
-            if exc.code in _BENIGN_SCHEMA_CODES:
+        except (Neo4jError, DriverError) as exc:
+            if isinstance(exc, Neo4jError) and exc.code in _BENIGN_SCHEMA_CODES:
                 _LOG.debug(
                     "ensure_neo4j_schema: Event uniqueness constraint already "
                     "present (benign concurrent-schema race, code=%s)",
                     exc.code,
                 )
             else:
+                # Either a dangerous Neo4jError code (e.g. ConstraintCreationFailed)
+                # or a connectivity DriverError that is NOT a Neo4jError
+                # (ServiceUnavailable / SessionExpired). The latter has no meaningful
+                # .code for our allow-list, so report it generically. Crucially, we
+                # continue rather than re-raise: this runs on the flush path via
+                # _ensure_schema, and a re-raise would be counted as a flush failure
+                # and could dead-letter real events.
+                code = exc.code if isinstance(exc, Neo4jError) else None
                 _LOG.error(
                     "ensure_neo4j_schema: could not create Event uniqueness "
                     "constraint (code=%s); continuing without it — duplicate Event "
                     "data may be present: %s",
-                    exc.code,
+                    code,
                     exc,
                 )
 
