@@ -1528,3 +1528,33 @@ def test_get_or_create_threads_flush_chunk_bounds(monkeypatch) -> None:
 
     assert captured.get("flush_chunk_rows") == 100
     assert captured.get("flush_chunk_bytes") == 4_194_304
+
+
+# ---------------------------------------------------------------------------
+# Task 1 (Phase 2, #278): last_successful_flush liveness field
+# ---------------------------------------------------------------------------
+
+
+class TestLastSuccessfulFlushField:
+    """SessionWorker.last_successful_flush defaults to creation time, not 0.0."""
+
+    def test_defaults_to_creation_time_not_zero(self) -> None:
+        """last_successful_flush must default to time.time() at construction
+        (same semantics as started_at), NOT 0.0.
+
+        A 0.0 default would make every brand-new worker read as 'last flushed
+        in 1970' (falsely ancient); defaulting to creation time means 'no flush
+        has happened yet, but the worker is fresh.'
+        """
+        before = time.time()
+        worker = SessionWorker(
+            session_id="test-lsf",
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+        after = time.time()
+
+        # Field must exist and be bracketed by the timestamps taken around construction.
+        assert before <= worker.last_successful_flush <= after
+        # Must be close to started_at (both use default_factory=time.time).
+        assert abs(worker.last_successful_flush - worker.started_at) < 0.1

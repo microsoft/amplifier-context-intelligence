@@ -34,6 +34,10 @@ class SessionWorker:
     events_processed: int = 0
     started_at: float = field(default_factory=time.time)
     error_count: int = 0
+    # Phase 2 (#278): liveness timestamp — when the flush boundary last
+    # completed for this worker. Defaults to creation time (NOT 0.0) so a
+    # brand-new worker reads as fresh, not ancient. Stamped in _flush_barrier.
+    last_successful_flush: float = field(default_factory=time.time)
 
 
 @dataclass
