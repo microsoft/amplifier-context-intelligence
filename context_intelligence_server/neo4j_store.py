@@ -176,6 +176,38 @@ def _normalize_temporal(value: Any) -> Any:
     return value
 
 
+# ---------------------------------------------------------------------------
+# Benign schema-error allow-list for constraint creation.
+# ---------------------------------------------------------------------------
+# These four codes are the ONLY ones treated as benign when CREATE CONSTRAINT
+# fails. Every one is kept deliberately, and none can mask data corruption:
+#
+#   * Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists
+#   * Neo.TransientError.Transaction.DeadlockDetected
+#   * Neo.ClientError.Schema.IndexWithNameAlreadyExists
+#   * Neo.ClientError.Schema.ConstraintWithNameAlreadyExists
+#
+# Rationale:
+#   - Real duplicate data NEVER surfaces as one of these — it surfaces as a
+#     DIFFERENT code, Neo.ClientError.Schema.ConstraintCreationFailed, which is
+#     deliberately NOT in this set and is surfaced at ERROR.
+#   - IndexWithNameAlreadyExists is the actual production-observed symptom of a
+#     concurrent-schema race (a backing index already present).
+#   - EquivalentSchemaRuleAlreadyExists and DeadlockDetected were reproduced by
+#     an empirical spike on neo4j:5.26.22-community / driver 6.1.0.
+#
+# Mirrors the benign-code handling in _create_index above (kept DRY by sharing
+# the EquivalentSchemaRuleAlreadyExists rationale).
+_BENIGN_SCHEMA_CODES: frozenset[str] = frozenset(
+    {
+        "Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists",
+        "Neo.TransientError.Transaction.DeadlockDetected",
+        "Neo.ClientError.Schema.IndexWithNameAlreadyExists",
+        "Neo.ClientError.Schema.ConstraintWithNameAlreadyExists",
+    }
+)
+
+
 async def ensure_neo4j_schema(
     driver: Any,
     database: str = "neo4j",
@@ -273,12 +305,21 @@ async def ensure_neo4j_schema(
                 "CREATE CONSTRAINT session_node_id_workspace_unique IF NOT EXISTS "
                 "FOR (n:Session) REQUIRE (n.node_id, n.workspace) IS UNIQUE"
             )
-        except Exception as exc:  # noqa: BLE001
-            _LOG.warning(
-                "ensure_neo4j_schema: could not create Session uniqueness constraint "
-                "(pre-existing duplicates?): %s",
-                exc,
-            )
+        except Neo4jError as exc:
+            if exc.code in _BENIGN_SCHEMA_CODES:
+                _LOG.debug(
+                    "ensure_neo4j_schema: Session uniqueness constraint already "
+                    "present (benign concurrent-schema race, code=%s)",
+                    exc.code,
+                )
+            else:
+                _LOG.error(
+                    "ensure_neo4j_schema: could not create Session uniqueness "
+                    "constraint (code=%s); continuing without it — duplicate Session "
+                    "data may be present: %s",
+                    exc.code,
+                    exc,
+                )
 
         # ------------------------------------------------------------------
         # Step 4: uniqueness constraint on Event nodes.
@@ -291,12 +332,21 @@ async def ensure_neo4j_schema(
                 "CREATE CONSTRAINT event_node_id_workspace_unique IF NOT EXISTS "
                 "FOR (n:Event) REQUIRE (n.node_id, n.workspace) IS UNIQUE"
             )
-        except Exception as exc:  # noqa: BLE001
-            _LOG.warning(
-                "ensure_neo4j_schema: could not create Event uniqueness constraint "
-                "(pre-existing duplicates?): %s",
-                exc,
-            )
+        except Neo4jError as exc:
+            if exc.code in _BENIGN_SCHEMA_CODES:
+                _LOG.debug(
+                    "ensure_neo4j_schema: Event uniqueness constraint already "
+                    "present (benign concurrent-schema race, code=%s)",
+                    exc.code,
+                )
+            else:
+                _LOG.error(
+                    "ensure_neo4j_schema: could not create Event uniqueness "
+                    "constraint (code=%s); continuing without it — duplicate Event "
+                    "data may be present: %s",
+                    exc.code,
+                    exc,
+                )
 
 
 def _serialized_row_size(value: Any) -> int:

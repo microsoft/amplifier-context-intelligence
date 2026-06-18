@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from neo4j.exceptions import Neo4jError
 
 from context_intelligence_server.graph_store import GraphStore, QueryableStore
 from context_intelligence_server.neo4j_store import (
@@ -28,6 +29,7 @@ from context_intelligence_server.neo4j_store import (
     _convert_temporal_props,
     _normalize_temporal,
     _validate_identifier,
+    ensure_neo4j_schema,
 )
 
 
@@ -1997,3 +1999,154 @@ async def test_reraise_restores_full_snapshot_and_logs(
         f"[{case_id}] Expected ERROR log containing 'flush_chunk_failed'. "
         f"Records: {[r.getMessage() for r in caplog.records]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# TestSchemaConstraintAllowList
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaConstraintAllowList:
+    """Verified benign allow-list for schema constraint creation.
+
+    Benign already-exists / concurrent-schema-race codes must be swallowed at
+    DEBUG and execution continues.  Dangerous codes (ConstraintCreationFailed
+    and anything else) must be surfaced at ERROR and continue — never re-raised
+    into the flush/write path, where a re-raise would make the drain barrier
+    count it as a flush failure and dead-letter real events.
+    """
+
+    @staticmethod
+    def _driver_raising_on_constraint(code: str):
+        """Build a mock driver whose CREATE CONSTRAINT statements raise Neo4jError(code).
+
+        ``Neo4jError._hydrate_neo4j`` returns the correct Neo4jError subclass with
+        ``.code`` set (``.code`` is a read-only property with no setter, so it
+        cannot be assigned directly) and is catchable as ``except Neo4jError``.
+        Non-constraint statements (dedup, index creation) succeed.
+        """
+        err = Neo4jError._hydrate_neo4j(code=code, message="schema failure")
+
+        async def _run(query, *args, **kwargs):
+            if "CREATE CONSTRAINT" in query:
+                raise err
+            return AsyncMock()
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.run = AsyncMock(side_effect=_run)
+
+        mock_driver = MagicMock()
+        mock_driver.session = MagicMock(return_value=mock_session)
+        return mock_driver
+
+    async def test_benign_deadlock_swallowed_at_debug(self, caplog):
+        """DeadlockDetected is benign: no raise, no WARNING/ERROR, a DEBUG constraint line."""
+        driver = self._driver_raising_on_constraint(
+            "Neo.TransientError.Transaction.DeadlockDetected"
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            await ensure_neo4j_schema(driver)  # MUST NOT raise
+
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            "Benign DeadlockDetected must not log at WARNING or above. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+        assert any(
+            r.levelno == logging.DEBUG and "constraint" in r.getMessage().lower()
+            for r in caplog.records
+        ), (
+            "Expected a DEBUG record mentioning the constraint. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
+    async def test_benign_equivalent_rule_swallowed_at_debug(self, caplog):
+        """EquivalentSchemaRuleAlreadyExists is benign: no raise, no WARNING/ERROR, DEBUG line."""
+        driver = self._driver_raising_on_constraint(
+            "Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists"
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            await ensure_neo4j_schema(driver)  # MUST NOT raise
+
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            "Benign EquivalentSchemaRuleAlreadyExists must not log at WARNING or above. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+        assert any(
+            r.levelno == logging.DEBUG and "constraint" in r.getMessage().lower()
+            for r in caplog.records
+        ), (
+            "Expected a DEBUG record mentioning the constraint. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
+    async def test_constraint_creation_failed_surfaced_at_error_no_raise(self, caplog):
+        """ConstraintCreationFailed is dangerous: no raise, ERROR logged, old wording gone."""
+        driver = self._driver_raising_on_constraint(
+            "Neo.ClientError.Schema.ConstraintCreationFailed"
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            await ensure_neo4j_schema(driver)  # MUST NOT raise
+
+        assert any(r.levelno >= logging.ERROR for r in caplog.records), (
+            "ConstraintCreationFailed must surface at ERROR. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+        assert not any(
+            "pre-existing duplicates?" in r.getMessage() for r in caplog.records
+        ), "The misleading '(pre-existing duplicates?)' wording must be dropped."
+
+    async def test_constraint_failure_on_flush_path_does_not_dead_letter(self, caplog):
+        """END-TO-END: a constraint failure on the flush path must not dead-letter events.
+
+        The schema session raises ConstraintCreationFailed on CREATE CONSTRAINT but
+        succeeds on index/dedup; the node-write transaction must still run and the
+        node buffer must be cleared (success path), proving the schema error did not
+        propagate out of flush() and trigger restore-on-failure + dead-lettering.
+        """
+        store = _make_store()
+        store._schema_initialized = False
+
+        # Schema session: raises ConstraintCreationFailed on CREATE CONSTRAINT,
+        # succeeds on dedup/index statements.
+        err = Neo4jError._hydrate_neo4j(
+            code="Neo.ClientError.Schema.ConstraintCreationFailed",
+            message="schema failure",
+        )
+
+        async def _schema_run(query, *args, **kwargs):
+            if "CREATE CONSTRAINT" in query:
+                raise err
+            return AsyncMock()
+
+        schema_session = AsyncMock()
+        schema_session.__aenter__ = AsyncMock(return_value=schema_session)
+        schema_session.run = AsyncMock(side_effect=_schema_run)
+
+        mock_tx, write_session = _make_flush_mocks()
+
+        store._driver.session = MagicMock(
+            side_effect=[schema_session, write_session, write_session, write_session]
+        )
+
+        await store.upsert_node("n1", {"labels": ["Session"], "name": "test"})
+
+        with caplog.at_level(logging.DEBUG):
+            await store.flush()  # MUST NOT raise
+
+        assert any(
+            r.levelno >= logging.ERROR and "constraint" in r.getMessage().lower()
+            for r in caplog.records
+        ), (
+            "Expected an ERROR record mentioning the constraint on the flush path. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+        assert mock_tx.run.await_count >= 1, (
+            "Node-write transaction must still run despite the constraint failure."
+        )
+        assert store._node_buffer == {}, (
+            "Buffer must be cleared (success path) — not restored on failure."
+        )
