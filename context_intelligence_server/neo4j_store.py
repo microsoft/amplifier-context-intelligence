@@ -650,7 +650,60 @@ async def _write_batch(
         row = {"src_id": src_id, "dst_id": dst_id, "props": props}
         edge_groups.setdefault(edge_type, []).append(row)
 
-    for edge_type, rows in edge_groups.items():
+    # Canonical node-lock pre-acquisition (completes the lock-order fix).
+    #
+    # Sorting edge-type groups and edge rows makes the EDGE iteration order
+    # consistent, but it cannot fix the residual root<->concept deadlock: the
+    # SAME node pair occupies different src/dst roles across different edge types
+    # in two concurrent drainers (e.g. a root drainer writes
+    # HAS_ATTRIBUTE root->concept while a child drainer writes
+    # HAS_ATTRIBUTE child->concept then HAS_SUBSESSION root->child), so the two
+    # transactions still acquire the (root, concept) node write-locks in inverted
+    # order. That inversion is topological, not orderable by any edge sort key.
+    #
+    # Fix: at the START of the edge phase, MATCH+SET every distinct endpoint
+    # node_id in ONE UNWIND, in globally-sorted node_id order. The SET takes an
+    # exclusive write-lock on each endpoint, so every drainer that touches a
+    # given set of nodes acquires their locks in the SAME canonical order before
+    # any relationship MERGE runs. Two transactions sharing any node pair can no
+    # longer hold one while waiting for the other -> the cycle is impossible.
+    #
+    # Pure Cypher (APOC is not installed). Issued as ONE single-row
+    # MATCH+SET per endpoint, in sorted node_id order. Why per-endpoint rather
+    # than a single UNWIND: an UNWIND that both MATCHes on node_id and SETs
+    # node_id plans an `Eager` operator (read/set conflict on the same
+    # property) which BUFFERS every matched row. Under a tight per-transaction
+    # memory cap that buffer adds pressure that can make an unrelated flush OOM
+    # at an unexpected boundary (observed: it tipped the 2 MiB-capped
+    # finalization-orphan test so its OOM escaped instead of being caught).
+    # A single-row MATCH on a bound node_id plans with NO Eager (verified via
+    # EXPLAIN), so each call buffers nothing. Python's sequential `await`
+    # guarantees the locks are acquired in the sorted order they are issued, and
+    # they accumulate on `tx` until commit. `SET n.node_id = n.node_id` is the
+    # same proven no-op write used elsewhere: it takes the node's EXCLUSIVE lock
+    # without changing data and leaves no leftover property. Guarded by
+    # `if edge_snapshot` so node-only (Phase 1) and patch-only (Phase 2)
+    # _write_batch calls skip it entirely (no wasted scan, no locks).
+    if edge_snapshot:
+        endpoint_ids = sorted(
+            {nid for src_id, dst_id in edge_snapshot for nid in (src_id, dst_id)}
+        )
+        for nid in endpoint_ids:
+            res = await tx.run(
+                "MATCH (n {node_id: $id, workspace: $workspace}) "
+                "SET n.node_id = n.node_id",
+                id=nid,
+                workspace=workspace,
+            )
+            await res.consume()
+
+    # Layer 1 (global lock-order invariant): iterate edge-type groups in a
+    # deterministic global order (sorted by edge_type) so every drainer locks
+    # edge types in the same sequence. Combined with the within-type
+    # (src_id, dst_id) sort below and the edge-snapshot sort before chunking in
+    # _flush_body, this makes the full cross-session edge lock order consistent,
+    # closing the HAS_ATTRIBUTE/HAS_SUBSESSION inversion on the shared supernodes.
+    for edge_type, rows in sorted(edge_groups.items()):
         _validate_identifier(edge_type, "edge_type")
         edge_merge_query = (  # type: ignore[assignment]
             f"UNWIND $rows AS row "
@@ -939,6 +992,16 @@ class Neo4jGraphStore:
         patch_snapshot = self._label_patches
         self._label_patches = []
 
+        # Layer 1 (global lock-order invariant): sort the FULL node snapshot by
+        # node_id BEFORE chunking so the concatenation of node_ids across every
+        # chunk is globally non-decreasing. Each drainer then acquires node
+        # locks (Phase 1 MERGE) in one consistent global order, eliminating the
+        # cross-session lock-order inversion that deadlocked the shared root
+        # Session / SST_CONCEPT supernodes. The values are the SAME dict
+        # references (no payload copy), so this does NOT reintroduce the #15
+        # per-transaction OOM — chunk row/byte bounds are unchanged.
+        node_snapshot = dict(sorted(node_snapshot.items()))
+
         rows = self._flush_chunk_rows
         byts = self._flush_chunk_bytes
         success = False
@@ -962,6 +1025,24 @@ class Neo4jGraphStore:
                     )
 
             # Phase 3: edges — each chunk is its own execute_write.
+            # Layer 1 (global lock-order invariant): sort the FULL edge snapshot
+            # by (edge_type, src_id, dst_id) BEFORE chunking so the edge rows
+            # across every chunk are globally non-decreasing in that key. This
+            # keeps chunk boundaries aligned with the within-_write_batch
+            # (sorted edge-type group + (src_id, dst_id)) order, so two drainers
+            # writing the same hot edges (HAS_ATTRIBUTE to the shared concept
+            # node, HAS_SUBSESSION to the root session) acquire those locks in
+            # one consistent global order — closing the inversion deadlock.
+            edge_snapshot = dict(
+                sorted(
+                    edge_snapshot.items(),
+                    key=lambda kv: (
+                        kv[1].get("type", _DEFAULT_EDGE_TYPE),
+                        kv[0][0],
+                        kv[0][1],
+                    ),
+                )
+            )
             for chunk in _chunk_dict(edge_snapshot, rows, byts):
                 async with self._driver.session(database=self._database) as db_session:
                     await db_session.execute_write(
