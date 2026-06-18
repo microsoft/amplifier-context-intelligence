@@ -1670,3 +1670,77 @@ def test_serialized_row_size_handles_unjsonable_value():
 
     result = _serialized_row_size({"ts": datetime(2026, 6, 18)})
     assert result > 0
+
+
+# ---------------------------------------------------------------------------
+# _chunk_dict / _chunk_list tests
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_dict_row_bound():
+    """250 tiny rows at max_rows=100 → chunk sizes [100, 100, 50], no loss/dup."""
+    from context_intelligence_server.neo4j_store import _chunk_dict
+
+    snapshot = {str(i): {"v": i} for i in range(250)}
+    # Use enormous max_bytes so only the row bound trips
+    chunks = list(_chunk_dict(snapshot, max_rows=100, max_bytes=10_000_000))
+
+    assert [len(c) for c in chunks] == [100, 100, 50]
+    merged = {}
+    for c in chunks:
+        merged.update(c)
+    assert merged == snapshot
+
+
+def test_chunk_dict_byte_bound():
+    """6 rows of ~2 KB blob each at max_bytes=5000 → all chunks len<=2, at least 3 chunks."""
+    from context_intelligence_server.neo4j_store import _chunk_dict
+
+    # Each value is ~2 KB; two rows together are ~4 KB which is < 5000, but three would exceed
+    blob = "x" * 2000
+    snapshot = {str(i): {"blob": blob} for i in range(6)}
+    chunks = list(_chunk_dict(snapshot, max_rows=1000, max_bytes=5000))
+
+    assert all(len(c) <= 2 for c in chunks), f"Expected all chunks <=2 rows, got {[len(c) for c in chunks]}"
+    assert len(chunks) >= 3, f"Expected >=3 chunks, got {len(chunks)}"
+    # No loss
+    merged = {}
+    for c in chunks:
+        merged.update(c)
+    assert merged == snapshot
+
+
+def test_chunk_dict_one_row_floor():
+    """Oversized row is yielded alone (one-row floor); next row goes in next chunk."""
+    from context_intelligence_server.neo4j_store import _chunk_dict
+
+    snapshot = {
+        "big": "x" * 10000,
+        "small": {"v": 1},
+    }
+    chunks = list(_chunk_dict(snapshot, max_rows=1000, max_bytes=1000))
+
+    assert len(chunks) == 2, f"Expected 2 chunks, got {len(chunks)}: {[list(c.keys()) for c in chunks]}"
+    assert list(chunks[0].keys()) == ["big"], f"Expected chunk[0] to contain only 'big', got {list(chunks[0].keys())}"
+    assert list(chunks[1].keys()) == ["small"], f"Expected chunk[1] to contain only 'small', got {list(chunks[1].keys())}"
+
+
+def test_chunk_dict_empty_yields_nothing():
+    """An empty snapshot produces no chunks."""
+    from context_intelligence_server.neo4j_store import _chunk_dict
+
+    result = list(_chunk_dict({}, max_rows=100, max_bytes=4_194_304))
+    assert result == []
+
+
+def test_chunk_list_row_bound():
+    """150 patches at max_rows=100 → chunks of [100, 50], flattened equals input."""
+    from context_intelligence_server.neo4j_store import _chunk_list
+
+    patches = [{"node_id": str(i), "label": f"L{i}"} for i in range(150)]
+    # Use enormous max_bytes so only row bound trips
+    chunks = list(_chunk_list(patches, max_rows=100, max_bytes=10_000_000))
+
+    assert [len(c) for c in chunks] == [100, 50]
+    flattened = [item for c in chunks for item in c]
+    assert flattened == patches

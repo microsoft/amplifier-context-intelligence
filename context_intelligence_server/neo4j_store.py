@@ -15,7 +15,7 @@ import json
 import logging
 import re
 from datetime import datetime
-from typing import Any, LiteralString, cast
+from typing import Any, Generator, LiteralString, cast
 
 from neo4j import AsyncGraphDatabase
 from neo4j.exceptions import Neo4jError
@@ -315,6 +315,67 @@ def _serialized_row_size(value: Any) -> int:
         return len(json.dumps(value, default=str))
     except (TypeError, ValueError):
         return len(str(value))
+
+
+def _chunk_dict(
+    snapshot: dict[Any, Any],
+    max_rows: int,
+    max_bytes: int,
+) -> Generator[dict[Any, Any], None, None]:
+    """Yield sub-dicts of *snapshot* bounded by *max_rows* and *max_bytes*.
+
+    Dual-bound slicing: a chunk is emitted when either the row count OR the
+    accumulated byte size would be exceeded by the next row.  A single row that
+    is larger than *max_bytes* is always yielded alone (one-row floor), so the
+    generator never loops forever on an oversized row.
+
+    An empty *snapshot* yields nothing.
+    """
+    chunk: dict[Any, Any] = {}
+    cur_rows = 0
+    cur_bytes = 0
+    for key, value in snapshot.items():
+        size = _serialized_row_size(value)
+        if chunk and (cur_rows + 1 > max_rows or cur_bytes + size > max_bytes):
+            yield chunk
+            chunk = {}
+            cur_rows = 0
+            cur_bytes = 0
+        chunk[key] = value
+        cur_rows += 1
+        cur_bytes += size
+    if chunk:
+        yield chunk
+
+
+def _chunk_list(
+    snapshot: list[Any],
+    max_rows: int,
+    max_bytes: int,
+) -> Generator[list[Any], None, None]:
+    """Yield sub-lists of *snapshot* bounded by *max_rows* and *max_bytes*.
+
+    Identical dual-bound logic to :func:`_chunk_dict` but operates on an
+    ordered list rather than a mapping.  A single oversized element is always
+    yielded alone (one-row floor).
+
+    An empty *snapshot* yields nothing.
+    """
+    chunk: list[Any] = []
+    cur_rows = 0
+    cur_bytes = 0
+    for item in snapshot:
+        size = _serialized_row_size(item)
+        if chunk and (cur_rows + 1 > max_rows or cur_bytes + size > max_bytes):
+            yield chunk
+            chunk = []
+            cur_rows = 0
+            cur_bytes = 0
+        chunk.append(item)
+        cur_rows += 1
+        cur_bytes += size
+    if chunk:
+        yield chunk
 
 
 async def _write_batch(
