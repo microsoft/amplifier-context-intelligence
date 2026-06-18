@@ -314,7 +314,7 @@ class SessionHandler:
             _current_type(labels), "end", bool(parent_id)
         )
         if "IncompleteSession" in transition.add:
-            logger.warning(
+            logger.debug(
                 "session %s reached end with no start/fork event; "
                 "marked IncompleteSession (recovered)",
                 session_id,

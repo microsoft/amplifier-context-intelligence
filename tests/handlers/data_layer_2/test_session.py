@@ -998,6 +998,37 @@ class TestSessionLabelStateMachine:
         )
         assert node["ended_at"] == "2026-01-01T01:00:00Z"
 
+    async def test_end_bare_no_parent_logs_incomplete_at_debug_not_warning(
+        self, services: HookStateService, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """IncompleteSession recovery log line must be emitted at DEBUG, not WARNING.
+
+        The IncompleteSession graph label remains the durable health signal; the log
+        line is redundant noise that fires once per delegate sub-agent session.
+        """
+        handler = SessionHandler(services)
+        await services.ensure_session_node("s1", {})
+        with caplog.at_level(
+            logging.DEBUG,
+            logger="context_intelligence_server.handlers.data_layer_2.session",
+        ):
+            await handler(
+                "session:end",
+                {"session_id": "s1", "timestamp": "2026-01-01T01:00:00Z"},
+            )
+        # Sanity: the recovery branch actually ran.
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        assert "IncompleteSession" in node["labels"]
+        # The recovery log line must exist and must be DEBUG-level.
+        recovery_records = [
+            r
+            for r in caplog.records
+            if "IncompleteSession (recovered)" in r.getMessage()
+        ]
+        assert recovery_records, "expected an IncompleteSession recovery log record"
+        assert all(r.levelno == logging.DEBUG for r in recovery_records)
+
     async def test_end_bare_with_parent_marks_incomplete_session(
         self, services: HookStateService
     ) -> None:
@@ -2435,24 +2466,29 @@ class TestIncompleteSessionMarker:
             "IncompleteSession must NOT be added to a properly-classified RootSession"
         )
 
-    async def test_incomplete_session_emits_warning_log(
+    async def test_incomplete_session_emits_debug_log(
         self, services: HookStateService, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """session:end on a bare session must emit a WARNING health-signal log."""
+        """session:end on a bare session emits the IncompleteSession recovery log at DEBUG.
+
+        The durable health signal is the IncompleteSession graph label; the log line
+        is redundant noise (fires once per delegate sub-agent session), so it lives at
+        DEBUG rather than WARNING.
+        """
         handler = SessionHandler(services)
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.DEBUG):
             await handler(
                 "session:end",
                 {"session_id": "bare-warn", "timestamp": "2026-01-01T01:00:00Z"},
             )
         assert any(
-            r.levelno == logging.WARNING
+            r.levelno == logging.DEBUG
             and "bare-warn" in r.message
             and "IncompleteSession" in r.message
             for r in caplog.records
         ), (
-            "session:end on bare session must emit WARNING containing session_id "
-            "and 'IncompleteSession' as a health signal for upstream event loss"
+            "session:end on bare session must emit a DEBUG log containing session_id "
+            "and 'IncompleteSession'"
         )
 
     async def test_current_type_returns_none_for_incomplete_session_node(

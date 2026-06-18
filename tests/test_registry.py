@@ -1,14 +1,16 @@
 """Tests for SessionRegistry and SessionWorker."""
 
 import asyncio
+import contextlib
 import dataclasses
 import json
+import logging
 import time
 from collections import deque
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -361,6 +363,166 @@ class TestWorkerActivityTracking:
                 pass
 
         assert worker.events_processed == 3
+
+
+class TestBatchCommittedDebugLog:
+    """drain-path commit emits ONE DEBUG 'batch_committed' trace per commit."""
+
+    @pytest.mark.asyncio
+    async def test_batch_committed_logs_debug_with_offset(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        reg = SessionRegistry()
+        qm = reg.queue_manager
+        sid = "sess-commit"
+        worker = SessionWorker(
+            session_id=sid,
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            await qm.append(sid, _line("tool_call", "/ws", {"session_id": sid}))
+            with caplog.at_level(logging.DEBUG, logger="context_intelligence_server"):
+                task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+                for _ in range(50):
+                    await asyncio.sleep(0.02)
+                    if (await qm.read_batch(sid, 10)).lines == []:
+                        break
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        records = [
+            r
+            for r in caplog.records
+            if "batch_committed" in r.getMessage()
+            and getattr(r, "session_id", None) == sid
+        ]
+        assert records, "expected a DEBUG batch_committed record with session_id"
+
+
+class TestDrainBatchFailedThrottle:
+    """drain_batch_failed logging is throttled off the local attempts counter:
+    first failure WARNING (one traceback), middle attempts DEBUG, and a single
+    budget-exhausted ERROR (no traceback storm)."""
+
+    @pytest.mark.asyncio
+    async def test_throttled_warning_then_debug_then_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        reg = SessionRegistry()
+        qm = reg.queue_manager
+        sid = "sess-fail"
+        worker = SessionWorker(
+            session_id=sid,
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+        # Every flush fails -> the drain barrier raises -> drain_batch_failed path.
+        worker.services.graph.flush = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("flush boom")
+        )
+        reg._register_for_test(worker)
+
+        max_attempts = reg._max_delivery_attempts
+        assert max_attempts >= 2
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            await qm.append(sid, _line("tool_call", "/ws", {"session_id": sid}))
+            with caplog.at_level(logging.DEBUG, logger="context_intelligence_server"):
+                # Small flush_timeout drives poll_interval so the 5 retries run fast.
+                task = asyncio.create_task(
+                    reg.drain_worker(worker, flush_timeout=0.05)
+                )
+                for _ in range(200):
+                    await asyncio.sleep(0.02)
+                    if any(
+                        r.levelno == logging.ERROR
+                        and "drain_batch_exhausted" in r.getMessage()
+                        for r in caplog.records
+                    ):
+                        break
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "drain_batch_failed" in r.getMessage()
+        ]
+        errors = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.ERROR
+            and "drain_batch_exhausted" in r.getMessage()
+        ]
+        debugs = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.DEBUG
+            and "drain_batch_failed" in r.getMessage()
+        ]
+        with_traceback = [
+            r
+            for r in caplog.records
+            if "drain_batch" in r.getMessage() and r.exc_info is not None
+        ]
+
+        assert len(warnings) == 1
+        assert len(errors) == 1
+        assert len(debugs) == max_attempts - 2
+        # Only the first-failure WARNING carries a traceback (NOT per-attempt).
+        assert len(with_traceback) == 1
+
+
+class TestDeadLetterWarning:
+    """The dead-letter path emits ONE WARNING per dead-lettered line (rare,
+    accounted-for data loss that must be visible in prod)."""
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_logs_warning_with_session_id(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        reg = SessionRegistry()
+        sid = "sess-dead"
+        worker = SessionWorker(
+            session_id=sid,
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+        reg._register_for_test(worker)
+        reg.queue_manager.dead_letter = AsyncMock()  # type: ignore[method-assign]
+        reg.queue_manager.commit = AsyncMock()  # type: ignore[method-assign]
+
+        # A malformed line makes _parse_line raise inside _handle_exhausted_batch,
+        # triggering the dead-letter path.
+        poison = MagicMock()
+        poison.lines = [b"{ this is not valid json"]
+        poison.start_offset = 0
+
+        with caplog.at_level(logging.WARNING, logger="context_intelligence_server"):
+            await reg._handle_exhausted_batch(worker, poison, handlers=MagicMock())
+
+        reg.queue_manager.dead_letter.assert_awaited()
+        records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "dead_letter" in r.getMessage()
+            and getattr(r, "session_id", None) == sid
+        ]
+        assert records, "expected a WARNING dead_letter record with session_id"
 
 
 class TestRingBufferEmission:
@@ -1645,3 +1807,69 @@ class TestOrphanedSessions:
         registry._register_for_test(worker)
 
         assert registry.orphaned_sessions() == []
+
+
+class TestDrainerSpawnedLog:
+    """Observability: get_or_create must emit an INFO milestone when it spawns
+    a new drainer for a freshly-created worker."""
+
+    @pytest.mark.asyncio
+    async def test_drainer_spawned_logs_info_with_session_id(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        reg = SessionRegistry()
+        sid = "sess-spawn"
+
+        with caplog.at_level(logging.INFO, logger="context_intelligence_server"):
+            worker = reg.get_or_create(sid, "/ws")
+
+        # Clean up the real drain task started by get_or_create.
+        if worker.task is not None:
+            worker.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker.task
+
+        assert any(
+            r.levelno == logging.INFO
+            and getattr(r, "session_id", None) == sid
+            and "spawn" in r.getMessage().lower()
+            for r in caplog.records
+        )
+
+
+class TestSessionFinalizedLog:
+    """Task 5: _finalize_session must emit an INFO milestone so a finalized
+    session is distinguishable from a stalled one."""
+
+    @pytest.mark.asyncio
+    async def test_session_finalized_logs_info_with_session_id(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        reg = SessionRegistry()
+        sid = "sess-final"
+        worker = SessionWorker(
+            session_id=sid,
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+        # Isolate from the real queue: no tail to drain, no real disk I/O.
+        reg.queue_manager.read_batch = AsyncMock(  # type: ignore[method-assign]
+            return_value=MagicMock(lines=[])
+        )
+        reg.queue_manager.commit = AsyncMock()  # type: ignore[method-assign]
+        reg.queue_manager.delete_drained = AsyncMock()  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.INFO, logger="context_intelligence_server"):
+            await reg._finalize_session(worker, handlers=MagicMock())
+
+        assert any(
+            r.levelno == logging.INFO
+            and getattr(r, "session_id", None) == sid
+            and "finaliz" in r.getMessage().lower()
+            for r in caplog.records
+        )
