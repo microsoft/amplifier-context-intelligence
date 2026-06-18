@@ -235,6 +235,11 @@ class SessionRegistry:
         """
         async with self.write_semaphore:
             await worker.services.graph.flush()
+            # Phase 2 (#278): stamp liveness at the SINGLE flush boundary all
+            # three success paths funnel through. Marks completion of the flush
+            # barrier (advances even on an empty-buffer flush = liveness proof
+            # that the drainer reached and finished the write barrier).
+            worker.last_successful_flush = time.time()
 
     async def drain_worker(
         self, worker: SessionWorker, flush_timeout: float = 30.0

@@ -1558,3 +1558,36 @@ class TestLastSuccessfulFlushField:
         assert before <= worker.last_successful_flush <= after
         # Must be close to started_at (both use default_factory=time.time).
         assert abs(worker.last_successful_flush - worker.started_at) < 0.1
+
+
+# ---------------------------------------------------------------------------
+# Task 2 (Phase 2, #278): _flush_barrier stamps last_successful_flush
+# ---------------------------------------------------------------------------
+
+
+class TestFlushBarrierStampsLiveness:
+    """_flush_barrier stamps worker.last_successful_flush after a successful flush."""
+
+    async def test_flush_barrier_advances_last_successful_flush(self) -> None:
+        """_flush_barrier must stamp worker.last_successful_flush immediately
+        after the awaited flush succeeds.
+
+        Fails before the fix because last_successful_flush stays at the forced
+        0.0 value; passes after because the stamp updates it to >= before.
+        """
+        registry = SessionRegistry()
+        worker = SessionWorker(
+            session_id="test-barrier-liveness",
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+        # Replace the graph service with an AsyncMock so flush() succeeds instantly.
+        worker.services.graph = AsyncMock()  # type: ignore[assignment]
+        # Force to a sentinel value so we can detect any stamp.
+        worker.last_successful_flush = 0.0
+
+        before = time.time()
+        await registry._flush_barrier(worker)
+
+        worker.services.graph.flush.assert_awaited_once()
+        assert worker.last_successful_flush >= before
