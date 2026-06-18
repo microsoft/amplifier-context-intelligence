@@ -108,6 +108,10 @@ def build_status_response(
     # Sort by last_event_time descending (most recent first).
     visible_workers.sort(key=lambda w: w.last_event_time, reverse=True)
 
+    # Compute orphan set ONCE — reused for both the per-session flag and the
+    # aggregate count (single source of truth: no inline task.done() calls).
+    orphaned_ids = {w.session_id for w in registry.orphaned_sessions()}
+
     sessions = [
         {
             "session_id": worker.session_id,
@@ -115,6 +119,8 @@ def build_status_response(
             "last_event": worker.last_event,
             "last_event_time": worker.last_event_time,
             "events_processed": worker.events_processed,
+            "orphaned": worker.session_id in orphaned_ids,
+            "last_successful_flush": worker.last_successful_flush,
         }
         for worker in visible_workers
     ]
@@ -130,4 +136,5 @@ def build_status_response(
         ],
         "error_count_last_hour": error_count_last_hour(ring_buffer),
         "server_version": SERVER_VERSION,
+        "orphaned_sessions": len(orphaned_ids),
     }

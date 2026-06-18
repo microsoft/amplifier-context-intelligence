@@ -1,5 +1,6 @@
 """Tests for EventRingBuffer and build_status_response in dashboard.py."""
 
+import asyncio
 import time
 from unittest.mock import MagicMock, patch
 
@@ -406,3 +407,87 @@ class TestBuildStatusResponseServerVersion:
 
         assert isinstance(SERVER_VERSION, str)
         assert len(SERVER_VERSION) > 0
+
+
+# ---------------------------------------------------------------------------
+# TestBuildStatusResponseOrphanVisibility
+# ---------------------------------------------------------------------------
+
+
+class TestBuildStatusResponseOrphanVisibility:
+    def setup_method(self) -> None:
+        """Clear the module-level ring_buffer before each test."""
+        ring_buffer._buffer.clear()
+
+    def _worker(self, sid: str) -> SessionWorker:
+        """Create a minimal SessionWorker with the given session_id."""
+        return SessionWorker(
+            session_id=sid,
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+
+    def test_done_task_worker_is_orphaned(self) -> None:
+        """Worker with a done asyncio.Task is flagged orphaned=True; top-level count is 1."""
+        registry = SessionRegistry()
+        worker = self._worker("sess-orphan")
+        mock_task = MagicMock(spec=asyncio.Task)
+        mock_task.done.return_value = True
+        worker.task = mock_task
+        registry._workers["sess-orphan"] = worker
+
+        mock_settings = MagicMock()
+        mock_settings.dashboard_inactive_timeout = 9_999_999_999.0
+
+        with patch(
+            "context_intelligence_server.dashboard.get_settings",
+            return_value=mock_settings,
+        ):
+            response = build_status_response(registry, time.time())
+
+        assert len(response["sessions"]) == 1
+        assert response["sessions"][0]["orphaned"] is True
+        assert response["orphaned_sessions"] == 1
+
+    def test_running_task_worker_is_not_orphaned(self) -> None:
+        """Worker with a running asyncio.Task is flagged orphaned=False; top-level count is 0."""
+        registry = SessionRegistry()
+        worker = self._worker("sess-active")
+        mock_task = MagicMock(spec=asyncio.Task)
+        mock_task.done.return_value = False
+        worker.task = mock_task
+        registry._workers["sess-active"] = worker
+
+        mock_settings = MagicMock()
+        mock_settings.dashboard_inactive_timeout = 9_999_999_999.0
+
+        with patch(
+            "context_intelligence_server.dashboard.get_settings",
+            return_value=mock_settings,
+        ):
+            response = build_status_response(registry, time.time())
+
+        assert len(response["sessions"]) == 1
+        assert response["sessions"][0]["orphaned"] is False
+        assert response["orphaned_sessions"] == 0
+
+    def test_last_successful_flush_present_in_session(self) -> None:
+        """Per-session dict includes last_successful_flush from the worker."""
+        registry = SessionRegistry()
+        worker = self._worker("sess-flush")
+        expected_flush = time.time() - 5.0
+        worker.last_successful_flush = expected_flush
+        registry._workers["sess-flush"] = worker
+
+        mock_settings = MagicMock()
+        mock_settings.dashboard_inactive_timeout = 9_999_999_999.0
+
+        with patch(
+            "context_intelligence_server.dashboard.get_settings",
+            return_value=mock_settings,
+        ):
+            response = build_status_response(registry, time.time())
+
+        sess = response["sessions"][0]
+        assert "last_successful_flush" in sess
+        assert sess["last_successful_flush"] == expected_flush
