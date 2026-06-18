@@ -365,6 +365,48 @@ class TestWorkerActivityTracking:
         assert worker.events_processed == 3
 
 
+class TestBatchCommittedDebugLog:
+    """drain-path commit emits ONE DEBUG 'batch_committed' trace per commit."""
+
+    @pytest.mark.asyncio
+    async def test_batch_committed_logs_debug_with_offset(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        reg = SessionRegistry()
+        qm = reg.queue_manager
+        sid = "sess-commit"
+        worker = SessionWorker(
+            session_id=sid,
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            await qm.append(sid, _line("tool_call", "/ws", {"session_id": sid}))
+            with caplog.at_level(logging.DEBUG, logger="context_intelligence_server"):
+                task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+                for _ in range(50):
+                    await asyncio.sleep(0.02)
+                    if (await qm.read_batch(sid, 10)).lines == []:
+                        break
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        records = [
+            r
+            for r in caplog.records
+            if "batch_committed" in r.getMessage()
+            and getattr(r, "session_id", None) == sid
+        ]
+        assert records, "expected a DEBUG batch_committed record with session_id"
+
+
 class TestRingBufferEmission:
     """drain_worker emits an EventRecord to ring_buffer after each processed event."""
 

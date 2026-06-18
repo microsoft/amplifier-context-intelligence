@@ -321,6 +321,12 @@ class SessionRegistry:
                 attempts = 0
                 await qm.commit(session_id, batch.end_offset)
                 self.record_written(len(batch.lines))
+                logger.debug(
+                    "batch_committed events=%d offset=%d",
+                    len(batch.lines),
+                    batch.end_offset,
+                    extra={"session_id": session_id},
+                )
 
                 if saw_terminal:
                     await self._finalize_session(worker, handlers)
@@ -407,6 +413,12 @@ class SessionRegistry:
                 return  # NOT finalized: keep worker alive, leave tail uncommitted
             await qm.commit(session_id, tail.end_offset)
             self.record_written(len(tail.lines))
+            logger.debug(
+                "batch_committed events=%d offset=%d",
+                len(tail.lines),
+                tail.end_offset,
+                extra={"session_id": session_id},
+            )
 
         ended_at = time.time()
         self._completed.append(
