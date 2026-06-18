@@ -114,7 +114,7 @@ async def _low_retry_store(
 # ---------------------------------------------------------------------------
 
 
-async def test_real_drain_orphan_surfaces_on_status(
+async def test_finalization_orphan_surfaces_on_status(
     neo4j_container_capped: dict[str, Any],
     caplog: pytest.LogCaptureFixture,
     tmp_path: Path,

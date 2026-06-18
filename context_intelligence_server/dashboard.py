@@ -91,7 +91,20 @@ def build_status_response(
 
     Returns:
         A dict with keys: status, uptime_seconds, active_sessions, sessions,
-        recent_events, completed_sessions, error_count_last_hour, server_version.
+        recent_events, completed_sessions, error_count_last_hour, server_version,
+        orphaned_sessions.
+
+        Each entry in ``sessions`` includes the keys: session_id, workspace,
+        last_event, last_event_time, events_processed, orphaned,
+        last_successful_flush.
+
+        Note: ``orphaned_sessions`` is the count of ALL registered workers whose
+        drain task has completed (``task.done()``).  A worker filtered *out* of
+        the visible ``sessions`` list by ``dashboard_inactive_timeout`` still
+        contributes to this count but will not appear with ``orphaned: True`` in
+        any per-session dict.  For a fresh OOM orphan this asymmetry is
+        irrelevant (OOM orphans are recent by definition); it can surface for
+        long-running orphans whose ``last_event_time`` ages past the timeout.
     """
     settings = get_settings()
     now = time.time()
