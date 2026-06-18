@@ -407,6 +407,85 @@ class TestBatchCommittedDebugLog:
         assert records, "expected a DEBUG batch_committed record with session_id"
 
 
+class TestDrainBatchFailedThrottle:
+    """drain_batch_failed logging is throttled off the local attempts counter:
+    first failure WARNING (one traceback), middle attempts DEBUG, and a single
+    budget-exhausted ERROR (no traceback storm)."""
+
+    @pytest.mark.asyncio
+    async def test_throttled_warning_then_debug_then_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        reg = SessionRegistry()
+        qm = reg.queue_manager
+        sid = "sess-fail"
+        worker = SessionWorker(
+            session_id=sid,
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+        # Every flush fails -> the drain barrier raises -> drain_batch_failed path.
+        worker.services.graph.flush = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("flush boom")
+        )
+        reg._register_for_test(worker)
+
+        max_attempts = reg._max_delivery_attempts
+        assert max_attempts >= 2
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            await qm.append(sid, _line("tool_call", "/ws", {"session_id": sid}))
+            with caplog.at_level(logging.DEBUG, logger="context_intelligence_server"):
+                # Small flush_timeout drives poll_interval so the 5 retries run fast.
+                task = asyncio.create_task(
+                    reg.drain_worker(worker, flush_timeout=0.05)
+                )
+                for _ in range(200):
+                    await asyncio.sleep(0.02)
+                    if any(
+                        r.levelno == logging.ERROR
+                        and "drain_batch_exhausted" in r.getMessage()
+                        for r in caplog.records
+                    ):
+                        break
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "drain_batch_failed" in r.getMessage()
+        ]
+        errors = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.ERROR
+            and "drain_batch_exhausted" in r.getMessage()
+        ]
+        debugs = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.DEBUG
+            and "drain_batch_failed" in r.getMessage()
+        ]
+        with_traceback = [
+            r
+            for r in caplog.records
+            if "drain_batch" in r.getMessage() and r.exc_info is not None
+        ]
+
+        assert len(warnings) == 1
+        assert len(errors) == 1
+        assert len(debugs) == max_attempts - 2
+        # Only the first-failure WARNING carries a traceback (NOT per-attempt).
+        assert len(with_traceback) == 1
+
+
 class TestDeadLetterWarning:
     """The dead-letter path emits ONE WARNING per dead-lettered line (rare,
     accounted-for data loss that must be visible in prod)."""

@@ -299,11 +299,33 @@ class SessionRegistry:
                 except Exception:
                     attempts += 1
                     self.record_write_retry()
-                    logger.exception(
-                        "drain_batch_failed session=%s attempt=%d",
-                        session_id,
-                        attempts,
-                    )
+                    # Throttle the failure log off the local attempts counter
+                    # (resets to 0 on commit and after exhaustion): the first
+                    # failure gets ONE traceback (WARNING), middle attempts are
+                    # DEBUG, and budget exhaustion gets a single ERROR (no
+                    # per-attempt traceback storm).
+                    if attempts == 1:
+                        logger.warning(
+                            "drain_batch_failed session=%s attempt=%d",
+                            session_id,
+                            attempts,
+                            exc_info=True,
+                            extra={"session_id": session_id},
+                        )
+                    elif attempts >= self._max_delivery_attempts:
+                        logger.error(
+                            "drain_batch_exhausted session=%s attempts=%d",
+                            session_id,
+                            attempts,
+                            extra={"session_id": session_id},
+                        )
+                    else:
+                        logger.debug(
+                            "drain_batch_failed session=%s attempt=%d",
+                            session_id,
+                            attempts,
+                            extra={"session_id": session_id},
+                        )
                     if attempts >= self._max_delivery_attempts:
                         # Budget spent -> isolate the batch ONE LINE AT A TIME,
                         # dead-letter the offending line(s), advance past all.
