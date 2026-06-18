@@ -1,8 +1,10 @@
 """Tests for SessionRegistry and SessionWorker."""
 
 import asyncio
+import contextlib
 import dataclasses
 import json
+import logging
 import time
 from collections import deque
 from collections.abc import AsyncGenerator
@@ -1645,3 +1647,31 @@ class TestOrphanedSessions:
         registry._register_for_test(worker)
 
         assert registry.orphaned_sessions() == []
+
+
+class TestDrainerSpawnedLog:
+    """Observability: get_or_create must emit an INFO milestone when it spawns
+    a new drainer for a freshly-created worker."""
+
+    @pytest.mark.asyncio
+    async def test_drainer_spawned_logs_info_with_session_id(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        reg = SessionRegistry()
+        sid = "sess-spawn"
+
+        with caplog.at_level(logging.INFO, logger="context_intelligence_server"):
+            worker = reg.get_or_create(sid, "/ws")
+
+        # Clean up the real drain task started by get_or_create.
+        if worker.task is not None:
+            worker.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker.task
+
+        assert any(
+            r.levelno == logging.INFO
+            and getattr(r, "session_id", None) == sid
+            and "spawn" in r.getMessage().lower()
+            for r in caplog.records
+        )

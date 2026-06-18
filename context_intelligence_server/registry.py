@@ -463,6 +463,11 @@ class SessionRegistry:
                 ),
             )
             self.start_drain(self._workers[session_id])
+            logger.info(
+                "drainer_spawned session=%s",
+                session_id,
+                extra={"session_id": session_id},
+            )
         return self._workers[session_id]
 
     def remove(self, session_id: str) -> None:
