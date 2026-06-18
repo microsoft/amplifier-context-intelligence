@@ -418,3 +418,55 @@ class TestSetupLogging:
                     f"JSON log should have 'message' key, got: {obj}"
                 )
                 assert "logger" in obj, f"JSON log should have 'logger' key, got: {obj}"
+
+    def test_access_logs_demoted_to_debug_and_neo4j_notifications_suppressed(
+        self,
+    ) -> None:
+        """At INFO: routine 2xx access logs are demoted to DEBUG (hidden), and the
+        neo4j driver's INFO notifications are suppressed below WARNING — so the
+        ingest-pipeline signals are not buried. uvicorn.error INFO and genuine
+        neo4j WARNING still surface.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = str(Path(tmpdir) / "server.jsonl")
+            mock_settings = self._make_mock_settings(log_path, log_level="INFO")
+            with patch(
+                "context_intelligence_server.logging_config.get_settings",
+                return_value=mock_settings,
+            ):
+                from context_intelligence_server.logging_config import setup_logging
+
+                setup_logging()
+
+            root_logger = logging.getLogger()
+            stdout_handler = next(
+                h
+                for h in root_logger.handlers
+                if isinstance(h, logging.StreamHandler)
+                and not isinstance(h, logging.handlers.RotatingFileHandler)
+                and h.stream is sys.stdout
+            )
+            capture = io.StringIO()
+            stdout_handler.setStream(capture)
+
+            logging.getLogger("uvicorn.access").info("GET /status HTTP/1.1 200")
+            logging.getLogger("uvicorn.error").info("application startup complete")
+            logging.getLogger("neo4j.notifications").info("index already exists")
+            logging.getLogger("neo4j.notifications").warning("genuine neo4j warning")
+            for handler in root_logger.handlers:
+                handler.flush()
+
+            output = capture.getvalue()
+            assert "GET /status" not in output, (
+                "routine uvicorn.access 2xx logging must be demoted to DEBUG and "
+                f"hidden at INFO, got: {output!r}"
+            )
+            assert "index already exists" not in output, (
+                "neo4j INFO notifications must be suppressed below WARNING"
+            )
+            assert "application startup complete" in output, (
+                "uvicorn.error INFO must still be emitted at INFO"
+            )
+            assert "genuine neo4j warning" in output, (
+                "genuine neo4j WARNING must still be emitted"
+            )

@@ -189,10 +189,38 @@ const logContainer = document.getElementById('log-container');
 const logFilter = document.getElementById('log-filter');
 const logToggle = document.getElementById('log-toggle');
 const logErrorBadge = document.getElementById('log-error-badge');
+const loggerFilters = document.getElementById('log-logger-filters');
 let isPaused = false;
 let pauseBuffer = [];
 let autoScroll = true;
 let logErrorCount = 0;
+const seenLoggers = new Set();
+const hiddenLoggers = new Set();
+
+function isLogVisible(text, logger) {
+  const ft = logFilter?.value.toLowerCase() || '';
+  if (ft && !text.toLowerCase().includes(ft)) return false;
+  if (logger && hiddenLoggers.has(logger)) return false;
+  return true;
+}
+
+function ensureLoggerCheckbox(logger) {
+  if (!loggerFilters || !logger || seenLoggers.has(logger)) return;
+  seenLoggers.add(logger);
+  const label = document.createElement('label');
+  label.className = 'log-logger-toggle';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = !hiddenLoggers.has(logger);
+  cb.addEventListener('change', () => {
+    if (cb.checked) hiddenLoggers.delete(logger);
+    else hiddenLoggers.add(logger);
+    filterLogs();
+  });
+  label.appendChild(cb);
+  label.appendChild(document.createTextNode(' ' + logger));
+  loggerFilters.appendChild(label);
+}
 
 logContainer?.addEventListener('scroll', () => {
   autoScroll = (logContainer.scrollHeight - logContainer.scrollTop - logContainer.clientHeight) < 8;
@@ -201,9 +229,11 @@ logContainer?.addEventListener('scroll', () => {
 function appendLogLine(text) {
   if (!logContainer) return;
   let level = 'INFO';
+  let logger = '';
   try {
     const p = JSON.parse(text);
     level = p.level || p.levelname || 'INFO';
+    logger = p.logger || '';
   } catch { /* raw text */ }
 
   if (level === 'ERROR') {
@@ -214,11 +244,13 @@ function appendLogLine(text) {
     }
   }
 
+  ensureLoggerCheckbox(logger);
+
   const div = document.createElement('div');
   div.className = `log-line log-${level}`;
+  if (logger) div.dataset.logger = logger;
   div.textContent = text;
-  const ft = logFilter?.value.toLowerCase();
-  if (ft && !text.toLowerCase().includes(ft)) div.style.display = 'none';
+  if (!isLogVisible(text, logger)) div.style.display = 'none';
   logContainer.appendChild(div);
 
   while (logContainer.children.length > 2000) logContainer.removeChild(logContainer.firstChild);
@@ -226,9 +258,8 @@ function appendLogLine(text) {
 }
 
 function filterLogs() {
-  const ft = logFilter?.value.toLowerCase() || '';
   for (const el of logContainer?.getElementsByClassName('log-line') || []) {
-    el.style.display = (!ft || el.textContent.toLowerCase().includes(ft)) ? '' : 'none';
+    el.style.display = isLogVisible(el.textContent, el.dataset.logger || '') ? '' : 'none';
   }
 }
 
