@@ -425,6 +425,12 @@ class SessionRegistry:
         # Panel finding #5: reclaim disk — a fully drained, finalized session no
         # longer needs its .log/.offset. Keep .dead.jsonl (retained dead-letter).
         await qm.delete_drained(session_id)
+        logger.info(
+            "session_finalized session=%s events=%d",
+            session_id,
+            worker.events_processed,
+            extra={"session_id": session_id},
+        )
 
     async def _safe_close(self, worker: SessionWorker) -> None:
         try:

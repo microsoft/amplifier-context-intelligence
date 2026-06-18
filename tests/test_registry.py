@@ -1675,3 +1675,41 @@ class TestDrainerSpawnedLog:
             and "spawn" in r.getMessage().lower()
             for r in caplog.records
         )
+
+
+class TestSessionFinalizedLog:
+    """Task 5: _finalize_session must emit an INFO milestone so a finalized
+    session is distinguishable from a stalled one."""
+
+    @pytest.mark.asyncio
+    async def test_session_finalized_logs_info_with_session_id(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        reg = SessionRegistry()
+        sid = "sess-final"
+        worker = SessionWorker(
+            session_id=sid,
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+        # Isolate from the real queue: no tail to drain, no real disk I/O.
+        reg.queue_manager.read_batch = AsyncMock(  # type: ignore[method-assign]
+            return_value=MagicMock(lines=[])
+        )
+        reg.queue_manager.commit = AsyncMock()  # type: ignore[method-assign]
+        reg.queue_manager.delete_drained = AsyncMock()  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.INFO, logger="context_intelligence_server"):
+            await reg._finalize_session(worker, handlers=MagicMock())
+
+        assert any(
+            r.levelno == logging.INFO
+            and getattr(r, "session_id", None) == sid
+            and "finaliz" in r.getMessage().lower()
+            for r in caplog.records
+        )
