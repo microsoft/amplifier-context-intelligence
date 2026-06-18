@@ -48,3 +48,15 @@ class TestGetVersionNoAuth:
         """GET /version returns 200 even when api_key is set and no Authorization is sent."""
         response = await auth_client.get("/version")
         assert response.status_code == 200
+
+
+class TestVersionIs4_0_1:
+    """pyproject.toml is the single source of truth and must declare version 4.0.1."""
+
+    def test_pyproject_version_is_4_0_1(self) -> None:
+        import tomllib
+        from pathlib import Path
+
+        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        assert data["project"]["version"] == "4.0.1"

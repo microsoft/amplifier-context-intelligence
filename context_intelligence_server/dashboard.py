@@ -91,7 +91,20 @@ def build_status_response(
 
     Returns:
         A dict with keys: status, uptime_seconds, active_sessions, sessions,
-        recent_events, completed_sessions, error_count_last_hour, server_version.
+        recent_events, completed_sessions, error_count_last_hour, server_version,
+        orphaned_sessions.
+
+        Each entry in ``sessions`` includes the keys: session_id, workspace,
+        last_event, last_event_time, events_processed, orphaned,
+        last_successful_flush.
+
+        Note: ``orphaned_sessions`` is the count of ALL registered workers whose
+        drain task has completed (``task.done()``).  A worker filtered *out* of
+        the visible ``sessions`` list by ``dashboard_inactive_timeout`` still
+        contributes to this count but will not appear with ``orphaned: True`` in
+        any per-session dict.  For a fresh OOM orphan this asymmetry is
+        irrelevant (OOM orphans are recent by definition); it can surface for
+        long-running orphans whose ``last_event_time`` ages past the timeout.
     """
     settings = get_settings()
     now = time.time()
@@ -108,6 +121,10 @@ def build_status_response(
     # Sort by last_event_time descending (most recent first).
     visible_workers.sort(key=lambda w: w.last_event_time, reverse=True)
 
+    # Compute orphan set ONCE — reused for both the per-session flag and the
+    # aggregate count (single source of truth: no inline task.done() calls).
+    orphaned_ids = {w.session_id for w in registry.orphaned_sessions()}
+
     sessions = [
         {
             "session_id": worker.session_id,
@@ -115,6 +132,8 @@ def build_status_response(
             "last_event": worker.last_event,
             "last_event_time": worker.last_event_time,
             "events_processed": worker.events_processed,
+            "orphaned": worker.session_id in orphaned_ids,
+            "last_successful_flush": worker.last_successful_flush,
         }
         for worker in visible_workers
     ]
@@ -130,4 +149,5 @@ def build_status_response(
         ],
         "error_count_last_hour": error_count_last_hour(ring_buffer),
         "server_version": SERVER_VERSION,
+        "orphaned_sessions": len(orphaned_ids),
     }

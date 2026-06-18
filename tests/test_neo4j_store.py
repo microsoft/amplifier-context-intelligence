@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1592,3 +1593,407 @@ async def test_discard_buffer_clears_all_buffers_without_flushing():
     assert store._edge_buffer == {}
     assert store._label_patches == []
     store._driver.session.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# flush_chunk_rows / flush_chunk_bytes constructor params (Task 3)
+# ---------------------------------------------------------------------------
+
+
+def _make_store_chunked(rows: int, byts: int) -> Neo4jGraphStore:
+    """Create a Neo4jGraphStore with explicit chunk-size knobs."""
+    with patch(
+        "context_intelligence_server.neo4j_store.AsyncGraphDatabase"
+    ) as mock_adb:
+        mock_driver = AsyncMock()
+        mock_adb.driver.return_value = mock_driver
+        store = Neo4jGraphStore(
+            uri="bolt://localhost:7687",
+            auth=("neo4j", "password"),
+            workspace="test",
+            flush_chunk_rows=rows,
+            flush_chunk_bytes=byts,
+        )
+    return store
+
+
+def test_init_stores_chunk_bounds():
+    """flush_chunk_rows=50 and flush_chunk_bytes=1024 are stored unchanged."""
+    store = _make_store_chunked(50, 1024)
+    assert store._flush_chunk_rows == 50
+    assert store._flush_chunk_bytes == 1024
+
+
+def test_init_clamps_nonpositive_bounds_to_one():
+    """Zero and negative values are clamped to 1 so chunks are never empty."""
+    store_zero = _make_store_chunked(0, 0)
+    assert store_zero._flush_chunk_rows == 1
+    assert store_zero._flush_chunk_bytes == 1
+
+    store_neg = _make_store_chunked(-5, -100)
+    assert store_neg._flush_chunk_rows == 1
+    assert store_neg._flush_chunk_bytes == 1
+
+
+def test_init_defaults_when_params_omitted():
+    """When flush_chunk_rows/bytes are omitted the defaults are 100 / 4_194_304."""
+    store = _make_store()
+    assert store._flush_chunk_rows == 100
+    assert store._flush_chunk_bytes == 4_194_304
+
+
+# ---------------------------------------------------------------------------
+# _serialized_row_size tests
+# ---------------------------------------------------------------------------
+
+
+def test_serialized_row_size_uses_serialized_form_not_len():
+    """_serialized_row_size measures JSON bytes, not element count.
+
+    A len()-based estimator on a dict/list returns the key/element count (3 for
+    fat below), which is blind to fat nested payloads.  The serialized form of
+    fat is several thousand bytes.
+    """
+    from context_intelligence_server.neo4j_store import _serialized_row_size
+
+    fat = {
+        "messages": ["x" * 2000],
+        "context_snapshot": {"a": "y" * 2000},
+        "k": 1,
+    }
+    # len(fat) == 3; the serialized form is >> 3000 bytes
+    assert _serialized_row_size(fat) > 3000
+
+
+def test_serialized_row_size_handles_unjsonable_value():
+    """Non-JSON-serializable values fall back to str() length and never crash."""
+    from context_intelligence_server.neo4j_store import _serialized_row_size
+
+    result = _serialized_row_size({"ts": datetime(2026, 6, 18)})
+    assert result > 0
+
+
+# ---------------------------------------------------------------------------
+# _chunk_dict / _chunk_list tests
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_dict_row_bound():
+    """250 tiny rows at max_rows=100 → chunk sizes [100, 100, 50], no loss/dup."""
+    from context_intelligence_server.neo4j_store import _chunk_dict
+
+    snapshot = {str(i): {"v": i} for i in range(250)}
+    # Use enormous max_bytes so only the row bound trips
+    chunks = list(_chunk_dict(snapshot, max_rows=100, max_bytes=10_000_000))
+
+    assert [len(c) for c in chunks] == [100, 100, 50]
+    merged = {}
+    for c in chunks:
+        merged.update(c)
+    assert merged == snapshot
+
+
+def test_chunk_dict_byte_bound():
+    """6 rows of ~2 KB blob each at max_bytes=5000 → all chunks len<=2, at least 3 chunks."""
+    from context_intelligence_server.neo4j_store import _chunk_dict
+
+    # Each value is ~2 KB; two rows together are ~4 KB which is < 5000, but three would exceed
+    blob = "x" * 2000
+    snapshot = {str(i): {"blob": blob} for i in range(6)}
+    chunks = list(_chunk_dict(snapshot, max_rows=1000, max_bytes=5000))
+
+    assert all(len(c) <= 2 for c in chunks), f"Expected all chunks <=2 rows, got {[len(c) for c in chunks]}"
+    assert len(chunks) >= 3, f"Expected >=3 chunks, got {len(chunks)}"
+    # No loss
+    merged = {}
+    for c in chunks:
+        merged.update(c)
+    assert merged == snapshot
+
+
+def test_chunk_dict_one_row_floor():
+    """Oversized row is yielded alone (one-row floor); next row goes in next chunk."""
+    from context_intelligence_server.neo4j_store import _chunk_dict
+
+    snapshot = {
+        "big": "x" * 10000,
+        "small": {"v": 1},
+    }
+    chunks = list(_chunk_dict(snapshot, max_rows=1000, max_bytes=1000))
+
+    assert len(chunks) == 2, f"Expected 2 chunks, got {len(chunks)}: {[list(c.keys()) for c in chunks]}"
+    assert list(chunks[0].keys()) == ["big"], f"Expected chunk[0] to contain only 'big', got {list(chunks[0].keys())}"
+    assert list(chunks[1].keys()) == ["small"], f"Expected chunk[1] to contain only 'small', got {list(chunks[1].keys())}"
+
+
+def test_chunk_dict_empty_yields_nothing():
+    """An empty snapshot produces no chunks."""
+    from context_intelligence_server.neo4j_store import _chunk_dict
+
+    result = list(_chunk_dict({}, max_rows=100, max_bytes=4_194_304))
+    assert result == []
+
+
+def test_chunk_list_row_bound():
+    """150 patches at max_rows=100 → chunks of [100, 50], flattened equals input."""
+    from context_intelligence_server.neo4j_store import _chunk_list
+
+    patches = [{"node_id": str(i), "label": f"L{i}"} for i in range(150)]
+    # Use enormous max_bytes so only row bound trips
+    chunks = list(_chunk_list(patches, max_rows=100, max_bytes=10_000_000))
+
+    assert [len(c) for c in chunks] == [100, 50]
+    flattened = [item for c in chunks for item in c]
+    assert flattened == patches
+
+
+# ---------------------------------------------------------------------------
+# Coordinator wiring guard (Task 9)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_coordinator_every_execute_write_within_bounds() -> None:
+    """Every execute_write call passes a node chunk within both row and byte bounds.
+
+    Coordinator characterization guard: 35 nodes at rows=10 must produce 4
+    execute_write calls for the node phase, each carrying ≤10 nodes and a
+    total serialized size ≤10_000_000 bytes (or exactly 1 node for the
+    single-oversized-row floor).  Does NOT re-test chunk-size math — that is
+    Task 5's responsibility.  This test guards only that the coordinator wires
+    chunk payloads to execute_write correctly.
+    """
+    from context_intelligence_server.neo4j_store import _serialized_row_size
+
+    store = _make_store_chunked(rows=10, byts=10_000_000)
+    store._schema_initialized = True
+
+    # Populate 35 simple nodes — row bound of 10 produces 4 chunks: [10,10,10,5]
+    store._node_buffer = {f"n{i}": {"name": f"node-{i}"} for i in range(35)}
+
+    captured_payloads: list[tuple[dict, dict, list]] = []
+
+    async def _capture(fn, *args, **kwargs):
+        # fn=_write_batch; args = (nodes_chunk, edges_chunk, patches_chunk, workspace)
+        nodes: dict = args[0]
+        edges: dict = args[1]
+        patches: list = args[2]
+        captured_payloads.append((nodes, edges, patches))
+
+    fake_session = AsyncMock()
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    fake_session.execute_write = AsyncMock(side_effect=_capture)
+    store._driver.session = MagicMock(return_value=fake_session)
+
+    await store.flush()
+
+    assert captured_payloads, (
+        "Expected execute_write to be called at least once (35 nodes → 4 node chunks)"
+    )
+    for nodes, _edges, _patches in captured_payloads:
+        if not nodes:
+            continue  # skip edge/patch-only calls (empty nodes dict)
+        assert len(nodes) <= 10, (
+            f"Node chunk exceeded row bound: {len(nodes)} > 10"
+        )
+        total_bytes = sum(_serialized_row_size(v) for v in nodes.values())
+        assert total_bytes <= 10_000_000 or len(nodes) == 1, (
+            f"Node chunk exceeded byte bound: {total_bytes} bytes across "
+            f"{len(nodes)} nodes (expected ≤10_000_000 or single-row floor)"
+        )
+
+
+@pytest.mark.asyncio
+async def test_coordinator_empty_buffer_makes_zero_calls() -> None:
+    """flush() with empty buffers must not call execute_write at all.
+
+    Early-exit guard: the coordinator short-circuits before opening a driver
+    session when all three buffers (_node_buffer, _edge_buffer, _label_patches)
+    are empty, so execute_write must never be invoked.
+    """
+    store = _make_store_chunked(rows=100, byts=4_194_304)
+    store._schema_initialized = True
+
+    fake_session = AsyncMock()
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    fake_session.execute_write = AsyncMock()
+    store._driver.session = MagicMock(return_value=fake_session)
+
+    # Buffers are empty by default — flush should early-exit with no DB calls
+    await store.flush()
+
+    fake_session.execute_write.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Coordinator phase ordering guard (Task 10 — A.4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_coordinator_phase_ordering_nodes_patches_edges() -> None:
+    """All node chunks precede all patch chunks which precede all edge chunks.
+
+    Phase-ordering guard: rows=2 forces multiple chunks per phase (5 nodes →
+    3 chunks, 3 patches → 2 chunks, 2 edges → 1 chunk).  The side_effect on
+    execute_write records which phase each call belongs to; the assertion
+    verifies there is no interleaving between phases and that all three phases
+    are exercised.
+    """
+    store = _make_store_chunked(rows=2, byts=10_000_000)
+    store._schema_initialized = True
+
+    # Populate buffers to force multiple chunks per phase
+    store._node_buffer = {f"n{i}": {"name": f"node-{i}"} for i in range(5)}
+    store._label_patches = [
+        {"node_id": f"n{i}", "add": ["X"], "remove": []} for i in range(3)
+    ]
+    store._edge_buffer = {
+        ("n0", "n1"): {"type": "KNOWS"},
+        ("n2", "n3"): {"type": "LINKS"},
+    }
+
+    order: list[str] = []
+
+    async def _record_phase(fn, *args, **kwargs) -> None:
+        # fn=_write_batch; positional args = (nodes_chunk, edges_chunk, patches_chunk, ...)
+        nodes = args[0]
+        edges = args[1]
+        patches = args[2]
+        if nodes:
+            order.append("node")
+        elif patches:
+            order.append("patch")
+        elif edges:
+            order.append("edge")
+
+    fake_session = AsyncMock()
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    fake_session.execute_write = AsyncMock(side_effect=_record_phase)
+    store._driver.session = MagicMock(return_value=fake_session)
+
+    await store.flush()
+
+    # All three phases must be present
+    assert "node" in order, "Expected at least one node-phase execute_write call"
+    assert "patch" in order, "Expected at least one patch-phase execute_write call"
+    assert "edge" in order, "Expected at least one edge-phase execute_write call"
+
+    # No phase interleaving: order must equal its phase-sorted form
+    phase_key = {"node": 0, "patch": 1, "edge": 2}
+    assert order == sorted(order, key=lambda p: phase_key[p]), (
+        f"Phase interleaving detected — actual call order: {order}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Re-raise invariant — A.5 (Task 11)
+# ---------------------------------------------------------------------------
+
+
+def _seq_execute_write_failing_on(call_index: int) -> AsyncMock:
+    """Return an execute_write mock that succeeds until call_index, then raises.
+
+    Call indices 0..(call_index-1) complete normally (return None).
+    Call at call_index raises RuntimeError('chunk boom').
+    """
+    call_count: list[int] = [0]
+
+    async def _side_effect(fn, *args, **kwargs) -> None:  # noqa: ANN001
+        idx = call_count[0]
+        call_count[0] += 1
+        if idx == call_index:
+            raise RuntimeError("chunk boom")
+        # success path — return None without executing the write function
+
+    return AsyncMock(side_effect=_side_effect)
+
+
+def _wire_session(store: Neo4jGraphStore, execute_write_mock: AsyncMock) -> None:
+    """Wire a fake session boundary with the given execute_write mock onto store.
+
+    Every call to ``store._driver.session(...)`` returns the same fake context
+    manager whose ``__aenter__`` yields itself and whose ``execute_write`` is
+    the provided mock.  This lets a single call-indexed mock accumulate all
+    execute_write invocations across chunks.
+    """
+    fake_session = MagicMock()
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    fake_session.execute_write = execute_write_mock
+    store._driver.session = MagicMock(return_value=fake_session)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fail_call,case_id",
+    [
+        (0, "first_chunk_fails"),
+        (1, "later_chunk_same_phase_committed"),
+        ("edge", "edge_after_nodes_committed"),
+    ],
+)
+async def test_reraise_restores_full_snapshot_and_logs(
+    fail_call: int | str,
+    case_id: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Re-raise invariant: RuntimeError propagates, full snapshot restored, ERROR logged.
+
+    Hard constraint #4: the coordinator must re-raise on any chunk failure and
+    never return success after a partial flush.
+
+    3 cases with materially different durable-progress state:
+    - first_chunk_fails (fail_call=0): nothing committed to Neo4j
+    - later_chunk_same_phase_committed (fail_call=1): first node chunk committed,
+      second node chunk fails — partial within the node phase
+    - edge_after_nodes_committed (fail_call='edge'): all 3 node chunks committed,
+      first edge chunk fails — partial durable progress across phases
+
+    In all 3 cases the FULL snapshot (nodes + edges) must be restored to the
+    live buffers and an ERROR containing 'flush_chunk_failed' must be logged.
+    """
+    nodes = {
+        "n0": {"name": "node-0"},
+        "n1": {"name": "node-1"},
+        "n2": {"name": "node-2"},
+    }
+    edges: dict = {("n0", "n1"): {"type": "KNOWS"}}
+
+    # rows=1 => each row is its own chunk:
+    #   Phase 1 nodes:   3 nodes  → 3 execute_write calls at indices 0, 1, 2
+    #   Phase 2 patches: 0        → 0 calls
+    #   Phase 3 edges:   1 edge   → 1 execute_write call at index 3
+    store = _make_store_chunked(rows=1, byts=10_000_000)
+    store._schema_initialized = True
+    store._node_buffer = dict(nodes)
+    store._edge_buffer = dict(edges)
+
+    # Map 'edge' to the first edge call index (index 3 = after 3 node calls)
+    actual_call_index: int = 3 if fail_call == "edge" else int(fail_call)  # type: ignore[arg-type]
+
+    execute_write_mock = _seq_execute_write_failing_on(actual_call_index)
+    _wire_session(store, execute_write_mock)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError, match="chunk boom"):
+            await store.flush()
+
+    # Full snapshot must be restored — not just uncommitted remainder
+    assert store._node_buffer == nodes, (
+        f"[{case_id}] _node_buffer not fully restored. "
+        f"Expected {nodes}, got {store._node_buffer}"
+    )
+    assert store._edge_buffer == edges, (
+        f"[{case_id}] _edge_buffer not fully restored. "
+        f"Expected {edges}, got {store._edge_buffer}"
+    )
+
+    # An ERROR containing 'flush_chunk_failed' must be logged
+    assert any("flush_chunk_failed" in r.message for r in caplog.records), (
+        f"[{case_id}] Expected ERROR log containing 'flush_chunk_failed'. "
+        f"Records: {[r.getMessage() for r in caplog.records]}"
+    )

@@ -294,3 +294,23 @@ def test_yaml_sets_individual_fields(
 
     s = Settings()
     assert getattr(s, field) == expected
+
+
+def test_neo4j_flush_chunk_rows_default():
+    """neo4j_flush_chunk_rows should default to 100 (cardinality bound, #278)."""
+    from context_intelligence_server.config import Settings
+
+    s = Settings()
+    assert s.neo4j_flush_chunk_rows == 100, (
+        f"Expected neo4j_flush_chunk_rows == 100, got {s.neo4j_flush_chunk_rows}"
+    )
+
+
+def test_neo4j_flush_chunk_bytes_default():
+    """neo4j_flush_chunk_bytes should default to 4_194_304 (4 MiB payload bound, #278)."""
+    from context_intelligence_server.config import Settings
+
+    s = Settings()
+    assert s.neo4j_flush_chunk_bytes == 4_194_304, (
+        f"Expected neo4j_flush_chunk_bytes == 4_194_304, got {s.neo4j_flush_chunk_bytes}"
+    )

@@ -113,3 +113,32 @@ def test_server_has_config_file_env() -> None:
     ), (
         "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE must be /data/credentials.yaml"
     )
+
+
+def test_neo4j_has_finite_transaction_memory_cap() -> None:
+    """Neo4j must have a finite db.memory.transaction.max cap as a deployment backstop.
+
+    This is a defense-in-depth guard: a future regression that removes or zeroes the cap
+    will fail fast and local rather than exhausting the whole pool in production.
+    """
+    compose = _compose()
+    neo4j_env_raw = compose["services"]["neo4j"].get("environment") or {}
+
+    # Handle both dict shape and list-of-'K=V'-strings shape
+    if isinstance(neo4j_env_raw, list):
+        env: dict = {}
+        for item in neo4j_env_raw:
+            if "=" in str(item):
+                k, v = str(item).split("=", 1)
+                env[k] = v
+    else:
+        env = dict(neo4j_env_raw)
+
+    cap = env.get("NEO4J_db_memory_transaction_max")
+    assert cap is not None, (
+        "Neo4j must have NEO4J_db_memory_transaction_max set as a deployment backstop; "
+        "add it to the neo4j service environment in docker-compose.yml"
+    )
+    assert cap not in ("0", "0b"), (
+        f"NEO4J_db_memory_transaction_max must be a finite non-zero value, got: {cap!r}"
+    )

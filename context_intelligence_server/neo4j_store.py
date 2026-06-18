@@ -15,7 +15,7 @@ import json
 import logging
 import re
 from datetime import datetime
-from typing import Any, LiteralString, cast
+from typing import Any, Generator, LiteralString, cast
 
 from neo4j import AsyncGraphDatabase
 from neo4j.exceptions import Neo4jError
@@ -299,6 +299,85 @@ async def ensure_neo4j_schema(
             )
 
 
+def _serialized_row_size(value: Any) -> int:
+    """Return a cheap conservative proxy for the serialized byte size of *value*.
+
+    Uses ``json.dumps(value, default=str)`` so that non-JSON-serialisable values
+    (e.g. ``datetime`` objects) are converted via ``str()`` rather than raising.
+    This measures the *serialized* form — not ``len()`` on a dict/list, which
+    returns the number of keys/elements and is blind to fat nested payloads such
+    as large ``messages`` arrays or ``context_snapshot`` dicts.
+
+    Not an exact wire-byte count (no encoding overhead, no Neo4j framing), but a
+    consistent, crash-free lower bound suitable for chunk-size decisions.
+    """
+    try:
+        return len(json.dumps(value, default=str))
+    except (TypeError, ValueError):
+        return len(str(value))
+
+
+def _chunk_dict(
+    snapshot: dict[Any, Any],
+    max_rows: int,
+    max_bytes: int,
+) -> Generator[dict[Any, Any], None, None]:
+    """Yield sub-dicts of *snapshot* bounded by *max_rows* and *max_bytes*.
+
+    Dual-bound slicing: a chunk is emitted when either the row count OR the
+    accumulated byte size would be exceeded by the next row.  A single row that
+    is larger than *max_bytes* is always yielded alone (one-row floor), so the
+    generator never loops forever on an oversized row.
+
+    An empty *snapshot* yields nothing.
+    """
+    chunk: dict[Any, Any] = {}
+    cur_rows = 0
+    cur_bytes = 0
+    for key, value in snapshot.items():
+        size = _serialized_row_size(value)
+        if chunk and (cur_rows + 1 > max_rows or cur_bytes + size > max_bytes):
+            yield chunk
+            chunk = {}
+            cur_rows = 0
+            cur_bytes = 0
+        chunk[key] = value
+        cur_rows += 1
+        cur_bytes += size
+    if chunk:
+        yield chunk
+
+
+def _chunk_list(
+    snapshot: list[Any],
+    max_rows: int,
+    max_bytes: int,
+) -> Generator[list[Any], None, None]:
+    """Yield sub-lists of *snapshot* bounded by *max_rows* and *max_bytes*.
+
+    Identical dual-bound logic to :func:`_chunk_dict` but operates on an
+    ordered list rather than a mapping.  A single oversized element is always
+    yielded alone (one-row floor).
+
+    An empty *snapshot* yields nothing.
+    """
+    chunk: list[Any] = []
+    cur_rows = 0
+    cur_bytes = 0
+    for item in snapshot:
+        size = _serialized_row_size(item)
+        if chunk and (cur_rows + 1 > max_rows or cur_bytes + size > max_bytes):
+            yield chunk
+            chunk = []
+            cur_rows = 0
+            cur_bytes = 0
+        chunk.append(item)
+        cur_rows += 1
+        cur_bytes += size
+    if chunk:
+        yield chunk
+
+
 async def _write_batch(
     tx: Any,
     node_snapshot: dict[str, dict[str, Any]],
@@ -471,6 +550,8 @@ class Neo4jGraphStore:
         auth: tuple | None = None,
         database: str = "neo4j",
         workspace: str | None = None,
+        flush_chunk_rows: int = 100,
+        flush_chunk_bytes: int = 4_194_304,
     ) -> None:
         """Initialise the store and create the async Neo4j driver.
 
@@ -496,6 +577,8 @@ class Neo4jGraphStore:
         self._schema_initialized: bool = False
         self._closed: bool = False
         self._flush_lock: asyncio.Lock = asyncio.Lock()
+        self._flush_chunk_rows: int = max(1, flush_chunk_rows)
+        self._flush_chunk_bytes: int = max(1, flush_chunk_bytes)
 
     # ------------------------------------------------------------------
     # workspace property
@@ -697,7 +780,22 @@ class Neo4jGraphStore:
             await self._flush_body()
 
     async def _flush_body(self) -> None:
-        """Inner flush implementation — must only be called while _flush_lock is held."""
+        """Inner flush implementation — must only be called while _flush_lock is held.
+
+        Phased, dual-bounded, per-chunk-committed coordinator.  Splits each buffer
+        into row/byte-bounded chunks and commits each chunk in its own
+        execute_write (independent Neo4j transaction), eliminating the memory-cap
+        OOM caused by sending the entire buffer in a single transaction.
+
+        Phase order: nodes → label patches → edges.  This ordering preserves the
+        invariant that label patches can only reference nodes already committed to
+        Neo4j, and edges can only reference nodes already committed.
+
+        On any chunk failure the full snapshot is merged back into the live buffers
+        (restoring the entire un-flushed batch for the next attempt) and the
+        exception is re-raised so the caller's offset never advances on a partial
+        flush.
+        """
         if not self._node_buffer and not self._edge_buffer and not self._label_patches:
             return  # early exit — nothing to write
 
@@ -709,25 +807,46 @@ class Neo4jGraphStore:
         patch_snapshot = self._label_patches
         self._label_patches = []
 
+        rows = self._flush_chunk_rows
+        byts = self._flush_chunk_bytes
         success = False
         try:
             await self._ensure_schema()
 
-            # Driver-managed transaction: execute_write owns commit/rollback and
-            # auto-retries transient failures (TransientError / DeadlockDetected)
-            # up to max_transaction_retry_time. Safe because _write_batch is a pure
-            # function of its snapshot parameters (idempotency rule #1) and every
-            # write is an idempotent MERGE backed by uniqueness constraints
-            # (rules #2/#3), so re-running the batch cannot corrupt or duplicate state.
-            async with self._driver.session(database=self._database) as db_session:
-                await db_session.execute_write(
-                    _write_batch,
-                    node_snapshot,
-                    edge_snapshot,
-                    patch_snapshot,
-                    self.workspace,
-                )
+            # Phase 1: nodes — each chunk is its own execute_write (independent commit).
+            # Do NOT wrap multiple chunks in one explicit transaction — that would
+            # re-collapse the memory bound and defeat the chunking.
+            for chunk in _chunk_dict(node_snapshot, rows, byts):
+                async with self._driver.session(database=self._database) as db_session:
+                    await db_session.execute_write(
+                        _write_batch, chunk, {}, [], self.workspace
+                    )
+
+            # Phase 2: label patches — each chunk is its own execute_write.
+            for chunk in _chunk_list(patch_snapshot, rows, byts):
+                async with self._driver.session(database=self._database) as db_session:
+                    await db_session.execute_write(
+                        _write_batch, {}, {}, chunk, self.workspace
+                    )
+
+            # Phase 3: edges — each chunk is its own execute_write.
+            for chunk in _chunk_dict(edge_snapshot, rows, byts):
+                async with self._driver.session(database=self._database) as db_session:
+                    await db_session.execute_write(
+                        _write_batch, {}, chunk, [], self.workspace
+                    )
+
             success = True
+        except Exception:
+            _LOG.error(
+                "flush_chunk_failed workspace=%s nodes=%d edges=%d patches=%d;"
+                " restoring full snapshot and re-raising",
+                self.workspace,
+                len(node_snapshot),
+                len(edge_snapshot),
+                len(patch_snapshot),
+            )
+            raise
         finally:
             if not success:
                 # Restore buffers: snapshot base + any new writes since flush started
@@ -737,8 +856,7 @@ class Neo4jGraphStore:
                 merged_edges = dict(edge_snapshot)
                 merged_edges.update(self._edge_buffer)
                 self._edge_buffer = merged_edges
-                merged_patches = patch_snapshot + self._label_patches
-                self._label_patches = merged_patches
+                self._label_patches = patch_snapshot + self._label_patches
 
     def discard_buffer(self) -> None:
         """Drop all buffered writes without persisting them (no driver I/O).

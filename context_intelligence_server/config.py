@@ -127,6 +127,10 @@ class Settings(BaseSettings):
     # Conservative working defaults pending tuning (design Open Question 4).
     write_concurrency: int = 8  # global cap on concurrent Neo4j-write flushes
     max_delivery_attempts: int = 5  # flush retries for one batch before dead-letter
+    # Sub-transaction chunk bounds for _flush_body (issue #278).
+    # A chunk closes when EITHER bound trips first: cardinality or payload size.
+    neo4j_flush_chunk_rows: int = 100  # max rows per sub-transaction (cardinality bound)
+    neo4j_flush_chunk_bytes: int = 4_194_304  # max serialized bytes per sub-tx (4 MiB payload bound)
 
     # -------------------------------------------------------------------------
     # Logging

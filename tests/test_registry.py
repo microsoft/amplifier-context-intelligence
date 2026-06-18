@@ -1499,3 +1499,149 @@ class TestWrittenCounterWiring:
             await reg._finalize_session(worker, handlers={})
 
         assert reg.pipeline_counters()["written_total"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 12: flush-chunk bounds threaded from settings into get_or_create
+# ---------------------------------------------------------------------------
+
+
+def test_get_or_create_threads_flush_chunk_bounds(monkeypatch) -> None:
+    """get_or_create must pass flush_chunk_rows and flush_chunk_bytes
+    (sourced from Settings) into the Neo4jGraphStore constructor.
+
+    Fails before the fix because Neo4jGraphStore is constructed without
+    those kwargs; passes after the fix at registry.py:441.
+    """
+    captured: dict[str, object] = {}
+
+    class _FakeStore:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    # Neutralise the drain task so the test stays a pure wiring assertion.
+    monkeypatch.setattr(SessionRegistry, "start_drain", lambda self, worker: None)
+    monkeypatch.setattr(registry_module, "Neo4jGraphStore", _FakeStore)
+
+    reg = SessionRegistry()
+    reg.get_or_create("sess-1", "ws-1")
+
+    assert captured.get("flush_chunk_rows") == 100
+    assert captured.get("flush_chunk_bytes") == 4_194_304
+
+
+# ---------------------------------------------------------------------------
+# Task 1 (Phase 2, #278): last_successful_flush liveness field
+# ---------------------------------------------------------------------------
+
+
+class TestLastSuccessfulFlushField:
+    """SessionWorker.last_successful_flush defaults to creation time, not 0.0."""
+
+    def test_defaults_to_creation_time_not_zero(self) -> None:
+        """last_successful_flush must default to time.time() at construction
+        (same semantics as started_at), NOT 0.0.
+
+        A 0.0 default would make every brand-new worker read as 'last flushed
+        in 1970' (falsely ancient); defaulting to creation time means 'no flush
+        has happened yet, but the worker is fresh.'
+        """
+        before = time.time()
+        worker = SessionWorker(
+            session_id="test-lsf",
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+        after = time.time()
+
+        # Field must exist and be bracketed by the timestamps taken around construction.
+        assert before <= worker.last_successful_flush <= after
+        # Must be close to started_at (both use default_factory=time.time).
+        assert abs(worker.last_successful_flush - worker.started_at) < 0.1
+
+
+# ---------------------------------------------------------------------------
+# Task 2 (Phase 2, #278): _flush_barrier stamps last_successful_flush
+# ---------------------------------------------------------------------------
+
+
+class TestFlushBarrierStampsLiveness:
+    """_flush_barrier stamps worker.last_successful_flush after a successful flush."""
+
+    async def test_flush_barrier_advances_last_successful_flush(self) -> None:
+        """_flush_barrier must stamp worker.last_successful_flush immediately
+        after the awaited flush succeeds.
+
+        Fails before the fix because last_successful_flush stays at the forced
+        0.0 value; passes after because the stamp updates it to >= before.
+        """
+        registry = SessionRegistry()
+        worker = SessionWorker(
+            session_id="test-barrier-liveness",
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+        # Replace the graph service with an AsyncMock so flush() succeeds instantly.
+        worker.services.graph = AsyncMock()  # type: ignore[assignment]
+        # Force to a sentinel value so we can detect any stamp.
+        worker.last_successful_flush = 0.0
+
+        before = time.time()
+        await registry._flush_barrier(worker)
+
+        worker.services.graph.flush.assert_awaited_once()
+        assert worker.last_successful_flush >= before
+
+
+# ---------------------------------------------------------------------------
+# Task 3 (Phase 2, #278): orphaned_sessions() predicate
+# ---------------------------------------------------------------------------
+
+
+def _make_worker(sid: str) -> SessionWorker:
+    """Minimal SessionWorker for orphan-detection tests."""
+    return SessionWorker(
+        session_id=sid,
+        workspace="/ws",
+        services=HookStateService(workspace="/ws"),
+    )
+
+
+class TestOrphanedSessions:
+    """SessionRegistry.orphaned_sessions() returns workers whose drain task
+    has completed but which are still registered."""
+
+    async def test_completed_task_worker_is_orphaned(self) -> None:
+        """A worker whose asyncio task has finished is reported as orphaned."""
+        registry = SessionRegistry()
+        worker = _make_worker("orphan-1")
+        # Create a task that completes immediately and await it so .done() → True
+        worker.task = asyncio.create_task(asyncio.sleep(0))
+        await worker.task  # drive the event loop until the task is done
+        registry._register_for_test(worker)
+
+        orphans = registry.orphaned_sessions()
+
+        assert worker in orphans
+        assert [w.session_id for w in orphans] == ["orphan-1"]
+
+    async def test_live_task_worker_is_not_orphaned(self) -> None:
+        """A worker whose asyncio task is still running is NOT orphaned."""
+        registry = SessionRegistry()
+        worker = _make_worker("live-1")
+        worker.task = asyncio.create_task(asyncio.sleep(60))
+        registry._register_for_test(worker)
+
+        try:
+            assert registry.orphaned_sessions() == []
+        finally:
+            worker.task.cancel()
+
+    async def test_no_task_worker_is_not_orphaned(self) -> None:
+        """A worker with task=None (never started) is NOT orphaned."""
+        registry = SessionRegistry()
+        worker = _make_worker("notask-1")
+        worker.task = None
+        registry._register_for_test(worker)
+
+        assert registry.orphaned_sessions() == []
