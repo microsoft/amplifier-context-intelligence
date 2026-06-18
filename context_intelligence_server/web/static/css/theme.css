@@ -308,6 +308,23 @@ a, button { transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1); }
   font-family: var(--font-mono);
 }
 .dark .log-container { background: oklch(0.09 0.003 255); }
+
+.log-logger-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.85rem;
+  margin: 0.4rem 0 0.6rem;
+}
+.log-logger-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  user-select: none;
+}
 .log-line { white-space: pre-wrap; font-size: 0.78rem; line-height: 1.6; margin: 1px 0; }
 .log-INFO    { color: oklch(0.6 0.01 255); }
 .log-WARNING { color: oklch(0.78 0.14 75); }

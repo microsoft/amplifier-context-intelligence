@@ -99,6 +99,13 @@ class _DemoteToDebugFilter(logging.Filter):
         return True
 
 
+# Module-level singleton. logging.Logger.addFilter() de-duplicates by identity,
+# so reusing one instance keeps setup_logging() idempotent — a fresh instance per
+# call would stack filters on the process-global access loggers (harmless but
+# unbounded, notably in tests where the handler guard does not short-circuit).
+_DEMOTE_TO_DEBUG = _DemoteToDebugFilter()
+
+
 def setup_logging() -> None:
     """Configure root logger with stdout StreamHandler and RotatingFileHandler.
 
@@ -163,7 +170,13 @@ def setup_logging() -> None:
     #    routine 2xx noise -> demote to DEBUG (hidden at INFO, shown at DEBUG).
     #  - the neo4j driver's chatty INFO schema "notifications" ("index already
     #    exists") are suppressed below WARNING.
-    demote_filter = _DemoteToDebugFilter()
+    #
+    # INVARIANT: the demote filter MUST live on the LOGGER, not a handler. Logger
+    # filters run in Logger.handle() BEFORE callHandlers(), so the record is
+    # rewritten to DEBUG before the handler-level gate (set above) evaluates it.
+    # Moved to a handler it would run AFTER that gate and access logs would
+    # reappear at INFO. The handler.setLevel(log_level) above is the gate that
+    # actually drops the demoted records — both lines are load-bearing.
     for name in ("uvicorn.access", "gunicorn.access"):
-        logging.getLogger(name).addFilter(demote_filter)
+        logging.getLogger(name).addFilter(_DEMOTE_TO_DEBUG)
     logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
