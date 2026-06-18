@@ -319,75 +319,60 @@ async def ensure_neo4j_schema(
         )
 
         # ------------------------------------------------------------------
-        # Step 3: uniqueness constraint on Session nodes.
-        # Must run AFTER deduplication (step 1) so pre-existing duplicates do
-        # not cause the constraint creation to fail.
-        # Combined with MERGE (n:Session ...) in flush(), makes concurrent
-        # MERGEs atomic and prevents duplicate Session nodes under load.
+        # Steps 3 & 4: uniqueness constraints on Session then Event nodes.
+        # Both must run AFTER deduplication (step 1) so pre-existing duplicates
+        # do not cause constraint creation to fail. Combined with MERGE (n ...)
+        # in flush(), they make concurrent MERGEs atomic and prevent duplicate
+        # Session/Event nodes under load. The two constraints are identical in
+        # shape, so both route through the single _create_constraint helper.
         # ------------------------------------------------------------------
-        try:
-            await session.run(
-                "CREATE CONSTRAINT session_node_id_workspace_unique IF NOT EXISTS "
-                "FOR (n:Session) REQUIRE (n.node_id, n.workspace) IS UNIQUE"
-            )
-        except (Neo4jError, DriverError) as exc:
-            if isinstance(exc, Neo4jError) and exc.code in _BENIGN_SCHEMA_CODES:
-                _LOG.debug(
-                    "ensure_neo4j_schema: Session uniqueness constraint already "
-                    "present (benign concurrent-schema race, code=%s)",
-                    exc.code,
-                )
-            else:
-                # Either a dangerous Neo4jError code (e.g. ConstraintCreationFailed)
-                # or a connectivity DriverError that is NOT a Neo4jError
-                # (ServiceUnavailable / SessionExpired). The latter has no meaningful
-                # .code for our allow-list, so report it generically. Crucially, we
-                # continue rather than re-raise: this runs on the flush path via
-                # _ensure_schema, and a re-raise would be counted as a flush failure
-                # and could dead-letter real events.
-                code = exc.code if isinstance(exc, Neo4jError) else None
-                _LOG.error(
-                    "ensure_neo4j_schema: could not create Session uniqueness "
-                    "constraint (code=%s); continuing without it — duplicate Session "
-                    "data may be present: %s",
-                    code,
-                    exc,
-                )
+        async def _create_constraint(session: Any, name: str, statement: str) -> None:
+            """Create a uniqueness constraint, tolerating benign races and
+            connectivity errors (never re-raise into the flush path).
 
-        # ------------------------------------------------------------------
-        # Step 4: uniqueness constraint on Event nodes.
-        # Mirrors the Session constraint above so that idempotent
-        # MERGE (n:Event ...) in flush() is atomic under concurrency and
-        # cannot create duplicate Event nodes when multiple writers race.
-        # ------------------------------------------------------------------
-        try:
-            await session.run(
-                "CREATE CONSTRAINT event_node_id_workspace_unique IF NOT EXISTS "
-                "FOR (n:Event) REQUIRE (n.node_id, n.workspace) IS UNIQUE"
-            )
-        except (Neo4jError, DriverError) as exc:
-            if isinstance(exc, Neo4jError) and exc.code in _BENIGN_SCHEMA_CODES:
-                _LOG.debug(
-                    "ensure_neo4j_schema: Event uniqueness constraint already "
-                    "present (benign concurrent-schema race, code=%s)",
-                    exc.code,
-                )
-            else:
-                # Either a dangerous Neo4jError code (e.g. ConstraintCreationFailed)
-                # or a connectivity DriverError that is NOT a Neo4jError
-                # (ServiceUnavailable / SessionExpired). The latter has no meaningful
-                # .code for our allow-list, so report it generically. Crucially, we
-                # continue rather than re-raise: this runs on the flush path via
-                # _ensure_schema, and a re-raise would be counted as a flush failure
-                # and could dead-letter real events.
-                code = exc.code if isinstance(exc, Neo4jError) else None
-                _LOG.error(
-                    "ensure_neo4j_schema: could not create Event uniqueness "
-                    "constraint (code=%s); continuing without it — duplicate Event "
-                    "data may be present: %s",
-                    code,
-                    exc,
-                )
+            Benign already-exists / concurrent-schema-race codes (the
+            ``_BENIGN_SCHEMA_CODES`` allow-list) are swallowed at DEBUG. Anything
+            else — either a dangerous Neo4jError code (e.g. ConstraintCreationFailed)
+            or a connectivity DriverError that is NOT a Neo4jError (ServiceUnavailable
+            / SessionExpired, which has no meaningful ``.code`` for our allow-list) —
+            is reported generically at ERROR. Crucially, we continue rather than
+            re-raise: this runs on the flush path via _ensure_schema, and a re-raise
+            would be counted as a flush failure and could dead-letter real events.
+            """
+            try:
+                await session.run(statement)
+            except (Neo4jError, DriverError) as exc:
+                if isinstance(exc, Neo4jError) and exc.code in _BENIGN_SCHEMA_CODES:
+                    _LOG.debug(
+                        "ensure_neo4j_schema: %s uniqueness constraint already "
+                        "present (benign concurrent-schema race, code=%s)",
+                        name,
+                        exc.code,
+                    )
+                else:
+                    code = exc.code if isinstance(exc, Neo4jError) else None
+                    _LOG.error(
+                        "ensure_neo4j_schema: could not create %s uniqueness "
+                        "constraint (code=%s); continuing without it — duplicate %s "
+                        "data may be present: %s",
+                        name,
+                        code,
+                        name,
+                        exc,
+                    )
+
+        await _create_constraint(
+            session,
+            "Session",
+            "CREATE CONSTRAINT session_node_id_workspace_unique IF NOT EXISTS "
+            "FOR (n:Session) REQUIRE (n.node_id, n.workspace) IS UNIQUE",
+        )
+        await _create_constraint(
+            session,
+            "Event",
+            "CREATE CONSTRAINT event_node_id_workspace_unique IF NOT EXISTS "
+            "FOR (n:Event) REQUIRE (n.node_id, n.workspace) IS UNIQUE",
+        )
 
 
 def _serialized_row_size(value: Any) -> int:

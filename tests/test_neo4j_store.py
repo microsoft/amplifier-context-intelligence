@@ -616,6 +616,35 @@ class TestSchemaIndexesWorkspace:
             f"Queries issued: {all_queries}"
         )
 
+    async def test_ensure_schema_creates_event_uniqueness_constraint(self) -> None:
+        """_ensure_schema creates the Event (node_id, workspace) uniqueness constraint.
+
+        Mirrors the Session constraint assertion to cover the second
+        ``_create_constraint`` call after Steps 3 & 4 were collapsed onto the one
+        shared helper — guarding the helper's name/statement parametrization.
+        """
+        store = _make_store()
+        store._schema_initialized = False
+
+        mock_session = self._make_schema_session()
+        store._driver.session = MagicMock(return_value=mock_session)
+
+        await store._ensure_schema()
+
+        all_queries = [
+            call.args[0] for call in mock_session.run.call_args_list if call.args
+        ]
+        event_constraint_queries = [
+            q
+            for q in all_queries
+            if "CONSTRAINT" in q.upper() and "event_node_id_workspace_unique" in q
+        ]
+        assert event_constraint_queries, (
+            f"Expected the Event uniqueness CONSTRAINT "
+            f"(event_node_id_workspace_unique) to be created in _ensure_schema. "
+            f"Queries issued: {all_queries}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestExecuteQuery
