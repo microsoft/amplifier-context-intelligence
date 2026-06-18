@@ -17,12 +17,16 @@ _BACKUP_COUNT = 5
 # cannot parse. We strip those handlers and force propagation so every record
 # bubbles up to the root logger's JsonFormatter-wired handlers as one-line JSON.
 #
-# Boundary: setup_logging() runs inside the worker process (via the FastAPI
-# lifespan), so it covers every line emitted after the app is imported. The
-# gunicorn MASTER process emits a handful of pre-import boot lines ("Listening
-# at", "Booting worker") before any worker runs setup_logging(); those are only
-# reachable via gunicorn's own --log-config / logconfig_dict and remain outside
-# this function's reach.
+# Boundary (confirmed by live gunicorn+UvicornWorker boot): the dividing line is
+# the moment the worker runs setup_logging() inside the FastAPI lifespan. EVERY
+# line emitted BEFORE that point is plain text and outside this function's reach
+# — this spans both the gunicorn MASTER lines ("Starting gunicorn", "Listening
+# at", "Booting worker", "Worker exited", "Shutting down") AND the early uvicorn
+# *worker* lines that fire before lifespan startup completes ("Started server
+# process", "Waiting for application startup"). Those plain-text lines are only
+# reachable via gunicorn's own --log-config / logconfig_dict. EVERYTHING emitted
+# AFTER setup_logging() runs — app logs, neo4j_store logs, uvicorn.error/access
+# at runtime, gunicorn.error worker events — is one-line JSON.
 _THIRD_PARTY_LOGGER_NAMES = (
     "uvicorn",
     "uvicorn.error",
