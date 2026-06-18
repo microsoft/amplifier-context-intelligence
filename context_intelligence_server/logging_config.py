@@ -82,6 +82,30 @@ class JsonFormatter(logging.Formatter):
             return json.dumps(fallback)
 
 
+class _DemoteToDebugFilter(logging.Filter):
+    """Rewrite a record to DEBUG level.
+
+    Attached to the per-request HTTP access loggers (uvicorn.access /
+    gunicorn.access). uvicorn emits one access line PER REQUEST at INFO; those
+    routine 2xx lines flood the log stream and bury the ingest-pipeline signals.
+    A 2xx request is not an INFO-worthy event, so we demote it to DEBUG: hidden
+    at the default INFO level, visible only when the level is lowered to DEBUG.
+    WARNING stays reserved for genuine problems.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.levelno = logging.DEBUG
+        record.levelname = "DEBUG"
+        return True
+
+
+# Module-level singleton. logging.Logger.addFilter() de-duplicates by identity,
+# so reusing one instance keeps setup_logging() idempotent — a fresh instance per
+# call would stack filters on the process-global access loggers (harmless but
+# unbounded, notably in tests where the handler guard does not short-circuit).
+_DEMOTE_TO_DEBUG = _DemoteToDebugFilter()
+
+
 def setup_logging() -> None:
     """Configure root logger with stdout StreamHandler and RotatingFileHandler.
 
@@ -130,7 +154,29 @@ def setup_logging() -> None:
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
 
+    # Gate the handlers at the configured level so the DEBUG-demoted access logs
+    # (below) are hidden at INFO and surface only when the level is DEBUG.
+    stream_handler.setLevel(log_level)
+    file_handler.setLevel(log_level)
+
     # Route uvicorn/gunicorn loggers up to the root JsonFormatter so every line
     # from those frameworks is one-line JSON (not plain text) for Azure Log
     # Analytics. See _THIRD_PARTY_LOGGER_NAMES for the master-process boundary.
     _route_third_party_loggers_to_root()
+
+    # Use levels correctly so the ingest-pipeline signals stay visible in the
+    # stream the dashboard tails:
+    #  - per-request HTTP access logs (uvicorn.access / gunicorn.access) are
+    #    routine 2xx noise -> demote to DEBUG (hidden at INFO, shown at DEBUG).
+    #  - the neo4j driver's chatty INFO schema "notifications" ("index already
+    #    exists") are suppressed below WARNING.
+    #
+    # INVARIANT: the demote filter MUST live on the LOGGER, not a handler. Logger
+    # filters run in Logger.handle() BEFORE callHandlers(), so the record is
+    # rewritten to DEBUG before the handler-level gate (set above) evaluates it.
+    # Moved to a handler it would run AFTER that gate and access logs would
+    # reappear at INFO. The handler.setLevel(log_level) above is the gate that
+    # actually drops the demoted records — both lines are load-bearing.
+    for name in ("uvicorn.access", "gunicorn.access"):
+        logging.getLogger(name).addFilter(_DEMOTE_TO_DEBUG)
+    logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
