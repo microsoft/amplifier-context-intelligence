@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+import logging
 from pathlib import Path
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -46,6 +47,22 @@ async def test_post_events_returns_202(client: httpx.AsyncClient) -> None:
         },
     )
     assert response.status_code == 202
+
+
+async def test_event_enqueued_not_logged(
+    client: httpx.AsyncClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger="context_intelligence_server"):
+        response = await client.post(
+            "/events",
+            json={
+                "event": "tool_use",
+                "workspace": "/ws",
+                "data": {"session_id": "sess-1"},
+            },
+        )
+    assert response.status_code == 202
+    assert not any("event_enqueued" in record.getMessage() for record in caplog.records)
 
 
 async def test_post_events_body(client: httpx.AsyncClient) -> None:
