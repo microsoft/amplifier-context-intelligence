@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 from neo4j import AsyncGraphDatabase
+from neo4j.exceptions import TransientError
 
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
 
@@ -150,5 +151,100 @@ async def test_calibration_guard_tiny_write_succeeds(
         assert count == 1, (
             f"Expected exactly 1 node after calibration flush, got {count}"
         )
+    finally:
+        await store._driver.close()
+
+
+async def test_unbounded_single_phase_flush_ooms(
+    neo4j_container_capped: dict[str, Any],
+) -> None:
+    """Enormous chunk bounds ⇒ single-phase flush ⇒ OOM on the 2 MiB cap.
+
+    Calibration: enormous flush_chunk_rows / flush_chunk_bytes (10 M rows,
+    10 GB bytes) means all 400 fat nodes (each ~20 KB blob ⇒ ~8 MB total)
+    are sent in one transaction, which is 4× over the 2 MiB per-transaction
+    cap ⇒ Neo4j raises MemoryPoolOutOfMemoryError.
+
+    Assertions:
+    - flush() raises TransientError with code == _OOM_CODE (positively
+      identifies the cause, not just "something failed").
+    - MATCH count under prefix == 0 after the failed flush (the failed
+      transaction committed nothing; _flush_body restored the buffer).
+    """
+    store = await _low_retry_store(
+        neo4j_container_capped,
+        rows=10_000_000,
+        byts=10_000_000_000,
+    )
+    try:
+        prefix = "oom-unbounded"
+        await _purge_prefix(store, prefix)
+        await _buffer_fat_nodes(store, n=400, blob_bytes=20_000, prefix=prefix)
+
+        with pytest.raises(TransientError) as exc_info:
+            await store.flush()
+        assert exc_info.value.code == _OOM_CODE, (
+            f"Expected OOM code {_OOM_CODE!r}, got {exc_info.value.code!r}"
+        )
+
+        # Nothing was committed — the failed transaction is fully rolled back.
+        records = await store.execute_query(
+            "MATCH (n) WHERE n.node_id STARTS WITH $prefix RETURN count(n) AS cnt",
+            {"prefix": prefix},
+            workspace="*",
+        )
+        count = records[0]["cnt"]
+        assert count == 0, (
+            f"Expected 0 nodes after OOM flush (nothing should commit), got {count}"
+        )
+    finally:
+        await store._driver.close()
+
+
+async def test_chunked_flush_drains_same_single_phase_buffer(
+    neo4j_container_capped: dict[str, Any],
+) -> None:
+    """Small chunk bounds ⇒ chunked flush ⇒ all 400 nodes drained (RED).
+
+    This is the genuine RED test: the same 400 fat nodes that OOM the capped
+    container in a single transaction MUST drain successfully when
+    flush_chunk_rows=50 / flush_chunk_bytes=262_144 (256 KB) keeps each
+    chunk well under the 2 MiB cap.
+
+    RED state: against the current unchunked _flush_body the store ignores
+    flush_chunk_rows / flush_chunk_bytes and sends all 400 nodes in one
+    transaction ⇒ TransientError / MemoryPoolOutOfMemoryError.
+
+    GREEN state (after the fix): flush() must NOT raise; _node_buffer must
+    be empty; MATCH count under prefix must equal 400.
+
+    Calibration note: each chunk is ~50 × 20 KB = ~1 MB ⇒ 4-8× UNDER the
+    2 MiB cap. Production defaults (100 rows / 4 MB) are deliberately NOT
+    used because a 4 MB chunk would itself exceed a 2 MiB cap.
+    """
+    store = await _low_retry_store(
+        neo4j_container_capped,
+        rows=50,
+        byts=262_144,
+    )
+    try:
+        prefix = "oom-drain"
+        await _purge_prefix(store, prefix)
+        await _buffer_fat_nodes(store, n=400, blob_bytes=20_000, prefix=prefix)
+
+        # Must NOT raise once chunking is implemented (RED: raises OOM now).
+        await store.flush()
+
+        assert store._node_buffer == {}, (
+            "_node_buffer must be empty after a successful chunked flush"
+        )
+
+        records = await store.execute_query(
+            "MATCH (n) WHERE n.node_id STARTS WITH $prefix RETURN count(n) AS cnt",
+            {"prefix": prefix},
+            workspace="*",
+        )
+        count = records[0]["cnt"]
+        assert count == 400, f"Expected 400 nodes after chunked flush, got {count}"
     finally:
         await store._driver.close()
