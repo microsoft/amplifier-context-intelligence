@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1885,4 +1886,114 @@ async def test_coordinator_phase_ordering_nodes_patches_edges() -> None:
     phase_key = {"node": 0, "patch": 1, "edge": 2}
     assert order == sorted(order, key=lambda p: phase_key[p]), (
         f"Phase interleaving detected — actual call order: {order}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Re-raise invariant — A.5 (Task 11)
+# ---------------------------------------------------------------------------
+
+
+def _seq_execute_write_failing_on(call_index: int) -> AsyncMock:
+    """Return an execute_write mock that succeeds until call_index, then raises.
+
+    Call indices 0..(call_index-1) complete normally (return None).
+    Call at call_index raises RuntimeError('chunk boom').
+    """
+    call_count: list[int] = [0]
+
+    async def _side_effect(fn, *args, **kwargs) -> None:  # noqa: ANN001
+        idx = call_count[0]
+        call_count[0] += 1
+        if idx == call_index:
+            raise RuntimeError("chunk boom")
+        # success path — return None without executing the write function
+
+    return AsyncMock(side_effect=_side_effect)
+
+
+def _wire_session(store: Neo4jGraphStore, execute_write_mock: AsyncMock) -> None:
+    """Wire a fake session boundary with the given execute_write mock onto store.
+
+    Every call to ``store._driver.session(...)`` returns the same fake context
+    manager whose ``__aenter__`` yields itself and whose ``execute_write`` is
+    the provided mock.  This lets a single call-indexed mock accumulate all
+    execute_write invocations across chunks.
+    """
+    fake_session = MagicMock()
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    fake_session.execute_write = execute_write_mock
+    store._driver.session = MagicMock(return_value=fake_session)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fail_call,case_id",
+    [
+        (0, "first_chunk_fails"),
+        (1, "later_chunk_same_phase_committed"),
+        ("edge", "edge_after_nodes_committed"),
+    ],
+)
+async def test_reraise_restores_full_snapshot_and_logs(
+    fail_call: int | str,
+    case_id: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Re-raise invariant: RuntimeError propagates, full snapshot restored, ERROR logged.
+
+    Hard constraint #4: the coordinator must re-raise on any chunk failure and
+    never return success after a partial flush.
+
+    3 cases with materially different durable-progress state:
+    - first_chunk_fails (fail_call=0): nothing committed to Neo4j
+    - later_chunk_same_phase_committed (fail_call=1): first node chunk committed,
+      second node chunk fails — partial within the node phase
+    - edge_after_nodes_committed (fail_call='edge'): all 3 node chunks committed,
+      first edge chunk fails — partial durable progress across phases
+
+    In all 3 cases the FULL snapshot (nodes + edges) must be restored to the
+    live buffers and an ERROR containing 'flush_chunk_failed' must be logged.
+    """
+    nodes = {
+        "n0": {"name": "node-0"},
+        "n1": {"name": "node-1"},
+        "n2": {"name": "node-2"},
+    }
+    edges: dict = {("n0", "n1"): {"type": "KNOWS"}}
+
+    # rows=1 => each row is its own chunk:
+    #   Phase 1 nodes:   3 nodes  → 3 execute_write calls at indices 0, 1, 2
+    #   Phase 2 patches: 0        → 0 calls
+    #   Phase 3 edges:   1 edge   → 1 execute_write call at index 3
+    store = _make_store_chunked(rows=1, byts=10_000_000)
+    store._schema_initialized = True
+    store._node_buffer = dict(nodes)
+    store._edge_buffer = dict(edges)
+
+    # Map 'edge' to the first edge call index (index 3 = after 3 node calls)
+    actual_call_index: int = 3 if fail_call == "edge" else int(fail_call)  # type: ignore[arg-type]
+
+    execute_write_mock = _seq_execute_write_failing_on(actual_call_index)
+    _wire_session(store, execute_write_mock)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError, match="chunk boom"):
+            await store.flush()
+
+    # Full snapshot must be restored — not just uncommitted remainder
+    assert store._node_buffer == nodes, (
+        f"[{case_id}] _node_buffer not fully restored. "
+        f"Expected {nodes}, got {store._node_buffer}"
+    )
+    assert store._edge_buffer == edges, (
+        f"[{case_id}] _edge_buffer not fully restored. "
+        f"Expected {edges}, got {store._edge_buffer}"
+    )
+
+    # An ERROR containing 'flush_chunk_failed' must be logged
+    assert any("flush_chunk_failed" in r.message for r in caplog.records), (
+        f"[{case_id}] Expected ERROR log containing 'flush_chunk_failed'. "
+        f"Records: {[r.getMessage() for r in caplog.records]}"
     )
