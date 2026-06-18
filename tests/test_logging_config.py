@@ -10,6 +10,17 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 
+# Third-party loggers that carry their own handlers in production (gunicorn +
+# UvicornWorker) and must be routed through the root JsonFormatter.
+_THIRD_PARTY_LOGGER_NAMES = [
+    "uvicorn",
+    "uvicorn.error",
+    "uvicorn.access",
+    "gunicorn.error",
+    "gunicorn.access",
+]
+
+
 class TestSetupLogging:
     """Tests for setup_logging() function."""
 
@@ -36,6 +47,14 @@ class TestSetupLogging:
         for handler in self._saved_handlers:
             root_logger.addHandler(handler)
         root_logger.setLevel(self._saved_level)
+        # Reset any third-party loggers this test class may have reconfigured so
+        # state does not leak into other tests.
+        for name in _THIRD_PARTY_LOGGER_NAMES:
+            lg = logging.getLogger(name)
+            for handler in list(lg.handlers):
+                handler.close()
+                lg.removeHandler(handler)
+            lg.propagate = True
 
     def _make_mock_settings(self, log_path: str, log_level: str = "INFO") -> MagicMock:
         """Create a mock settings object."""
@@ -269,7 +288,9 @@ class TestSetupLogging:
                 and not isinstance(h, logging.handlers.RotatingFileHandler)
                 and h.stream is sys.stdout
             ]
-            assert len(stdout_handlers) >= 1, "Expected a configured stdout StreamHandler"
+            assert len(stdout_handlers) >= 1, (
+                "Expected a configured stdout StreamHandler"
+            )
             stdout_handler = stdout_handlers[0]
 
             # Swap the configured handler's stream to capture its output.
@@ -308,7 +329,92 @@ class TestSetupLogging:
                 assert "event" not in obj, f"Did not expect 'event' key, got: {obj}"
 
             exc_record = parsed[1]
-            assert "exc" in exc_record, f"Exception record should have 'exc', got: {exc_record}"
+            assert "exc" in exc_record, (
+                f"Exception record should have 'exc', got: {exc_record}"
+            )
             assert "Traceback" in exc_record["exc"], (
                 f"Folded exc field should contain traceback, got: {exc_record['exc']!r}"
             )
+
+    def test_uvicorn_gunicorn_loggers_route_through_json_formatter(self) -> None:
+        """uvicorn/gunicorn loggers must emit through the root JsonFormatter as one-line JSON.
+
+        Production runs gunicorn + uvicorn.workers.UvicornWorker. Those frameworks
+        install their OWN handlers on the ``uvicorn*`` / ``gunicorn*`` loggers with
+        ``propagate=False`` so their lines (startup, access, errors) reach stdout as
+        PLAIN TEXT, which Azure Log Analytics cannot parse as JSON.
+
+        This test first simulates that production state (a plain-text handler +
+        propagate=False on those loggers), then asserts setup_logging() strips the
+        rogue handlers and re-enables propagation so the records bubble up to the
+        root logger's JsonFormatter-wired stdout handler as valid one-line JSON.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = str(Path(tmpdir) / "server.jsonl")
+            mock_settings = self._make_mock_settings(log_path, log_level="DEBUG")
+
+            # Simulate uvicorn/gunicorn having installed their own plain-text
+            # handlers with propagation disabled (what they do at worker startup).
+            simulated = ("uvicorn.access", "gunicorn.error")
+            for name in simulated:
+                lg = logging.getLogger(name)
+                plain = logging.StreamHandler(io.StringIO())
+                plain.setFormatter(logging.Formatter("%(message)s"))
+                lg.handlers = [plain]
+                lg.propagate = False
+
+            with patch(
+                "context_intelligence_server.logging_config.get_settings",
+                return_value=mock_settings,
+            ):
+                from context_intelligence_server.logging_config import setup_logging
+
+                setup_logging()
+
+            root_logger = logging.getLogger()
+            stdout_handlers = [
+                h
+                for h in root_logger.handlers
+                if isinstance(h, logging.StreamHandler)
+                and not isinstance(h, logging.handlers.RotatingFileHandler)
+                and h.stream is sys.stdout
+            ]
+            assert len(stdout_handlers) >= 1, (
+                "Expected a configured stdout StreamHandler"
+            )
+            stdout_handler = stdout_handlers[0]
+
+            # Capture what the production-wired stdout handler emits.
+            capture = io.StringIO()
+            stdout_handler.setStream(capture)
+
+            # After setup_logging() these loggers must no longer carry their own
+            # (non-JSON) handlers and must propagate to root.
+            for name in simulated:
+                lg = logging.getLogger(name)
+                assert lg.handlers == [], (
+                    f"{name} should have no own handlers after setup_logging(), "
+                    f"got: {lg.handlers}"
+                )
+                assert lg.propagate is True, (
+                    f"{name} should propagate to the root logger after setup_logging()"
+                )
+
+            logging.getLogger("uvicorn.access").info("GET /status HTTP/1.1 200")
+            logging.getLogger("gunicorn.error").warning("Booting worker with pid: 7")
+
+            for handler in root_logger.handlers:
+                handler.flush()
+
+            output = capture.getvalue()
+            lines = [line for line in output.splitlines() if line.strip()]
+            assert len(lines) == 2, (
+                f"Expected exactly 2 JSON lines from uvicorn/gunicorn loggers, "
+                f"got {len(lines)}: {lines!r}"
+            )
+            for line in lines:
+                obj = json.loads(line)  # must be valid one-line JSON
+                assert "message" in obj, (
+                    f"JSON log should have 'message' key, got: {obj}"
+                )
+                assert "logger" in obj, f"JSON log should have 'logger' key, got: {obj}"

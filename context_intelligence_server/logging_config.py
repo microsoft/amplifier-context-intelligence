@@ -11,6 +11,39 @@ from context_intelligence_server.config import get_settings
 _MAX_BYTES = 10 * 1024 * 1024
 _BACKUP_COUNT = 5
 
+# Third-party loggers (gunicorn + uvicorn.workers.UvicornWorker) that install
+# their OWN handlers and do NOT propagate by default. Left alone, their lines
+# (startup, access, errors) reach stdout as PLAIN TEXT, which Azure Log Analytics
+# cannot parse. We strip those handlers and force propagation so every record
+# bubbles up to the root logger's JsonFormatter-wired handlers as one-line JSON.
+#
+# Boundary: setup_logging() runs inside the worker process (via the FastAPI
+# lifespan), so it covers every line emitted after the app is imported. The
+# gunicorn MASTER process emits a handful of pre-import boot lines ("Listening
+# at", "Booting worker") before any worker runs setup_logging(); those are only
+# reachable via gunicorn's own --log-config / logconfig_dict and remain outside
+# this function's reach.
+_THIRD_PARTY_LOGGER_NAMES = (
+    "uvicorn",
+    "uvicorn.error",
+    "uvicorn.access",
+    "gunicorn.error",
+    "gunicorn.access",
+)
+
+
+def _route_third_party_loggers_to_root() -> None:
+    """Strip third-party loggers' own handlers and force propagation to root.
+
+    Idempotent: clearing handlers and setting propagate=True can be repeated
+    safely. This is the standard way to unify framework logging onto a single
+    formatter wired on the root logger.
+    """
+    for name in _THIRD_PARTY_LOGGER_NAMES:
+        lg = logging.getLogger(name)
+        lg.handlers.clear()
+        lg.propagate = True
+
 
 class JsonFormatter(logging.Formatter):
     """Serialize each log record to exactly one physical JSON line.
@@ -92,3 +125,8 @@ def setup_logging() -> None:
     )
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
+
+    # Route uvicorn/gunicorn loggers up to the root JsonFormatter so every line
+    # from those frameworks is one-line JSON (not plain text) for Azure Log
+    # Analytics. See _THIRD_PARTY_LOGGER_NAMES for the master-process boundary.
+    _route_third_party_loggers_to_root()
