@@ -645,6 +645,43 @@ class TestSchemaIndexesWorkspace:
             f"Queries issued: {all_queries}"
         )
 
+    async def test_ensure_schema_deduplicates_session_and_event_nodes(self) -> None:
+        """Step 1 must deduplicate duplicate Session AND Event nodes.
+
+        Both Session and Event carry a uniqueness constraint (Steps 3 & 4). With
+        the retry-until-established behavior, a duplicate Event node makes the
+        Event ``CREATE CONSTRAINT`` fail ``ConstraintCreationFailed`` on every
+        flush forever unless a dedup pass clears the duplicates first. The
+        Session dedup already exists; the Event dedup must mirror it so the
+        constraint retry can converge.
+        """
+        store = _make_store()
+        store._schema_initialized = False
+
+        mock_session = self._make_schema_session()
+        store._driver.session = MagicMock(return_value=mock_session)
+
+        await store._ensure_schema()
+
+        all_queries = [
+            call.args[0] for call in mock_session.run.call_args_list if call.args
+        ]
+        session_dedup = [
+            q for q in all_queries if "MATCH (s:Session)" in q and "DETACH DELETE" in q
+        ]
+        event_dedup = [
+            q for q in all_queries if "MATCH (e:Event)" in q and "DETACH DELETE" in q
+        ]
+        assert session_dedup, (
+            f"Expected a Session dedup (MATCH (s:Session) ... DETACH DELETE) query. "
+            f"Queries issued: {all_queries}"
+        )
+        assert event_dedup, (
+            f"Expected an Event dedup (MATCH (e:Event) ... DETACH DELETE) query so "
+            f"the Event uniqueness constraint retry can converge. "
+            f"Queries issued: {all_queries}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestExecuteQuery

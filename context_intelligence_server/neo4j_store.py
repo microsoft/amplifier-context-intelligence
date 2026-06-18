@@ -229,8 +229,8 @@ async def ensure_neo4j_schema(
     concurrent ``flush()`` transactions execute ``MERGE``.
 
     Runs a deduplication pass *first* so that any pre-existing duplicate Session
-    nodes (from a previous run without the constraint) do not block constraint
-    creation.
+    and Event nodes (from a previous run without the constraint) do not block
+    constraint creation.
 
     Args:
         driver:    An ``AsyncDriver`` instance created via
@@ -250,16 +250,26 @@ async def ensure_neo4j_schema(
     """
     async with driver.session(database=database) as session:
         # ------------------------------------------------------------------
-        # Step 1: deduplicate any pre-existing duplicate Session nodes.
+        # Step 1: deduplicate any pre-existing duplicate Session and Event nodes.
         # For each duplicate (node_id, workspace) group keep the first node
         # (as returned by collect()) and DETACH DELETE the remainder.
         # This MUST run before constraint creation so a dirty graph does not
-        # cause the CREATE CONSTRAINT statement to fail.
+        # cause the CREATE CONSTRAINT statement to fail. Both Session (Step 3)
+        # and Event (Step 4) carry a uniqueness constraint, so both must be
+        # deduplicated here or the corresponding constraint retry never
+        # converges.
         # ------------------------------------------------------------------
         try:
             await session.run(
                 "MATCH (s:Session) "
                 "WITH s.node_id AS nid, s.workspace AS ws, collect(s) AS nodes "
+                "WHERE size(nodes) > 1 "
+                "UNWIND tail(nodes) AS duplicate "
+                "DETACH DELETE duplicate"
+            )
+            await session.run(
+                "MATCH (e:Event) "
+                "WITH e.node_id AS nid, e.workspace AS ws, collect(e) AS nodes "
                 "WHERE size(nodes) > 1 "
                 "UNWIND tail(nodes) AS duplicate "
                 "DETACH DELETE duplicate"
