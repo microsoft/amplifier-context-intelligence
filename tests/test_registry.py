@@ -1499,3 +1499,32 @@ class TestWrittenCounterWiring:
             await reg._finalize_session(worker, handlers={})
 
         assert reg.pipeline_counters()["written_total"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 12: flush-chunk bounds threaded from settings into get_or_create
+# ---------------------------------------------------------------------------
+
+
+def test_get_or_create_threads_flush_chunk_bounds(monkeypatch) -> None:
+    """get_or_create must pass flush_chunk_rows and flush_chunk_bytes
+    (sourced from Settings) into the Neo4jGraphStore constructor.
+
+    Fails before the fix because Neo4jGraphStore is constructed without
+    those kwargs; passes after the fix at registry.py:441.
+    """
+    captured: dict[str, object] = {}
+
+    class _FakeStore:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    # Neutralise the drain task so the test stays a pure wiring assertion.
+    monkeypatch.setattr(SessionRegistry, "start_drain", lambda self, worker: None)
+    monkeypatch.setattr(registry_module, "Neo4jGraphStore", _FakeStore)
+
+    reg = SessionRegistry()
+    reg.get_or_create("sess-1", "ws-1")
+
+    assert captured.get("flush_chunk_rows") == 100
+    assert captured.get("flush_chunk_bytes") == 4_194_304

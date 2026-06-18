@@ -441,6 +441,8 @@ class SessionRegistry:
             neo4j_store = Neo4jGraphStore(
                 uri=settings.neo4j_url,
                 auth=neo4j_auth,
+                flush_chunk_rows=settings.neo4j_flush_chunk_rows,
+                flush_chunk_bytes=settings.neo4j_flush_chunk_bytes,
             )
             self._workers[session_id] = SessionWorker(
                 session_id=session_id,
