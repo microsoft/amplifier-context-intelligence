@@ -2358,3 +2358,125 @@ class TestSchemaConstraintAllowList:
         assert store._node_buffer == {}, (
             "Buffer must be cleared (success path) — not restored on failure."
         )
+
+
+# ---------------------------------------------------------------------------
+# TestSchemaLatchOnSuccess
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaLatchOnSuccess:
+    """The ``_schema_initialized`` flag must latch True only on genuine full success.
+
+    Regression for the data-integrity gap: when Neo4j is unreachable while schema
+    init runs, ``ensure_neo4j_schema`` swallows the connectivity DriverError (it
+    never re-raises, to avoid dead-lettering real events) and the uniqueness
+    constraint is NOT created.  If the flag latched True anyway, schema init would
+    never be retried for the worker's life — so when Neo4j returns, concurrent
+    MERGE runs with no uniqueness backstop and duplicate Session/Event nodes
+    accrue until process restart.  The flag must therefore stay False until the
+    schema is fully established, letting a later flush retry and self-heal.
+    """
+
+    @staticmethod
+    def _schema_session_raising_on(substring: str, err: Exception):
+        """Schema session whose ``run`` raises *err* for queries containing *substring*."""
+
+        async def _run(query, *args, **kwargs):
+            if substring in query:
+                raise err
+            return AsyncMock()
+
+        session = AsyncMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.run = AsyncMock(side_effect=_run)
+        return session
+
+    @staticmethod
+    def _schema_session_all_ok():
+        """Schema session whose ``run`` succeeds for every statement."""
+        session = AsyncMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.run = AsyncMock(return_value=AsyncMock())
+        return session
+
+    async def test_ensure_schema_does_not_latch_when_constraint_uncreated_on_connectivity(
+        self,
+    ) -> None:
+        """Flag must stay False when the constraint could not be created (connectivity)."""
+        from neo4j.exceptions import ServiceUnavailable
+
+        store = _make_store()
+        store._schema_initialized = False
+        degraded = self._schema_session_raising_on(
+            "CREATE CONSTRAINT", ServiceUnavailable("connection refused")
+        )
+        store._driver.session = MagicMock(return_value=degraded)
+
+        await store._ensure_schema()  # MUST NOT raise
+
+        assert store._schema_initialized is False, (
+            "Flag must NOT latch True when the uniqueness constraint could not be "
+            "created (connectivity error swallowed) — otherwise schema init is "
+            "never retried and duplicate Session/Event nodes accrue."
+        )
+
+    async def test_ensure_schema_retries_until_established_then_latches(self) -> None:
+        """Degraded first run retries on the next flush, then latches and stops re-running."""
+        from neo4j.exceptions import ServiceUnavailable
+
+        store = _make_store()
+        store._schema_initialized = False
+
+        degraded = self._schema_session_raising_on(
+            "CREATE CONSTRAINT", ServiceUnavailable("connection refused")
+        )
+        ok_session = self._schema_session_all_ok()
+        store._driver.session = MagicMock(side_effect=[degraded, ok_session])
+
+        # First flush: connectivity error on a schema step → flag stays False.
+        await store._ensure_schema()
+        assert store._schema_initialized is False, (
+            "Degraded first run must leave the flag False so a later flush retries."
+        )
+
+        # Second flush: schema fully succeeds → flag latches True, and the schema
+        # statements were genuinely re-attempted (retry, not skip).
+        await store._ensure_schema()
+        assert store._schema_initialized is True, (
+            "Once the schema is fully established the flag must latch True."
+        )
+        assert any(
+            "CREATE CONSTRAINT" in call.args[0]
+            for call in ok_session.run.await_args_list
+        ), "Schema statements must be re-attempted on the retry — not skipped."
+
+        # Third flush: flag latched → schema must NOT be re-run.
+        store._driver.session = MagicMock(side_effect=AssertionError("schema re-run"))
+        await store._ensure_schema()  # MUST NOT touch the driver session
+
+    async def test_ensure_neo4j_schema_returns_true_on_full_success(self) -> None:
+        """Direct return value: True when every index/constraint is established."""
+        session = self._schema_session_all_ok()
+        driver = MagicMock()
+        driver.session = MagicMock(return_value=session)
+
+        result = await ensure_neo4j_schema(driver)
+
+        assert result is True
+
+    async def test_ensure_neo4j_schema_returns_false_on_connectivity_error(
+        self,
+    ) -> None:
+        """Direct return value: False when a connectivity error prevents constraint creation."""
+        from neo4j.exceptions import ServiceUnavailable
+
+        session = self._schema_session_raising_on(
+            "CREATE CONSTRAINT", ServiceUnavailable("connection refused")
+        )
+        driver = MagicMock()
+        driver.session = MagicMock(return_value=session)
+
+        result = await ensure_neo4j_schema(driver)
+
+        assert result is False

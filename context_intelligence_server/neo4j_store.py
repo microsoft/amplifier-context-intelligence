@@ -221,7 +221,7 @@ async def ensure_neo4j_schema(
     driver: Any,
     database: str = "neo4j",
     workspace: str = "",
-) -> None:
+) -> bool:
     """Create Neo4j indexes and constraints idempotently.
 
     Intended to be called **once at server startup** (before any requests are
@@ -237,6 +237,16 @@ async def ensure_neo4j_schema(
                    ``AsyncGraphDatabase.driver(...)``.
         database:  Target Neo4j database name (default: ``"neo4j"``).
         workspace: Reserved for future workspace-scoped schema; currently unused.
+
+    Returns:
+        ``True`` iff the schema is **fully established** — every index and
+        uniqueness constraint was created (or already exists via a benign race).
+        ``False`` if any index/constraint could not be created (e.g. Neo4j was
+        unreachable and the connectivity error was swallowed to avoid
+        dead-lettering real events). Callers use this to decide whether to retry
+        schema init on a later flush rather than latching a half-built schema and
+        leaving the uniqueness constraint permanently absent. The best-effort
+        Step-1 dedup pass does not affect the return value.
     """
     async with driver.session(database=database) as session:
         # ------------------------------------------------------------------
@@ -271,7 +281,7 @@ async def ensure_neo4j_schema(
         # error is benign — swallow it (mirroring the constraint handling below)
         # while re-raising any other schema error.
         # ------------------------------------------------------------------
-        async def _create_index(statement: str) -> None:
+        async def _create_index(statement: str) -> bool:
             try:
                 await session.run(statement)
             except (Neo4jError, DriverError) as exc:
@@ -285,6 +295,8 @@ async def ensure_neo4j_schema(
                         "create race, benign): %s",
                         statement,
                     )
+                    # The index exists / will exist via the race winner: established.
+                    return True
                 elif isinstance(exc, Neo4jError):
                     # A dangerous Neo4jError code we do not recognise as benign.
                     raise
@@ -302,6 +314,15 @@ async def ensure_neo4j_schema(
                         "error); continuing without it: %s",
                         exc,
                     )
+                    # Index NOT created: report failure so the caller does not latch.
+                    return False
+            # session.run succeeded: the index is established.
+            return True
+
+        # Track whether every index/constraint was established. We attempt them
+        # ALL each run (no short-circuit) so a single transient failure does not
+        # skip the rest — but the aggregate latches only when nothing was missed.
+        fully_established = True
 
         for label in (
             "Session",
@@ -310,12 +331,18 @@ async def ensure_neo4j_schema(
             "ToolExecution",
             "Event",
         ):
-            await _create_index(
-                f"CREATE INDEX IF NOT EXISTS FOR (n:{label}) ON (n.node_id)"
+            fully_established = (
+                await _create_index(
+                    f"CREATE INDEX IF NOT EXISTS FOR (n:{label}) ON (n.node_id)"
+                )
+                and fully_established
             )
-        await _create_index(
-            "CREATE INDEX idx_session_workspace IF NOT EXISTS "
-            "FOR (n:Session) ON (n.workspace)"
+        fully_established = (
+            await _create_index(
+                "CREATE INDEX idx_session_workspace IF NOT EXISTS "
+                "FOR (n:Session) ON (n.workspace)"
+            )
+            and fully_established
         )
 
         # ------------------------------------------------------------------
@@ -326,7 +353,7 @@ async def ensure_neo4j_schema(
         # Session/Event nodes under load. The two constraints are identical in
         # shape, so both route through the single _create_constraint helper.
         # ------------------------------------------------------------------
-        async def _create_constraint(session: Any, name: str, statement: str) -> None:
+        async def _create_constraint(session: Any, name: str, statement: str) -> bool:
             """Create a uniqueness constraint, tolerating benign races and
             connectivity errors (never re-raise into the flush path).
 
@@ -338,6 +365,11 @@ async def ensure_neo4j_schema(
             is reported generically at ERROR. Crucially, we continue rather than
             re-raise: this runs on the flush path via _ensure_schema, and a re-raise
             would be counted as a flush failure and could dead-letter real events.
+
+            Returns ``True`` when the constraint is established (the statement
+            succeeded, or a benign code means the winner created/will create it) and
+            ``False`` on the ERROR-and-continue path (constraint NOT created) so the
+            caller can decide whether to retry rather than latch a half-built schema.
             """
             try:
                 await session.run(statement)
@@ -349,6 +381,8 @@ async def ensure_neo4j_schema(
                         name,
                         exc.code,
                     )
+                    # The constraint exists / will exist via the race winner.
+                    return True
                 else:
                     code = exc.code if isinstance(exc, Neo4jError) else None
                     _LOG.error(
@@ -360,19 +394,31 @@ async def ensure_neo4j_schema(
                         name,
                         exc,
                     )
+                    # Constraint NOT created: report failure so the caller retries.
+                    return False
+            # session.run succeeded: the constraint is established.
+            return True
 
-        await _create_constraint(
-            session,
-            "Session",
-            "CREATE CONSTRAINT session_node_id_workspace_unique IF NOT EXISTS "
-            "FOR (n:Session) REQUIRE (n.node_id, n.workspace) IS UNIQUE",
+        fully_established = (
+            await _create_constraint(
+                session,
+                "Session",
+                "CREATE CONSTRAINT session_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Session) REQUIRE (n.node_id, n.workspace) IS UNIQUE",
+            )
+            and fully_established
         )
-        await _create_constraint(
-            session,
-            "Event",
-            "CREATE CONSTRAINT event_node_id_workspace_unique IF NOT EXISTS "
-            "FOR (n:Event) REQUIRE (n.node_id, n.workspace) IS UNIQUE",
+        fully_established = (
+            await _create_constraint(
+                session,
+                "Event",
+                "CREATE CONSTRAINT event_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Event) REQUIRE (n.node_id, n.workspace) IS UNIQUE",
+            )
+            and fully_established
         )
+
+        return fully_established
 
 
 def _serialized_row_size(value: Any) -> int:
@@ -956,19 +1002,31 @@ class Neo4jGraphStore:
         self._label_patches = []
 
     async def _ensure_schema(self) -> None:
-        """Create Neo4j indexes and constraints idempotently (runs once per store instance).
+        """Create Neo4j indexes and constraints idempotently (latches once fully established).
 
         Safety-net for contexts where the FastAPI lifespan is not active (e.g. tests,
         CLI tools, or direct store use).  The primary schema-initialization path is
         ``ensure_neo4j_schema()`` called from the lifespan handler *before* the server
         starts accepting requests, which guarantees the uniqueness constraint is active
         before any concurrent ``flush()`` transactions execute ``MERGE``.
+
+        The ``_schema_initialized`` flag latches True ONLY when the schema is fully
+        established.  If ``ensure_neo4j_schema`` could not create every index/constraint
+        (e.g. Neo4j was unreachable at init and the connectivity error was swallowed to
+        avoid dead-lettering real events), the flag stays False so the NEXT flush retries
+        schema init — self-healing once Neo4j is reachable and the dedup pass has cleared
+        any duplicates.  This closes the "constraint created once, never retried"
+        data-integrity gap, where a missing uniqueness constraint would otherwise let
+        concurrent MERGE accrue duplicate Session/Event nodes until process restart.
         """
         if self._schema_initialized:
             return
 
-        await ensure_neo4j_schema(self._driver, self._database)
-        self._schema_initialized = True
+        fully_established = await ensure_neo4j_schema(self._driver, self._database)
+        if fully_established:
+            self._schema_initialized = True
+        # else: leave the flag False so the NEXT flush retries schema init (self-heals
+        # once Neo4j is reachable / duplicates are cleared by the dedup pass).
 
     async def close(self) -> None:
         """Flush pending writes, await any background task, and close the driver.
