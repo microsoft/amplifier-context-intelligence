@@ -1824,3 +1824,65 @@ async def test_coordinator_empty_buffer_makes_zero_calls() -> None:
     await store.flush()
 
     fake_session.execute_write.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Coordinator phase ordering guard (Task 10 — A.4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_coordinator_phase_ordering_nodes_patches_edges() -> None:
+    """All node chunks precede all patch chunks which precede all edge chunks.
+
+    Phase-ordering guard: rows=2 forces multiple chunks per phase (5 nodes →
+    3 chunks, 3 patches → 2 chunks, 2 edges → 1 chunk).  The side_effect on
+    execute_write records which phase each call belongs to; the assertion
+    verifies there is no interleaving between phases and that all three phases
+    are exercised.
+    """
+    store = _make_store_chunked(rows=2, byts=10_000_000)
+    store._schema_initialized = True
+
+    # Populate buffers to force multiple chunks per phase
+    store._node_buffer = {f"n{i}": {"name": f"node-{i}"} for i in range(5)}
+    store._label_patches = [
+        {"node_id": f"n{i}", "add": ["X"], "remove": []} for i in range(3)
+    ]
+    store._edge_buffer = {
+        ("n0", "n1"): {"type": "KNOWS"},
+        ("n2", "n3"): {"type": "LINKS"},
+    }
+
+    order: list[str] = []
+
+    async def _record_phase(fn, *args, **kwargs) -> None:
+        # fn=_write_batch; positional args = (nodes_chunk, edges_chunk, patches_chunk, ...)
+        nodes = args[0]
+        edges = args[1]
+        patches = args[2]
+        if nodes:
+            order.append("node")
+        elif patches:
+            order.append("patch")
+        elif edges:
+            order.append("edge")
+
+    fake_session = AsyncMock()
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=False)
+    fake_session.execute_write = AsyncMock(side_effect=_record_phase)
+    store._driver.session = MagicMock(return_value=fake_session)
+
+    await store.flush()
+
+    # All three phases must be present
+    assert "node" in order, "Expected at least one node-phase execute_write call"
+    assert "patch" in order, "Expected at least one patch-phase execute_write call"
+    assert "edge" in order, "Expected at least one edge-phase execute_write call"
+
+    # No phase interleaving: order must equal its phase-sorted form
+    phase_key = {"node": 0, "patch": 1, "edge": 2}
+    assert order == sorted(order, key=lambda p: phase_key[p]), (
+        f"Phase interleaving detected — actual call order: {order}"
+    )
