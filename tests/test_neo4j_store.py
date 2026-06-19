@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from neo4j.exceptions import Neo4jError
 
 from context_intelligence_server.graph_store import GraphStore, QueryableStore
 from context_intelligence_server.neo4j_store import (
@@ -28,6 +29,7 @@ from context_intelligence_server.neo4j_store import (
     _convert_temporal_props,
     _normalize_temporal,
     _validate_identifier,
+    ensure_neo4j_schema,
 )
 
 
@@ -611,6 +613,72 @@ class TestSchemaIndexesWorkspace:
         assert constraint_queries, (
             f"Expected a uniqueness CONSTRAINT on (node_id, workspace) to be created "
             f"in _ensure_schema to prevent concurrent-worker duplicate nodes. "
+            f"Queries issued: {all_queries}"
+        )
+
+    async def test_ensure_schema_creates_event_uniqueness_constraint(self) -> None:
+        """_ensure_schema creates the Event (node_id, workspace) uniqueness constraint.
+
+        Mirrors the Session constraint assertion to cover the second
+        ``_create_constraint`` call after Steps 3 & 4 were collapsed onto the one
+        shared helper — guarding the helper's name/statement parametrization.
+        """
+        store = _make_store()
+        store._schema_initialized = False
+
+        mock_session = self._make_schema_session()
+        store._driver.session = MagicMock(return_value=mock_session)
+
+        await store._ensure_schema()
+
+        all_queries = [
+            call.args[0] for call in mock_session.run.call_args_list if call.args
+        ]
+        event_constraint_queries = [
+            q
+            for q in all_queries
+            if "CONSTRAINT" in q.upper() and "event_node_id_workspace_unique" in q
+        ]
+        assert event_constraint_queries, (
+            f"Expected the Event uniqueness CONSTRAINT "
+            f"(event_node_id_workspace_unique) to be created in _ensure_schema. "
+            f"Queries issued: {all_queries}"
+        )
+
+    async def test_ensure_schema_deduplicates_session_and_event_nodes(self) -> None:
+        """Step 1 must deduplicate duplicate Session AND Event nodes.
+
+        Both Session and Event carry a uniqueness constraint (Steps 3 & 4). With
+        the retry-until-established behavior, a duplicate Event node makes the
+        Event ``CREATE CONSTRAINT`` fail ``ConstraintCreationFailed`` on every
+        flush forever unless a dedup pass clears the duplicates first. The
+        Session dedup already exists; the Event dedup must mirror it so the
+        constraint retry can converge.
+        """
+        store = _make_store()
+        store._schema_initialized = False
+
+        mock_session = self._make_schema_session()
+        store._driver.session = MagicMock(return_value=mock_session)
+
+        await store._ensure_schema()
+
+        all_queries = [
+            call.args[0] for call in mock_session.run.call_args_list if call.args
+        ]
+        session_dedup = [
+            q for q in all_queries if "MATCH (s:Session)" in q and "DETACH DELETE" in q
+        ]
+        event_dedup = [
+            q for q in all_queries if "MATCH (e:Event)" in q and "DETACH DELETE" in q
+        ]
+        assert session_dedup, (
+            f"Expected a Session dedup (MATCH (s:Session) ... DETACH DELETE) query. "
+            f"Queries issued: {all_queries}"
+        )
+        assert event_dedup, (
+            f"Expected an Event dedup (MATCH (e:Event) ... DETACH DELETE) query so "
+            f"the Event uniqueness constraint retry can converge. "
             f"Queries issued: {all_queries}"
         )
 
@@ -1702,7 +1770,9 @@ def test_chunk_dict_byte_bound():
     snapshot = {str(i): {"blob": blob} for i in range(6)}
     chunks = list(_chunk_dict(snapshot, max_rows=1000, max_bytes=5000))
 
-    assert all(len(c) <= 2 for c in chunks), f"Expected all chunks <=2 rows, got {[len(c) for c in chunks]}"
+    assert all(len(c) <= 2 for c in chunks), (
+        f"Expected all chunks <=2 rows, got {[len(c) for c in chunks]}"
+    )
     assert len(chunks) >= 3, f"Expected >=3 chunks, got {len(chunks)}"
     # No loss
     merged = {}
@@ -1721,9 +1791,15 @@ def test_chunk_dict_one_row_floor():
     }
     chunks = list(_chunk_dict(snapshot, max_rows=1000, max_bytes=1000))
 
-    assert len(chunks) == 2, f"Expected 2 chunks, got {len(chunks)}: {[list(c.keys()) for c in chunks]}"
-    assert list(chunks[0].keys()) == ["big"], f"Expected chunk[0] to contain only 'big', got {list(chunks[0].keys())}"
-    assert list(chunks[1].keys()) == ["small"], f"Expected chunk[1] to contain only 'small', got {list(chunks[1].keys())}"
+    assert len(chunks) == 2, (
+        f"Expected 2 chunks, got {len(chunks)}: {[list(c.keys()) for c in chunks]}"
+    )
+    assert list(chunks[0].keys()) == ["big"], (
+        f"Expected chunk[0] to contain only 'big', got {list(chunks[0].keys())}"
+    )
+    assert list(chunks[1].keys()) == ["small"], (
+        f"Expected chunk[1] to contain only 'small', got {list(chunks[1].keys())}"
+    )
 
 
 def test_chunk_dict_empty_yields_nothing():
@@ -1794,9 +1870,7 @@ async def test_coordinator_every_execute_write_within_bounds() -> None:
     for nodes, _edges, _patches in captured_payloads:
         if not nodes:
             continue  # skip edge/patch-only calls (empty nodes dict)
-        assert len(nodes) <= 10, (
-            f"Node chunk exceeded row bound: {len(nodes)} > 10"
-        )
+        assert len(nodes) <= 10, f"Node chunk exceeded row bound: {len(nodes)} > 10"
         total_bytes = sum(_serialized_row_size(v) for v in nodes.values())
         assert total_bytes <= 10_000_000 or len(nodes) == 1, (
             f"Node chunk exceeded byte bound: {total_bytes} bytes across "
@@ -1997,3 +2071,449 @@ async def test_reraise_restores_full_snapshot_and_logs(
         f"[{case_id}] Expected ERROR log containing 'flush_chunk_failed'. "
         f"Records: {[r.getMessage() for r in caplog.records]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# TestSchemaConstraintAllowList
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaConstraintAllowList:
+    """Verified benign allow-list for schema constraint creation.
+
+    Benign already-exists / concurrent-schema-race codes must be swallowed at
+    DEBUG and execution continues.  Dangerous codes (ConstraintCreationFailed
+    and anything else) must be surfaced at ERROR and continue — never re-raised
+    into the flush/write path, where a re-raise would make the drain barrier
+    count it as a flush failure and dead-letter real events.
+    """
+
+    @staticmethod
+    def _driver_raising_on_constraint(code: str):
+        """Build a mock driver whose CREATE CONSTRAINT statements raise Neo4jError(code).
+
+        ``Neo4jError._hydrate_neo4j`` returns the correct Neo4jError subclass with
+        ``.code`` set (``.code`` is a read-only property with no setter, so it
+        cannot be assigned directly) and is catchable as ``except Neo4jError``.
+        Non-constraint statements (dedup, index creation) succeed.
+        """
+        err = Neo4jError._hydrate_neo4j(code=code, message="schema failure")
+
+        async def _run(query, *args, **kwargs):
+            if "CREATE CONSTRAINT" in query:
+                raise err
+            return AsyncMock()
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.run = AsyncMock(side_effect=_run)
+
+        mock_driver = MagicMock()
+        mock_driver.session = MagicMock(return_value=mock_session)
+        return mock_driver
+
+    async def test_benign_deadlock_swallowed_at_debug(self, caplog):
+        """DeadlockDetected is benign: no raise, no WARNING/ERROR, a DEBUG constraint line."""
+        driver = self._driver_raising_on_constraint(
+            "Neo.TransientError.Transaction.DeadlockDetected"
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            await ensure_neo4j_schema(driver)  # MUST NOT raise
+
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            "Benign DeadlockDetected must not log at WARNING or above. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+        assert any(
+            r.levelno == logging.DEBUG and "constraint" in r.getMessage().lower()
+            for r in caplog.records
+        ), (
+            "Expected a DEBUG record mentioning the constraint. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
+    async def test_benign_equivalent_rule_swallowed_at_debug(self, caplog):
+        """EquivalentSchemaRuleAlreadyExists is benign: no raise, no WARNING/ERROR, DEBUG line."""
+        driver = self._driver_raising_on_constraint(
+            "Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists"
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            await ensure_neo4j_schema(driver)  # MUST NOT raise
+
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            "Benign EquivalentSchemaRuleAlreadyExists must not log at WARNING or above. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+        assert any(
+            r.levelno == logging.DEBUG and "constraint" in r.getMessage().lower()
+            for r in caplog.records
+        ), (
+            "Expected a DEBUG record mentioning the constraint. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
+    async def test_constraint_creation_failed_surfaced_at_error_no_raise(self, caplog):
+        """ConstraintCreationFailed is dangerous: no raise, ERROR logged, old wording gone."""
+        driver = self._driver_raising_on_constraint(
+            "Neo.ClientError.Schema.ConstraintCreationFailed"
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            await ensure_neo4j_schema(driver)  # MUST NOT raise
+
+        assert any(r.levelno >= logging.ERROR for r in caplog.records), (
+            "ConstraintCreationFailed must surface at ERROR. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+        assert not any(
+            "pre-existing duplicates?" in r.getMessage() for r in caplog.records
+        ), "The misleading '(pre-existing duplicates?)' wording must be dropped."
+
+    async def test_constraint_failure_on_flush_path_does_not_dead_letter(self, caplog):
+        """END-TO-END: a constraint failure on the flush path must not dead-letter events.
+
+        The schema session raises ConstraintCreationFailed on CREATE CONSTRAINT but
+        succeeds on index/dedup; the node-write transaction must still run and the
+        node buffer must be cleared (success path), proving the schema error did not
+        propagate out of flush() and trigger restore-on-failure + dead-lettering.
+        """
+        store = _make_store()
+        store._schema_initialized = False
+
+        # Schema session: raises ConstraintCreationFailed on CREATE CONSTRAINT,
+        # succeeds on dedup/index statements.
+        err = Neo4jError._hydrate_neo4j(
+            code="Neo.ClientError.Schema.ConstraintCreationFailed",
+            message="schema failure",
+        )
+
+        async def _schema_run(query, *args, **kwargs):
+            if "CREATE CONSTRAINT" in query:
+                raise err
+            return AsyncMock()
+
+        schema_session = AsyncMock()
+        schema_session.__aenter__ = AsyncMock(return_value=schema_session)
+        schema_session.run = AsyncMock(side_effect=_schema_run)
+
+        mock_tx, write_session = _make_flush_mocks()
+
+        store._driver.session = MagicMock(
+            side_effect=[schema_session, write_session, write_session, write_session]
+        )
+
+        await store.upsert_node("n1", {"labels": ["Session"], "name": "test"})
+
+        with caplog.at_level(logging.DEBUG):
+            await store.flush()  # MUST NOT raise
+
+        assert any(
+            r.levelno >= logging.ERROR and "constraint" in r.getMessage().lower()
+            for r in caplog.records
+        ), (
+            "Expected an ERROR record mentioning the constraint on the flush path. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+        assert mock_tx.run.await_count >= 1, (
+            "Node-write transaction must still run despite the constraint failure."
+        )
+        assert store._node_buffer == {}, (
+            "Buffer must be cleared (success path) — not restored on failure."
+        )
+
+    async def test_connectivity_driver_error_surfaced_at_error_no_raise(self, caplog):
+        """ServiceUnavailable (a DriverError, NOT a Neo4jError) on CREATE CONSTRAINT.
+
+        Connectivity errors (ServiceUnavailable / SessionExpired) inherit from
+        DriverError, not Neo4jError.  They must be caught, logged at ERROR, and
+        MUST NOT propagate out of ensure_neo4j_schema — otherwise a connectivity
+        drop on the flush path would be counted as a flush failure and dead-letter
+        real events.
+        """
+        from neo4j.exceptions import ServiceUnavailable
+
+        err = ServiceUnavailable("connection refused")
+
+        async def _run(query, *args, **kwargs):
+            if "CREATE CONSTRAINT" in query:
+                raise err
+            return AsyncMock()
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.run = AsyncMock(side_effect=_run)
+
+        mock_driver = MagicMock()
+        mock_driver.session = MagicMock(return_value=mock_session)
+
+        with caplog.at_level(logging.DEBUG):
+            await ensure_neo4j_schema(mock_driver)  # MUST NOT raise
+
+        assert any(
+            r.levelno >= logging.ERROR and "constraint" in r.getMessage().lower()
+            for r in caplog.records
+        ), (
+            "ServiceUnavailable on constraint creation must surface at ERROR. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
+    async def test_connectivity_error_on_flush_path_does_not_dead_letter(self, caplog):
+        """END-TO-END: a ServiceUnavailable on the flush path must not dead-letter.
+
+        The schema session raises ServiceUnavailable (a DriverError) on CREATE
+        CONSTRAINT but succeeds on dedup/index; the node-write transaction must
+        still run and the node buffer must be cleared (success path), proving the
+        connectivity error did not propagate out of flush() and trigger
+        restore-on-failure + dead-lettering.
+        """
+        from neo4j.exceptions import ServiceUnavailable
+
+        store = _make_store()
+        store._schema_initialized = False
+
+        err = ServiceUnavailable("connection refused")
+
+        async def _schema_run(query, *args, **kwargs):
+            if "CREATE CONSTRAINT" in query:
+                raise err
+            return AsyncMock()
+
+        schema_session = AsyncMock()
+        schema_session.__aenter__ = AsyncMock(return_value=schema_session)
+        schema_session.run = AsyncMock(side_effect=_schema_run)
+
+        mock_tx, write_session = _make_flush_mocks()
+
+        store._driver.session = MagicMock(
+            side_effect=[schema_session, write_session, write_session, write_session]
+        )
+
+        await store.upsert_node("n1", {"labels": ["Session"], "name": "test"})
+
+        with caplog.at_level(logging.DEBUG):
+            await store.flush()  # MUST NOT raise
+
+        assert any(
+            r.levelno >= logging.ERROR and "constraint" in r.getMessage().lower()
+            for r in caplog.records
+        ), (
+            "Expected an ERROR record mentioning the constraint on the flush path. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+        assert mock_tx.run.await_count >= 1, (
+            "Node-write transaction must still run despite the connectivity error."
+        )
+        assert store._node_buffer == {}, (
+            "Buffer must be cleared (success path) — not restored on failure."
+        )
+
+    async def test_connectivity_driver_error_on_index_surfaced_no_raise(self, caplog):
+        """ServiceUnavailable (a DriverError) on CREATE INDEX (the _create_index path).
+
+        The INDEX-creation steps run BEFORE the constraint steps, so a connectivity
+        DriverError (ServiceUnavailable / SessionExpired, NOT a Neo4jError) during
+        index creation would otherwise propagate out of ensure_neo4j_schema and
+        dead-letter real events on the flush path — reached even before the
+        constraint hardening. It must be caught, logged at ERROR, and MUST NOT
+        propagate out of ensure_neo4j_schema.
+        """
+        from neo4j.exceptions import ServiceUnavailable
+
+        err = ServiceUnavailable("connection refused")
+
+        async def _run(query, *args, **kwargs):
+            if "CREATE INDEX" in query:
+                raise err
+            return AsyncMock()
+
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.run = AsyncMock(side_effect=_run)
+
+        mock_driver = MagicMock()
+        mock_driver.session = MagicMock(return_value=mock_session)
+
+        with caplog.at_level(logging.DEBUG):
+            await ensure_neo4j_schema(mock_driver)  # MUST NOT raise
+
+        assert any(
+            r.levelno >= logging.ERROR and "index" in r.getMessage().lower()
+            for r in caplog.records
+        ), (
+            "ServiceUnavailable on index creation must surface at ERROR. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
+    async def test_connectivity_error_on_index_step_does_not_dead_letter(self, caplog):
+        """END-TO-END: a ServiceUnavailable on the INDEX step must not dead-letter.
+
+        The schema session raises ServiceUnavailable (a DriverError) on CREATE
+        INDEX but succeeds on dedup/constraint; the node-write transaction must
+        still run and the node buffer must be cleared (success path), proving the
+        connectivity error did not propagate out of flush() and trigger
+        restore-on-failure + dead-lettering.
+        """
+        from neo4j.exceptions import ServiceUnavailable
+
+        store = _make_store()
+        store._schema_initialized = False
+
+        err = ServiceUnavailable("connection refused")
+
+        async def _schema_run(query, *args, **kwargs):
+            if "CREATE INDEX" in query:
+                raise err
+            return AsyncMock()
+
+        schema_session = AsyncMock()
+        schema_session.__aenter__ = AsyncMock(return_value=schema_session)
+        schema_session.run = AsyncMock(side_effect=_schema_run)
+
+        mock_tx, write_session = _make_flush_mocks()
+
+        store._driver.session = MagicMock(
+            side_effect=[schema_session, write_session, write_session, write_session]
+        )
+
+        await store.upsert_node("n1", {"labels": ["Session"], "name": "test"})
+
+        with caplog.at_level(logging.DEBUG):
+            await store.flush()  # MUST NOT raise
+
+        assert any(
+            r.levelno >= logging.ERROR and "index" in r.getMessage().lower()
+            for r in caplog.records
+        ), (
+            "Expected an ERROR record mentioning the index on the flush path. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+        assert mock_tx.run.await_count >= 1, (
+            "Node-write transaction must still run despite the connectivity error."
+        )
+        assert store._node_buffer == {}, (
+            "Buffer must be cleared (success path) — not restored on failure."
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestSchemaLatchOnSuccess
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaLatchOnSuccess:
+    """The ``_schema_initialized`` flag must latch True only on genuine full success.
+
+    Regression for the data-integrity gap: when Neo4j is unreachable while schema
+    init runs, ``ensure_neo4j_schema`` swallows the connectivity DriverError (it
+    never re-raises, to avoid dead-lettering real events) and the uniqueness
+    constraint is NOT created.  If the flag latched True anyway, schema init would
+    never be retried for the worker's life — so when Neo4j returns, concurrent
+    MERGE runs with no uniqueness backstop and duplicate Session/Event nodes
+    accrue until process restart.  The flag must therefore stay False until the
+    schema is fully established, letting a later flush retry and self-heal.
+    """
+
+    @staticmethod
+    def _schema_session_raising_on(substring: str, err: Exception):
+        """Schema session whose ``run`` raises *err* for queries containing *substring*."""
+
+        async def _run(query, *args, **kwargs):
+            if substring in query:
+                raise err
+            return AsyncMock()
+
+        session = AsyncMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.run = AsyncMock(side_effect=_run)
+        return session
+
+    @staticmethod
+    def _schema_session_all_ok():
+        """Schema session whose ``run`` succeeds for every statement."""
+        session = AsyncMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.run = AsyncMock(return_value=AsyncMock())
+        return session
+
+    async def test_ensure_schema_does_not_latch_when_constraint_uncreated_on_connectivity(
+        self,
+    ) -> None:
+        """Flag must stay False when the constraint could not be created (connectivity)."""
+        from neo4j.exceptions import ServiceUnavailable
+
+        store = _make_store()
+        store._schema_initialized = False
+        degraded = self._schema_session_raising_on(
+            "CREATE CONSTRAINT", ServiceUnavailable("connection refused")
+        )
+        store._driver.session = MagicMock(return_value=degraded)
+
+        await store._ensure_schema()  # MUST NOT raise
+
+        assert store._schema_initialized is False, (
+            "Flag must NOT latch True when the uniqueness constraint could not be "
+            "created (connectivity error swallowed) — otherwise schema init is "
+            "never retried and duplicate Session/Event nodes accrue."
+        )
+
+    async def test_ensure_schema_retries_until_established_then_latches(self) -> None:
+        """Degraded first run retries on the next flush, then latches and stops re-running."""
+        from neo4j.exceptions import ServiceUnavailable
+
+        store = _make_store()
+        store._schema_initialized = False
+
+        degraded = self._schema_session_raising_on(
+            "CREATE CONSTRAINT", ServiceUnavailable("connection refused")
+        )
+        ok_session = self._schema_session_all_ok()
+        store._driver.session = MagicMock(side_effect=[degraded, ok_session])
+
+        # First flush: connectivity error on a schema step → flag stays False.
+        await store._ensure_schema()
+        assert store._schema_initialized is False, (
+            "Degraded first run must leave the flag False so a later flush retries."
+        )
+
+        # Second flush: schema fully succeeds → flag latches True, and the schema
+        # statements were genuinely re-attempted (retry, not skip).
+        await store._ensure_schema()
+        assert store._schema_initialized is True, (
+            "Once the schema is fully established the flag must latch True."
+        )
+        assert any(
+            "CREATE CONSTRAINT" in call.args[0]
+            for call in ok_session.run.await_args_list
+        ), "Schema statements must be re-attempted on the retry — not skipped."
+
+        # Third flush: flag latched → schema must NOT be re-run.
+        store._driver.session = MagicMock(side_effect=AssertionError("schema re-run"))
+        await store._ensure_schema()  # MUST NOT touch the driver session
+
+    async def test_ensure_neo4j_schema_returns_true_on_full_success(self) -> None:
+        """Direct return value: True when every index/constraint is established."""
+        session = self._schema_session_all_ok()
+        driver = MagicMock()
+        driver.session = MagicMock(return_value=session)
+
+        result = await ensure_neo4j_schema(driver)
+
+        assert result is True
+
+    async def test_ensure_neo4j_schema_returns_false_on_connectivity_error(
+        self,
+    ) -> None:
+        """Direct return value: False when a connectivity error prevents constraint creation."""
+        from neo4j.exceptions import ServiceUnavailable
+
+        session = self._schema_session_raising_on(
+            "CREATE CONSTRAINT", ServiceUnavailable("connection refused")
+        )
+        driver = MagicMock()
+        driver.session = MagicMock(return_value=session)
+
+        result = await ensure_neo4j_schema(driver)
+
+        assert result is False

@@ -299,11 +299,33 @@ class SessionRegistry:
                 except Exception:
                     attempts += 1
                     self.record_write_retry()
-                    logger.exception(
-                        "drain_batch_failed session=%s attempt=%d",
-                        session_id,
-                        attempts,
-                    )
+                    # Throttle the failure log off the local attempts counter
+                    # (resets to 0 on commit and after exhaustion): the first
+                    # failure gets ONE traceback (WARNING), middle attempts are
+                    # DEBUG, and budget exhaustion gets a single ERROR (no
+                    # per-attempt traceback storm).
+                    if attempts == 1:
+                        logger.warning(
+                            "drain_batch_failed session=%s attempt=%d",
+                            session_id,
+                            attempts,
+                            exc_info=True,
+                            extra={"session_id": session_id},
+                        )
+                    elif attempts >= self._max_delivery_attempts:
+                        logger.error(
+                            "drain_batch_exhausted session=%s attempts=%d",
+                            session_id,
+                            attempts,
+                            extra={"session_id": session_id},
+                        )
+                    else:
+                        logger.debug(
+                            "drain_batch_failed session=%s attempt=%d",
+                            session_id,
+                            attempts,
+                            extra={"session_id": session_id},
+                        )
                     if attempts >= self._max_delivery_attempts:
                         # Budget spent -> isolate the batch ONE LINE AT A TIME,
                         # dead-letter the offending line(s), advance past all.
@@ -321,6 +343,12 @@ class SessionRegistry:
                 attempts = 0
                 await qm.commit(session_id, batch.end_offset)
                 self.record_written(len(batch.lines))
+                logger.debug(
+                    "batch_committed events=%d offset=%d",
+                    len(batch.lines),
+                    batch.end_offset,
+                    extra={"session_id": session_id},
+                )
 
                 if saw_terminal:
                     await self._finalize_session(worker, handlers)
@@ -381,6 +409,12 @@ class SessionRegistry:
                 self.record_written(1)
             except Exception as exc:
                 await qm.dead_letter(session_id, raw + b"\n", str(exc))
+                logger.warning(
+                    "dead_letter session=%s error=%s",
+                    session_id,
+                    exc,
+                    extra={"session_id": session_id},
+                )
                 # COE blocker (decision #13): drop the failed line's residue so
                 # it cannot contaminate the NEXT line's flush. A successful flush
                 # clears the buffer itself; only the failure path needs this.
@@ -407,6 +441,12 @@ class SessionRegistry:
                 return  # NOT finalized: keep worker alive, leave tail uncommitted
             await qm.commit(session_id, tail.end_offset)
             self.record_written(len(tail.lines))
+            logger.debug(
+                "batch_committed events=%d offset=%d",
+                len(tail.lines),
+                tail.end_offset,
+                extra={"session_id": session_id},
+            )
 
         ended_at = time.time()
         self._completed.append(
@@ -425,6 +465,12 @@ class SessionRegistry:
         # Panel finding #5: reclaim disk — a fully drained, finalized session no
         # longer needs its .log/.offset. Keep .dead.jsonl (retained dead-letter).
         await qm.delete_drained(session_id)
+        logger.info(
+            "session_finalized session=%s events=%d",
+            session_id,
+            worker.events_processed,
+            extra={"session_id": session_id},
+        )
 
     async def _safe_close(self, worker: SessionWorker) -> None:
         try:
@@ -464,6 +510,11 @@ class SessionRegistry:
                 ),
             )
             self.start_drain(self._workers[session_id])
+            logger.info(
+                "drainer_spawned session=%s",
+                session_id,
+                extra={"session_id": session_id},
+            )
         return self._workers[session_id]
 
     def remove(self, session_id: str) -> None:

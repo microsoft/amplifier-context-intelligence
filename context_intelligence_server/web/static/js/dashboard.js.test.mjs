@@ -294,3 +294,22 @@ describe('dashboard.js Queues tab wiring (C2 re-arch)', () => {
     );
   });
 });
+
+// ── Logger filter (filter visible log lines by their `logger` field) ──────────
+describe('dashboard.js logger filter', () => {
+  test('reads the logger field from each log line', () => {
+    assert.ok(jsSource.includes('p.logger'), 'should parse the logger field from the log JSON');
+  });
+  test('tracks hidden loggers and a checkbox container', () => {
+    assert.ok(jsSource.includes('hiddenLoggers'), 'should maintain a hiddenLoggers set');
+    assert.ok(jsSource.includes('log-logger-filters'), 'should reference the logger-filter container');
+  });
+  test('dynamically creates a per-logger checkbox', () => {
+    assert.ok(jsSource.includes('ensureLoggerCheckbox'), 'should add a checkbox per distinct logger');
+    assert.ok(jsSource.includes("type = 'checkbox'"), 'logger filter should use checkboxes');
+  });
+  test('visibility honours both text filter and hidden loggers', () => {
+    assert.ok(jsSource.includes('isLogVisible'), 'should gate visibility through isLogVisible');
+    assert.ok(jsSource.includes('hiddenLoggers.has'), 'visibility should check hiddenLoggers');
+  });
+});
