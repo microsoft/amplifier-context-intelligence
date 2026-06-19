@@ -541,13 +541,17 @@ async def ensure_neo4j_schema(
         # re-keyed Session/edge MERGEs on :Node must find pre-existing nodes
         # rather than fork their identity.
         #
-        # Batched + idempotent: CALL { ... } IN TRANSACTIONS commits in chunks
+        # Batched + idempotent: CALL (n) { ... } IN TRANSACTIONS commits in chunks
         # (so 1.3M nodes don't blow the per-transaction memory cap), and the
         # WHERE NOT n:Node guard makes re-runs converge to a no-op once the
         # graph is fully tagged.  ensure_neo4j_schema is awaited at the top of
         # _flush_body, so this runs before any flush MERGEs on :Node.
         # The batch size must be a literal in Cypher, so it is interpolated from
         # the in-process int constant (never user input).
+        #
+        # Uses the variable-scoped subquery form ``CALL (n) { ... }`` (the
+        # importing-`WITH` form ``CALL { WITH n ... }`` is deprecated in Neo4j 5
+        # and emits an 01N00 deprecation notification on every run).
         #
         # NOTE (was a latent bug): this block previously sat after an early
         # ``return fully_established`` and was therefore DEAD CODE — the backfill
@@ -557,7 +561,7 @@ async def ensure_neo4j_schema(
                 cast(
                     LiteralString,
                     f"MATCH (n) WHERE NOT n:{_UNIVERSAL_NODE_LABEL} "
-                    f"CALL {{ WITH n SET n:{_UNIVERSAL_NODE_LABEL} }} "
+                    f"CALL (n) {{ SET n:{_UNIVERSAL_NODE_LABEL} }} "
                     f"IN TRANSACTIONS OF {int(_NODE_BACKFILL_BATCH)} ROWS",
                 )
             )
