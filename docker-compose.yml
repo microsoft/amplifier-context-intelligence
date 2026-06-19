@@ -33,6 +33,15 @@ services:
       - ${HOME}/amplifier-context-intelligence-server-data-store/neo4j-auth.env
     environment:
       NEO4J_db_memory_transaction_max: "512m"
+      # Fail-loud guarantee: a finite lock-acquisition timeout. With the Neo4j
+      # default of 0s a flush that cannot acquire a node lock blocks FOREVER and
+      # silently (the v4.0.1 drain-stall incident). A finite bound makes a stuck
+      # flush raise a TransientError, which the managed-tx retry + drain loop
+      # surface LOUDLY (ERROR log, dead-letter, /status degraded) instead of
+      # hanging. It also bounds starvation: a blocked flush releases its write
+      # slot within this window rather than holding it indefinitely. 30s default
+      # (tunable); see verify/results/green-failloud.md.
+      NEO4J_db_lock_acquisition_timeout: "30s"
     ports:
       - "7474:7474"
       - "7687:7687"

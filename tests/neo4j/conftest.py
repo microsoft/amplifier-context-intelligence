@@ -195,6 +195,90 @@ def neo4j_container_capped() -> Generator[dict[str, Any], None, None]:
     container.stop()
 
 
+@pytest.fixture(scope="module")
+def neo4j_container_lock_timeout() -> Generator[dict[str, Any], None, None]:
+    """Spin up a Neo4j container with a SHORT finite lock-acquisition timeout.
+
+    Identical bootstrap logic to ``neo4j_container_capped`` (random ports,
+    port-flake retry, 60s readiness poll, remove=True, stop on teardown) but
+    sets ``NEO4J_db_lock_acquisition_timeout=2s`` instead of a memory cap.
+
+    Why a SHORT (2s) timeout rather than the shipped 30s default: the fail-loud
+    fault-injection tests hold an exclusive lock and then drive a flush that must
+    acquire it.  A 2s timeout makes the bounded-failure path resolve in seconds
+    instead of minutes while proving the SAME behaviour the shipped 30s default
+    guarantees: a stuck flush raises (loudly) within a finite bound rather than
+    blocking forever (the v4.0.1 incident's ``db.lock.acquisition.timeout=0``).
+
+    Fully independent of the other container fixtures (no shared state).
+    Skips if the ``docker`` package is not importable.
+    Yields a dict with bolt_url, http_url, user, password, http_port, bolt_port.
+    """
+    try:
+        import docker  # type: ignore[import-untyped]
+        from docker.errors import APIError  # type: ignore[import-untyped]
+    except ImportError:
+        pytest.skip("docker package not installed — skip Neo4j tests")
+
+    client = docker.from_env()
+
+    container = None
+    http_port = bolt_port = 0
+    last_exc: Exception | None = None
+    for _attempt in range(5):
+        http_port = _get_free_port()
+        bolt_port = _get_free_port()
+        try:
+            container = client.containers.run(
+                "neo4j:5.26.22-community",
+                environment={
+                    "NEO4J_AUTH": "neo4j/testpassword",
+                    # The fail-loud guarantee under test: a finite lock timeout.
+                    "NEO4J_db_lock_acquisition_timeout": "2s",
+                },
+                ports={"7474/tcp": http_port, "7687/tcp": bolt_port},
+                detach=True,
+                remove=True,
+            )
+            break
+        except APIError as exc:
+            if "ports are not available" not in str(exc):
+                raise
+            last_exc = exc
+            time.sleep(1)
+    if container is None:
+        pytest.fail(
+            f"Lock-timeout Neo4j container could not acquire host ports after 5 "
+            f"attempts (transient docker port-allocation flake): {last_exc}"
+        )
+
+    # Wait for Neo4j readiness (up to 60 seconds)
+    for _ in range(60):
+        try:
+            r = httpx.get(f"http://localhost:{http_port}", timeout=2.0)
+            if r.status_code < 500:
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+    else:
+        container.stop()
+        pytest.fail(
+            "Lock-timeout Neo4j container did not become ready within 60 seconds"
+        )
+
+    yield {
+        "bolt_url": f"bolt://localhost:{bolt_port}",
+        "http_url": f"http://localhost:{http_port}",
+        "user": "neo4j",
+        "password": "testpassword",
+        "http_port": http_port,
+        "bolt_port": bolt_port,
+    }
+
+    container.stop()
+
+
 @pytest.fixture
 def neo4j_services(
     neo4j_container: dict[str, Any],
