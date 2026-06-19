@@ -33,6 +33,11 @@ services:
       - ${HOME}/amplifier-context-intelligence-server-data-store/neo4j-auth.env
     environment:
       NEO4J_db_memory_transaction_max: "512m"
+      # APOC plugin. Neo4j 5.x auto-installs the bundled apoc-core jar from
+      # /var/lib/neo4j/labs into /var/lib/neo4j/plugins at startup and applies
+      # APOC's default config (incl. unrestricted apoc.*). No volume mount or
+      # manual jar download is required; it re-installs on every container start.
+      NEO4J_PLUGINS: '["apoc"]'
     ports:
       - "7474:7474"
       - "7687:7687"

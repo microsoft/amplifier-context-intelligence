@@ -49,9 +49,30 @@ docker run -d \
   -p ${NEO4J_HTTP_PORT}:7474 \
   -p ${NEO4J_BOLT_PORT}:7687 \
   -e NEO4J_AUTH=neo4j/${NEO4J_PASSWORD} \
+  -e 'NEO4J_PLUGINS=["apoc"]' \
   -v "${DATA_DIR}/neo4j:/data" \
   neo4j:5.26.22-community
 ```
+
+> **APOC plugin:** `-e 'NEO4J_PLUGINS=["apoc"]'` enables the APOC plugin, matching
+> the Docker Compose stack. Neo4j 5.x auto-installs the bundled `apoc-core` jar at
+> startup (from `/var/lib/neo4j/labs` into `/var/lib/neo4j/plugins`) and applies
+> APOC's default config — no volume mount or manual jar download is required, and
+> it re-installs on every container start. Verify with
+> `docker exec amplifier-context-intelligence-neo4j cypher-shell -u neo4j -p "${NEO4J_PASSWORD}" "RETURN apoc.version();"`.
+> See the README's "Neo4j Plugins (APOC)" section for details. Hosted AuraDB has
+> APOC Core preinstalled.
+>
+> **Air-gapped hosts:** `NEO4J_PLUGINS=["apoc"]` installs APOC Core from a jar
+> bundled *inside* the image (`/var/lib/neo4j/labs/`) — no internet download — so
+> the line above already works offline. For an air-tight guarantee that skips the
+> installer entirely, build a Neo4j image with the jar baked in using the repo's
+> `neo4j.Dockerfile` + `docker-compose.airgap.yml`
+> (`docker compose -f docker-compose.yml -f docker-compose.airgap.yml up -d --build`).
+> On a fully disconnected host, also pre-load the base image first:
+> `docker save neo4j:5.26.22-community -o neo4j.tar` on a connected machine, then
+> `docker load -i neo4j.tar` on the air-gapped host (or use an internal registry
+> mirror).
 
 **Wait for Neo4j to be ready** (usually 15–30 seconds):
 
