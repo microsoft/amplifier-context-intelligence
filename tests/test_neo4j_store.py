@@ -1231,27 +1231,33 @@ class TestNeo4jGraphStoreSetLabels:
 
 
 class TestNeo4jGraphStoreFlushNoLabelMerge:
-    """flush() uses label-aware MERGE for Session nodes + label-free MERGE for others.
+    """flush() MERGEs node identity on the universal :Node label.
 
-    Session nodes use MERGE (n:Session {node_id, workspace}) so they benefit from the
-    Session uniqueness constraint, preventing concurrent-worker duplicate nodes.
-    Non-session nodes use label-free MERGE (no uniqueness constraint needed).
-    Labels beyond Session (RootSession, SubSession, ForkedSession) are applied separately
-    via MATCH ... SET n:Label after the MERGE.
+    All node writers (Session and others) MERGE on (n:Node {node_id, workspace}) so a
+    bare :Node placeholder created by the cross-session edge writer converges with the
+    later typed write instead of splitting identity.  Concurrent-worker atomicity is
+    guaranteed by the :Node(node_id, workspace) UNIQUENESS CONSTRAINT (it replaced the
+    former :Session-keyed MERGE + :Session constraint for this purpose).  The :Session
+    type label is applied via ``SET n:Session`` in the same MERGE statement; labels
+    beyond Session (RootSession, SubSession, ForkedSession) are applied separately via
+    MATCH ... SET n:Label.
     """
 
     def _make_store(self) -> Neo4jGraphStore:
         return _make_store(workspace="test-ws")
 
     async def test_flush_session_node_merge_includes_session_label(self) -> None:
-        """flush() MERGE for Session nodes must include the Session label.
+        """flush() MERGE for Session nodes keys on :Node and SETs the Session label.
 
-        Correct:  MERGE (n:Session {node_id: ..., workspace: ...})
-        Wrong:    MERGE (n {node_id: ..., workspace: ...})
+        Correct:  MERGE (n:Node {node_id: ..., workspace: ...}) SET ... n:Session
+        Wrong:    MERGE (n:Session {node_id: ..., workspace: ...})   (splits identity
+                  vs a bare :Node placeholder created by the cross-session edge writer)
 
-        Using the Session label in MERGE lets the uniqueness constraint on
-        (Session.node_id, Session.workspace) make concurrent MERGEs atomic —
-        preventing duplicate nodes from concurrent worker flushes.
+        Identity MERGEs on the universal :Node label so a placeholder endpoint
+        converges with this typed write; the :Node(node_id, workspace) uniqueness
+        constraint makes concurrent MERGEs atomic (the role :Session used to play).
+        The :Session type label is still guaranteed — applied via SET in the same
+        statement.
         """
         import re
 
@@ -1272,9 +1278,13 @@ class TestNeo4jGraphStoreFlushNoLabelMerge:
             if c.args and "MERGE" in str(c.args[0])
         ]
         assert merge_queries, "Expected at least one MERGE query during flush"
-        # Session nodes must use Session-label MERGE (benefits from uniqueness constraint)
-        assert any(re.search(r"MERGE\s*\(n:Session\s*\{", q) for q in merge_queries), (
-            f"flush() MUST use 'MERGE (n:Session {{...}})' for Session nodes. "
+        # Session node identity MERGEs on :Node (converges with edge-writer placeholders;
+        # atomic via the :Node uniqueness constraint) and SETs the :Session label.
+        assert any(
+            re.search(r"MERGE\s*\(n:Node\s*\{", q) and "n:Session" in q
+            for q in merge_queries
+        ), (
+            f"flush() MUST MERGE Session-node identity on :Node and SET n:Session. "
             f"Queries issued: {merge_queries}"
         )
 
@@ -1315,13 +1325,14 @@ class TestNeo4jGraphStoreFlushNoLabelMerge:
             if c.args and "MERGE" in str(c.args[0])
         ]
         assert merge_queries_flush2, "Expected MERGE queries in flush 2"
-        # Both flush cycles must use Session-label MERGE for this Session node
+        # Both flush cycles MERGE identity on :Node (converges across cycles + with
+        # edge-writer placeholders; atomic via the :Node uniqueness constraint).
         assert any(
-            re.search(r"MERGE\s*\(n:Session\s*\{", q) for q in merge_queries_flush2
+            re.search(r"MERGE\s*\(n:Node\s*\{", q) for q in merge_queries_flush2
         ), (
-            f"Flush 2 MUST use 'MERGE (n:Session {{...}})' for Session nodes. "
-            f"Session base label is always present, so this MERGE finds the existing node. "
-            f"Queries seen: {merge_queries_flush2}"
+            f"Flush 2 MUST MERGE Session-node identity on :Node. "
+            f"Identity is always (node_id, workspace) on :Node, so this MERGE finds "
+            f"the existing node across cycles. Queries seen: {merge_queries_flush2}"
         )
 
         # Labels must be applied separately via MATCH ... SET n:Label
@@ -1338,10 +1349,12 @@ class TestNeo4jGraphStoreFlushNoLabelMerge:
 
     @pytest.mark.anyio
     async def test_flush_session_nodes_use_label_aware_merge(self) -> None:
-        """Session nodes must use MERGE (n:Session ...) not label-free MERGE.
+        """Session nodes MERGE identity on :Node (SET n:Session), not label-free MERGE.
 
-        Regression test: label-free MERGE doesn't benefit from the Session uniqueness
-        constraint, allowing concurrent flushes to create duplicates.
+        Regression test: a label-free MERGE (n {...}) is unindexed (AllNodesScan) and
+        unconstrained; identity MERGEs on :Node so it is index-backed and made atomic
+        by the :Node(node_id, workspace) uniqueness constraint, preventing concurrent
+        flushes (and edge-writer placeholders) from creating duplicates.
         """
         store = self._make_store()
         store._node_buffer["s1"] = {
@@ -1380,10 +1393,11 @@ class TestNeo4jGraphStoreFlushNoLabelMerge:
             q for q in captured_queries if "MERGE" in q and "row.node_id" in q
         ]
         assert merge_queries, "Must have at least one MERGE query"
-        # Session nodes must use MERGE (n:Session ...) — not label-free MERGE (n {..})
+        # Session-node identity MERGEs on :Node (index-backed + atomic via the :Node
+        # uniqueness constraint) and SETs the :Session label — never a label-free MERGE.
         for q in merge_queries:
-            assert "MERGE (n:Session {" in q, (
-                f"Session nodes must use label-aware MERGE with Session label. Got: {q}"
+            assert "MERGE (n:Node {" in q and "n:Session" in q, (
+                f"Session nodes must MERGE identity on :Node and SET n:Session. Got: {q}"
             )
 
     @pytest.mark.anyio
@@ -2102,6 +2116,14 @@ class TestSchemaConstraintAllowList:
         async def _run(query, *args, **kwargs):
             if "CREATE CONSTRAINT" in query:
                 raise err
+            if "RETURN count(n) AS remaining" in query:
+                # Backfill verification count — model a fully-tagged graph (0
+                # untagged) so the migration logs INFO, not the incomplete WARNING.
+                # (A bare AsyncMock() would yield MagicMock-int == 1, a spurious
+                # "backfill incomplete" warning unrelated to these constraint tests.)
+                result = AsyncMock()
+                result.single = AsyncMock(return_value={"remaining": 0})
+                return result
             return AsyncMock()
 
         mock_session = AsyncMock()
