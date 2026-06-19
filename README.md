@@ -106,6 +106,30 @@ The Docker Compose stack ships with the **APOC** plugin (Awesome Procedures On
 Cypher) enabled on the Neo4j service. APOC adds ~190 procedures and ~246
 functions used for graph maintenance, migrations, and richer Cypher queries.
 
+### Neo4j version policy
+
+This project tracks the **latest Neo4j Community release** — currently
+**`2026.05.0`** (the calendar-versioned line). It is pinned to a concrete tag
+(not the moving `neo4j:latest`) so builds are reproducible and the air-gap path
+is deterministic.
+
+> **Heads up — two Neo4j release lines, easily confused:**
+> - **Calendar line** (`2026.05.0`, what `neo4j:latest` resolves to) — newest
+>   features. **This is what this project pins.**
+> - **5.26 LTS line** (e.g. `5.26.27`) — long-term support; older scheme.
+>
+> Do not mix them up: `2026.05.0` is *newer* than `5.26.x`, even though `5` looks
+> larger than `2026.05`'s minor.
+
+**There is no separate APOC version to manage.** APOC Core ships bundled inside
+the official Neo4j image, and `NEO4J_PLUGINS=["apoc"]` (and the baked
+`neo4j.Dockerfile` glob) installs whatever `apoc-<version>-core.jar` the image
+carries — so **APOC always matches the Neo4j version automatically**.
+
+**To bump the Neo4j version**, change the tag in these places (APOC follows):
+`docker-compose.yml`, `neo4j.Dockerfile`, `docker-compose.airgap.yml`,
+`docs/service-setup.md`, and the `NEO4J_VERSION` default + `test/airgap/` checks.
+
 ### How it is enabled
 
 APOC is enabled by a single environment variable on the `neo4j` service in
@@ -113,19 +137,19 @@ APOC is enabled by a single environment variable on the `neo4j` service in
 
 ```yaml
 neo4j:
-  image: neo4j:5.26.22-community
+  image: neo4j:2026.05.0-community
   environment:
     NEO4J_PLUGINS: '["apoc"]'
 ```
 
-On startup Neo4j 5.x auto-installs the bundled `apoc-core` jar from
+On startup Neo4j auto-installs the bundled `apoc-core` jar from
 `/var/lib/neo4j/labs` into `/var/lib/neo4j/plugins` and applies APOC's default
 configuration (which includes `dbms.security.procedures.unrestricted=apoc.*`).
 
 - **No volume mount or manual jar download is required.** The jar lives on the
   image layer and is re-installed on every container start, so it survives
   rebuilds automatically.
-- **APOC Core only.** `neo4j:5.26.22-community` bundles APOC Core. APOC
+- **APOC Core only.** `neo4j:2026.05.0-community` bundles APOC Core. APOC
   Extended is not included and is not needed.
 
 ### Verify APOC is loaded
@@ -133,7 +157,7 @@ configuration (which includes `dbms.security.procedures.unrestricted=apoc.*`).
 ```bash
 docker compose exec neo4j \
   cypher-shell -u neo4j -p "<password>" "RETURN apoc.version();"
-# → "5.26.22"  (matches the Neo4j version)
+# → "2026.05.0"  (matches the Neo4j version)
 ```
 
 > If you run a **standalone** Neo4j container (the `docker run` examples in this
@@ -149,7 +173,7 @@ must then be **provisioned locally** — it cannot be downloaded. Two facts make
 this straightforward:
 
 1. **The default `NEO4J_PLUGINS=["apoc"]` path is already offline-safe for APOC
-   Core.** On Neo4j 5.x the APOC Core jar ships *inside* the official image at
+   Core.** The APOC Core jar ships *inside* the official image at
    `/var/lib/neo4j/labs/`; the startup installer copies it from there into
    `/var/lib/neo4j/plugins/` — it does **not** reach the internet. (Verified by
    running the container with networking fully disabled: the jar still installs
@@ -168,15 +192,16 @@ this straightforward:
    ```
 
 > **Base image must be pre-loaded too.** On a fully disconnected host you also
-> cannot `docker pull neo4j:5.26.22-community`. Pre-load it on a connected
-> machine and transfer it — `docker save neo4j:5.26.22-community -o neo4j.tar`
+> cannot `docker pull neo4j:2026.05.0-community`. Pre-load it on a connected
+> machine and transfer it — `docker save neo4j:2026.05.0-community -o neo4j.tar`
 > then `docker load -i neo4j.tar` on the air-gapped host — or pull from an
 > internal registry mirror. The base image carries the bundled APOC Core jar the
 > build copies, so everything else then runs with zero internet access.
 
 This air-gapped path has been validated in an isolated environment with the
 Neo4j container cut off from the internet (no default route; outbound to
-`dist.neo4j.org:443` blocked): `RETURN apoc.version()` returns `5.26.22`, APOC
+`dist.neo4j.org:443` blocked): `RETURN apoc.version()` returns the image's
+matching version (e.g. `2026.05.0`), APOC
 procedures run, built-in `db.*` procedures are unaffected, and no plugin
 download occurs.
 
@@ -250,7 +275,7 @@ docker run -d --name neo4j-ci \
   -p 7474:7474 -p 7687:7687 \
   -e NEO4J_AUTH=none \
   -e 'NEO4J_PLUGINS=["apoc"]' \
-  neo4j:5.26.22-community
+  neo4j:2026.05.0-community
 ```
 
 The `NEO4J_PLUGINS=["apoc"]` line enables the APOC plugin (see
@@ -260,7 +285,9 @@ Compose stack.
 
 **Option B — Neo4j Desktop / existing instance:**
 
-Use any Neo4j 5.x instance. Note the bolt URL, username, and password — you will need them in the next step.
+Use any current Neo4j instance — the calendar `2026.x` line (recommended, what
+this project tracks) or the `5.26` LTS line. Note the bolt URL, username, and
+password — you will need them in the next step.
 
 ### 3. Configure the server
 

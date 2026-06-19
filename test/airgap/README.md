@@ -28,7 +28,7 @@ assert APOC is functional.
 test/airgap/verify-airgap-apoc.sh
 ```
 
-Exit code `0` = PASS. Env overrides: `NEO4J_VERSION` (default `5.26.22`),
+Exit code `0` = PASS. Env overrides: `NEO4J_VERSION` (default `2026.05.0`),
 `IMAGE_TAG`, `KEEP=1` (leave container/network/image up for inspection).
 
 What it asserts:
@@ -56,7 +56,7 @@ the profile file, so it can be launched from anywhere in the repo.
 
 These checks use build-time internet only to pull the base `neo4j` image and (for
 the DTU path) install Docker. On a **fully** disconnected host you must pre-load
-the base image too — `docker save neo4j:5.26.22-community -o neo4j.tar` on a
+the base image too — `docker save neo4j:2026.05.0-community -o neo4j.tar` on a
 connected machine, then `docker load -i neo4j.tar` on the air-gapped host (or use
 an internal registry mirror). The base image carries the bundled APOC Core jar
 the build copies, so everything else then runs with zero internet access.

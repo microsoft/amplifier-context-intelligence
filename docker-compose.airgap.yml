@@ -8,7 +8,7 @@
 #   docker compose -f docker-compose.yml -f docker-compose.airgap.yml up -d --build
 #
 # On a fully disconnected host, also pre-load the base image first (on a
-# connected machine: `docker save neo4j:5.26.22-community -o neo4j.tar`; on the
+# connected machine: `docker save neo4j:2026.05.0-community -o neo4j.tar`; on the
 # air-gapped host: `docker load -i neo4j.tar`) or pull it from an internal
 # registry mirror. Everything else then runs offline.
 services:
@@ -16,7 +16,7 @@ services:
     build:
       context: .
       dockerfile: neo4j.Dockerfile
-    image: amplifier-context-intelligence-neo4j-apoc:5.26.22
+    image: amplifier-context-intelligence-neo4j-apoc:2026.05.0
     environment:
       # APOC jar is baked into the image and its security config is set in the
       # Dockerfile. Disable the NEO4J_PLUGINS installer so nothing attempts to

@@ -3,10 +3,9 @@
 # WHY THIS EXISTS
 # ---------------
 # The default stack enables APOC via `NEO4J_PLUGINS=["apoc"]` (see
-# docker-compose.yml). On Neo4j 5.x that mechanism installs APOC *Core* from a
-# jar already bundled inside the official image at /var/lib/neo4j/labs — it does
-# NOT reach the internet for APOC Core. That is already safe for most offline
-# environments.
+# docker-compose.yml). That mechanism installs APOC *Core* from a jar already
+# bundled inside the official image at /var/lib/neo4j/labs — it does NOT reach
+# the internet for APOC Core. That is already safe for most offline environments.
 #
 # This image goes one step further for *air-tight* deployments — environments
 # where the Neo4j container has no internet egress at all and you want zero
@@ -20,12 +19,17 @@
 #   docker compose -f docker-compose.yml -f docker-compose.airgap.yml up -d --build
 #
 # In a truly disconnected host you must also pre-load the BASE image
-# (neo4j:5.26.22-community) — e.g. `docker save` it on a connected machine and
+# (neo4j:2026.05.0-community) — e.g. `docker save` it on a connected machine and
 # `docker load` it on the air-gapped host, or pull it from an internal registry
 # mirror. The base image carries the bundled APOC Core jar this build copies.
-FROM neo4j:5.26.22-community
+#
+# Keep this tag in sync with docker-compose.yml. The APOC version follows the
+# image automatically (the cp glob below matches whatever apoc-*-core.jar the
+# image bundles), so there is no separate APOC version to bump.
+FROM neo4j:2026.05.0-community
 
 # Bake the bundled APOC Core jar into the live plugins dir (no download).
+# The glob matches the image's bundled APOC version (e.g. apoc-2026.05.0-core.jar).
 RUN cp /var/lib/neo4j/labs/apoc-*-core.jar /var/lib/neo4j/plugins/apoc.jar
 
 # APOC's own default config. ONLY `unrestricted` — do NOT set `allowlist` to

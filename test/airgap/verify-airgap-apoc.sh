@@ -16,14 +16,14 @@
 #   test/airgap/verify-airgap-apoc.sh
 #
 # Env overrides:
-#   NEO4J_VERSION   expected APOC/Neo4j version (default: 5.26.22)
+#   NEO4J_VERSION   expected APOC/Neo4j version (default: 2026.05.0)
 #   IMAGE_TAG       built image tag (default: amplifier-ci-neo4j-apoc-airgap:test)
 #   KEEP            set to 1 to leave the container/network/image for inspection
 #
 # Exit code 0 = PASS, non-zero = FAIL.
 set -euo pipefail
 
-NEO4J_VERSION="${NEO4J_VERSION:-5.26.22}"
+NEO4J_VERSION="${NEO4J_VERSION:-2026.05.0}"
 IMAGE_TAG="${IMAGE_TAG:-amplifier-ci-neo4j-apoc-airgap:test}"
 KEEP="${KEEP:-0}"
 

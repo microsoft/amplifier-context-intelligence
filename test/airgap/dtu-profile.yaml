@@ -4,7 +4,8 @@
 # stands up a fresh Incus container, installs Docker inside it, builds the
 # air-tight Neo4j image from this repo's neo4j.Dockerfile (which bakes the APOC
 # Core jar at BUILD time from the official image's bundled
-# /var/lib/neo4j/labs/apoc-*-core.jar -- no external plugin download), then runs
+# /var/lib/neo4j/labs/apoc-*-core.jar (version matches the image) -- no external
+# plugin download), then runs
 # that image on a Docker *internal* network (no NAT / no egress) and verifies
 # APOC loads with the Neo4j container cut off from the internet.
 #
@@ -66,8 +67,8 @@ provision:
     # Build the air-tight image (pulls base neo4j, bakes APOC jar at build time).
     - |
       docker build -f /root/neo4j-build/neo4j.Dockerfile \
-        -t neo4j-apoc-airgap:5.26.22 /root/neo4j-build
-      docker image inspect neo4j-apoc-airgap:5.26.22 >/dev/null \
+        -t neo4j-apoc-airgap:2026.05.0 /root/neo4j-build
+      docker image inspect neo4j-apoc-airgap:2026.05.0 >/dev/null \
         || { echo "image build failed"; exit 1; }
 
     # AIR-GAP RUN + VERIFY: run the baked image on an INTERNAL docker network
@@ -76,7 +77,7 @@ provision:
       set -e
       docker network create --internal apoc-airgap-net
       docker run -d --name neo4j-airgap --network apoc-airgap-net \
-        -e NEO4J_AUTH=neo4j/airgaptestpw neo4j-apoc-airgap:5.26.22
+        -e NEO4J_AUTH=neo4j/airgaptestpw neo4j-apoc-airgap:2026.05.0
       echo "waiting for Neo4j to start (air-gapped)..."
       for i in $(seq 1 30); do
         docker logs neo4j-airgap 2>&1 | grep -q "Started." && break
@@ -93,7 +94,7 @@ provision:
       VER=$(docker exec neo4j-airgap cypher-shell -u neo4j -p airgaptestpw --format plain \
         "RETURN apoc.version();" | tr -d '"[:space:]' | tail -1)
       echo "apoc.version() = ${VER}"
-      [ "${VER}" = "5.26.22" ] || { echo "FAIL: apoc.version mismatch"; exit 1; }
+      [ "${VER}" = "2026.05.0" ] || { echo "FAIL: apoc.version mismatch"; exit 1; }
       # Built-in db.* must still work (allowlist not over-restricted).
       docker exec neo4j-airgap cypher-shell -u neo4j -p airgaptestpw --format plain \
         "CALL db.labels() YIELD label RETURN count(label);" >/dev/null \
@@ -104,6 +105,6 @@ readiness:
   - name: docker-ready
     command: "docker info >/dev/null 2>&1"
   - name: airgap-image-built
-    command: "docker image inspect neo4j-apoc-airgap:5.26.22 >/dev/null 2>&1"
+    command: "docker image inspect neo4j-apoc-airgap:2026.05.0 >/dev/null 2>&1"
   - name: apoc-verified-airgapped
-    command: "docker exec neo4j-airgap cypher-shell -u neo4j -p airgaptestpw 'RETURN apoc.version();' 2>/dev/null | grep -q 5.26.22"
+    command: "docker exec neo4j-airgap cypher-shell -u neo4j -p airgaptestpw 'RETURN apoc.version();' 2>/dev/null | grep -q 2026.05.0"

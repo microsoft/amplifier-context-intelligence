@@ -51,11 +51,11 @@ docker run -d \
   -e NEO4J_AUTH=neo4j/${NEO4J_PASSWORD} \
   -e 'NEO4J_PLUGINS=["apoc"]' \
   -v "${DATA_DIR}/neo4j:/data" \
-  neo4j:5.26.22-community
+  neo4j:2026.05.0-community
 ```
 
 > **APOC plugin:** `-e 'NEO4J_PLUGINS=["apoc"]'` enables the APOC plugin, matching
-> the Docker Compose stack. Neo4j 5.x auto-installs the bundled `apoc-core` jar at
+> the Docker Compose stack. Neo4j auto-installs the bundled `apoc-core` jar at
 > startup (from `/var/lib/neo4j/labs` into `/var/lib/neo4j/plugins`) and applies
 > APOC's default config — no volume mount or manual jar download is required, and
 > it re-installs on every container start. Verify with
@@ -70,7 +70,7 @@ docker run -d \
 > `neo4j.Dockerfile` + `docker-compose.airgap.yml`
 > (`docker compose -f docker-compose.yml -f docker-compose.airgap.yml up -d --build`).
 > On a fully disconnected host, also pre-load the base image first:
-> `docker save neo4j:5.26.22-community -o neo4j.tar` on a connected machine, then
+> `docker save neo4j:2026.05.0-community -o neo4j.tar` on a connected machine, then
 > `docker load -i neo4j.tar` on the air-gapped host (or use an internal registry
 > mirror).
 

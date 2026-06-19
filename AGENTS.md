@@ -60,7 +60,7 @@ uv run pytest tests/ -q                    # All tests (no Neo4j required)
 uv run pytest tests/neo4j/ -q              # Neo4j tests (requires running instance)
 ```
 
-Most tests run against in-memory fakes. The `tests/neo4j/` suite requires a live Neo4j 5.x instance — see `tests/neo4j/conftest.py` for connection details.
+Most tests run against in-memory fakes. The `tests/neo4j/` suite requires a live Neo4j instance (the calendar `2026.x` line that this project tracks, or `5.26` LTS) — see `tests/neo4j/conftest.py` for connection details.
 
 ---
 
@@ -72,7 +72,7 @@ docker run -d --name neo4j-ci \
   -p 7474:7474 -p 7687:7687 \
   -e NEO4J_AUTH=none \
   -e 'NEO4J_PLUGINS=["apoc"]' \
-  neo4j:5.26.22-community
+  neo4j:2026.05.0-community
 
 # 2. Configure and start the server
 cp server-config.example.yaml server-config.yaml
@@ -109,23 +109,31 @@ environment:
 -e 'NEO4J_PLUGINS=["apoc"]'
 ```
 
-Neo4j 5.x auto-installs the bundled `apoc-core` jar from `/var/lib/neo4j/labs`
+Neo4j auto-installs the bundled `apoc-core` jar from `/var/lib/neo4j/labs`
 into `/var/lib/neo4j/plugins` at every startup and applies APOC's default config
 (including `dbms.security.procedures.unrestricted=apoc.*`). **No volume mount and
 no manual jar download are required** — the jar lives on the image layer and
-re-installs on each container start. `neo4j:5.26.22-community` bundles APOC Core;
-APOC Extended is neither included nor needed. Hosted **AuraDB** already has APOC
-Core preinstalled.
+re-installs on each container start. The image bundles APOC Core; APOC Extended
+is neither included nor needed. **APOC tracks the Neo4j version automatically**
+(the bundled jar matches the image), so there is no separate APOC version to
+manage. Hosted **AuraDB** already has APOC Core preinstalled.
+
+This project pins the **latest Neo4j Community release** — currently
+`2026.05.0-community` (the calendar line, what `neo4j:latest` resolves to), not
+the moving `latest` tag. Do not confuse it with the `5.26` LTS line; `2026.05.0`
+is newer. To bump, change the tag in `docker-compose.yml`, `neo4j.Dockerfile`,
+`docker-compose.airgap.yml`, `docs/service-setup.md`, and `test/airgap/` — APOC
+follows automatically.
 
 Verify: `cypher-shell -u neo4j -p <pw> "RETURN apoc.version();"` → matches the
-Neo4j version (e.g. `5.26.22`). Canonical setup docs: `README.md`
-("Neo4j Plugins (APOC)") and `docs/service-setup.md` (Step 2).
+Neo4j version (e.g. `2026.05.0`). Canonical setup docs: `README.md`
+("Neo4j Plugins (APOC)" / "Neo4j version policy") and `docs/service-setup.md` (Step 2).
 
 **Air-gapped / offline provisioning.** When provisioning Neo4j in an environment
 with no internet egress, do NOT rely on a download. Two facts:
 
 1. `NEO4J_PLUGINS=["apoc"]` is already offline-safe for APOC **Core** — Neo4j
-   5.x copies the jar from the in-image `/var/lib/neo4j/labs/` dir, never the
+   copies the jar from the in-image `/var/lib/neo4j/labs/` dir, never the
    network. (Confirmed: the install happens even with networking disabled.)
 2. For an air-tight guarantee that skips the installer entirely, use the baked
    image: **`neo4j.Dockerfile`** (copies the bundled APOC Core jar into
@@ -134,7 +142,7 @@ with no internet egress, do NOT rely on a download. Two facts:
    `docker compose -f docker-compose.yml -f docker-compose.airgap.yml up -d --build`.
 
 On a fully disconnected host, also pre-load the **base image** itself
-(`docker save neo4j:5.26.22-community` → `docker load`, or an internal registry
+(`docker save neo4j:2026.05.0-community` → `docker load`, or an internal registry
 mirror) — you cannot `docker pull` it either. Do NOT set
 `dbms.security.procedures.allowlist=apoc.*`; that blocks built-in `db.*`/`dbms.*`
 procedures. Only `unrestricted=apoc.*` is needed. This path was validated in an
