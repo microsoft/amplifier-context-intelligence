@@ -361,6 +361,17 @@ See [docs/azure-deployment.md](docs/azure-deployment.md) for a full guide to dep
 
 ---
 
+## Sharing with Trusted Peers
+
+To let a few trusted people on **other networks** send their sessions to your server
+— privately, exposing only the `/events` endpoint and nothing else — see
+[docs/remote-access-sharing.md](docs/remote-access-sharing.md). It covers loopback
+binding, exposing a single path over Tailscale, and per-peer access scoping
+(including a common ACL pitfall that silently grants too much). Hand your peers
+[docs/peer-onboarding.md](docs/peer-onboarding.md) to get them connected.
+
+---
+
 ## Network Access and Security
 
 The server defaults to `server_host: 0.0.0.0`, which binds on **all network interfaces** — loopback, LAN, and any container bridges (Docker, Incus). This is intentional: worker containers and DTU containers use the host's bridge gateway IP to reach the server, and they cannot reach `127.0.0.1` (the host's loopback) from inside a container. On a single-user development machine behind a NAT router or firewall, binding to 0.0.0.0 is safe. If you deploy the server in an environment where port 8000 (or your configured `server_port`) is reachable from untrusted networks, restrict access with a firewall rule to trusted source IPs. Use `server_host: 127.0.0.1` only when you are certain no container processes will ever need to reach the server.
