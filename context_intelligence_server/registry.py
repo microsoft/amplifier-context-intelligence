@@ -498,6 +498,7 @@ class SessionRegistry:
                 auth=neo4j_auth,
                 flush_chunk_rows=settings.neo4j_flush_chunk_rows,
                 flush_chunk_bytes=settings.neo4j_flush_chunk_bytes,
+                neo4j_lock_timeout=settings.neo4j_lock_timeout,
             )
             self._workers[session_id] = SessionWorker(
                 session_id=session_id,
