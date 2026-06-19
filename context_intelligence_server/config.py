@@ -129,8 +129,19 @@ class Settings(BaseSettings):
     max_delivery_attempts: int = 5  # flush retries for one batch before dead-letter
     # Sub-transaction chunk bounds for _flush_body (issue #278).
     # A chunk closes when EITHER bound trips first: cardinality or payload size.
-    neo4j_flush_chunk_rows: int = 100  # max rows per sub-transaction (cardinality bound)
-    neo4j_flush_chunk_bytes: int = 4_194_304  # max serialized bytes per sub-tx (4 MiB payload bound)
+    neo4j_flush_chunk_rows: int = (
+        100  # max rows per sub-transaction (cardinality bound)
+    )
+    neo4j_flush_chunk_bytes: int = (
+        4_194_304  # max serialized bytes per sub-tx (4 MiB payload bound)
+    )
+    neo4j_lock_timeout: float = (
+        30.0  # per-transaction server-side timeout in seconds (Layer B)
+    )
+    # A conservative default matching max_transaction_retry_time=30s.  Prevents
+    # a blocked flush from parking indefinitely when db.lock.acquisition.timeout=0
+    # (Neo4j default) holds all write_semaphore permits and stalls the pipeline.
+    # Set to 0 to disable (no per-transaction timeout).
 
     # -------------------------------------------------------------------------
     # Logging

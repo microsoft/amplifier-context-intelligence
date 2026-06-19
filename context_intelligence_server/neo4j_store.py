@@ -17,7 +17,7 @@ import re
 from datetime import datetime
 from typing import Any, Generator, LiteralString, cast
 
-from neo4j import AsyncGraphDatabase
+from neo4j import AsyncGraphDatabase, unit_of_work as _unit_of_work
 from neo4j.exceptions import Neo4jError
 
 _LOG = logging.getLogger(__name__)
@@ -552,23 +552,35 @@ class Neo4jGraphStore:
         workspace: str | None = None,
         flush_chunk_rows: int = 100,
         flush_chunk_bytes: int = 4_194_304,
+        neo4j_lock_timeout: float | None = None,
     ) -> None:
         """Initialise the store and create the async Neo4j driver.
 
         Args:
-            uri:       Bolt/neo4j URI, e.g. ``bolt://localhost:7687``.
-            auth:      ``(username, password)`` tuple, or ``None`` for no-auth.
-            database:  Target Neo4j database name (default: ``"neo4j"``).
-            workspace: Workspace to scope writes to.  ``None`` resolves to
-                       ``"default"`` via the ``workspace`` property.
+            uri:               Bolt/neo4j URI, e.g. ``bolt://localhost:7687``.
+            auth:              ``(username, password)`` tuple, or ``None`` for no-auth.
+            database:          Target Neo4j database name (default: ``"neo4j"``).
+            workspace:         Workspace to scope writes to.  ``None`` resolves to
+                               ``"default"`` via the ``workspace`` property.
+            neo4j_lock_timeout: Server-side transaction timeout in seconds
+                               (Layer B — fail loud).  When set, every
+                               ``execute_write`` call is wrapped with
+                               ``unit_of_work(timeout=neo4j_lock_timeout)``
+                               so a blocked flush raises ``Neo4jError``
+                               instead of parking forever.  ``None`` disables
+                               the timeout (default: no per-transaction limit).
+                               Also sets ``connection_acquisition_timeout`` on
+                               the driver to the same value so pool-exhaustion
+                               failures also surface quickly.
         """
         # Explicit auto-retry budget for transient errors (e.g. deadlocks) so the
         # managed-transaction retry window is deliberate and reviewable rather than
         # relying on the driver default implicitly. 30.0s is a working default;
         # design Open Question #3 — verify driver 6.1.0 backoff constants before tuning.
-        self._driver = AsyncGraphDatabase.driver(
-            uri, auth=auth, max_transaction_retry_time=30.0
-        )
+        driver_kwargs: dict[str, Any] = {"max_transaction_retry_time": 30.0}
+        if neo4j_lock_timeout is not None and neo4j_lock_timeout > 0:
+            driver_kwargs["connection_acquisition_timeout"] = neo4j_lock_timeout
+        self._driver = AsyncGraphDatabase.driver(uri, auth=auth, **driver_kwargs)
         self._database = database
         self._workspace = workspace
         self._node_buffer: dict[str, dict[str, Any]] = {}
@@ -579,6 +591,11 @@ class Neo4jGraphStore:
         self._flush_lock: asyncio.Lock = asyncio.Lock()
         self._flush_chunk_rows: int = max(1, flush_chunk_rows)
         self._flush_chunk_bytes: int = max(1, flush_chunk_bytes)
+        self._neo4j_lock_timeout: float | None = (
+            neo4j_lock_timeout
+            if neo4j_lock_timeout and neo4j_lock_timeout > 0
+            else None
+        )
 
     # ------------------------------------------------------------------
     # workspace property
@@ -809,6 +826,30 @@ class Neo4jGraphStore:
 
         rows = self._flush_chunk_rows
         byts = self._flush_chunk_bytes
+
+        # Layer A — global lock-acquisition order.
+        # Sort both snapshots by key BEFORE chunking so every concurrent flush
+        # visits node_ids and (src_id, dst_id) pairs in the same monotonically
+        # increasing order.  A single consistent order rules out circular
+        # wait-for cycles across transactions: if every flush processes key X
+        # before key Y, no flush can ever hold Y while waiting for X.
+        # (Cost: O(N log N) on snapshot keys, always negligible next to I/O.)
+        node_snapshot_sorted = dict(sorted(node_snapshot.items()))
+        edge_snapshot_sorted = dict(sorted(edge_snapshot.items()))
+
+        # Layer B — fail loud via finite transaction timeout.
+        # Wrap _write_batch with unit_of_work(timeout=) so the Neo4j server
+        # aborts a transaction that cannot acquire locks within the configured
+        # window.  Without this, db.lock.acquisition.timeout=0 (server default)
+        # parks the coroutine forever, exhausting write_semaphore permits and
+        # stalling the entire drain pipeline.
+        if self._neo4j_lock_timeout is not None:
+            _bounded_write = _unit_of_work(timeout=self._neo4j_lock_timeout)(
+                _write_batch
+            )
+        else:
+            _bounded_write = _write_batch
+
         success = False
         try:
             await self._ensure_schema()
@@ -816,24 +857,24 @@ class Neo4jGraphStore:
             # Phase 1: nodes — each chunk is its own execute_write (independent commit).
             # Do NOT wrap multiple chunks in one explicit transaction — that would
             # re-collapse the memory bound and defeat the chunking.
-            for chunk in _chunk_dict(node_snapshot, rows, byts):
+            for chunk in _chunk_dict(node_snapshot_sorted, rows, byts):
                 async with self._driver.session(database=self._database) as db_session:
                     await db_session.execute_write(
-                        _write_batch, chunk, {}, [], self.workspace
+                        _bounded_write, chunk, {}, [], self.workspace
                     )
 
             # Phase 2: label patches — each chunk is its own execute_write.
             for chunk in _chunk_list(patch_snapshot, rows, byts):
                 async with self._driver.session(database=self._database) as db_session:
                     await db_session.execute_write(
-                        _write_batch, {}, {}, chunk, self.workspace
+                        _bounded_write, {}, {}, chunk, self.workspace
                     )
 
             # Phase 3: edges — each chunk is its own execute_write.
-            for chunk in _chunk_dict(edge_snapshot, rows, byts):
+            for chunk in _chunk_dict(edge_snapshot_sorted, rows, byts):
                 async with self._driver.session(database=self._database) as db_session:
                     await db_session.execute_write(
-                        _write_batch, {}, chunk, [], self.workspace
+                        _bounded_write, {}, chunk, [], self.workspace
                     )
 
             success = True

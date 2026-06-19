@@ -101,6 +101,7 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
         max_delivery_attempts: int = _real.max_delivery_attempts
         neo4j_flush_chunk_rows: int = _real.neo4j_flush_chunk_rows
         neo4j_flush_chunk_bytes: int = _real.neo4j_flush_chunk_bytes
+        neo4j_lock_timeout: float = _real.neo4j_lock_timeout
 
     with patch(
         "context_intelligence_server.registry.get_settings",
