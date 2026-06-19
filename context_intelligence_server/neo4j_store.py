@@ -101,6 +101,65 @@ _LATTICE_NORMALIZATION = (
     " REMOVE n:RootSession)"
 )
 
+# Universal node label.  EVERY node (Session and non-Session alike) carries
+# :Node, and there is a composite :Node(node_id, workspace) index.  This lets
+# the non-Session node MERGE seek the index instead of doing an AllNodesScan
+# over the whole graph (the 1.3M-node drain stall).  :Node is an *additional*
+# label only — it is never the sole identity of a node and never replaces a
+# type label, so it preserves the original label-free MERGE semantics: identity
+# is still (node_id, workspace), independent of which type labels a node has
+# accumulated across flush cycles.
+_UNIVERSAL_NODE_LABEL = "Node"
+
+# The non-Session node MERGE, extracted so tests can assert its query plan
+# (NodeIndexSeek, never AllNodesScan).  MERGE on the universal :Node label so
+# the composite :Node(node_id, workspace) index backs the lookup.
+_NODE_MERGE_CYPHER = (
+    "UNWIND $rows AS row "
+    f"MERGE (n:{_UNIVERSAL_NODE_LABEL} "
+    "{node_id: row.node_id, workspace: row.props.workspace}) "
+    "SET n += row.props"
+)
+
+# Single-node lookup-by-identity MATCH prefix, seeking the universal :Node
+# label so the composite :Node(node_id, workspace) index backs the lookup
+# (NodeIndexSeek) instead of an AllNodesScan.  Shared by every label-write
+# query in _write_batch (the per-node label SET and the label-patch add/remove)
+# so they are DRY and the tests can assert their query plan against the exact
+# production string.
+_NODE_MATCH_BY_ID = (
+    f"MATCH (n:{_UNIVERSAL_NODE_LABEL} {{node_id: $node_id, workspace: $workspace}})"
+)
+
+
+def _edge_merge_cypher(edge_type: str) -> str:
+    """Return the UNWIND edge-MERGE query for *edge_type*.
+
+    src/dst are matched via the universal :Node label so each MATCH uses the
+    composite :Node(node_id, workspace) index (NodeIndexSeek) instead of an
+    AllNodesScan over the whole graph — the root cause of the multi-second
+    "Running" edge transactions on the 1.3M-node graph.  The relationship
+    MERGE/SET logic is unchanged from the original label-free query.
+
+    *edge_type* MUST already be validated via ``_validate_identifier`` by the
+    caller (it is interpolated into the Cypher, so it cannot be user input).
+    """
+    return (
+        "UNWIND $rows AS row "
+        f"MATCH (src:{_UNIVERSAL_NODE_LABEL} "
+        "{node_id: row.src_id, workspace: $workspace}) "
+        f"MATCH (dst:{_UNIVERSAL_NODE_LABEL} "
+        "{node_id: row.dst_id, workspace: $workspace}) "
+        f"MERGE (src)-[r:{edge_type}]->(dst) "
+        "SET r += row.props"
+    )
+
+
+# Batch size for the one-time :Node backfill migration (CALL ... IN
+# TRANSACTIONS OF N ROWS).  A literal int is required by Cypher for the batch
+# size, so this constant is interpolated (never user-supplied).
+_NODE_BACKFILL_BATCH = 10_000
+
 
 def _validate_identifier(name: str, kind: str) -> None:
     """Raise ``ValueError`` if *name* is not a safe Neo4j label / relationship-type identifier.
@@ -261,6 +320,15 @@ async def ensure_neo4j_schema(
             "FOR (n:Session) ON (n.workspace)"
         )
 
+        # Composite index backing the universal-label node MERGE.  The
+        # non-Session node write does MERGE (n:Node {node_id, workspace}); this
+        # index turns that into a NodeIndexSeek instead of an AllNodesScan over
+        # the whole graph (root cause of the 1.3M-node drain stall).
+        await _create_index(
+            f"CREATE INDEX idx_node_universal IF NOT EXISTS "
+            f"FOR (n:{_UNIVERSAL_NODE_LABEL}) ON (n.node_id, n.workspace)"
+        )
+
         # ------------------------------------------------------------------
         # Step 3: uniqueness constraint on Session nodes.
         # Must run AFTER deduplication (step 1) so pre-existing duplicates do
@@ -295,6 +363,37 @@ async def ensure_neo4j_schema(
             _LOG.warning(
                 "ensure_neo4j_schema: could not create Event uniqueness constraint "
                 "(pre-existing duplicates?): %s",
+                exc,
+            )
+
+        # ------------------------------------------------------------------
+        # Step 5: backfill the universal :Node label onto pre-existing nodes.
+        # The non-Session node MERGE targets (n:Node {node_id, workspace}) so it
+        # can use the composite :Node(node_id, workspace) index.  Nodes written
+        # before this label existed have NO :Node label, so the indexed MERGE
+        # would CREATE a duplicate of them rather than match them.  Tag every
+        # such node first.
+        #
+        # Batched + idempotent: CALL { ... } IN TRANSACTIONS commits in chunks
+        # (so 1.3M nodes don't blow the per-transaction memory cap), and the
+        # WHERE NOT n:Node guard makes re-runs converge to a no-op once the
+        # graph is fully tagged.  Must run BEFORE any flush MERGEs on :Node —
+        # ensure_neo4j_schema is awaited at the top of _flush_body, so it does.
+        # The batch size must be a literal in Cypher, so it is interpolated from
+        # the in-process int constant (never user input).
+        try:
+            await session.run(
+                cast(
+                    LiteralString,
+                    f"MATCH (n) WHERE NOT n:{_UNIVERSAL_NODE_LABEL} "
+                    f"CALL {{ WITH n SET n:{_UNIVERSAL_NODE_LABEL} }} "
+                    f"IN TRANSACTIONS OF {int(_NODE_BACKFILL_BATCH)} ROWS",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning(
+                "ensure_neo4j_schema: :Node backfill did not complete "
+                "(non-fatal, retried next startup): %s",
                 exc,
             )
 
@@ -431,21 +530,27 @@ async def _write_batch(
     # global order, preventing the out-of-order lock cycle that causes deadlocks.
     session_rows.sort(key=lambda r: r["node_id"])
     if session_rows:
+        # MERGE key stays :Session (backed by the uniqueness constraint); the
+        # universal :Node label is added via SET so every node carries it and
+        # the backfill converges permanently (no need to re-tag new sessions).
         res = await tx.run(
             "UNWIND $rows AS row "
             "MERGE (n:Session {node_id: row.node_id, workspace: row.props.workspace}) "
-            "SET n += row.props",
+            f"SET n += row.props, n:{_UNIVERSAL_NODE_LABEL}",
             rows=session_rows,
         )
         await res.consume()
 
-    # Non-session nodes: label-free MERGE (no constraint needed — single-worker owned)
+    # Non-session nodes: MERGE on the universal :Node label so the composite
+    # :Node(node_id, workspace) index backs the lookup (NodeIndexSeek) instead
+    # of an AllNodesScan over the entire graph.  Identity is still purely
+    # (node_id, workspace) — :Node is on every node, so this matches the exact
+    # same set the old label-free MERGE did, without splitting a node whose type
+    # labels change across flush cycles.
     other_rows.sort(key=lambda r: r["node_id"])
     if other_rows:
         res = await tx.run(
-            "UNWIND $rows AS row "
-            "MERGE (n {node_id: row.node_id, workspace: row.props.workspace}) "
-            "SET n += row.props",
+            cast(LiteralString, _NODE_MERGE_CYPHER),
             rows=other_rows,
         )
         await res.consume()
@@ -460,9 +565,8 @@ async def _write_batch(
     label_assignments.sort(key=lambda i: i["node_id"])
     for item in label_assignments:
         labels_str = ":".join(item["labels"])
-        cypher = (
-            f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) SET n:{labels_str}"
-        )
+        # Seek via :Node (idx_node_universal) instead of an AllNodesScan.
+        cypher = f"{_NODE_MATCH_BY_ID} SET n:{labels_str}"
         if set(item["labels"]) & _TERMINAL_LABELS:
             cypher += _LATTICE_NORMALIZATION
         res = await tx.run(
@@ -480,7 +584,7 @@ async def _write_batch(
             res = await tx.run(
                 cast(
                     LiteralString,
-                    f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) REMOVE n:{label}",
+                    f"{_NODE_MATCH_BY_ID} REMOVE n:{label}",
                 ),
                 node_id=pid,
                 workspace=workspace,
@@ -490,9 +594,7 @@ async def _write_batch(
             _validate_identifier(label, "label")
             # Lattice normalisation for patch-adds of terminal labels: same lock-first
             # guarantee — append the normalization to the SET statement.
-            cypher = (
-                f"MATCH (n {{node_id: $node_id, workspace: $workspace}}) SET n:{label}"
-            )
+            cypher = f"{_NODE_MATCH_BY_ID} SET n:{label}"
             if label in _TERMINAL_LABELS:
                 cypher += _LATTICE_NORMALIZATION
             res = await tx.run(
@@ -520,13 +622,7 @@ async def _write_batch(
 
     for edge_type, rows in edge_groups.items():
         _validate_identifier(edge_type, "edge_type")
-        edge_merge_query = (  # type: ignore[assignment]
-            f"UNWIND $rows AS row "
-            f"MATCH (src {{node_id: row.src_id, workspace: $workspace}}) "
-            f"MATCH (dst {{node_id: row.dst_id, workspace: $workspace}}) "
-            f"MERGE (src)-[r:{edge_type}]->(dst) "
-            f"SET r += row.props"
-        )
+        edge_merge_query = _edge_merge_cypher(edge_type)
         rows.sort(key=lambda r: (r["src_id"], r["dst_id"]))
         res = await tx.run(
             edge_merge_query,  # type: ignore[arg-type]
