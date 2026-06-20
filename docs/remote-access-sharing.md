@@ -122,15 +122,9 @@ reach; **ACL grants** control *which ports* on it.
 
 ### 5a. Share the machine, per peer
 In the Tailscale admin console: **Machines → (your node) → Share** → invite each
-peer by **the exact email they sign into Tailscale with**. Each accepts with their
-own (free) account. Sharing grants access to **only that one machine**, and is
-revocable per person.
-
-> **Identity is matched as an exact string.** In particular, **Gmail dots are
-> significant to Tailscale** even though Gmail ignores them for mail delivery —
-> `marc.goodner@gmail.com` and `marcgoodner@gmail.com` are *different* identities.
-> The share invite and the peer's actual login must match byte-for-byte, or the
-> peer is silently denied (see the timeout symptom in §5c).
+peer by the email they sign into Tailscale with (the share must show **Accepted**).
+Each accepts with their own (free) account. Sharing grants access to **only that one
+machine**, and is revocable per person.
 
 ### 5b. The ACL lesson that makes or breaks this
 

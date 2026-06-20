@@ -35,13 +35,6 @@ they use something else.
    **Accept it** (via the email link, or under *Machines* in your Tailscale admin
    console). You do not join their network — you just get access to that one machine.
 
-> **Accept while signed in to the exact account the owner invited.** Tailscale
-> matches your identity as an exact string — and **Gmail dots count** (`a.b@gmail.com`
-> ≠ `ab@gmail.com`). If your login differs from the address they invited, tell them
-> so they can re-share to the right one. Also: reach the server by the **URL the
-> owner gives you** (its MagicDNS name), never a raw `100.x` IP — a shared machine
-> has a different IP in your tailnet.
-
 ---
 
 ## 3. Get your credentials from the owner
