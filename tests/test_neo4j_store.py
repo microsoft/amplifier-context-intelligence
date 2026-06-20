@@ -2539,3 +2539,73 @@ class TestSchemaLatchOnSuccess:
         result = await ensure_neo4j_schema(driver)
 
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# T17-T19: per-user API keys — Neo4jGraphStore.created_by + Cypher constants
+# ---------------------------------------------------------------------------
+
+
+class TestCreatedByProperty:
+    """T17: Neo4jGraphStore.created_by property getter/setter."""
+
+    def test_created_by_defaults_to_none(self) -> None:
+        """T17: created_by is None by default after construction."""
+        store = _make_store()
+        assert store.created_by is None
+
+    def test_created_by_settable(self) -> None:
+        """T17: created_by can be set to a string value."""
+        store = _make_store()
+        store.created_by = "alice"
+        assert store.created_by == "alice"
+
+    def test_created_by_settable_to_none(self) -> None:
+        """T17: created_by can be reset to None."""
+        store = _make_store()
+        store.created_by = "alice"
+        store.created_by = None
+        assert store.created_by is None
+
+
+class TestNodeMergeCypherCreatedBy:
+    """T18: _NODE_MERGE_CYPHER includes ON CREATE SET n.created_by = $created_by."""
+
+    def test_node_merge_cypher_has_on_create_set_created_by(self) -> None:
+        """T18: _NODE_MERGE_CYPHER contains the write-once provenance clause."""
+        from context_intelligence_server.neo4j_store import _NODE_MERGE_CYPHER
+
+        assert "ON CREATE SET n.created_by = $created_by" in _NODE_MERGE_CYPHER, (
+            f"_NODE_MERGE_CYPHER must include ON CREATE SET n.created_by = $created_by; "
+            f"got:\n{_NODE_MERGE_CYPHER}"
+        )
+
+    def test_node_merge_cypher_does_not_include_created_by_in_merge_key(self) -> None:
+        """T18: created_by must NOT appear in the MERGE key (must not affect node identity)."""
+        import re
+
+        from context_intelligence_server.neo4j_store import _NODE_MERGE_CYPHER
+
+        # MERGE clause must NOT contain created_by in the key dict {...}
+        merge_match = re.search(r"MERGE\s*\(n:\w+\s*\{([^}]+)\}", _NODE_MERGE_CYPHER)
+        if merge_match:
+            merge_key = merge_match.group(1)
+            assert "created_by" not in merge_key, (
+                "created_by must NOT be part of the MERGE key — it must not affect node identity"
+            )
+
+
+class TestSessionMergeInlineCreatedBy:
+    """T19: inline Session MERGE (in _write_batch) includes ON CREATE SET n.created_by."""
+
+    def test_session_merge_has_on_create_set_created_by(self) -> None:
+        """T19: _write_batch source contains ON CREATE SET n.created_by for Session nodes."""
+        import inspect
+
+        from context_intelligence_server import neo4j_store
+
+        source = inspect.getsource(neo4j_store._write_batch)
+        assert "ON CREATE SET n.created_by = $created_by" in source, (
+            "_write_batch must contain ON CREATE SET n.created_by = $created_by "
+            "for the inline Session MERGE path"
+        )

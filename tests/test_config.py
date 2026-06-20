@@ -314,3 +314,175 @@ def test_neo4j_flush_chunk_bytes_default():
     assert s.neo4j_flush_chunk_bytes == 4_194_304, (
         f"Expected neo4j_flush_chunk_bytes == 4_194_304, got {s.neo4j_flush_chunk_bytes}"
     )
+
+
+# ---------------------------------------------------------------------------
+# T1-T5, T22: per-user API keys — _is_hex, _validate_api_keys, build_keystore
+# ---------------------------------------------------------------------------
+
+
+class TestIsHex:
+    """T1-T3: _is_hex helper."""
+
+    def test_valid_64_char_hex_string(self) -> None:
+        """T1: _is_hex accepts a valid 64-char lowercase hex string."""
+        from context_intelligence_server.config import _is_hex
+
+        assert _is_hex("a" * 64) is True
+        assert _is_hex("deadbeef" * 8) is True  # 64 hex chars
+
+    def test_mixed_case_hex_accepted(self) -> None:
+        """T1: _is_hex accepts uppercase hex chars too."""
+        from context_intelligence_server.config import _is_hex
+
+        assert _is_hex("DEADBEEF" * 8) is True
+
+    def test_too_short_rejected(self) -> None:
+        """T2: _is_hex rejects strings shorter than 32 chars."""
+        from context_intelligence_server.config import _is_hex
+
+        assert _is_hex("abc") is False
+        assert _is_hex("deadbeef") is False  # only 8 chars
+        assert _is_hex("") is False
+
+    def test_non_hex_chars_rejected(self) -> None:
+        """T3: _is_hex rejects strings with non-hex characters."""
+        from context_intelligence_server.config import _is_hex
+
+        assert _is_hex("z" * 64) is False
+        assert _is_hex("ghijklmn" * 8) is False
+        assert _is_hex("test-secret-token-not-hex-00000000000") is False
+
+
+class TestValidateApiKeys:
+    """T8-T12 / T22: _validate_api_keys enforces the NESTED shape, fail-closed.
+
+    The NESTED form (design D4) maps a 64-char SHA-256 hex digest to a metadata
+    dict carrying at least ``id``::
+
+        api_keys:
+          "<64-hex>":
+            id: owner
+    """
+
+    def test_valid_nested_api_keys_accepted(self) -> None:
+        """T8: Settings with valid <64-hex> -> {id: ...} entries succeeds."""
+        from context_intelligence_server.config import Settings
+
+        d1 = "a" * 64
+        d2 = "b" * 64
+        s = Settings(api_keys={d1: {"id": "owner"}, d2: {"id": "peer-test"}})
+        assert s.api_keys == {d1: {"id": "owner"}, d2: {"id": "peer-test"}}
+
+    def test_bad_length_key_raises(self) -> None:
+        """T9: a key that is not 64 hex chars raises ValidationError."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(api_keys={"a" * 32: {"id": "owner"}})  # 32 != 64
+
+    def test_non_hex_key_raises(self) -> None:
+        """T9: a 64-char non-hex key raises ValidationError."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(api_keys={"z" * 64: {"id": "owner"}})
+
+    def test_value_not_a_dict_raises(self) -> None:
+        """T10: a non-dict value (legacy flat string token) raises ValidationError."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(api_keys={"a" * 64: "owner"})  # type: ignore[dict-item]
+
+    def test_missing_id_raises(self) -> None:
+        """T11: a value dict missing 'id' raises ValidationError."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(api_keys={"a" * 64: {"label": "owner"}})
+
+    def test_empty_id_raises(self) -> None:
+        """T11: a value dict with empty 'id' raises ValidationError."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(api_keys={"a" * 64: {"id": ""}})
+
+    def test_empty_api_keys_is_valid(self) -> None:
+        """T12: Empty api_keys dict is valid (no auth configured)."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(api_keys={})
+        assert s.api_keys == {}
+
+    def test_none_api_keys_is_valid(self) -> None:
+        """T12: api_keys=None (default) is valid (no per-contributor keys configured)."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(api_keys=None)
+        assert s.api_keys is None
+
+
+class TestBuildKeystore:
+    """T4-T5: build_keystore maps sha256_hex(token) → contributor_id."""
+
+    def test_legacy_api_key_folds_to_owner(self) -> None:
+        """T4: build_keystore maps sha256(legacy api_key) → 'owner'."""
+        import hashlib
+
+        from context_intelligence_server.config import Settings
+
+        s = Settings(api_key="my-secret-token")
+        ks = s.build_keystore()
+        expected_digest = hashlib.sha256(b"my-secret-token").hexdigest()
+        assert ks[expected_digest] == "owner"
+
+    def test_nested_entry_digest_maps_to_id(self) -> None:
+        """T5: build_keystore reads id via meta['id']; the digest key is used verbatim."""
+        import hashlib
+
+        from context_intelligence_server.config import Settings
+
+        token = "peer-test-raw-token"
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        s = Settings(api_keys={digest: {"id": "peer-test"}})
+        ks = s.build_keystore()
+        # The digest key is used directly (NOT re-hashed) and maps to the id.
+        assert ks[digest] == "peer-test"
+
+    def test_empty_config_returns_empty_keystore(self) -> None:
+        """T4: build_keystore returns {} when neither api_key nor api_keys is set."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(api_key=None, api_keys=None)
+        assert s.build_keystore() == {}
+
+    def test_legacy_and_nested_combined(self) -> None:
+        """T5: build_keystore combines legacy api_key (→owner) with nested entries."""
+        import hashlib
+
+        from context_intelligence_server.config import Settings
+
+        legacy_token = "legacy-token"
+        peer_token = "peer-raw-token"
+        peer_digest = hashlib.sha256(peer_token.encode()).hexdigest()
+        s = Settings(
+            api_key=legacy_token,
+            api_keys={peer_digest: {"id": "peer-test"}},
+        )
+        ks = s.build_keystore()
+        legacy_digest = hashlib.sha256(legacy_token.encode()).hexdigest()
+        assert ks[legacy_digest] == "owner"
+        assert ks[peer_digest] == "peer-test"
+        assert ks[legacy_digest] == "owner"

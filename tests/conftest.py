@@ -152,9 +152,14 @@ async def auth_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncGenerator[httpx.AsyncClient, None]:
     """Client routed through asgi_app (auth middleware applied) with a test API key set."""
+    import hashlib  # noqa: PLC0415
+
     from context_intelligence_server.main import asgi_app  # noqa: PLC0415
 
-    monkeypatch.setattr(asgi_app, "api_key", "test-secret")
+    # Build a keystore that maps sha256("test-secret") → "owner" so existing
+    # integration tests that send `Authorization: Bearer test-secret` continue to work.
+    test_keystore = {hashlib.sha256(b"test-secret").hexdigest(): "owner"}
+    monkeypatch.setattr(asgi_app, "keystore", test_keystore)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=asgi_app),
         base_url="http://test",

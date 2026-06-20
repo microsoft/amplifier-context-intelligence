@@ -102,8 +102,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         try:
             obj = json.loads(batch.lines[0])
             workspace = obj.get("workspace", "")
+            created_by: str | None = obj.get("created_by")
         except (ValueError, KeyError):
             workspace = ""
+            created_by = None
         if not workspace:
             # Panel finding #10: never spawn a workspace='' worker — it would
             # violate the EventRequest non-empty-workspace invariant (422). A
@@ -113,7 +115,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 sid,
             )
             continue
-        registry.get_or_create(sid, workspace)
+        registry.get_or_create(sid, workspace, created_by=created_by)
         respawned += 1
     logger.info(
         "lifespan_startup: crash recovery respawned %d/%d drainers",
@@ -158,7 +160,7 @@ app.mount("/static", StaticFiles(directory=_WEB_DIR / "static"), name="static")
 
 def create_asgi_app() -> BearerTokenMiddleware:
     """Return the ASGI app wrapped with auth middleware."""
-    return BearerTokenMiddleware(app, api_key=_settings.api_key)
+    return BearerTokenMiddleware(app, keystore=_settings.build_keystore())
 
 
 # Module-level ASGI app used by Gunicorn: context_intelligence_server.main:asgi_app
@@ -205,6 +207,10 @@ async def _check_neo4j_connected(app_instance: FastAPI) -> bool:
 async def post_events(
     request: EventRequest, http_request: Request, replay: bool = False
 ) -> EventResponse:
+    # Read contributor_id injected by auth middleware (None when auth not configured).
+    contributor_id: str | None = http_request.scope.get("state", {}).get(
+        "contributor_id"
+    )
     session_id = request.data.get("session_id", "")
     # Idempotency-cache check + replay stay BEFORE the durable append so a
     # duplicate is rejected without persisting a second log line.
@@ -221,12 +227,16 @@ async def post_events(
     # events from distinct workspaces never collide in one log (decision #10).
     worker_key = session_id or (_NO_SESSION_PREFIX + _workspace_slug(request.workspace))
     # Spawn (or reuse) the sticky drainer keyed by worker_key.
-    registry.get_or_create(worker_key, request.workspace)
-    # Persist the EXACT request body bytes (the raw EventRequest JSON, which
-    # preserves idempotency_key) BEFORE returning 202 — this is the
-    # zero-silent-loss window. The body is compact JSON with no literal newline
-    # bytes, so the newline-delimited log framing is safe.
+    registry.get_or_create(worker_key, request.workspace, created_by=contributor_id)
+    # Re-parse the raw validated body bytes, stamp created_by (server-assigned,
+    # unconditional overwrite — kills any client-supplied spoofed value), then
+    # re-serialize compact JSON before persisting to the durable queue.
+    # IMPORTANT: re-parse raw bytes (not the pydantic model) so client extra
+    # fields are preserved. body() is cached by Starlette after the first read.
     body = await http_request.body()
+    body_obj = json.loads(body)
+    body_obj["created_by"] = contributor_id  # overwrite, never setdefault
+    body = json.dumps(body_obj, separators=(",", ":")).encode()
     await registry.queue_manager.append(worker_key, body)
     registry.record_accepted()  # count the durably-accepted event
     return EventResponse(status="queued", session_id=session_id or None)

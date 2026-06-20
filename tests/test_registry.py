@@ -440,9 +440,7 @@ class TestDrainBatchFailedThrottle:
             await qm.append(sid, _line("tool_call", "/ws", {"session_id": sid}))
             with caplog.at_level(logging.DEBUG, logger="context_intelligence_server"):
                 # Small flush_timeout drives poll_interval so the 5 retries run fast.
-                task = asyncio.create_task(
-                    reg.drain_worker(worker, flush_timeout=0.05)
-                )
+                task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
                 for _ in range(200):
                     await asyncio.sleep(0.02)
                     if any(
@@ -458,20 +456,17 @@ class TestDrainBatchFailedThrottle:
         warnings = [
             r
             for r in caplog.records
-            if r.levelno == logging.WARNING
-            and "drain_batch_failed" in r.getMessage()
+            if r.levelno == logging.WARNING and "drain_batch_failed" in r.getMessage()
         ]
         errors = [
             r
             for r in caplog.records
-            if r.levelno == logging.ERROR
-            and "drain_batch_exhausted" in r.getMessage()
+            if r.levelno == logging.ERROR and "drain_batch_exhausted" in r.getMessage()
         ]
         debugs = [
             r
             for r in caplog.records
-            if r.levelno == logging.DEBUG
-            and "drain_batch_failed" in r.getMessage()
+            if r.levelno == logging.DEBUG and "drain_batch_failed" in r.getMessage()
         ]
         with_traceback = [
             r
@@ -1873,3 +1868,72 @@ class TestSessionFinalizedLog:
             and "finaliz" in r.getMessage().lower()
             for r in caplog.records
         )
+
+
+# ---------------------------------------------------------------------------
+# T20: get_or_create accepts created_by kwarg and binds it to the store
+# ---------------------------------------------------------------------------
+
+
+class TestGetOrCreateCreatedBy:
+    """T20: get_or_create accepts created_by and binds it to the Neo4jGraphStore."""
+
+    def test_get_or_create_accepts_created_by_kwarg(self) -> None:
+        """T20: get_or_create does not raise when called with created_by kwarg."""
+        from unittest.mock import MagicMock, patch
+
+        from context_intelligence_server.registry import SessionRegistry
+
+        reg = SessionRegistry()
+
+        with (
+            patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
+            patch(
+                "context_intelligence_server.registry.AsyncDiskBlobStore"
+            ) as MockBlob,
+            patch(
+                "context_intelligence_server.registry.HookStateService"
+            ) as MockService,
+        ):
+            MockStore.return_value = MagicMock()
+            MockBlob.return_value = MagicMock()
+            mock_svc = MagicMock()
+            MockService.return_value = mock_svc
+            # Prevent actual drain task from starting
+            reg.start_drain = MagicMock()
+
+            reg.get_or_create("test-session", "/ws", created_by="alice")
+
+        # HookStateService must be called with created_by="alice"
+        MockService.assert_called_once()
+        kwargs = MockService.call_args.kwargs
+        assert kwargs.get("created_by") == "alice"
+
+    def test_get_or_create_default_created_by_is_none(self) -> None:
+        """T20: get_or_create defaults created_by to None when not provided."""
+        from unittest.mock import MagicMock, patch
+
+        from context_intelligence_server.registry import SessionRegistry
+
+        reg = SessionRegistry()
+
+        with (
+            patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
+            patch(
+                "context_intelligence_server.registry.AsyncDiskBlobStore"
+            ) as MockBlob,
+            patch(
+                "context_intelligence_server.registry.HookStateService"
+            ) as MockService,
+        ):
+            MockStore.return_value = MagicMock()
+            MockBlob.return_value = MagicMock()
+            mock_svc = MagicMock()
+            MockService.return_value = mock_svc
+            reg.start_drain = MagicMock()
+
+            reg.get_or_create("test-session-2", "/ws")
+
+        MockService.assert_called_once()
+        kwargs = MockService.call_args.kwargs
+        assert kwargs.get("created_by") is None

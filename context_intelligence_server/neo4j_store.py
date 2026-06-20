@@ -114,10 +114,15 @@ _UNIVERSAL_NODE_LABEL = "Node"
 # The non-Session node MERGE, extracted so tests can assert its query plan
 # (NodeIndexSeek, never AllNodesScan).  MERGE on the universal :Node label so
 # the composite :Node(node_id, workspace) index backs the lookup.
+# ON CREATE SET n.created_by: write-once provenance stamp — applied only when
+# the node is first created, never overwritten by subsequent updates.  The
+# value is passed as the $created_by query parameter (never in row.props so it
+# cannot affect node identity or uniqueness constraints).
 _NODE_MERGE_CYPHER = (
     "UNWIND $rows AS row "
     f"MERGE (n:{_UNIVERSAL_NODE_LABEL} "
     "{node_id: row.node_id, workspace: row.props.workspace}) "
+    "ON CREATE SET n.created_by = $created_by "
     "SET n += row.props"
 )
 
@@ -443,6 +448,13 @@ async def ensure_neo4j_schema(
             )
             and fully_established
         )
+        fully_established = (
+            await _create_index(
+                "CREATE INDEX idx_session_created_by IF NOT EXISTS "
+                "FOR (n:Session) ON (n.created_by)"
+            )
+            and fully_established
+        )
 
         # NOTE: the composite :Node(node_id, workspace) lookup index that backs the
         # universal-label node MERGE (NodeIndexSeek, not AllNodesScan — the
@@ -735,6 +747,7 @@ async def _write_batch(
     edge_snapshot: dict[tuple[str, str], dict[str, Any]],
     patch_snapshot: list[dict[str, Any]],
     workspace: str,
+    created_by: str | None = None,
 ) -> None:
     """Execute one buffered batch of node, label, and edge writes on ``tx``.
 
@@ -794,8 +807,10 @@ async def _write_batch(
             "UNWIND $rows AS row "
             f"MERGE (n:{_UNIVERSAL_NODE_LABEL} "
             "{node_id: row.node_id, workspace: row.props.workspace}) "
+            "ON CREATE SET n.created_by = $created_by "
             "SET n += row.props, n:Session",
             rows=session_rows,
+            created_by=created_by,
         )
         await res.consume()
 
@@ -810,6 +825,7 @@ async def _write_batch(
         res = await tx.run(
             cast(LiteralString, _NODE_MERGE_CYPHER),
             rows=other_rows,
+            created_by=created_by,
         )
         await res.consume()
 
@@ -937,6 +953,7 @@ class Neo4jGraphStore:
         self._driver = AsyncGraphDatabase.driver(uri, auth=auth, **driver_kwargs)
         self._database = database
         self._workspace = workspace
+        self._created_by: str | None = None
         self._node_buffer: dict[str, dict[str, Any]] = {}
         self._edge_buffer: dict[tuple, dict[str, Any]] = {}
         self._label_patches: list[dict[str, Any]] = []
@@ -964,6 +981,20 @@ class Neo4jGraphStore:
     def workspace(self, value: str | None) -> None:
         """Set the workspace (``None`` will resolve to ``'default'`` on read)."""
         self._workspace = value
+
+    # ------------------------------------------------------------------
+    # created_by property (getter + setter)
+    # ------------------------------------------------------------------
+
+    @property
+    def created_by(self) -> str | None:
+        """Authenticated contributor id for write-once provenance (None when unset)."""
+        return self._created_by
+
+    @created_by.setter
+    def created_by(self, value: str | None) -> None:
+        """Set the contributor id (``None`` skips the provenance stamp)."""
+        self._created_by = value
 
     # ------------------------------------------------------------------
     # supported_dialects property
@@ -1214,21 +1245,21 @@ class Neo4jGraphStore:
             for chunk in _chunk_dict(node_snapshot_sorted, rows, byts):
                 async with self._driver.session(database=self._database) as db_session:
                     await db_session.execute_write(
-                        _bounded_write, chunk, {}, [], self.workspace
+                        _bounded_write, chunk, {}, [], self.workspace, self.created_by
                     )
 
             # Phase 2: label patches — each chunk is its own execute_write.
             for chunk in _chunk_list(patch_snapshot, rows, byts):
                 async with self._driver.session(database=self._database) as db_session:
                     await db_session.execute_write(
-                        _bounded_write, {}, {}, chunk, self.workspace
+                        _bounded_write, {}, {}, chunk, self.workspace, self.created_by
                     )
 
             # Phase 3: edges — each chunk is its own execute_write.
             for chunk in _chunk_dict(edge_snapshot_sorted, rows, byts):
                 async with self._driver.session(database=self._database) as db_session:
                     await db_session.execute_write(
-                        _bounded_write, {}, chunk, [], self.workspace
+                        _bounded_write, {}, chunk, [], self.workspace, self.created_by
                     )
 
             success = True

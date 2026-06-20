@@ -66,6 +66,7 @@ class GraphState:
 
     def __init__(self, workspace: str = "default") -> None:
         self._workspace = workspace
+        self._created_by: str | None = None
         self._nodes: dict[str, dict[str, Any]] = {}
         self._edges: dict[tuple[str, str], dict[str, Any]] = {}
 
@@ -81,6 +82,19 @@ class GraphState:
     @workspace.setter
     def workspace(self, value: str) -> None:
         self._workspace = value
+
+    # ------------------------------------------------------------------
+    # created_by property (getter + setter)
+    # ------------------------------------------------------------------
+
+    @property
+    def created_by(self) -> str | None:
+        """Authenticated contributor id for provenance stamping (None when unset)."""
+        return self._created_by
+
+    @created_by.setter
+    def created_by(self, value: str | None) -> None:
+        self._created_by = value
 
     # ------------------------------------------------------------------
     # Node operations
@@ -190,6 +204,7 @@ class HookStateService:
         workspace: str = "default",
         graph_store: Any | None = None,
         *,
+        created_by: str | None = None,
         raw_config: dict[str, Any] | None = None,
         blob_store: Any | None = None,
     ) -> None:
@@ -199,6 +214,7 @@ class HookStateService:
         else:
             self.graph = GraphState()
         self.graph.workspace = workspace
+        self.graph.created_by = created_by
         self.blob_store = blob_store
         self._seen_sessions: set[str] = set()
         self.data_layer_2 = DataLayer2State()

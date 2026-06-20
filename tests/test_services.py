@@ -671,3 +671,42 @@ async def test_graphstate_discard_buffer_is_noop():
     node = await state.get_node("n1")
     assert node is not None
     assert node["name"] == "Alice"
+
+
+# ---------------------------------------------------------------------------
+# T21: HookStateService propagates created_by to graph.created_by
+# ---------------------------------------------------------------------------
+
+
+class TestHookStateServiceCreatedBy:
+    """T21: HookStateService propagates created_by to graph.created_by."""
+
+    def test_created_by_propagated_to_graph_state(self) -> None:
+        """T21: HookStateService(created_by='alice') sets graph.created_by='alice'."""
+        svc = HookStateService(workspace="/ws", created_by="alice")
+        assert svc.graph.created_by == "alice"
+
+    def test_created_by_defaults_to_none(self) -> None:
+        """T21: HookStateService() without created_by leaves graph.created_by as None."""
+        svc = HookStateService(workspace="/ws")
+        assert svc.graph.created_by is None
+
+    def test_created_by_none_explicit(self) -> None:
+        """T21: HookStateService(created_by=None) leaves graph.created_by as None."""
+        svc = HookStateService(workspace="/ws", created_by=None)
+        assert svc.graph.created_by is None
+
+    def test_graphstate_created_by_property_getter_setter(self) -> None:
+        """T21: GraphState has a settable created_by property."""
+        state = GraphState()
+        assert state.created_by is None
+        state.created_by = "bob"
+        assert state.created_by == "bob"
+        state.created_by = None
+        assert state.created_by is None
+
+    def test_created_by_propagated_to_custom_graph_store(self) -> None:
+        """T21: HookStateService propagates created_by even when a custom graph_store is provided."""
+        store = GraphState()
+        svc = HookStateService(workspace="/ws", graph_store=store, created_by="carol")
+        assert svc.graph.created_by == "carol"
