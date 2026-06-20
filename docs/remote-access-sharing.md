@@ -122,8 +122,15 @@ reach; **ACL grants** control *which ports* on it.
 
 ### 5a. Share the machine, per peer
 In the Tailscale admin console: **Machines → (your node) → Share** → invite each
-peer by their Tailscale login email. Each accepts with their own (free) account.
-Sharing grants access to **only that one machine**, and is revocable per person.
+peer by **the exact email they sign into Tailscale with**. Each accepts with their
+own (free) account. Sharing grants access to **only that one machine**, and is
+revocable per person.
+
+> **Identity is matched as an exact string.** In particular, **Gmail dots are
+> significant to Tailscale** even though Gmail ignores them for mail delivery —
+> `marc.goodner@gmail.com` and `marcgoodner@gmail.com` are *different* identities.
+> The share invite and the peer's actual login must match byte-for-byte, or the
+> peer is silently denied (see the timeout symptom in §5c).
 
 ### 5b. The ACL lesson that makes or breaks this
 
@@ -152,33 +159,48 @@ from `*` to `autogroup:member` (all *direct* members of your own tailnet, which
     // Your own members keep full access. NOTE: src is autogroup:member, NOT "*".
     { "src": ["autogroup:member"], "dst": ["*"], "ip": ["*"] },
 
-    // Shared peers: ONLY tcp:443 on the server, nothing else.
-    { "src": ["peer1@example.com", "peer2@example.com"], "dst": ["ci-server"], "ip": ["tcp:443"] }
-  ],
-
-  // Optional self-check. CAVEAT: a shared-user email as a test `src` is not
-  // documented; if it errors on save, remove it and verify operationally (5c).
-  "tests": [
-    { "src": "peer1@example.com", "accept": ["ci-server:443"], "deny": ["ci-server:8000"] }
+    // Shared peers: ONLY tcp:443 on the server, nothing else. autogroup:shared
+    // auto-includes every accepted-share user — no email string to mistype.
+    { "src": ["autogroup:shared"], "dst": ["ci-server"], "ip": ["tcp:443"] }
   ]
 }
 ```
 
 Notes:
-- **Name peers explicitly** (`peer@email`) for the tightest, most auditable rule.
-  `autogroup:shared` also works as a `src` and auto-includes all current and future
-  shared users — convenient, but broader. (`autogroup:shared` is valid only as a
-  `src`, never a `dst`.)
+- **Prefer `autogroup:shared`** for the shared grant (above): it covers every
+  current and future shared peer with no email to get wrong. To restrict to
+  *specific* peers, list their exact emails instead — but see the testing caveat
+  below. (`autogroup:shared` is valid only as a `src`, never a `dst`.)
 - Reference the node in `dst` via a `hosts` alias or a tag — MagicDNS device names
   are not a documented grant selector.
 - Your existing `ssh` and Funnel (`nodeAttrs`) rules that key on
   `autogroup:member` already exclude shared users — peers get neither.
 
-### 5c. Operational isolation check (do this once a peer is connected)
-From a **shared** peer's machine: `https://<node>.<tailnet>.ts.net/events` connects
-(401 without a token), while the server's other ports (`8000`, `7474`, `7687`) and
-every **other** host on your tailnet are **refused**. A **non-shared** account
-should be refused entirely.
+> **The ACL Tests feature cannot validate `autogroup:shared`.** Tailscale's `tests`
+> block evaluates a *static* policy, but `autogroup:shared` membership is *dynamic* —
+> it's populated by who has actually accepted a share. A test such as
+> `{ "src": "peer@example.com", "accept": ["ci-server:443"] }` reports **Drop**
+> against an `autogroup:shared` grant **even when everything is correct** — a false
+> negative; don't chase it. Verify instead via the Machines page (the share shows
+> **Accepted**) and the peer's real request (§5c). For a *testable* rule, temporarily
+> set the grant `src` to the peer's explicit email (a literal match the test *can*
+> evaluate), confirm green, then switch back to `autogroup:shared`.
+
+### 5c. Verify from the peer's side (and read these symptoms)
+A Tailscale ACL deny **drops packets silently**, so a wrong or missing grant shows
+up as a **connection timeout, not "refused."** And a shared node is **remapped to a
+different `100.x` IP in the peer's tailnet** (1-1 NAT) — so the peer must connect by
+the **owner-tailnet MagicDNS name** `https://<node>.<tailnet>.ts.net`, **never** a
+raw IP, with MagicDNS enabled on their side.
+
+From a **shared** peer's machine:
+```bash
+curl -m 10 -o /dev/null -w '%{http_code}\n' https://<node>.<tailnet>.ts.net/events
+```
+- `401` → reachable and correctly token-gated. The other ports (`8000`/`7474`/`7687`)
+  and every *other* tailnet host stay refused; a non-shared account is refused entirely.
+- timeout / `000` → ACL deny, or the share isn't **Accepted** under the peer's exact
+  identity (see §5a) — check the Machines page.
 
 ---
 
@@ -190,7 +212,7 @@ should be refused entirely.
 | 1 | host lockdown | LAN/bridge curl to `:8000`, `:7474`, `:7687` → refused |
 | 2 | auth | `POST /events` no token → 401; `OPTIONS`/`HEAD /events` → 401 (no CORS/405 leak); with token → accepted |
 | 3 | reboot persistence | after reboot, `tailscale serve status` still shows the `/events` mount and gate 1 still holds |
-| 4 | ACL isolation | shared account reaches `:443` only; non-shared account refused |
+| 4 | ACL isolation | shared account reaches `:443` only; non-shared account refused (verify operationally from a shared account — the ACL Tests feature can't validate `autogroup:shared`) |
 | 5 | end to end | a real Amplifier session via the client lands events in Neo4j (`/cypher` count increases) |
 
 Onboard real peers only after gates 0–5 pass.
