@@ -18,9 +18,13 @@ arguments — is uploaded to a **shared graph that the server owner can query**.
 contribute data; you don't query the shared graph yourself.
 
 Traffic is end-to-end encrypted (over the owner's overlay network plus HTTPS) and
-reaches only the upload endpoint. **You can opt out at any time** by removing the two
-settings below or stopping the bundle. Data already uploaded remains in the graph
-unless the owner deletes it.
+reaches only the upload endpoint. **You can opt out at any time** by removing the
+destination below (or stopping the bundle). Data already uploaded remains in the
+graph unless the owner deletes it.
+
+You also choose **which** of your sessions are shared — the `include`/`exclude`
+patterns in step 4 let you contribute everything or just a scoped subset (e.g. only
+work sessions, never personal ones). By default this guide contributes everything.
 
 If that's acceptable, continue.
 
@@ -56,21 +60,54 @@ peers. Treat the token as a secret; if it leaks, ask the owner to rotate it.
 
 ## 4. Configure Amplifier
 
-Put both values in `~/.amplifier/keys.env`, then lock the file's permissions:
+The client hook sends your sessions to one or more named **destinations**. You'll add
+the owner's server as a destination — keeping the secret token in `keys.env` and
+referencing it from `settings.yaml`, so the secret never lives in your config file.
+
+**a. Put your token in `~/.amplifier/keys.env`**, then lock the file's permissions:
 
 ```bash
 cat >> ~/.amplifier/keys.env <<'EOF'
-AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL=https://<their-node>.<their-tailnet>.ts.net
-AMPLIFIER_CONTEXT_INTELLIGENCE_API_KEY=<paste-the-key-from-the-owner>
+CI_TEAM_KEY=<paste-the-token-from-the-owner>
 EOF
 chmod 600 ~/.amplifier/keys.env
 ```
 
-Add the client bundle to your Amplifier app:
+**b. Add the destination in `~/.amplifier/settings.yaml`:**
+
+```yaml
+overrides:
+  hook-context-intelligence:
+    config:
+      destinations:
+        team:
+          url: "https://<their-node>.<their-tailnet>.ts.net"
+          api_key: "${CI_TEAM_KEY}"     # expanded from keys.env — secret stays out of this file
+          include: ["**"]               # contribute ALL your sessions
+          # Prefer to share only SOME sessions? Scope by working directory instead:
+          #   include: ["**/work/**"]       # only sessions under a "work" directory
+          #   exclude: ["**/secret/**"]     # ...minus anything under "secret"
+          # IMPORTANT: a destination with no `include` sends NOTHING — you must opt in.
+```
+
+Each session's events are sent to **every** destination whose `include` matches the
+session's working directory and isn't caught by an `exclude`. With `include: ["**"]`
+that's all of them; narrow it to contribute selectively. Sessions that match no
+destination stay local only. You can also add more destinations here later (e.g. your
+own personal server) — they fan out independently.
+
+**c. Add the client bundle to your Amplifier app:**
 
 ```bash
 amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-context-intelligence@main --app
 ```
+
+> **Simplest alternative (contribute everything, no YAML):** instead of the
+> `destinations` block you can set two env vars in `~/.amplifier/keys.env` —
+> `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL=<url>` and
+> `AMPLIFIER_CONTEXT_INTELLIGENCE_API_KEY=<token>` — which sends *all* your sessions
+> to that one server. The `destinations` form above is preferred because it lets you
+> choose what to share and add more servers later.
 
 ---
 
@@ -92,15 +129,16 @@ curl -s -o /dev/null -w '%{http_code}\n' https://<their-node>.<their-tailnet>.ts
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<their-node>.<their-tailnet>.ts.net/events \
-  -H "authorization: Bearer $(grep API_KEY ~/.amplifier/keys.env | cut -d= -f2)" \
+  -H "authorization: Bearer $(grep CI_TEAM_KEY ~/.amplifier/keys.env | cut -d= -f2)" \
   -H 'content-type: application/json' -d '{}'
 ```
 
 - `422` — authenticated (the empty test body is rejected, which is expected).
 - `401` — key is wrong; re-copy it from the owner.
 
-**C. Real run:** start a normal Amplifier session. Your events upload automatically
-in the background. Ask the owner to confirm your workspace appears.
+**C. Real run:** start a normal Amplifier session from a directory your `include`
+matches. Your events upload automatically in the background. Ask the owner to confirm
+your workspace appears.
 
 ---
 
@@ -111,6 +149,7 @@ in the background. Ask the owner to confirm your workspace appears.
 | `000` / timeout on step 5A | Open Tailscale; confirm you're connected and accepted the device share |
 | `404` | Server URL typo — must match exactly what the owner gave you |
 | `401` in step 5B | Wrong or stale API key — request it again |
-| Events don't appear | Confirm the bundle is added (`--app`) and `~/.amplifier/keys.env` is loaded |
+| Events don't appear | Confirm the bundle is added (`--app`), that `~/.amplifier/keys.env` is loaded, and that your `include` actually matches the directory you ran from (no `include` ⇒ nothing is sent) |
 
-To stop sharing at any time, remove the two lines from `~/.amplifier/keys.env`.
+To stop sharing at any time, remove the `team` destination from
+`~/.amplifier/settings.yaml` (or delete `CI_TEAM_KEY` from `~/.amplifier/keys.env`).
