@@ -9,6 +9,7 @@ Values are resolved in this priority order (highest first):
 3. Built-in defaults.
 """
 
+import hashlib
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -29,6 +30,13 @@ from pydantic_settings import (
 # instantiated, so the prefix-based machinery cannot apply.
 _CONFIG_FILE_ENV = "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE"
 _CONFIG_FILE_DEFAULT = "server-config.yaml"
+
+
+def _is_hex(v: str) -> bool:
+    """Return True if *v* is a non-empty hex string of at least 32 characters."""
+    if not v or len(v) < 32:
+        return False
+    return all(c in "0123456789abcdefABCDEF" for c in v)
 
 
 class YamlConfigSettingsSource(PydanticBaseSettingsSource):
@@ -106,6 +114,97 @@ class Settings(BaseSettings):
     def _normalize_api_key(cls, v: str | None) -> str | None:
         """Normalize empty string to None so that api_key: '' in config disables auth."""
         return None if v == "" else v
+
+    # Per-contributor API keys (NESTED form, design D4): the keystore is keyed by
+    # the SHA-256 hex digest of the raw token (64 lowercase hex chars), and each
+    # value is a metadata dict carrying at least ``id`` (the contributor id). The
+    # nested shape leaves room to add ``role`` / ``label`` later without a breaking
+    # config change. Raw tokens NEVER appear here — only their digests.
+    #
+    #   api_keys:
+    #     "<64-hex sha256 of token>":
+    #       id: owner
+    #     "<64-hex sha256 of token>":
+    #       id: peer-test
+    api_keys: dict[str, dict[str, str]] | None = None
+
+    @field_validator("api_keys", mode="after")
+    @classmethod
+    def _validate_api_keys(
+        cls, v: dict[str, dict[str, str]] | None
+    ) -> dict[str, dict[str, str]] | None:
+        """Fail-closed: raise unless every entry is ``<64-hex> -> {"id": <non-empty str>}``.
+
+        Rejects (by raising ``ValueError``):
+        - an explicitly empty dict (omit or null-out to disable authentication);
+        - a key that is not exactly 64 lowercase-hex characters after normalization
+          (whitespace characters are rejected because they are not valid hex digits);
+        - a value that is not a dict;
+        - a value whose ``id`` is missing, not a string, empty, or whitespace-only.
+
+        Digest keys are normalized to lowercase before validation and returned as
+        lowercase so an UPPERCASE digest in a config file maps correctly to the
+        lowercase hexdigest produced by ``hashlib.sha256(...).hexdigest()``.
+
+        NOTE: Duplicate digest keys in YAML/dict collapse to last-wins at the YAML
+        parse level, before this validator sees the data.  Detection is not possible
+        here.
+        """
+        if v is None:
+            return None
+        # Fail-closed: an explicitly empty map is a misconfiguration, not "auth off".
+        # Omit api_keys or set it to null to disable per-contributor authentication.
+        if len(v) == 0:
+            raise ValueError(
+                "api_keys must contain at least one entry if specified; "
+                "omit it or use null to disable authentication"
+            )
+        normalized: dict[str, dict[str, str]] = {}
+        for digest, meta in v.items():
+            digest_lower = digest.lower()
+            if len(digest_lower) != 64 or not all(
+                c in "0123456789abcdef" for c in digest_lower
+            ):
+                raise ValueError(
+                    f"api_keys key {digest!r} must be a 64-character SHA-256 hex digest"
+                )
+            if not isinstance(meta, dict):
+                raise ValueError(
+                    f"api_keys[{digest!r}] must be a dict with an 'id' field, "
+                    f"got {meta!r}"
+                )
+            contributor_id = meta.get("id")
+            if not isinstance(contributor_id, str) or not contributor_id.strip():
+                raise ValueError(
+                    f"api_keys[{digest!r}]['id'] must be a non-empty, "
+                    f"non-whitespace string, got {contributor_id!r}"
+                )
+            normalized[digest_lower] = meta
+        return normalized
+
+    def build_keystore(self) -> dict[str, str]:
+        """Return ``{sha256_hex(token) -> contributor_id}`` for all configured keys.
+
+        Combines the legacy ``api_key`` (folded to id ``"owner"``) with every entry
+        in ``api_keys``.  An empty result means authentication is disabled (no keys
+        configured) — backward-compatible with ``api_key=None`` setups.
+
+        For the nested ``api_keys`` form the dict key IS already the SHA-256 hex
+        digest of the token, so it is used verbatim; only the legacy single
+        ``api_key`` is hashed here (over its UTF-8 bytes) so the bearer token sent
+        in the Authorization header and the digest derived here always match.
+        """
+        ks: dict[str, str] = {}
+        # Legacy api_key folds to contributor id "owner" for back-compat.
+        if self.api_key is not None:
+            digest = hashlib.sha256(self.api_key.encode()).hexdigest()
+            ks[digest] = "owner"
+        # Explicit per-contributor keys: key is the digest, value carries id.
+        # (May overwrite the legacy "owner" entry if the same digest is present.)
+        # Defensive .lower(): validator normalizes digests, but belt-and-suspenders here.
+        for digest, meta in (self.api_keys or {}).items():
+            ks[digest.lower()] = meta["id"]
+        return ks
 
     # -------------------------------------------------------------------------
     # Neo4j

@@ -21,16 +21,46 @@ neo4j_browser_url: http://localhost:7474  # Neo4j HTTP browser UI — displayed 
 neo4j_user: neo4j
 neo4j_password: ""          # Empty only for local Neo4j with NEO4J_AUTH=none (dev only).
                              # Docker and production deployments always use a password.
-                             # Run: context-intelligence-server init  --neo4j-url bolt://localhost:7687  --neo4j-user neo4j
 
 # -----------------------------------------------------------------------------
 # Authentication
-# Generate with: context-intelligence-server init
-# When set, all API endpoints (except /status) require:
-#   Authorization: Bearer <api_key>
-# When absent or empty, no authentication is required (local dev only).
+#
+# Two coexisting modes (see docs/managing-api-keys.md for the full guide):
+#
+#   1. Legacy single key  -> api_key   (one shared secret, folds to contributor id "owner")
+#   2. Per-contributor     -> api_keys  (map of sha256(token) -> {id: ...}, one key per peer)
+#
+# For BOTH modes the peer sends `Authorization: Bearer <raw_token>`; the server
+# computes sha256(token) and looks the digest up. The server stores only the
+# DIGEST, never the raw token.
+#
+# Auth is DISABLED (every request passes) only when api_keys is omitted/null AND
+# no api_key is set. That is dev-only.
+#
+# There is no `init` subcommand. Use the Docker first-run bootstrap (./start.sh
+# prints the token once) or add keys by hand per docs/managing-api-keys.md.
 # -----------------------------------------------------------------------------
-api_key: ""                 # Empty or absent = auth disabled (local dev). Set to a non-empty secret to enable auth.
+api_key: ""                 # Empty or absent = legacy auth disabled. Set to a non-empty secret to enable single-key auth.
+
+# Per-contributor keystore. The KEY is the sha256 hex digest of the raw token
+# (64 lowercase hex chars, quoted); the value carries the contributor `id`.
+# Derive a token + its digest with these two one-liners:
+#
+#   token:  python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+#   digest: python3 -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "<token>"
+#
+# Put the DIGEST below; send the RAW token to the peer over a secure channel.
+# Mixing them up (raw token in the file, or digest sent to the peer) => 401.
+#
+# api_keys and api_key can coexist (both feed one keystore). IMPORTANT:
+# `api_keys: {}` (an explicit empty map) is a HARD STARTUP ERROR (fail-closed) —
+# to disable auth, omit api_keys or set it to null, do NOT use {}.
+#
+# api_keys:
+#   "0000000000000000000000000000000000000000000000000000000000000000":   # sha256(owner-token)
+#     id: owner
+#   "1111111111111111111111111111111111111111111111111111111111111111":   # sha256(alice-token)
+#     id: alice
 
 # -----------------------------------------------------------------------------
 # Storage paths

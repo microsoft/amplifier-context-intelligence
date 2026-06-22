@@ -52,11 +52,7 @@ On first run, use the `start.sh` script to generate credentials and start the st
 
 This generates credentials (`credentials.yaml` + `neo4j-auth.env`), then calls `docker compose up -d` to start the services.
 
-To retrieve your API key after the first run:
-
-```bash
-grep api_key ~/amplifier-context-intelligence-server-data-store/credentials.yaml
-```
+On first run, `start.sh` prints your API token **once**, behind a `SAVE THIS TOKEN — it will NOT be shown again` banner. Capture it then — `credentials.yaml` stores only its SHA-256 digest (under `api_keys`), so you cannot grep the raw token back later. If you lose it, rotate to issue a new one (see [docs/managing-api-keys.md](docs/managing-api-keys.md)).
 
 ### 2a. Restart the stack (subsequent runs)
 
@@ -94,7 +90,7 @@ The home page and dashboard both show:
 
 Both URLs are displayed verbatim from the configuration. If Neo4j is on a remote host, the displayed values reflect that remote address — not `localhost`.
 
-When `api_key` is configured, the dashboard shows an API key prompt on first visit — enter the key from `credentials.yaml`.
+When authentication is configured, the dashboard shows an API key prompt on first visit — enter the raw API token you saved at first run (it is **not** in `credentials.yaml`, which stores only the digest).
 
 The dashboard has an in-page Queues tab (Overview | Queues) showing the pipeline conservation invariant, totals, and dead-letter management (Replay/Purge). The dashboard's single auth overlay gates everything; the `/queues/*` data endpoints require a Bearer token. There is no separate `/queues` page.
 
@@ -198,28 +194,44 @@ docker run -d \
   context-intelligence-server
 ```
 
-Retrieve the generated API key after first run:
+The entrypoint prints the generated API token **once** on first run, behind a `SAVE THIS TOKEN` banner. Read it from the container's first-run logs and save it — `/data/credentials.yaml` stores only the token's SHA-256 digest (under `api_keys`), not the token itself:
 
 ```bash
-docker exec context-intelligence-server grep api_key /data/credentials.yaml
+docker logs context-intelligence-server   # look for the "SAVE THIS TOKEN" banner
 ```
+
+> Passing `-e AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY=<...>` above uses the legacy single-key mode instead, with a token you choose. See [docs/managing-api-keys.md](docs/managing-api-keys.md) for both modes.
 
 ---
 
 ## First-Run Setup (Standalone)
 
-Before starting the server for the first time outside Docker, run the init command to generate credentials:
+There is **no `init` subcommand.** To run the server standalone, write a
+`server-config.yaml` by hand (copy `server-config.example.yaml` and edit — see
+[Running Without Docker](#running-without-docker) below) and add authentication
+yourself.
 
-```bash
-context-intelligence-server init \
-  --neo4j-url         bolt://localhost:7687 \
-  --neo4j-browser-url http://localhost:7474 \
-  --neo4j-user        neo4j
-```
+For auth, choose one of:
 
-You will be prompted for the Neo4j password. The command writes `server-config.yaml` with all required fields including a generated `api_key`. The generated API key is printed to stdout — copy it to your bundle config as `context_intelligence_api_key`.
+- **Legacy single key** — set `api_key: "<your-secret>"` in the config. Clients
+  send it as `Authorization: Bearer <your-secret>`.
+- **Per-contributor keystore** — generate a token, derive its SHA-256 digest, and
+  add an `api_keys` entry. Send the **raw token** to the client.
 
-`--neo4j-url` is the bolt driver URL (used for all graph operations). `--neo4j-browser-url` is the Neo4j Browser HTTP URL (displayed as a clickable link in the web UI). If Neo4j is on a remote host, use that host in both values.
+  ```bash
+  TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+  python3 -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$TOKEN"
+  echo "raw token (give to client): $TOKEN"
+  ```
+
+The server verifies every request by hashing the presented token (`sha256(token)`)
+and matching the digest. The full guide — adding/revoking/rotating peers, the
+empty-`{}` hard-error rule, and the raw-token-vs-digest guardrail — is in
+[docs/managing-api-keys.md](docs/managing-api-keys.md). Use the client token as
+`context_intelligence_api_key` in your bundle config.
+
+> Running under Docker instead? `./start.sh` (or the container entrypoint)
+> bootstraps an `api_keys` keystore and prints the token once — no manual steps.
 
 ---
 
@@ -418,7 +430,7 @@ All settings live in `~/.amplifier/settings.yaml` under `overrides.hook-context-
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `context_intelligence_server_url` | *(empty — disabled)* | Server URL to forward events to |
-| `context_intelligence_api_key` | *(empty)* | Bearer token for server auth. Must match the server's `api_key`. |
+| `context_intelligence_api_key` | *(empty)* | Raw bearer token for server auth. The server verifies it by computing `sha256(token)` and matching the digest in its keystore (a legacy `api_key`, or an `api_keys` entry). Send this raw token to clients; never the digest. |
 | `workspace` | *(auto-resolved)* | Workspace scope for graph data |
 
 ---
@@ -484,7 +496,8 @@ Values are resolved with this priority (highest first):
 | Environment variable | YAML key | Default | Description |
 |----------------------|----------|---------|-------------|
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE` | *(env only)* | `server-config.yaml` | Path to the YAML config file |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY` | `api_key` | *(empty — auth disabled)* | Bearer token. When set, all API endpoints except `/status` and static routes require `Authorization: Bearer <value>`. Generate with `context-intelligence-server init`. |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY` | `api_key` | *(empty — auth disabled)* | Legacy single bearer token (folds to contributor id `owner`). When set, all API endpoints except `/status` and static routes require `Authorization: Bearer <value>`. The server verifies a request by computing `sha256(token)` and matching it. Coexists with `api_keys`. See [docs/managing-api-keys.md](docs/managing-api-keys.md). |
+| *(YAML only)* | `api_keys` | *(empty — disabled)* | Per-contributor keystore: a map of `sha256_hex(token) -> {id: <contributor>}`. The server stores only digests; the peer sends the **raw** token and the server hashes it to look up the contributor. `api_keys: {}` (empty map) is a **hard startup error** — omit or use `null` to disable auth. The matched `id` is recorded as `created_by` on graph nodes. See [docs/managing-api-keys.md](docs/managing-api-keys.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL` | `neo4j_url` | `neo4j://neo4j:7687` | Neo4j bolt/driver URL used for all graph operations. **Displayed verbatim in the web UI.** May point to a remote host — `bolt://db.internal:7687` is valid. Use `bolt://` scheme for Community Edition single-node installs. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_BROWSER_URL` | `neo4j_browser_url` | `http://localhost:7474` | Neo4j Browser HTTP UI URL. **Displayed verbatim as a clickable link in the web UI.** Set to the address reachable from your browser — not necessarily `localhost` if Neo4j is on a remote machine. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_USER` | `neo4j_user` | `neo4j` | Neo4j username |

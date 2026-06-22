@@ -114,10 +114,15 @@ _UNIVERSAL_NODE_LABEL = "Node"
 # The non-Session node MERGE, extracted so tests can assert its query plan
 # (NodeIndexSeek, never AllNodesScan).  MERGE on the universal :Node label so
 # the composite :Node(node_id, workspace) index backs the lookup.
+# ON CREATE SET n.created_by: write-once provenance stamp — applied only when
+# the node is first created, never overwritten by subsequent updates.  The
+# value is passed as the $created_by query parameter (never in row.props so it
+# cannot affect node identity or uniqueness constraints).
 _NODE_MERGE_CYPHER = (
     "UNWIND $rows AS row "
     f"MERGE (n:{_UNIVERSAL_NODE_LABEL} "
     "{node_id: row.node_id, workspace: row.props.workspace}) "
+    "ON CREATE SET n.created_by = $created_by "
     "SET n += row.props"
 )
 
@@ -161,6 +166,7 @@ def _edge_merge_cypher(edge_type: str) -> str:
         f"MERGE (dst:{_UNIVERSAL_NODE_LABEL} "
         "{node_id: row.dst_id, workspace: $workspace}) "
         f"MERGE (src)-[r:{edge_type}]->(dst) "
+        "ON CREATE SET r.created_by = $created_by "
         "SET r += row.props"
     )
 
@@ -443,6 +449,15 @@ async def ensure_neo4j_schema(
             )
             and fully_established
         )
+        fully_established = (
+            await _create_index(
+                "CREATE INDEX idx_session_created_by IF NOT EXISTS "
+                "FOR (n:Session) ON (n.created_by)"
+            )
+            and fully_established
+        )
+        # NOTE: relationship created_by is intentionally NOT indexed in v1 — no consumer
+        # yet; querying edges by contributor is unsupported until indexed in a future phase.
 
         # NOTE: the composite :Node(node_id, workspace) lookup index that backs the
         # universal-label node MERGE (NodeIndexSeek, not AllNodesScan — the
@@ -729,12 +744,28 @@ def _chunk_list(
         yield chunk
 
 
+def _build_node_props(data: dict[str, Any], workspace: str) -> dict[str, Any]:
+    """Assemble the sanitized props dict for a single node row.
+
+    ``labels`` and ``created_by`` are excluded from the returned dict:
+    - ``labels`` are applied separately via ``SET n:Label`` statements (not stored as props).
+    - ``created_by`` travels ONLY as the ``$created_by`` query param (never a node property)
+      so it cannot affect node identity or clobber the ``ON CREATE SET n.created_by`` stamp.
+    """
+    raw = {k: v for k, v in data.items() if k not in ("labels", "created_by")}
+    _convert_temporal_props(raw)  # ISO str -> datetime, in place
+    props = Neo4jGraphStore._sanitize_properties(raw)
+    props["workspace"] = workspace
+    return props
+
+
 async def _write_batch(
     tx: Any,
     node_snapshot: dict[str, dict[str, Any]],
     edge_snapshot: dict[tuple[str, str], dict[str, Any]],
     patch_snapshot: list[dict[str, Any]],
     workspace: str,
+    created_by: str | None = None,
 ) -> None:
     """Execute one buffered batch of node, label, and edge writes on ``tx``.
 
@@ -759,10 +790,7 @@ async def _write_batch(
 
     for node_id, data in node_snapshot.items():
         labels: list[str] = data.get("labels", [])
-        node_props = {k: v for k, v in data.items() if k != "labels"}
-        _convert_temporal_props(node_props)  # ISO str -> datetime, in place
-        props = Neo4jGraphStore._sanitize_properties(node_props)
-        props["workspace"] = workspace
+        props = _build_node_props(data, workspace)
         row: dict[str, Any] = {"node_id": node_id, "props": props}
 
         if "Session" in labels:
@@ -794,8 +822,10 @@ async def _write_batch(
             "UNWIND $rows AS row "
             f"MERGE (n:{_UNIVERSAL_NODE_LABEL} "
             "{node_id: row.node_id, workspace: row.props.workspace}) "
+            "ON CREATE SET n.created_by = $created_by "
             "SET n += row.props, n:Session",
             rows=session_rows,
+            created_by=created_by,
         )
         await res.consume()
 
@@ -810,6 +840,7 @@ async def _write_batch(
         res = await tx.run(
             cast(LiteralString, _NODE_MERGE_CYPHER),
             rows=other_rows,
+            created_by=created_by,
         )
         await res.consume()
 
@@ -866,7 +897,9 @@ async def _write_batch(
     edge_groups: dict[str, list[dict[str, Any]]] = {}
     for (src_id, dst_id), data in edge_snapshot.items():
         edge_type: str = data.get("type", _DEFAULT_EDGE_TYPE)
-        edge_props = {k: v for k, v in data.items() if k != "type"}
+        # created_by travels ONLY as the $created_by query param (never a rel property)
+        # so it cannot clobber the ON CREATE SET r.created_by provenance stamp.
+        edge_props = {k: v for k, v in data.items() if k not in ("type", "created_by")}
         _convert_temporal_props(edge_props)  # ISO str -> datetime, in place
         props = Neo4jGraphStore._sanitize_properties(edge_props)
         props["workspace"] = workspace
@@ -886,6 +919,7 @@ async def _write_batch(
             edge_merge_query,  # type: ignore[arg-type]
             rows=rows,
             workspace=workspace,
+            created_by=created_by,
         )
         await res.consume()
 
@@ -937,6 +971,7 @@ class Neo4jGraphStore:
         self._driver = AsyncGraphDatabase.driver(uri, auth=auth, **driver_kwargs)
         self._database = database
         self._workspace = workspace
+        self._created_by: str | None = None
         self._node_buffer: dict[str, dict[str, Any]] = {}
         self._edge_buffer: dict[tuple, dict[str, Any]] = {}
         self._label_patches: list[dict[str, Any]] = []
@@ -964,6 +999,20 @@ class Neo4jGraphStore:
     def workspace(self, value: str | None) -> None:
         """Set the workspace (``None`` will resolve to ``'default'`` on read)."""
         self._workspace = value
+
+    # ------------------------------------------------------------------
+    # created_by property (getter + setter)
+    # ------------------------------------------------------------------
+
+    @property
+    def created_by(self) -> str | None:
+        """Authenticated contributor id for write-once provenance (None when unset)."""
+        return self._created_by
+
+    @created_by.setter
+    def created_by(self, value: str | None) -> None:
+        """Set the contributor id (``None`` skips the provenance stamp)."""
+        self._created_by = value
 
     # ------------------------------------------------------------------
     # supported_dialects property
@@ -1214,21 +1263,21 @@ class Neo4jGraphStore:
             for chunk in _chunk_dict(node_snapshot_sorted, rows, byts):
                 async with self._driver.session(database=self._database) as db_session:
                     await db_session.execute_write(
-                        _bounded_write, chunk, {}, [], self.workspace
+                        _bounded_write, chunk, {}, [], self.workspace, self.created_by
                     )
 
             # Phase 2: label patches — each chunk is its own execute_write.
             for chunk in _chunk_list(patch_snapshot, rows, byts):
                 async with self._driver.session(database=self._database) as db_session:
                     await db_session.execute_write(
-                        _bounded_write, {}, {}, chunk, self.workspace
+                        _bounded_write, {}, {}, chunk, self.workspace, self.created_by
                     )
 
             # Phase 3: edges — each chunk is its own execute_write.
             for chunk in _chunk_dict(edge_snapshot_sorted, rows, byts):
                 async with self._driver.session(database=self._database) as db_session:
                     await db_session.execute_write(
-                        _bounded_write, {}, chunk, [], self.workspace
+                        _bounded_write, {}, chunk, [], self.workspace, self.created_by
                     )
 
             success = True

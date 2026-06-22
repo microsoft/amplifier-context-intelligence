@@ -50,13 +50,13 @@ class TestGetVersionNoAuth:
         assert response.status_code == 200
 
 
-class TestVersionIs4_0_2:
-    """pyproject.toml is the single source of truth and must declare version 4.0.2."""
+class TestVersionIs5_0_0:
+    """pyproject.toml is the single source of truth and must declare version 5.0.0."""
 
-    def test_pyproject_version_is_4_0_2(self) -> None:
+    def test_pyproject_version_is_5_0_0(self) -> None:
         import tomllib
         from pathlib import Path
 
         pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-        assert data["project"]["version"] == "4.0.2"
+        assert data["project"]["version"] == "5.0.0"

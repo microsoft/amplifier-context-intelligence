@@ -440,9 +440,7 @@ class TestDrainBatchFailedThrottle:
             await qm.append(sid, _line("tool_call", "/ws", {"session_id": sid}))
             with caplog.at_level(logging.DEBUG, logger="context_intelligence_server"):
                 # Small flush_timeout drives poll_interval so the 5 retries run fast.
-                task = asyncio.create_task(
-                    reg.drain_worker(worker, flush_timeout=0.05)
-                )
+                task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
                 for _ in range(200):
                     await asyncio.sleep(0.02)
                     if any(
@@ -458,20 +456,17 @@ class TestDrainBatchFailedThrottle:
         warnings = [
             r
             for r in caplog.records
-            if r.levelno == logging.WARNING
-            and "drain_batch_failed" in r.getMessage()
+            if r.levelno == logging.WARNING and "drain_batch_failed" in r.getMessage()
         ]
         errors = [
             r
             for r in caplog.records
-            if r.levelno == logging.ERROR
-            and "drain_batch_exhausted" in r.getMessage()
+            if r.levelno == logging.ERROR and "drain_batch_exhausted" in r.getMessage()
         ]
         debugs = [
             r
             for r in caplog.records
-            if r.levelno == logging.DEBUG
-            and "drain_batch_failed" in r.getMessage()
+            if r.levelno == logging.DEBUG and "drain_batch_failed" in r.getMessage()
         ]
         with_traceback = [
             r
@@ -1873,3 +1868,226 @@ class TestSessionFinalizedLog:
             and "finaliz" in r.getMessage().lower()
             for r in caplog.records
         )
+
+
+# ---------------------------------------------------------------------------
+# T20: get_or_create accepts created_by kwarg and binds it to the store
+# ---------------------------------------------------------------------------
+
+
+class TestGetOrCreateCreatedBy:
+    """T20: get_or_create accepts created_by and binds it to the Neo4jGraphStore."""
+
+    def test_get_or_create_accepts_created_by_kwarg(self) -> None:
+        """T20: get_or_create does not raise when called with created_by kwarg."""
+        from unittest.mock import MagicMock, patch
+
+        from context_intelligence_server.registry import SessionRegistry
+
+        reg = SessionRegistry()
+
+        with (
+            patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
+            patch(
+                "context_intelligence_server.registry.AsyncDiskBlobStore"
+            ) as MockBlob,
+            patch(
+                "context_intelligence_server.registry.HookStateService"
+            ) as MockService,
+        ):
+            MockStore.return_value = MagicMock()
+            MockBlob.return_value = MagicMock()
+            mock_svc = MagicMock()
+            MockService.return_value = mock_svc
+            # Prevent actual drain task from starting
+            reg.start_drain = MagicMock()
+
+            reg.get_or_create("test-session", "/ws", created_by="alice")
+
+        # HookStateService must be called with created_by="alice"
+        MockService.assert_called_once()
+        kwargs = MockService.call_args.kwargs
+        assert kwargs.get("created_by") == "alice"
+
+    def test_get_or_create_default_created_by_is_none(self) -> None:
+        """T20: get_or_create defaults created_by to None when not provided."""
+        from unittest.mock import MagicMock, patch
+
+        from context_intelligence_server.registry import SessionRegistry
+
+        reg = SessionRegistry()
+
+        with (
+            patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
+            patch(
+                "context_intelligence_server.registry.AsyncDiskBlobStore"
+            ) as MockBlob,
+            patch(
+                "context_intelligence_server.registry.HookStateService"
+            ) as MockService,
+        ):
+            MockStore.return_value = MagicMock()
+            MockBlob.return_value = MagicMock()
+            mock_svc = MagicMock()
+            MockService.return_value = mock_svc
+            reg.start_drain = MagicMock()
+
+            reg.get_or_create("test-session-2", "/ws")
+
+        MockService.assert_called_once()
+        kwargs = MockService.call_args.kwargs
+        assert kwargs.get("created_by") is None
+
+
+class TestSessionOwnershipInvariant:
+    """T21: session-ownership invariant is observable on the get_or_create reuse path.
+
+    Each session_id is owned by exactly one contributor.  The reuse path must:
+      - log nothing at ERROR when the same (or None) created_by arrives;
+      - log an ERROR and preserve the bound id when a different created_by arrives.
+
+    Mocking strategy: patch Neo4jGraphStore / AsyncDiskBlobStore / HookStateService
+    exactly as TestGetOrCreateCreatedBy does.  After the first get_or_create call
+    (which stores a worker whose .services is the mock_svc MagicMock), we manually
+    set mock_svc.graph.created_by = "alice" to simulate the bound state — the real
+    HookStateService sets graph.created_by at construction time, but the mock does
+    not, so we set it explicitly.
+    """
+
+    def test_get_or_create_reuse_keeps_bound_created_by(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Reuse with the SAME created_by emits no ERROR log (normal path)."""
+        from unittest.mock import MagicMock, patch
+
+        from context_intelligence_server.registry import SessionRegistry
+
+        reg = SessionRegistry()
+
+        with caplog.at_level(logging.ERROR, logger="context_intelligence_server"):
+            with (
+                patch(
+                    "context_intelligence_server.registry.Neo4jGraphStore"
+                ) as MockStore,
+                patch(
+                    "context_intelligence_server.registry.AsyncDiskBlobStore"
+                ) as MockBlob,
+                patch(
+                    "context_intelligence_server.registry.HookStateService"
+                ) as MockService,
+            ):
+                MockStore.return_value = MagicMock()
+                MockBlob.return_value = MagicMock()
+                mock_svc = MagicMock()
+                MockService.return_value = mock_svc
+                reg.start_drain = MagicMock()
+
+                # First call — creates the worker, binds "alice"
+                reg.get_or_create("sess-same", "/ws", created_by="alice")
+                # Simulate what the real HookStateService sets on graph_store
+                mock_svc.graph.created_by = "alice"
+
+                # Second call — same contributor, must be silent
+                worker = reg.get_or_create("sess-same", "/ws", created_by="alice")
+
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert error_records == [], (
+            f"No ERROR expected for same-contributor reuse, got: {caplog.text}"
+        )
+        assert worker is not None
+
+    def test_get_or_create_reuse_ignores_new_created_by_no_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Reuse with created_by=None (common post_events path) emits no ERROR log."""
+        from unittest.mock import MagicMock, patch
+
+        from context_intelligence_server.registry import SessionRegistry
+
+        reg = SessionRegistry()
+
+        with caplog.at_level(logging.ERROR, logger="context_intelligence_server"):
+            with (
+                patch(
+                    "context_intelligence_server.registry.Neo4jGraphStore"
+                ) as MockStore,
+                patch(
+                    "context_intelligence_server.registry.AsyncDiskBlobStore"
+                ) as MockBlob,
+                patch(
+                    "context_intelligence_server.registry.HookStateService"
+                ) as MockService,
+            ):
+                MockStore.return_value = MagicMock()
+                MockBlob.return_value = MagicMock()
+                mock_svc = MagicMock()
+                MockService.return_value = mock_svc
+                reg.start_drain = MagicMock()
+
+                # First call — creates the worker bound to "alice"
+                reg.get_or_create("sess-none", "/ws", created_by="alice")
+                mock_svc.graph.created_by = "alice"
+
+                # Second call — created_by=None must never trigger the guard
+                worker = reg.get_or_create("sess-none", "/ws", created_by=None)
+
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert error_records == [], (
+            f"No ERROR expected when incoming created_by is None, got: {caplog.text}"
+        )
+        assert worker is not None
+
+    def test_invariant_violation_is_observed_and_not_overwritten(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Conflicting created_by: ERROR logged, bound id preserved, no exception."""
+        from unittest.mock import MagicMock, patch
+
+        from context_intelligence_server.registry import SessionRegistry
+
+        reg = SessionRegistry()
+
+        with caplog.at_level(logging.ERROR, logger="context_intelligence_server"):
+            with (
+                patch(
+                    "context_intelligence_server.registry.Neo4jGraphStore"
+                ) as MockStore,
+                patch(
+                    "context_intelligence_server.registry.AsyncDiskBlobStore"
+                ) as MockBlob,
+                patch(
+                    "context_intelligence_server.registry.HookStateService"
+                ) as MockService,
+            ):
+                MockStore.return_value = MagicMock()
+                MockBlob.return_value = MagicMock()
+                mock_svc = MagicMock()
+                MockService.return_value = mock_svc
+                reg.start_drain = MagicMock()
+
+                # First call — creates the worker bound to "alice"
+                reg.get_or_create("sess-conflict", "/ws", created_by="alice")
+                mock_svc.graph.created_by = "alice"
+
+                # Second call — conflicting contributor "bob" arrives
+                worker = reg.get_or_create("sess-conflict", "/ws", created_by="bob")
+
+        # 1. An ERROR record must have been emitted
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_records) == 1, (
+            f"Expected exactly 1 ERROR record, got {len(error_records)}: {caplog.text}"
+        )
+        msg = error_records[0].getMessage()
+        assert "session_ownership_invariant_violation" in msg, (
+            f"Expected greppable token in ERROR message, got: {msg!r}"
+        )
+        assert "alice" in msg, f"Expected bound id 'alice' in message, got: {msg!r}"
+        assert "bob" in msg, f"Expected incoming id 'bob' in message, got: {msg!r}"
+
+        # 2. Bound id must NOT be overwritten
+        assert mock_svc.graph.created_by == "alice", (
+            f"Bound id must be preserved; got: {mock_svc.graph.created_by!r}"
+        )
+
+        # 3. Worker is returned — no exception raised
+        assert worker is not None

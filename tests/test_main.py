@@ -727,10 +727,13 @@ async def test_dashboard_html_includes_log_viewer(client: httpx.AsyncClient) -> 
 
 @contextlib.asynccontextmanager
 async def _auth_client(
-    api_key: str = "test-secret",
+    token: str = "test-secret",
 ) -> AsyncGenerator[httpx.AsyncClient, None]:
-    """Yield an AsyncClient pre-wrapped with BearerTokenMiddleware."""
-    wrapped = BearerTokenMiddleware(app, api_key=api_key)
+    """Yield an AsyncClient pre-wrapped with BearerTokenMiddleware (keystore API)."""
+    import hashlib
+
+    keystore = {hashlib.sha256(token.encode()).hexdigest(): "owner"}
+    wrapped = BearerTokenMiddleware(app, keystore=keystore)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=wrapped),
         base_url="http://test",
@@ -801,36 +804,7 @@ class TestAuthMiddleware:
 
 
 class TestMainDispatch:
-    """Tests for the CLI entrypoint main() dispatch function."""
-
-    def test_main_with_init_subcommand_calls_init_main(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """main() calls init_command.main() when first arg is 'init', not run()."""
-        from unittest.mock import patch as _patch
-
-        import context_intelligence_server.main as _main_mod
-
-        monkeypatch.setattr(
-            "sys.argv",
-            [
-                "context-intelligence-server",
-                "init",
-                "--config-path",
-                "/tmp/test.yaml",
-                "--neo4j-password",
-                "pw",
-            ],
-        )
-
-        with (
-            _patch.object(_main_mod, "run") as mock_run,
-            _patch("context_intelligence_server.init_command.main") as mock_init_main,
-        ):
-            _main_mod.main()
-
-        mock_init_main.assert_called_once()
-        mock_run.assert_not_called()
+    """Tests for the CLI entrypoint main() function."""
 
     def test_main_with_no_args_calls_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """main() calls run() when no subcommand is given."""
@@ -840,19 +814,15 @@ class TestMainDispatch:
 
         monkeypatch.setattr("sys.argv", ["context-intelligence-server"])
 
-        with (
-            _patch.object(_main_mod, "run") as mock_run,
-            _patch("context_intelligence_server.init_command.main") as mock_init_main,
-        ):
+        with _patch.object(_main_mod, "run") as mock_run:
             _main_mod.main()
 
         mock_run.assert_called_once()
-        mock_init_main.assert_not_called()
 
     def test_main_with_non_init_flag_calls_run(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """main() calls run() when first arg is not 'init' (e.g. --workers 2)."""
+        """main() calls run() when flags are present."""
         from unittest.mock import patch as _patch
 
         import context_intelligence_server.main as _main_mod
@@ -861,48 +831,10 @@ class TestMainDispatch:
             "sys.argv", ["context-intelligence-server", "--workers", "2"]
         )
 
-        with (
-            _patch.object(_main_mod, "run") as mock_run,
-            _patch("context_intelligence_server.init_command.main") as mock_init_main,
-        ):
+        with _patch.object(_main_mod, "run") as mock_run:
             _main_mod.main()
 
         mock_run.assert_called_once()
-        mock_init_main.assert_not_called()
-
-    def test_main_init_strips_init_from_argv(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """main() removes 'init' from sys.argv before delegating to init_command.main()."""
-        import sys
-        from unittest.mock import patch as _patch
-
-        import context_intelligence_server.main as _main_mod
-
-        monkeypatch.setattr(
-            "sys.argv",
-            [
-                "context-intelligence-server",
-                "init",
-                "--neo4j-password",
-                "secret",
-            ],
-        )
-        captured_argv: list[str] = []
-
-        def capture_init() -> None:
-            captured_argv.extend(sys.argv)
-
-        with (
-            _patch(
-                "context_intelligence_server.init_command.main",
-                side_effect=capture_init,
-            ),
-        ):
-            _main_mod.main()
-
-        assert "init" not in captured_argv
-        assert "--neo4j-password" in captured_argv
 
 
 async def test_lifespan_creates_and_closes_driver(
@@ -961,8 +893,12 @@ async def test_lifespan_recovers_and_respawns_drainers(
     ).encode("utf-8")
     await qm.append(sid, body)
 
-    spawned: list[tuple[str, str]] = []
-    monkeypatch.setattr(registry, "get_or_create", lambda s, w: spawned.append((s, w)))
+    spawned: list[tuple] = []
+    monkeypatch.setattr(
+        registry,
+        "get_or_create",
+        lambda s, w, **kw: spawned.append((s, w)),
+    )
 
     mock_driver = _patched_lifespan_deps()
     with (
@@ -999,8 +935,12 @@ async def test_lifespan_skips_recovery_for_empty_workspace(
     ).encode("utf-8")
     await qm.append(sid, body)
 
-    spawned: list[tuple[str, str]] = []
-    monkeypatch.setattr(registry, "get_or_create", lambda s, w: spawned.append((s, w)))
+    spawned: list[tuple] = []
+    monkeypatch.setattr(
+        registry,
+        "get_or_create",
+        lambda s, w, **kw: spawned.append((s, w)),
+    )
 
     mock_driver = _patched_lifespan_deps()
     with (
@@ -1187,3 +1127,214 @@ async def test_queues_data_endpoint_still_requires_auth(
     NOT exempt the data routes."""
     response = await auth_client.get("/queues/dead-letter")
     assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# T12-T15: per-user API keys — post_events stamping and crash recovery
+# ---------------------------------------------------------------------------
+
+
+async def test_post_events_stamps_contributor_id_from_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T12: post_events stamps created_by from scope state into the queued body."""
+    import hashlib
+
+    import httpx
+
+    from context_intelligence_server.main import asgi_app
+
+    monkeypatch.setattr(
+        main_module.registry, "get_or_create", lambda *args, **kwargs: MagicMock()
+    )
+    captured: list[bytes] = []
+
+    async def _fake_append(worker_key: str, raw: bytes) -> None:
+        captured.append(raw)
+
+    monkeypatch.setattr(main_module.registry.queue_manager, "append", _fake_append)
+
+    # Temporarily configure keystore on asgi_app so auth injects contributor_id.
+    test_token = "test-secret"
+    test_keystore = {hashlib.sha256(test_token.encode()).hexdigest(): "alice"}
+    monkeypatch.setattr(asgi_app, "keystore", test_keystore)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=asgi_app),
+        base_url="http://test",
+    ) as ac:
+        response = await ac.post(
+            "/events",
+            json={
+                "event": "tool_use",
+                "workspace": "/ws",
+                "data": {"session_id": "s1"},
+            },
+            headers={"Authorization": f"Bearer {test_token}"},
+        )
+
+    assert response.status_code == 202
+    assert len(captured) == 1
+    body_obj = json.loads(captured[0])
+    assert body_obj["created_by"] == "alice"
+
+
+async def test_post_events_overwrites_client_supplied_created_by(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T13: post_events overwrites any client-supplied created_by (anti-spoof)."""
+    import hashlib
+
+    import httpx
+
+    from context_intelligence_server.main import asgi_app
+
+    monkeypatch.setattr(
+        main_module.registry, "get_or_create", lambda *args, **kwargs: MagicMock()
+    )
+    captured: list[bytes] = []
+
+    async def _fake_append(worker_key: str, raw: bytes) -> None:
+        captured.append(raw)
+
+    monkeypatch.setattr(main_module.registry.queue_manager, "append", _fake_append)
+
+    test_token = "test-secret"
+    test_keystore = {hashlib.sha256(test_token.encode()).hexdigest(): "real-owner"}
+    monkeypatch.setattr(asgi_app, "keystore", test_keystore)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=asgi_app),
+        base_url="http://test",
+    ) as ac:
+        response = await ac.post(
+            "/events",
+            json={
+                "event": "tool_use",
+                "workspace": "/ws",
+                "data": {"session_id": "s2"},
+                "created_by": "hacker",  # client-supplied spoofed value
+            },
+            headers={"Authorization": f"Bearer {test_token}"},
+        )
+
+    assert response.status_code == 202
+    assert len(captured) == 1
+    body_obj = json.loads(captured[0])
+    # Server wins — "hacker" must be replaced by the authenticated id
+    assert body_obj["created_by"] == "real-owner"
+    assert body_obj["created_by"] != "hacker"
+
+
+async def test_post_events_stamps_none_when_no_auth(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T14: post_events stamps created_by=None when auth is not configured."""
+    monkeypatch.setattr(
+        main_module.registry, "get_or_create", lambda *args, **kwargs: MagicMock()
+    )
+    captured: list[bytes] = []
+
+    async def _fake_append(worker_key: str, raw: bytes) -> None:
+        captured.append(raw)
+
+    monkeypatch.setattr(main_module.registry.queue_manager, "append", _fake_append)
+
+    response = await client.post(
+        "/events",
+        json={"event": "tool_use", "workspace": "/ws", "data": {"session_id": "s3"}},
+    )
+
+    assert response.status_code == 202
+    assert len(captured) == 1
+    body_obj = json.loads(captured[0])
+    # No auth configured: created_by is present with null (None) value
+    assert "created_by" in body_obj
+    assert body_obj["created_by"] is None
+
+
+async def test_crash_recovery_passes_created_by_to_get_or_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T15: crash recovery reads created_by from first queued line and passes it to get_or_create.
+
+    Exercises the REAL ``_recover_one_session()`` from main.py — not an inline
+    reimplementation.  The function accepts ``str | bytes`` so no QueueManager
+    plumbing is required here; the queue-read step is the caller's responsibility
+    (tested end-to-end by ``test_lifespan_recovers_and_respawns_drainers``).
+    """
+    import context_intelligence_server.main as _main_mod
+
+    sid = "recovery-session-t15"
+    first_line = json.dumps(
+        {
+            "event": "session:start",
+            "workspace": "/test-workspace",
+            "created_by": "recovered-contributor",
+            "data": {"session_id": sid},
+        },
+        separators=(",", ":"),
+    )
+
+    calls: list[dict] = []
+
+    def _fake_get_or_create(
+        session_id: str,
+        workspace: str,
+        created_by: str | None = None,
+    ) -> MagicMock:
+        calls.append(
+            {"session_id": session_id, "workspace": workspace, "created_by": created_by}
+        )
+        return MagicMock()
+
+    # Call the REAL recovery function — not a reimplementation of its logic.
+    result = _main_mod._recover_one_session(sid, first_line, _fake_get_or_create)
+
+    assert result is True
+    assert len(calls) == 1
+    assert calls[0]["session_id"] == sid
+    assert calls[0]["created_by"] == "recovered-contributor"
+    assert calls[0]["workspace"] == "/test-workspace"
+
+
+@pytest.mark.parametrize(
+    "bad_line",
+    [
+        '{"event":"session:start","workspace":"/ws","crea',  # truncated JSON
+        "} totally invalid json {",  # pure garbage
+        "",  # empty line
+    ],
+    ids=["truncated-json", "garbage", "empty"],
+)
+async def test_crash_recovery_truncated_line_safe_skip(bad_line: str) -> None:
+    """T15b: crash recovery handles a truncated/garbage JSONL line deterministically.
+
+    A queue whose final line is truncated or garbage must be safe-skipped — the
+    recovery must not raise and must not spawn a drainer for the bad line.
+
+    Exercises the REAL ``_recover_one_session()`` from main.py.
+    """
+    import context_intelligence_server.main as _main_mod
+
+    sid = "recovery-session-t15b"
+    calls: list[dict] = []
+
+    def _fake_get_or_create(
+        session_id: str,
+        workspace: str,
+        created_by: str | None = None,
+    ) -> MagicMock:
+        calls.append(
+            {"session_id": session_id, "workspace": workspace, "created_by": created_by}
+        )
+        return MagicMock()
+
+    # Must not raise — bad JSON triggers ValueError which is caught internally.
+    result = _main_mod._recover_one_session(sid, bad_line, _fake_get_or_create)
+
+    assert result is False, (
+        f"Bad/truncated line must be safe-skipped (return False), got {result!r}"
+    )
+    assert calls == [], "No drainer must be spawned for a bad/truncated line"

@@ -113,10 +113,11 @@ async def test_node_chunk_sequence_is_globally_sorted(
         edges: dict[Any, Any],
         patches: list[Any],
         workspace: str,
+        created_by: str | None = None,
     ) -> None:
         if nodes:
             chunk_first_keys.append(next(iter(nodes)))
-        await original(tx, nodes, edges, patches, workspace)
+        await original(tx, nodes, edges, patches, workspace, created_by)
 
     _cis_store_mod._write_batch = recording_write_batch  # type: ignore[assignment]
     try:
@@ -189,10 +190,11 @@ async def test_edge_chunk_sequence_is_globally_sorted(
         edges: dict[Any, Any],
         patches: list[Any],
         workspace: str,
+        created_by: str | None = None,
     ) -> None:
         if edges:
             chunk_first_edge_keys.append(next(iter(edges)))
-        await original(tx, nodes, edges, patches, workspace)
+        await original(tx, nodes, edges, patches, workspace, created_by)
 
     _cis_store_mod._write_batch = recording_write_batch  # type: ignore[assignment]
     try:

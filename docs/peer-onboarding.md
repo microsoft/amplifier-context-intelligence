@@ -1,8 +1,9 @@
 # Connecting to a Shared Context-Intelligence Server
 
 For people who've been **invited** to send their Amplifier sessions to someone
-else's context-intelligence server. The server owner will give you a URL and an API
-key; this guide gets you connected in a few minutes.
+else's context-intelligence server. The server owner will give you a URL and a
+**bearer token that is unique to you** (not a key shared with other peers); this
+guide gets you connected in a few minutes.
 
 > If you are the owner setting up sharing, see
 > [docs/remote-access-sharing.md](remote-access-sharing.md) instead.
@@ -44,7 +45,12 @@ Over a secure channel, the owner gives you two values:
 | Value | Example |
 |-------|---------|
 | Server URL | `https://<their-node>.<their-tailnet>.ts.net` |
-| API key | a long random token |
+| API token | a long random token, **unique to you** |
+
+This is a **raw token** — you send it verbatim as the bearer credential. The
+server keeps only its SHA-256 digest and revokes it by removing that digest, so
+the owner can cut off your access (or rotate your token) without disturbing other
+peers. Treat the token as a secret; if it leaks, ask the owner to rotate it.
 
 ---
 

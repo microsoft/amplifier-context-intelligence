@@ -110,7 +110,7 @@ One binary is placed at `~/.local/bin`:
 
 | Binary | Purpose |
 |--------|---------|
-| `context-intelligence-server` | Runs the FastAPI server; also accepts `init` subcommand for first-run configuration |
+| `context-intelligence-server` | Runs the FastAPI server |
 
 **Upgrade later:**
 
@@ -122,46 +122,8 @@ uv tool upgrade context-intelligence-server
 
 ## 4. Configuration
 
-### Option A — Generate config with `context-intelligence-server init` (recommended)
-
-Run `context-intelligence-server init` **once** to generate the server config
-with all required settings. Do not run it again after the server is in use
-— it regenerates `api_key`, which must then be updated everywhere.
-
-```bash
-DATA_DIR="$HOME/amplifier-context-intelligence-server-data-store"
-mkdir -p "${DATA_DIR}/blobs" "${DATA_DIR}/logs" "${DATA_DIR}/queues"
-
-context-intelligence-server init \
-  --config-path       ~/.config/context-intelligence/server-config.yaml \
-  --neo4j-url         bolt://localhost:37687 \
-  --neo4j-browser-url http://localhost:37474 \
-  --neo4j-user        neo4j \
-  --neo4j-password    "<your-neo4j-password>" \
-  --blob-path         "${DATA_DIR}/blobs" \
-  --log-path          "${DATA_DIR}/logs/server.jsonl" \
-  --server-host       0.0.0.0 \
-  --server-port       8000
-```
-
-Replace `37687` with your `NEO4J_BOLT_PORT` and `37474` with your `NEO4J_HTTP_PORT` from Step 2.
-
-The command prints:
-
-```
-Config written to: /home/<you>/.config/context-intelligence/server-config.yaml
-API key: <generated-token>
-```
-
-**Copy the API key** — you need it in Step 7 (Amplifier settings).
-
-`--neo4j-url` must use the `bolt://` scheme and the bolt port chosen in Step 2.
-`--neo4j-browser-url` is the HTTP browser UI address — it is displayed verbatim
-as a clickable link in the web UI and never used for driver connections.
-If Neo4j runs on a remote machine, provide its hostname in both values.
-All parameters and their defaults are described in the settings tables below.
-
-### Option B — Manual config (advanced)
+There is **no `init` subcommand.** Write `server-config.yaml` by hand from the
+annotated template, then add authentication.
 
 ```bash
 mkdir -p ~/.config/context-intelligence
@@ -169,8 +131,32 @@ curl -o ~/.config/context-intelligence/server-config.yaml \
   https://raw.githubusercontent.com/microsoft/amplifier-context-intelligence/main/server-config.example.yaml
 ```
 
-Edit the file and set values for your machine. Configuration keys are
-grouped into three categories below.
+Edit the file and set values for your machine — at minimum `neo4j_url` (use the
+`bolt://` scheme and your `NEO4J_BOLT_PORT` from Step 2), `neo4j_browser_url`
+(your `NEO4J_HTTP_PORT`, displayed as a clickable link in the web UI), and
+`neo4j_password`. Configuration keys are grouped into three categories below.
+
+### Authentication
+
+Set up an API token so the server requires `Authorization: Bearer <token>`.
+Generate a token, derive its SHA-256 digest, and add an `api_keys` entry (the
+file stores the **digest**; clients send the **raw token**):
+
+```bash
+TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+DIGEST=$(python3 -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$TOKEN")
+printf 'api_keys:\n  "%s":\n    id: owner\n' "$DIGEST" >> ~/.config/context-intelligence/server-config.yaml
+echo "API token (use in Step 7): $TOKEN"
+```
+
+**Copy the API token** — you need it in Step 7 (Amplifier settings), and it is not
+recoverable from the config file afterward. The legacy single-key mode
+(`api_key: "<secret>"`) also still works. Full guide — adding/revoking/rotating
+peers, the empty-`{}` hard-error rule, and the raw-token-vs-digest guardrail — in
+[managing-api-keys.md](managing-api-keys.md).
+
+> If you run under Docker instead, `./start.sh` (or the container entrypoint)
+> bootstraps the `api_keys` keystore and prints the token once — no manual steps.
 
 ---
 
@@ -181,7 +167,8 @@ grouped into three categories below.
 | `server_host` | `0.0.0.0` | Bind address. `0.0.0.0` = all interfaces; `127.0.0.1` = localhost only |
 | `server_port` | `8000` | Listen port |
 | `log_level` | `INFO` | Verbosity (`DEBUG` / `INFO` / `WARNING` / `ERROR`) |
-| `api_key` | *(generated)* | Bearer token for API auth. All endpoints except `/status` and static routes require `Authorization: Bearer <value>`. Generate with `context-intelligence-server init`. |
+| `api_key` | *(your secret)* | Legacy single bearer token (folds to contributor id `owner`). All endpoints except `/status` and static routes require `Authorization: Bearer <value>`. The server verifies it as `sha256(token)`. |
+| `api_keys` | *(map)* | Per-contributor keystore: `sha256_hex(token) -> {id: <contributor>}`. The file holds digests; clients send raw tokens. `api_keys: {}` is a hard startup error (omit/`null` to disable auth). See [managing-api-keys.md](managing-api-keys.md). |
 
 ### Neo4j settings
 
@@ -311,8 +298,8 @@ amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-context-i
 
 ### Configure the hook
 
-Add the server URL and the API key (printed by `context-intelligence-server init`
-in Step 4) to `~/.amplifier/settings.yaml`:
+Add the server URL and the API token (the raw token you saved in Step 4) to
+`~/.amplifier/settings.yaml`:
 
 ```yaml
 overrides:
@@ -327,7 +314,7 @@ overrides:
 | Key | What it does |
 |-----|-------------|
 | `context_intelligence_server_url` | URL of the running server. The hook POSTs all session events here. |
-| `context_intelligence_api_key` | Bearer token. Must match `api_key` in `server-config.yaml`. If this key is missing or wrong, the hook logs a warning once and disables HTTP dispatch for the session. |
+| `context_intelligence_api_key` | Raw bearer token. The server verifies it as `sha256(token)` against its keystore (a legacy `api_key`, or an `api_keys` entry). If this token is missing or wrong, the hook logs a warning once and disables HTTP dispatch for the session. |
 
 ### Complete `~/.amplifier/settings.yaml` example
 
@@ -389,7 +376,7 @@ bypass the browser cache.
 | Linux: service doesn't start on boot | Lingering not enabled | `loginctl enable-linger $USER` |
 | macOS: plist loaded but service not running | launchd silently failed | Check `server.stderr.log` for startup errors |
 | Events stop dispatching, circuit breaker tripped | `context_intelligence_api_key` missing from `~/.amplifier/settings.yaml` | Add `context_intelligence_api_key: "<key>"` under `overrides.hook-context-intelligence.config` |
-| Dashboard shows "Enter your API key" and won't load | API key prompt is active | Open `server-config.yaml`, find `api_key:`, paste it into the dashboard prompt |
+| Dashboard shows "Enter your API key" and won't load | API key prompt is active | Paste the raw API token you saved at setup into the prompt. It is not in `server-config.yaml` (which holds only the digest under `api_keys`); if lost, rotate it per [managing-api-keys.md](managing-api-keys.md) |
 
 ---
 

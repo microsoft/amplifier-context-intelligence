@@ -1,11 +1,12 @@
 """Tests for bearer token authentication middleware."""
 
+import hashlib
 import json
 from unittest.mock import AsyncMock
 
 import httpx
 
-from context_intelligence_server.auth import BearerTokenMiddleware
+from context_intelligence_server.auth import BearerTokenMiddleware, _resolve_token
 
 
 def _make_scope(path: str = "/events", method: str = "POST") -> dict:
@@ -30,13 +31,30 @@ def _make_scope_with_auth(
     }
 
 
-class TestMiddlewareNoApiKey:
-    """When api_key is None (not configured), all requests pass through."""
+def _keystore(token: str, contributor_id: str = "tester") -> dict[str, str]:
+    """Build a minimal keystore from a raw token string (for test convenience)."""
+    return {hashlib.sha256(token.encode()).hexdigest(): contributor_id}
 
-    async def test_request_passes_without_api_key_configured(self) -> None:
-        """No api_key configured means no auth required — request reaches the app."""
+
+class TestMiddlewareNoApiKey:
+    """When keystore is empty (no keys configured), all requests pass through."""
+
+    async def test_request_passes_without_keystore_configured(self) -> None:
+        """Empty keystore means no auth required — request reaches the app."""
         app = AsyncMock()
-        middleware = BearerTokenMiddleware(app, api_key=None)
+        middleware = BearerTokenMiddleware(app, keystore={})
+
+        scope = _make_scope("/events")
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        await middleware(scope, receive, send)
+        app.assert_called_once_with(scope, receive, send)
+
+    async def test_request_passes_with_none_keystore(self) -> None:
+        """None keystore (default) is equivalent to empty — no auth required."""
+        app = AsyncMock()
+        middleware = BearerTokenMiddleware(app)  # keystore=None → {}
 
         scope = _make_scope("/events")
         receive = AsyncMock()
@@ -46,13 +64,13 @@ class TestMiddlewareNoApiKey:
         app.assert_called_once_with(scope, receive, send)
 
 
-class TestMiddlewareWithApiKey:
-    """When api_key is set, all requests except /status require valid token."""
+class TestMiddlewareWithKeystore:
+    """When keystore is non-empty, all requests except exempt paths require a valid token."""
 
     async def test_missing_token_returns_401(self) -> None:
         """Request without Authorization header gets 401."""
         app = AsyncMock()
-        middleware = BearerTokenMiddleware(app, api_key="secret-token")
+        middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
 
         scope = _make_scope("/events")
         receive = AsyncMock()
@@ -68,7 +86,7 @@ class TestMiddlewareWithApiKey:
     async def test_wrong_token_returns_401(self) -> None:
         """Request with wrong bearer token gets 401."""
         app = AsyncMock()
-        middleware = BearerTokenMiddleware(app, api_key="secret-token")
+        middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
 
         scope = _make_scope_with_auth("wrong-token", "/events")
         receive = AsyncMock()
@@ -83,7 +101,7 @@ class TestMiddlewareWithApiKey:
     async def test_valid_token_passes_through(self) -> None:
         """Request with correct bearer token reaches the app."""
         app = AsyncMock()
-        middleware = BearerTokenMiddleware(app, api_key="secret-token")
+        middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
 
         scope = _make_scope_with_auth("secret-token", "/events")
         receive = AsyncMock()
@@ -92,10 +110,25 @@ class TestMiddlewareWithApiKey:
         await middleware(scope, receive, send)
         app.assert_called_once_with(scope, receive, send)
 
+    async def test_valid_token_injects_contributor_id_into_scope(self) -> None:
+        """T10: valid token injects contributor_id into scope['state']."""
+        app = AsyncMock()
+        middleware = BearerTokenMiddleware(
+            app, keystore=_keystore("secret-token", contributor_id="alice")
+        )
+
+        scope = _make_scope_with_auth("secret-token", "/events")
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        await middleware(scope, receive, send)
+
+        assert scope.get("state", {}).get("contributor_id") == "alice"
+
     async def test_status_exempt_without_token(self) -> None:
         """/status is accessible without any token."""
         app = AsyncMock()
-        middleware = BearerTokenMiddleware(app, api_key="secret-token")
+        middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
 
         scope = _make_scope("/status", "GET")
         receive = AsyncMock()
@@ -107,7 +140,7 @@ class TestMiddlewareWithApiKey:
     async def test_non_http_scope_passes_through(self) -> None:
         """Non-HTTP scopes (e.g. websocket, lifespan) are not intercepted."""
         app = AsyncMock()
-        middleware = BearerTokenMiddleware(app, api_key="secret-token")
+        middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
 
         scope = {"type": "lifespan"}
         receive = AsyncMock()
@@ -119,7 +152,7 @@ class TestMiddlewareWithApiKey:
     async def test_401_response_body_is_json(self) -> None:
         """401 response body is JSON with a detail field."""
         app = AsyncMock()
-        middleware = BearerTokenMiddleware(app, api_key="secret-token")
+        middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
 
         scope = _make_scope("/events")
         receive = AsyncMock()
@@ -135,7 +168,7 @@ class TestMiddlewareWithApiKey:
     async def test_logs_stream_exempt_without_token(self) -> None:
         """/logs/stream is accessible without any token (EventSource compatibility)."""
         app = AsyncMock()
-        middleware = BearerTokenMiddleware(app, api_key="secret-token")
+        middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
 
         scope = _make_scope("/logs/stream", "GET")
         receive = AsyncMock()
@@ -147,7 +180,7 @@ class TestMiddlewareWithApiKey:
     async def test_index_page_exempt(self) -> None:
         """GET / without token passes through (dashboard HTML must load before JS auth)."""
         app = AsyncMock()
-        middleware = BearerTokenMiddleware(app, api_key="secret-token")
+        middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
 
         scope = _make_scope("/", "GET")
         receive = AsyncMock()
@@ -159,7 +192,7 @@ class TestMiddlewareWithApiKey:
     async def test_dashboard_page_exempt(self) -> None:
         """GET /dashboard without token passes through."""
         app = AsyncMock()
-        middleware = BearerTokenMiddleware(app, api_key="secret-token")
+        middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
 
         scope = _make_scope("/dashboard", "GET")
         receive = AsyncMock()
@@ -171,7 +204,7 @@ class TestMiddlewareWithApiKey:
     async def test_static_assets_exempt(self) -> None:
         """GET /static/js/api.js without token passes through (static assets must load before auth)."""
         app = AsyncMock()
-        middleware = BearerTokenMiddleware(app, api_key="secret-token")
+        middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
 
         scope = _make_scope("/static/js/api.js", "GET")
         receive = AsyncMock()
@@ -183,7 +216,7 @@ class TestMiddlewareWithApiKey:
     async def test_docs_page_exempt(self) -> None:
         """GET /docs without token passes through."""
         app = AsyncMock()
-        middleware = BearerTokenMiddleware(app, api_key="secret-token")
+        middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
 
         scope = _make_scope("/docs", "GET")
         receive = AsyncMock()
@@ -193,19 +226,53 @@ class TestMiddlewareWithApiKey:
         app.assert_called_once_with(scope, receive, send)
 
 
-class TestConstantTimeComparison:
-    """Token comparison must be constant-time to prevent timing attacks."""
+# ---------------------------------------------------------------------------
+# T6-T8: _resolve_token unit tests
+# ---------------------------------------------------------------------------
 
-    def test_auth_uses_hmac_compare_digest(self) -> None:
-        """auth.py must use hmac.compare_digest for token comparison, not ==."""
+
+class TestResolveToken:
+    """T6-T8: _resolve_token resolves correctly, returns None on miss, never 'unknown'."""
+
+    def test_resolve_token_returns_contributor_id_on_match(self) -> None:
+        """T6: _resolve_token returns contributor_id when sha256(token) is in keystore."""
+        token = "mysecrettoken"
+        contributor_id = "alice"
+        ks = {hashlib.sha256(token.encode()).hexdigest(): contributor_id}
+        assert _resolve_token(token, ks) == contributor_id
+
+    def test_resolve_token_returns_none_on_miss(self) -> None:
+        """T7: _resolve_token returns None (not 'unknown') when token is not in keystore."""
+        ks = {hashlib.sha256(b"other-token").hexdigest(): "bob"}
+        result = _resolve_token("wrong-token", ks)
+        assert result is None
+        assert result != "unknown"
+
+    def test_resolve_token_returns_none_for_empty_keystore(self) -> None:
+        """T8: _resolve_token returns None for any token when keystore is empty."""
+        assert _resolve_token("any-token", {}) is None
+
+
+# ---------------------------------------------------------------------------
+# T11: source inspection — _resolve_token in source, no hmac.compare_digest
+# ---------------------------------------------------------------------------
+
+
+class TestAuthSourceInspection:
+    """T11: source inspection for auth.py security implementation."""
+
+    def test_resolve_token_used_for_comparison(self) -> None:
+        """T11: auth.py uses _resolve_token (sha256 hash lookup), not hmac.compare_digest."""
         import inspect
 
         import context_intelligence_server.auth as auth_module
 
         source = inspect.getsource(auth_module)
-        assert "hmac.compare_digest" in source, (
-            "Token comparison must use hmac.compare_digest() "
-            "to prevent timing attacks, not == or !="
+        assert "_resolve_token" in source, (
+            "auth.py must use _resolve_token for token comparison"
+        )
+        assert "hmac.compare_digest" not in source, (
+            "auth.py must NOT use hmac.compare_digest after the keystore migration"
         )
 
 
@@ -307,7 +374,7 @@ class TestAuthEnforcedViaAsgiApp:
 
 
 class TestSkillsEndpointExempt:
-    """GET /skills/* is exempt from authentication even when api_key is set."""
+    """GET /skills/* is exempt from authentication even when keystore is configured."""
 
     async def test_skills_path_exempt_from_auth(self) -> None:
         from context_intelligence_server.auth import BearerTokenMiddleware
@@ -322,7 +389,7 @@ class TestSkillsEndpointExempt:
             if event["type"] == "http.response.start":
                 received.append(event["status"])
 
-        middleware = BearerTokenMiddleware(mock_app, api_key="secret")
+        middleware = BearerTokenMiddleware(mock_app, keystore=_keystore("secret"))
         scope = {
             "type": "http",
             "path": "/skills/context-intelligence-graph-query",
@@ -344,7 +411,7 @@ class TestSkillsEndpointExempt:
             if event["type"] == "http.response.start":
                 received.append(event["status"])
 
-        middleware = BearerTokenMiddleware(mock_app, api_key="secret")
+        middleware = BearerTokenMiddleware(mock_app, keystore=_keystore("secret"))
         scope = {
             "type": "http",
             "path": "/skills/any-other-skill",
@@ -355,7 +422,7 @@ class TestSkillsEndpointExempt:
 
 
 class TestVersionEndpointExempt:
-    """/version is exempt from authentication even when api_key is set."""
+    """/version is exempt from authentication even when keystore is configured."""
 
     async def test_version_path_exempt_from_auth(self) -> None:
         """GET /version without token passes through (version info must be accessible without auth)."""
@@ -369,7 +436,7 @@ class TestVersionEndpointExempt:
             if event["type"] == "http.response.start":
                 received.append(event["status"])
 
-        middleware = BearerTokenMiddleware(mock_app, api_key="secret")
+        middleware = BearerTokenMiddleware(mock_app, keystore=_keystore("secret"))
         scope = {
             "type": "http",
             "path": "/version",
@@ -390,7 +457,7 @@ class TestVersionEndpointExempt:
             if event["type"] == "http.response.start":
                 received.append(event["status"])
 
-        middleware = BearerTokenMiddleware(mock_app, api_key="secret")
+        middleware = BearerTokenMiddleware(mock_app, keystore=_keystore("secret"))
         scope = {
             "type": "http",
             "path": "/version",
