@@ -161,6 +161,28 @@ same registry and conversion path; no special-casing needed.
 `services.py`, `pipeline.py`, and handlers deal in Python stdlib types only and never import
 or reference `neo4j.time`.
 
+### Setting up / deploying auth (per-user API keys)
+
+If you are setting up or deploying this server, do NOT look for an `init`
+subcommand — **it has been removed.** Use one of:
+
+- **Docker bootstrap (default):** `./start.sh` (or the container entrypoint)
+  generates credentials on first run, writes an `api_keys` keystore, and **prints
+  the raw API token ONCE** behind a "SAVE THIS TOKEN" banner. Capture it then — the
+  file stores only the SHA-256 digest, so you cannot grep the token back.
+- **Manual:** follow [`docs/managing-api-keys.md`](docs/managing-api-keys.md).
+
+Auth model facts:
+- `api_keys` is the per-contributor keystore: `sha256_hex(token) -> {id: <contributor>}`.
+  The server stores digests; the peer sends the raw token; the server hashes it to
+  look up the contributor. The matched `id` surfaces as `created_by` on graph nodes.
+- Legacy single `api_key` still works (folds to id `owner`) — back-compat.
+- **`api_keys: {}` (empty map) is a HARD startup error** (fail-closed). To disable
+  auth, omit `api_keys`/use `null` and set no `api_key` (dev only).
+
+Canonical guide: `docs/managing-api-keys.md`. Design record:
+`docs/designs/per-user-api-keys.md`.
+
 ---
 
 ## Key Concepts

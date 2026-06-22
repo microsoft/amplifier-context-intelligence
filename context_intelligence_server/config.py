@@ -136,14 +136,35 @@ class Settings(BaseSettings):
         """Fail-closed: raise unless every entry is ``<64-hex> -> {"id": <non-empty str>}``.
 
         Rejects (by raising ``ValueError``):
-        - a key that is not a 64-character hex string;
+        - an explicitly empty dict (omit or null-out to disable authentication);
+        - a key that is not exactly 64 lowercase-hex characters after normalization
+          (whitespace characters are rejected because they are not valid hex digits);
         - a value that is not a dict;
-        - a value whose ``id`` is missing, not a string, or empty.
+        - a value whose ``id`` is missing, not a string, empty, or whitespace-only.
+
+        Digest keys are normalized to lowercase before validation and returned as
+        lowercase so an UPPERCASE digest in a config file maps correctly to the
+        lowercase hexdigest produced by ``hashlib.sha256(...).hexdigest()``.
+
+        NOTE: Duplicate digest keys in YAML/dict collapse to last-wins at the YAML
+        parse level, before this validator sees the data.  Detection is not possible
+        here.
         """
         if v is None:
             return None
+        # Fail-closed: an explicitly empty map is a misconfiguration, not "auth off".
+        # Omit api_keys or set it to null to disable per-contributor authentication.
+        if len(v) == 0:
+            raise ValueError(
+                "api_keys must contain at least one entry if specified; "
+                "omit it or use null to disable authentication"
+            )
+        normalized: dict[str, dict[str, str]] = {}
         for digest, meta in v.items():
-            if not _is_hex(digest) or len(digest) != 64:
+            digest_lower = digest.lower()
+            if len(digest_lower) != 64 or not all(
+                c in "0123456789abcdef" for c in digest_lower
+            ):
                 raise ValueError(
                     f"api_keys key {digest!r} must be a 64-character SHA-256 hex digest"
                 )
@@ -153,12 +174,13 @@ class Settings(BaseSettings):
                     f"got {meta!r}"
                 )
             contributor_id = meta.get("id")
-            if not isinstance(contributor_id, str) or not contributor_id:
+            if not isinstance(contributor_id, str) or not contributor_id.strip():
                 raise ValueError(
-                    f"api_keys[{digest!r}]['id'] must be a non-empty string, "
-                    f"got {contributor_id!r}"
+                    f"api_keys[{digest!r}]['id'] must be a non-empty, "
+                    f"non-whitespace string, got {contributor_id!r}"
                 )
-        return v
+            normalized[digest_lower] = meta
+        return normalized
 
     def build_keystore(self) -> dict[str, str]:
         """Return ``{sha256_hex(token) -> contributor_id}`` for all configured keys.
@@ -179,8 +201,9 @@ class Settings(BaseSettings):
             ks[digest] = "owner"
         # Explicit per-contributor keys: key is the digest, value carries id.
         # (May overwrite the legacy "owner" entry if the same digest is present.)
+        # Defensive .lower(): validator normalizes digests, but belt-and-suspenders here.
         for digest, meta in (self.api_keys or {}).items():
-            ks[digest] = meta["id"]
+            ks[digest.lower()] = meta["id"]
         return ks
 
     # -------------------------------------------------------------------------

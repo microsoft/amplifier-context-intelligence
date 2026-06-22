@@ -166,6 +166,7 @@ def _edge_merge_cypher(edge_type: str) -> str:
         f"MERGE (dst:{_UNIVERSAL_NODE_LABEL} "
         "{node_id: row.dst_id, workspace: $workspace}) "
         f"MERGE (src)-[r:{edge_type}]->(dst) "
+        "ON CREATE SET r.created_by = $created_by "
         "SET r += row.props"
     )
 
@@ -455,6 +456,8 @@ async def ensure_neo4j_schema(
             )
             and fully_established
         )
+        # NOTE: relationship created_by is intentionally NOT indexed in v1 — no consumer
+        # yet; querying edges by contributor is unsupported until indexed in a future phase.
 
         # NOTE: the composite :Node(node_id, workspace) lookup index that backs the
         # universal-label node MERGE (NodeIndexSeek, not AllNodesScan — the
@@ -741,6 +744,21 @@ def _chunk_list(
         yield chunk
 
 
+def _build_node_props(data: dict[str, Any], workspace: str) -> dict[str, Any]:
+    """Assemble the sanitized props dict for a single node row.
+
+    ``labels`` and ``created_by`` are excluded from the returned dict:
+    - ``labels`` are applied separately via ``SET n:Label`` statements (not stored as props).
+    - ``created_by`` travels ONLY as the ``$created_by`` query param (never a node property)
+      so it cannot affect node identity or clobber the ``ON CREATE SET n.created_by`` stamp.
+    """
+    raw = {k: v for k, v in data.items() if k not in ("labels", "created_by")}
+    _convert_temporal_props(raw)  # ISO str -> datetime, in place
+    props = Neo4jGraphStore._sanitize_properties(raw)
+    props["workspace"] = workspace
+    return props
+
+
 async def _write_batch(
     tx: Any,
     node_snapshot: dict[str, dict[str, Any]],
@@ -772,10 +790,7 @@ async def _write_batch(
 
     for node_id, data in node_snapshot.items():
         labels: list[str] = data.get("labels", [])
-        node_props = {k: v for k, v in data.items() if k != "labels"}
-        _convert_temporal_props(node_props)  # ISO str -> datetime, in place
-        props = Neo4jGraphStore._sanitize_properties(node_props)
-        props["workspace"] = workspace
+        props = _build_node_props(data, workspace)
         row: dict[str, Any] = {"node_id": node_id, "props": props}
 
         if "Session" in labels:
@@ -882,7 +897,9 @@ async def _write_batch(
     edge_groups: dict[str, list[dict[str, Any]]] = {}
     for (src_id, dst_id), data in edge_snapshot.items():
         edge_type: str = data.get("type", _DEFAULT_EDGE_TYPE)
-        edge_props = {k: v for k, v in data.items() if k != "type"}
+        # created_by travels ONLY as the $created_by query param (never a rel property)
+        # so it cannot clobber the ON CREATE SET r.created_by provenance stamp.
+        edge_props = {k: v for k, v in data.items() if k not in ("type", "created_by")}
         _convert_temporal_props(edge_props)  # ISO str -> datetime, in place
         props = Neo4jGraphStore._sanitize_properties(edge_props)
         props["workspace"] = workspace
@@ -902,6 +919,7 @@ async def _write_batch(
             edge_merge_query,  # type: ignore[arg-type]
             rows=rows,
             workspace=workspace,
+            created_by=created_by,
         )
         await res.consume()
 

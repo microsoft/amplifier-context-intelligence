@@ -804,36 +804,7 @@ class TestAuthMiddleware:
 
 
 class TestMainDispatch:
-    """Tests for the CLI entrypoint main() dispatch function."""
-
-    def test_main_with_init_subcommand_calls_init_main(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """main() calls init_command.main() when first arg is 'init', not run()."""
-        from unittest.mock import patch as _patch
-
-        import context_intelligence_server.main as _main_mod
-
-        monkeypatch.setattr(
-            "sys.argv",
-            [
-                "context-intelligence-server",
-                "init",
-                "--config-path",
-                "/tmp/test.yaml",
-                "--neo4j-password",
-                "pw",
-            ],
-        )
-
-        with (
-            _patch.object(_main_mod, "run") as mock_run,
-            _patch("context_intelligence_server.init_command.main") as mock_init_main,
-        ):
-            _main_mod.main()
-
-        mock_init_main.assert_called_once()
-        mock_run.assert_not_called()
+    """Tests for the CLI entrypoint main() function."""
 
     def test_main_with_no_args_calls_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """main() calls run() when no subcommand is given."""
@@ -843,19 +814,15 @@ class TestMainDispatch:
 
         monkeypatch.setattr("sys.argv", ["context-intelligence-server"])
 
-        with (
-            _patch.object(_main_mod, "run") as mock_run,
-            _patch("context_intelligence_server.init_command.main") as mock_init_main,
-        ):
+        with _patch.object(_main_mod, "run") as mock_run:
             _main_mod.main()
 
         mock_run.assert_called_once()
-        mock_init_main.assert_not_called()
 
     def test_main_with_non_init_flag_calls_run(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """main() calls run() when first arg is not 'init' (e.g. --workers 2)."""
+        """main() calls run() when flags are present."""
         from unittest.mock import patch as _patch
 
         import context_intelligence_server.main as _main_mod
@@ -864,48 +831,10 @@ class TestMainDispatch:
             "sys.argv", ["context-intelligence-server", "--workers", "2"]
         )
 
-        with (
-            _patch.object(_main_mod, "run") as mock_run,
-            _patch("context_intelligence_server.init_command.main") as mock_init_main,
-        ):
+        with _patch.object(_main_mod, "run") as mock_run:
             _main_mod.main()
 
         mock_run.assert_called_once()
-        mock_init_main.assert_not_called()
-
-    def test_main_init_strips_init_from_argv(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """main() removes 'init' from sys.argv before delegating to init_command.main()."""
-        import sys
-        from unittest.mock import patch as _patch
-
-        import context_intelligence_server.main as _main_mod
-
-        monkeypatch.setattr(
-            "sys.argv",
-            [
-                "context-intelligence-server",
-                "init",
-                "--neo4j-password",
-                "secret",
-            ],
-        )
-        captured_argv: list[str] = []
-
-        def capture_init() -> None:
-            captured_argv.extend(sys.argv)
-
-        with (
-            _patch(
-                "context_intelligence_server.init_command.main",
-                side_effect=capture_init,
-            ),
-        ):
-            _main_mod.main()
-
-        assert "init" not in captured_argv
-        assert "--neo4j-password" in captured_argv
 
 
 async def test_lifespan_creates_and_closes_driver(
@@ -1326,23 +1255,19 @@ async def test_post_events_stamps_none_when_no_auth(
 
 
 async def test_crash_recovery_passes_created_by_to_get_or_create(
-    tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """T15: crash recovery reads created_by from first queued line and passes it to get_or_create."""
-    import json as _json
+    """T15: crash recovery reads created_by from first queued line and passes it to get_or_create.
 
-    from context_intelligence_server.queue_manager import QueueManager
+    Exercises the REAL ``_recover_one_session()`` from main.py — not an inline
+    reimplementation.  The function accepts ``str | bytes`` so no QueueManager
+    plumbing is required here; the queue-read step is the caller's responsibility
+    (tested end-to-end by ``test_lifespan_recovers_and_respawns_drainers``).
+    """
+    import context_intelligence_server.main as _main_mod
 
-    # Build a queue file that has a first line with created_by set.
     sid = "recovery-session-t15"
-    queue_dir = tmp_path / "queues"
-    queue_dir.mkdir(parents=True, exist_ok=True)
-    # QueueManager stores files directly in _dir: <sid>.log and <sid>.offset
-    log_file = queue_dir / f"{sid}.log"
-    offset_file = queue_dir / f"{sid}.offset"
-
-    first_line = _json.dumps(
+    first_line = json.dumps(
         {
             "event": "session:start",
             "workspace": "/test-workspace",
@@ -1351,11 +1276,7 @@ async def test_crash_recovery_passes_created_by_to_get_or_create(
         },
         separators=(",", ":"),
     )
-    log_file.write_text(first_line + "\n", encoding="utf-8")
-    # offset 0 = unread
-    offset_file.write_text("0", encoding="utf-8")
 
-    qm = QueueManager(queues_dir=tmp_path / "queues")
     calls: list[dict] = []
 
     def _fake_get_or_create(
@@ -1368,26 +1289,52 @@ async def test_crash_recovery_passes_created_by_to_get_or_create(
         )
         return MagicMock()
 
-    # Simulate the recovery loop logic directly (mirrors main.py lifespan recovery).
-    # We cannot monkeypatch registry.queue_manager (it's a property with no setter),
-    # so we exercise the parsing logic in isolation.
-    recovered = [sid]
-    fake_registry_get_or_create = _fake_get_or_create
-    for s in recovered:
-        batch = await qm.read_batch(s, max_items=1)
-        if not batch.lines:
-            continue
-        try:
-            obj = _json.loads(batch.lines[0])
-            workspace = obj.get("workspace", "")
-            created_by: str | None = obj.get("created_by")
-        except (ValueError, KeyError):
-            workspace = ""
-            created_by = None
-        if not workspace:
-            continue
-        fake_registry_get_or_create(s, workspace, created_by=created_by)
+    # Call the REAL recovery function — not a reimplementation of its logic.
+    result = _main_mod._recover_one_session(sid, first_line, _fake_get_or_create)
 
+    assert result is True
     assert len(calls) == 1
+    assert calls[0]["session_id"] == sid
     assert calls[0]["created_by"] == "recovered-contributor"
     assert calls[0]["workspace"] == "/test-workspace"
+
+
+@pytest.mark.parametrize(
+    "bad_line",
+    [
+        '{"event":"session:start","workspace":"/ws","crea',  # truncated JSON
+        "} totally invalid json {",  # pure garbage
+        "",  # empty line
+    ],
+    ids=["truncated-json", "garbage", "empty"],
+)
+async def test_crash_recovery_truncated_line_safe_skip(bad_line: str) -> None:
+    """T15b: crash recovery handles a truncated/garbage JSONL line deterministically.
+
+    A queue whose final line is truncated or garbage must be safe-skipped — the
+    recovery must not raise and must not spawn a drainer for the bad line.
+
+    Exercises the REAL ``_recover_one_session()`` from main.py.
+    """
+    import context_intelligence_server.main as _main_mod
+
+    sid = "recovery-session-t15b"
+    calls: list[dict] = []
+
+    def _fake_get_or_create(
+        session_id: str,
+        workspace: str,
+        created_by: str | None = None,
+    ) -> MagicMock:
+        calls.append(
+            {"session_id": session_id, "workspace": workspace, "created_by": created_by}
+        )
+        return MagicMock()
+
+    # Must not raise — bad JSON triggers ValueError which is caught internally.
+    result = _main_mod._recover_one_session(sid, bad_line, _fake_get_or_create)
+
+    assert result is False, (
+        f"Bad/truncated line must be safe-skipped (return False), got {result!r}"
+    )
+    assert calls == [], "No drainer must be spawned for a bad/truncated line"

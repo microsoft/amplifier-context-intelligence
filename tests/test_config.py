@@ -419,13 +419,6 @@ class TestValidateApiKeys:
         with pytest.raises(ValidationError):
             Settings(api_keys={"a" * 64: {"id": ""}})
 
-    def test_empty_api_keys_is_valid(self) -> None:
-        """T12: Empty api_keys dict is valid (no auth configured)."""
-        from context_intelligence_server.config import Settings
-
-        s = Settings(api_keys={})
-        assert s.api_keys == {}
-
     def test_none_api_keys_is_valid(self) -> None:
         """T12: api_keys=None (default) is valid (no per-contributor keys configured)."""
         from context_intelligence_server.config import Settings
@@ -486,3 +479,121 @@ class TestBuildKeystore:
         assert ks[legacy_digest] == "owner"
         assert ks[peer_digest] == "peer-test"
         assert ks[legacy_digest] == "owner"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 auth correctness — T1.1 (fail-closed empty dict) + T1.2 (digest hygiene)
+# ---------------------------------------------------------------------------
+
+
+class TestPhase1FailClosedEmptyApiKeys:
+    """T1.1: api_keys={} is a configuration error; auth-off requires None / omission."""
+
+    def test_api_keys_empty_dict_raises(self) -> None:
+        """T1.1: Settings(api_keys={}) raises ValidationError (fail-closed).
+
+        An explicitly empty map is a misconfiguration, not "auth disabled".
+        Omit api_keys or set it to null to disable per-contributor auth.
+        """
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="at least one entry"):
+            Settings(api_keys={})
+
+    def test_api_keys_none_is_allowed(self) -> None:
+        """T1.1: api_keys=None (omitted) disables auth — no ValidationError raised.
+
+        Guards against an implementation mistake where the empty-dict rejection
+        accidentally fires for None as well.
+        """
+        from context_intelligence_server.config import Settings
+
+        s = Settings(api_keys=None)
+        assert s.api_keys is None
+        # build_keystore returns {} when neither api_key nor api_keys is set.
+        assert s.build_keystore() == {}
+
+
+class TestPhase1DigestHygiene:
+    """T1.2: Digest normalization and contributor-id hygiene (close silent-401 traps)."""
+
+    def test_uppercase_digest_normalized_and_authenticates(self) -> None:
+        """T1.2: UPPERCASE digest is accepted and normalized to lowercase.
+
+        hashlib.sha256(...).hexdigest() always returns lowercase hex.  An operator
+        who pastes a digest in UPPERCASE must not end up with a silent 401.
+        After build_keystore the keystore key must be lowercase so _resolve_token
+        (which uses hexdigest) can find it.
+        """
+        from context_intelligence_server.config import Settings
+
+        upper = "A" * 64
+        lower = upper.lower()  # "a" * 64
+
+        s = Settings(api_keys={upper: {"id": "owner"}})
+
+        # Validator must have lowercased the key in the stored dict.
+        assert s.api_keys is not None, "api_keys must not be None after construction"
+        assert lower in s.api_keys, (
+            f"Expected lowercase key in api_keys, got keys: {list(s.api_keys)!r}"
+        )
+        assert upper not in s.api_keys, (
+            "Uppercase key must not remain in api_keys after normalization"
+        )
+        assert s.api_keys[lower] == {"id": "owner"}
+
+        # build_keystore must expose the lowercase key so _resolve_token hits it.
+        ks = s.build_keystore()
+        assert ks.get(lower) == "owner", (
+            f"keystore[{lower!r}] should be 'owner'; full keystore={ks!r}"
+        )
+        assert ks.get(upper) is None, "Uppercase key must not appear in keystore"
+
+    def test_non_hex_digest_rejected(self) -> None:
+        """T1.2: 64-char string containing non-hex characters raises ValidationError."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(api_keys={"z" * 64: {"id": "owner"}})
+
+    def test_wrong_length_digest_rejected(self) -> None:
+        """T1.2: 63- and 65-char hex strings raise ValidationError (must be exactly 64)."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(api_keys={"a" * 63: {"id": "owner"}})
+
+        with pytest.raises(ValidationError):
+            Settings(api_keys={"a" * 65: {"id": "owner"}})
+
+    def test_whitespace_in_digest_rejected(self) -> None:
+        """T1.2: A digest containing whitespace is rejected (space is not a hex char)."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        # 64 chars total, but a leading space makes it invalid hex.
+        digest_with_spaces = " " + "a" * 62 + " "
+        assert len(digest_with_spaces) == 64
+
+        with pytest.raises(ValidationError):
+            Settings(api_keys={digest_with_spaces: {"id": "owner"}})
+
+    def test_blank_contributor_id_rejected(self) -> None:
+        """T1.2: Whitespace-only contributor id raises ValidationError.
+
+        ``not contributor_id`` is True only for the empty string; ``\"   \"`` is
+        truthy.  The validator must use ``.strip()`` to catch whitespace-only ids.
+        """
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(api_keys={"a" * 64: {"id": "   "}})

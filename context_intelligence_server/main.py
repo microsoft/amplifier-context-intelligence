@@ -47,6 +47,47 @@ _settings = get_settings()
 logger = logging.getLogger("context_intelligence_server")
 
 
+def _recover_one_session(
+    sid: str,
+    first_line: str | bytes,
+    get_or_create: Any,
+) -> bool:
+    """Parse the first queued line for *sid* and respawn a drainer when valid.
+
+    Extracted from the lifespan startup recovery loop so tests can exercise the
+    real parsing/dispatch logic rather than reimplementing it inline.
+
+    The queue-read step is handled by the caller (the lifespan loop or the test)
+    so this function is pure — no I/O, fully synchronous.
+
+    Args:
+        sid:            Session id being recovered.
+        first_line:     The first raw log line (bytes from QueueManager or str
+                        from tests).  ``json.loads`` accepts both.
+        get_or_create:  The registry callable — ``registry.get_or_create`` in
+                        production or a spy in tests.
+
+    Returns:
+        True  – drainer was (re)spawned via *get_or_create*.
+        False – session skipped (empty/torn workspace, or malformed JSON line).
+    """
+    try:
+        obj = json.loads(first_line)
+        workspace: str = obj.get("workspace", "")
+        created_by: str | None = obj.get("created_by")
+    except (ValueError, KeyError):
+        workspace = ""
+        created_by = None
+    if not workspace:
+        logger.warning(
+            "recovery_skipped session=%s: torn or empty workspace in first line",
+            sid,
+        )
+        return False
+    get_or_create(sid, workspace, created_by=created_by)
+    return True
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application lifespan: configure logging and create shared Neo4j driver."""
@@ -99,24 +140,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         batch = await registry.queue_manager.read_batch(sid, max_items=1)
         if not batch.lines:
             continue
-        try:
-            obj = json.loads(batch.lines[0])
-            workspace = obj.get("workspace", "")
-            created_by: str | None = obj.get("created_by")
-        except (ValueError, KeyError):
-            workspace = ""
-            created_by = None
-        if not workspace:
-            # Panel finding #10: never spawn a workspace='' worker — it would
-            # violate the EventRequest non-empty-workspace invariant (422). A
-            # torn or empty-workspace first line is skipped, not recovered.
-            logger.warning(
-                "recovery_skipped session=%s: torn or empty workspace in first line",
-                sid,
-            )
-            continue
-        registry.get_or_create(sid, workspace, created_by=created_by)
-        respawned += 1
+        if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
+            respawned += 1
     logger.info(
         "lifespan_startup: crash recovery respawned %d/%d drainers",
         respawned,
@@ -315,21 +340,8 @@ async def post_cypher(body: CypherRequest, request: Request) -> Response:
 
 
 def main() -> None:
-    """CLI entrypoint.
-
-    context-intelligence-server           → start the server (gunicorn)
-    context-intelligence-server init ...  → run first-run configuration
-    """
-    import sys
-
-    if len(sys.argv) > 1 and sys.argv[1] == "init":
-        # Strip "init" from argv so init_command's argparse sees only its own flags
-        sys.argv = [sys.argv[0]] + sys.argv[2:]
-        from context_intelligence_server.init_command import main as _init_main
-
-        _init_main()
-    else:
-        run()
+    """CLI entrypoint."""
+    run()
 
 
 def _effective_worker_count() -> int:

@@ -2609,3 +2609,147 @@ class TestSessionMergeInlineCreatedBy:
             "_write_batch must contain ON CREATE SET n.created_by = $created_by "
             "for the inline Session MERGE path"
         )
+
+
+# ---------------------------------------------------------------------------
+# T20: Phase 2 — node created_by structural exclusion (_build_node_props helper)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildNodePropsCreatedBy:
+    """T20: _build_node_props excludes 'created_by' from node props (write-once structural guarantee).
+
+    ``created_by`` travels ONLY as the ``$created_by`` query param so it can never
+    ride in ``row.props`` and clobber the ``ON CREATE SET n.created_by`` stamp.
+    """
+
+    def test_node_props_excludes_created_by(self) -> None:
+        """T20: data dict containing created_by → built props has NO created_by key."""
+        from context_intelligence_server.neo4j_store import _build_node_props
+
+        data: dict = {
+            "labels": ["Event"],
+            "created_by": "alice",
+            "name": "test-event",
+            "count": 42,
+        }
+        props = _build_node_props(data, "ws-1")
+
+        assert "created_by" not in props, (
+            "_build_node_props must NOT include created_by in props; "
+            "created_by travels ONLY as the $created_by query param"
+        )
+        # Phase 6: real-Neo4j behavioral write-once gate
+
+    def test_node_props_includes_workspace(self) -> None:
+        """T20: _build_node_props injects workspace into returned props."""
+        from context_intelligence_server.neo4j_store import _build_node_props
+
+        data: dict = {"labels": ["Event"], "name": "x"}
+        props = _build_node_props(data, "ws-test")
+        assert props.get("workspace") == "ws-test", (
+            "_build_node_props must inject workspace into the returned props"
+        )
+
+    def test_node_props_excludes_labels(self) -> None:
+        """T20: _build_node_props must NOT include labels in props (labels travel separately)."""
+        from context_intelligence_server.neo4j_store import _build_node_props
+
+        data: dict = {"labels": ["Event", "Session"], "name": "x"}
+        props = _build_node_props(data, "ws-1")
+        assert "labels" not in props, (
+            "_build_node_props must NOT include labels in props"
+        )
+
+    def test_node_props_preserves_legitimate_props(self) -> None:
+        """T20: _build_node_props preserves legitimate data properties."""
+        from context_intelligence_server.neo4j_store import _build_node_props
+
+        data: dict = {
+            "labels": ["Event"],
+            "name": "test",
+            "count": 7,
+            "active": True,
+        }
+        props = _build_node_props(data, "ws-1")
+        assert props.get("name") == "test", "_build_node_props must preserve 'name'"
+        assert props.get("count") == 7, "_build_node_props must preserve 'count'"
+        assert props.get("active") is True, "_build_node_props must preserve 'active'"
+
+
+# ---------------------------------------------------------------------------
+# T21: Phase 2E — edge/relationship provenance (write-once, worker-level scalar)
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeMergeCypherProvenance:
+    """T21: _edge_merge_cypher + _write_batch edge path implement write-once provenance."""
+
+    def test_edge_merge_cypher_has_on_create_set_created_by(self) -> None:
+        """T21: _edge_merge_cypher output contains ON CREATE SET r.created_by = $created_by."""
+        from context_intelligence_server.neo4j_store import _edge_merge_cypher
+
+        cypher = _edge_merge_cypher("RELATED")
+        assert "ON CREATE SET r.created_by = $created_by" in cypher, (
+            "_edge_merge_cypher must include ON CREATE SET r.created_by = $created_by; "
+            f"got:\n{cypher}"
+        )
+
+    def test_edge_endpoint_merges_have_no_set(self) -> None:
+        """T21: endpoint MERGE (src) / MERGE (dst) clauses are NOT followed by ON CREATE SET.
+
+        Placeholder endpoint nodes must stay bare — setting created_by on them here would
+        mis-attribute a node created first by contributor A but initially referenced as an
+        edge endpoint by contributor B.
+        """
+        import re
+
+        from context_intelligence_server.neo4j_store import _edge_merge_cypher
+
+        cypher = _edge_merge_cypher("RELATED")
+        # Every ON CREATE SET in the cypher must target the relationship var 'r',
+        # never the endpoint node vars 'src' or 'dst'.
+        on_create_targets = re.findall(r"ON\s+CREATE\s+SET\s+(\w+)\.", cypher)
+        for target in on_create_targets:
+            assert target == "r", (
+                f"ON CREATE SET must only target the relationship (r); "
+                f"found ON CREATE SET {target}. — endpoint nodes must stay bare "
+                f"to avoid cross-session mis-attribution"
+            )
+
+    def test_edge_write_passes_created_by_param(self) -> None:
+        """T21: _write_batch edge tx.run() call passes created_by=created_by kwarg.
+
+        The param already exists in _write_batch's signature; this asserts it is
+        forwarded to the edge path (not just the node paths).
+        """
+        import inspect
+
+        from context_intelligence_server import neo4j_store
+
+        source = inspect.getsource(neo4j_store._write_batch)
+        # Look only in the edge section (after 'edge_merge_query' is first assigned)
+        edge_section_start = source.find("edge_merge_query")
+        assert edge_section_start != -1, (
+            "_write_batch must contain an 'edge_merge_query' assignment"
+        )
+        edge_section = source[edge_section_start:]
+        assert "created_by=created_by" in edge_section, (
+            "_write_batch edge tx.run() must pass created_by=created_by; "
+            "the param is in the _write_batch signature but absent from the edge path"
+        )
+
+    def test_edge_props_excludes_created_by(self) -> None:
+        """T21: edge row builder drops created_by from props (same guarantee as nodes)."""
+        import inspect
+
+        from context_intelligence_server import neo4j_store
+
+        source = inspect.getsource(neo4j_store._write_batch)
+        # The edge comprehension must exclude "created_by" alongside "type"
+        # GREEN shape: if k not in ("type", "created_by")
+        assert 'not in ("type", "created_by")' in source, (
+            '_write_batch edge props comprehension must exclude "created_by": '
+            'expected `if k not in ("type", "created_by")` in source'
+        )
+        # Phase 6: real-Neo4j edge write-once + cross-session gate

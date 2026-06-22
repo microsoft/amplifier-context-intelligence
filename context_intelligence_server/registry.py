@@ -521,6 +521,28 @@ class SessionRegistry:
                 session_id,
                 extra={"session_id": session_id},
             )
+        else:
+            # Session-ownership invariant: each session_id is owned by exactly one
+            # contributor; the bound created_by (set once at creation) is load-bearing
+            # for provenance.  Log at ERROR — not WARNING — so monitoring surfaces a
+            # violation observably; preserve the bound id and don't crash live ingest.
+            if created_by is not None:
+                bound = getattr(
+                    self._workers[session_id].services.graph, "created_by", None
+                )
+                if bound is not None and bound != created_by:
+                    logger.error(
+                        "session_ownership_invariant_violation session=%s "
+                        "bound_contributor=%s conflicting_contributor=%s",
+                        session_id,
+                        bound,
+                        created_by,
+                        extra={
+                            "session_id": session_id,
+                            "bound_contributor": bound,
+                            "conflicting_contributor": created_by,
+                        },
+                    )
         return self._workers[session_id]
 
     def remove(self, session_id: str) -> None:

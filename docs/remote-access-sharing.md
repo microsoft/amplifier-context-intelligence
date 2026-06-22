@@ -33,8 +33,11 @@ It never connects to Neo4j (bolt `7687` / browser `7474`) and uses no other
 endpoint. So a peer needs reachability to **one path on one port** — `POST /events`
 — and nothing else. The entire design below follows from that fact.
 
-The bearer token is the server's `api_key` (see the auth model in the README). Keep
-it set; it is your application-layer gate even inside the tunnel.
+The peer holds a **raw bearer token**; the server stores only its SHA-256 digest
+and verifies each request by hashing the presented token (`sha256(token)`) and
+looking the digest up. Issue each peer their own token via the `api_keys` keystore
+— see [docs/managing-api-keys.md](managing-api-keys.md). Keep auth enabled; it is
+your application-layer gate even inside the tunnel.
 
 ---
 

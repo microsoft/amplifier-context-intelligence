@@ -104,7 +104,7 @@ def test_first_run_creates_credentials_files(
 def test_first_run_credentials_yaml_has_expected_keys(
     isolated_home: tuple[pathlib.Path, dict],
 ) -> None:
-    """credentials.yaml must contain neo4j_url, neo4j_user, neo4j_password, api_key."""
+    """credentials.yaml must contain neo4j_url, neo4j_user, neo4j_password, api_keys."""
     fake_home, env = isolated_home
 
     result = subprocess.run(
@@ -123,7 +123,19 @@ def test_first_run_credentials_yaml_has_expected_keys(
     assert "neo4j_url" in creds, "credentials.yaml must contain 'neo4j_url'"
     assert "neo4j_user" in creds, "credentials.yaml must contain 'neo4j_user'"
     assert "neo4j_password" in creds, "credentials.yaml must contain 'neo4j_password'"
-    assert "api_key" in creds, "credentials.yaml must contain 'api_key'"
+    # New per-user format: api_keys maps sha256_hex(token) -> {id: owner}.
+    # The raw token is NOT stored on disk (only its digest); it is printed once
+    # by start.sh. Legacy top-level 'api_key' must no longer be emitted.
+    assert "api_key" not in creds, "credentials.yaml must NOT contain legacy 'api_key'"
+    assert "api_keys" in creds, "credentials.yaml must contain 'api_keys'"
+    assert isinstance(creds["api_keys"], dict) and len(creds["api_keys"]) == 1, (
+        "api_keys must contain exactly one entry on first run"
+    )
+    ((digest, meta),) = creds["api_keys"].items()
+    assert len(digest) == 64 and all(c in "0123456789abcdef" for c in digest), (
+        f"api_keys key must be a 64-char lowercase sha256 hex digest, got {digest!r}"
+    )
+    assert meta == {"id": "owner"}, f"first-run entry must be {{id: owner}}, got {meta!r}"
     assert creds["neo4j_url"] == "bolt://neo4j:7687", (
         "neo4j_url must be 'bolt://neo4j:7687'"
     )
