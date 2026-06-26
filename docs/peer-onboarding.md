@@ -17,6 +17,13 @@ metadata and tool-call traces, which can include prompts, file paths, and tool
 arguments — is uploaded to a **shared graph that the server owner can query**. You
 contribute data; you don't query the shared graph yourself.
 
+> **Contribute-only — you cannot query the shared graph.** The connection is one-way:
+> your sessions upload, and the *owner* queries them. The query endpoints are not
+> exposed to peers. If someone told you you'd be able to query the shared graph
+> (for example, to read the owner's own sessions), that isn't part of this setup —
+> check with them. Enabling it would require the owner to expose their entire graph
+> for reading, which most owners won't do.
+
 Traffic is end-to-end encrypted (over the owner's overlay network plus HTTPS) and
 reaches only the upload endpoint. **You can opt out at any time** by removing the
 destination below (or stopping the bundle). Data already uploaded remains in the
@@ -39,6 +46,11 @@ they use something else.
 2. Sign in. The owner sends you a **device share invitation** for one machine.
    **Accept it** (via the email link, or under *Machines* in your Tailscale admin
    console). You do not join their network — you just get access to that one machine.
+3. **Confirm the share is live before going further.** The shared machine should now
+   appear in your Tailscale *Machines* list. Until it does, you have no network path to
+   the server and the connection test in step 5 returns `000` (not `401`) — that's the
+   share not being active yet, **not** a server problem. Give it a moment after
+   accepting, and re-open the invite if the machine doesn't show up.
 
 ---
 
@@ -122,7 +134,7 @@ curl -s -o /dev/null -w '%{http_code}\n' https://<their-node>.<their-tailnet>.ts
 | Result | Meaning |
 |--------|---------|
 | `401`  | Reachable — the server is there and (correctly) wants a token. You're good. |
-| `000` / hang | Tailscale isn't connected, or you haven't accepted the share. |
+| `000` / hang | The Tailscale share isn't active yet (the most common first-run snag) — confirm the shared machine appears in your *Machines* list and Tailscale is connected. **Not** a server problem. |
 | `404`  | Wrong URL — re-check it exactly. |
 
 **B. Your key is accepted:**
