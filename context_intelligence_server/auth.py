@@ -7,9 +7,20 @@ from collections.abc import Callable, MutableMapping
 from typing import Any
 
 import jwt  # pyjwt[crypto] — added in T1; used by EntraResolver
+from jwt import PyJWKClient
 from typing_extensions import Protocol
 
 _log = logging.getLogger(__name__)
+
+# JWKS signing-key cache TTL passed to PyJWKClient.
+#
+# PyJWKClient handles per-kid caching and lifespan-bounded refresh natively;
+# making the value explicit here keeps the contract visible in code even
+# though 300 s matches the library default.  No custom per-kid dedup lock
+# or global refresh cap is built for the pilot (council/cranky: pilot-scale
+# does not justify that complexity — revisit at scale if stampede behaviour
+# is observed in production metrics).
+JWKS_CACHE_LIFESPAN_SECONDS: int = 300
 
 # Paths that are exempt from authentication (health checks, monitoring, dashboard pages).
 _EXEMPT_PATHS: frozenset[str] = frozenset(
@@ -139,10 +150,11 @@ class EntraResolver:
                       ``https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys``
                       and calls ``fetch_data()`` eagerly.
 
-    Note — T5 TODO:
-        The per-``kid`` dedup lock and global JWKS-refresh cap described in §8b
-        (H3) are NOT implemented here.  The eager prefetch at construction is the
-        only caching guard in place.  T5 adds the full cap + per-kid lock.
+    Note — JWKS caching (T5):
+        Per-``kid`` caching and lifespan-bounded refresh are handled by
+        ``PyJWKClient`` (``lifespan=JWKS_CACHE_LIFESPAN_SECONDS``).  No custom
+        per-``kid`` dedup lock or global refresh cap is built for the pilot;
+        revisit at scale if stampede behaviour appears in production metrics.
     """
 
     def __init__(
@@ -163,18 +175,18 @@ class EntraResolver:
         self._expected_issuer = f"https://login.microsoftonline.com/{tenant_id}/v2.0"
 
         if jwks_client is None:
-            from jwt import PyJWKClient
-
             jwks_uri = (
                 f"https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys"
             )
-            jwks_client = PyJWKClient(jwks_uri)
+            jwks_client = PyJWKClient(jwks_uri, lifespan=JWKS_CACHE_LIFESPAN_SECONDS)
 
         # Eager prefetch — fail-closed at startup (§8b / crusty gate).
         # Called regardless of whether the client was injected or built by
         # default so that tests can inject a _FailingJWKSClient and verify
         # the fail-closed guarantee.
-        # TODO(T5): replace with per-kid dedup lock + global cap.
+        # Per-kid caching and lifespan-bounded refresh are handled by
+        # PyJWKClient (lifespan=JWKS_CACHE_LIFESPAN_SECONDS).  No custom
+        # per-kid dedup lock or global refresh cap is built for the pilot.
         try:
             jwks_client.fetch_data()
         except Exception as exc:  # noqa: BLE001 — any failure is fatal here
@@ -395,16 +407,26 @@ class BearerTokenMiddleware:
         except AuthError as exc:
             # EntraResolver (and future resolvers) raise AuthError to communicate
             # 401 vs 403.  Dispatch the status code directly.
+            # Log at INFO — distinguishable from unexpected errors (ERROR).
+            # auth_event=auth_denied is a greppable marker for "bad token rejected".
+            _log.info(
+                "auth_event=auth_denied: %s (status=%d)",
+                exc.reason,
+                exc.status_code,
+            )
             await _send_error(send, exc.status_code, exc.reason)
             return
         except Exception:
             # Defense-in-depth catch-all: any unexpected exception from the
             # resolver (e.g. a transient library bug) must not propagate as a
             # 500 — respond fail-closed (401) and log loudly for operators.
+            # auth_event=resolver_unexpected_exception distinguishes this from
+            # a normal auth denial so operators can grep specifically for it.
             # The raw token is intentionally NOT logged (credential hygiene).
             _log.error(
-                "Unexpected exception in resolver.resolve() — denying request "
-                "(fail-closed).  Investigate the exception below.",
+                "auth_event=resolver_unexpected_exception: unexpected error in "
+                "resolver.resolve() — denying request fail-closed "
+                "(investigate exc_info below)",
                 exc_info=True,
             )
             await _send_401(send)
