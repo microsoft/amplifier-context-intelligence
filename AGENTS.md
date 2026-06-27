@@ -183,6 +183,35 @@ Auth model facts:
 Canonical guide: `docs/managing-api-keys.md`. Design record:
 `docs/designs/per-user-api-keys.md`.
 
+### Entra (Azure AD) JWT auth (`auth_mode=entra`)
+
+The server also supports **Microsoft Entra** authentication as an alternative to
+static keys. `auth_mode` (in `config.py`) selects the active resolver — `static`
+(default, the api_keys keystore above) or `entra` (JWT validation via Entra JWKS).
+Exactly one mode is active; switching is a config change, no code change.
+
+Auth model facts:
+- When `auth_mode=entra`, the server validates an RS256 Entra bearer token
+  (audience `[<client_id>, api://<client_id>]`, issuer `…/<tenant_id>/v2.0`,
+  explicit `tid`, `scp` must contain `access_as_user`), extracts the `oid` claim,
+  and maps it to a contributor via `entra_identities`. That `id` surfaces as
+  `created_by` on graph nodes — same provenance path as static mode.
+- Config fields (all required for `auth_mode=entra`): `azure_client_id`,
+  `azure_tenant_id`, and `entra_identities` (`{ "<oid>": { "id": "<contributor>" } }`
+  — value carries ONLY `id`). Env prefix `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_`.
+- **Fail-closed:** misconfig (missing field / empty or malformed `entra_identities`)
+  is a HARD startup error. `allow_unauthenticated` defaults to `false`; a server
+  with no auth configured refuses to start.
+- **401** = bad/expired/wrong-audience/missing token; **403** = valid token whose
+  `oid` isn't in the map (the 403 body names the unbound oid for the operator).
+
+> 🔒 **Secret hygiene — NO real identifiers in this product repo.** An `oid` is a
+> persistent personal identifier (PII). Never commit real oids, client IDs, or
+> tenant IDs here — **placeholders only** (e.g. `aaaaaaaa-0000-0000-0000-…`). Inject
+> the real `entra_identities` map via env/secret or a git-ignored config file.
+
+Canonical guide: `docs/entra-auth-setup.md` (operator + developer + ops runbook).
+
 ---
 
 ## Key Concepts
