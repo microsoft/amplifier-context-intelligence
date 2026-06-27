@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from neo4j import AsyncGraphDatabase
 
 from context_intelligence_server import __version__
-from context_intelligence_server.auth import BearerTokenMiddleware
+from context_intelligence_server.auth import BearerTokenMiddleware, StaticKeyResolver
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.dashboard import build_status_response
@@ -184,8 +184,17 @@ app.mount("/static", StaticFiles(directory=_WEB_DIR / "static"), name="static")
 
 
 def create_asgi_app() -> BearerTokenMiddleware:
-    """Return the ASGI app wrapped with auth middleware."""
-    return BearerTokenMiddleware(app, keystore=_settings.build_keystore())
+    """Return the ASGI app wrapped with auth middleware.
+
+    Explicitly constructs a :class:`~context_intelligence_server.auth.StaticKeyResolver`
+    from the current settings keystore and passes it as the *resolver* argument.
+    This is the single place where the resolver strategy is chosen; T3+ will
+    replace this with ``EntraResolver`` or a mode-switch without touching the
+    middleware itself.
+    """
+    keystore = _settings.build_keystore()
+    resolver = StaticKeyResolver(keystore)
+    return BearerTokenMiddleware(app, resolver=resolver)
 
 
 # Module-level ASGI app used by Gunicorn: context_intelligence_server.main:asgi_app
