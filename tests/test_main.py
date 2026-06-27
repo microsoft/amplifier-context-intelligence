@@ -1154,10 +1154,13 @@ async def test_post_events_stamps_contributor_id_from_scope(
 
     monkeypatch.setattr(main_module.registry.queue_manager, "append", _fake_append)
 
-    # Temporarily configure keystore on asgi_app so auth injects contributor_id.
+    # Temporarily configure a StaticKeyResolver on asgi_app so auth injects contributor_id.
+    # T2: middleware now uses resolver= seam; patch asgi_app.resolver, not asgi_app.keystore.
+    from context_intelligence_server.auth import StaticKeyResolver  # noqa: PLC0415
+
     test_token = "test-secret"
     test_keystore = {hashlib.sha256(test_token.encode()).hexdigest(): "alice"}
-    monkeypatch.setattr(asgi_app, "keystore", test_keystore)
+    monkeypatch.setattr(asgi_app, "resolver", StaticKeyResolver(test_keystore))
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=asgi_app),
@@ -1199,9 +1202,12 @@ async def test_post_events_overwrites_client_supplied_created_by(
 
     monkeypatch.setattr(main_module.registry.queue_manager, "append", _fake_append)
 
+    # T2: middleware now uses resolver= seam; patch asgi_app.resolver, not asgi_app.keystore.
+    from context_intelligence_server.auth import StaticKeyResolver  # noqa: PLC0415
+
     test_token = "test-secret"
     test_keystore = {hashlib.sha256(test_token.encode()).hexdigest(): "real-owner"}
-    monkeypatch.setattr(asgi_app, "keystore", test_keystore)
+    monkeypatch.setattr(asgi_app, "resolver", StaticKeyResolver(test_keystore))
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=asgi_app),
