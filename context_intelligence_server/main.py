@@ -24,9 +24,13 @@ from fastapi.staticfiles import StaticFiles
 from neo4j import AsyncGraphDatabase
 
 from context_intelligence_server import __version__
-from context_intelligence_server.auth import BearerTokenMiddleware, StaticKeyResolver
+from context_intelligence_server.auth import (
+    BearerTokenMiddleware,
+    EntraResolver,
+    StaticKeyResolver,
+)
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
-from context_intelligence_server.config import get_settings
+from context_intelligence_server.config import Settings, get_settings
 from context_intelligence_server.dashboard import build_status_response
 from context_intelligence_server.routers.queues import router as queues_router
 from context_intelligence_server.routers.skills import SkillRegistry
@@ -183,17 +187,59 @@ _WEB_DIR = Path(__file__).parent / "web"
 app.mount("/static", StaticFiles(directory=_WEB_DIR / "static"), name="static")
 
 
-def create_asgi_app() -> BearerTokenMiddleware:
+def create_asgi_app(
+    settings: Settings | None = None,
+    *,
+    _jwks_client: Any = None,
+) -> BearerTokenMiddleware:
     """Return the ASGI app wrapped with auth middleware.
 
-    Explicitly constructs a :class:`~context_intelligence_server.auth.StaticKeyResolver`
-    from the current settings keystore and passes it as the *resolver* argument.
-    This is the single place where the resolver strategy is chosen; T3+ will
-    replace this with ``EntraResolver`` or a mode-switch without touching the
-    middleware itself.
+    This is the single strategy-selection point.  *settings* defaults to
+    the module-level ``_settings`` (the cached production config).  Pass an
+    explicit :class:`~context_intelligence_server.config.Settings` instance
+    from tests to exercise specific configurations without touching the live
+    cached settings.
+
+    *_jwks_client* is an injectable JWKS client used **only** when
+    ``auth_mode="entra"`` — intended for tests that need to construct an
+    :class:`~context_intelligence_server.auth.EntraResolver` without making
+    real network calls.  Production deployments leave it as ``None``; the
+    resolver builds a real ``PyJWKClient`` internally.
+
+    Raises:
+        RuntimeError: When the chosen resolver has ``auth_enabled=False``
+            (no credentials configured for the selected mode) AND
+            ``settings.allow_unauthenticated`` is ``False`` (default).
+            This is the fail-closed startup gate — the server must never boot
+            silently unauthenticated in production.
     """
-    keystore = _settings.build_keystore()
-    resolver = StaticKeyResolver(keystore)
+    s = settings if settings is not None else _settings
+
+    if s.auth_mode == "entra":
+        # EntraResolver raises RuntimeError at construction if the JWKS
+        # prefetch fails (eager fail-closed guard from §8b / crusty gate).
+        resolver: StaticKeyResolver | EntraResolver = EntraResolver(
+            s.azure_client_id,  # type: ignore[arg-type]  — validated non-None by config
+            s.azure_tenant_id,  # type: ignore[arg-type]  — validated non-None by config
+            s.build_identity_map(),
+            jwks_client=_jwks_client,
+        )
+    else:
+        resolver = StaticKeyResolver(s.build_keystore())
+
+    # Fail-closed gate: refuse to start if authentication is not configured.
+    # The only valid exception is allow_unauthenticated=True, an explicit opt-out
+    # for test harnesses and local dev environments — never set in production.
+    if not resolver.auth_enabled and not s.allow_unauthenticated:
+        raise RuntimeError(
+            "No authentication configured — the server refuses to start. "
+            "For auth_mode='static': set api_key or api_keys in the config. "
+            "For auth_mode='entra': set azure_client_id, azure_tenant_id, and "
+            "entra_identities. "
+            "To allow unauthenticated access (TEST/DEV ONLY) set "
+            "allow_unauthenticated: true in the config."
+        )
+
     return BearerTokenMiddleware(app, resolver=resolver)
 
 

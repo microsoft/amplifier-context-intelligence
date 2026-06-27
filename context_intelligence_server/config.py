@@ -45,13 +45,6 @@ _GUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 _ALL_ZEROS_GUID = "00000000-0000-0000-0000-000000000000"
 
 
-def _is_hex(v: str) -> bool:
-    """Return True if *v* is a non-empty hex string of at least 32 characters."""
-    if not v or len(v) < 32:
-        return False
-    return all(c in "0123456789abcdefABCDEF" for c in v)
-
-
 class YamlConfigSettingsSource(PydanticBaseSettingsSource):
     """Load settings from a YAML configuration file.
 
@@ -152,8 +145,11 @@ class Settings(BaseSettings):
         - an explicitly empty dict (omit or null-out to disable authentication);
         - a key that is not exactly 64 lowercase-hex characters after normalization
           (whitespace characters are rejected because they are not valid hex digits);
-        - a value that is not a dict;
-        - a value whose ``id`` is missing, not a string, empty, or whitespace-only.
+        - a value whose ``id`` is missing, empty, or whitespace-only.
+
+        Non-dict values are already rejected by pydantic's ``dict[str, dict[str, str]]``
+        coercion before this validator runs (``mode="after"``), so no extra
+        ``isinstance`` check is needed here.
 
         Digest keys are normalized to lowercase before validation and returned as
         lowercase so an UPPERCASE digest in a config file maps correctly to the
@@ -180,11 +176,6 @@ class Settings(BaseSettings):
             ):
                 raise ValueError(
                     f"api_keys key {digest!r} must be a 64-character SHA-256 hex digest"
-                )
-            if not isinstance(meta, dict):
-                raise ValueError(
-                    f"api_keys[{digest!r}] must be a dict with an 'id' field, "
-                    f"got {meta!r}"
                 )
             contributor_id = meta.get("id")
             if not isinstance(contributor_id, str) or not contributor_id.strip():
@@ -227,6 +218,18 @@ class Settings(BaseSettings):
     # is active at a time — no "both".  Choosing "entra" without the required
     # supporting fields is a hard startup error (AC7 / §8b).
     auth_mode: Literal["static", "entra"] = "static"
+
+    # allow_unauthenticated: explicit opt-out of the fail-closed startup gate.
+    #
+    # Production deployments MUST have auth configured (api_key / api_keys for
+    # auth_mode=static, or entra_identities for auth_mode=entra).  Setting this
+    # flag to True bypasses the RuntimeError that create_asgi_app() raises when
+    # no credentials are configured, allowing the server to start in
+    # unauthenticated mode (every request passes through).
+    #
+    # This flag exists ONLY for the test harness and local dev environments
+    # where auth is intentionally disabled.  Never set it in production.
+    allow_unauthenticated: bool = False
 
     # azure_client_id / azure_tenant_id: the App Registration coordinates.
     # Both are required when auth_mode="entra".  Empty / whitespace-only
@@ -280,22 +283,11 @@ class Settings(BaseSettings):
         - the all-zeros GUID (placeholder sentinel);
         - a value whose ``id`` is missing, empty, or whitespace-only.
 
-        Note on defensive ``isinstance`` branches
-        ------------------------------------------
         This validator runs in ``mode="after"``, so pydantic has already coerced
-        and validated the field as ``dict[str, dict[str, str]]`` before this
-        function is called.  As a result:
-
-        - The ``if not isinstance(meta, dict)`` branch is **dead code**: pydantic
-          raises a ``dict_type`` ValidationError for any non-dict value (e.g. a
-          bare string like ``{oid: "colombod"}``) before this validator runs.  The
-          branch is retained as a harmless defensive fallback but its custom error
-          message is never surfaced to operators.
-        - The ``if not isinstance(contributor_id, str)`` check fires only when the
-          ``id`` key is *absent* from the dict (``meta.get("id")`` returns
-          ``None``).  For an *explicit* non-string ``id`` value (e.g. ``{"id": 123}``
-          from YAML ``id: 123``), pydantic's ``str``-field validator rejects it
-          with a ``string_type`` error before this code is reached.
+        the field as ``dict[str, dict[str, str]]`` before this function is called.
+        Non-dict values and non-string ``id`` values are caught by pydantic before
+        reaching this code.  The ``if not isinstance(contributor_id, str)`` check
+        fires only when the ``id`` key is *absent* from the dict.
 
         GUID keys are normalized to lowercase before validation and returned as
         lowercase so an UPPERCASE oid in a config file maps correctly to the
@@ -322,11 +314,6 @@ class Settings(BaseSettings):
                 raise ValueError(
                     f"entra_identities key {oid!r} must not be the all-zeros GUID; "
                     f"use the real oid from 'az ad signed-in-user show --query id -o tsv'"
-                )
-            if not isinstance(meta, dict):
-                raise ValueError(
-                    f"entra_identities[{oid!r}] must be a dict with an 'id' field, "
-                    f"got {meta!r}"
                 )
             contributor_id = meta.get("id")
             if not isinstance(contributor_id, str) or not contributor_id.strip():
