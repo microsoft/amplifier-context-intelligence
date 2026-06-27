@@ -4,7 +4,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Callable, MutableMapping
-from typing import Any, runtime_checkable
+from typing import Any
 
 import jwt  # pyjwt[crypto] — added in T1; used by EntraResolver
 from typing_extensions import Protocol
@@ -69,22 +69,35 @@ def _resolve_token(token: str, keystore: dict[str, str]) -> str | None:
     return keystore.get(digest)
 
 
-@runtime_checkable
 class PrincipalResolver(Protocol):
     """Resolves a raw bearer token string to a contributor id.
 
     Returns the contributor id string on success, or ``None`` when the token is
     not recognised (caller should respond 401).  Implementations may also raise
-    to signal specific auth failures (e.g. an expired JWT); the middleware
-    catches those and maps them to 401 responses.
+    :class:`AuthError` to signal specific auth failures (401 or 403); the
+    middleware dispatches the exact ``status_code`` from the exception.
 
     Only one concrete implementation exists today: :class:`StaticKeyResolver`.
     The ``EntraResolver`` (JWT via JWKS) is added in T4.  Do NOT add a third
     resolver without a separate design review.
     """
 
+    @property
+    def auth_enabled(self) -> bool:
+        """True when authentication is active (at least one credential configured).
+
+        ``False`` only for a :class:`StaticKeyResolver` built with an empty
+        keystore — the explicit ``allow_unauthenticated=True`` opt-out path.
+        ``EntraResolver`` always returns ``True``.
+        """
+        ...
+
     def resolve(self, token: str) -> str | None:
-        """Return contributor id or ``None`` if the token is not recognised."""
+        """Return contributor id or ``None`` if the token is not recognised.
+
+        Raises :class:`AuthError` (with ``status_code`` 401 or 403) when the
+        token is present but invalid or maps to an unauthorised identity.
+        """
         ...
 
 
@@ -191,6 +204,11 @@ class EntraResolver:
 
         self._jwks_client = jwks_client
 
+    @property
+    def auth_enabled(self) -> bool:
+        """Always True — EntraResolver is always active (identity map is non-empty by construction)."""
+        return True
+
     def resolve(self, token: str) -> str:
         """Validate Entra JWT and return the mapped contributor id.
 
@@ -281,8 +299,23 @@ class StaticKeyResolver:
         self._keystore = keystore
 
     @property
+    def auth_enabled(self) -> bool:
+        """True when at least one key is configured (authentication is active).
+
+        ``False`` means the keystore is empty — the server is in
+        unauthenticated mode (explicit ``allow_unauthenticated`` opt-out only;
+        :func:`~context_intelligence_server.main.create_asgi_app` refuses to
+        start with ``auth_enabled=False`` unless that flag is set).
+        """
+        return bool(self._keystore)
+
+    @property
     def is_empty(self) -> bool:
-        """True when no keys are configured (auth is effectively disabled)."""
+        """True when no keys are configured.
+
+        Kept for backward compatibility with existing tests.  Prefer
+        ``auth_enabled`` (its logical inverse) for new code.
+        """
         return not self._keystore
 
     def resolve(self, token: str) -> str | None:
@@ -298,9 +331,11 @@ class BearerTokenMiddleware:
     or a raw *keystore* dict for backward compatibility with tests that
     construct the middleware directly.
 
-    When built with a :class:`StaticKeyResolver` whose keystore is empty (no
-    keys configured), all requests pass through without authentication —
-    backward-compatible behaviour for un-authed local dev setups.
+    When the resolver's ``auth_enabled`` property is ``False`` (i.e. a
+    :class:`StaticKeyResolver` built with an empty keystore), all requests
+    pass through without authentication — the explicit ``allow_unauthenticated``
+    opt-out path.  :func:`~context_intelligence_server.main.create_asgi_app`
+    prevents booting in this state at the application level.
 
     On a successful match, the resolved contributor id is injected into the
     ASGI scope under ``scope["state"]["contributor_id"]`` so downstream
@@ -335,10 +370,12 @@ class BearerTokenMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Backward-compat fail-open: a StaticKeyResolver with no keys means
-        # auth is disabled — every request passes through unauthenticated.
-        # This preserves the pre-T2 behaviour of ``not self.keystore``.
-        if isinstance(self.resolver, StaticKeyResolver) and self.resolver.is_empty:
+        # Fail-open when auth is disabled (resolver.auth_enabled is False).
+        # Uses the protocol property rather than isinstance(resolver, StaticKeyResolver)
+        # so the check works for any resolver that opts out of authentication.
+        # In practice this path is only reached by the allow_unauthenticated opt-out;
+        # create_asgi_app() refuses to start with auth_enabled=False in production.
+        if not self.resolver.auth_enabled:
             await self.app(scope, receive, send)
             return
 

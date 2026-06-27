@@ -687,6 +687,11 @@ class TestMiddlewareAuthError:
         """
 
         class _BrokenResolver:
+            # auth_enabled=True so the middleware proceeds to call resolve()
+            @property
+            def auth_enabled(self) -> bool:
+                return True
+
             def resolve(self, token: str) -> str | None:
                 raise RuntimeError("unexpected internal error — simulated bug")
 

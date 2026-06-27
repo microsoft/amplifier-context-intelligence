@@ -317,41 +317,11 @@ def test_neo4j_flush_chunk_bytes_default():
 
 
 # ---------------------------------------------------------------------------
-# T1-T5, T22: per-user API keys — _is_hex, _validate_api_keys, build_keystore
+# T1-T5, T22: per-user API keys — _validate_api_keys, build_keystore
 # ---------------------------------------------------------------------------
-
-
-class TestIsHex:
-    """T1-T3: _is_hex helper."""
-
-    def test_valid_64_char_hex_string(self) -> None:
-        """T1: _is_hex accepts a valid 64-char lowercase hex string."""
-        from context_intelligence_server.config import _is_hex
-
-        assert _is_hex("a" * 64) is True
-        assert _is_hex("deadbeef" * 8) is True  # 64 hex chars
-
-    def test_mixed_case_hex_accepted(self) -> None:
-        """T1: _is_hex accepts uppercase hex chars too."""
-        from context_intelligence_server.config import _is_hex
-
-        assert _is_hex("DEADBEEF" * 8) is True
-
-    def test_too_short_rejected(self) -> None:
-        """T2: _is_hex rejects strings shorter than 32 chars."""
-        from context_intelligence_server.config import _is_hex
-
-        assert _is_hex("abc") is False
-        assert _is_hex("deadbeef") is False  # only 8 chars
-        assert _is_hex("") is False
-
-    def test_non_hex_chars_rejected(self) -> None:
-        """T3: _is_hex rejects strings with non-hex characters."""
-        from context_intelligence_server.config import _is_hex
-
-        assert _is_hex("z" * 64) is False
-        assert _is_hex("ghijklmn" * 8) is False
-        assert _is_hex("test-secret-token-not-hex-00000000000") is False
+# Note: _is_hex() was removed in T7 (cranky-old-sam cleanup) — it was dead
+# code never called by the validator; the 64-hex check is inline in
+# _validate_api_keys.  Tests for _is_hex have been deleted alongside it.
 
 
 class TestValidateApiKeys:

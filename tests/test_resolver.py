@@ -116,17 +116,17 @@ class TestPrincipalResolverProtocol:
         assert PrincipalResolver is not None
 
     def test_static_key_resolver_satisfies_protocol(self) -> None:
-        """StaticKeyResolver has a resolve() method matching the Protocol signature."""
+        """StaticKeyResolver has resolve() and auth_enabled matching the Protocol signature."""
         from context_intelligence_server.auth import (  # noqa: PLC0415
-            PrincipalResolver,
             StaticKeyResolver,
         )
 
         resolver = StaticKeyResolver({})
-        # Structural check: must have resolve() callable
+        # Structural checks: must have resolve() callable and auth_enabled property
         assert callable(resolver.resolve)
-        # Runtime-checkable isinstance (requires @runtime_checkable on the Protocol)
-        assert isinstance(resolver, PrincipalResolver)
+        assert hasattr(resolver, "auth_enabled")
+        # Note: isinstance(resolver, PrincipalResolver) is not used because
+        # PrincipalResolver is no longer @runtime_checkable (T7 cleanup).
 
 
 # ---------------------------------------------------------------------------
@@ -146,16 +146,16 @@ class TestBearerTokenMiddlewareResolvesViaResolver:
         class TrackingResolver:
             """A stub that records every token it was asked to resolve."""
 
+            # auth_enabled=True so the middleware proceeds past the fail-open gate
+            # and calls resolve().  (The middleware now checks resolver.auth_enabled,
+            # not isinstance(resolver, StaticKeyResolver) and resolver.is_empty.)
+            @property
+            def auth_enabled(self) -> bool:
+                return True
+
             def resolve(self, token: str) -> str | None:
                 calls.append(token)
                 return "tracked-user"
-
-            # Needed so the middleware treats this resolver as "active"
-            # (non-empty static resolvers pass is_empty=False; non-static
-            # resolvers are always treated as active by the middleware).
-            @property
-            def is_empty(self) -> bool:
-                return False
 
         app = AsyncMock()
         middleware = BearerTokenMiddleware(app, resolver=TrackingResolver())

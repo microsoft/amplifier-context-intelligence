@@ -1,10 +1,20 @@
 """Pytest configuration and shared fixtures for the test suite."""
 
-from collections.abc import AsyncGenerator, Generator
-from typing import Any
+import os
 
-import httpx
-import pytest
+# Allow the server to boot with no auth in the test harness.
+# create_asgi_app() refuses to start when no credentials are configured UNLESS
+# allow_unauthenticated=True — this env var is the test-suite's explicit opt-out.
+# Never set this in production.
+os.environ.setdefault(
+    "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ALLOW_UNAUTHENTICATED", "true"
+)
+
+from collections.abc import AsyncGenerator, Generator  # noqa: E402
+from typing import Any  # noqa: E402
+
+import httpx  # noqa: E402
+import pytest  # noqa: E402
 
 
 from context_intelligence_server.main import app, registry  # noqa: E402
