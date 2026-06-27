@@ -11,12 +11,13 @@ Values are resolved in this priority order (highest first):
 
 import hashlib
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Tuple, Type
+from typing import Any, Literal, Tuple, Type
 
 import yaml
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import (
     BaseSettings,
@@ -30,6 +31,18 @@ from pydantic_settings import (
 # instantiated, so the prefix-based machinery cannot apply.
 _CONFIG_FILE_ENV = "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE"
 _CONFIG_FILE_DEFAULT = "server-config.yaml"
+
+# ---------------------------------------------------------------------------
+# GUID validation helpers (Entra identities)
+# ---------------------------------------------------------------------------
+# Anchored pattern for lowercase hex groups of 8-4-4-4-12.
+# re.fullmatch() anchors the match to the full string, so braces, urn:uuid:
+# prefixes, and trailing junk are all rejected without explicit anchors in the
+# pattern.
+_GUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# The all-zeros sentinel is explicitly rejected — a placeholder accidentally
+# left in config should never authorize anyone.
+_ALL_ZEROS_GUID = "00000000-0000-0000-0000-000000000000"
 
 
 def _is_hex(v: str) -> bool:
@@ -205,6 +218,179 @@ class Settings(BaseSettings):
         for digest, meta in (self.api_keys or {}).items():
             ks[digest.lower()] = meta["id"]
         return ks
+
+    # -------------------------------------------------------------------------
+    # Entra authentication (auth_mode=entra)
+    # -------------------------------------------------------------------------
+    # auth_mode selects which resolver is active: "static" = today's sha256
+    # keystore; "entra" = JWT validation via Entra / JWKS.  Exactly one mode
+    # is active at a time — no "both".  Choosing "entra" without the required
+    # supporting fields is a hard startup error (AC7 / §8b).
+    auth_mode: Literal["static", "entra"] = "static"
+
+    # azure_client_id / azure_tenant_id: the App Registration coordinates.
+    # Both are required when auth_mode="entra".  Empty / whitespace-only
+    # strings are normalized to None so that a template placeholder in a YAML
+    # file (e.g. azure_client_id: "") behaves identically to omitting the field
+    # and triggers a clear startup error rather than a silent wrong-value lookup.
+    azure_client_id: str | None = None
+    azure_tenant_id: str | None = None
+
+    @field_validator("azure_client_id", "azure_tenant_id", mode="before")
+    @classmethod
+    def _normalize_azure_field(cls, v: Any) -> str | None:
+        """Normalize empty/whitespace-only strings to None (mirrors _normalize_api_key)."""
+        if v is None:
+            return None
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+    # entra_identities: the oid→contributor map — exact parity with api_keys.
+    #
+    # Shape: { "<oid-GUID>": {"id": "<contributor>"} }  (value = {id} only)
+    #
+    # Key  = the user's Azure AD object ID (oid), stored verbatim (public id);
+    #        not hashed — hashing buys nothing for a public id and hurts auditability.
+    # Value = {"id": "<contributor>"} matching the api_keys payload — same
+    #        contributor string space, same write-once provenance semantics.
+    #
+    # Many oids → one contributor works automatically: each oid is its own key
+    # with the same "id" value (e.g. two AD identities for the same person).
+    #
+    # NOTE: oid is a persistent personal identifier.  Do NOT commit real oid
+    # values to product repos — use env/secret injection or a git-ignored map
+    # (see §3 PII note in the auth plan).
+    entra_identities: dict[str, dict[str, str]] | None = None
+
+    @field_validator("entra_identities", mode="after")
+    @classmethod
+    def _validate_entra_identities(
+        cls, v: dict[str, dict[str, str]] | None
+    ) -> dict[str, dict[str, str]] | None:
+        """Fail-closed: raise unless every entry is ``<GUID> -> {"id": <non-empty str>}``.
+
+        Mirrors ``_validate_api_keys`` exactly, with GUID validation replacing
+        64-hex validation.
+
+        Rejects (by raising ``ValueError`` or pydantic ``ValidationError``):
+        - an explicitly empty dict (omit or null-out to disable Entra auth);
+        - a key that is not a valid GUID in 8-4-4-4-12 lowercase hex form after
+          normalization (rejects braces, urn:uuid: prefixes, trailing junk);
+        - the all-zeros GUID (placeholder sentinel);
+        - a value whose ``id`` is missing, empty, or whitespace-only.
+
+        Note on defensive ``isinstance`` branches
+        ------------------------------------------
+        This validator runs in ``mode="after"``, so pydantic has already coerced
+        and validated the field as ``dict[str, dict[str, str]]`` before this
+        function is called.  As a result:
+
+        - The ``if not isinstance(meta, dict)`` branch is **dead code**: pydantic
+          raises a ``dict_type`` ValidationError for any non-dict value (e.g. a
+          bare string like ``{oid: "colombod"}``) before this validator runs.  The
+          branch is retained as a harmless defensive fallback but its custom error
+          message is never surfaced to operators.
+        - The ``if not isinstance(contributor_id, str)`` check fires only when the
+          ``id`` key is *absent* from the dict (``meta.get("id")`` returns
+          ``None``).  For an *explicit* non-string ``id`` value (e.g. ``{"id": 123}``
+          from YAML ``id: 123``), pydantic's ``str``-field validator rejects it
+          with a ``string_type`` error before this code is reached.
+
+        GUID keys are normalized to lowercase before validation and returned as
+        lowercase so an UPPERCASE oid in a config file maps correctly to the
+        lowercase oid extracted from a JWT claim.
+        """
+        if v is None:
+            return None
+        # Fail-closed: an explicitly empty map is a misconfiguration.
+        # Omit entra_identities or set it to null to disable Entra auth.
+        if len(v) == 0:
+            raise ValueError(
+                "entra_identities must contain at least one entry if specified; "
+                "omit it or use null to disable Entra authentication"
+            )
+        normalized: dict[str, dict[str, str]] = {}
+        for oid, meta in v.items():
+            oid_lower = oid.lower()
+            if not _GUID_RE.fullmatch(oid_lower):
+                raise ValueError(
+                    f"entra_identities key {oid!r} must be a valid GUID "
+                    f"(xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)"
+                )
+            if oid_lower == _ALL_ZEROS_GUID:
+                raise ValueError(
+                    f"entra_identities key {oid!r} must not be the all-zeros GUID; "
+                    f"use the real oid from 'az ad signed-in-user show --query id -o tsv'"
+                )
+            if not isinstance(meta, dict):
+                raise ValueError(
+                    f"entra_identities[{oid!r}] must be a dict with an 'id' field, "
+                    f"got {meta!r}"
+                )
+            contributor_id = meta.get("id")
+            if not isinstance(contributor_id, str) or not contributor_id.strip():
+                raise ValueError(
+                    f"entra_identities[{oid!r}]['id'] must be a non-empty, "
+                    f"non-whitespace string, got {contributor_id!r}"
+                )
+            normalized[oid_lower] = meta
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_entra_config(self) -> "Settings":
+        """Cross-field startup validator for auth_mode='entra' (AC7).
+
+        When auth_mode is 'entra' ALL of the following must be present and
+        non-None after normalization:
+        - azure_client_id
+        - azure_tenant_id
+        - entra_identities (non-empty — field validator already rejects ``{}``,
+          so here we only catch None / omitted)
+
+        A single ValueError names every missing field so the operator sees one
+        clear startup message rather than cryptic downstream failures.
+        """
+        if self.auth_mode == "entra":
+            errors: list[str] = []
+            if self.azure_client_id is None:
+                errors.append(
+                    "azure_client_id is required when auth_mode='entra'; "
+                    "set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_CLIENT_ID "
+                    "or azure_client_id in the config file"
+                )
+            if self.azure_tenant_id is None:
+                errors.append(
+                    "azure_tenant_id is required when auth_mode='entra'; "
+                    "set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_TENANT_ID "
+                    "or azure_tenant_id in the config file"
+                )
+            if not self.entra_identities:
+                errors.append(
+                    "entra_identities must be a non-empty map when auth_mode='entra'; "
+                    "provide at least one oid → {id: contributor} entry"
+                )
+            if errors:
+                raise ValueError(
+                    "Entra auth misconfiguration (startup refused): "
+                    + "; ".join(errors)
+                )
+        return self
+
+    def build_identity_map(self) -> dict[str, str]:
+        """Return ``{oid_lower -> contributor_id}`` for all configured Entra identities.
+
+        Mirrors ``build_keystore()`` — returns a plain ``{key: contributor_id}``
+        dict that the EntraResolver can use for O(1) lookup after extracting the
+        ``oid`` claim from a validated JWT.
+
+        Keys are lowercased as a belt-and-suspenders guarantee: the field
+        validator already normalizes them, but the resolver also lowercases the
+        JWT ``oid`` claim before lookup, so both sides use the same casing.
+        """
+        if not self.entra_identities:
+            return {}
+        return {oid.lower(): meta["id"] for oid, meta in self.entra_identities.items()}
 
     # -------------------------------------------------------------------------
     # Neo4j

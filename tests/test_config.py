@@ -597,3 +597,792 @@ class TestPhase1DigestHygiene:
 
         with pytest.raises(ValidationError):
             Settings(api_keys={"a" * 64: {"id": "   "}})
+
+
+# ---------------------------------------------------------------------------
+# T3: Entra auth config — new fields, validators, cross-field checks
+# §8b carried build-gates mapped to each test in the docstrings.
+# ---------------------------------------------------------------------------
+
+# Fake GUIDs used throughout — NEVER real app-reg ids, oids, or tenant ids.
+_FAKE_OID_1 = "11111111-1111-1111-1111-111111111111"
+_FAKE_OID_2 = "22222222-2222-2222-2222-222222222222"
+_FAKE_OID_UPPER = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"  # uppercase hex letters
+_FAKE_CLIENT_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+_FAKE_TENANT_ID = "ffffffff-0000-1111-2222-333333333333"
+
+
+class TestAuthModeField:
+    """T3: auth_mode field defaults and valid values."""
+
+    def test_auth_mode_defaults_to_static(self) -> None:
+        """§8b regression: auth_mode defaults to 'static'."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings()
+        assert s.auth_mode == "static"
+
+    def test_auth_mode_can_be_set_to_entra(self) -> None:
+        """auth_mode='entra' accepted when all required entra fields are present."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(
+            auth_mode="entra",
+            azure_client_id=_FAKE_CLIENT_ID,
+            azure_tenant_id=_FAKE_TENANT_ID,
+            entra_identities={_FAKE_OID_1: {"id": "colombod"}},
+        )
+        assert s.auth_mode == "entra"
+
+    def test_auth_mode_from_yaml(self, tmp_path: Path, monkeypatch) -> None:
+        """auth_mode can be read from YAML config — YAML path exercised per §0.4."""
+        config_file = tmp_path / "server-config.yaml"
+        config_file.write_text(
+            f"auth_mode: entra\n"
+            f"azure_client_id: {_FAKE_CLIENT_ID}\n"
+            f"azure_tenant_id: {_FAKE_TENANT_ID}\n"
+            f"entra_identities:\n"
+            f"  {_FAKE_OID_1}:\n"
+            f"    id: colombod\n"
+        )
+        monkeypatch.setenv(
+            "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE", str(config_file)
+        )
+
+        from context_intelligence_server.config import Settings
+
+        s = Settings()
+        assert s.auth_mode == "entra"
+
+
+class TestAzureFieldNormalization:
+    """T3: azure_client_id / azure_tenant_id empty/whitespace normalization.
+
+    §8b gate (tester-breaker): whitespace azure_client_id / azure_tenant_id →
+    normalized to None at field level, then caught by the cross-field validator.
+    """
+
+    def test_azure_client_id_defaults_to_none(self) -> None:
+        """azure_client_id defaults to None."""
+        from context_intelligence_server.config import Settings
+
+        assert Settings().azure_client_id is None
+
+    def test_azure_tenant_id_defaults_to_none(self) -> None:
+        """azure_tenant_id defaults to None."""
+        from context_intelligence_server.config import Settings
+
+        assert Settings().azure_tenant_id is None
+
+    def test_azure_client_id_empty_string_to_none(self) -> None:
+        """azure_client_id='' normalized to None (mirrors _normalize_api_key)."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(azure_client_id="")
+        assert s.azure_client_id is None
+
+    def test_azure_tenant_id_empty_string_to_none(self) -> None:
+        """azure_tenant_id='' normalized to None."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(azure_tenant_id="")
+        assert s.azure_tenant_id is None
+
+    def test_azure_client_id_whitespace_to_none(self) -> None:
+        """§8b (tester-breaker): azure_client_id='   ' normalized to None."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(azure_client_id="   ")
+        assert s.azure_client_id is None
+
+    def test_azure_tenant_id_whitespace_to_none(self) -> None:
+        """§8b (tester-breaker): azure_tenant_id='   ' normalized to None."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(azure_tenant_id="   ")
+        assert s.azure_tenant_id is None
+
+    def test_azure_client_id_valid_preserved(self) -> None:
+        """A non-empty azure_client_id is stored as-is."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(azure_client_id=_FAKE_CLIENT_ID)
+        assert s.azure_client_id == _FAKE_CLIENT_ID
+
+    def test_azure_tenant_id_valid_preserved(self) -> None:
+        """A non-empty azure_tenant_id is stored as-is."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(azure_tenant_id=_FAKE_TENANT_ID)
+        assert s.azure_tenant_id == _FAKE_TENANT_ID
+
+
+class TestValidateEntraIdentities:
+    """T3: _validate_entra_identities — §8b full edge matrix.
+
+    Mirrors _validate_api_keys: None→None, empty→raise, key must be GUID,
+    value must be {id: non-empty-str}, keys normalized to lowercase.
+    """
+
+    def test_valid_entry_accepted(self) -> None:
+        """§8b: valid single entry accepted."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(entra_identities={_FAKE_OID_1: {"id": "colombod"}})
+        assert s.entra_identities is not None
+        assert s.entra_identities[_FAKE_OID_1]["id"] == "colombod"
+
+    def test_none_is_valid(self) -> None:
+        """§8b regression: entra_identities=None (omitted) is valid."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(entra_identities=None)
+        assert s.entra_identities is None
+
+    def test_empty_dict_raises(self) -> None:
+        """§8b: entra_identities={} raises ValidationError (fail-closed, mirrors api_keys)."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="at least one entry"):
+            Settings(entra_identities={})
+
+    def test_non_guid_key_raises(self) -> None:
+        """§8b: a key that is not a GUID raises ValidationError."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="valid GUID"):
+            Settings(entra_identities={"not-a-guid": {"id": "colombod"}})
+
+    def test_sha256_hex_key_not_valid_guid_raises(self) -> None:
+        """§8b: 64-char SHA-256 hex (valid api_keys key) is NOT a valid GUID — raises."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="valid GUID"):
+            Settings(entra_identities={"a" * 64: {"id": "colombod"}})
+
+    def test_guid_with_braces_raises(self) -> None:
+        """§8b: {xxxxxxxx-...} braced form raises ValidationError."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        braced = "{" + _FAKE_OID_1 + "}"
+        with pytest.raises(ValidationError, match="valid GUID"):
+            Settings(entra_identities={braced: {"id": "colombod"}})
+
+    def test_urn_uuid_prefix_raises(self) -> None:
+        """§8b: urn:uuid:... prefix raises ValidationError."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="valid GUID"):
+            Settings(entra_identities={"urn:uuid:" + _FAKE_OID_1: {"id": "colombod"}})
+
+    def test_trailing_junk_raises(self) -> None:
+        """§8b: trailing characters after valid GUID raises ValidationError."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="valid GUID"):
+            Settings(entra_identities={_FAKE_OID_1 + "-extra": {"id": "colombod"}})
+
+    def test_all_zeros_guid_raises(self) -> None:
+        """§8b: the all-zeros GUID (00000000-0000-0000-0000-000000000000) is rejected."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(
+                entra_identities={
+                    "00000000-0000-0000-0000-000000000000": {"id": "colombod"}
+                }
+            )
+
+    def test_uppercase_key_normalized_to_lowercase(self) -> None:
+        """§8b (tester-breaker F-02/F-03): UPPERCASE GUID normalized to lowercase."""
+        from context_intelligence_server.config import Settings
+
+        lower_oid = _FAKE_OID_UPPER.lower()  # "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+        s = Settings(entra_identities={_FAKE_OID_UPPER: {"id": "colombod"}})
+        assert s.entra_identities is not None
+        assert lower_oid in s.entra_identities, (
+            f"Expected lowercase key in entra_identities, got: {list(s.entra_identities)!r}"
+        )
+        assert _FAKE_OID_UPPER not in s.entra_identities, (
+            "Uppercase key must not remain in entra_identities after normalization"
+        )
+
+    def test_non_dict_value_raises(self) -> None:
+        """§8b (tester-breaker): string value {oid: 'colombod'} instead of dict raises."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(
+                entra_identities={_FAKE_OID_1: "colombod"}  # type: ignore[dict-item]
+            )
+
+    def test_value_missing_id_raises(self) -> None:
+        """§8b: value dict without 'id' key raises ValidationError."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(entra_identities={_FAKE_OID_1: {"label": "some-person"}})
+
+    def test_value_empty_id_raises(self) -> None:
+        """§8b: value dict with empty 'id' raises ValidationError."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(entra_identities={_FAKE_OID_1: {"id": ""}})
+
+    def test_value_whitespace_id_raises(self) -> None:
+        """§8b: value dict with whitespace-only 'id' raises ValidationError."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(entra_identities={_FAKE_OID_1: {"id": "   "}})
+
+    def test_two_oids_same_contributor_works(self) -> None:
+        """§8b: two different OIDs → same contributor (many-to-one mapping) works."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(
+            entra_identities={
+                _FAKE_OID_1: {"id": "colombod"},
+                _FAKE_OID_2: {"id": "colombod"},
+            }
+        )
+        assert s.entra_identities is not None
+        assert s.entra_identities[_FAKE_OID_1]["id"] == "colombod"
+        assert s.entra_identities[_FAKE_OID_2]["id"] == "colombod"
+
+
+class TestBuildIdentityMap:
+    """T3: build_identity_map() — mirrors build_keystore(), returns {oid_lower: contributor_id}."""
+
+    def test_returns_oid_to_contributor_map(self) -> None:
+        """§8b: build_identity_map() returns {oid: contributor_id} for each entry."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(
+            entra_identities={
+                _FAKE_OID_1: {"id": "colombod"},
+                _FAKE_OID_2: {"id": "other-contributor"},
+            }
+        )
+        result = s.build_identity_map()
+        assert result == {
+            _FAKE_OID_1: "colombod",
+            _FAKE_OID_2: "other-contributor",
+        }
+
+    def test_returns_empty_for_none_identities(self) -> None:
+        """§8b: build_identity_map() returns {} when entra_identities is None."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(entra_identities=None)
+        assert s.build_identity_map() == {}
+
+    def test_uppercase_key_lowercased_in_result(self) -> None:
+        """§8b: build_identity_map() keys are lowercased (belt-and-suspenders, mirrors build_keystore)."""
+        from context_intelligence_server.config import Settings
+
+        lower_oid = _FAKE_OID_UPPER.lower()
+        s = Settings(entra_identities={_FAKE_OID_UPPER: {"id": "colombod"}})
+        result = s.build_identity_map()
+        assert lower_oid in result
+        assert _FAKE_OID_UPPER not in result
+        assert result[lower_oid] == "colombod"
+
+    def test_two_oids_same_contributor_in_map(self) -> None:
+        """§8b: two OIDs → same contributor both appear in the map."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(
+            entra_identities={
+                _FAKE_OID_1: {"id": "colombod"},
+                _FAKE_OID_2: {"id": "colombod"},
+            }
+        )
+        result = s.build_identity_map()
+        assert result[_FAKE_OID_1] == "colombod"
+        assert result[_FAKE_OID_2] == "colombod"
+
+
+class TestCrossFieldEntraValidation:
+    """T3: model_validator — auth_mode=entra requires client_id, tenant_id, identities (AC7, §8b).
+
+    This is the startup-refusal gate: bad entra config must refuse to construct Settings.
+    """
+
+    def test_entra_mode_all_fields_set_succeeds(self) -> None:
+        """AC7: auth_mode=entra with all required fields set constructs successfully."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(
+            auth_mode="entra",
+            azure_client_id=_FAKE_CLIENT_ID,
+            azure_tenant_id=_FAKE_TENANT_ID,
+            entra_identities={_FAKE_OID_1: {"id": "colombod"}},
+        )
+        assert s.auth_mode == "entra"
+        assert s.azure_client_id == _FAKE_CLIENT_ID
+        assert s.azure_tenant_id == _FAKE_TENANT_ID
+
+    def test_entra_mode_missing_client_id_raises(self) -> None:
+        """AC7: auth_mode=entra + azure_client_id=None → startup refused."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="azure_client_id"):
+            Settings(
+                auth_mode="entra",
+                azure_client_id=None,
+                azure_tenant_id=_FAKE_TENANT_ID,
+                entra_identities={_FAKE_OID_1: {"id": "colombod"}},
+            )
+
+    def test_entra_mode_missing_tenant_id_raises(self) -> None:
+        """AC7: auth_mode=entra + azure_tenant_id=None → startup refused."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="azure_tenant_id"):
+            Settings(
+                auth_mode="entra",
+                azure_client_id=_FAKE_CLIENT_ID,
+                azure_tenant_id=None,
+                entra_identities={_FAKE_OID_1: {"id": "colombod"}},
+            )
+
+    def test_entra_mode_whitespace_client_id_raises(self) -> None:
+        """AC7 + §8b: whitespace azure_client_id → None after normalization → startup refused."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="azure_client_id"):
+            Settings(
+                auth_mode="entra",
+                azure_client_id="   ",
+                azure_tenant_id=_FAKE_TENANT_ID,
+                entra_identities={_FAKE_OID_1: {"id": "colombod"}},
+            )
+
+    def test_entra_mode_whitespace_tenant_id_raises(self) -> None:
+        """AC7 + §8b: whitespace azure_tenant_id → None after normalization → startup refused."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="azure_tenant_id"):
+            Settings(
+                auth_mode="entra",
+                azure_client_id=_FAKE_CLIENT_ID,
+                azure_tenant_id="   ",
+                entra_identities={_FAKE_OID_1: {"id": "colombod"}},
+            )
+
+    def test_entra_mode_none_identities_raises(self) -> None:
+        """AC7: auth_mode=entra + entra_identities=None → startup refused."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="entra_identities"):
+            Settings(
+                auth_mode="entra",
+                azure_client_id=_FAKE_CLIENT_ID,
+                azure_tenant_id=_FAKE_TENANT_ID,
+                entra_identities=None,
+            )
+
+    def test_static_mode_no_entra_fields_required(self) -> None:
+        """§8b regression: auth_mode=static does not require azure_* or entra_identities."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(auth_mode="static")
+        assert s.auth_mode == "static"
+        assert s.azure_client_id is None
+        assert s.azure_tenant_id is None
+        assert s.entra_identities is None
+
+    def test_default_settings_no_entra_required(self) -> None:
+        """§8b regression: default Settings() still constructs (auth_mode=static default)."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings()
+        assert s.auth_mode == "static"
+
+
+# ---------------------------------------------------------------------------
+# T3 hardening (tester-breaker adversarial review):
+#   - env-var path (the REAL production path — highest priority)
+#   - auth_mode bad literal
+#   - GUID regex edges (leading/trailing space, g-hex, fullwidth, ZWSP)
+#   - extra keys tolerated (nested-dict extensibility)
+#   - coexistence of api_keys + entra_identities
+#   - duplicate-oid last-wins (documentation)
+#   - YAML-native id coercion (int/bool/None each raise)
+#   - dead-code/message documentation (pydantic dict_type fires before isinstance)
+# ---------------------------------------------------------------------------
+
+
+class TestT3EnvVarPath:
+    """T3 hardening: the env-var path is the REAL production path — validates identically.
+
+    tester-breaker flagged that the existing T3 tests exercise only direct
+    Settings() construction.  These tests use monkeypatch.setenv with
+    AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES to confirm that
+    pydantic-settings parses the JSON env var and feeds it through the same
+    field validators as direct construction.
+    """
+
+    _ENTRA_KEY = "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES"
+    _AUTH_KEY = "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AUTH_MODE"
+    _CLIENT_KEY = "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_CLIENT_ID"
+    _TENANT_KEY = "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_TENANT_ID"
+
+    def test_env_var_path_loads_and_normalizes(self, monkeypatch) -> None:
+        """Production path: ENTRA_IDENTITIES JSON env var loads, validates, and normalizes.
+
+        Confirms that pydantic-settings parses the JSON env var value and runs the
+        same field validators as direct Settings() construction.
+        """
+        monkeypatch.setenv(self._AUTH_KEY, "entra")
+        monkeypatch.setenv(self._CLIENT_KEY, _FAKE_CLIENT_ID)
+        monkeypatch.setenv(self._TENANT_KEY, _FAKE_TENANT_ID)
+        monkeypatch.setenv(
+            self._ENTRA_KEY,
+            '{"11111111-1111-1111-1111-111111111111":{"id":"colombod"}}',
+        )
+
+        from context_intelligence_server.config import Settings
+
+        s = Settings()
+        assert s.entra_identities is not None
+        assert s.entra_identities[_FAKE_OID_1]["id"] == "colombod"
+        assert s.build_identity_map()[_FAKE_OID_1] == "colombod"
+
+    def test_env_var_all_zeros_guid_raises(self, monkeypatch) -> None:
+        """Env-var path: all-zeros GUID is rejected identically to direct construction."""
+        from pydantic import ValidationError
+
+        monkeypatch.setenv(
+            self._ENTRA_KEY,
+            '{"00000000-0000-0000-0000-000000000000":{"id":"colombod"}}',
+        )
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings()
+
+    def test_env_var_non_guid_key_raises(self, monkeypatch) -> None:
+        """Env-var path: non-GUID key is rejected (same validator fires as direct construction)."""
+        from pydantic import ValidationError
+
+        monkeypatch.setenv(
+            self._ENTRA_KEY,
+            '{"not-a-guid":{"id":"colombod"}}',
+        )
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="valid GUID"):
+            Settings()
+
+    def test_env_var_empty_dict_raises(self, monkeypatch) -> None:
+        """Env-var path: empty {} is rejected (fail-closed, same as direct construction)."""
+        from pydantic import ValidationError
+
+        monkeypatch.setenv(self._ENTRA_KEY, "{}")
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="at least one entry"):
+            Settings()
+
+    def test_env_var_string_value_raises(self, monkeypatch) -> None:
+        """Env-var path: string (non-dict) value is rejected by pydantic dict_type coercion."""
+        from pydantic import ValidationError
+
+        monkeypatch.setenv(
+            self._ENTRA_KEY,
+            '{"11111111-1111-1111-1111-111111111111":"colombod"}',
+        )
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings()
+
+
+class TestT3AuthModeLiteral:
+    """T3 hardening: auth_mode is a Literal field — unknown values raise at construction."""
+
+    def test_bad_literal_raises(self) -> None:
+        """Settings(auth_mode='foobar') raises ValidationError — only 'static' and 'entra' are valid."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(auth_mode="foobar")  # type: ignore[arg-type]
+
+
+class TestT3EntraIdentitiesEdges:
+    """T3 hardening: GUID regex edges, extra keys, duplicate-oid, YAML type coercion, dead-code doc.
+
+    All tests assert EXISTING correct behavior (characterization / regression tests).
+    Expected to pass immediately — a failure here is a real bug, not a test gap.
+    """
+
+    def test_extra_keys_in_value_dict_tolerated(self) -> None:
+        """Extra keys beyond 'id' in the value dict are accepted and ignored in build_identity_map().
+
+        Documents the intentional nested-dict extensibility of entra_identities:
+        a future 'role' or 'label' key can be added to any entry without a breaking
+        config change or validation failure.  build_identity_map() reads only 'id'.
+        """
+        from context_intelligence_server.config import Settings
+
+        s = Settings(
+            entra_identities={
+                _FAKE_OID_1: {"id": "colombod", "email": "x@y.z", "extra": "k"}
+            }
+        )
+        assert s.entra_identities is not None
+        result = s.build_identity_map()
+        assert result[_FAKE_OID_1] == "colombod"
+
+    def test_guid_leading_space_rejected(self) -> None:
+        """GUID key with a leading space is rejected — re.fullmatch anchors the entire string."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="valid GUID"):
+            Settings(entra_identities={" " + _FAKE_OID_1: {"id": "colombod"}})
+
+    def test_guid_trailing_space_rejected(self) -> None:
+        """GUID key with a trailing space is rejected — re.fullmatch anchors both ends."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="valid GUID"):
+            Settings(entra_identities={_FAKE_OID_1 + " ": {"id": "colombod"}})
+
+    def test_guid_g_hex_chars_rejected(self) -> None:
+        """GUID key whose hex segments contain 'g' (not a valid hex digit) is rejected."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="valid GUID"):
+            Settings(
+                entra_identities={
+                    "gggggggg-gggg-gggg-gggg-gggggggggggg": {"id": "colombod"}
+                }
+            )
+
+    def test_guid_fullwidth_digits_rejected(self) -> None:
+        """GUID key with fullwidth Unicode digits (U+FF10-FF19, lookalikes for 0-9) is rejected.
+
+        Fullwidth digit U+FF11 is visually similar to ASCII '1' (U+0031) but is NOT
+        matched by [0-9a-f].  Confirms the regex anchors on ASCII code points only.
+        """
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        fullwidth_1 = "\uff11"  # fullwidth digit 1 (U+FF11), visually '1' but NOT ASCII
+        fullwidth_guid = (
+            fullwidth_1 * 8
+            + "-"
+            + fullwidth_1 * 4
+            + "-"
+            + fullwidth_1 * 4
+            + "-"
+            + fullwidth_1 * 4
+            + "-"
+            + fullwidth_1 * 12
+        )
+
+        with pytest.raises(ValidationError, match="valid GUID"):
+            Settings(entra_identities={fullwidth_guid: {"id": "colombod"}})
+
+    def test_guid_with_zero_width_space_appended_rejected(self) -> None:
+        """GUID key with a zero-width space (U+200B) appended is rejected.
+
+        Invisible Unicode characters appended to an otherwise valid GUID must not
+        silently bypass validation.  re.fullmatch() ensures the entire string is
+        consumed — no invisible trailing junk is tolerated.
+        """
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        zwsp_guid = _FAKE_OID_1 + "\u200b"  # zero-width space (U+200B) appended
+
+        with pytest.raises(ValidationError, match="valid GUID"):
+            Settings(entra_identities={zwsp_guid: {"id": "colombod"}})
+
+    def test_duplicate_oid_last_wins_via_python_dict(self) -> None:
+        """Duplicate oid keys collapse to last-wins before the validator sees the data.
+
+        Python dict construction and PyYAML parsing both deduplicate keys (last-wins)
+        at their own level, so the validator never receives duplicates and cannot
+        detect or reject them.  This test documents that expected behavior: the last
+        value wins, no error is raised, and only one entry survives.
+
+        Mirrors the 'duplicate digest keys' note in _validate_api_keys docstring.
+        """
+        from context_intelligence_server.config import Settings
+
+        # Build dict programmatically to avoid SyntaxWarning for duplicate literal keys.
+        # This simulates what a YAML file with duplicate keys would produce.
+        d: dict[str, dict[str, str]] = {}
+        d[_FAKE_OID_1] = {"id": "first-value"}
+        d[_FAKE_OID_1] = {
+            "id": "last-wins"
+        }  # overwrite — last-wins, same as YAML behavior
+
+        s = Settings(entra_identities=d)
+        assert s.entra_identities is not None
+        assert s.entra_identities[_FAKE_OID_1]["id"] == "last-wins"
+        assert len(s.entra_identities) == 1
+
+    def test_id_as_int_raises(self) -> None:
+        """id as integer (e.g. YAML: 'id: 123') raises ValidationError.
+
+        pydantic v2 dict[str, str] rejects int for a str field in lax mode
+        (string_type error).  The custom isinstance(contributor_id, str) branch
+        in _validate_entra_identities is therefore dead for this case — pydantic
+        fires first and the mode='after' validator never runs.
+        """
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(
+                entra_identities={_FAKE_OID_1: {"id": 123}}  # type: ignore[dict-item]
+            )
+
+    def test_id_as_bool_raises(self) -> None:
+        """id as bool (e.g. YAML: 'id: true') raises ValidationError.
+
+        pydantic v2 dict[str, str] rejects bool for a str field in lax mode
+        (string_type error) — True/False are not coerced to 'True'/'False'.
+        """
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(
+                entra_identities={_FAKE_OID_1: {"id": True}}  # type: ignore[dict-item]
+            )
+
+    def test_id_as_none_raises(self) -> None:
+        """id as None (e.g. YAML: 'id: null') raises ValidationError.
+
+        pydantic v2 dict[str, str] rejects None for a str field (string_type error).
+        An explicit null in the YAML config is rejected before reaching our validator.
+        """
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(
+                entra_identities={_FAKE_OID_1: {"id": None}}  # type: ignore[dict-item]
+            )
+
+    def test_non_dict_value_raises_pydantic_dict_type_not_custom_message(self) -> None:
+        """Documents that pydantic dict_type coercion fires BEFORE the custom isinstance branch.
+
+        _validate_entra_identities contains:
+
+            if not isinstance(meta, dict):
+                raise ValueError("... must be a dict with an 'id' field ...")
+
+        This branch is DEAD CODE.  pydantic's dict[str, dict[str, str]] field type
+        rejects a non-dict value (e.g. a bare string) with a 'dict_type' ValidationError
+        before the mode='after' field validator is called.  The custom error message is
+        therefore never surfaced to operators — they see pydantic's generic dict_type
+        error instead.  The isinstance branch remains as a harmless defensive fallback.
+        """
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError) as exc_info:
+            Settings(
+                entra_identities={_FAKE_OID_1: "colombod"}  # type: ignore[dict-item]
+            )
+
+        errors = exc_info.value.errors()
+        error_types = {e["type"] for e in errors}
+        assert "dict_type" in error_types, (
+            "Expected 'dict_type' pydantic error (pydantic fires before custom isinstance branch);\n"
+            f"got error types: {error_types!r}\nfull errors: {errors!r}"
+        )
+
+
+class TestT3Coexistence:
+    """T3 hardening: auth_mode=entra with both api_keys and entra_identities coexist independently.
+
+    Confirms there is no collision between the static-auth keystore and the Entra
+    identity map: they are separate data structures with separate lookup paths.
+    Neither map's entries appear in the other.
+    """
+
+    def test_api_keys_and_entra_identities_coexist(self) -> None:
+        """auth_mode=entra + api_keys + entra_identities: both populate their stores independently."""
+        from context_intelligence_server.config import Settings
+
+        static_digest = "a" * 64
+
+        s = Settings(
+            auth_mode="entra",
+            azure_client_id=_FAKE_CLIENT_ID,
+            azure_tenant_id=_FAKE_TENANT_ID,
+            api_keys={static_digest: {"id": "static-user"}},
+            entra_identities={_FAKE_OID_1: {"id": "colombod"}},
+        )
+
+        ks = s.build_keystore()
+        identity_map = s.build_identity_map()
+
+        # Each resolver sees its own entries
+        assert ks[static_digest] == "static-user"
+        assert identity_map[_FAKE_OID_1] == "colombod"
+
+        # No cross-contamination between the two maps
+        assert static_digest not in identity_map, (
+            "Static API key digest must not appear in the Entra identity map"
+        )
+        assert _FAKE_OID_1 not in ks, "Entra oid must not appear in the API keystore"
