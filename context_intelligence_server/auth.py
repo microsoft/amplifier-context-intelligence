@@ -23,6 +23,7 @@ _log = logging.getLogger(__name__)
 JWKS_CACHE_LIFESPAN_SECONDS: int = 300
 
 # Paths that are exempt from authentication (health checks, monitoring, dashboard pages).
+# Used when web_ui_enabled=True (the default full-web mode).
 _EXEMPT_PATHS: frozenset[str] = frozenset(
     {
         "/status",
@@ -32,6 +33,17 @@ _EXEMPT_PATHS: frozenset[str] = frozenset(
         "/dashboard",
         "/docs",
         "/openapi.json",
+    }
+)
+
+# Paths exempt from authentication in API-only mode (web_ui_enabled=False).
+# Web-UI-only paths (/logs/stream, /, /dashboard, /docs, /openapi.json) are intentionally
+# absent: those routes are not registered in api-only mode and /logs/stream must not
+# remain an unauthenticated log drain.
+_EXEMPT_PATHS_API_ONLY: frozenset[str] = frozenset(
+    {
+        "/status",
+        "/version",
     }
 )
 
@@ -364,6 +376,7 @@ class BearerTokenMiddleware:
         keystore: dict[str, str] | None = None,
         *,
         resolver: PrincipalResolver | None = None,
+        exempt_paths: frozenset[str] | None = None,
     ) -> None:
         self.app = app
         if resolver is not None:
@@ -374,6 +387,14 @@ class BearerTokenMiddleware:
             # provided (or defaulted-to-empty) keystore dict.
             ks: dict[str, str] = keystore if keystore is not None else {}
             self.resolver = StaticKeyResolver(ks)
+        # Exempt paths: which exact paths bypass auth entirely.  Defaults to the
+        # full web-UI set (_EXEMPT_PATHS); pass _EXEMPT_PATHS_API_ONLY when
+        # web_ui_enabled=False to prevent /logs/stream from being an
+        # unauthenticated log drain.  Path prefixes (_EXEMPT_PREFIXES) are
+        # always applied regardless of this setting.
+        self._exempt_paths: frozenset[str] = (
+            exempt_paths if exempt_paths is not None else _EXEMPT_PATHS
+        )
 
     async def __call__(
         self, scope: MutableMapping[str, Any], receive: Any, send: Any
@@ -392,7 +413,9 @@ class BearerTokenMiddleware:
             return
 
         path: str = scope.get("path", "")
-        if path in _EXEMPT_PATHS or any(path.startswith(p) for p in _EXEMPT_PREFIXES):
+        if path in self._exempt_paths or any(
+            path.startswith(p) for p in _EXEMPT_PREFIXES
+        ):
             await self.app(scope, receive, send)
             return
 
