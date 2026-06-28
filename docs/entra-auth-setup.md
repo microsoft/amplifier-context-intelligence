@@ -292,6 +292,19 @@ endpoint **refuses to start** — fail-closed) and cached thereafter (`PyJWKClie
   token is **never** logged (credential hygiene). A distinct log tag to tell these
   two apart at a glance is being finalized in **T5**.
 
+### 4.4 Known limitation — events must include `data.timestamp`
+
+The graph-write path requires every ingested event to carry a `data.timestamp`
+(ISO-8601). This is **ingest payload validation, not auth**: an authenticated request
+with a valid token is still accepted (HTTP 202) and `created_by` is still stamped, but
+if `data.timestamp` is missing or empty the durable drainer cannot build the graph
+node, retries, and **dead-letters the event** — so no node ever appears in Neo4j. This
+surfaced during the live AC10 end-to-end run; real Amplifier clients always send a
+timestamp, so it only bites hand-rolled / `curl` test payloads. **Operator action:**
+include a valid `data.timestamp` when smoke-testing with `curl`, and if events
+authenticate (202) but no graph nodes appear, check the drainer / dead-letter logs for
+a timestamp parse error **before** suspecting auth.
+
 ---
 
 ## Reference — accurate to the code
