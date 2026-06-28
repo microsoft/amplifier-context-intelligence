@@ -8,6 +8,7 @@ import re
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -192,6 +193,30 @@ def _workspace_slug(workspace: str) -> str:
     return slug or "default"
 
 
+def _validate_data_timestamp(data: dict[str, Any]) -> None:
+    """Raise HTTPException(400) if data['timestamp'] is missing, empty, or not ISO-8601.
+
+    This is the ingest boundary check (Option A). Real Amplifier clients always
+    supply data.timestamp (verified: 224,530 events on disk, 0 missing). This
+    guard rejects only malformed/hand-rolled payloads with a clear 400, instead
+    of accepting them silently and dead-lettering them later when the graph
+    drainer calls make_node_id() on an empty string.
+    """
+    value = data.get("timestamp")
+    if value is None or not isinstance(value, str) or not value.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="data.timestamp is required and must be a non-empty ISO-8601 string",
+        )
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"data.timestamp must be a valid ISO-8601 string; got {value!r}",
+        )
+
+
 _WEB_DIR = Path(__file__).parent / "web"
 
 
@@ -310,6 +335,9 @@ async def post_events(
         "contributor_id"
     )
     session_id = request.data.get("session_id", "")
+    # Validate data.timestamp at the ingest boundary (fail loud, not silent dead-letter).
+    # Real Amplifier clients always supply this field; 400 only hits malformed payloads.
+    _validate_data_timestamp(request.data)
     # Idempotency-cache check + replay stay BEFORE the durable append so a
     # duplicate is rejected without persisting a second log line.
     if request.idempotency_key and not replay:

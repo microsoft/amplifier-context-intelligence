@@ -264,3 +264,35 @@ class TestEventHandlerProtocol:
 
         handler = MissingServices()
         assert not isinstance(handler, EventHandler)
+
+
+# ---------------------------------------------------------------------------
+# make_node_id drainer guard: legible errors on bad timestamps
+# ---------------------------------------------------------------------------
+
+
+class TestMakeNodeIdDrainerGuard:
+    """make_node_id must raise a legible, NAMED ValueError on bad timestamps.
+
+    Defense-in-depth: even if the ingest 400 guard somehow misses a bad
+    timestamp, the drainer must dead-letter with a clear cause (not a bare
+    'Invalid isoformat string: ""' that is hard to trace in logs).
+    """
+
+    def test_empty_timestamp_raises_named_error(self) -> None:
+        """Empty timestamp raises ValueError naming make_node_id and event context."""
+        with pytest.raises(ValueError, match="make_node_id: invalid/empty timestamp"):
+            make_node_id("sess-abc", "tool:call", "")
+
+    def test_invalid_timestamp_raises_named_error(self) -> None:
+        """Non-ISO-8601 timestamp raises ValueError naming make_node_id and event context."""
+        with pytest.raises(ValueError, match="make_node_id: invalid/empty timestamp"):
+            make_node_id("sess-abc", "tool:call", "not-a-timestamp")
+
+    def test_error_includes_session_and_event_context(self) -> None:
+        """ValueError message includes session_id and event_name for log traceability."""
+        with pytest.raises(ValueError) as exc_info:
+            make_node_id("my-session", "llm:request", "bad-date")
+        msg = str(exc_info.value)
+        assert "my-session" in msg
+        assert "llm:request" in msg
