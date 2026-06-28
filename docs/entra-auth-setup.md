@@ -41,6 +41,119 @@ config file**, which takes precedence over defaults.
 
 ---
 
+## Authentication model & Entra App Registration
+
+> Read this before the operator steps below — it explains the model the rest of the
+> document configures. The operator and developer guides (§2, §3) are the concrete
+> steps; this section is the *why* they take the shape they do.
+
+### The model — delegated (user) tokens only
+
+As configured today, the server authenticates **delegated user tokens** — tokens
+that Entra issues **in the context of a signed-in person**. The decisive check is
+in `EntraResolver.resolve()` (`auth.py`): the token's **`scp`** claim must contain
+**`access_as_user`**, and `scp` is a claim that **only ever appears on a delegated
+(user-context) token**.
+
+App-only / daemon tokens (client-credentials flow) are therefore **not accepted**
+as configured: they carry a **`roles`** claim instead of `scp`, so they fail the
+`access_as_user` check and are rejected with **401**. This is by design for the
+pilot — see the limitation note at the end of this section.
+
+### The App Registration setup (what is configured)
+
+A **single Entra App Registration** backs the whole flow. It plays two roles at
+once: it is **the protected API** (the resource the server validates tokens for)
+*and* the registration whose **Application ID URI** the caller requests a token
+against.
+
+| Registration property | Value (placeholder) | Maps to server setting |
+|---|---|---|
+| Application (client) ID | `<AZURE_CLIENT_ID>` | `azure_client_id` |
+| Directory (tenant) ID | `<AZURE_TENANT_ID>` | `azure_tenant_id` |
+| Application ID URI | `api://<AZURE_CLIENT_ID>` | (the `--resource` callers request) |
+
+**Expose an API** (Entra portal → *Expose an API*):
+
+- **Application ID URI:** `api://<AZURE_CLIENT_ID>`.
+- One **delegated** scope named **`access_as_user`**, with **"Who can consent:
+  Admins and users."**
+- The scope's **GUID is auto-generated and internal to the registration**. Callers
+  **never reference the scope GUID directly** — they request the scope by its
+  *value* (`access_as_user`) or, via the SDK, the resource's **`/.default`** form
+  (see below). The GUID is plumbing; it never appears in client code or in this doc.
+
+**What the server checks** (every claim below is enforced in `EntraResolver`,
+`auth.py`):
+
+| Check | Value (placeholder) | Code |
+|---|---|---|
+| Signature algorithm | **RS256** only (`alg=none`/HS256 rejected) | `algorithms=["RS256"]` |
+| Signing key | tenant **JWKS**, eager-fetched at startup | `PyJWKClient(.../<AZURE_TENANT_ID>/discovery/v2.0/keys)` |
+| Audience (`aud`) | one of `<AZURE_CLIENT_ID>` **or** `api://<AZURE_CLIENT_ID>` | `audience=[client_id, "api://"+client_id]` |
+| Issuer (`iss`) | `https://login.microsoftonline.com/<AZURE_TENANT_ID>/v2.0` | `issuer=...` |
+| Tenant (`tid`) | must equal `<AZURE_TENANT_ID>` (explicit, defense-in-depth) | `claims["tid"] == tenant_id` |
+| Scope (`scp`) | must contain **`access_as_user`** | `"access_as_user" in scp.split()` |
+| Object ID (`oid`) | looked up in `entra_identities` → `created_by` | `identity_map[oid.lower()]` |
+| Required claims | `exp`, `iss`, `aud` must be present | `options={"require": ["exp","iss","aud"]}` |
+
+A valid token whose `oid` is **not** in the map is a **403** (identity unbound);
+any other failure is a **401**.
+
+### How a token is obtained today — the Azure CLI
+
+The relied-on path is the **Azure CLI as a signed-in user**:
+
+```bash
+az login                                                                 # sign in as a user
+az account get-access-token --resource api://<AZURE_CLIENT_ID> \
+  --query accessToken -o tsv
+```
+
+`--resource api://<AZURE_CLIENT_ID>` makes Entra mint an **access token for this
+API**: a **delegated** token whose **`aud`** is the bare `<AZURE_CLIENT_ID>` and
+whose **`scp`** contains `access_as_user`. Send it as a normal bearer header:
+
+```
+Authorization: Bearer <token>
+```
+
+**Via the Azure SDK (`DefaultAzureCredential`)** — request the **`/.default`**
+scope, **not** the bare scope:
+
+```python
+from azure.identity import DefaultAzureCredential
+
+cred = DefaultAzureCredential()
+token = cred.get_token("api://<AZURE_CLIENT_ID>/.default").token   # NOT the bare scope
+```
+
+`/.default` is required because the SDK credential chain does not request bare
+delegated scopes uniformly. **Important caveat:** this yields a server-compatible
+(delegated, `scp=access_as_user`) token **only when the credential resolves to a
+user-context credential** — `AzureCliCredential` (the same `az login`), the VS Code
+sign-in, or an interactive browser login. If the chain instead resolves to an
+**app-only** credential (Managed Identity, or `EnvironmentCredential` with a client
+secret/cert), the resulting `/.default` token has the right `aud` but **no `scp`**
+(it carries `roles`) and the server rejects it with 401 — see the limitation below.
+
+### Limitation — delegated-only, by design today
+
+> **App-only credentials are not supported as configured.** A **Managed Identity**,
+> or a **service principal with a client secret / certificate** (the
+> client-credentials flow), produces a token carrying **`roles`, not `scp`**. The
+> server's `scp` must contain `access_as_user` check therefore **rejects it (401)**.
+> Headless / daemon / service-to-service callers are **not** supported in this
+> configuration; the pilot deliberately relies on the **user-context (Azure CLI)
+> delegated** flow only.
+>
+> Supporting service identities later would require **adding an App Role** to the
+> registration and **teaching the server to accept a `roles` claim** (in addition to
+> `scp`). That is **explicitly not done today** — `EntraResolver` checks `scp` only
+> (`auth.py`, "V1 scope: delegated USER tokens from the `az` CLI client").
+
+---
+
 ## 2. Operator guide — configure `auth_mode=entra`
 
 **Goal:** zero to a protected server in under 30 minutes.
@@ -197,9 +310,11 @@ To bind them:
 ### 3.1 The scope
 
 The server accepts **delegated user** tokens carrying the scope
-**`access_as_user`** on the resource **`api://<AZURE_CLIENT_ID>`**. The operator's
-App Registration exposes this scope and pre-authorizes the Azure CLI public client,
-so the `az` commands below work out of the box.
+**`access_as_user`** on the resource **`api://<AZURE_CLIENT_ID>`** — see
+[Authentication model & Entra App Registration](#authentication-model--entra-app-registration)
+for the full model, including the delegated-only limitation and the
+`DefaultAzureCredential` `/.default` caveat. The `az` commands below are the
+relied-on, out-of-the-box path.
 
 ### 3.2 Give the operator your oid
 
