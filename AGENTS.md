@@ -191,6 +191,10 @@ static keys. `auth_mode` (in `config.py`) selects the active resolver — `stati
 Exactly one mode is active; switching is a config change, no code change.
 
 Auth model facts:
+- Entra mode accepts **delegated user tokens only** (`scp=access_as_user`) —
+  obtained via the Azure CLI / a user-context `DefaultAzureCredential`; app-only /
+  Managed-Identity tokens (which carry `roles`, not `scp`) are not accepted. See
+  `docs/entra-auth-setup.md`.
 - When `auth_mode=entra`, the server validates an RS256 Entra bearer token
   (audience `[<client_id>, api://<client_id>]`, issuer `…/<tenant_id>/v2.0`,
   explicit `tid`, `scp` must contain `access_as_user`), extracts the `oid` claim,
