@@ -8,6 +8,10 @@ guardrails that keep you from locking yourself (or your peers) out with a 401.
 > There is **no `init` subcommand.** Setup is either the Docker first-run
 > bootstrap (below) or the manual steps in this guide.
 
+> Using **Microsoft Entra JWT** auth (`auth_mode=entra`) instead of pre-shared keys?
+> This guide covers the static-key modes; for the Entra setup see
+> [entra-auth-setup.md](entra-auth-setup.md).
+
 ---
 
 ## 1. Two modes of authentication

@@ -1,0 +1,328 @@
+digraph auth_startup {
+    // -- Global defaults -----------------------------------------------------------
+    graph [
+        rankdir   = TB
+        splines   = ortho
+        compound  = true
+        nodesep   = 0.55
+        ranksep   = 0.80
+        fontname  = "Helvetica"
+        fontsize  = 11
+        label     = "Auth Wiring at Boot \u2014 Mode Selection & Fail-Closed Startup Gate\n(context_intelligence_server/main.py \u2014 create_asgi_app()  \u00b7  auth.py \u2014 resolvers)"
+        labelloc  = t
+        labeljust = c
+    ]
+    node [
+        fontname = "Helvetica"
+        fontsize = 11
+        style    = "filled,rounded"
+        shape    = box
+    ]
+    edge [
+        fontname = "Helvetica"
+        fontsize = 10
+    ]
+
+    // ====================================================================
+    // ENTRY
+    // ====================================================================
+    Entry [
+        label     = "create_asgi_app(settings)\n(called once at module load \u2014 main.py line 286:\nasgi_app = create_asgi_app())"
+        shape     = oval
+        fillcolor = "#E3F2FD"
+    ]
+
+    // ====================================================================
+    // AUTH MODE SELECTION
+    // ====================================================================
+    AuthModeSwitch [
+        label     = "settings.auth_mode?"
+        shape     = diamond
+        fillcolor = "#FFF9C4"
+        style     = filled
+    ]
+
+    // ====================================================================
+    // STATIC KEY RESOLVER CONSTRUCTION  (auth_mode=static)
+    // ====================================================================
+    subgraph cluster_static_build {
+        graph [
+            label     = "StaticKeyResolver  (auth_mode=static)  \u2014 auth.py\nPre-shared bearer tokens; no network calls at startup"
+            style     = "filled"
+            color     = "#546E7A"
+            fillcolor = "#ECEFF1"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        BuildKeystore [
+            label     = "settings.build_keystore()\nsha256(token) \u2192 contributor_id map\n(from api_key / api_keys config)"
+            fillcolor = "#F5F5F5"
+        ]
+
+        StaticResolver [
+            label     = "StaticKeyResolver(keystore)\nauth_enabled = bool(keystore)\n  True  \u2193 \u22651 key configured\n  False \u2193 empty keystore (allow_unauthenticated opt-out only)"
+            fillcolor = "#ECEFF1"
+            fontname  = "Helvetica-Bold"
+        ]
+    }
+
+    // ====================================================================
+    // ENTRA RESOLVER CONSTRUCTION  (auth_mode=entra)
+    // ====================================================================
+    subgraph cluster_entra_build {
+        graph [
+            label     = "EntraResolver  (auth_mode=entra)  \u2014 auth.py\nMicrosoft Entra RS256 JWT; JWKS keys fetched eagerly at startup"
+            style     = "filled"
+            color     = "#0D47A1"
+            fillcolor = "#E3F2FD"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        BuildIdentityMap [
+            label     = "settings.build_identity_map()\n{oid_lower \u2192 contributor_id}\n(from entra_identities config; keys lowercased)"
+            fillcolor = "#BBDEFB"
+        ]
+
+        BuildJwksClient [
+            label     = "PyJWKClient(\n  uri=https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys\n  lifespan=JWKS_CACHE_LIFESPAN_SECONDS  [300 s]\n)"
+            fillcolor = "#BBDEFB"
+        ]
+
+        EagerFetch [
+            label     = "jwks_client.fetch_data()\nEAGER prefetch \u2014 fail-closed at startup\n(\u00a78b / crusty gate)"
+            fillcolor = "#80CBC4"
+            fontname  = "Helvetica-Bold"
+        ]
+
+        FetchOk [
+            label     = "JWKS reachable?"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        ZeroKeysCheck [
+            label     = "jwks_client.get_jwk_set().keys\nnon-empty?"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        EntraResolver [
+            label     = "EntraResolver(client_id, tenant_id, identity_map)\nauth_enabled = True  (always \u2014 identity_map non-empty by config validation)\nexpected_aud = [client_id, \"api://client_id\"]\nexpected_issuer = https://login.microsoftonline.com/{tenant_id}/v2.0"
+            fillcolor = "#BBDEFB"
+            fontname  = "Helvetica-Bold"
+        ]
+    }
+
+    // ====================================================================
+    // FAIL-CLOSED STARTUP GATE
+    // ====================================================================
+    subgraph cluster_failclosed {
+        graph [
+            label     = "Fail-closed startup gate  (main.py \u2014 create_asgi_app)\nserver must refuse to boot unauthenticated in production"
+            style     = "filled"
+            color     = "#B71C1C"
+            fillcolor = "#FFEBEE"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        AuthEnabledCheck [
+            label     = "resolver.auth_enabled?"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        AllowUnauthCheck [
+            label     = "settings.allow_unauthenticated?\n(test/dev opt-out ONLY \u2014 never set in production)"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+    }
+
+    // ====================================================================
+    // EXEMPT PATH SELECTION  (web_ui_enabled)
+    // ====================================================================
+    subgraph cluster_exempt {
+        graph [
+            label     = "Exempt-path selection  (main.py \u2014 create_asgi_app)\ncontrols which paths bypass auth entirely"
+            style     = "filled"
+            color     = "#006064"
+            fillcolor = "#E0F7FA"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        WebUiCheck [
+            label     = "settings.web_ui_enabled?"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        ExemptFull [
+            label     = "exempt = _EXEMPT_PATHS\n{/status, /version, /logs/stream,\n /, /dashboard, /docs, /openapi.json}\nFastAPI: docs_url=\"/docs\"\n  redoc_url=\"/redoc\"\n  openapi_url=\"/openapi.json\"\nWeb routes registered:\n  GET /  GET /dashboard  GET /logs/stream\n  StaticFiles /static"
+            fillcolor = "#B2EBF2"
+        ]
+
+        ExemptApiOnly [
+            label     = "exempt = _EXEMPT_PATHS_API_ONLY\n{/status, /version}\nFastAPI: docs_url=None\n  redoc_url=None\n  openapi_url=None\nWeb routes NOT registered\n(/logs/stream not exempt \u2192 gated by auth)"
+            fillcolor = "#B2EBF2"
+        ]
+
+        ExemptNote [
+            label     = "prefix exemptions always apply\n(regardless of web_ui_enabled):\n  /static/   /skills/"
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+    }
+
+    // ====================================================================
+    // ASSEMBLY
+    // ====================================================================
+    subgraph cluster_assembly {
+        graph [
+            label     = "Middleware assembly  (auth.py \u2014 BearerTokenMiddleware)"
+            style     = "filled"
+            color     = "#006064"
+            fillcolor = "#E0F7FA"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        MiddlewareWrap [
+            label     = "BearerTokenMiddleware(\n  app,                   \u2190 FastAPI ASGI app\n  resolver=resolver,     \u2190 active resolver\n  exempt_paths=exempt    \u2190 mode-selected set\n)"
+            fillcolor = "#80CBC4"
+            fontname  = "Helvetica-Bold"
+        ]
+    }
+
+    // ====================================================================
+    // OUTPUT
+    // ====================================================================
+    AsgiApp [
+        label     = "asgi_app  (module-level)\nserved by Gunicorn + UvicornWorker\nbind=settings.server_host:settings.server_port\nworkers=1  (validated by _validate_single_worker)"
+        shape     = oval
+        fillcolor = "#C8E6C9"
+        fontname  = "Helvetica-Bold"
+        penwidth  = 2.5
+    ]
+
+    // ====================================================================
+    // FAILURE EXIT NODES
+    // ====================================================================
+    JwksFetchFail [
+        label     = "RuntimeError\n\"JWKS prefetch failed for tenant ...\n server cannot start\"\nprocess exits \u2014 start refused"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
+    ZeroKeysFail [
+        label     = "RuntimeError\n\"JWKS endpoint returned zero signing keys ...\n server cannot start\"\nprocess exits \u2014 start refused"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
+    NoAuthFail [
+        label     = "RuntimeError\n\"No authentication configured \u2014\n the server refuses to start\"\nprocess exits \u2014 start refused"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
+    // ====================================================================
+    // FLOW EDGES
+    // ====================================================================
+    Entry           -> AuthModeSwitch
+
+    // auth_mode branch
+    AuthModeSwitch  -> BuildKeystore    [label = "\"static\"\n(default)"]
+    AuthModeSwitch  -> BuildIdentityMap [label = "\"entra\""]
+
+    // Static path
+    BuildKeystore   -> StaticResolver
+
+    // Entra path
+    BuildIdentityMap -> BuildJwksClient
+    BuildJwksClient  -> EagerFetch
+    EagerFetch       -> FetchOk
+
+    FetchOk          -> ZeroKeysCheck    [label = "reachable"]
+    FetchOk          -> JwksFetchFail    [label = "any exception\n(network / DNS / TLS)"]
+
+    ZeroKeysCheck    -> EntraResolver    [label = "non-empty"]
+    ZeroKeysCheck    -> ZeroKeysFail     [label = "empty {\"keys\": []}"]
+
+    // Both paths converge at fail-closed gate
+    StaticResolver   -> AuthEnabledCheck
+    EntraResolver    -> AuthEnabledCheck
+
+    // Fail-closed gate
+    AuthEnabledCheck -> AllowUnauthCheck [label = "False\n(no credentials)"]
+    AuthEnabledCheck -> WebUiCheck       [label = "True"]
+    AllowUnauthCheck -> NoAuthFail       [label = "False\n(default \u2014 refuse to start)"]
+    AllowUnauthCheck -> WebUiCheck       [label = "True\n(test/dev only)"]
+
+    // Exempt path selection
+    WebUiCheck       -> ExemptFull       [label = "True\n(default)"]
+    WebUiCheck       -> ExemptApiOnly    [label = "False"]
+    ExemptFull       -> ExemptNote       [style = dotted, color = "#AAAAAA", arrowhead = none]
+    ExemptApiOnly    -> ExemptNote       [style = dotted, color = "#AAAAAA", arrowhead = none]
+
+    // Assembly
+    ExemptFull       -> MiddlewareWrap
+    ExemptApiOnly    -> MiddlewareWrap
+
+    // Output
+    MiddlewareWrap   -> AsgiApp
+
+    // ====================================================================
+    // LEGEND
+    // ====================================================================
+    subgraph cluster_legend {
+        graph [
+            label     = "Legend"
+            fontsize  = 10
+            fontname  = "Helvetica"
+            style     = "dashed"
+            color     = "#AAAAAA"
+        ]
+        node [fontsize = 10]
+
+        LegGrey [
+            label     = "StaticKeyResolver"
+            fillcolor = "#ECEFF1"
+        ]
+        LegBlue [
+            label     = "EntraResolver / Entra\nJWT validation"
+            fillcolor = "#BBDEFB"
+        ]
+        LegTeal [
+            label     = "auth middleware\n/ exempt paths"
+            fillcolor = "#B2EBF2"
+        ]
+        LegGreen [
+            label     = "asgi_app output\n(server ready)"
+            fillcolor = "#C8E6C9"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
+        ]
+        LegError [
+            label     = "startup refused\n(RuntimeError)"
+            shape     = oval
+            fillcolor = "#FFCCBC"
+        ]
+        LegDecision [
+            label     = "decision"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        LegGrey -> LegBlue -> LegTeal -> LegGreen -> LegError -> LegDecision [style = invis]
+    }
+}

@@ -224,6 +224,10 @@ For auth, choose one of:
   echo "raw token (give to client): $TOKEN"
   ```
 
+- **Microsoft Entra JWT** (`auth_mode=entra`) — clients authenticate with Azure AD
+  bearer tokens instead of pre-shared keys; the server validates the JWT and maps the
+  token's `oid` to a contributor. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md).
+
 The server verifies every request by hashing the presented token (`sha256(token)`)
 and matching the digest. The full guide — adding/revoking/rotating peers, the
 empty-`{}` hard-error rule, and the raw-token-vs-digest guardrail — is in
@@ -498,6 +502,12 @@ Values are resolved with this priority (highest first):
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE` | *(env only)* | `server-config.yaml` | Path to the YAML config file |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY` | `api_key` | *(empty — auth disabled)* | Legacy single bearer token (folds to contributor id `owner`). When set, all API endpoints except `/status` and static routes require `Authorization: Bearer <value>`. The server verifies a request by computing `sha256(token)` and matching it. Coexists with `api_keys`. See [docs/managing-api-keys.md](docs/managing-api-keys.md). |
 | *(YAML only)* | `api_keys` | *(empty — disabled)* | Per-contributor keystore: a map of `sha256_hex(token) -> {id: <contributor>}`. The server stores only digests; the peer sends the **raw** token and the server hashes it to look up the contributor. `api_keys: {}` (empty map) is a **hard startup error** — omit or use `null` to disable auth. The matched `id` is recorded as `created_by` on graph nodes. See [docs/managing-api-keys.md](docs/managing-api-keys.md). |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AUTH_MODE` | `auth_mode` | `static` | Selects the active resolver: `static` (sha256 keystore, the `api_key`/`api_keys` path above) or `entra` (Microsoft Entra JWT validation via JWKS). Exactly one mode is active. `entra` requires the three fields below. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_CLIENT_ID` | `azure_client_id` | *(empty)* | App Registration (client) GUID. **Required when `auth_mode=entra`** (startup refuses otherwise). See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_TENANT_ID` | `azure_tenant_id` | *(empty)* | Azure AD tenant GUID. **Required when `auth_mode=entra`**. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES` (JSON) | `entra_identities` | *(empty)* | Identity map `oid -> {id: <contributor>}` (oids are Azure Object IDs — **PII**, never commit real values). **Required (non-empty) when `auth_mode=entra`**; the matched `id` is recorded as `created_by`. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ALLOW_UNAUTHENTICATED` | `allow_unauthenticated` | `false` | Opt-out of the fail-closed startup gate so the server can boot with no auth configured (every request passes through). **TEST/DEV ONLY — never set in production.** |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_WEB_UI_ENABLED` | `web_ui_enabled` | `true` | When `false`, locks down to API-only: no OpenAPI schema / Swagger UI, and the index, dashboard, static assets, and `/logs/stream` routes are unregistered and removed from the auth-exempt set (`/logs/stream` becomes auth-gated). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL` | `neo4j_url` | `neo4j://neo4j:7687` | Neo4j bolt/driver URL used for all graph operations. **Displayed verbatim in the web UI.** May point to a remote host — `bolt://db.internal:7687` is valid. Use `bolt://` scheme for Community Edition single-node installs. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_BROWSER_URL` | `neo4j_browser_url` | `http://localhost:7474` | Neo4j Browser HTTP UI URL. **Displayed verbatim as a clickable link in the web UI.** Set to the address reachable from your browser — not necessarily `localhost` if Neo4j is on a remote machine. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_USER` | `neo4j_user` | `neo4j` | Neo4j username |

@@ -36,10 +36,38 @@ digraph durable_ingest_queue {
             fontsize  = 10
         ]
 
-        PostEvents [
-            label     = "POST /events"
+        ClientRequest [
+            label     = "POST /events\n(incoming HTTP request)"
             shape     = oval
             fillcolor = "#E3F2FD"
+        ]
+
+        BearerMiddleware [
+            label     = "BearerTokenMiddleware\n(ASGI middleware \u2014 see diagram 06 for full auth flow)\nverifies bearer token; stamps contributor_id into scope[\"state\"]\nexempt paths bypass auth (/status, /version, etc.)"
+            fillcolor = "#B2EBF2"
+        ]
+
+        Auth401Exit [
+            label     = "HTTP 401 / 403\nauth_event=auth_denied\n(or resolver_unexpected_exception \u2192 401)"
+            shape     = oval
+            fillcolor = "#FFCCBC"
+        ]
+
+        PostEvents [
+            label     = "POST /events  (route handler)\ncontributor_id verified by middleware"
+            shape     = oval
+            fillcolor = "#E3F2FD"
+        ]
+
+        ValidateTimestamp [
+            label     = "_validate_data_timestamp(data)\ndata[\"timestamp\"] must be present +\nnon-empty string + valid ISO-8601\n(fail loud at boundary \u2014 never silently dead-letter)"
+            fillcolor = "#F5F5F5"
+        ]
+
+        Return400 [
+            label     = "HTTP 400\ndata.timestamp missing / empty / non-ISO-8601"
+            shape     = oval
+            fillcolor = "#FFCCBC"
         ]
 
         IdempotencyHit [
@@ -71,7 +99,7 @@ digraph durable_ingest_queue {
         ]
 
         QueueAppend [
-            label     = "QueueManager.append(worker_key, raw_body)\nPERSIST-FIRST: append line to <key>.log\n(zero-silent-loss window)"
+            label     = "QueueManager.append(worker_key, stamped_body)\nbody[\"created_by\"] = contributor_id (write-once, prevents spoofing)\nPERSIST-FIRST: append line to <key>.log\n(zero-silent-loss window)"
             fillcolor = "#C8E6C9"
             fontname  = "Helvetica-Bold"
             penwidth  = 2.5
@@ -169,7 +197,7 @@ digraph durable_ingest_queue {
         { rank = same; FileLog; FileOffset; FileDeadLetter }
 
         FileLog [
-            label     = "<key>.log\nappend-only, newline-delimited\nraw EventRequest JSON"
+            label     = "<key>.log\nappend-only, newline-delimited\nraw EventRequest JSON (created_by-stamped)"
             shape     = note
             style     = filled
             fillcolor = "#FFF8E1"
@@ -265,10 +293,15 @@ digraph durable_ingest_queue {
     // ============================================================
     // PHASE 1 edges
     // ============================================================
-    PostEvents      -> IdempotencyHit
-    IdempotencyHit  -> ReturnCached   [label = "yes"]
+    ClientRequest   -> BearerMiddleware
+    BearerMiddleware -> Auth401Exit      [label = "401 / 403\n(auth denied)"]
+    BearerMiddleware -> PostEvents       [label = "contributor_id\ninjected to scope"]
+    PostEvents      -> ValidateTimestamp
+    ValidateTimestamp -> Return400       [label = "invalid"]
+    ValidateTimestamp -> IdempotencyHit  [label = "valid"]
+    IdempotencyHit  -> ReturnCached      [label = "yes"]
     ReturnCached    -> CachedExit
-    IdempotencyHit  -> WorkerKey      [label = "no"]
+    IdempotencyHit  -> WorkerKey         [label = "no"]
     WorkerKey       -> GetOrCreate
     GetOrCreate     -> QueueAppend
     QueueAppend     -> RecordAccepted
@@ -370,6 +403,10 @@ digraph durable_ingest_queue {
             fontname  = "Helvetica-Bold"
             penwidth  = 2.5
         ]
+        LegAuth [
+            label     = "auth middleware\n(diagram 06)"
+            fillcolor = "#B2EBF2"
+        ]
         LegDiamond [
             label     = "decision"
             shape     = diamond
@@ -387,7 +424,12 @@ digraph durable_ingest_queue {
             shape     = oval
             fillcolor = "#E3F2FD"
         ]
+        LegError [
+            label     = "error / rejection"
+            shape     = oval
+            fillcolor = "#FFCCBC"
+        ]
 
-        LegGreen -> LegDiamond -> LegFile -> LegOval [style = invis]
+        LegGreen -> LegAuth -> LegDiamond -> LegFile -> LegOval -> LegError [style = invis]
     }
 }

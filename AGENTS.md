@@ -29,7 +29,7 @@ context_intelligence_server/      # FastAPI ingestion server
 │   ├── data_layer_2/             # Graph enrichment handlers
 │   └── data_layer_3/             # High-level insight handlers
 ├── routers/                      # API routers (queues.py = dead-letter inspect/replay/purge)
-├── auth.py                       # API key authentication
+├── auth.py                       # Bearer-token auth middleware (StaticKeyResolver / EntraResolver via PrincipalResolver; BearerTokenMiddleware)
 ├── dashboard.py                  # Dashboard SSE stream
 ├── models.py                     # Pydantic request/response models
 └── web/                          # Dashboard HTML + static assets

@@ -245,7 +245,13 @@ On success the event is queued and the resulting graph nodes are stamped
 
 > Health/monitoring paths are exempt from auth and need no token: `/status`,
 > `/version`, `/`, `/dashboard`, `/docs`, `/openapi.json`, plus `/static/*` and
-> `/skills/*`.
+> `/skills/*`. This is the full-web exempt set (`web_ui_enabled=true`, the default).
+>
+> **API-only mode (`web_ui_enabled=false`):** the exempt set shrinks to just
+> `{/status, /version}`. The web-UI routes (`/`, `/dashboard`, `/docs`,
+> `/openapi.json`) are not registered (→ 404), and `/logs/stream` becomes
+> **auth-gated** — it is removed from the exempt set so it can no longer be reached
+> as an unauthenticated log drain. See the `web_ui_enabled` field in `config.py`.
 
 ### 3.5 What 401 vs 403 mean **to you**
 
@@ -285,25 +291,42 @@ endpoint **refuses to start** — fail-closed) and cached thereafter (`PyJWKClie
 
 ### 4.3 Reading auth logs
 
-- A **normal denial** (401/403) is the expected path for a bad/unbound token and is
-  not an error condition for the server.
-- An **unexpected resolver error** is caught fail-closed (the request still gets a
-  401, never a 500) and logged loudly with a stack trace for investigation. The raw
-  token is **never** logged (credential hygiene). A distinct log tag to tell these
-  two apart at a glance is being finalized in **T5**.
+Two distinct, greppable tags separate a normal token rejection from an unexpected
+internal error. The raw bearer token is **never** logged (credential hygiene).
 
-### 4.4 Known limitation — events must include `data.timestamp`
+| Log tag | Level | Meaning | Grep |
+|---|---|---|---|
+| `auth_event=auth_denied` | **INFO** | A normal token rejection (401 or 403) — bad/expired/unbound token. Expected, not a server fault. The line includes the reason and status code. | `grep 'auth_event=auth_denied'` |
+| `auth_event=resolver_unexpected_exception` | **ERROR** | An *unexpected* error inside `resolver.resolve()` (e.g. a transient library bug). The request is still denied fail-closed (401, never a 500) and a full stack trace is logged for investigation. | `grep 'auth_event=resolver_unexpected_exception'` |
 
-The graph-write path requires every ingested event to carry a `data.timestamp`
-(ISO-8601). This is **ingest payload validation, not auth**: an authenticated request
-with a valid token is still accepted (HTTP 202) and `created_by` is still stamped, but
-if `data.timestamp` is missing or empty the durable drainer cannot build the graph
-node, retries, and **dead-letters the event** — so no node ever appears in Neo4j. This
-surfaced during the live AC10 end-to-end run; real Amplifier clients always send a
-timestamp, so it only bites hand-rolled / `curl` test payloads. **Operator action:**
-include a valid `data.timestamp` when smoke-testing with `curl`, and if events
-authenticate (202) but no graph nodes appear, check the drainer / dead-letter logs for
-a timestamp parse error **before** suspecting auth.
+A steady trickle of `auth_denied` is normal. Any `resolver_unexpected_exception` is
+worth investigating — it means the resolver hit something it did not expect.
+
+### 4.4 Events must include `data.timestamp` — rejected with `400` at ingest
+
+Every ingested event must carry a `data.timestamp` (a non-empty ISO-8601 string).
+This is **ingest payload validation, not auth**: `post_events` calls
+`_validate_data_timestamp(request.data)` **before queuing**, so a missing, empty,
+non-string, or non-ISO-8601 `data.timestamp` is rejected immediately with **HTTP 400**
+— the event is never accepted (no 202), never queued, and never dead-lettered. The
+response body names the field:
+
+```json
+{ "detail": "data.timestamp is required and must be a non-empty ISO-8601 string" }
+```
+```json
+{ "detail": "data.timestamp must be a valid ISO-8601 string; got '<value>'" }
+```
+
+Real Amplifier clients **always** send `data.timestamp` (verified: 224,530 events on
+disk, 0 missing), so this 400 only ever catches hand-rolled / `curl` test payloads —
+it cannot reject legitimate traffic. As defense-in-depth, the graph drainer's
+`make_node_id` additionally re-raises a **named** error if an unparseable timestamp
+ever reaches it, so anything that somehow bypasses the ingest check dead-letters
+legibly instead of as a bare `Invalid isoformat string: ''`.
+
+**Operator action:** when smoke-testing with `curl`, include a valid `data.timestamp`
+(see §3.4). A `400` here means a malformed payload, not an auth problem.
 
 ---
 
