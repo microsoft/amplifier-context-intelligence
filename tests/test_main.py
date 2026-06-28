@@ -43,7 +43,10 @@ async def test_post_events_returns_202(client: httpx.AsyncClient) -> None:
         json={
             "event": "tool_use",
             "workspace": "/ws",
-            "data": {"session_id": "sess-1"},
+            "data": {
+                "session_id": "sess-1",
+                "timestamp": "2026-06-16T20:17:11.604690+00:00",
+            },
         },
     )
     assert response.status_code == 202
@@ -58,7 +61,10 @@ async def test_event_enqueued_not_logged(
             json={
                 "event": "tool_use",
                 "workspace": "/ws",
-                "data": {"session_id": "sess-1"},
+                "data": {
+                    "session_id": "sess-1",
+                    "timestamp": "2026-06-16T20:17:11.604690+00:00",
+                },
             },
         )
     assert response.status_code == 202
@@ -71,7 +77,10 @@ async def test_post_events_body(client: httpx.AsyncClient) -> None:
         json={
             "event": "tool_use",
             "workspace": "/ws",
-            "data": {"session_id": "sess-1"},
+            "data": {
+                "session_id": "sess-1",
+                "timestamp": "2026-06-16T20:17:11.604690+00:00",
+            },
         },
     )
     data = response.json()
@@ -98,7 +107,10 @@ async def test_post_events_duplicate_idempotency_key_skips_enqueue(
         "event": "tool_use",
         "workspace": "/ws",
         "idempotency_key": "aci-event-v1:test-key",
-        "data": {"session_id": "sess-dupe"},
+        "data": {
+            "session_id": "sess-dupe",
+            "timestamp": "2026-06-16T20:17:11.604690+00:00",
+        },
     }
 
     first = await client.post("/events", json=payload)
@@ -130,7 +142,10 @@ async def test_post_events_replay_bypasses_idempotency_guard(
         "event": "tool_use",
         "workspace": "/ws",
         "idempotency_key": "aci-event-v1:test-key",
-        "data": {"session_id": "sess-replay"},
+        "data": {
+            "session_id": "sess-replay",
+            "timestamp": "2026-06-16T20:17:11.604690+00:00",
+        },
     }
 
     first = await client.post("/events", json=payload)
@@ -165,7 +180,10 @@ async def test_post_events_increments_accepted_counter(
         json={
             "event": "tool_use",
             "workspace": "/ws",
-            "data": {"session_id": "sess-accepted"},
+            "data": {
+                "session_id": "sess-accepted",
+                "timestamp": "2026-06-16T20:17:11.604690+00:00",
+            },
         },
     )
 
@@ -182,7 +200,10 @@ async def test_post_events_increments_active_sessions(
         json={
             "event": "tool_use",
             "workspace": "/ws",
-            "data": {"session_id": "sess-inc"},
+            "data": {
+                "session_id": "sess-inc",
+                "timestamp": "2026-06-16T20:17:11.604690+00:00",
+            },
         },
     )
     status_response = await client.get("/status")
@@ -200,9 +221,14 @@ async def test_post_events_missing_event_returns_422(client: httpx.AsyncClient) 
 async def test_post_events_no_session_id_returns_null(
     client: httpx.AsyncClient,
 ) -> None:
+    # data has a valid timestamp but no session_id — response session_id must be null.
     response = await client.post(
         "/events",
-        json={"event": "tool_use", "workspace": "/ws", "data": {}},
+        json={
+            "event": "tool_use",
+            "workspace": "/ws",
+            "data": {"timestamp": "2026-06-16T20:17:11.604690+00:00"},
+        },
     )
     assert response.status_code == 202
     data = response.json()
@@ -231,7 +257,10 @@ async def test_drain_loop_processes_event(
         json={
             "event": "tool_use",
             "workspace": "/ws",
-            "data": {"session_id": "sess-drain"},
+            "data": {
+                "session_id": "sess-drain",
+                "timestamp": "2026-06-16T20:17:11.604690+00:00",
+            },
         },
     )
 
@@ -452,7 +481,10 @@ async def test_status_session_detail_after_event(client: httpx.AsyncClient) -> N
         json={
             "event": "tool_use",
             "workspace": "/ws-detail",
-            "data": {"session_id": "sess-detail"},
+            "data": {
+                "session_id": "sess-detail",
+                "timestamp": "2026-06-16T20:17:11.604690+00:00",
+            },
         },
     )
     response = await client.get("/status")
@@ -758,7 +790,10 @@ class TestAuthMiddleware:
                 json={
                     "event": "tool_use",
                     "workspace": "/ws",
-                    "data": {"session_id": "s1"},
+                    "data": {
+                        "session_id": "s1",
+                        "timestamp": "2026-06-16T20:17:11.604690+00:00",
+                    },
                 },
             )
         assert response.status_code == 401
@@ -771,7 +806,10 @@ class TestAuthMiddleware:
                 json={
                     "event": "tool_use",
                     "workspace": "/ws",
-                    "data": {"session_id": "s1"},
+                    "data": {
+                        "session_id": "s1",
+                        "timestamp": "2026-06-16T20:17:11.604690+00:00",
+                    },
                 },
                 headers={"Authorization": "Bearer test-secret"},
             )
@@ -792,7 +830,10 @@ class TestAuthMiddleware:
             json={
                 "event": "tool_use",
                 "workspace": "/ws",
-                "data": {"session_id": "s1"},
+                "data": {
+                    "session_id": "s1",
+                    "timestamp": "2026-06-16T20:17:11.604690+00:00",
+                },
             },
         )
         assert response.status_code == 202
@@ -1171,7 +1212,10 @@ async def test_post_events_stamps_contributor_id_from_scope(
             json={
                 "event": "tool_use",
                 "workspace": "/ws",
-                "data": {"session_id": "s1"},
+                "data": {
+                    "session_id": "s1",
+                    "timestamp": "2026-06-16T20:17:11.604690+00:00",
+                },
             },
             headers={"Authorization": f"Bearer {test_token}"},
         )
@@ -1218,7 +1262,10 @@ async def test_post_events_overwrites_client_supplied_created_by(
             json={
                 "event": "tool_use",
                 "workspace": "/ws",
-                "data": {"session_id": "s2"},
+                "data": {
+                    "session_id": "s2",
+                    "timestamp": "2026-06-16T20:17:11.604690+00:00",
+                },
                 "created_by": "hacker",  # client-supplied spoofed value
             },
             headers={"Authorization": f"Bearer {test_token}"},
@@ -1249,7 +1296,14 @@ async def test_post_events_stamps_none_when_no_auth(
 
     response = await client.post(
         "/events",
-        json={"event": "tool_use", "workspace": "/ws", "data": {"session_id": "s3"}},
+        json={
+            "event": "tool_use",
+            "workspace": "/ws",
+            "data": {
+                "session_id": "s3",
+                "timestamp": "2026-06-16T20:17:11.604690+00:00",
+            },
+        },
     )
 
     assert response.status_code == 202
@@ -1344,3 +1398,141 @@ async def test_crash_recovery_truncated_line_safe_skip(bad_line: str) -> None:
         f"Bad/truncated line must be safe-skipped (return False), got {result!r}"
     )
     assert calls == [], "No drainer must be spawned for a bad/truncated line"
+
+
+# ---------------------------------------------------------------------------
+# data.timestamp ingest validation (Option A: fail at boundary with HTTP 400)
+# ---------------------------------------------------------------------------
+
+
+async def test_post_events_data_timestamp_missing_returns_400(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /events with data lacking timestamp returns 400, not 202 then silent dead-letter."""
+    response = await client.post(
+        "/events",
+        json={
+            "event": "tool_use",
+            "workspace": "/ws",
+            "data": {"session_id": "sess-ts-missing"},
+        },
+    )
+    assert response.status_code == 400
+    assert "data.timestamp" in response.json()["detail"]
+
+
+async def test_post_events_data_timestamp_empty_returns_400(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /events with data.timestamp == '' returns 400."""
+    response = await client.post(
+        "/events",
+        json={
+            "event": "tool_use",
+            "workspace": "/ws",
+            "data": {"session_id": "sess-ts-empty", "timestamp": ""},
+        },
+    )
+    assert response.status_code == 400
+    assert "data.timestamp" in response.json()["detail"]
+
+
+async def test_post_events_data_timestamp_whitespace_returns_400(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /events with data.timestamp == whitespace-only returns 400."""
+    response = await client.post(
+        "/events",
+        json={
+            "event": "tool_use",
+            "workspace": "/ws",
+            "data": {"session_id": "sess-ts-ws", "timestamp": "   "},
+        },
+    )
+    assert response.status_code == 400
+    assert "data.timestamp" in response.json()["detail"]
+
+
+async def test_post_events_data_timestamp_non_string_returns_400(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /events with data.timestamp that is not a string returns 400."""
+    response = await client.post(
+        "/events",
+        json={
+            "event": "tool_use",
+            "workspace": "/ws",
+            "data": {"session_id": "sess-ts-int", "timestamp": 12345},
+        },
+    )
+    assert response.status_code == 400
+    assert "data.timestamp" in response.json()["detail"]
+
+
+async def test_post_events_data_timestamp_invalid_iso_returns_400(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /events with data.timestamp that is not valid ISO-8601 returns 400."""
+    response = await client.post(
+        "/events",
+        json={
+            "event": "tool_use",
+            "workspace": "/ws",
+            "data": {"session_id": "sess-ts-bad", "timestamp": "not-a-date"},
+        },
+    )
+    assert response.status_code == 400
+    assert "data.timestamp" in response.json()["detail"]
+
+
+async def test_post_events_data_timestamp_invalid_detail_names_value(
+    client: httpx.AsyncClient,
+) -> None:
+    """400 detail for an invalid ISO timestamp includes the bad value for easy debugging."""
+    response = await client.post(
+        "/events",
+        json={
+            "event": "tool_use",
+            "workspace": "/ws",
+            "data": {"session_id": "sess-ts-detail", "timestamp": "2026-99-99"},
+        },
+    )
+    assert response.status_code == 400
+    # detail must name the bad value so operator knows what to fix
+    assert "2026-99-99" in response.json()["detail"]
+
+
+async def test_post_events_valid_iso_timestamp_returns_202(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /events with a valid ISO-8601 data.timestamp returns 202 (happy path unchanged)."""
+    response = await client.post(
+        "/events",
+        json={
+            "event": "tool_use",
+            "workspace": "/ws",
+            "data": {
+                "session_id": "sess-ts-ok",
+                "timestamp": "2026-06-16T20:17:11.604690+00:00",
+            },
+        },
+    )
+    assert response.status_code == 202
+
+
+async def test_post_events_valid_utc_z_timestamp_returns_202(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /events with Z-suffix UTC timestamp (real Amplifier format) returns 202."""
+    response = await client.post(
+        "/events",
+        json={
+            "event": "session:start",
+            "workspace": "/ws",
+            "data": {
+                "session_id": "sess-ts-utcz",
+                "timestamp": "2026-06-16T20:17:11.604690106+00:00",
+            },
+        },
+    )
+    assert response.status_code == 202
