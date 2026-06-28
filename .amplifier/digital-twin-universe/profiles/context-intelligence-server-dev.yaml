@@ -109,7 +109,14 @@ provision:
       CI_WORKSPACE=${WORKSPACE}
       export AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL=bolt://localhost:7687
       export AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD=none
-      nohup uvicorn context_intelligence_server.main:app \
+      # Tell the SERVER about the API key so BearerTokenMiddleware actually enforces it.
+      # (The bundle is already configured to send $CI_KEY as the Bearer token below.)
+      # Without this the keystore is empty and the auth-wrapped app fails CLOSED at startup.
+      export AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY=$CI_KEY
+      # Serve the auth-wrapped ASGI app (main:asgi_app), NOT main:app. main:app bypasses
+      # BearerTokenMiddleware entirely -- an unauthenticated write returns 422, not 401
+      # (a silent fail-open footgun). asgi_app enforces the Bearer token end-to-end.
+      nohup uvicorn context_intelligence_server.main:asgi_app \
         --host 0.0.0.0 --port $CI_PORT \
         > /var/log/ci-server.log 2>&1 &
       sleep 3
@@ -120,6 +127,7 @@ provision:
       export VIRTUAL_ENV=/opt/ci-venv
       export AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL=http://localhost:$CI_PORT
       export AMPLIFIER_CONTEXT_INTELLIGENCE_API_KEY=$CI_KEY
+      export AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY=$CI_KEY
       export AMPLIFIER_CONTEXT_INTELLIGENCE_WORKSPACE=$CI_WORKSPACE
       export NEO4J_URL=bolt://localhost:7687
       ENVEOF
@@ -128,6 +136,7 @@ provision:
       echo "VIRTUAL_ENV=/opt/ci-venv" >> /etc/environment
       echo "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_URL=http://localhost:$CI_PORT" >> /etc/environment
       echo "AMPLIFIER_CONTEXT_INTELLIGENCE_API_KEY=$CI_KEY" >> /etc/environment
+      echo "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY=$CI_KEY" >> /etc/environment
       echo "AMPLIFIER_CONTEXT_INTELLIGENCE_WORKSPACE=$CI_WORKSPACE" >> /etc/environment
       echo "NEO4J_URL=bolt://localhost:7687" >> /etc/environment
 
@@ -208,7 +217,8 @@ update:
     - |
       source /opt/ci-venv/bin/activate
       . /etc/environment
-      nohup uvicorn context_intelligence_server.main:app \
+      # Auth-wrapped app (see start block) -- main:asgi_app enforces the Bearer token; main:app does not.
+      nohup uvicorn context_intelligence_server.main:asgi_app \
         --host 0.0.0.0 --port ${SERVER_PORT:-8000} \
         > /var/log/ci-server.log 2>&1 &
       sleep 3
