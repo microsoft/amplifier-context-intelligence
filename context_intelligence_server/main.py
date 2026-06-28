@@ -28,6 +28,8 @@ from context_intelligence_server.auth import (
     BearerTokenMiddleware,
     EntraResolver,
     StaticKeyResolver,
+    _EXEMPT_PATHS,
+    _EXEMPT_PATHS_API_ONLY,
 )
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import Settings, get_settings
@@ -159,7 +161,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 app = FastAPI(
-    title="Context Intelligence Server", version=__version__, lifespan=lifespan
+    title="Context Intelligence Server",
+    version=__version__,
+    lifespan=lifespan,
+    # web_ui_enabled=False locks down to API-only: no OpenAPI schema, no Swagger UI.
+    # Must be set at construction time — FastAPI does not support changing these after init.
+    docs_url="/docs" if _settings.web_ui_enabled else None,
+    redoc_url="/redoc" if _settings.web_ui_enabled else None,
+    openapi_url="/openapi.json" if _settings.web_ui_enabled else None,
 )
 app.include_router(skills_router)
 app.include_router(version_router)
@@ -184,7 +193,6 @@ def _workspace_slug(workspace: str) -> str:
 
 
 _WEB_DIR = Path(__file__).parent / "web"
-app.mount("/static", StaticFiles(directory=_WEB_DIR / "static"), name="static")
 
 
 def create_asgi_app(
@@ -240,7 +248,12 @@ def create_asgi_app(
             "allow_unauthenticated: true in the config."
         )
 
-    return BearerTokenMiddleware(app, resolver=resolver)
+    # Select the auth-exempt path set based on web_ui_enabled.
+    # web_ui_enabled=False (api-only): use the smaller set that excludes /logs/stream
+    # and other web-UI paths so they cannot be reached unauthenticated.
+    # web_ui_enabled=True (default): use the full set including web-UI paths.
+    exempt = _EXEMPT_PATHS if s.web_ui_enabled else _EXEMPT_PATHS_API_ONLY
+    return BearerTokenMiddleware(app, resolver=resolver, exempt_paths=exempt)
 
 
 # Module-level ASGI app used by Gunicorn: context_intelligence_server.main:asgi_app
@@ -248,14 +261,19 @@ def create_asgi_app(
 asgi_app: BearerTokenMiddleware = create_asgi_app()
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index() -> FileResponse:
-    return FileResponse(_WEB_DIR / "index.html")
+if _settings.web_ui_enabled:
+    # static mount moved into this block so there is ONE conditional for all web-UI
+    # registrations that appear before the API routes.  (The /logs/stream route has
+    # its own block below because it lives after the /blobs routes in the file.)
+    app.mount("/static", StaticFiles(directory=_WEB_DIR / "static"), name="static")
 
+    @app.get("/", response_class=HTMLResponse)
+    async def index() -> FileResponse:
+        return FileResponse(_WEB_DIR / "index.html")
 
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard() -> FileResponse:
-    return FileResponse(_WEB_DIR / "dashboard.html")
+    @app.get("/dashboard", response_class=HTMLResponse)
+    async def dashboard() -> FileResponse:
+        return FileResponse(_WEB_DIR / "dashboard.html")
 
 
 @app.get("/status")
@@ -340,39 +358,43 @@ async def get_blob(session_id: str, key: str) -> JSONResponse:
     return JSONResponse(content=content)
 
 
-@app.get("/logs/stream")
-async def stream_logs(request: Request) -> StreamingResponse:
-    """Stream server log lines as Server-Sent Events."""
-    log_path = Path(_settings.log_path)
+if _settings.web_ui_enabled:
+    # /logs/stream is web-UI only — the dashboard consumes it.  When web_ui_enabled=False
+    # this route is absent (→ 404) and the path is not in _EXEMPT_PATHS_API_ONLY, so any
+    # unauthenticated request is gated by the middleware (→ 401).
+    @app.get("/logs/stream")
+    async def stream_logs(request: Request) -> StreamingResponse:
+        """Stream server log lines as Server-Sent Events."""
+        log_path = Path(_settings.log_path)
 
-    async def event_generator() -> AsyncGenerator[str, None]:
-        # Backfill last 200 lines (skip if log file does not yet exist)
-        if log_path.exists():
-            for line in log_path.read_text().splitlines()[-200:]:
-                yield f"data: {line}\n\n"
+        async def event_generator() -> AsyncGenerator[str, None]:
+            # Backfill last 200 lines (skip if log file does not yet exist)
+            if log_path.exists():
+                for line in log_path.read_text().splitlines()[-200:]:
+                    yield f"data: {line}\n\n"
 
-        # Tail new lines (return early if log file still does not exist)
-        if not log_path.exists():
-            return
-        async with aiofiles.open(log_path, mode="r") as f:
-            await f.seek(0, 2)
-            while True:
-                if await request.is_disconnected():
-                    break
-                line = await f.readline()
-                if not line:
-                    await asyncio.sleep(0.2)
-                else:
-                    yield f"data: {line.rstrip()}\n\n"
+            # Tail new lines (return early if log file still does not exist)
+            if not log_path.exists():
+                return
+            async with aiofiles.open(log_path, mode="r") as f:
+                await f.seek(0, 2)
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    line = await f.readline()
+                    if not line:
+                        await asyncio.sleep(0.2)
+                    else:
+                        yield f"data: {line.rstrip()}\n\n"
 
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
 
 @app.post("/cypher")
