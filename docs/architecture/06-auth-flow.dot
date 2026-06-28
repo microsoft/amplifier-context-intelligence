@@ -1,0 +1,409 @@
+digraph auth_flow {
+    // -- Global defaults -----------------------------------------------------------
+    graph [
+        rankdir   = TB
+        splines   = ortho
+        compound  = true
+        nodesep   = 0.6
+        ranksep   = 0.8
+        fontname  = "Helvetica"
+        fontsize  = 11
+        label     = "Per-Request Authentication Flow\n(context_intelligence_server/auth.py \u2014 BearerTokenMiddleware  \u00b7  main.py \u2014 post_events)"
+        labelloc  = t
+        labeljust = c
+    ]
+    node [
+        fontname = "Helvetica"
+        fontsize = 11
+        style    = "filled,rounded"
+        shape    = box
+    ]
+    edge [
+        fontname = "Helvetica"
+        fontsize = 10
+    ]
+
+    // ====================================================================
+    // ENTRY
+    // ====================================================================
+    Client [
+        label     = "HTTP client\nAuthorization: Bearer <token>"
+        shape     = oval
+        fillcolor = "#E3F2FD"
+    ]
+
+    // ====================================================================
+    // BEARER TOKEN MIDDLEWARE  (ASGI layer \u2014 sits before every HTTP route)
+    // ====================================================================
+    subgraph cluster_middleware {
+        graph [
+            label     = "BearerTokenMiddleware  (ASGI layer \u2014 auth.py)\nwraps the FastAPI app; intercepts every HTTP request before routing"
+            style     = "filled"
+            color     = "#006064"
+            fillcolor = "#E0F7FA"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        IsHttpScope [
+            label     = "scope[\"type\"] == \"http\"?"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        IsAuthEnabled [
+            label     = "resolver.auth_enabled?\n(False only when allow_unauthenticated=True\n\u2014 test/dev opt-out, never production)"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        IsExemptPath [
+            label     = "Exempt path?\nexact: _EXEMPT_PATHS (web_ui_enabled=True)\n  or _EXEMPT_PATHS_API_ONLY (web_ui_enabled=False)\nprefix: /static/, /skills/ (always exempt)"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        ExtractToken [
+            label     = "_extract_bearer_token(scope[\"headers\"])\nscan headers for Authorization: Bearer <token>"
+            fillcolor = "#B2EBF2"
+        ]
+
+        HasToken [
+            label     = "token extracted?"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        ResolveCall [
+            label     = "resolver.resolve(token)\n(dispatched to active resolver\nwired at startup \u2014 see diagram 07)"
+            fillcolor = "#80CBC4"
+            fontname  = "Helvetica-Bold"
+        ]
+
+        AuthErrCatch [
+            label     = "except AuthError as exc\nauth_event=auth_denied\nlog.info(reason, status_code=exc.status_code)"
+            fillcolor = "#FFCCBC"
+        ]
+
+        ExcCatch [
+            label     = "except Exception  (defense-in-depth catch-all)\nauth_event=resolver_unexpected_exception\nlog.error(exc_info=True)\nfail-closed \u2192 401  (never propagate as 500)"
+            fillcolor = "#FFCCBC"
+        ]
+
+        ContribNone [
+            label     = "contributor_id is None?\n(StaticKeyResolver miss \u2014 backward-compat path;\nEntraResolver always raises AuthError instead)"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        InjectIdentity [
+            label     = "scope[\"state\"][\"contributor_id\"] = contributor_id\n\u2192 await self.app(scope, receive, send)"
+            fillcolor = "#C8E6C9"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
+        ]
+    }
+
+    // ====================================================================
+    // STATIC KEY RESOLVER  (auth_mode=static)
+    // ====================================================================
+    subgraph cluster_static {
+        graph [
+            label     = "StaticKeyResolver  (auth_mode=static)  \u2014 auth.py\nPre-shared bearer tokens; pure dict lookup, no network calls"
+            style     = "filled"
+            color     = "#546E7A"
+            fillcolor = "#ECEFF1"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        StaticHash [
+            label     = "sha256(token.encode()).hexdigest()"
+            fillcolor = "#F5F5F5"
+        ]
+
+        StaticLookup [
+            label     = "keystore.get(sha256_hex)\n\u2192 contributor_id str  or  None\n(None on miss \u2014 never 'unknown')"
+            fillcolor = "#F5F5F5"
+        ]
+    }
+
+    // ====================================================================
+    // ENTRA RESOLVER  (auth_mode=entra)
+    // ====================================================================
+    subgraph cluster_entra {
+        graph [
+            label     = "EntraResolver  (auth_mode=entra)  \u2014 auth.py\nMicrosoft Entra RS256 JWT; JWKS keys cached per kid (lifespan=300 s)\nmirrors Team Pulse identity/extractors.py"
+            style     = "filled"
+            color     = "#0D47A1"
+            fillcolor = "#E3F2FD"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        JwksKey [
+            label     = "PyJWKClient.get_signing_key_from_jwt(token).key\n(per-kid cache; auto-refresh after lifespan boundary)"
+            fillcolor = "#BBDEFB"
+        ]
+
+        JwtDecode [
+            label     = "jwt.decode(token, key\n  algorithms=[\"RS256\"]  \u2190 H1: reject alg=none / HS256\n  audience=[client_id, \"api://client_id\"]\n  issuer=https://login.microsoftonline.com/{tenant_id}/v2.0\n  require=[\"exp\", \"iss\", \"aud\"])"
+            fillcolor = "#BBDEFB"
+        ]
+
+        TidCheck [
+            label     = "claims[\"tid\"] == tenant_id?\n(defense-in-depth alongside issuer pin)"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        ScpCheck [
+            label     = "\"access_as_user\" in\nclaims.get(\"scp\", \"\").split()?"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        OidCheck [
+            label     = "oid = claims.get(\"oid\")\nisinstance(oid, str) and oid.strip() != \"\"?"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        IdentityLookup [
+            label     = "identity_map.get(oid.lower())\n\u2192 contributor_id str  or  None"
+            fillcolor = "#BBDEFB"
+        ]
+
+        OidMapped [
+            label     = "contributor_id found?"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+    }
+
+    // ====================================================================
+    // EXIT NODES
+    // ====================================================================
+    PassThrough [
+        label     = "pass-through to route\n(no auth check)"
+        shape     = oval
+        fillcolor = "#E3F2FD"
+    ]
+
+    Exit401NoToken [
+        label     = "HTTP 401\nMissing or invalid bearer token"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
+    Exit401Auth [
+        label     = "HTTP 401  (auth_denied)"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
+    Exit403Auth [
+        label     = "HTTP 403  (auth_denied)\noid valid but not in identity_map\noperator action: add oid to entra_identities config"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
+    // ====================================================================
+    // POST /events HANDLER  (main.py)
+    // ====================================================================
+    subgraph cluster_post_events {
+        graph [
+            label     = "POST /events  (main.py \u2014 post_events)\ncontributor_id already verified by middleware; stamped before queue append"
+            style     = "filled"
+            color     = "#1565C0"
+            fillcolor = "#E3F2FD"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        ValidateTimestamp [
+            label     = "_validate_data_timestamp(data)\ndata[\"timestamp\"] must be:\n  present  +  non-empty string  +  valid ISO-8601\n(fail loud at boundary \u2014 never silently dead-letter)"
+            fillcolor = "#F5F5F5"
+        ]
+
+        IdempotencyCheck [
+            label     = "idempotency_key seen before?\n(EventIdempotencyCache)"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        WorkerKey [
+            label     = "worker_key =\nsession_id  or  _no_session__<workspace-slug>"
+            fillcolor = "#F5F5F5"
+        ]
+
+        GetOrCreate [
+            label     = "registry.get_or_create(worker_key, workspace)\n(spawn sticky drainer if new session)"
+            fillcolor = "#F5F5F5"
+        ]
+
+        StampCreatedBy [
+            label     = "body_obj[\"created_by\"] = contributor_id\n(unconditional overwrite \u2014 prevents client spoofing)\nre-serialize as compact JSON"
+            fillcolor = "#F5F5F5"
+        ]
+
+        QueueAppend [
+            label     = "QueueManager.append(worker_key, stamped_body)\nPERSIST-FIRST: append to <worker_key>.log\n(drain loop \u2014 see diagram 05)"
+            fillcolor = "#C8E6C9"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
+        ]
+
+        RecordAccepted [
+            label     = "registry.record_accepted()"
+            fillcolor = "#F5F5F5"
+        ]
+    }
+
+    Exit400 [
+        label     = "HTTP 400\ndata.timestamp missing / empty / non-ISO-8601"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
+    Exit202Dup [
+        label     = "HTTP 202  {status: duplicate}"
+        shape     = oval
+        fillcolor = "#E3F2FD"
+    ]
+
+    Exit202 [
+        label     = "HTTP 202  {status: queued}"
+        shape     = oval
+        fillcolor = "#E3F2FD"
+    ]
+
+    // ====================================================================
+    // MIDDLEWARE FLOW EDGES
+    // ====================================================================
+    Client        -> IsHttpScope
+    IsHttpScope   -> PassThrough    [label = "non-HTTP\n(WebSocket etc.)"]
+    IsHttpScope   -> IsAuthEnabled  [label = "HTTP"]
+    IsAuthEnabled -> PassThrough    [label = "False\n(allow_unauthenticated=True\ntest/dev only)"]
+    IsAuthEnabled -> IsExemptPath   [label = "True"]
+    IsExemptPath  -> PassThrough    [label = "yes"]
+    IsExemptPath  -> ExtractToken   [label = "no"]
+    ExtractToken  -> HasToken
+    HasToken      -> Exit401NoToken [label = "None\n(missing or\nno Bearer prefix)"]
+    HasToken      -> ResolveCall    [label = "token string"]
+
+    // Dispatch branches to resolvers
+    ResolveCall   -> StaticHash     [label = "auth_mode=static"]
+    ResolveCall   -> JwksKey        [label = "auth_mode=entra"]
+
+    // Catch-all from resolver.resolve()
+    ResolveCall   -> ExcCatch       [label = "unexpected Exception\n(from any resolver)", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    ExcCatch      -> Exit401Auth
+
+    // AuthError dispatcher
+    AuthErrCatch  -> Exit401Auth    [label = "status_code=401"]
+    AuthErrCatch  -> Exit403Auth    [label = "status_code=403"]
+
+    // contributor_id=None check (after resolver returns)
+    ContribNone   -> Exit401NoToken [label = "None\n(StaticKeyResolver miss)"]
+    ContribNone   -> InjectIdentity [label = "str"]
+
+    // ====================================================================
+    // STATIC RESOLVER EDGES
+    // ====================================================================
+    StaticHash    -> StaticLookup
+    StaticLookup  -> ContribNone    [label = "result (str or None)"]
+
+    // ====================================================================
+    // ENTRA RESOLVER EDGES
+    // ====================================================================
+    JwksKey          -> JwtDecode
+    JwtDecode        -> TidCheck        [label = "claims decoded"]
+    TidCheck         -> ScpCheck        [label = "tid match"]
+    ScpCheck         -> OidCheck        [label = "scp ok"]
+    OidCheck         -> IdentityLookup  [label = "valid str"]
+    IdentityLookup   -> OidMapped
+
+    // Entra failure exits (all raise AuthError \u2014 caught by middleware)
+    JwksKey          -> AuthErrCatch  [label = "PyJWTError\n\u2192 AuthError(401)",          style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    JwtDecode        -> AuthErrCatch  [label = "PyJWTError\n\u2192 AuthError(401)",          style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    TidCheck         -> AuthErrCatch  [label = "wrong tenant\n\u2192 AuthError(401)",        style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    ScpCheck         -> AuthErrCatch  [label = "missing access_as_user\n\u2192 AuthError(401)", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    OidCheck         -> AuthErrCatch  [label = "non-str / empty oid\n\u2192 AuthError(401)", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    OidMapped        -> AuthErrCatch  [label = "None\n\u2192 AuthError(403)",               style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+
+    // Entra success \u2014 contributor_id str returns to middleware ContribNone check
+    OidMapped        -> ContribNone   [label = "contributor_id str"]
+
+    // ====================================================================
+    // POST /events FLOW EDGES
+    // ====================================================================
+    InjectIdentity    -> ValidateTimestamp
+
+    ValidateTimestamp -> Exit400           [label = "invalid"]
+    ValidateTimestamp -> IdempotencyCheck  [label = "valid"]
+    IdempotencyCheck  -> Exit202Dup        [label = "yes (duplicate)"]
+    IdempotencyCheck  -> WorkerKey         [label = "no"]
+    WorkerKey         -> GetOrCreate
+    GetOrCreate       -> StampCreatedBy
+    StampCreatedBy    -> QueueAppend
+    QueueAppend       -> RecordAccepted
+    RecordAccepted    -> Exit202
+
+    // ====================================================================
+    // LEGEND
+    // ====================================================================
+    subgraph cluster_legend {
+        graph [
+            label     = "Legend"
+            fontsize  = 10
+            fontname  = "Helvetica"
+            style     = "dashed"
+            color     = "#AAAAAA"
+        ]
+        node [fontsize = 10]
+
+        LegTeal [
+            label     = "auth middleware"
+            fillcolor = "#B2EBF2"
+        ]
+        LegBlue [
+            label     = "Entra JWT validation"
+            fillcolor = "#BBDEFB"
+        ]
+        LegGreen [
+            label     = "critical path / success"
+            fillcolor = "#C8E6C9"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
+        ]
+        LegOval [
+            label     = "HTTP boundary"
+            shape     = oval
+            fillcolor = "#E3F2FD"
+        ]
+        LegError [
+            label     = "error / rejection"
+            shape     = oval
+            fillcolor = "#FFCCBC"
+        ]
+        LegDecision [
+            label     = "decision"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        LegTeal -> LegBlue -> LegGreen -> LegOval -> LegError -> LegDecision [style = invis]
+    }
+}

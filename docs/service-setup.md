@@ -158,6 +158,12 @@ peers, the empty-`{}` hard-error rule, and the raw-token-vs-digest guardrail —
 > If you run under Docker instead, `./start.sh` (or the container entrypoint)
 > bootstraps the `api_keys` keystore and prints the token once — no manual steps.
 
+> **Microsoft Entra JWT auth.** Instead of pre-shared keys, the server also supports
+> `auth_mode=entra`, where clients authenticate with Azure AD bearer tokens and the
+> server maps each token's `oid` to a contributor. Set `auth_mode`, `azure_client_id`,
+> `azure_tenant_id`, and `entra_identities` (see the table below). Full guide:
+> [entra-auth-setup.md](entra-auth-setup.md).
+
 ---
 
 ### Server settings
