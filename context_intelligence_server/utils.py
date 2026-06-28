@@ -28,7 +28,13 @@ def make_node_id(
     backward compatibility.
     """
     safe_event = event_name.replace(":", "_")
-    dt = datetime.fromisoformat(timestamp)
+    try:
+        dt = datetime.fromisoformat(timestamp)
+    except ValueError as exc:
+        raise ValueError(
+            f"make_node_id: invalid/empty timestamp {timestamp!r} for event "
+            f"{event_name!r} (session {session_id!r})"
+        ) from exc
     epoch_ms = int(dt.astimezone(timezone.utc).timestamp() * 1000)
     node_id = f"{session_id}__{safe_event}__{epoch_ms}"
     if disambiguator is not None:
