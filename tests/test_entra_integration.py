@@ -212,7 +212,10 @@ class TestEntraAuthIntegrationOverHTTP:
             json={
                 "event": "tool_use",
                 "workspace": "/ws",
-                "data": {"session_id": "s-entra-1"},
+                "data": {
+                    "session_id": "s-entra-1",
+                    "timestamp": "2026-06-16T20:17:11.604690+00:00",
+                },
             },
             headers={"Authorization": f"Bearer {token}"},
         )
