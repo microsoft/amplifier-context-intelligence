@@ -214,8 +214,23 @@ curl -sS "$SERVER/status" | jq '.auth'
 
 ---
 
-## 8. Durability & the un-removable admin authority
+## 8. How resolution stays fresh (no cache) & durability
 
+**There is no cache and no TTL.** Each map is an **in-process live dictionary**
+that the active resolver (`StaticKeyResolver` / `EntraResolver`) holds **by
+reference**. A `/admin/*` `PUT`/`DELETE` mutates that same dict, so the change is
+visible to the resolver on the **very next request** — there is nothing to expire
+or invalidate.
+
+- **Commit order (write-file-then-swap-memory).** A mutation first writes the JSON
+  file atomically (tempfile → `os.replace`), and **only on success** updates the
+  in-process dict. The file is therefore never behind memory; a mid-write crash
+  cannot leave memory ahead of disk.
+- **Single replica is why this is safe and simple.** The pilot runs `maxReplicas=1`
+  (the drainer is a single writer), so there is no second process whose copy of the
+  map could go stale — the one in-process map *is* the source of truth. If a future
+  read-tier (M3) adds replicas, it would introduce a short TTL / poll re-read of the
+  store file; **that does not exist today** and is not needed at one replica.
 - Both maps live on the **`/data` Azure Files volume** and survive restarts and
   redeploys. Loads are **fail-closed**: a corrupt store starts empty and loud
   rather than crash-looping.

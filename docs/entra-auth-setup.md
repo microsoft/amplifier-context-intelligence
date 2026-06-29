@@ -102,6 +102,19 @@ against.
 A valid token whose `oid` is **not** in the map is a **403** (identity unbound);
 any other failure is a **401**.
 
+### Admin authority — the `roles` claim (for `/admin/*` only)
+
+Data authentication is delegated-only (the `scp` check above). Separately, the
+resolver also extracts the token's **`roles`** claim (App Role assignments) so the
+`/admin/*` identity-map endpoints can authorize an admin. A token whose `roles`
+contains the App Role named by `entra_admin_role` (**default `IdentityAdmin`**,
+created/assigned in the App Registration) may call `/admin/*`; any other valid
+token gets **403** there. The server reads **only `roles`** — never `groups`
+(group membership can never grant admin). The `roles` claim has **no effect on
+data auth**: a delegated user token with no admin role still authenticates to
+`POST /events` normally. Full runtime onboarding/offboarding API and runbook:
+[identity-management.md](identity-management.md).
+
 ### How a token is obtained today — the Azure CLI
 
 The relied-on path is the **Azure CLI as a signed-in user**:
@@ -300,8 +313,15 @@ To bind them:
    --query id -o tsv`).
 2. **Verify** the oid maps to the right person (`az ad user show --id <oid> --query
    userPrincipalName -o tsv`) **before** adding it — see §4.1 (write-once is permanent).
-3. Add `"<oid>": {id: <contributor>}` to `entra_identities`.
-4. Restart the server. The next call from that user → `created_by = <contributor>`.
+3. Bind it. Two paths:
+   - **Runtime, no restart (preferred):** `PUT /admin/identities/{oid}` with an
+     `IdentityAdmin` token — effective on the user's **next request**. Full runbook:
+     [identity-management.md](identity-management.md).
+   - **Config + restart (bootstrap):** add `"<oid>": {id: <contributor>}` to
+     `entra_identities` and restart. Use this for the day-zero seed; runtime
+     onboarding should use the `/admin` API above.
+
+The next call from that user → `created_by = <contributor>`.
 
 ---
 

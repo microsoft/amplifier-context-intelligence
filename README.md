@@ -439,6 +439,52 @@ All settings live in `~/.amplifier/settings.yaml` under `overrides.hook-context-
 
 ---
 
+## Authentication and identity resolution
+
+Every data request is authenticated by a single ASGI gate (`BearerTokenMiddleware`,
+`auth.py`) that runs before any route. One `auth_mode` setting selects the active
+resolver:
+
+- **`static`** (default) — pre-shared bearer tokens. The server hashes the
+  presented token (`sha256`) and looks the digest up in the keystore to get the
+  contributor id. See [docs/managing-api-keys.md](docs/managing-api-keys.md).
+- **`entra`** — Microsoft Entra delegated JWTs (RS256, validated against the
+  tenant JWKS, with audience / issuer / `tid` / `scp=access_as_user` checks), then
+  the token's `oid` is mapped to a contributor. See
+  [docs/entra-auth-setup.md](docs/entra-auth-setup.md).
+
+The matched contributor id is stamped onto the graph as the write-once `created_by`
+provenance field. A missing/invalid credential is a **401**; a valid credential
+whose identity is not in the map is a **403**. Health and (in full-web mode) the
+dashboard/docs paths are exempt; in API-only mode (`web_ui_enabled=false`) the
+exempt set shrinks to `{/status, /version}`.
+
+**Admin authority** is a separate layer that gates the `/admin/*` identity-map
+endpoints: in static mode a dedicated `admin_api_key` (recognized by the
+middleware, distinct from data keys); in entra mode the App Role named by
+`entra_admin_role` (default `IdentityAdmin`) in the token's `roles` claim. Regular
+data keys/tokens get **403** on `/admin/*`; if the admin credential for the active
+mode is unconfigured, `/admin/*` returns **503**.
+
+### How identity resolution stays fresh — no cache
+
+There is **no cache and no TTL** on the identity map. Each map is an **in-process
+live dictionary** backed by a durable JSON file on the `/data` volume
+(`api_keys_store_path` / `entra_identities_store_path`). The resolver holds a
+*reference* to that live dict, so a runtime `/admin/*` `PUT`/`DELETE` is visible on
+the **very next request** — no restart, no redeploy. Writes use a
+**write-file-then-swap-memory** commit (atomic file replace first, then the
+in-process update) so the file is never behind memory; a corrupt store file
+**fails closed** to an empty map (loud log, never a crash-loop). This is safe and
+simple because the pilot runs a **single replica** (`maxReplicas=1`, single-writer
+drainer): there is no second process to go stale. A future read-tier (M3) that adds
+replicas would introduce a short TTL/poll re-read; that does not exist today.
+
+Full runtime onboarding/offboarding runbook and the `/admin/*` API:
+[docs/identity-management.md](docs/identity-management.md).
+
+---
+
 ## API Reference
 
 | Method | Path | Description |
@@ -455,6 +501,8 @@ All settings live in `~/.amplifier/settings.yaml` under `overrides.hook-context-
 | `GET` | `/queues/dead-letter` | List dead-letter queues — `worker_key`, `item_count`, `last_error`, `last_ts` (requires `Authorization: Bearer`) |
 | `POST` | `/queues/dead-letter/{worker_key}/replay` | Re-enqueue a worker's dead-letter records then purge; returns count re-enqueued (requires `Authorization: Bearer`) |
 | `POST` | `/queues/dead-letter/{worker_key}/purge` | Permanently delete a worker's dead-letter records; returns count purged (requires `Authorization: Bearer`) |
+| `PUT`/`DELETE`/`GET` | `/admin/identities[/{oid}]` | Runtime entra identity-map CRUD (`auth_mode=entra`) — admin authority required. See [docs/identity-management.md](docs/identity-management.md) |
+| `PUT`/`DELETE`/`GET` | `/admin/keys[/{sha256hash}]` | Runtime static API-key map CRUD (`auth_mode=static`) — admin authority required. See [docs/identity-management.md](docs/identity-management.md) |
 
 ### Event payload
 
@@ -506,6 +554,10 @@ Values are resolved with this priority (highest first):
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_CLIENT_ID` | `azure_client_id` | *(empty)* | App Registration (client) GUID. **Required when `auth_mode=entra`** (startup refuses otherwise). See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_TENANT_ID` | `azure_tenant_id` | *(empty)* | Azure AD tenant GUID. **Required when `auth_mode=entra`**. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES` (JSON) | `entra_identities` | *(empty)* | Identity map `oid -> {id: <contributor>}` (oids are Azure Object IDs — **PII**, never commit real values). **Required (non-empty) when `auth_mode=entra`**; the matched `id` is recorded as `created_by`. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY` | `admin_api_key` | *(empty — admin API disabled)* | **Static-mode admin credential** — separate from the data `api_keys`; it is the only key allowed to call the `/admin/*` identity-map endpoints. Sent as a bearer token; the middleware recognizes it before the data keystore lookup. Empty → admin API returns `503`; regular data keys get `403` on `/admin/*`. Cannot be deleted/shadowed via the API. See [docs/identity-management.md](docs/identity-management.md). |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_ADMIN_ROLE` | `entra_admin_role` | `IdentityAdmin` | **Entra-mode admin authority** — the App Role name that must appear in a token's `roles` claim (never `groups`) to call `/admin/*`. Created/assigned in the App Registration. Empty/`null` → admin API returns `503`. See [docs/identity-management.md](docs/identity-management.md). |
+| *(YAML only)* | `api_keys_store_path` | `/data/identity/api-keys.json` | Durable JSON file backing the **static** identity map (`sha256(key) -> contributor`). The in-process map is seeded from `api_keys` on first boot, then this file is the source of truth for runtime `/admin/keys` edits. |
+| *(YAML only)* | `entra_identities_store_path` | `/data/identity/entra-identities.json` | Durable JSON file backing the **entra** identity map (`oid -> contributor`). Seeded from `entra_identities` on first boot, then this file is the source of truth for runtime `/admin/identities` edits. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ALLOW_UNAUTHENTICATED` | `allow_unauthenticated` | `false` | Opt-out of the fail-closed startup gate so the server can boot with no auth configured (every request passes through). **TEST/DEV ONLY — never set in production.** |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_WEB_UI_ENABLED` | `web_ui_enabled` | `true` | When `false`, locks down to API-only: no OpenAPI schema / Swagger UI, and the index, dashboard, static assets, and `/logs/stream` routes are unregistered and removed from the auth-exempt set (`/logs/stream` becomes auth-gated). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL` | `neo4j_url` | `neo4j://neo4j:7687` | Neo4j bolt/driver URL used for all graph operations. **Displayed verbatim in the web UI.** May point to a remote host — `bolt://db.internal:7687` is valid. Use `bolt://` scheme for Community Edition single-node installs. |

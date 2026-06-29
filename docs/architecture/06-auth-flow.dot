@@ -8,7 +8,7 @@ digraph auth_flow {
         ranksep   = 0.8
         fontname  = "Helvetica"
         fontsize  = 11
-        label     = "Per-Request Authentication Flow\n(context_intelligence_server/auth.py \u2014 BearerTokenMiddleware  \u00b7  main.py \u2014 post_events)"
+        label     = "Per-Request Authentication Flow\n(context_intelligence_server/auth.py \u2014 BearerTokenMiddleware  \u00b7  routers/admin.py  \u00b7  main.py \u2014 post_events)"
         labelloc  = t
         labeljust = c
     ]
@@ -218,6 +218,28 @@ digraph auth_flow {
     ]
 
     // ====================================================================
+    // PATH DISPATCH  (after identity injected)
+    // ====================================================================
+    PathDispatch [
+        label     = "Request path?"
+        shape     = diamond
+        fillcolor = "#FFF9C4"
+        style     = filled
+    ]
+
+    AdminPath [
+        label     = "/admin/* handler  (routers/admin.py)\nrequire_admin: static \u2192 is_admin check  \u00b7  entra \u2192 IdentityAdmin role check\nIdentityStore.put/delete  (write-file-then-swap, ROB F2)\nlive flat_dict updated  \u2192  resolver sees change immediately\n(see diagram 08 for full admin management flow)"
+        fillcolor = "#FFF3E0"
+        fontname  = "Helvetica-Bold"
+    ]
+
+    ExitAdminResponse [
+        label     = "HTTP 200 / 403 / 409 / 422 / 503\n(see diagram 08)"
+        shape     = oval
+        fillcolor = "#E3F2FD"
+    ]
+
+    // ====================================================================
     // POST /events HANDLER  (main.py)
     // ====================================================================
     subgraph cluster_post_events {
@@ -346,9 +368,16 @@ digraph auth_flow {
     OidMapped        -> ContribNone   [label = "contributor_id str"]
 
     // ====================================================================
+    // POST-INJECT PATH DISPATCH
+    // ====================================================================
+    InjectIdentity    -> PathDispatch
+    PathDispatch      -> AdminPath         [label = "/admin/*"]
+    PathDispatch      -> ValidateTimestamp [label = "data endpoint\n(e.g. POST /events)"]
+    AdminPath         -> ExitAdminResponse
+
+    // ====================================================================
     // POST /events FLOW EDGES
     // ====================================================================
-    InjectIdentity    -> ValidateTimestamp
 
     ValidateTimestamp -> Exit400           [label = "invalid"]
     ValidateTimestamp -> IdempotencyCheck  [label = "valid"]
@@ -404,6 +433,12 @@ digraph auth_flow {
             style     = filled
         ]
 
-        LegTeal -> LegBlue -> LegGreen -> LegOval -> LegError -> LegDecision [style = invis]
+        LegAdmin [
+            label     = "/admin/* handler\n(see diagram 08)"
+            fillcolor = "#FFF3E0"
+            fontname  = "Helvetica-Bold"
+        ]
+
+        LegTeal -> LegBlue -> LegGreen -> LegAdmin -> LegOval -> LegError -> LegDecision [style = invis]
     }
 }

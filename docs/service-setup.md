@@ -164,6 +164,12 @@ peers, the empty-`{}` hard-error rule, and the raw-token-vs-digest guardrail —
 > `azure_tenant_id`, and `entra_identities` (see the table below). Full guide:
 > [entra-auth-setup.md](entra-auth-setup.md).
 
+> **Runtime identity-map management (no restart).** Adding or removing a key/identity
+> by editing config requires a restart. To onboard/offboard at runtime, enable the
+> admin API — set `admin_api_key` (static mode) or the `IdentityAdmin` App Role
+> (entra mode) — and use the `/admin/*` endpoints. Full runbook:
+> [identity-management.md](identity-management.md).
+
 ---
 
 ### Server settings

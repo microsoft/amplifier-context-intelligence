@@ -33,8 +33,9 @@ and exempt-path set are selected at boot time.
 | 03 | [03-graph-model.dot](./03-graph-model.dot) | Neo4j property-graph schema |
 | 04 | [04-default-handler-flow.dot](./04-default-handler-flow.dot) | DefaultHandler internal decision flow |
 | 05 | [05-durable-ingest-queue.dot](./05-durable-ingest-queue.dot) | Durable ingest queue + drain loop (incl. auth middleware entry) |
-| 06 | [06-auth-flow.dot](./06-auth-flow.dot) | **Per-request auth flow** — BearerTokenMiddleware → resolver dispatch → post_events |
+| 06 | [06-auth-flow.dot](./06-auth-flow.dot) | **Per-request auth flow** — BearerTokenMiddleware → resolver dispatch → `/admin/*` branch or `post_events` |
 | 07 | [07-auth-startup.dot](./07-auth-startup.dot) | **Auth boot wiring** — mode selection, JWKS prefetch, fail-closed gate, exempt-path selection |
+| 08 | [08-identity-map-management.dot](./08-identity-map-management.dot) | **Runtime identity-map management** — admin API, `require_admin` gate, `IdentityStore` write-then-swap, live `flat_dict`, no-redeploy proof |
 
 ---
 
@@ -46,7 +47,9 @@ and exempt-path set are selected at boot time.
 
 The complete per-request authentication decision flow. Every HTTP request enters
 `BearerTokenMiddleware`, which checks whether the path is exempt, extracts the bearer token,
-and dispatches to the active `PrincipalResolver`:
+and dispatches to the active `PrincipalResolver`. After identity is injected into scope state,
+a **path dispatch** routes `/admin/*` requests to the admin handler (see diagram 08) and data
+endpoints (e.g. `POST /events`) to the existing ingest flow.
 
 - **`StaticKeyResolver` (auth_mode=static):** `sha256(token)` → keystore lookup → contributor
   id or `None` → 401.
@@ -86,6 +89,57 @@ includes `/logs/stream`, `/`, `/dashboard`, `/docs`, `/openapi.json`; the API-on
 reduces to `/status` and `/version` so web-UI paths cannot be reached unauthenticated.
 Finally, `BearerTokenMiddleware(app, resolver, exempt_paths)` is assembled and returned as
 `asgi_app` (served by Gunicorn + uvicorn).
+
+---
+
+## Runtime Identity-Map Management
+
+![Runtime Identity-Map Management](./08-identity-map-management.png)
+
+**Source:** [`08-identity-map-management.dot`](./08-identity-map-management.dot)
+
+End-to-end flow for runtime identity-map management via the `/admin/*` API — no server restart
+required for any mutation. The diagram covers both the **entra-identities store** (oid →
+contributor) and the **api-keys store** (sha256 hash → contributor) through a single shared
+`IdentityStore` abstraction.
+
+**Authorization gate (`require_admin`):** applied router-wide via
+`APIRouter(dependencies=[Depends(require_admin)])`. The middleware (`BearerTokenMiddleware`)
+handles authentication first — `/admin/*` paths are never exempt (TB-07 startup assertion).
+`require_admin` then enforces *authorization*:
+
+- **Static mode:** `admin_api_key_configured` on `app.state` → 503 if unconfigured; `is_admin`
+  flag in scope state → 403 if False (data key used). The admin key is recognized by the
+  middleware before the data keystore is consulted (ROB F1); it resolves to
+  `contributor_id="admin"`, `is_admin=True`.
+- **Entra mode:** `entra_admin_role` on `app.state` → 503 if empty; `IdentityAdmin` (or the
+  configured role) in the token's `roles` claim → 403 if absent. Only the `roles` claim is
+  checked — `groups` can never grant admin access (TB-09).
+
+**Validation and guards:** path-param guard (GUID regex + all-zeros check for OIDs; 64-hex
+check for key hashes) → 422; admin-key guard (hash of `admin_api_key` cannot be shadowed or
+deleted via the API) → 409; contributor-id body validation (non-empty, ≤256 chars, no null
+bytes, TB-12) → 422; structured audit line to stdout → Log Analytics before every successful
+mutation (raw keys are never logged).
+
+**`IdentityStore` commit order (ROB F2 — non-negotiable):** `put` / `delete` build a snapshot
+of the current data dict, write it to a tempfile in the same directory, `fsync`, then
+`os.replace` (atomic on POSIX and Azure Files) onto the target. Only after the file write
+succeeds are `_data` and `flat_dict` updated in-place. A write failure leaves memory
+unchanged; the handler returns 5xx. The persistent JSON file and in-process dict are never
+out of sync.
+
+**Live in-process dict (no-redeploy proof):** `IdentityStore.flat_dict` is the same dict
+object passed by reference to the active resolver at startup
+(`StaticKeyResolver(key_store.flat_dict)` / `EntraResolver(…, entra_store.flat_dict, …)`).
+After `StUpdateMem`, the resolver's keystore/identity-map is already updated — the very next
+authenticated request resolves the new principal immediately after a `PUT`, or is rejected
+immediately after a `DELETE` (no cache, no TTL, no restart).
+
+**Load-time fail-closed:** on `IdentityStore.load()`, a missing file → empty dict (normal
+first boot); a corrupt / partial / invalid-JSON file → empty dict + loud `logger.error` /
+`logger.critical` — the server never crash-loops on a bad store file, but every auth attempt
+fails until an admin re-populates via the `/admin` API.
 
 ---
 

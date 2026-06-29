@@ -45,6 +45,13 @@ Key facts that follow from this:
 - Legacy `api_key` still works unchanged — existing single-key deployments are
   unaffected and need no migration.
 
+> **Two ways to edit the keystore.** This guide covers the **config-file** path
+> (edit `api_keys`, restart) — the right path for the day-zero bootstrap and for
+> deployments that don't run the admin API. To add/revoke keys **at runtime with no
+> restart**, use the `/admin/keys` API (gated by a separate `admin_api_key`); see
+> [identity-management.md](identity-management.md). Both edit the same map — the
+> in-process keystore that is the source of truth at runtime.
+
 ---
 
 ## 2. The two one-liners
