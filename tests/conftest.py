@@ -103,6 +103,10 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
     class _SettingsProxy:
         blob_path: str = _real.blob_path
         queues_path: str = str(tmp_path / "queues")
+        # Redirect identity-store paths so the registry proxy never touches the
+        # real /data/identity/ defaults on machines where those files exist.
+        api_keys_store_path: str = str(tmp_path / "api-keys.json")
+        entra_identities_store_path: str = str(tmp_path / "entra-identities.json")
         neo4j_url: str = _real.neo4j_url
         neo4j_user: str = _real.neo4j_user
         neo4j_password: str = _real.neo4j_password

@@ -201,7 +201,7 @@ class TestCreateAsgiAppWire:
 class TestCreateAsgiAppFailClosed:
     """AC13: create_asgi_app() refuses to start when auth_enabled=False."""
 
-    def test_static_mode_no_keys_raises_runtime_error(self) -> None:
+    def test_static_mode_no_keys_raises_runtime_error(self, tmp_path: Any) -> None:
         """AC13 (CRITICAL): auth_mode=static + no api_key/api_keys raises RuntimeError.
 
         This is the primary proof of the fail-closed gate.  Before T7 the server
@@ -210,12 +210,24 @@ class TestCreateAsgiAppFailClosed:
         harness sets the env var AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ALLOW_UNAUTHENTICATED=true
         to prevent the module-level import from raising; we override it for this specific
         test to prove the production gate fires.
+
+        api_keys_store_path is pointed at a non-existent tmp_path location to ensure
+        this test is isolated from any pre-seeded /data/identity/api-keys.json that
+        may exist on machines where the server has previously run (e.g. DTU environments).
+        Without this, a pre-seeded store file would cause the IdentityStore to load keys
+        and the fail-closed gate would never fire.
         """
         from context_intelligence_server.config import Settings  # noqa: PLC0415
         from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
-        # Explicitly set allow_unauthenticated=False to simulate production config
-        settings = Settings(auth_mode="static", allow_unauthenticated=False)
+        # Explicitly set allow_unauthenticated=False to simulate production config.
+        # api_keys_store_path points to a non-existent tmp_path location to guarantee
+        # the store is empty regardless of any pre-seeded /data/identity/ files.
+        settings = Settings(
+            auth_mode="static",
+            allow_unauthenticated=False,
+            api_keys_store_path=str(tmp_path / "api-keys.json"),
+        )
 
         with pytest.raises(RuntimeError, match="[Nn]o authentication"):
             create_asgi_app(settings=settings)

@@ -31,7 +31,11 @@ async def test_post_events_persists_raw_body_then_returns_202(
         "event": "tool:pre",
         "workspace": "/ws",
         "idempotency_key": "aci-event-v1:durable-key",
-        "data": {"session_id": "sess-durable"},
+        # data.timestamp is required by _validate_data_timestamp (ISO-8601 string)
+        "data": {
+            "session_id": "sess-durable",
+            "timestamp": "2024-01-01T00:00:00+00:00",
+        },
     }
     resp = await client.post("/events", json=payload)
     assert resp.status_code == 202
@@ -71,7 +75,11 @@ async def test_durable_line_is_drained_to_graph(
         json={
             "event": "tool:pre",
             "workspace": "/ws",
-            "data": {"session_id": "sess-drain-graph"},
+            # data.timestamp is required by _validate_data_timestamp (ISO-8601 string)
+            "data": {
+                "session_id": "sess-drain-graph",
+                "timestamp": "2024-01-01T00:00:00+00:00",
+            },
         },
     )
     assert resp.status_code == 202
