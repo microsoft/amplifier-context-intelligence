@@ -396,6 +396,34 @@ class Settings(BaseSettings):
         return {oid.lower(): meta["id"] for oid, meta in self.entra_identities.items()}
 
     # -------------------------------------------------------------------------
+    # Admin API key (static mode only — gates /admin/* map-mutation endpoints)
+    # -------------------------------------------------------------------------
+    # admin_api_key is a separate credential from the data-auth api_keys.
+    # It is set via the YAML config file (same CONFIG_FILE that carries api_keys)
+    # and/or the env var below (env overrides YAML — standard pydantic-settings
+    # priority).  Empty string is normalised to None so that admin_api_key: ""
+    # in a YAML template behaves identically to omitting the field.
+    admin_api_key: str | None = None
+
+    @field_validator("admin_api_key", mode="before")
+    @classmethod
+    def _normalize_admin_api_key(cls, v: object) -> str | None:
+        """Normalize empty string to None (mirrors _normalize_api_key)."""
+        return None if v == "" else v  # type: ignore[return-value]
+
+    # -------------------------------------------------------------------------
+    # Durable identity-map store paths
+    # -------------------------------------------------------------------------
+    # These paths control where the two JSON identity-map files live on the
+    # Azure Files volume (/data).  Both are env/YAML overridable to allow
+    # non-default layouts in development or custom deployments.
+    #
+    # api_keys_store_path:          SHA-256 digest → contributor map (static mode)
+    # entra_identities_store_path:  OID → contributor map (entra mode)
+    api_keys_store_path: str = "/data/identity/api-keys.json"
+    entra_identities_store_path: str = "/data/identity/entra-identities.json"
+
+    # -------------------------------------------------------------------------
     # Neo4j
     # -------------------------------------------------------------------------
     neo4j_url: str = "neo4j://neo4j:7687"

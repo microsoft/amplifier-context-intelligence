@@ -34,6 +34,7 @@ from context_intelligence_server.auth import (
 )
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import Settings, get_settings
+from context_intelligence_server.identity_store import IdentityStore
 from context_intelligence_server.dashboard import build_status_response
 from context_intelligence_server.routers.queues import router as queues_router
 from context_intelligence_server.routers.skills import SkillRegistry
@@ -52,6 +53,37 @@ from context_intelligence_server.registry import SessionRegistry
 _settings = get_settings()
 
 logger = logging.getLogger("context_intelligence_server")
+
+# ---------------------------------------------------------------------------
+# Module-level live identity-map stores (T3)
+#
+# Set by create_asgi_app() so the future /admin router can mutate the active
+# store without needing to carry a reference through the middleware chain.
+# Exactly ONE of these is non-None at any time — whichever mode is active.
+# The other is always reset to None so accessors return an unambiguous result.
+# ---------------------------------------------------------------------------
+_api_key_store: IdentityStore | None = None
+_entra_identity_store: IdentityStore | None = None
+
+
+def get_api_key_store() -> IdentityStore | None:
+    """Return the live API-key IdentityStore, or None when entra mode is active.
+
+    The /admin router calls this to mutate the keystore (PUT/DELETE entries).
+    The returned store's flat_dict is the SAME object used by StaticKeyResolver,
+    so any put() or delete() is visible to the resolver immediately.
+    """
+    return _api_key_store
+
+
+def get_entra_identity_store() -> IdentityStore | None:
+    """Return the live Entra-identity IdentityStore, or None when static mode is active.
+
+    The /admin router calls this to mutate the identity map (PUT/DELETE entries).
+    The returned store's flat_dict is the SAME object used by EntraResolver,
+    so any put() or delete() is visible to the resolver immediately.
+    """
+    return _entra_identity_store
 
 
 def _recover_one_session(
@@ -246,19 +278,55 @@ def create_asgi_app(
             This is the fail-closed startup gate — the server must never boot
             silently unauthenticated in production.
     """
+    global _api_key_store, _entra_identity_store
+
     s = settings if settings is not None else _settings
 
+    # Reset both stores; the active mode sets exactly one of them below.
+    _api_key_store = None
+    _entra_identity_store = None
+
     if s.auth_mode == "entra":
+        # Build and load the entra identity store.
+        entra_store = IdentityStore(Path(s.entra_identities_store_path))
+        entra_store.load()
+        if not entra_store.path.exists():
+            # First boot: seed in-process map from config.  Converts the flat
+            # {oid -> contributor_id} from build_identity_map() to the rich
+            # {oid -> {"id": contributor_id}} format that IdentityStore expects.
+            config_map = s.build_identity_map()
+            if config_map:
+                rich_seed = {oid: {"id": cid} for oid, cid in config_map.items()}
+                entra_store.seed(rich_seed)
+        _entra_identity_store = entra_store
+
         # EntraResolver raises RuntimeError at construction if the JWKS
         # prefetch fails (eager fail-closed guard from §8b / crusty gate).
+        # Pass entra_store.flat_dict (the LIVE dict) so the resolver sees
+        # any put()/delete() made by /admin immediately, no restart required.
         resolver: StaticKeyResolver | EntraResolver = EntraResolver(
             s.azure_client_id,  # type: ignore[arg-type]  — validated non-None by config
             s.azure_tenant_id,  # type: ignore[arg-type]  — validated non-None by config
-            s.build_identity_map(),
+            entra_store.flat_dict,  # live reference — mutations visible immediately
             jwks_client=_jwks_client,
         )
     else:
-        resolver = StaticKeyResolver(s.build_keystore())
+        # Build and load the API-key store.
+        key_store = IdentityStore(Path(s.api_keys_store_path))
+        key_store.load()
+        if not key_store.path.exists():
+            # First boot: seed from config.  Converts the flat
+            # {sha256_hex -> contributor_id} from build_keystore() to the
+            # rich {sha256_hex -> {"id": contributor_id}} format.
+            config_ks = s.build_keystore()
+            if config_ks:
+                rich_seed = {digest: {"id": cid} for digest, cid in config_ks.items()}
+                key_store.seed(rich_seed)
+        _api_key_store = key_store
+
+        # Pass key_store.flat_dict (the LIVE dict) so the resolver sees any
+        # put()/delete() made by /admin immediately, no restart required.
+        resolver = StaticKeyResolver(key_store.flat_dict)
 
     # Fail-closed gate: refuse to start if authentication is not configured.
     # The only valid exception is allow_unauthenticated=True, an explicit opt-out
