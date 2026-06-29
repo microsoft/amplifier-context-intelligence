@@ -254,6 +254,42 @@ def _validate_data_timestamp(data: dict[str, Any]) -> None:
 _WEB_DIR = Path(__file__).parent / "web"
 
 
+def _assert_admin_not_exempt() -> None:
+    """Startup assertion (TB-07): /admin/* must NEVER be in any exempt set.
+
+    Called by ``create_asgi_app`` before constructing the middleware.
+    Raises ``RuntimeError`` if any ``/admin`` path or prefix appears in
+    ``_EXEMPT_PATHS``, ``_EXEMPT_PATHS_API_ONLY``, or ``_EXEMPT_PREFIXES``,
+    because that would make the admin API accessible without authentication.
+
+    This is a defence-in-depth structural check: it is impossible to
+    accidentally ship an unauthenticated admin surface.
+    """
+    import context_intelligence_server.auth as _auth_module  # noqa: PLC0415
+
+    # Check exact-path exempt sets.
+    for exempt_set_name, exempt_set in (
+        ("_EXEMPT_PATHS", _auth_module._EXEMPT_PATHS),
+        ("_EXEMPT_PATHS_API_ONLY", _auth_module._EXEMPT_PATHS_API_ONLY),
+    ):
+        for path in exempt_set:
+            if path == "/admin" or path.startswith("/admin/"):
+                raise RuntimeError(
+                    f"Security invariant violated: /admin path {path!r} found in "
+                    f"auth.{exempt_set_name}.  The /admin surface MUST be "
+                    f"authenticated — remove it from the exempt set immediately."
+                )
+
+    # Check prefix exempt tuple.
+    for prefix in _auth_module._EXEMPT_PREFIXES:
+        if prefix == "/admin" or prefix.startswith("/admin/") or prefix == "/admin":
+            raise RuntimeError(
+                f"Security invariant violated: /admin prefix {prefix!r} found in "
+                f"auth._EXEMPT_PREFIXES.  The /admin surface MUST be authenticated "
+                f"— remove it from the exempt prefix list immediately."
+            )
+
+
 def create_asgi_app(
     settings: Settings | None = None,
     *,
@@ -279,8 +315,15 @@ def create_asgi_app(
             ``settings.allow_unauthenticated`` is ``False`` (default).
             This is the fail-closed startup gate — the server must never boot
             silently unauthenticated in production.
+        RuntimeError: (TB-07) When any ``/admin`` path or prefix appears in an
+            auth-exempt set.  The admin API surface must never be unguarded.
     """
     global _api_key_store, _entra_identity_store
+
+    # TB-07 structural assertion: /admin must not be in any exempt set.
+    # This runs before any middleware construction so the failure is loud and
+    # immediate — no request ever reaches an unauthenticated /admin endpoint.
+    _assert_admin_not_exempt()
 
     s = settings if settings is not None else _settings
 
@@ -292,6 +335,26 @@ def create_asgi_app(
     _entra_identity_store = None
     app.state.api_key_store = None
     app.state.entra_identity_store = None
+
+    # T5: store auth/admin config on app.state so the require_admin dependency
+    # can read it without importing from main (avoids circular import) and so
+    # test-specific settings (passed via create_asgi_app(settings=...)) take
+    # effect without relying on the module-level cached get_settings().
+    app.state.auth_mode = s.auth_mode
+    app.state.admin_api_key_configured = s.admin_api_key is not None
+    app.state.entra_admin_role = s.entra_admin_role
+
+    # Compute the admin-key digest for the middleware (static mode only).
+    # The middleware checks the bearer token's sha256 against this digest BEFORE
+    # calling the resolver, so the admin key can authenticate even though it is
+    # not in the data keystore (ROB F1).
+    import hashlib as _hashlib  # noqa: PLC0415
+
+    admin_api_key_digest: str | None = (
+        _hashlib.sha256(s.admin_api_key.encode()).hexdigest()
+        if s.admin_api_key is not None
+        else None
+    )
 
     if s.auth_mode == "entra":
         # Build and load the entra identity store.
@@ -318,6 +381,8 @@ def create_asgi_app(
             entra_store.flat_dict,  # live reference — mutations visible immediately
             jwks_client=_jwks_client,
         )
+        # Entra mode does not use admin_api_key_digest (admin via roles claim).
+        admin_api_key_digest = None
     else:
         # Build and load the API-key store.
         key_store = IdentityStore(Path(s.api_keys_store_path))
@@ -350,12 +415,36 @@ def create_asgi_app(
             "allow_unauthenticated: true in the config."
         )
 
+    # Log admin capability status for operator visibility (E: status surfacing).
+    if s.auth_mode == "static":
+        _admin_status = (
+            "enabled"
+            if s.admin_api_key is not None
+            else "disabled (admin_api_key not set)"
+        )
+    else:
+        _admin_status = (
+            f"enabled (role={s.entra_admin_role!r})"
+            if s.entra_admin_role
+            else "disabled (entra_admin_role not configured)"
+        )
+    logger.info(
+        "create_asgi_app: auth_mode=%s admin_api=%s",
+        s.auth_mode,
+        _admin_status,
+    )
+
     # Select the auth-exempt path set based on web_ui_enabled.
     # web_ui_enabled=False (api-only): use the smaller set that excludes /logs/stream
     # and other web-UI paths so they cannot be reached unauthenticated.
     # web_ui_enabled=True (default): use the full set including web-UI paths.
     exempt = _EXEMPT_PATHS if s.web_ui_enabled else _EXEMPT_PATHS_API_ONLY
-    return BearerTokenMiddleware(app, resolver=resolver, exempt_paths=exempt)
+    return BearerTokenMiddleware(
+        app,
+        resolver=resolver,
+        exempt_paths=exempt,
+        admin_api_key_digest=admin_api_key_digest,
+    )
 
 
 # Module-level ASGI app used by Gunicorn: context_intelligence_server.main:asgi_app
@@ -388,6 +477,26 @@ async def get_status(request: Request) -> dict[str, Any]:
     # unauthenticated, so this block must NOT carry the per-key table or the
     # dead-letter listing — both are authenticated-only.
     response["metrics"] = await registry.pipeline_metrics()
+    # T5 (E): surface auth mode and admin-API capability so operators can
+    # confirm admin is enabled without tailing startup logs.  /status is
+    # unauthenticated — only config-level boolean flags are exposed here
+    # (no credential values, no key hashes, no token details).
+    _auth_mode = getattr(request.app.state, "auth_mode", _settings.auth_mode)
+    _admin_key_set = getattr(
+        request.app.state, "admin_api_key_configured", _settings.admin_api_key is not None
+    )
+    _entra_admin_role = getattr(
+        request.app.state, "entra_admin_role", _settings.entra_admin_role
+    )
+    response["auth"] = {
+        "mode": _auth_mode,
+        "admin_api_enabled": (
+            _admin_key_set if _auth_mode == "static" else bool(_entra_admin_role)
+        ),
+        # Surface the role name (not a secret) so operators can see which role
+        # is configured, without exposing any credential values.
+        **({"entra_admin_role": _entra_admin_role} if _auth_mode == "entra" else {}),
+    }
     return response
 
 

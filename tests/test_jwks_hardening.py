@@ -553,7 +553,10 @@ class TestJWKSPostStartupFailClosed:
 
         resolver = _make_entra_resolver(_CachedKeyJWKSClient(public_key))
         result = resolver.resolve(token)
-        assert result == "colombod", (
+        # T5 protocol change: resolve() returns (contributor_id, roles) tuple.
+        assert result is not None
+        contributor_id, _roles = result
+        assert contributor_id == "colombod", (
             "A cached signing key must resolve a valid token even when the endpoint is down"
         )
 

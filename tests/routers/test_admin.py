@@ -540,15 +540,18 @@ class TestBodyValidation422:
 class TestRequireAdminSeam:
     """The require_admin dependency exists and is importable.
 
-    T5 will replace the body; here we only confirm the seam is in place.
+    T5 replaced the no-op body with real enforcement.  This class now only
+    confirms the seam can be imported and overridden (the enforcement is
+    fully tested in test_admin_auth.py).
     """
 
     def test_require_admin_is_callable(self) -> None:
         from context_intelligence_server.routers.admin import require_admin  # noqa: PLC0415
 
-        # Must be callable and return None (no-op placeholder)
-        result = require_admin()
-        assert result is None
+        # Must be callable.  T5 changed signature to require(request: Request),
+        # so we just verify it is importable and callable — not that it returns
+        # None without args (the no-op contract is gone; it now enforces auth).
+        assert callable(require_admin)
 
     def test_dependency_override_is_honoured(self, tmp_path: Path) -> None:
         """app.dependency_overrides[require_admin] overrides the dependency."""

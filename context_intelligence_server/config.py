@@ -412,6 +412,29 @@ class Settings(BaseSettings):
         return None if v == "" else v  # type: ignore[return-value]
 
     # -------------------------------------------------------------------------
+    # Entra admin role (entra mode only — gates /admin/* map-mutation endpoints)
+    # -------------------------------------------------------------------------
+    # entra_admin_role is the Entra App Role name whose presence in a token's
+    # `roles` claim grants access to /admin/* endpoints.  The role is created
+    # in the App Registration (approles-patch.json).
+    #
+    # Empty string ("") means the admin API is DISABLED in entra mode (callers
+    # receive 503).  The default "IdentityAdmin" matches the App Registration
+    # role defined for the pilot.  Override via YAML or env var to rename.
+    #
+    # NOTE: the check ONLY reads the `roles` claim — NEVER `groups`.  A value
+    # in the `groups` claim must NOT grant admin access (TB-09 / design §6).
+    entra_admin_role: str = "IdentityAdmin"
+
+    @field_validator("entra_admin_role", mode="before")
+    @classmethod
+    def _normalize_entra_admin_role(cls, v: object) -> str:
+        """Normalize None → '' so that entra_admin_role: null disables the admin API."""
+        if v is None:
+            return ""
+        return str(v)
+
+    # -------------------------------------------------------------------------
     # Durable identity-map store paths
     # -------------------------------------------------------------------------
     # These paths control where the two JSON identity-map files live on the

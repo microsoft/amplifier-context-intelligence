@@ -160,12 +160,18 @@ class TestEntraResolverMockSeam:
         claims: dict[str, Any],
         identity_map: dict[str, str] | None = None,
     ) -> str:
-        """Patch jwt.decode → return claims; call resolver.resolve('dummy')."""
+        """Patch jwt.decode → return claims; call resolver.resolve('dummy').
+
+        T5 protocol change: resolve() now returns (contributor_id, roles).
+        This helper returns contributor_id only (the original contract).
+        """
         resolver = _make_resolver(identity_map=identity_map)
         with patch("context_intelligence_server.auth.jwt") as mock_jwt:
             mock_jwt.decode.return_value = claims
             mock_jwt.PyJWTError = __import__("jwt", fromlist=["PyJWTError"]).PyJWTError
-            return resolver.resolve("dummy-token")
+            result = resolver.resolve("dummy-token")
+        contributor_id, _roles = result
+        return contributor_id
 
     def _resolve_raises_jwt_error(self, exc: Exception) -> "Any":
         """Patch jwt.decode to raise; return the AuthError raised by resolve()."""
@@ -434,7 +440,10 @@ class TestEntraResolverRealCrypto:
         resolver = _make_real_crypto_resolver(public_key)
         token = _sign_jwt(private_key, _valid_real_claims())
         result = resolver.resolve(token)
-        assert result == FAKE_CONTRIBUTOR
+        # T5 protocol change: resolve() returns (contributor_id, roles) tuple.
+        assert result is not None
+        contributor_id, _roles = result
+        assert contributor_id == FAKE_CONTRIBUTOR
 
     # -- Dual-aud: bare GUID AND api:// both succeed (§9 Q-AUD) -----------
 
@@ -443,7 +452,8 @@ class TestEntraResolverRealCrypto:
         private_key, public_key = rsa_keypair
         resolver = _make_real_crypto_resolver(public_key)
         token = _sign_jwt(private_key, _valid_real_claims(aud=FAKE_CLIENT_ID))
-        assert resolver.resolve(token) == FAKE_CONTRIBUTOR
+        result = resolver.resolve(token)
+        assert result is not None and result[0] == FAKE_CONTRIBUTOR
 
     def test_dual_aud_api_prefix_succeeds(self, rsa_keypair: tuple[Any, Any]) -> None:
         """Q-AUD: token with aud=api://<client_id> is accepted."""
@@ -452,7 +462,8 @@ class TestEntraResolverRealCrypto:
         token = _sign_jwt(
             private_key, _valid_real_claims(aud=f"api://{FAKE_CLIENT_ID}")
         )
-        assert resolver.resolve(token) == FAKE_CONTRIBUTOR
+        result = resolver.resolve(token)
+        assert result is not None and result[0] == FAKE_CONTRIBUTOR
 
     # -- AC3: expired token → 401 -----------------------------------------
 
@@ -998,7 +1009,8 @@ class TestEntraResolverAudArray:
         resolver = _make_real_crypto_resolver(public_key)
         claims = _valid_real_claims(aud=["other-app", FAKE_CLIENT_ID])
         token = _sign_jwt(private_key, claims)
-        assert resolver.resolve(token) == FAKE_CONTRIBUTOR
+        result = resolver.resolve(token)
+        assert result is not None and result[0] == FAKE_CONTRIBUTOR
 
     def test_aud_array_without_matching_audience_raises_401(
         self, rsa_keypair: tuple[Any, Any]

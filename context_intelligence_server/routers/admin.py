@@ -32,18 +32,103 @@ from context_intelligence_server.identity_store import IdentityStore
 
 
 # ---------------------------------------------------------------------------
-# Auth seam — permissive placeholder; T5 replaces the body
+# Auth seam — real enforcement (T5)
 # ---------------------------------------------------------------------------
 
 
-def require_admin() -> None:
-    """No-op admin guard — REPLACED in T5 with real enforcement.
+def require_admin(request: Request) -> None:
+    """Router-level admin guard — enforces admin authority on all /admin/* requests.
 
     Applied router-wide via ``APIRouter(dependencies=[Depends(require_admin)])``.
-    For now every caller is allowed through.  T5 changes this body to enforce
-    ``admin_api_key`` (static mode) or the ``IdentityAdmin`` App Role (entra
-    mode); routes and existing tests do not change.
+
+    Security model (design §6, T5):
+    - The middleware (BearerTokenMiddleware) ALWAYS enforces authentication on
+      /admin/* paths (they are never in an exempt set — TB-07 startup assertion).
+      A missing/invalid token → 401 before this function is ever reached.
+    - This dependency enforces *authorization* (not authentication): the request
+      has already been authenticated; here we check whether the authenticated
+      principal has admin authority.
+
+    Static mode logic:
+    - ``is_admin=True`` on scope state → allow.  This flag is set by the
+      middleware when the bearer token's sha256 matches ``admin_api_key_digest``
+      (ROB F1 — admin key recognized before data keystore lookup).
+    - ``is_admin=False`` → 403 "use the admin key to call /admin/*".
+    - ``admin_api_key_configured=False`` on app.state → 503 "admin API disabled".
+
+    Entra mode logic:
+    - ``IdentityAdmin`` (or the configured ``entra_admin_role``) in the token's
+      ``roles`` claim (stored in scope state by the middleware) → allow.
+    - Role not present → 403 naming the required role.
+    - ``entra_admin_role`` empty/unconfigured → 503 "admin API disabled".
+
+    503 signals "capability not configured" (distinct from 403 "you are denied").
+
+    Notes:
+    - Tests override this with ``app.dependency_overrides[require_admin] = lambda: None``
+      to bypass enforcement in T4 route tests (this is the standard FastAPI override
+      mechanism; the lambda's signature must satisfy ITS OWN declared parameters —
+      FastAPI injects based on the override's signature, not the original's).
+    - The ``roles`` check reads ONLY the ``roles`` claim — never ``groups``.
+      Group membership in the token cannot grant admin access (TB-09).
     """
+    auth_mode: str = getattr(request.app.state, "auth_mode", "static")
+    # Read auth metadata from scope state (set by BearerTokenMiddleware).
+    scope_state: dict = request.scope.get("state", {})
+
+    if auth_mode == "static":
+        # 503 when admin key is not configured (capability off, not forbidden).
+        admin_configured: bool = getattr(
+            request.app.state, "admin_api_key_configured", False
+        )
+        if not admin_configured:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Admin API disabled: admin_api_key is not configured. "
+                    "Set admin_api_key in the YAML config or via the "
+                    "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY env var."
+                ),
+            )
+
+        # 403 when the request was authenticated with a data key (not the admin key).
+        is_admin: bool = scope_state.get("is_admin", False)
+        if not is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Forbidden: the admin API key is required to call /admin/* "
+                    "endpoints. Data keys authenticate to the data API only."
+                ),
+            )
+
+    else:  # entra mode
+        # 503 when admin role is not configured (capability off, not forbidden).
+        entra_admin_role: str = getattr(request.app.state, "entra_admin_role", "")
+        if not entra_admin_role:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Admin API disabled: entra_admin_role is not configured. "
+                    "Set entra_admin_role in the YAML config or via the "
+                    "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_ADMIN_ROLE env var."
+                ),
+            )
+
+        # 403 when the token's `roles` claim does not contain the required role.
+        # ONLY the `roles` claim is checked — `groups` is intentionally excluded
+        # so group membership cannot grant admin access (TB-09).
+        roles: list[str] = scope_state.get("roles", [])
+        if entra_admin_role not in roles:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Forbidden: the App Role '{entra_admin_role}' is required "
+                    f"to call /admin/* endpoints. Assign the role in the Entra "
+                    f"App Registration and ensure the token's 'roles' claim "
+                    f"(not 'groups') contains it."
+                ),
+            )
 
 
 # ---------------------------------------------------------------------------
