@@ -6,6 +6,156 @@ integrated with the Amplifier CLI so sessions are automatically captured.
 
 ---
 
+## Local quickstart — static mode with web UI + admin
+
+The fastest path to a **local** server (server v6.0.0): static API-key auth, the
+browser dashboard **on**, and the runtime `/admin/*` identity-map API **enabled**.
+Every value below is a **placeholder** — substitute your own. The numbered
+sections after this one explain each step in full.
+
+**1. Install uv and the server** (one binary lands in `~/.local/bin`):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv tool install git+https://github.com/microsoft/amplifier-context-intelligence
+# Pre-merge / a specific branch instead (note --force to overwrite an existing install):
+#   uv tool install --force "git+https://github.com/microsoft/amplifier-context-intelligence@feat/runtime-identity-map"
+# A local checkout instead:
+#   uv tool install --force /path/to/amplifier-context-intelligence
+```
+
+**2. Start Neo4j (Docker)** — APOC required; GDS optional:
+
+```bash
+NEO4J_BOLT_PORT=37687              # bolt driver (standard would be 7687)
+NEO4J_HTTP_PORT=37474              # browser UI  (standard would be 7474)
+NEO4J_PASSWORD="<your-strong-password>"
+DATA_DIR="$HOME/amplifier-context-intelligence-server-data-store"
+mkdir -p "${DATA_DIR}/neo4j"
+
+docker run -d \
+  --name amplifier-context-intelligence-neo4j \
+  --restart unless-stopped \
+  -p ${NEO4J_HTTP_PORT}:7474 -p ${NEO4J_BOLT_PORT}:7687 \
+  -e NEO4J_AUTH=neo4j/${NEO4J_PASSWORD} \
+  -e 'NEO4J_PLUGINS=["apoc"]' \
+  -v "${DATA_DIR}/neo4j:/data" \
+  neo4j:5.26.22-community
+```
+
+> **Want GDS (Graph Data Science) too?** Replace the plugins line with
+> `-e 'NEO4J_PLUGINS=["apoc","graph-data-science"]'` and add
+> `-e 'NEO4J_dbms_security_procedures_unrestricted=gds.*,apoc.*'` so the GDS
+> procedures load. Use a Neo4j image whose bundled GDS build matches your Neo4j
+> version. Verify after start with
+> `docker exec amplifier-context-intelligence-neo4j cypher-shell -u neo4j -p "$NEO4J_PASSWORD" "RETURN gds.version();"`.
+
+**3. Make two DISTINCT tokens** — one for data capture, one for admin:
+
+```bash
+# Data token: clients/the hook send this RAW; the config stores only its digest.
+DATA_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+DATA_DIGEST=$(python3 -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$DATA_TOKEN")
+
+# Admin token: the RAW value goes in admin_api_key and is the bearer for /admin/*.
+# Keep it DISTINCT from the data token (see the created_by note in step 4).
+ADMIN_TOKEN=$(openssl rand -hex 32)
+
+echo "DATA  token (use in the hook / clients): $DATA_TOKEN"
+echo "DATA  digest (goes into api_keys):       $DATA_DIGEST"
+echo "ADMIN token (bearer for /admin/* calls): $ADMIN_TOKEN"
+```
+
+**4. Write `server-config.yaml`** — static mode, web UI on, admin on, **local
+writable** store paths. Create the dirs, then drop in the file:
+
+```bash
+mkdir -p "${DATA_DIR}/identity" "${DATA_DIR}/blobs" "${DATA_DIR}/logs" "${DATA_DIR}/queues"
+mkdir -p ~/.config/context-intelligence
+```
+
+```yaml
+# ~/.config/context-intelligence/server-config.yaml  —  LOCAL STATIC MODE
+
+# --- Auth: static keystore (static is the default; shown for clarity) ---
+auth_mode: static
+api_keys:
+  "<DATA_DIGEST>":          # sha256(DATA_TOKEN) from step 3 — the DIGEST, not the raw token
+    id: owner               # the contributor id; surfaces as created_by on graph nodes
+
+# --- Admin API (runtime identity-map management) ---
+# A request bearing this RAW token may call /admin/*. Without it, /admin/* → 503.
+# IMPORTANT: keep this DISTINCT from any data token in api_keys (see note below).
+admin_api_key: "<ADMIN_TOKEN>"
+
+# --- Web dashboard + OpenAPI docs at http://localhost:8000 ---
+web_ui_enabled: true        # default true; set false for an API-only deployment
+
+# --- Identity-map store files (LOCAL writable dir — default /data/... is not writable on a normal box) ---
+api_keys_store_path: "/home/you/amplifier-context-intelligence-server-data-store/identity/api-keys.json"
+entra_identities_store_path: "/home/you/amplifier-context-intelligence-server-data-store/identity/entra-identities.json"
+
+# --- Neo4j (use bolt:// for Community Edition) ---
+neo4j_url: "bolt://localhost:37687"          # NEO4J_BOLT_PORT from step 2
+neo4j_browser_url: "http://localhost:37474"  # NEO4J_HTTP_PORT from step 2 (clickable link in the UI)
+neo4j_user: neo4j
+neo4j_password: "<your-strong-password>"
+
+# --- Server bind + storage ---
+server_host: 0.0.0.0
+server_port: 8000
+blob_path:   "/home/you/amplifier-context-intelligence-server-data-store/blobs"
+log_path:    "/home/you/amplifier-context-intelligence-server-data-store/logs/server.jsonl"
+queues_path: "/home/you/amplifier-context-intelligence-server-data-store/queues"
+```
+
+> **`created_by="admin"` caveat — why two tokens.** The admin key is recognised
+> by the middleware **before** the data-identity resolver, so any request bearing
+> the admin token is attributed `created_by="admin"`. If you reuse one token for
+> both capture and `/admin/*`, your captured sessions are stamped `admin` instead
+> of your real contributor id. **Use a distinct `admin_api_key` vs your data
+> `api_keys`** to preserve per-user attribution.
+
+**5. Run it** — directly for a quick check (or install it as a service via §5/§6):
+
+```bash
+AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE=$HOME/.config/context-intelligence/server-config.yaml \
+  context-intelligence-server
+```
+
+**6. Verify**:
+
+```bash
+curl -sS http://localhost:8000/status | jq '.auth'
+# → {"mode":"static","admin_api_enabled":true}
+curl -sS http://localhost:8000/version
+# → {"version":"6.0.0"}
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8000/events \
+  -H "Content-Type: application/json" -d '{}'
+# → 401   (auth is enforced)
+```
+
+Open `http://localhost:8000` and paste the **DATA token** when prompted.
+
+**7. Use the admin API** (static — the bearer is the **ADMIN token**):
+
+```bash
+# List current key entries (hash + contributor id; never raw keys):
+curl -sS http://localhost:8000/admin/keys -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# Onboard a peer at runtime (register the HASH of their key, never the raw key):
+PEER_HASH=$(printf '%s' "<peer-raw-key>" | sha256sum | cut -d' ' -f1)
+curl -sS -X PUT "http://localhost:8000/admin/keys/$PEER_HASH" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"id": "<contributor>"}'
+```
+
+Full onboarding/offboarding runbook and status-code matrix:
+[identity-management.md](identity-management.md).
+
+---
+
 ## 1. Prerequisites
 
 ### Install uv
@@ -169,6 +319,33 @@ peers, the empty-`{}` hard-error rule, and the raw-token-vs-digest guardrail —
 > admin API — set `admin_api_key` (static mode) or the `IdentityAdmin` App Role
 > (entra mode) — and use the `/admin/*` endpoints. Full runbook:
 > [identity-management.md](identity-management.md).
+
+---
+
+### Admin API, web UI, and identity-map stores (the local-static essentials)
+
+These cover the three things a local static-mode run usually needs turned on or
+pointed somewhere writable. All are plain `server-config.yaml` keys (or the
+matching `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_*` env var; env wins).
+
+| Key | Example | Purpose |
+|-----|---------|---------|
+| `admin_api_key` | *(a raw admin token)* | **Enables the `/admin/*` runtime identity-map API in static mode.** A request whose bearer token equals this value is recognised as admin — the middleware checks it **before** the data keystore. Unset/empty → every `/admin/*` call returns **503**; a valid *data* key gets **403**. The admin key cannot be deleted or shadowed via the API (**409**). **Use a token DISTINCT from your data keys** (see caveat). Env: `…_ADMIN_API_KEY`. |
+| `web_ui_enabled` | `true` | **Turns on the browser dashboard at `http://localhost:8000`**, the OpenAPI docs (`/docs`), and the `/logs/stream` tail. **Default `true`.** Set `false` for a locked-down **API-only** deployment — no OpenAPI schema/Swagger UI, and the index/dashboard/static/`/logs/stream` routes are unregistered (those paths 404). Env: `…_WEB_UI_ENABLED`. |
+| `api_keys_store_path` | *(local writable path)* | Durable JSON file backing the static `sha256(key) → contributor` map that `/admin/keys` edits. **The default `/data/identity/api-keys.json` is not writable on a normal box — point it at your data store** (e.g. `…/identity/api-keys.json`). It is **seeded from `api_keys` on first boot**, then this file is the source of truth for runtime edits. |
+| `entra_identities_store_path` | *(local writable path)* | The entra equivalent (`oid → contributor`), used only in `auth_mode=entra`. Same default-not-writable caveat; set it to a writable path even in static mode if you want a clean layout. |
+
+> **`created_by="admin"` caveat — use two distinct tokens.** The admin key is
+> recognised by the middleware **before** the data-identity resolver, so any
+> request bearing the admin token is attributed `created_by="admin"`. The
+> session-capture hook uses a *data* token; if you reuse that same token as the
+> admin key, your captured sessions are stamped `admin` instead of your real
+> contributor id. **Keep `admin_api_key` distinct from your data `api_keys`** to
+> preserve per-user attribution.
+
+Runtime onboarding/offboarding via `/admin/keys` (static) or `/admin/identities`
+(entra), the full status-code matrix (401/403/409/422/503), and how the live map
+stays fresh without a restart: [identity-management.md](identity-management.md).
 
 ---
 

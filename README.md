@@ -237,6 +237,12 @@ empty-`{}` hard-error rule, and the raw-token-vs-digest guardrail — is in
 > Running under Docker instead? `./start.sh` (or the container entrypoint)
 > bootstraps an `api_keys` keystore and prints the token once — no manual steps.
 
+> **Local static run with the web dashboard + runtime admin API?** For a
+> copy-paste path that strings install → Neo4j → `server-config.yaml`
+> (`api_keys` + `admin_api_key` + `web_ui_enabled: true`) → run → verify → use
+> `/admin/*`, see the **"Local quickstart — static mode with web UI + admin"**
+> section in [docs/service-setup.md](docs/service-setup.md).
+
 ---
 
 ## Running Without Docker
