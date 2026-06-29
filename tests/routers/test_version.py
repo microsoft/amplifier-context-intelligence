@@ -50,13 +50,26 @@ class TestGetVersionNoAuth:
         assert response.status_code == 200
 
 
-class TestVersionIs6_0_0:
-    """pyproject.toml is the single source of truth and must declare version 6.0.0."""
+class TestVersionMatchesPyproject:
+    """The version the server reports must equal the version declared in pyproject.toml.
 
-    def test_pyproject_version_is_6_0_0(self) -> None:
+    This is a *consistency* check, deliberately NOT a hardcoded constant: bumping the
+    version in pyproject.toml never requires editing this test, and a stale/forgotten
+    rebuild (where the installed package metadata drifts from pyproject) is caught.
+    Combined with ``test_version_matches_server_version_constant`` above, this pins the
+    full chain: ``GET /version`` == ``SERVER_VERSION`` == ``pyproject.toml [project].version``.
+    """
+
+    def test_served_version_matches_pyproject(self) -> None:
         import tomllib
         from pathlib import Path
 
         pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
-        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-        assert data["project"]["version"] == "6.0.0"
+        declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"][
+            "version"
+        ]
+        assert SERVER_VERSION == declared, (
+            f"Version drift: pyproject.toml declares {declared!r} but the server reports "
+            f"{SERVER_VERSION!r} (from importlib.metadata). Rebuild/reinstall the package "
+            f"after a version bump so the two stay in sync."
+        )
