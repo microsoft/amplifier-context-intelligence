@@ -239,6 +239,27 @@ Both auth modes can add/remove identities **at runtime, no restart**, via the
 
 Canonical guide: `docs/identity-management.md`.
 
+### Local static run (web UI + admin) — the common single-box setup
+
+For a local server with static keys, the browser dashboard, and runtime
+onboarding (no restart), set these in `server-config.yaml`:
+
+- `auth_mode: static` (default) **+** an `api_keys` entry
+  (`sha256(token) -> {id: <contributor>}`) — the data credential.
+- `admin_api_key: "<raw token>"` — **enables `/admin/*` in static mode** (unset →
+  `503`; a data key → `403`). Use a token **DISTINCT** from any data key: the
+  admin key is recognized *before* the data resolver, so requests bearing it are
+  attributed `created_by="admin"` — reusing the capture hook's token stamps your
+  captured sessions `admin` instead of the real contributor.
+- `web_ui_enabled: true` (default) — dashboard + `/docs` at `:8000`; `false` =
+  API-only (those routes 404).
+- `api_keys_store_path` — point at a **writable** dir; the `/data/...` default is
+  not writable on a normal box. Seeded from `api_keys` on first boot, then it is
+  the source of truth for `/admin/keys` edits.
+
+Copy-paste quickstart: `docs/service-setup.md` ("Local quickstart — static mode
+with web UI + admin"). Runtime runbook: `docs/identity-management.md`.
+
 ---
 
 ## Key Concepts
