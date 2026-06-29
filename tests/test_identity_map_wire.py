@@ -285,9 +285,10 @@ class TestT3StaticWiring:
         assert FAKE_TOKEN_DIGEST in store.flat_dict
         assert store.flat_dict[FAKE_TOKEN_DIGEST] == FAKE_CONTRIBUTOR
 
-        # The resolver itself can resolve the seeded token
+        # The resolver itself can resolve the seeded token (T5: returns tuple)
         middleware = create_asgi_app(settings=settings)
-        assert middleware.resolver.resolve(FAKE_RAW_TOKEN) == FAKE_CONTRIBUTOR
+        result = middleware.resolver.resolve(FAKE_RAW_TOKEN)
+        assert result is not None and result[0] == FAKE_CONTRIBUTOR
 
     def test_store_wins_when_file_present(self, tmp_path: Path) -> None:
         """File exists with different data → config seeds are NOT applied (store wins)."""
@@ -338,7 +339,9 @@ class TestT3StaticWiring:
         store.put(FAKE_NEW_DIGEST, {"id": FAKE_NEW_CONTRIBUTOR})
 
         # The resolver sees it immediately — no create_asgi_app call, no restart
-        assert middleware.resolver.resolve(FAKE_NEW_RAW_TOKEN) == FAKE_NEW_CONTRIBUTOR
+        # T5 protocol change: resolve() returns (contributor_id, roles) tuple.
+        new_result = middleware.resolver.resolve(FAKE_NEW_RAW_TOKEN)
+        assert new_result is not None and new_result[0] == FAKE_NEW_CONTRIBUTOR
 
     def test_resolver_keystore_is_store_flat_dict(self, tmp_path: Path) -> None:
         """The resolver's internal keystore IS the same dict object as store.flat_dict.

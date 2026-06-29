@@ -95,14 +95,25 @@ def _resolve_token(token: str, keystore: dict[str, str]) -> str | None:
 class PrincipalResolver(Protocol):
     """Resolves a raw bearer token string to a contributor id.
 
-    Returns the contributor id string on success, or ``None`` when the token is
-    not recognised (caller should respond 401).  Implementations may also raise
-    :class:`AuthError` to signal specific auth failures (401 or 403); the
-    middleware dispatches the exact ``status_code`` from the exception.
+    Returns ``(contributor_id, roles)`` on success, or ``None`` when the token
+    is not recognised (caller should respond 401).  Implementations may also
+    raise :class:`AuthError` to signal specific auth failures (401 or 403);
+    the middleware dispatches the exact ``status_code`` from the exception.
+
+    The ``roles`` element (a list of strings) carries the token's App-Role
+    claim for the entra resolver, or an empty list for the static resolver.
+    The middleware stores these on ``scope["state"]["roles"]`` so downstream
+    dependencies (e.g. ``require_admin``) can read them without re-parsing.
 
     Only one concrete implementation exists today: :class:`StaticKeyResolver`.
     The ``EntraResolver`` (JWT via JWKS) is added in T4.  Do NOT add a third
     resolver without a separate design review.
+
+    T5 protocol change: ``resolve()`` previously returned ``str | None``.
+    Changed to ``tuple[str, list[str]] | None`` to carry the ``roles`` claim
+    from the Entra JWT so the middleware can set ``is_admin``/``roles`` on
+    scope state without a second token parse.  ``StaticKeyResolver`` always
+    returns an empty roles list.
     """
 
     @property
@@ -115,11 +126,14 @@ class PrincipalResolver(Protocol):
         """
         ...
 
-    def resolve(self, token: str) -> str | None:
-        """Return contributor id or ``None`` if the token is not recognised.
+    def resolve(self, token: str) -> tuple[str, list[str]] | None:
+        """Return ``(contributor_id, roles)`` or ``None`` if token not recognised.
 
         Raises :class:`AuthError` (with ``status_code`` 401 or 403) when the
         token is present but invalid or maps to an unauthorised identity.
+
+        ``roles`` is a list of App-Role strings (from the Entra ``roles``
+        claim).  ``StaticKeyResolver`` always returns ``[]``.
         """
         ...
 
@@ -233,15 +247,23 @@ class EntraResolver:
         """Always True — EntraResolver is always active (identity map is non-empty by construction)."""
         return True
 
-    def resolve(self, token: str) -> str:
-        """Validate Entra JWT and return the mapped contributor id.
+    def resolve(self, token: str) -> tuple[str, list[str]]:
+        """Validate Entra JWT and return the mapped contributor id and roles.
 
         Args:
             token: Raw bearer token string (``Authorization: Bearer`` prefix
                    already stripped by the middleware).
 
         Returns:
-            The contributor id mapped from the token's ``oid`` claim.
+            A ``(contributor_id, roles)`` tuple where *contributor_id* is
+            mapped from the token's ``oid`` claim and *roles* is the token's
+            ``roles`` claim (App Role assignments) as a list of strings, or
+            ``[]`` when the claim is absent or not a list.
+
+            The ``roles`` list is stored by the middleware on
+            ``scope["state"]["roles"]`` so ``require_admin`` can check it
+            without re-parsing the token.  Only the ``roles`` claim is
+            returned — ``groups`` is intentionally excluded (TB-09).
 
         Raises:
             AuthError(401): Any JWT validation failure (signature, audience,
@@ -304,7 +326,19 @@ class EntraResolver:
                 f"identity (tenant {self._tenant_id!r})",
             )
 
-        return contributor_id
+        # Extract roles claim (T5: admin authorization for /admin/* endpoints).
+        # roles must be a list of strings; any other type (missing claim, int,
+        # string) is normalised to [] so the resolver is fail-closed on bad
+        # token shapes.  Only `roles` is returned — `groups` is intentionally
+        # excluded so group membership can NEVER grant admin access (TB-09).
+        _roles_raw = claims.get("roles")
+        roles: list[str] = (
+            [r for r in _roles_raw if isinstance(r, str)]
+            if isinstance(_roles_raw, list)
+            else []
+        )
+
+        return (contributor_id, roles)
 
 
 class StaticKeyResolver:
@@ -342,9 +376,17 @@ class StaticKeyResolver:
         """
         return not self._keystore
 
-    def resolve(self, token: str) -> str | None:
-        """Return contributor id for *token*, or ``None`` on a miss."""
-        return _resolve_token(token, self._keystore)
+    def resolve(self, token: str) -> tuple[str, list[str]] | None:
+        """Return ``(contributor_id, [])`` for *token*, or ``None`` on a miss.
+
+        The roles list is always empty for static-key auth — admin authority is
+        signalled via ``scope["state"]["is_admin"]`` by the middleware (which
+        recognises the admin key before calling this resolver).
+        """
+        contributor_id = _resolve_token(token, self._keystore)
+        if contributor_id is None:
+            return None
+        return (contributor_id, [])
 
 
 class BearerTokenMiddleware:
@@ -361,9 +403,27 @@ class BearerTokenMiddleware:
     opt-out path.  :func:`~context_intelligence_server.main.create_asgi_app`
     prevents booting in this state at the application level.
 
-    On a successful match, the resolved contributor id is injected into the
-    ASGI scope under ``scope["state"]["contributor_id"]`` so downstream
-    handlers can read authenticated identity without re-resolving.
+    On a successful match the following keys are injected into
+    ``scope["state"]`` so downstream handlers can read authenticated identity
+    without re-resolving:
+
+    * ``contributor_id`` (str): the resolved contributor.
+    * ``is_admin`` (bool): ``True`` only when the static-mode admin key was
+      used.  Always ``False`` for regular data keys and for entra tokens (where
+      admin authority is carried in ``roles`` instead).
+    * ``roles`` (list[str]): App Role assignments from the Entra ``roles``
+      claim, or ``[]`` for static-mode tokens.  The ``require_admin``
+      dependency checks this list for the ``IdentityAdmin`` role.
+
+    T5 — static-mode admin key (ROB F1):
+
+    The admin key (``admin_api_key_digest``) is not in the data keystore, so
+    it would normally fail the resolver and produce a 401.  Instead, the
+    middleware checks the bearer token's sha256 against the admin-key digest
+    BEFORE delegating to the resolver.  A match authenticates the request
+    directly with ``contributor_id="admin"`` and ``is_admin=True``.  The
+    token still reaches data-API endpoints (it is a valid principal) but
+    ``require_admin`` passes only for admin-key bearers.
 
     Several paths are always exempt (see ``_EXEMPT_PATHS``) so health checks,
     monitoring tools, and public-facing pages continue working without
@@ -377,6 +437,7 @@ class BearerTokenMiddleware:
         *,
         resolver: PrincipalResolver | None = None,
         exempt_paths: frozenset[str] | None = None,
+        admin_api_key_digest: str | None = None,
     ) -> None:
         self.app = app
         if resolver is not None:
@@ -395,6 +456,12 @@ class BearerTokenMiddleware:
         self._exempt_paths: frozenset[str] = (
             exempt_paths if exempt_paths is not None else _EXEMPT_PATHS
         )
+        # Admin key digest (T5 / ROB F1): sha256 hex of the raw admin_api_key.
+        # When set, a bearer token whose sha256 matches this digest is
+        # authenticated as the "admin" principal with is_admin=True and bypasses
+        # the data keystore.  None means admin key is not configured (static
+        # mode) or is irrelevant (entra mode — admin is via roles claim).
+        self._admin_api_key_digest: str | None = admin_api_key_digest
 
     async def __call__(
         self, scope: MutableMapping[str, Any], receive: Any, send: Any
@@ -425,8 +492,28 @@ class BearerTokenMiddleware:
             await _send_401(send)
             return
 
+        # T5 / ROB F1 — static-mode admin key check.
+        #
+        # The admin key is NOT in the data keystore, so it would normally fail
+        # the resolver and produce a 401.  Check the bearer token's sha256
+        # against the admin-key digest BEFORE calling the resolver.  A match
+        # authenticates the request directly with contributor_id="admin" and
+        # is_admin=True — the resolver is bypassed entirely.
+        #
+        # Note: entra mode does not use admin_api_key_digest (it is always
+        # None in entra mode); admin authority comes from the roles claim.
+        if self._admin_api_key_digest is not None:
+            token_digest = hashlib.sha256(token.encode()).hexdigest()
+            if token_digest == self._admin_api_key_digest:
+                state = scope.setdefault("state", {})
+                state["contributor_id"] = "admin"
+                state["is_admin"] = True
+                state["roles"] = []
+                await self.app(scope, receive, send)
+                return
+
         try:
-            contributor_id = self.resolver.resolve(token)
+            result = self.resolver.resolve(token)
         except AuthError as exc:
             # EntraResolver (and future resolvers) raise AuthError to communicate
             # 401 vs 403.  Dispatch the status code directly.
@@ -455,13 +542,20 @@ class BearerTokenMiddleware:
             await _send_401(send)
             return
 
-        if contributor_id is None:
+        if result is None:
             # Backward-compat path: StaticKeyResolver returns None on a miss.
             await _send_401(send)
             return
 
-        # Inject authenticated identity into scope state so post_events can read it.
-        scope.setdefault("state", {})["contributor_id"] = contributor_id
+        contributor_id, roles = result
+
+        # Inject authenticated identity and auth metadata into scope state.
+        # is_admin is False for regular data keys and for entra tokens (admin
+        # authority for entra is signalled via the roles list, not this flag).
+        state = scope.setdefault("state", {})
+        state["contributor_id"] = contributor_id
+        state["is_admin"] = False
+        state["roles"] = roles
 
         await self.app(scope, receive, send)
 

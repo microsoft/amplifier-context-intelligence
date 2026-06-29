@@ -49,14 +49,18 @@ class TestStaticKeyResolver:
         assert StaticKeyResolver is not None
 
     def test_resolve_known_token_returns_contributor_id(self) -> None:
-        """resolve() returns the contributor id for a known token."""
+        """resolve() returns (contributor_id, []) for a known token (T5: tuple protocol)."""
         from context_intelligence_server.auth import StaticKeyResolver  # noqa: PLC0415
 
         token = "my-api-key"
         digest = hashlib.sha256(token.encode()).hexdigest()
         resolver = StaticKeyResolver({digest: "alice"})
 
-        assert resolver.resolve(token) == "alice"
+        result = resolver.resolve(token)
+        assert result is not None
+        contributor_id, roles = result
+        assert contributor_id == "alice"
+        assert roles == []  # static resolver always returns empty roles
 
     def test_resolve_unknown_token_returns_none(self) -> None:
         """resolve() returns None — never 'unknown' — for an unrecognised token."""
@@ -90,15 +94,19 @@ class TestStaticKeyResolver:
         assert StaticKeyResolver({digest: "user"}).is_empty is False
 
     def test_resolve_multiple_entries_correct_contributor(self) -> None:
-        """Multiple keys in the store resolve independently."""
+        """Multiple keys in the store resolve independently (T5: tuple protocol)."""
         from context_intelligence_server.auth import StaticKeyResolver  # noqa: PLC0415
 
         d_alice = hashlib.sha256(b"alice-key").hexdigest()
         d_bob = hashlib.sha256(b"bob-key").hexdigest()
         resolver = StaticKeyResolver({d_alice: "alice", d_bob: "bob"})
 
-        assert resolver.resolve("alice-key") == "alice"
-        assert resolver.resolve("bob-key") == "bob"
+        alice_result = resolver.resolve("alice-key")
+        bob_result = resolver.resolve("bob-key")
+        assert alice_result is not None
+        assert bob_result is not None
+        assert alice_result[0] == "alice"
+        assert bob_result[0] == "bob"
         assert resolver.resolve("unknown") is None
 
 
@@ -153,9 +161,10 @@ class TestBearerTokenMiddlewareResolvesViaResolver:
             def auth_enabled(self) -> bool:
                 return True
 
-            def resolve(self, token: str) -> str | None:
+            def resolve(self, token: str) -> tuple[str, list[str]] | None:
+                # T5: resolve() now returns (contributor_id, roles) tuple.
                 calls.append(token)
-                return "tracked-user"
+                return ("tracked-user", [])
 
         app = AsyncMock()
         middleware = BearerTokenMiddleware(app, resolver=TrackingResolver())
