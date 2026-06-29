@@ -1,0 +1,489 @@
+digraph identity_map_management {
+    // -- Global defaults -----------------------------------------------------------
+    graph [
+        rankdir   = TB
+        splines   = ortho
+        compound  = true
+        nodesep   = 0.55
+        ranksep   = 0.80
+        fontname  = "Helvetica"
+        fontsize  = 11
+        label     = "Runtime Identity-Map Management \u2014 Admin API + Live Store\n(context_intelligence_server/routers/admin.py \u00b7 identity_store.py \u00b7 auth.py)"
+        labelloc  = t
+        labeljust = c
+    ]
+    node [
+        fontname = "Helvetica"
+        fontsize = 11
+        style    = "filled,rounded"
+        shape    = box
+    ]
+    edge [
+        fontname = "Helvetica"
+        fontsize = 10
+    ]
+
+    // ====================================================================
+    // ENTRY
+    // ====================================================================
+    AdminCaller [
+        label     = "Admin caller\nAuthorization: Bearer <token>"
+        shape     = oval
+        fillcolor = "#E3F2FD"
+    ]
+
+    // ====================================================================
+    // BEARER TOKEN MIDDLEWARE  (abbreviated \u2014 see diagram 06 for full flow)
+    // ====================================================================
+    subgraph cluster_middleware {
+        graph [
+            label     = "BearerTokenMiddleware  (auth.py \u2014 abbreviated; see diagram 06 for full per-request flow)\n/admin/* NEVER in any exempt set (TB-07 \u2014 _assert_admin_not_exempt() assertion at startup in main.py)"
+            style     = "filled"
+            color     = "#006064"
+            fillcolor = "#E0F7FA"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        MwDigestCheck [
+            label     = "static mode: sha256(token) == admin_api_key_digest?\n(ROB F1 \u2014 admin key checked BEFORE data keystore lookup)"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        MwSetAdmin [
+            label     = "contributor_id = \"admin\"\nis_admin = True\n(data resolver bypassed entirely)"
+            fillcolor = "#B2EBF2"
+        ]
+
+        MwResolver [
+            label     = "resolver.resolve(token)\ndata key (static) or Entra JWT (entra)\ncontributor_id = mapped id\nis_admin = False; roles = JWT roles list (or [])"
+            fillcolor = "#B2EBF2"
+        ]
+
+        MwInject [
+            label     = "scope[\"state\"] \u2190 {contributor_id, is_admin, roles}\n\u2192 dispatch to /admin/* route handler"
+            fillcolor = "#80CBC4"
+            fontname  = "Helvetica-Bold"
+        ]
+    }
+
+    // ====================================================================
+    // REQUIRE_ADMIN DEPENDENCY  (router-level authorization gate)
+    // ====================================================================
+    subgraph cluster_require_admin {
+        graph [
+            label     = "require_admin  (routers/admin.py)\nAPIRouter(dependencies=[Depends(require_admin)]) \u2014 applied to every /admin/* route\nEnforces AUTHORIZATION; authentication is already done by the middleware"
+            style     = "filled"
+            color     = "#BF360C"
+            fillcolor = "#FBE9E7"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        RaModeSwitch [
+            label     = "app.state.auth_mode?"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        // --- static branch ---
+        RaStaticConfigured [
+            label     = "\"static\": admin_api_key_configured?\n(app.state.admin_api_key_configured)"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        RaStaticIsAdmin [
+            label     = "is_admin?\n(scope[\"state\"].is_admin)"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        // --- entra branch ---
+        RaEntraConfigured [
+            label     = "\"entra\": entra_admin_role configured?\n(app.state.entra_admin_role != \"\")"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        RaEntraRole [
+            label     = "entra_admin_role in scope[\"state\"].roles?\n(roles claim ONLY \u2014 never groups claim, TB-09)"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        RaAuthorized [
+            label     = "AUTHORIZED\n\u2192 proceed to /admin handler"
+            fillcolor = "#C8E6C9"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
+        ]
+    }
+
+    // ====================================================================
+    // VALIDATION + GUARDS  (routers/admin.py \u2014 before store mutation)
+    // ====================================================================
+    subgraph cluster_validation {
+        graph [
+            label     = "Validation & Guards  (routers/admin.py)"
+            style     = "filled"
+            color     = "#37474F"
+            fillcolor = "#ECEFF1"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        ValPath [
+            label     = "Path-param guard (TB-10):\nPUT /admin/identities/{oid}: GUID regex + all-zeros check\nPUT /admin/keys/{sha256hash}: exactly 64 lowercase hex chars\n\u2192 422 on violation"
+            fillcolor = "#F5F5F5"
+        ]
+
+        ValAdminGuard [
+            label     = "Admin-key guard (TB-05): PUT /keys and DELETE /keys only\nsha256hash == admin_api_key_digest?\n\u2192 409 (un-shadowable / un-deletable bootstrap credential)"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        ValContrib [
+            label     = "Body: contributor id validation (Pydantic)\nnon-empty, non-whitespace, \u2264 256 chars, no null bytes\n(TB-12) \u2192 422 on violation"
+            fillcolor = "#F5F5F5"
+        ]
+
+        ValAudit [
+            label     = "Mutation audit \u2192 stdout \u2192 Log Analytics\nadmin.audit action=put|delete\ntarget=<oid|sha256hash> contributor=<id> who=<caller>\nNEVER logs raw key values"
+            fillcolor = "#F5F5F5"
+        ]
+    }
+
+    // ====================================================================
+    // IDENTITY STORE  (ROB F2 commit order \u2014 write-file-then-swap-memory)
+    // ====================================================================
+    subgraph cluster_store {
+        graph [
+            label     = "IdentityStore.put() / delete()  (identity_store.py)\nROB F2 commit order: write-file-then-swap-memory (non-negotiable)\nApplies to BOTH stores \u2014 entra-identities and api-keys"
+            style     = "filled"
+            color     = "#2E7D32"
+            fillcolor = "#E8F5E9"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        StBuild [
+            label     = "1. new_data = dict(_data)\n   in-memory snapshot \u2014 _data NOT touched yet"
+            fillcolor = "#F5F5F5"
+        ]
+
+        StWrite [
+            label     = "2. tempfile.mkstemp(dir=same directory as target)\n   json.dump(new_data, indent=2)\n3. os.fsync(fd)  \u2014 data flushed to stable storage"
+            fillcolor = "#A5D6A7"
+        ]
+
+        StReplace [
+            label     = "4. os.replace(tmp_path, target)\n   atomic rename on POSIX / Azure Files\n   \u2192 durable JSON on disk visible immediately"
+            fillcolor = "#66BB6A"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
+        ]
+
+        StOk [
+            label     = "write succeeded?"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        StUpdateMem [
+            label     = "5. ONLY NOW: update _data + flat_dict IN-PLACE\n   put:    _data[key]=value  \u2022  flat_dict[key]=contributor_id\n   delete: _data.pop(key)   \u2022  flat_dict.pop(key)\n   file and memory never diverge"
+            fillcolor = "#C8E6C9"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
+        ]
+
+        StFail [
+            label     = "file write raised (OS/IO exception)\n_data + flat_dict UNCHANGED\nhandler returns 5xx"
+            fillcolor = "#FFCCBC"
+        ]
+    }
+
+    // ====================================================================
+    // DURABLE FILES  (/data Azure Files volume)
+    // ====================================================================
+    subgraph cluster_files {
+        graph [
+            label     = "Durable store files on /data  (Azure Files volume)\nload(): missing \u2192 empty dict (first boot); corrupt \u2192 empty dict + LOUD error log (fail-closed, never crash-loop)"
+            style     = "dashed"
+            color     = "#795548"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        { rank = same; FileEntra; FileKeys }
+
+        FileEntra [
+            label     = "entra-identities.json\n{\"<oid>\": {\"id\": \"<contrib>\", \"display_name?\": \"...\"}}\nread at boot into IdentityStore; resolver uses flat_dict at runtime"
+            shape     = note
+            style     = filled
+            fillcolor = "#FFF8E1"
+        ]
+
+        FileKeys [
+            label     = "api-keys.json\n{\"<sha256_hex>\": {\"id\": \"<contributor>\"}}\nread at boot into IdentityStore; resolver uses flat_dict at runtime"
+            shape     = note
+            style     = filled
+            fillcolor = "#FFF8E1"
+        ]
+
+        FileEntra -> FileKeys [style = invis]
+    }
+
+    // ====================================================================
+    // LIVE IN-PROCESS DICT  (shared object reference \u2014 no-redeploy proof)
+    // ====================================================================
+    subgraph cluster_live {
+        graph [
+            label     = "IdentityStore.flat_dict \u2014 live in-process dict\nSAME dict object held by IdentityStore AND the active resolver (passed by reference at startup)\nMutated IN-PLACE by put()/delete() \u2014 resolver sees every change immediately\n(no redeploy \u00b7 no cache \u00b7 no TTL)"
+            style     = "filled"
+            color     = "#1565C0"
+            fillcolor = "#E3F2FD"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        LiveEntra [
+            label     = "entra_store.flat_dict\n{oid_lower \u2192 contributor_id}\nEntraResolver._identity_map\nholds this exact reference"
+            fillcolor = "#BBDEFB"
+            fontname  = "Helvetica-Bold"
+        ]
+
+        LiveKeys [
+            label     = "key_store.flat_dict\n{sha256_hex \u2192 contributor_id}\nStaticKeyResolver._keystore\nholds this exact reference"
+            fillcolor = "#ECEFF1"
+            fontname  = "Helvetica-Bold"
+        ]
+
+        LiveEntra -> LiveKeys [style = invis]
+    }
+
+    // ====================================================================
+    // RESOLVER \u2014 NEXT AUTH REQUEST  (no-redeploy proof)
+    // ====================================================================
+    subgraph cluster_effect {
+        graph [
+            label     = "Next auth request \u2014 immediately after mutation (same process, no restart)\nResolver reads the live flat_dict it already holds by reference"
+            style     = "filled"
+            color     = "#006064"
+            fillcolor = "#E0F7FA"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        EffNextReq [
+            label     = "Next request from new/removed principal\nAuthorization: Bearer <token>"
+            shape     = oval
+            fillcolor = "#E3F2FD"
+        ]
+
+        EffLookup [
+            label     = "resolver reads flat_dict (live reference)\nentra:  identity_map.get(oid.lower())\nstatic: keystore.get(sha256_hex)\n\u2192 PUT: new entry visible immediately\n\u2192 DELETE: miss immediately \u2192 401/403"
+            fillcolor = "#80CBC4"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
+        ]
+
+        EffResolved [
+            label     = "contributor_id resolved  (PUT \u2192 200)\nor rejected 401/403           (DELETE)"
+            shape     = oval
+            fillcolor = "#C8E6C9"
+        ]
+    }
+
+    // ====================================================================
+    // ERROR EXIT NODES
+    // ====================================================================
+    Err401 [
+        label     = "HTTP 401\nmissing / invalid bearer token\n(middleware \u2014 before require_admin)"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
+    Err503S [
+        label     = "HTTP 503\nadmin_api_key not configured\n(static admin API disabled)"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
+    Err403S [
+        label     = "HTTP 403\nData key cannot call /admin/*\nUse the admin key"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
+    Err503E [
+        label     = "HTTP 503\nentra_admin_role not configured\n(entra admin API disabled)"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
+    Err403E [
+        label     = "HTTP 403\nToken lacks the required App Role\n(entra \u2014 roles claim only, never groups)"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
+    Err422 [
+        label     = "HTTP 422\nInvalid OID / sha256hash / contributor"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
+    Err409 [
+        label     = "HTTP 409\nCannot shadow or delete admin key\n(bootstrap credential protected)"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
+    Resp200 [
+        label     = "HTTP 200\nMutation complete\n{oid|hash, id[, display_name], deleted?}"
+        shape     = oval
+        fillcolor = "#E3F2FD"
+    ]
+
+    // ====================================================================
+    // FLOW EDGES \u2014 middleware
+    // ====================================================================
+    AdminCaller   -> MwDigestCheck [label = "static mode"]
+    AdminCaller   -> MwResolver    [label = "entra mode (JWT)"]
+
+    MwDigestCheck -> MwSetAdmin    [label = "digest match\n(admin key)"]
+    MwDigestCheck -> MwResolver    [label = "no match\n(try data keystore)"]
+    MwDigestCheck -> Err401        [label = "missing / invalid\ntoken", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+
+    MwSetAdmin    -> MwInject
+    MwResolver    -> MwInject      [label = "authenticated"]
+    MwResolver    -> Err401        [label = "token invalid\n\u2192 401", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+
+    // ====================================================================
+    // FLOW EDGES \u2014 require_admin gate
+    // ====================================================================
+    MwInject      -> RaModeSwitch
+
+    RaModeSwitch  -> RaStaticConfigured [label = "\"static\""]
+    RaModeSwitch  -> RaEntraConfigured  [label = "\"entra\""]
+
+    RaStaticConfigured -> Err503S         [label = "False", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    RaStaticConfigured -> RaStaticIsAdmin [label = "True"]
+    RaStaticIsAdmin    -> Err403S         [label = "False\n(data key)", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    RaStaticIsAdmin    -> RaAuthorized    [label = "True"]
+
+    RaEntraConfigured  -> Err503E         [label = "False (empty)", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    RaEntraConfigured  -> RaEntraRole     [label = "True"]
+    RaEntraRole        -> Err403E         [label = "absent", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    RaEntraRole        -> RaAuthorized    [label = "present"]
+
+    // ====================================================================
+    // FLOW EDGES \u2014 validation + guards
+    // ====================================================================
+    RaAuthorized  -> ValPath
+    ValPath       -> Err422        [label = "invalid", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    ValPath       -> ValAdminGuard [label = "valid format"]
+    ValAdminGuard -> Err409        [label = "== admin digest", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    ValAdminGuard -> ValContrib    [label = "safe to proceed"]
+    ValContrib    -> Err422        [label = "invalid body", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    ValContrib    -> ValAudit      [label = "valid"]
+
+    // ====================================================================
+    // FLOW EDGES \u2014 IdentityStore commit order (F2)
+    // ====================================================================
+    ValAudit      -> StBuild
+    StBuild       -> StWrite
+    StWrite       -> StReplace
+    StReplace     -> StOk
+    StOk          -> StUpdateMem [label = "ok"]
+    StOk          -> StFail      [label = "OS/IO exception", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    StUpdateMem   -> Resp200
+
+    // ====================================================================
+    // DURABLE FILE side-effects (dashed \u2014 annotate the atomic rename)
+    // ====================================================================
+    StReplace     -> FileEntra  [label = "entra mode\natomic rename",  style = dashed, color = "#795548", fontcolor = "#795548", constraint = false]
+    StReplace     -> FileKeys   [label = "static mode\natomic rename", style = dashed, color = "#795548", fontcolor = "#795548", constraint = false]
+
+    // ====================================================================
+    // LIVE DICT in-place update (dashed \u2014 annotate the in-process mutation)
+    // ====================================================================
+    StUpdateMem   -> LiveEntra  [label = "entra:\nflat_dict[oid]=id\nor flat_dict.pop(oid)",   style = dashed, color = "#1565C0", fontcolor = "#1565C0", constraint = false]
+    StUpdateMem   -> LiveKeys   [label = "static:\nflat_dict[hash]=id\nor flat_dict.pop(hash)", style = dashed, color = "#546E7A", fontcolor = "#546E7A", constraint = false]
+
+    // ====================================================================
+    // RESOLVER reads live dict (same object reference)
+    // ====================================================================
+    LiveEntra     -> EffLookup  [label = "EntraResolver\nholds live ref",        style = dashed, color = "#1565C0", fontcolor = "#1565C0", constraint = false]
+    LiveKeys      -> EffLookup  [label = "StaticKeyResolver\nholds live ref",     style = dashed, color = "#546E7A", fontcolor = "#546E7A", constraint = false]
+    EffNextReq    -> EffLookup
+    EffLookup     -> EffResolved
+
+    // ====================================================================
+    // LEGEND
+    // ====================================================================
+    subgraph cluster_legend {
+        graph [
+            label     = "Legend"
+            fontsize  = 10
+            fontname  = "Helvetica"
+            style     = "dashed"
+            color     = "#AAAAAA"
+        ]
+        node [fontsize = 10]
+
+        LegTeal [
+            label     = "auth middleware"
+            fillcolor = "#B2EBF2"
+        ]
+        LegGreen [
+            label     = "critical path / success\n(write-then-swap)"
+            fillcolor = "#C8E6C9"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
+        ]
+        LegBlue [
+            label     = "live dict (entra)"
+            fillcolor = "#BBDEFB"
+        ]
+        LegGrey [
+            label     = "live dict (static)"
+            fillcolor = "#ECEFF1"
+        ]
+        LegFile [
+            label     = "durable store file"
+            shape     = note
+            style     = filled
+            fillcolor = "#FFF8E1"
+        ]
+        LegOval [
+            label     = "HTTP boundary"
+            shape     = oval
+            fillcolor = "#E3F2FD"
+        ]
+        LegError [
+            label     = "error / rejection"
+            shape     = oval
+            fillcolor = "#FFCCBC"
+        ]
+        LegDiamond [
+            label     = "decision"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        LegTeal -> LegGreen -> LegBlue -> LegGrey -> LegFile -> LegOval -> LegError -> LegDiamond [style = invis]
+    }
+}

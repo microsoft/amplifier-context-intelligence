@@ -28,8 +28,9 @@ context_intelligence_server/      # FastAPI ingestion server
 │   ├── data_layer_1/             # Session/tool-call handlers
 │   ├── data_layer_2/             # Graph enrichment handlers
 │   └── data_layer_3/             # High-level insight handlers
-├── routers/                      # API routers (queues.py = dead-letter inspect/replay/purge)
-├── auth.py                       # Bearer-token auth middleware (StaticKeyResolver / EntraResolver via PrincipalResolver; BearerTokenMiddleware)
+├── routers/                      # API routers (queues.py = dead-letter inspect/replay/purge; admin.py = /admin/* identity-map CRUD)
+├── auth.py                       # Bearer-token auth middleware (StaticKeyResolver / EntraResolver via PrincipalResolver; BearerTokenMiddleware; admin-key recognition)
+├── identity_store.py             # Durable JSON identity map (write-file-then-swap, fail-closed load, live flat_dict)
 ├── dashboard.py                  # Dashboard SSE stream
 ├── models.py                     # Pydantic request/response models
 └── web/                          # Dashboard HTML + static assets
@@ -215,6 +216,28 @@ Auth model facts:
 > the real `entra_identities` map via env/secret or a git-ignored config file.
 
 Canonical guide: `docs/entra-auth-setup.md` (operator + developer + ops runbook).
+
+### Runtime identity-map admin API (`/admin/*`)
+
+Both auth modes can add/remove identities **at runtime, no restart**, via the
+`/admin/*` router (`routers/admin.py`). Facts:
+
+- Each map is an **in-process live dict** backed by a durable JSON file on `/data`
+  (`api_keys_store_path` / `entra_identities_store_path`, in `config.py`). The
+  resolver holds the dict **by reference**, so a `/admin` `PUT`/`DELETE` is visible
+  on the next request. **No cache, no TTL** — safe because the pilot runs a
+  **single replica** (the in-process map is the source of truth).
+- `IdentityStore` (`identity_store.py`) commits **write-file-then-swap-memory**
+  (atomic file replace first, then memory) and **fails closed** on a corrupt file
+  (empty map + loud log, never a crash-loop).
+- **Admin authority** is separate from data auth: static mode uses a dedicated
+  `admin_api_key` (recognized by the middleware, not in the data keystore); entra
+  mode uses the App Role named by `entra_admin_role` (default `IdentityAdmin`) in
+  the token's `roles` claim (**never `groups`**). Data credentials get `403` on
+  `/admin/*`; an unconfigured admin credential → `503`. The admin key cannot be
+  deleted/shadowed via the API (`409`).
+
+Canonical guide: `docs/identity-management.md`.
 
 ---
 
