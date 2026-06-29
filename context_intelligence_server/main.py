@@ -36,6 +36,7 @@ from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import Settings, get_settings
 from context_intelligence_server.identity_store import IdentityStore
 from context_intelligence_server.dashboard import build_status_response
+from context_intelligence_server.routers.admin import router as admin_router
 from context_intelligence_server.routers.queues import router as queues_router
 from context_intelligence_server.routers.skills import SkillRegistry
 from context_intelligence_server.routers.skills import router as skills_router
@@ -203,6 +204,7 @@ app = FastAPI(
     redoc_url="/redoc" if _settings.web_ui_enabled else None,
     openapi_url="/openapi.json" if _settings.web_ui_enabled else None,
 )
+app.include_router(admin_router)
 app.include_router(skills_router)
 app.include_router(version_router)
 app.include_router(queues_router)
@@ -283,8 +285,13 @@ def create_asgi_app(
     s = settings if settings is not None else _settings
 
     # Reset both stores; the active mode sets exactly one of them below.
+    # app.state.* mirrors the module-level globals so the /admin router can
+    # access the live stores via request.app.state without importing from main
+    # (which would create a circular import).
     _api_key_store = None
     _entra_identity_store = None
+    app.state.api_key_store = None
+    app.state.entra_identity_store = None
 
     if s.auth_mode == "entra":
         # Build and load the entra identity store.
@@ -299,6 +306,7 @@ def create_asgi_app(
                 rich_seed = {oid: {"id": cid} for oid, cid in config_map.items()}
                 entra_store.seed(rich_seed)
         _entra_identity_store = entra_store
+        app.state.entra_identity_store = entra_store
 
         # EntraResolver raises RuntimeError at construction if the JWKS
         # prefetch fails (eager fail-closed guard from §8b / crusty gate).
@@ -323,6 +331,7 @@ def create_asgi_app(
                 rich_seed = {digest: {"id": cid} for digest, cid in config_ks.items()}
                 key_store.seed(rich_seed)
         _api_key_store = key_store
+        app.state.api_key_store = key_store
 
         # Pass key_store.flat_dict (the LIVE dict) so the resolver sees any
         # put()/delete() made by /admin immediately, no restart required.
