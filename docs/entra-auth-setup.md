@@ -9,6 +9,8 @@
 > client IDs, or tenant IDs to a shared or public repo.** Inject them via environment
 > variables / a secret store, or a **git-ignored** config file. See §2 (PII warning).
 
+> To add/remove users at runtime without redeploying, see [docs/identity-management.md](identity-management.md).
+
 ---
 
 ## 1. Overview
