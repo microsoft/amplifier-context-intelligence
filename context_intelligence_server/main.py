@@ -434,6 +434,13 @@ def create_asgi_app(
         _admin_status,
     )
 
+    # T6: store the admin-key digest on app.state so the /admin router handlers
+    # can read it without importing from main (no circular import) and so that
+    # test-specific settings are honoured.  In entra mode admin_api_key_digest
+    # has already been set to None above (line ~385); in static mode it is the
+    # sha256 of admin_api_key (or None when admin_api_key is not configured).
+    app.state.admin_api_key_digest = admin_api_key_digest
+
     # Select the auth-exempt path set based on web_ui_enabled.
     # web_ui_enabled=False (api-only): use the smaller set that excludes /logs/stream
     # and other web-UI paths so they cannot be reached unauthenticated.
@@ -483,7 +490,9 @@ async def get_status(request: Request) -> dict[str, Any]:
     # (no credential values, no key hashes, no token details).
     _auth_mode = getattr(request.app.state, "auth_mode", _settings.auth_mode)
     _admin_key_set = getattr(
-        request.app.state, "admin_api_key_configured", _settings.admin_api_key is not None
+        request.app.state,
+        "admin_api_key_configured",
+        _settings.admin_api_key is not None,
     )
     _entra_admin_role = getattr(
         request.app.state, "entra_admin_role", _settings.entra_admin_role
