@@ -1,17 +1,16 @@
 # M2 auth — live-token acceptance gate
 
-> **Current status: DEFERRED — not yet executed.** M2 (app-token / service
-> authentication, see [`entra-auth-setup.md`](entra-auth-setup.md)) is
-> **proven offline**: the discriminator, role gating, and `created_by`
-> derivation in `EntraResolver` (`context_intelligence_server/auth.py`) are
-> covered by unit tests against synthetic, self-signed JWTs. It has **never**
-> been exercised against a **real** Microsoft Entra token. This document and
-> the workflow it describes
-> ([`.github/workflows/m2-auth-acceptance.yml`](../.github/workflows/m2-auth-acceptance.yml))
-> are that missing step. Until someone with tenant access runs it
-> successfully, treat M2 as **unverified against reality** — synthetic-token
-> tests prove the logic is internally consistent; they do not prove a real
-> Entra token actually has the shape the resolver assumes.
+> **Current status: EXECUTED — green on 2026-06-30.** The live-token
+> acceptance gate ran successfully against a **real** Microsoft Entra app-only
+> token from the corp tenant (`72f988bf-…`):
+> [run 28479002620](https://github.com/microsoft/amplifier-context-intelligence/actions/runs/28479002620)
+> — STEP A.1 reported `ALL CLAIM-SHAPE ASSERTIONS PASSED` and STEP A.2 reported
+> `Resolver ACCEPTED the live token … is_service=True`. M2 is now **verified
+> against reality**: a real app-only token has the shape `EntraResolver`
+> assumes. Acquisition path: federated-OIDC self-call, no secret. One STEP A.1
+> confidence assertion was deliberately broadened to match this tenant's actual
+> token (no `idtyp`/`appidacr` emitted) — see §6. The offline synthetic-token
+> unit tests remain the fast regression layer.
 
 > **Secret hygiene.** This document uses **placeholder** identifiers only.
 > Never commit real client IDs, tenant IDs, or object IDs to this repo — see
@@ -71,24 +70,44 @@ setup (and the one this workflow defaults to) is **self-call**: use the
 `azure_client_id` in server config) as the caller too. If your tenant
 requires a separate caller app, see §3.4.
 
+> **Self-call is a test-gate convenience, not a production identity pattern.**
+> Reusing the resource app as its own caller keeps this acceptance check to a
+> single registration, which is fine for a one-shot gate. In production,
+> callers should be **distinct** identities (separate app registrations or
+> managed identities) per service, each assigned its own App Role — never the
+> API impersonating itself. See §3.4 for the separate-caller setup.
+
 On that app registration → **Certificates & secrets → Federated credentials
 → Add credential → GitHub Actions deploying Azure resources** (or the
 generic OIDC federated-credential blade), set the **subject** to match this
-repository's workflow. Two supported subject shapes:
+repository's workflow.
 
-| Scenario | Subject |
+> **Use the ID-based subject form.** GitHub OIDC subjects come in two
+> spellings, and Entra matches the string **exactly** — a mismatch fails the
+> `Azure login` step with `AADSTS7002381` (see [§4.1](#41-the-aadsts7002381-trap)).
+> The **name-based** form (`repo:<org>/<repo>:…`) breaks the moment the org or
+> repo is renamed and is the more common source of that error. Prefer the
+> **ID-based** form, which uses immutable numeric identifiers:
+
+| Scenario | Subject (ID-based, preferred) |
 |---|---|
-| Dispatched against a specific branch (e.g. `main`) | `repo:<org>/<repo>:ref:refs/heads/main` |
-| Scoped to a GitHub Environment named `<env>` | `repo:<org>/<repo>:environment:<env>` |
+| Dispatched against a specific branch (e.g. `main`) | `repository_owner_id:<ORG_ID>:repository_id:<REPO_ID>:ref:refs/heads/main` |
+| Scoped to a GitHub Environment named `<env>` | `repository_owner_id:<ORG_ID>:repository_id:<REPO_ID>:environment:<env>` |
 
-> **Recommendation: prefer the environment-scoped subject.**
-> `workflow_dispatch` runs use whichever ref the operator picks at dispatch
-> time, so a `ref:` subject only matches if you always dispatch from that
-> exact branch. An environment-scoped subject is independent of the ref. If
-> you use this option, add `environment: <env>` to the `acceptance-gate`
-> job in the workflow file before running it (a one-line edit — this
-> workflow intentionally does not parameterize it, to keep the trigger
-> surface minimal and auditable).
+Look up the two numeric IDs once:
+
+```bash
+gh api repos/microsoft/amplifier-context-intelligence \
+  --jq '{owner_id: .owner.id, repo_id: .id}'
+```
+
+> **Branch vs. environment scope.** `workflow_dispatch` runs use whichever ref
+> the operator picks at dispatch time, so a `:ref:` subject only matches if you
+> always dispatch from that exact branch. An `:environment:` subject is
+> independent of the ref. If you use it, add `environment: <env>` to the
+> `acceptance-gate` job in the workflow file before running (a one-line edit —
+> intentionally not parameterized, to keep the trigger surface minimal and
+> auditable).
 
 Audience: leave at the GitHub Actions default
 (`api://AzureADTokenExchange`) — this is the OIDC *token-exchange* audience,
@@ -112,6 +131,18 @@ resulting `roles` claim):
 If your server's `service_data_role` / `reader_role` are not the defaults,
 set the matching optional repo Variables (§4) so the workflow checks for
 the *actual* configured role names.
+
+> **Also set "Assignment required?" = Yes on the enterprise application.**
+> On the resource app's **Enterprise application → Properties**, set
+> **Assignment required?** to **Yes** (the `appRoleAssignmentRequired: true`
+> service-principal property). The server authorizes on the `roles` claim
+> alone — there is no `azp`/`appid` allow-list — which is the *Entra-Enforced
+> Assignment* posture: it is only sound when Entra itself refuses to issue a
+> token to an **unassigned** caller. Without this toggle, any app in the
+> tenant can request a token for this API; the server would still deny it
+> (no qualifying role ⇒ 403), but the assignment gate belongs at the identity
+> provider, not only in application code. Setting it is what makes
+> "roles-only authorization" defensible rather than merely defense-in-depth.
 
 ### 3.3 (Optional) a second caller for the negative test
 
@@ -160,6 +191,44 @@ workflow**. No inputs to fill in; all configuration comes from the repo
 Variables above. If `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` are unset, the
 `preflight` job prints a warning and the rest of the workflow is skipped
 (not failed) — see the job summary for exactly which Variable is missing.
+
+> **Must run from the canonical org repo.** Dispatch from
+> `microsoft/amplifier-context-intelligence` on GitHub-hosted runners — that is
+> what carries the enterprise claim Entra's federated credential requires. A
+> fork or personal-account repo fails at login with `AADSTS7002381` (§4.1).
+> CLI equivalent:
+>
+> ```bash
+> gh workflow run m2-auth-acceptance.yml \
+>   --repo microsoft/amplifier-context-intelligence \
+>   --ref <pr-branch>
+> ```
+
+### 4.1 The `AADSTS7002381` trap
+
+If the **Azure login** or **token acquisition** step fails with
+`AADSTS7002381: The token issued by the identity provider does not match the
+expected configuration`, it is almost always one of two things — and the error
+**does not distinguish them**. It fails **loudly at the login step, before any
+server code runs**, so look here first rather than hunting downstream:
+
+1. **Name-based subject form was used.** Switch the federated credential to the
+   **ID-based** subject (§3.1).
+2. **The run is not from a Microsoft-enterprise org repo.** A fork or personal
+   repo's OIDC token lacks the enterprise claim Entra requires — dispatch from
+   `microsoft/amplifier-context-intelligence` itself.
+
+**Escape hatch if CI federation is blocked entirely:** run the same assertions
+locally against a real **Managed Identity** caller — from an Azure VM or
+container whose MI is assigned the App Role:
+
+```bash
+az account get-access-token --scope "api://<AZURE_CLIENT_ID>/.default"
+```
+
+then feed that token through the same STEP A checks. Same token shape, a
+different acquisition path — it still proves the resolver accepts a real Entra
+token (note this in the PR evidence per §5).
 
 ## 5. What it proves (pass criteria)
 
@@ -219,7 +288,62 @@ asserts `POST /events` returns **403** (write requires `Contributor`; a
 Reader-only token must be rejected on a write route per
 `authz.require_write`).
 
+### Pass criterion, in one sentence
+
+Preflight **proceeded** (not skipped), and **both** STEP A.1
+(`ALL CLAIM-SHAPE ASSERTIONS PASSED`) and STEP A.2 (`Resolver ACCEPTED … is_service=True`)
+are green on a real federated-OIDC token from the corp tenant — with the run
+link and decoded-claims output attached to the PR. STEP B/C are best-effort and
+never decide the verdict.
+
+### Evidence to capture for the PR
+
+A green run is only useful if it is auditable. Attach to the PR:
+
+1. **Permalink to the green run**, explicitly noting it ran in
+   `microsoft/amplifier-context-intelligence` (not a fork — see §4).
+2. **STEP A.1** (step id `assert_shape`): the `ALL CLAIM-SHAPE ASSERTIONS PASSED`
+   line plus the redacted claim summary (`aud`/`iss`/`tid`/`roles`/`appid`/`azp`,
+   `scp` absent). **Never paste a raw token.**
+3. **STEP A.2** (step id `assert_resolver`): the `Resolver ACCEPTED the live
+   token: created_by=… is_service=True` line — the load-bearing proof that
+   production code (with its live JWKS fetch) accepted a real token.
+   `is_service` MUST be `True`.
+4. If run: **STEP B** `202` and **STEP C** `403` lines.
+5. One line naming the **acquisition path** (federated-OIDC self-call, or the
+   Managed Identity escape hatch in §4.1) so reviewers can confirm no secret was
+   involved.
+6. Flip the **status banner** at the top of this file and the PR's
+   outstanding-gate note: **DEFERRED → Executed `<date>`, run `<link>`, green.**
+
+> **Match on step IDs, not messages.** The pass lines above are emitted by the
+> steps `assert_shape` (STEP A.1) and `assert_resolver` (STEP A.2). If a step's
+> *message* text is reworded later, key your evidence off those stable step IDs.
+
 ## 6. Honest gaps — what we could not determine without a real token
+
+> **RESOLVED 2026-06-30 — [run 28479002620](https://github.com/microsoft/amplifier-context-intelligence/actions/runs/28479002620).**
+> The gate has now seen a real app-only token from this tenant. Confirmed
+> claim shape (redacted):
+>
+> ```
+> scp      = None            absent  → routes to the SERVICE branch ✓
+> roles    = ['Contributor'] App Role assignment honored            ✓
+> azp      = <present>       created_by source                      ✓
+> appid    = None
+> idtyp    = None            ← NOT emitted by this tenant/flow
+> appidacr = None            ← NOT emitted by this tenant/flow
+> aud/iss/tid = api://<client> / login.microsoftonline.com/<tid>/v2.0 / 72f988bf-…  ✓
+> ```
+>
+> **Finding:** this tenant emits **neither `idtyp` nor `appidacr`** on a
+> federated app-only token. The token is nonetheless genuinely app-only, and
+> the real `EntraResolver` accepts it (`is_service=True`) — its service branch
+> (`auth.py`) keys on `scp`-absence plus a qualifying role and never reads
+> `idtyp`/`appidacr`. STEP A.1's Assertion 2 (an extra confidence check,
+> stricter than the resolver) was therefore **deliberately broadened** to
+> accept `scp`-absent + (`appid` | `azp`) as a valid app-only signal. The
+> pre-run uncertainties below are retained for history.
 
 We have never seen a real Microsoft Entra app-only access token from this
 tenant, only Microsoft's general documentation and the Team Pulse mirror
