@@ -454,16 +454,26 @@ resolver:
 - **`static`** (default) — pre-shared bearer tokens. The server hashes the
   presented token (`sha256`) and looks the digest up in the keystore to get the
   contributor id. See [docs/managing-api-keys.md](docs/managing-api-keys.md).
-- **`entra`** — Microsoft Entra delegated JWTs (RS256, validated against the
-  tenant JWKS, with audience / issuer / `tid` / `scp=access_as_user` checks), then
-  the token's `oid` is mapped to a contributor. See
-  [docs/entra-auth-setup.md](docs/entra-auth-setup.md).
+- **`entra`** — Microsoft Entra JWTs (RS256, validated against the tenant JWKS,
+  with audience / issuer / `tid` checks), then a **dual-path** discriminator on
+  the token's `scp`/`idtyp` claims:
+  - **User (delegated)** — `scp` present: must contain `access_as_user`, then the
+    token's `oid` maps to a contributor via `entra_identities`. *Unchanged.*
+  - **Service (app / managed-identity)** — `scp` absent: authorized by an Entra
+    **App Role** alone — `Contributor` (write + read) or `Reader` (read-only:
+    `POST /cypher`, `GET /blobs/*`). `created_by` is `service_identities[oid]` if
+    mapped, else the stable `appid`.
+
+  See [docs/entra-auth-setup.md](docs/entra-auth-setup.md) for the canonical model.
 
 The matched contributor id is stamped onto the graph as the write-once `created_by`
 provenance field. A missing/invalid credential is a **401**; a valid credential
-whose identity is not in the map is a **403**. Health and (in full-web mode) the
-dashboard/docs paths are exempt; in API-only mode (`web_ui_enabled=false`) the
-exempt set shrinks to `{/status, /version}`.
+that lacks the needed binding or role is a **403** — a delegated user whose `oid`
+is unmapped, or a service token with no qualifying App Role (its 403 body names the
+`appid`/`oid` and the required roles). **Behavior change (M2):** a token with no
+`scp` and no qualifying role now returns **403** (previously **401**). Health and
+(in full-web mode) the dashboard/docs paths are exempt; in API-only mode
+(`web_ui_enabled=false`) the exempt set shrinks to `{/status, /version}`.
 
 **Admin authority** is a separate layer that gates the `/admin/*` identity-map
 endpoints: in static mode a dedicated `admin_api_key` (recognized by the
@@ -559,7 +569,10 @@ Values are resolved with this priority (highest first):
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AUTH_MODE` | `auth_mode` | `static` | Selects the active resolver: `static` (sha256 keystore, the `api_key`/`api_keys` path above) or `entra` (Microsoft Entra JWT validation via JWKS). Exactly one mode is active. `entra` requires the three fields below. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_CLIENT_ID` | `azure_client_id` | *(empty)* | App Registration (client) GUID. **Required when `auth_mode=entra`** (startup refuses otherwise). See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_TENANT_ID` | `azure_tenant_id` | *(empty)* | Azure AD tenant GUID. **Required when `auth_mode=entra`**. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES` (JSON) | `entra_identities` | *(empty)* | Identity map `oid -> {id: <contributor>}` (oids are Azure Object IDs — **PII**, never commit real values). **Required (non-empty) when `auth_mode=entra`**; the matched `id` is recorded as `created_by`. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES` (JSON) | `entra_identities` | *(empty)* | Identity map `oid -> {id: <contributor>}` for the **user (delegated)** path (oids are Azure Object IDs — **PII**, never commit real values). **Required (non-empty) when `auth_mode=entra`**; the matched `id` is recorded as `created_by`. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVICE_IDENTITIES` (JSON) | `service_identities` | *(empty)* | **Entra service path — optional.** `oid -> {id: <contributor>}` map giving a **friendly `created_by`** name to a service principal / managed identity. **Not an auth gate** (App Roles authorize; see below) and **never required** for boot. Unmapped services still authorize, with `created_by` = `appid`. No runtime CRUD — edit config and redeploy. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVICE_DATA_ROLE` | `service_data_role` | `Contributor` | **Entra service path.** App Role name whose presence in an app token's `roles` claim grants service **write + read**. `""`/`null` disables the service write path. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_READER_ROLE` | `reader_role` | `Reader` | **Entra service path.** App Role name granting service **read-only** access (`POST /cypher`, `GET /blobs/*`). `""`/`null` disables read-only app-token gating. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY` | `admin_api_key` | *(empty — admin API disabled)* | **Static-mode admin credential** — separate from the data `api_keys`; it is the only key allowed to call the `/admin/*` identity-map endpoints. Sent as a bearer token; the middleware recognizes it before the data keystore lookup. Empty → admin API returns `503`; regular data keys get `403` on `/admin/*`. Cannot be deleted/shadowed via the API. See [docs/identity-management.md](docs/identity-management.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_ADMIN_ROLE` | `entra_admin_role` | `IdentityAdmin` | **Entra-mode admin authority** — the App Role name that must appear in a token's `roles` claim (never `groups`) to call `/admin/*`. Created/assigned in the App Registration. Empty/`null` → admin API returns `503`. See [docs/identity-management.md](docs/identity-management.md). |
 | *(YAML only)* | `api_keys_store_path` | `/data/identity/api-keys.json` | Durable JSON file backing the **static** identity map (`sha256(key) -> contributor`). The in-process map is seeded from `api_keys` on first boot, then this file is the source of truth for runtime `/admin/keys` edits. |

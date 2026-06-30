@@ -55,6 +55,32 @@ server checks the role named by `entra_admin_role` (**default `IdentityAdmin`**)
 > `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_ADMIN_ROLE`. Setting it empty
 > (`null`) **disables** the admin API → callers get `503`.
 
+#### Entra App Roles and service identities (no runtime CRUD)
+
+`IdentityAdmin` is one of **three** App Roles the server recognizes in an entra
+token's `roles` claim. The other two authorize the **service path** (app /
+managed-identity tokens — see
+[entra-auth-setup.md](entra-auth-setup.md#the-model--two-authentication-paths-user--service)):
+
+| App Role | Setting (default) | Grants |
+|---|---|---|
+| `Contributor` | `service_data_role` (`Contributor`) | Service **write + read** (`POST /events`, `POST /cypher`, `GET /blobs/*`) |
+| `Reader` | `reader_role` (`Reader`) | Service **read-only** (`POST /cypher`, `GET /blobs/*`) |
+| `IdentityAdmin` | `entra_admin_role` (`IdentityAdmin`) | The `/admin/*` map API (both paths) |
+
+A service principal is authorized by an App Role **alone** — assigning the role
+in Entra *is* the onboarding step (§4). There is **no** server-side
+pre-registration of service principals.
+
+> **`service_identities` is OPTIONAL STATIC config — there is no runtime CRUD.**
+> Unlike the user `entra_identities` map (mutable live via `/admin/identities`),
+> the `service_identities` map (`oid → {id: <contributor>}`) lives **only** in
+> config (env/YAML). It is **not** an authorization gate — it only supplies a
+> **friendly `created_by`** name for a mapped service. An unmapped but
+> role-bearing service is still fully authorized; its `created_by` falls back to
+> the stable `appid` (a GUID). **There is no `/admin/services` endpoint** — to add
+> or change a friendly name, edit `service_identities` in config and redeploy.
+
 ### Static mode — set `admin_api_key`
 
 The admin key is a credential **separate from the data `api_keys`**, and it is
@@ -136,6 +162,34 @@ chars**, with no null bytes → otherwise `422`.
    ```
 3. The user authenticates **immediately** on their next request — no redeploy.
 
+### Service callers (entra app tokens)
+
+Onboarding a **service** principal / managed identity is an **Entra** operation,
+not an `/admin/*` call — there is no server-side registration of service
+principals. Three steps:
+
+1. **Assign the App Role in Entra.** Grant the caller's service principal the
+   **`Contributor`** App Role (write + read) — or **`Reader`** for read-only — on
+   this API's App Registration, as an **Application**-type role assignment
+   (*Enterprise Applications → your app → Users and groups*, or via Graph). This
+   assignment **is** the authorization — no server change, no redeploy.
+2. **The caller requests a token** for **`api://<client_id>/.default`** via
+   **Managed Identity** or **federated OIDC** (a client secret only where the
+   tenant permits — see the tenant policy note in
+   [entra-auth-setup.md](entra-auth-setup.md#the-model--two-authentication-paths-user--service)).
+   The token carries the App Role in `roles` and **no `scp`**, so it takes the
+   service path. On the next call it authenticates; `created_by` defaults to the
+   service principal's **`appid`** (a GUID).
+3. **(Optional) Add a friendly `created_by` name.** To stamp a human-readable
+   contributor instead of the `appid` GUID, add the service principal's `oid` to
+   the **static** `service_identities` map (`oid → {id: <contributor>}`) in
+   config and **redeploy**. This is config-only — there is **no** runtime endpoint
+   for it.
+
+> To **remove** a service caller, unassign the App Role in Entra. (Deleting a
+> `service_identities` entry only drops the friendly name; the role assignment is
+> what authorizes.)
+
 ### Static (`auth_mode=static`)
 
 1. Generate a key, derive its hash, and register the **hash** (never the key):
@@ -203,8 +257,9 @@ curl -sS "$SERVER/status" | jq '.auth'
 // static mode
 { "mode": "static", "admin_api_enabled": true }
 
-// entra mode
-{ "mode": "entra", "admin_api_enabled": true, "entra_admin_role": "IdentityAdmin" }
+// entra mode (reader_role + service_data_role are the M2 service-path roles)
+{ "mode": "entra", "admin_api_enabled": true, "entra_admin_role": "IdentityAdmin",
+  "reader_role": "Reader", "service_data_role": "Contributor" }
 ```
 
 - `auth.mode` — the active `auth_mode`.

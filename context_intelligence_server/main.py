@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import aiofiles
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -31,6 +31,11 @@ from context_intelligence_server.auth import (
     StaticKeyResolver,
     _EXEMPT_PATHS,
     _EXEMPT_PATHS_API_ONLY,
+)
+from context_intelligence_server.authz import (  # noqa: F401 — re-exported for tests/routes
+    _is_write_capable,
+    require_read,
+    require_write,
 )
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import Settings, get_settings
@@ -343,6 +348,9 @@ def create_asgi_app(
     app.state.auth_mode = s.auth_mode
     app.state.admin_api_key_configured = s.admin_api_key is not None
     app.state.entra_admin_role = s.entra_admin_role
+    # M2: service capability role names for require_write / require_read deps.
+    app.state.service_data_role = s.service_data_role
+    app.state.reader_role = s.reader_role
 
     # Compute the admin-key digest for the middleware (static mode only).
     # The middleware checks the bearer token's sha256 against this digest BEFORE
@@ -371,6 +379,24 @@ def create_asgi_app(
         _entra_identity_store = entra_store
         app.state.entra_identity_store = entra_store
 
+        # B4: boot disjointness invariant — each oid must belong to exactly one
+        # identity source.  Building the service map here (not inline in the
+        # EntraResolver call) lets us check the overlap BEFORE construction so
+        # the server fails loudly at startup rather than silently misbehaving.
+        # This is cheap hygiene: B1 already keeps app tokens off the human map
+        # at request time; this prevents a same-oid-in-both misconfiguration.
+        _service_id_map = s.build_service_identity_map()
+        _entra_oids = set(entra_store.flat_dict.keys())
+        _service_oids = set(_service_id_map.keys())
+        _overlap = _entra_oids & _service_oids
+        if _overlap:
+            raise RuntimeError(
+                f"Boot invariant violated (B4): oid(s) {sorted(_overlap)!r} appear "
+                f"in both entra_identities and service_identities. Each oid must "
+                f"belong to exactly one identity source. Fix the config to remove "
+                f"the overlap before restarting."
+            )
+
         # EntraResolver raises RuntimeError at construction if the JWKS
         # prefetch fails (eager fail-closed guard from §8b / crusty gate).
         # Pass entra_store.flat_dict (the LIVE dict) so the resolver sees
@@ -379,6 +405,10 @@ def create_asgi_app(
             s.azure_client_id,  # type: ignore[arg-type]  — validated non-None by config
             s.azure_tenant_id,  # type: ignore[arg-type]  — validated non-None by config
             entra_store.flat_dict,  # live reference — mutations visible immediately
+            service_identity_map=_service_id_map,  # B4: pre-built, disjointness verified
+            service_data_role=s.service_data_role,  # M2: role gate
+            reader_role=s.reader_role,  # M2: role gate
+            entra_admin_role=s.entra_admin_role,  # M2: role gate
             jwks_client=_jwks_client,
         )
         # Entra mode does not use admin_api_key_digest (admin via roles claim).
@@ -474,6 +504,15 @@ if _settings.web_ui_enabled:
         return FileResponse(_WEB_DIR / "dashboard.html")
 
 
+# ---------------------------------------------------------------------------
+# M2 — service capability dependencies (moved to authz.py to avoid circular import)
+#
+# require_write, require_read, _is_write_capable are imported from
+# context_intelligence_server.authz at the top of this file (re-exported here
+# so tests and existing imports from main still work).
+# ---------------------------------------------------------------------------
+
+
 @app.get("/status")
 async def get_status(request: Request) -> dict[str, Any]:
     response = build_status_response(registry, _start_time)
@@ -502,9 +541,23 @@ async def get_status(request: Request) -> dict[str, Any]:
         "admin_api_enabled": (
             _admin_key_set if _auth_mode == "static" else bool(_entra_admin_role)
         ),
-        # Surface the role name (not a secret) so operators can see which role
-        # is configured, without exposing any credential values.
-        **({"entra_admin_role": _entra_admin_role} if _auth_mode == "entra" else {}),
+        # Surface the role names (not secrets) so operators can confirm which
+        # roles are configured without exposing credential values.  Additive:
+        # existing fields (mode, admin_api_enabled, entra_admin_role) are
+        # unchanged; reader_role and service_data_role are new in M2.
+        **(
+            {
+                "entra_admin_role": _entra_admin_role,
+                "reader_role": getattr(
+                    request.app.state, "reader_role", _settings.reader_role
+                ),
+                "service_data_role": getattr(
+                    request.app.state, "service_data_role", _settings.service_data_role
+                ),
+            }
+            if _auth_mode == "entra"
+            else {}
+        ),
     }
     return response
 
@@ -521,7 +574,12 @@ async def _check_neo4j_connected(app_instance: FastAPI) -> bool:
         return False
 
 
-@app.post("/events", status_code=202, response_model=EventResponse)
+@app.post(
+    "/events",
+    status_code=202,
+    response_model=EventResponse,
+    dependencies=[Depends(require_write)],
+)
 async def post_events(
     request: EventRequest, http_request: Request, replay: bool = False
 ) -> EventResponse:
@@ -563,14 +621,14 @@ async def post_events(
     return EventResponse(status="queued", session_id=session_id or None)
 
 
-@app.get("/blobs/{session_id}")
+@app.get("/blobs/{session_id}", dependencies=[Depends(require_read)])
 async def list_blobs(session_id: str) -> JSONResponse:
     blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
     uris = await blob_store.list(session_id)
     return JSONResponse(content={"session_id": session_id, "blobs": uris})
 
 
-@app.get("/blobs/{session_id}/{key}")
+@app.get("/blobs/{session_id}/{key}", dependencies=[Depends(require_read)])
 async def get_blob(session_id: str, key: str) -> JSONResponse:
     blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
     uri = f"ci-blob://{session_id}/{key}"
@@ -620,7 +678,7 @@ if _settings.web_ui_enabled:
         )
 
 
-@app.post("/cypher")
+@app.post("/cypher", dependencies=[Depends(require_read)])
 async def post_cypher(body: CypherRequest, request: Request) -> Response:
     """Proxy a Cypher query to Neo4j and return the results as JSON."""
     driver = request.app.state.neo4j_driver

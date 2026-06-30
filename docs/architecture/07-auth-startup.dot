@@ -8,7 +8,7 @@ digraph auth_startup {
         ranksep   = 0.80
         fontname  = "Helvetica"
         fontsize  = 11
-        label     = "Auth Wiring at Boot \u2014 Mode Selection & Fail-Closed Startup Gate\n(context_intelligence_server/main.py \u2014 create_asgi_app()  \u00b7  auth.py \u2014 resolvers)"
+        label     = "Auth Wiring at Boot \u2014 Mode Selection & Fail-Closed Startup Gates\n(context_intelligence_server/main.py \u2014 create_asgi_app()  \u00b7  auth.py \u2014 resolvers)\nM2: dual-map construction (entra_identities + service_identities) + B4 disjointness gate before JWKS prefetch"
         labelloc  = t
         labeljust = c
     ]
@@ -69,10 +69,11 @@ digraph auth_startup {
 
     // ====================================================================
     // ENTRA RESOLVER CONSTRUCTION  (auth_mode=entra)
+    // M2: dual-map build + B4 disjointness gate + JWKS prefetch
     // ====================================================================
     subgraph cluster_entra_build {
         graph [
-            label     = "EntraResolver  (auth_mode=entra)  \u2014 auth.py\nMicrosoft Entra RS256 JWT; JWKS keys fetched eagerly at startup"
+            label     = "EntraResolver  (auth_mode=entra)  \u2014 auth.py\nM2: both identity maps built from config; B4 disjointness gate; JWKS fetched eagerly (fail-closed)"
             style     = "filled"
             color     = "#0D47A1"
             fillcolor = "#E3F2FD"
@@ -80,9 +81,25 @@ digraph auth_startup {
             fontsize  = 10
         ]
 
+        // Force parallel layout for the two map-build steps
+        { rank = same; BuildIdentityMap; BuildServiceMap }
+
         BuildIdentityMap [
-            label     = "settings.build_identity_map()\n{oid_lower \u2192 contributor_id}\n(from entra_identities config; keys lowercased)"
+            label     = "settings.build_identity_map()\n{oid_lower \u2192 contributor_id}\n(from entra_identities config; keys lowercased)\nLIVE via IdentityStore.flat_dict \u2014 runtime-mutable by /admin/*"
             fillcolor = "#BBDEFB"
+        ]
+
+        BuildServiceMap [
+            label     = "build_service_identity_map()\n{oid_lower \u2192 friendly_name}\n(from service_identities config; keys lowercased)\nPLAIN DICT \u2014 NOT an IdentityStore, NO durable file\nStatic config only; empty dict if not configured\nNo /admin/services \u2014 managed by config change + redeploy"
+            fillcolor = "#BBDEFB"
+        ]
+
+        // B4: Disjointness invariant -- fail-closed gate
+        DisjointCheck [
+            label     = "B4: disjointness invariant\nentra_identities.keys() \u2229 service_identities.keys() = \u2205?\n(same oid in both maps \u2192 name collision at resolve time)\nfail-closed: any overlap \u2192 RuntimeError; server refuses to start\n\u2014\nNote: B1 (idtyp-first branch) is the security-critical\nhuman/service separation; B4 guards friendly-name hygiene"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
         ]
 
         BuildJwksClient [
@@ -111,7 +128,7 @@ digraph auth_startup {
         ]
 
         EntraResolver [
-            label     = "EntraResolver(client_id, tenant_id, identity_map)\nauth_enabled = True  (always \u2014 identity_map non-empty by config validation)\nexpected_aud = [client_id, \"api://client_id\"]\nexpected_issuer = https://login.microsoftonline.com/{tenant_id}/v2.0"
+            label     = "EntraResolver(\n  client_id, tenant_id,\n  identity_map,          \u2190 entra flat_dict (live \u2014 via IdentityStore)\n  service_identity_map,  \u2190 plain dict from config (static, read-only)\n  service_data_role,     \u2190 \"Contributor\" (default)\n  reader_role,           \u2190 \"Reader\"\n  entra_admin_role       \u2190 e.g. \"IdentityAdmin\"\n)\nauth_enabled = True  (always \u2014 identity_map non-empty by config validation)\nexpected_aud = [client_id, \"api://client_id\"]\nexpected_issuer = https://login.microsoftonline.com/{tenant_id}/v2.0"
             fillcolor = "#BBDEFB"
             fontname  = "Helvetica-Bold"
         ]
@@ -216,6 +233,12 @@ digraph auth_startup {
     // ====================================================================
     // FAILURE EXIT NODES
     // ====================================================================
+    DisjointFail [
+        label     = "RuntimeError\n\"boot invariant B4: oid(s) appear in both\n entra_identities and service_identities\n \u2014 maps must be disjoint; server cannot start\"\nprocess exits \u2014 start refused"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
     JwksFetchFail [
         label     = "RuntimeError\n\"JWKS prefetch failed for tenant ...\n server cannot start\"\nprocess exits \u2014 start refused"
         shape     = oval
@@ -242,12 +265,18 @@ digraph auth_startup {
     // auth_mode branch
     AuthModeSwitch  -> BuildKeystore    [label = "\"static\"\n(default)"]
     AuthModeSwitch  -> BuildIdentityMap [label = "\"entra\""]
+    AuthModeSwitch  -> BuildServiceMap  [label = "\"entra\""]
 
     // Static path
     BuildKeystore   -> StaticResolver
 
-    // Entra path
-    BuildIdentityMap -> BuildJwksClient
+    // Entra path: build BOTH maps in parallel, then B4 disjointness check
+    BuildIdentityMap -> DisjointCheck
+    BuildServiceMap  -> DisjointCheck
+    DisjointCheck    -> DisjointFail    [label = "overlap\n(\u2229 \u2260 \u2205)\n\u2192 RuntimeError", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    DisjointCheck    -> BuildJwksClient [label = "disjoint\n(\u2229 = \u2205)\n\u2192 proceed"]
+
+    // JWKS prefetch (fail-closed)
     BuildJwksClient  -> EagerFetch
     EagerFetch       -> FetchOk
 
@@ -298,7 +327,7 @@ digraph auth_startup {
             fillcolor = "#ECEFF1"
         ]
         LegBlue [
-            label     = "EntraResolver / Entra\nJWT validation"
+            label     = "EntraResolver / Entra JWT validation\n(identity_map + service_identity_map\n+ role params \u2014 M2)"
             fillcolor = "#BBDEFB"
         ]
         LegTeal [
@@ -317,7 +346,7 @@ digraph auth_startup {
             fillcolor = "#FFCCBC"
         ]
         LegDecision [
-            label     = "decision"
+            label     = "decision / gate\n(incl. B4 disjointness)"
             shape     = diamond
             fillcolor = "#FFF9C4"
             style     = filled
