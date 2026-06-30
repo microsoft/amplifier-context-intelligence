@@ -1,0 +1,129 @@
+# Amplifier Online - Public API on Azure Container Apps (APIM-fronted)
+# This stack (web-app-aca + auth.expose) deploys the context-intelligence API
+# with PUBLIC ingress behind an Azure API Management gateway. Callers present a
+# Microsoft Entra access_as_user token (no APIM subscription key required); the
+# server re-validates the JWT in-app (PyJWT + cached JWKS).
+
+name: context-intelligence
+stack: web-app-aca
+
+# BRING-YOUR-OWN Entra registration — reuse the existing app reg
+# "MADE: Team-Context-Intelligence" instead of letting the platform create an
+# `ao-context-intelligence-api`. The platform validates this -api app READ-ONLY
+# (never creates/modifies it) and skips it on `destroy`.
+#   - audience:        api://53aa4ffd-fbea-40a3-b35c-63fdcb609af1
+#   - delegated scope: access_as_user  (already exposed — BYO validation passes)
+#   - app roles:       team, council, IdentityAdmin (already defined + assigned)
+# NOTE: this server validates JWTs IN-APP (PyJWT + cached JWKS) using its own
+# AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_* env (see services.api.env). It does NOT
+# use the platform's bare AZURE_CLIENT_ID / JWT-middleware convention.
+auth:
+  api_app_id: "53aa4ffd-fbea-40a3-b35c-63fdcb609af1"
+  # Flip the BYO -api to "user-facing" so `amplifier-online up` provisions the
+  # PUBLIC edge (public ingress + APIM front + access_as_user) as one shot,
+  # instead of the network-internal app-to-app-only posture of internal-service-aca.
+  # 53aa4ffd already exposes access_as_user, so BYO read-only validation passes.
+  expose: true
+
+# Services define the container apps to deploy.
+# This service has a PUBLIC endpoint: public Container Apps ingress fronted by an
+# APIM gateway (provisioned by `amplifier-online up` because auth.expose: true).
+# Public FQDNs (as-built):
+#   APIM:   https://amplifier-online-apim.azure-api.net/context-intelligence
+#   direct: https://context-intelligence-api.<env-default-domain>
+#
+# Auth: bearer Microsoft Entra JWT (delegated access_as_user). This server does
+# NOT use EasyAuth; it validates JWTs in-app (PyJWT + cached JWKS).
+services:
+  api:
+    # As-built image, now served from the platform ACR (amplifieronlinecr). v6.0.0
+    # was imported into amplifieronlinecr, which is the only registry the shared CAE
+    # has pull creds for — so this reference makes the pull succeed.
+    image: amplifieronlinecr.azurecr.io/context-intelligence-server:v6.0.0
+    port: 8000  # gunicorn + uvicorn; matches EXPOSE 8000 in the Dockerfile
+
+    # Persistent /data — backs the oid→contributor store, durable ingest queues,
+    # blobs, and logs. Survives restarts/revision swaps. Single-instance enforced.
+    volume:
+      mount_path: /data
+      size_gib: 16
+
+    env:
+      # === Force Entra auth (server DEFAULTS to static — must override) ===
+      # All keys carry the server's config prefix AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_.
+      # The bare names in the request (AUTH_MODE, AZURE_CLIENT_ID, …) are shorthand;
+      # the server only reads the PREFIXED form (Pydantic Settings env_prefix).
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AUTH_MODE
+        value: entra
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_CLIENT_ID
+        value: "53aa4ffd-fbea-40a3-b35c-63fdcb609af1"   # api://53aa4ffd-… audience
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_TENANT_ID
+        value: "72f988bf-86f1-41af-91ab-2d7cd011db47"
+
+      # === Admin-route gate ===
+      # /admin/identities is authorized by the IdentityAdmin App Role in the JWT
+      # `roles` claim. The role (id 0d67be49-…) + its assignments (colombod, bkrabach,
+      # incl. SC-ALT) already exist in Entra — this var is ALL the manifest needs for
+      # admin authz. Empty/null here would DISABLE the admin API (503).
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_ADMIN_ROLE
+        value: IdentityAdmin
+
+      # === First-boot seed of the oid→contributor map (OPERATOR-SUPPLIED) ===
+      # The oid→GitHub-handle identity map is intentionally NOT committed here —
+      # it contains real Microsoft Entra object IDs. The operator supplies it at
+      # deploy time (optionally), via one of:
+      #   - export AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES in the
+      #     local environment before `amplifier-online up` (uncommitted), or
+      #   - wire it as a Key Vault secretRef out-of-band post-`up` (same pattern
+      #     as the Neo4j creds below), or
+      #   - pre-populate the /data store at ENTRA_IDENTITIES_STORE_PATH.
+      # Format: {"<entra-oid>":{"id":"<github-handle>"}, ...}
+      # The server refuses to start in entra mode with an EMPTY map; after first
+      # boot the /data store + /admin/identities are authoritative (runtime edits
+      # win), so this seed only populates an initially-empty store.
+      # - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES
+      #   value: '{"<entra-oid>":{"id":"<github-handle>"}}'   # operator-filled; do NOT commit real oids
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES_STORE_PATH
+        value: /data/identity/entra-identities.json
+
+      # === Durable /data paths (must live on the mounted volume) ===
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_QUEUES_PATH
+        value: /data/queues
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH
+        value: /data/blobs
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_PATH
+        value: /data/logs/server.jsonl
+
+      # === Neo4j backing service (private static IP, plain Bolt) ===
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL
+        value: bolt://10.100.4.4:7687
+      # NEO4J_USER / NEO4J_PASSWORD are SECRETS sourced from Key Vault kv-context-intel.
+      # The manifest has NO field for Container Apps secrets / Key Vault refs (custom
+      # env values are PLAINTEXT app settings) — see GAP #3. Wire these OUT OF BAND
+      # after `up`, then map the prefixed env vars to the secretRefs:
+      #   az containerapp secret set -n context-intelligence-api -g amplifier-online-rg \
+      #     --secrets \
+      #       neo4j-user=keyvaultref:https://kv-context-intel.vault.azure.net/secrets/context-intelligence-neo4j-user,identityref:<app-mi-resource-id> \
+      #       neo4j-password=keyvaultref:https://kv-context-intel.vault.azure.net/secrets/context-intelligence-neo4j-password,identityref:<app-mi-resource-id>
+      #   az containerapp update  -n context-intelligence-api -g amplifier-online-rg \
+      #     --set-env-vars \
+      #       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_USER=secretref:neo4j-user \
+      #       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD=secretref:neo4j-password
+
+# Optional managed databases (provisions isolated resources for this project)
+resources:
+  postgres:
+    enabled: false  # Injects DATABASE_URL environment variable
+  cosmos:
+    enabled: false  # Injects COSMOS_ENDPOINT and COSMOS_KEY
+  redis:
+    enabled: false  # Keyless (managed identity): injects REDIS_HOST + REDIS_PORT (Azure Managed Redis)
+  storage:
+    enabled: false  # Injects STORAGE_ACCOUNT_NAME (ADLS Gen2 blob store, NOT a filesystem)
+
+# NOTE: This service is PUBLIC — reachable at the APIM gateway URL above
+# (auth.expose: true provisions public ingress + an APIM front). Access requires
+# a valid Microsoft Entra bearer token (no APIM subscription key).
+#
+# Neo4j credentials are wired OUT OF BAND post-`up` as Key Vault secretRefs
+# (see the services.api.env NEO4J_URL comment) — never in this manifest.
