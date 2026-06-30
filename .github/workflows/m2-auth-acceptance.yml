@@ -1,0 +1,439 @@
+name: M2 Auth — Live-Token Acceptance Gate
+
+# ──────────────────────────────────────────────────────────────────────────
+# PURPOSE
+# ──────────────────────────────────────────────────────────────────────────
+# M2 (non-interactive / app-token auth — see docs/entra-auth-setup.md §"two
+# authentication paths" and context_intelligence_server/auth.py:EntraResolver)
+# was implemented and tested entirely against SYNTHETIC tokens (unit tests
+# mint their own JWTs with a test JWKS). This workflow is the deferred
+# ACCEPTANCE GATE that was never run: it acquires a REAL Microsoft Entra
+# app-only token via GitHub Actions OIDC (workload identity federation) and
+# proves the *real* token's shape matches what EntraResolver assumes — both
+# by re-deriving the claims by hand AND by invoking the actual resolver code
+# against the token. Until this workflow has been run once, successfully,
+# against a real tenant, M2 is "proven offline, awaiting live-token gate."
+#
+# Full prerequisites, federated-credential subject formats, and pass
+# criteria: docs/m2-auth-acceptance.md. Read that before your first run.
+#
+# WHY OIDC ONLY: the target tenant blocks client-secret / certificate
+# credentials for this purpose. Workload identity federation (GitHub OIDC →
+# Entra federated credential) is the only credential path this gate uses —
+# there is no client secret anywhere in this workflow, by design.
+#
+# WHY workflow_dispatch ONLY: this gate calls out to a real Entra tenant
+# (and optionally a real deployed server). It must never run automatically
+# on push/PR — that would either spam a real tenant on every commit or
+# silently no-op (and either way doesn't belong in normal CI red/green).
+# ──────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write # required for OIDC -> Entra federated-credential exchange
+  contents: read # required for actions/checkout
+
+concurrency:
+  group: m2-auth-acceptance
+  cancel-in-progress: false
+
+jobs:
+  # ── Preflight ──────────────────────────────────────────────────────────
+  # Gate everything below on the required repo Variables being configured.
+  # This is what makes the workflow safe to merge before anyone has set up
+  # the federated credential: it SKIPS with a clear message instead of
+  # failing red. See docs/m2-auth-acceptance.md "Prerequisites".
+  preflight:
+    name: Preflight — verify required repo Variables
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - name: Check AZURE_CLIENT_ID / AZURE_TENANT_ID are set
+        id: check
+        run: |
+          missing=()
+          [ -z "${{ vars.AZURE_CLIENT_ID }}" ] && missing+=("AZURE_CLIENT_ID")
+          [ -z "${{ vars.AZURE_TENANT_ID }}" ] && missing+=("AZURE_TENANT_ID")
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::warning::M2 auth acceptance gate SKIPPED — missing required repo Variable(s): ${missing[*]}. See docs/m2-auth-acceptance.md for setup (federated credential + repo Variables)."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Required Variables present. Proceeding."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── The acceptance gate ────────────────────────────────────────────────
+  acceptance-gate:
+    name: STEP A (gate) + STEP B/C (optional E2E)
+    needs: preflight
+    if: needs.preflight.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # ── Environment setup (needed for STEP A's real-code invocation) ──
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      # ── Acquire a real token via GitHub OIDC -> Entra federated cred ──
+      #
+      # ASSUMPTION (flagged in the implementation report): the CALLER
+      # identity — the service principal whose federated credential trusts
+      # this repo's GitHub OIDC token — defaults to the SAME app
+      # registration as the resource (AZURE_CLIENT_ID), i.e. the
+      # "self-call" pattern: one App Registration is both the protected API
+      # AND (via a federated credential + a self-assigned App Role on its
+      # own service principal) the caller. This needs only the one
+      # AZURE_CLIENT_ID Variable, matching the literal input list in the
+      # acceptance-gate spec. If your tenant instead uses a SEPARATE caller
+      # app registration, set the optional AZURE_CALLER_CLIENT_ID Variable
+      # and it takes priority below. Either way, the token is requested FOR
+      # the resource api://${AZURE_CLIENT_ID}/.default — exactly what the
+      # server's EntraResolver expects as audience.
+      - name: Azure login (OIDC federated credential, caller identity)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CALLER_CLIENT_ID || vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Acquire access token for api://${AZURE_CLIENT_ID}/.default
+        id: get_token
+        run: |
+          TOKEN=$(az account get-access-token --scope "api://${{ vars.AZURE_CLIENT_ID }}/.default" --query accessToken -o tsv)
+          if [ -z "$TOKEN" ]; then
+            echo "::error::az account get-access-token returned no token. Check the federated credential subject and the resource URI api://${{ vars.AZURE_CLIENT_ID }}."
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          echo "Token acquired (masked)."
+
+      # ── STEP A.1 — decode the real JWT and assert its SHAPE ───────────
+      # This is the literal acceptance-gate ask: assert scp ABSENT;
+      # idtyp=="app" OR appidacr present (an app-only signal); roles
+      # contains a configured role; appid or azp present. Prints a
+      # REDACTED claim summary. The raw token is never printed (only
+      # ever referenced via the masked $TOKEN env var).
+      - name: "STEP A.1 (THE GATE): decode + assert real token shape"
+        id: assert_shape
+        env:
+          SERVICE_DATA_ROLE: ${{ vars.ACCEPTANCE_SERVICE_DATA_ROLE || 'Contributor' }}
+          READER_ROLE: ${{ vars.ACCEPTANCE_READER_ROLE || 'Reader' }}
+          ADMIN_ROLE: ${{ vars.ACCEPTANCE_ADMIN_ROLE || 'IdentityAdmin' }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import sys
+
+          token = os.environ["TOKEN"]
+          required_roles = [
+              r
+              for r in (
+                  os.environ["SERVICE_DATA_ROLE"],
+                  os.environ["READER_ROLE"],
+                  os.environ["ADMIN_ROLE"],
+              )
+              if r
+          ]
+
+          parts = token.split(".")
+          if len(parts) != 3:
+              print("::error::Token is not a 3-part JWT (header.payload.signature)")
+              sys.exit(1)
+
+          payload_b64 = parts[1]
+          padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+          try:
+              claims = json.loads(base64.urlsafe_b64decode(padded))
+          except Exception as exc:  # noqa: BLE001 - report and fail, not crash-trace
+              print(f"::error::Failed to base64url-decode/JSON-parse token payload: {exc}")
+              sys.exit(1)
+
+          scp = claims.get("scp")
+          idtyp_raw = claims.get("idtyp")
+          idtyp = idtyp_raw.strip().lower() if isinstance(idtyp_raw, str) else ""
+          appidacr = claims.get("appidacr")
+          roles = claims.get("roles") if isinstance(claims.get("roles"), list) else []
+          appid = claims.get("appid")
+          azp = claims.get("azp")
+          oid = claims.get("oid")
+          aud = claims.get("aud")
+          iss = claims.get("iss")
+          tid = claims.get("tid")
+
+          oid_redacted = (oid[:8] + "...") if isinstance(oid, str) and len(oid) > 8 else "(absent)"
+
+          print("---- Real-token claim summary (redacted; never the raw token) ----")
+          print(f"aud={aud!r}")
+          print(f"iss={iss!r}")
+          print(f"tid={tid!r}")
+          print(f"scp={scp!r}  (present={bool(scp)!r})")
+          print(f"idtyp={idtyp_raw!r}  (normalized={idtyp!r})")
+          print(f"appidacr={appidacr!r}")
+          print(f"roles={roles!r}")
+          print(f"appid={appid!r}")
+          print(f"azp={azp!r}")
+          print(f"oid={oid_redacted}  (redacted - oid is a persistent identifier)")
+          print("--------------------------------------------------------------------")
+
+          failures = []
+
+          # Assertion 1: scp ABSENT — this is the primary discriminator that
+          # routes EntraResolver to the service branch (auth.py has_scp check).
+          if scp:
+              failures.append(
+                  f"scp is PRESENT ({scp!r}) — the resolver would treat this as a "
+                  f"USER (delegated) token, not a service token"
+              )
+
+          # Assertion 2: at least one app-only signal. The resolver itself does
+          # not require this (it only checks idtyp=='app' for the [B1] ambiguous
+          # case when scp IS present); this is an extra confidence check that we
+          # really were issued an app-only token and not something stranger.
+          if not (idtyp == "app" or appidacr is not None):
+              failures.append(
+                  "no app-only signal found: idtyp != 'app' AND appidacr is absent "
+                  "— this does not look like a genuine app-only/service token"
+              )
+
+          # Assertion 3: roles contains at least one of the server's configured
+          # App Roles (defaults: Contributor / Reader / IdentityAdmin).
+          matched_roles = [r for r in roles if r in required_roles]
+          if not matched_roles:
+              failures.append(
+                  f"roles {roles!r} contains none of the required roles "
+                  f"{required_roles!r} — assign one as an APPLICATION App Role "
+                  f"on the caller service principal in Entra"
+              )
+
+          # Assertion 4: appid or azp present — the resolver's created_by
+          # fallback chain (service_map[oid] -> appid -> azp -> oid) needs at
+          # least one of these to produce a stable, non-PII identity.
+          if not (appid or azp):
+              failures.append(
+                  "neither appid nor azp present — the resolver's created_by "
+                  "fallback chain has nothing before oid (PII) to use"
+              )
+
+          if failures:
+              for f in failures:
+                  print(f"::error::ASSERTION FAILED: {f}")
+              sys.exit(1)
+
+          print(f"ALL CLAIM-SHAPE ASSERTIONS PASSED. matched_roles={matched_roles!r}")
+
+          expected_created_by = appid or azp or oid or ""
+          gh_output = os.environ.get("GITHUB_OUTPUT")
+          if gh_output:
+              with open(gh_output, "a", encoding="utf-8") as f:
+                  f.write(f"expected_created_by={expected_created_by}\n")
+          PY
+
+      # ── STEP A.2 — invoke the REAL resolver code against the token ───
+      # Stronger than re-implementing the discriminator: this literally
+      # constructs context_intelligence_server.auth.EntraResolver (which
+      # does its own live JWKS fetch against the real tenant) and calls
+      # .resolve(token) — the exact code path production uses. If this
+      # passes, the design is proven against this real token, not a
+      # reimplementation of its logic.
+      - name: "STEP A.2 (THE GATE): real EntraResolver.resolve() against the live token"
+        id: assert_resolver
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          SERVICE_DATA_ROLE: ${{ vars.ACCEPTANCE_SERVICE_DATA_ROLE || 'Contributor' }}
+          READER_ROLE: ${{ vars.ACCEPTANCE_READER_ROLE || 'Reader' }}
+          ADMIN_ROLE: ${{ vars.ACCEPTANCE_ADMIN_ROLE || 'IdentityAdmin' }}
+        run: |
+          uv run python - <<'PY'
+          import os
+          import sys
+
+          from context_intelligence_server.auth import AuthError, EntraResolver
+
+          client_id = os.environ["AZURE_CLIENT_ID"]
+          tenant_id = os.environ["AZURE_TENANT_ID"]
+          token = os.environ["TOKEN"]
+
+          try:
+              resolver = EntraResolver(
+                  client_id=client_id,
+                  tenant_id=tenant_id,
+                  identity_map={},  # user path not exercised by this gate
+                  service_identity_map={},
+                  service_data_role=os.environ["SERVICE_DATA_ROLE"],
+                  reader_role=os.environ["READER_ROLE"],
+                  entra_admin_role=os.environ["ADMIN_ROLE"],
+              )
+          except RuntimeError as exc:
+              print(f"::error::EntraResolver construction failed (JWKS prefetch against the real tenant) -- {exc}")
+              sys.exit(1)
+
+          try:
+              contributor_id, roles, is_service = resolver.resolve(token)
+          except AuthError as exc:
+              print(f"::error::The REAL resolver REJECTED the live token: status={exc.status_code} reason={exc.reason}")
+              sys.exit(1)
+
+          print(
+              f"Resolver ACCEPTED the live token: created_by={contributor_id!r} "
+              f"roles={roles!r} is_service={is_service!r}"
+          )
+
+          if not is_service:
+              print(
+                  "::error::ASSERTION FAILED: the real resolver classified this "
+                  "token as a USER (delegated) token, not a service token"
+              )
+              sys.exit(1)
+
+          gh_output = os.environ.get("GITHUB_OUTPUT")
+          if gh_output:
+              with open(gh_output, "a", encoding="utf-8") as f:
+                  f.write(f"resolver_created_by={contributor_id}\n")
+          PY
+
+      # ── STEP B (optional) — drive a deployed server end-to-end ───────
+      # Only runs when ACCEPTANCE_SERVER_URL is set. Best-effort / non-
+      # blocking (continue-on-error: true) per the deliverable spec: the
+      # job's pass/fail is decided by STEP A above, not by this.
+      - name: "STEP B (optional): POST /events against ACCEPTANCE_SERVER_URL, expect 202"
+        id: step_b_post
+        if: ${{ vars.ACCEPTANCE_SERVER_URL != '' }}
+        continue-on-error: true
+        env:
+          SERVER_URL: ${{ vars.ACCEPTANCE_SERVER_URL }}
+        run: |
+          SESSION_ID="gh-actions-m2-acceptance-${{ github.run_id }}-${{ github.run_attempt }}"
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          HTTP_CODE=$(curl -sS -o /tmp/events_resp.json -w "%{http_code}" -X POST "$SERVER_URL/events" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"event\":\"m2_acceptance_probe\",\"workspace\":\"m2-acceptance\",\"data\":{\"timestamp\":\"$TS\",\"session_id\":\"$SESSION_ID\"}}")
+          echo "POST /events -> HTTP $HTTP_CODE"
+          cat /tmp/events_resp.json 2>/dev/null || true
+          echo
+          if [ "$HTTP_CODE" != "202" ]; then
+            echo "::error::Expected 202 from POST /events with a Contributor-role service token, got $HTTP_CODE"
+            exit 1
+          fi
+          echo "session_id=$SESSION_ID" >> "$GITHUB_OUTPUT"
+
+      - name: "STEP B (optional, best-effort): poll graph read-back for created_by"
+        if: ${{ vars.ACCEPTANCE_SERVER_URL != '' && steps.step_b_post.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          SERVER_URL: ${{ vars.ACCEPTANCE_SERVER_URL }}
+          SESSION_ID: ${{ steps.step_b_post.outputs.session_id }}
+          EXPECTED_CREATED_BY: ${{ steps.assert_shape.outputs.expected_created_by }}
+        run: |
+          # NOTE (flagged as an assumption in the implementation report): the
+          # event pipeline is persist-then-202 (async drain to Neo4j), and the
+          # exact Cypher match pattern below is a best guess at the graph
+          # schema (any node carrying the session_id property) since this
+          # workflow does not assume detailed knowledge of the live schema.
+          # This step is best-effort and non-blocking by design.
+          echo "Polling for created_by == $EXPECTED_CREATED_BY (session_id=$SESSION_ID) ..."
+          ok=false
+          for i in $(seq 1 10); do
+            RESP=$(curl -sS -X POST "$SERVER_URL/cypher" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"query\":\"MATCH (n) WHERE n.session_id = \$session_id RETURN n.created_by AS created_by LIMIT 5\",\"params\":{\"session_id\":\"$SESSION_ID\"}}")
+            echo "poll $i/10: $RESP"
+            if echo "$RESP" | grep -q "\"created_by\":\"$EXPECTED_CREATED_BY\""; then
+              echo "MATCH: a node has created_by == $EXPECTED_CREATED_BY"
+              ok=true
+              break
+            fi
+            sleep 3
+          done
+          if [ "$ok" != "true" ]; then
+            echo "::warning::Could not confirm created_by == $EXPECTED_CREATED_BY via graph read-back within the polling window. Non-blocking — verify the Cypher match pattern against this server's actual schema, or check manually."
+            exit 1
+          fi
+
+      # ── STEP C (optional negative test) — Reader-only token -> 403 ───
+      # Only runs when BOTH ACCEPTANCE_SERVER_URL and AZURE_READER_CLIENT_ID
+      # are set. AZURE_READER_CLIENT_ID must name a SEPARATE caller SP/app,
+      # federated the same way as the primary caller, assigned ONLY the
+      # Reader App Role (no Contributor). If unset, this is skipped with a
+      # note in the summary below — it is optional by design.
+      - name: "STEP C setup (optional): Azure login as Reader-only caller"
+        if: ${{ vars.ACCEPTANCE_SERVER_URL != '' && vars.AZURE_READER_CLIENT_ID != '' }}
+        continue-on-error: true
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_READER_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: "STEP C (optional): acquire Reader-only token"
+        id: reader_token
+        if: ${{ vars.ACCEPTANCE_SERVER_URL != '' && vars.AZURE_READER_CLIENT_ID != '' }}
+        continue-on-error: true
+        run: |
+          READER_TOKEN=$(az account get-access-token --scope "api://${{ vars.AZURE_CLIENT_ID }}/.default" --query accessToken -o tsv)
+          if [ -z "$READER_TOKEN" ]; then
+            echo "::error::Failed to acquire a Reader-scoped access token via AZURE_READER_CLIENT_ID"
+            exit 1
+          fi
+          echo "::add-mask::$READER_TOKEN"
+          echo "READER_TOKEN=$READER_TOKEN" >> "$GITHUB_ENV"
+
+      - name: "STEP C (optional negative test): Reader-only token on POST /events expects 403"
+        if: ${{ vars.ACCEPTANCE_SERVER_URL != '' && vars.AZURE_READER_CLIENT_ID != '' }}
+        continue-on-error: true
+        env:
+          SERVER_URL: ${{ vars.ACCEPTANCE_SERVER_URL }}
+        run: |
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          HTTP_CODE=$(curl -sS -o /tmp/reader_resp.json -w "%{http_code}" -X POST "$SERVER_URL/events" \
+            -H "Authorization: Bearer $READER_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"event\":\"m2_acceptance_negative_probe\",\"workspace\":\"m2-acceptance\",\"data\":{\"timestamp\":\"$TS\",\"session_id\":\"gh-actions-m2-negative-${{ github.run_id }}\"}}")
+          echo "POST /events (Reader-only token) -> HTTP $HTTP_CODE"
+          cat /tmp/reader_resp.json 2>/dev/null || true
+          echo
+          if [ "$HTTP_CODE" != "403" ]; then
+            echo "::error::Expected 403 for a Reader-only token on POST /events (write requires Contributor), got $HTTP_CODE"
+            exit 1
+          fi
+          echo "Negative assertion PASSED: Reader-only token correctly rejected with 403 on a write route."
+
+      # ── Summary (always runs) ─────────────────────────────────────────
+      - name: Summary
+        if: always()
+        run: |
+          echo "## M2 Auth Live-Token Acceptance Gate — summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- STEP A.1 (claim-shape assertions): ${{ steps.assert_shape.outcome || 'skipped' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- STEP A.2 (real EntraResolver.resolve()): ${{ steps.assert_resolver.outcome || 'skipped' }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${{ vars.ACCEPTANCE_SERVER_URL }}" ]; then
+            echo "- STEP B (POST /events -> 202): ${{ steps.step_b_post.outcome || 'skipped' }} (best-effort, non-blocking)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- STEP B: SKIPPED (ACCEPTANCE_SERVER_URL not set)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -n "${{ vars.ACCEPTANCE_SERVER_URL }}" ] && [ -n "${{ vars.AZURE_READER_CLIENT_ID }}" ]; then
+            echo "- STEP C (Reader-only token -> 403): ${{ steps.reader_token.outcome || 'skipped' }} (best-effort, non-blocking)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- STEP C: SKIPPED (ACCEPTANCE_SERVER_URL and/or AZURE_READER_CLIENT_ID not set)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "STEP A is the gate (job fails red if either A.1 or A.2 fails). STEP B/C are best-effort and never fail the job." >> "$GITHUB_STEP_SUMMARY"
