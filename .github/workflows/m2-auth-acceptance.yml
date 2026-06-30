@@ -206,10 +206,25 @@ jobs:
           # not require this (it only checks idtyp=='app' for the [B1] ambiguous
           # case when scp IS present); this is an extra confidence check that we
           # really were issued an app-only token and not something stranger.
-          if not (idtyp == "app" or appidacr is not None):
+          #
+          # LIVE-RUN FINDING (2026-06-30, run 28476594818): this corp tenant
+          # issues app-only tokens for this flow with scp ABSENT, roles present,
+          # and azp present, but emits NEITHER idtyp NOR appidacr. Such a token
+          # is genuinely app-only and the real resolver accepts it (the service
+          # branch in auth.py checks neither claim). The signal is therefore
+          # broadened: scp-absent together with an app identity claim (appid or
+          # azp) is a valid app-only signal for this tenant.
+          # See docs/m2-auth-acceptance.md §6.
+          app_only_signal = (
+              idtyp == "app"
+              or appidacr is not None
+              or (not scp and (bool(appid) or bool(azp)))
+          )
+          if not app_only_signal:
               failures.append(
-                  "no app-only signal found: idtyp != 'app' AND appidacr is absent "
-                  "— this does not look like a genuine app-only/service token"
+                  "no app-only signal: scp absent but none of idtyp=='app', "
+                  "appidacr, appid, or azp present — does not look like a "
+                  "genuine app-only/service token"
               )
 
           # Assertion 3: roles contains at least one of the server's configured
