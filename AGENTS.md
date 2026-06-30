@@ -191,24 +191,34 @@ static keys. `auth_mode` (in `config.py`) selects the active resolver — `stati
 (default, the api_keys keystore above) or `entra` (JWT validation via Entra JWKS).
 Exactly one mode is active; switching is a config change, no code change.
 
-Auth model facts:
-- Entra mode accepts **delegated user tokens only** (`scp=access_as_user`) —
-  obtained via the Azure CLI / a user-context `DefaultAzureCredential`; app-only /
-  Managed-Identity tokens (which carry `roles`, not `scp`) are not accepted. See
-  `docs/entra-auth-setup.md`.
-- When `auth_mode=entra`, the server validates an RS256 Entra bearer token
-  (audience `[<client_id>, api://<client_id>]`, issuer `…/<tenant_id>/v2.0`,
-  explicit `tid`, `scp` must contain `access_as_user`), extracts the `oid` claim,
-  and maps it to a contributor via `entra_identities`. That `id` surfaces as
-  `created_by` on graph nodes — same provenance path as static mode.
-- Config fields (all required for `auth_mode=entra`): `azure_client_id`,
-  `azure_tenant_id`, and `entra_identities` (`{ "<oid>": { "id": "<contributor>" } }`
-  — value carries ONLY `id`). Env prefix `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_`.
+Auth model facts (the canonical statement of "which tokens are accepted" lives in
+`docs/entra-auth-setup.md` — this is a pointer, not a restatement):
+- Entra mode is **dual-path** (M2): after shared RS256 validation (audience
+  `[<client_id>, api://<client_id>]`, issuer `…/<tenant_id>/v2.0`, explicit `tid`),
+  a `scp`/`idtyp` discriminator selects the path:
+  - **User (delegated)** — `scp` present: must contain `access_as_user`, then
+    `oid` → contributor via `entra_identities`. *Unchanged.*
+  - **Service (app / managed-identity)** — `scp` absent: authorized by an Entra
+    **App Role** alone — `Contributor` (write+read) or `Reader` (read-only:
+    `POST /cypher`, `GET /blobs/*`). `created_by` = `service_identities[oid]` if
+    mapped, else the stable `appid`. App-only / MI tokens (which carry `roles`,
+    not `scp`) **are now accepted** on this path.
+  - `scp` + `idtyp=="app"` → 401 (ambiguous, fail-closed).
+- The matched `created_by` surfaces on graph nodes — same provenance path as static
+  mode.
+- Config fields: required for boot — `azure_client_id`, `azure_tenant_id`,
+  `entra_identities`. Optional service-path — `service_identities` (friendly
+  `created_by` map, **not** an auth gate, **no runtime CRUD** — config + redeploy),
+  `service_data_role` (default `Contributor`), `reader_role` (default `Reader`).
+  Env prefix `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_`.
 - **Fail-closed:** misconfig (missing field / empty or malformed `entra_identities`)
   is a HARD startup error. `allow_unauthenticated` defaults to `false`; a server
   with no auth configured refuses to start.
-- **401** = bad/expired/wrong-audience/missing token; **403** = valid token whose
-  `oid` isn't in the map (the 403 body names the unbound oid for the operator).
+- **401** = bad/expired/wrong-audience/missing/ambiguous token; **403** = valid
+  token lacking authorization — a user whose `oid` is unmapped, or a service token
+  with no qualifying App Role (the 403 body names the principal + required roles).
+  **Behavior change (M2):** a token with no `scp` and no qualifying role now returns
+  **403** (was **401**).
 
 > 🔒 **Secret hygiene — NO real identifiers in this product repo.** An `oid` is a
 > persistent personal identifier (PII). Never commit real oids, client IDs, or

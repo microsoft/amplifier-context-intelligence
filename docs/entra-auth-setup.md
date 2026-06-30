@@ -33,9 +33,14 @@ az access token  →  server validates the JWT  →  extracts the oid claim
 ```
 
 So a real person's Azure identity is attributed to a stable contributor name on
-every node they write. The two modes are mutually exclusive — exactly one resolver
-is active at a time. Switching is a one-line config change (`auth_mode: static` →
-`auth_mode: entra`) plus the supporting fields below.
+every node they write. Entra mode authenticates **two kinds of token** along
+separate paths — delegated **user** tokens (the chain above) and **service**
+(app / managed-identity) tokens authorized by an Entra **App Role** — see
+[Authentication model](#the-model--two-authentication-paths-user--service) below
+for the full dual-path model. The two *auth modes* (`static`/`entra`) remain
+mutually exclusive — exactly one resolver is active at a time. Switching is a
+one-line config change (`auth_mode: static` → `auth_mode: entra`) plus the
+supporting fields below.
 
 All config is read by Pydantic Settings (`config.py`): **environment variables**
 (prefix `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_`) take precedence over the **YAML
@@ -49,18 +54,54 @@ config file**, which takes precedence over defaults.
 > document configures. The operator and developer guides (§2, §3) are the concrete
 > steps; this section is the *why* they take the shape they do.
 
-### The model — delegated (user) tokens only
+### The model — two authentication paths (user + service)
 
-As configured today, the server authenticates **delegated user tokens** — tokens
-that Entra issues **in the context of a signed-in person**. The decisive check is
-in `EntraResolver.resolve()` (`auth.py`): the token's **`scp`** claim must contain
-**`access_as_user`**, and `scp` is a claim that **only ever appears on a delegated
-(user-context) token**.
+> **Canonical statement.** This is the single source of truth for "which Entra
+> tokens the server accepts." Other docs (README, AGENTS.md) point here rather
+> than restating it.
 
-App-only / daemon tokens (client-credentials flow) are therefore **not accepted**
-as configured: they carry a **`roles`** claim instead of `scp`, so they fail the
-`access_as_user` check and are rejected with **401**. This is by design for the
-pilot — see the limitation note at the end of this section.
+In entra mode the server authenticates **two kinds of token** along separate
+paths inside `EntraResolver.resolve()` (`auth.py`). After the shared JWT
+validation (signature / audience / issuer / `tid`, below), a single
+**discriminator** picks the path from the token's `scp` and `idtyp` claims:
+
+| Token shape | Path | How it is authorized | `created_by` |
+|---|---|---|---|
+| **`scp` present** (and `idtyp != "app"`) | **User (delegated)** — *unchanged* | `scp` must contain `access_as_user`; then `oid` → `entra_identities` map | the mapped contributor `id` |
+| **`scp` absent** | **Service (app / daemon / managed-identity)** — *new* | an **App Role** alone: `roles` must contain `Contributor`, `Reader`, or `IdentityAdmin` | `service_identities[oid]` if mapped, else the stable `appid` |
+| **`scp` present *and* `idtyp == "app"`** | — | anomalous (no legitimate Entra token is both) → **401**, fail-closed | — |
+
+- **User path — delegated, byte-for-byte unchanged.** A token Entra issues **in
+  the context of a signed-in person** carries `scp` (always present on a
+  delegated token). It must contain `access_as_user`; the `oid` is then looked
+  up in `entra_identities`. A valid user token whose `oid` is **not** mapped is a
+  **403**. This path behaves exactly as it did before service tokens existed.
+
+- **Service path — authorized by an App Role alone.** An **app-only token**
+  (client-credentials flow, a managed identity, or a federated-OIDC workload)
+  carries **`roles`, not `scp`**. The server admits it **iff** its `roles` claim
+  contains a qualifying App Role:
+  - **`Contributor`** (default `service_data_role`) — **write + read**.
+  - **`Reader`** (default `reader_role`) — **read only**: `POST /cypher` and
+    `GET /blobs/*` (not `POST /events`).
+  - **`IdentityAdmin`** (default `entra_admin_role`) — the `/admin/*` map API.
+
+  A service token with **no** qualifying role is a **403** whose body names the
+  rejected principal (its `appid`/`oid`) and the required roles. The role
+  assignment **is** the authorization decision — there is no server-side
+  allow-list of service principals and no pre-registration step.
+
+> **`service_identities` is *not* an auth gate.** It is an **optional, static**
+> `oid → {id: <contributor>}` map (env/YAML, same shape as `entra_identities`)
+> that only supplies a **friendly `created_by` name**. An unmapped but
+> role-bearing service is fully authorized; its `created_by` simply falls back to
+> the stable `appid`. There is **no** runtime `/admin/services` endpoint — service
+> identities change only by editing config and redeploying.
+
+> **Tenant policy note.** In a locked-down tenant that blocks client secrets,
+> service callers must obtain tokens via **Managed Identity** or **federated
+> OIDC**, **not** a client secret/certificate. See
+> [docs/azure-deployment.md](azure-deployment.md#deploying-with-entra-auth).
 
 ### The App Registration setup (what is configured)
 
@@ -95,24 +136,46 @@ against.
 | Audience (`aud`) | one of `<AZURE_CLIENT_ID>` **or** `api://<AZURE_CLIENT_ID>` | `audience=[client_id, "api://"+client_id]` |
 | Issuer (`iss`) | `https://login.microsoftonline.com/<AZURE_TENANT_ID>/v2.0` | `issuer=...` |
 | Tenant (`tid`) | must equal `<AZURE_TENANT_ID>` (explicit, defense-in-depth) | `claims["tid"] == tenant_id` |
-| Scope (`scp`) | must contain **`access_as_user`** | `"access_as_user" in scp.split()` |
-| Object ID (`oid`) | looked up in `entra_identities` → `created_by` | `identity_map[oid.lower()]` |
 | Required claims | `exp`, `iss`, `aud` must be present | `options={"require": ["exp","iss","aud"]}` |
 
-A valid token whose `oid` is **not** in the map is a **403** (identity unbound);
-any other failure is a **401**.
+The next checks are **path-specific** — selected by the `scp`/`idtyp`
+discriminator (see the model table above):
 
-### Admin authority — the `roles` claim (for `/admin/*` only)
+| Path | Check | Value | Code |
+|---|---|---|---|
+| Discriminator | Token type | `scp` present → user; `scp` absent → service; `scp` + `idtyp=="app"` → 401 | `has_scp` / `idtyp` |
+| User | Scope (`scp`) | must contain **`access_as_user`** | `"access_as_user" in scp.split()` |
+| User | Object ID (`oid`) | looked up in `entra_identities` → `created_by` | `identity_map[oid.lower()]` |
+| Service | App Role (`roles`) | must contain `Contributor`, `Reader`, **or** `IdentityAdmin` | `service_data_role`/`reader_role`/`entra_admin_role in roles` |
+| Service | Identity (`created_by`) | `service_identities[oid]` if mapped, else `appid` (never `app_displayname`) | truthiness chain |
 
-Data authentication is delegated-only (the `scp` check above). Separately, the
-resolver also extracts the token's **`roles`** claim (App Role assignments) so the
-`/admin/*` identity-map endpoints can authorize an admin. A token whose `roles`
-contains the App Role named by `entra_admin_role` (**default `IdentityAdmin`**,
-created/assigned in the App Registration) may call `/admin/*`; any other valid
-token gets **403** there. The server reads **only `roles`** — never `groups`
-(group membership can never grant admin). The `roles` claim has **no effect on
-data auth**: a delegated user token with no admin role still authenticates to
-`POST /events` normally. Full runtime onboarding/offboarding API and runbook:
+A valid **user** token whose `oid` is **not** in the map is a **403** (identity
+unbound). A valid **service** token with **no** qualifying App Role is a **403**
+(named principal + required roles). Any other failure is a **401**.
+
+> **`created_by` legend — a GUID means a machine.** When `created_by` is a **GUID**
+> it is an **`appid`** (a service principal's application ID) — i.e. a **machine**
+> identity, resolvable in Entra by that app id. A **friendly** `created_by` name
+> appears only when the service's `oid` is present in the optional
+> `service_identities` map. (Delegated **users** always resolve to the friendly
+> contributor `id` from `entra_identities`.)
+
+### Admin authority and service roles — the `roles` claim
+
+The token's **`roles`** claim (Entra App Role assignments) now drives **two**
+things:
+
+- **Service data authorization (new).** On the service path, a qualifying role —
+  `Contributor` (`service_data_role`, write+read) or `Reader` (`reader_role`,
+  read-only) — is the **sole** authorization gate. This has **no effect on the
+  user path**: a delegated user token authorizes via its mapped `oid` regardless
+  of `roles`.
+- **Admin authority (unchanged).** A token whose `roles` contains the App Role
+  named by `entra_admin_role` (**default `IdentityAdmin`**) may call `/admin/*`;
+  any other valid token gets **403** there. This holds for **both** paths.
+
+The server reads **only `roles`** — never `groups` (group membership can never
+grant access). Full runtime onboarding/offboarding API and runbook:
 [identity-management.md](identity-management.md).
 
 ### How a token is obtained today — the Azure CLI
@@ -144,28 +207,36 @@ token = cred.get_token("api://<AZURE_CLIENT_ID>/.default").token   # NOT the bar
 ```
 
 `/.default` is required because the SDK credential chain does not request bare
-delegated scopes uniformly. **Important caveat:** this yields a server-compatible
-(delegated, `scp=access_as_user`) token **only when the credential resolves to a
-user-context credential** — `AzureCliCredential` (the same `az login`), the VS Code
-sign-in, or an interactive browser login. If the chain instead resolves to an
-**app-only** credential (Managed Identity, or `EnvironmentCredential` with a client
-secret/cert), the resulting `/.default` token has the right `aud` but **no `scp`**
-(it carries `roles`) and the server rejects it with 401 — see the limitation below.
+delegated scopes uniformly. **Which path you get depends on how the credential
+resolves:**
 
-### Limitation — delegated-only, by design today
+- **User-context credential** — `AzureCliCredential` (the same `az login`), the
+  VS Code sign-in, or an interactive browser login — yields a **delegated**
+  token (`scp=access_as_user`) that takes the **user path**.
+- **App-only credential** — a **Managed Identity**, or `EnvironmentCredential`
+  with a client secret/cert — yields a token with the right `aud` but **no
+  `scp`** (it carries **`roles`**). This now takes the **service path**: with a
+  qualifying App Role (`Contributor`/`Reader`/`IdentityAdmin`) it authenticates
+  as a service; **without** any qualifying role it is a **403**.
 
-> **App-only credentials are not supported as configured.** A **Managed Identity**,
-> or a **service principal with a client secret / certificate** (the
-> client-credentials flow), produces a token carrying **`roles`, not `scp`**. The
-> server's `scp` must contain `access_as_user` check therefore **rejects it (401)**.
-> Headless / daemon / service-to-service callers are **not** supported in this
-> configuration; the pilot deliberately relies on the **user-context (Azure CLI)
-> delegated** flow only.
+### Service callers — app / daemon / managed-identity tokens
+
+> **App-only credentials are now supported via the service path.** A **Managed
+> Identity**, a **federated-OIDC workload**, or (where the tenant allows) a
+> **service principal with a secret/cert** produces a token carrying **`roles`,
+> not `scp`**. The server admits it **iff** its `roles` claim holds a qualifying
+> App Role — `Contributor` (write+read), `Reader` (read-only), or `IdentityAdmin`
+> (admin). The App Role assignment *is* the authorization; there is no
+> server-side allow-list and no pre-registration of the service principal.
 >
-> Supporting service identities later would require **adding an App Role** to the
-> registration and **teaching the server to accept a `roles` claim** (in addition to
-> `scp`). That is **explicitly not done today** — `EntraResolver` checks `scp` only
-> (`auth.py`, "V1 scope: delegated USER tokens from the `az` CLI client").
+> **Behavior change (was 401, now 403).** Before M2, any token with `roles` and
+> no `scp` failed the `access_as_user` check and was rejected with **401**. Now
+> such a token reaches the service path: with a qualifying role it is **admitted**;
+> with **no** qualifying role it is a **403** that names the principal and the
+> required roles. See [What 401 vs 403 mean](#35-what-401-vs-403-mean-to-you).
+>
+> **Onboarding a service caller:** see
+> [identity-management.md → service callers](identity-management.md#service-callers-entra-app-tokens).
 
 ---
 
@@ -183,7 +254,22 @@ otherwise — see §2.5):
 | Auth mode | `auth_mode` | `AUTH_MODE` | Set to `entra` |
 | Client ID | `azure_client_id` | `AZURE_CLIENT_ID` | App Registration (client) GUID |
 | Tenant ID | `azure_tenant_id` | `AZURE_TENANT_ID` | Azure AD tenant GUID |
-| Identity map | `entra_identities` | `ENTRA_IDENTITIES` (JSON) | `oid → {id: <contributor>}` |
+| Identity map | `entra_identities` | `ENTRA_IDENTITIES` (JSON) | `oid → {id: <contributor>}` (the **user** path) |
+
+These four boot the **user** path. The **service** path needs **no required
+settings** — it works out of the box once an App Role is assigned in Entra. Its
+settings are all **optional** and have working defaults:
+
+| Field | YAML key | Env var (`AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_` + …) | Default | Meaning |
+|---|---|---|---|---|
+| Service data role | `service_data_role` | `SERVICE_DATA_ROLE` | `Contributor` | App Role granting service **write + read**. `""`/`null` disables it. |
+| Reader role | `reader_role` | `READER_ROLE` | `Reader` | App Role granting service **read-only** (`POST /cypher`, `GET /blobs/*`). `""`/`null` disables it. |
+| Service identities | `service_identities` | `SERVICE_IDENTITIES` (JSON) | *(unset)* | **Optional** `oid → {id: <contributor>}` map — a friendly `created_by` override only, **not** an auth gate. Unmapped services still authorize (via App Role); their `created_by` falls back to `appid`. No runtime CRUD — edit config and redeploy. |
+
+> `service_identities` is validated with the **same** GUID-key / non-empty-`id`
+> rules as `entra_identities`, but it is **never** required for boot and never
+> participates in the entra startup validator. Omit it entirely if you don't need
+> friendly machine names.
 
 ### 2.2 YAML config
 
@@ -331,12 +417,15 @@ The next call from that user → `created_by = <contributor>`.
 
 ### 3.1 The scope
 
-The server accepts **delegated user** tokens carrying the scope
-**`access_as_user`** on the resource **`api://<AZURE_CLIENT_ID>`** — see
+**As a human developer** you use the **user path**: a **delegated** token
+carrying the scope **`access_as_user`** on the resource
+**`api://<AZURE_CLIENT_ID>`**. The `az` commands below are the relied-on,
+out-of-the-box path. (Headless **service** callers use a different path — an
+App-Role-bearing app token with no scope; see
+[Authentication model](#the-model--two-authentication-paths-user--service) and
+[service callers](identity-management.md#service-callers-entra-app-tokens).) See
 [Authentication model & Entra App Registration](#authentication-model--entra-app-registration)
-for the full model, including the delegated-only limitation and the
-`DefaultAzureCredential` `/.default` caveat. The `az` commands below are the
-relied-on, out-of-the-box path.
+for the full dual-path model and the `DefaultAzureCredential` `/.default` caveat.
 
 ### 3.2 Give the operator your oid
 
@@ -392,10 +481,25 @@ On success the event is queued and the resulting graph nodes are stamped
 
 ### 3.5 What 401 vs 403 mean **to you**
 
-| Status | Meaning | What to do |
-|---|---|---|
-| **401** | **Token problem.** Missing / expired / wrong audience / wrong tenant / missing `access_as_user` scope / missing `oid`. | Re-acquire the token (§3.3). Confirm you used `--resource api://<AZURE_CLIENT_ID>`. |
-| **403** | **Identity not bound.** Your token is valid, but your `oid` isn't in the operator's map. The body names your oid. | Send your oid (§3.2) to the operator to be added (§2.6). |
+`401` is always a **token problem**; `403` is always an **authorization problem**
+(the token is valid, but you lack the binding/role). Note that "missing
+`access_as_user`" is **no longer a universal 401 cause** — it only applies on the
+**user path** (a token that *has* `scp`). A token with **no** `scp` is routed to
+the service path instead, where the question is App Roles, not scope.
+
+| Status | Path | Meaning | What to do |
+|---|---|---|---|
+| **401** | both | **Token problem.** Missing / expired / wrong audience / wrong tenant / missing `oid`; or a **user** token whose `scp` lacks `access_as_user`; or an **ambiguous** token (`scp` *and* `idtyp=="app"`). | Re-acquire the token (§3.3). Confirm `--resource api://<AZURE_CLIENT_ID>`. |
+| **403** | user | **Identity not bound.** Your delegated token is valid, but your `oid` isn't in the operator's map. The body names your oid. | Send your oid (§3.2) to the operator to be added (§2.6). |
+| **403** | service | **No qualifying App Role.** Your app/service token is valid, but its `roles` has none of `Contributor`/`Reader`/`IdentityAdmin`. The body names your `appid`/`oid` and the required roles. | Have an admin assign the App Role in Entra ([service callers](identity-management.md#service-callers-entra-app-tokens)). |
+
+> **Behavior change (M2): 401 → 403 for role-less app tokens.** Before M2, an
+> app-only token (with `roles`, no `scp`) failed the `access_as_user` check and
+> got **401**. It now reaches the service path: with a qualifying role it is
+> admitted; with **no** qualifying role it is a **403** (named principal +
+> required roles) instead of a 401. If you previously saw 401 for a daemon/MI
+> caller, expect **403** now — and the fix is an **App Role assignment**, not a
+> token re-acquire.
 
 ---
 
@@ -471,10 +575,20 @@ legibly instead of as a bare `Invalid isoformat string: ''`.
 
 - Config fields & validators: `context_intelligence_server/config.py`
   (`auth_mode`, `azure_client_id`, `azure_tenant_id`, `entra_identities`,
-  `allow_unauthenticated`, `build_identity_map()`).
+  `service_identities`, `service_data_role`, `reader_role`, `entra_admin_role`,
+  `allow_unauthenticated`, `build_identity_map()`, `build_service_identity_map()`).
 - JWT validation: `context_intelligence_server/auth.py` (`EntraResolver`) — RS256
   pinned, audience `[<client_id>, api://<client_id>]`, issuer
-  `https://login.microsoftonline.com/<tenant_id>/v2.0`, explicit `tid`, `scp` must
-  contain `access_as_user`, `oid` → contributor; **401** = invalid/expired/missing/
-  wrong-audience token, **403** = valid token whose `oid` is unbound.
+  `https://login.microsoftonline.com/<tenant_id>/v2.0`, explicit `tid`; then the
+  **dual-path discriminator** on `scp`/`idtyp`:
+  - **User** (`scp` present): `scp` must contain `access_as_user`, `oid` →
+    contributor; **403** when the `oid` is unbound.
+  - **Service** (`scp` absent): `roles` must contain `Contributor`/`Reader`/
+    `IdentityAdmin`; `created_by` = `service_identities[oid]` → `appid` → `azp` →
+    `oid` (never `app_displayname`); **403** when no qualifying role.
+  - `scp` + `idtyp=="app"` → **401** (ambiguous, fail-closed).
+  - **401** otherwise = invalid/expired/missing/wrong-audience/wrong-tenant token.
+- Per-route capability gates: `context_intelligence_server/authz.py`
+  (`require_write` on `POST /events`; `require_read` on `POST /cypher`,
+  `GET /blobs/*`).
 - Static-key mode: `docs/managing-api-keys.md`.

@@ -12,8 +12,10 @@ import json
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException  # noqa: F401  (HTTPException per spec)
+from fastapi import APIRouter, Depends, HTTPException  # noqa: F401  (HTTPException per spec)
 from fastapi.requests import Request
+
+from context_intelligence_server.authz import require_read, require_write
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +36,7 @@ def _decode_payload(record: dict[str, Any]) -> bytes:
     raise ValueError("dead-letter record missing both 'payload' and 'payload_b64'")
 
 
-@router.get("/queues/dead-letter")
+@router.get("/queues/dead-letter", dependencies=[Depends(require_read)])
 async def list_dead_letters(request: Request) -> dict[str, Any]:
     """List dead-letter queues with per-worker record counts and last error.
 
@@ -61,7 +63,10 @@ async def list_dead_letters(request: Request) -> dict[str, Any]:
     return {"dead_letters": entries}
 
 
-@router.post("/queues/dead-letter/{worker_key:path}/purge")
+@router.post(
+    "/queues/dead-letter/{worker_key:path}/purge",
+    dependencies=[Depends(require_write)],
+)
 async def purge_dead_letters(worker_key: str, request: Request) -> dict[str, Any]:
     """Purge all dead-letter records for ``worker_key``.
 
@@ -77,7 +82,10 @@ async def purge_dead_letters(worker_key: str, request: Request) -> dict[str, Any
     return {"worker_key": worker_key, "purged": purged}
 
 
-@router.post("/queues/dead-letter/{worker_key:path}/replay")
+@router.post(
+    "/queues/dead-letter/{worker_key:path}/replay",
+    dependencies=[Depends(require_write)],
+)
 async def replay_dead_letters(worker_key: str, request: Request) -> dict[str, Any]:
     """Re-enqueue every dead-letter record for ``worker_key`` then purge them.
 

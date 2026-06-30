@@ -1356,3 +1356,302 @@ class TestT3Coexistence:
             "Static API key digest must not appear in the Entra identity map"
         )
         assert _FAKE_OID_1 not in ks, "Entra oid must not appear in the API keystore"
+
+
+# ---------------------------------------------------------------------------
+# M2 Phase 1: service_identities, service_data_role, reader_role
+# ---------------------------------------------------------------------------
+
+_SVC_OID_1 = "33333333-3333-3333-3333-333333333333"
+_SVC_OID_2 = "44444444-4444-4444-4444-444444444444"
+
+
+class TestServiceIdentitiesValidator:
+    """M2-Phase1: _validate_service_identities enforces identical GUID rules to entra_identities.
+
+    service_identities uses the shared _validate_identity_map() helper, so all rules
+    from _validate_entra_identities apply identically.
+    """
+
+    def test_valid_map_accepted_and_keys_lowercased(self) -> None:
+        """Valid map with uppercase GUID keys is accepted; keys normalized to lowercase.
+
+        Uses _FAKE_OID_UPPER ("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE") which contains
+        actual uppercase hex letters so .lower() produces a different string.
+        """
+        from context_intelligence_server.config import Settings
+
+        lower = _FAKE_OID_UPPER.lower()
+        s = Settings(service_identities={_FAKE_OID_UPPER: {"id": "svc-agent"}})
+        assert s.service_identities is not None
+        assert lower in s.service_identities
+        assert _FAKE_OID_UPPER not in s.service_identities
+        assert s.service_identities[lower]["id"] == "svc-agent"
+
+    def test_default_is_none(self) -> None:
+        """service_identities defaults to None when not configured."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings()
+        assert s.service_identities is None
+
+    def test_empty_dict_raises(self) -> None:
+        """service_identities={} is a misconfiguration (fail-closed, mirrors entra_identities)."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="at least one entry"):
+            Settings(service_identities={})
+
+    def test_non_guid_key_raises(self) -> None:
+        """Non-GUID key raises ValidationError."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="valid GUID"):
+            Settings(service_identities={"not-a-guid": {"id": "svc"}})
+
+    def test_all_zeros_guid_rejected(self) -> None:
+        """All-zeros GUID is rejected (placeholder sentinel must not authorize anyone)."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(
+                service_identities={
+                    "00000000-0000-0000-0000-000000000000": {"id": "svc"}
+                }
+            )
+
+    def test_empty_id_raises(self) -> None:
+        """Empty 'id' in value dict raises ValidationError."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(service_identities={_SVC_OID_1: {"id": ""}})
+
+    def test_missing_id_raises(self) -> None:
+        """Missing 'id' in value dict raises ValidationError."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(service_identities={_SVC_OID_1: {"label": "svc"}})
+
+    def test_none_accepted(self) -> None:
+        """service_identities=None is accepted (disables feature)."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(service_identities=None)
+        assert s.service_identities is None
+
+    def test_multiple_valid_entries(self) -> None:
+        """Multiple valid entries all survive validation."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(
+            service_identities={
+                _SVC_OID_1: {"id": "svc-agent-1"},
+                _SVC_OID_2: {"id": "svc-agent-2"},
+            }
+        )
+        assert s.service_identities is not None
+        assert s.service_identities[_SVC_OID_1]["id"] == "svc-agent-1"
+        assert s.service_identities[_SVC_OID_2]["id"] == "svc-agent-2"
+
+
+class TestBuildServiceIdentityMap:
+    """M2-Phase1: build_service_identity_map() mirrors build_identity_map()."""
+
+    def test_returns_oid_to_id_mapping(self) -> None:
+        """build_service_identity_map() returns {oid_lower: id}."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(service_identities={_SVC_OID_1: {"id": "svc-agent"}})
+        result = s.build_service_identity_map()
+        assert result == {_SVC_OID_1: "svc-agent"}
+
+    def test_none_returns_empty_dict(self) -> None:
+        """None service_identities → empty dict."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(service_identities=None)
+        assert s.build_service_identity_map() == {}
+
+    def test_default_none_returns_empty_dict(self) -> None:
+        """Default Settings() (service_identities=None) → empty dict."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings()
+        assert s.build_service_identity_map() == {}
+
+    def test_uppercase_keys_lowercased_in_result(self) -> None:
+        """Keys are lowercased in the result map (belt-and-suspenders).
+
+        Uses _FAKE_OID_UPPER ("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE") which contains
+        actual uppercase hex letters so .lower() produces a different string.
+        """
+        from context_intelligence_server.config import Settings
+
+        lower = _FAKE_OID_UPPER.lower()
+        s = Settings(service_identities={_FAKE_OID_UPPER: {"id": "svc-agent"}})
+        result = s.build_service_identity_map()
+        assert lower in result
+        assert _FAKE_OID_UPPER not in result
+        assert result[lower] == "svc-agent"
+
+    def test_multiple_entries(self) -> None:
+        """Multiple entries all appear in the result map."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(
+            service_identities={
+                _SVC_OID_1: {"id": "svc-1"},
+                _SVC_OID_2: {"id": "svc-2"},
+            }
+        )
+        result = s.build_service_identity_map()
+        assert result == {_SVC_OID_1: "svc-1", _SVC_OID_2: "svc-2"}
+
+
+class TestServiceDataRole:
+    """M2-Phase1: service_data_role — default 'Contributor', None→'' (disabled)."""
+
+    def test_default_is_contributor(self) -> None:
+        """service_data_role defaults to 'Contributor'."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings()
+        assert s.service_data_role == "Contributor"
+
+    def test_none_normalized_to_empty_string(self) -> None:
+        """service_data_role=None is normalized to '' (feature disabled)."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(service_data_role=None)  # type: ignore[arg-type]
+        assert s.service_data_role == ""
+
+    def test_custom_value_passes_through(self) -> None:
+        """A custom role name passes through unchanged."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(service_data_role="DataWriter")
+        assert s.service_data_role == "DataWriter"
+
+    def test_empty_string_passes_through(self) -> None:
+        """Empty string explicitly disables the role (passes through as-is)."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(service_data_role="")
+        assert s.service_data_role == ""
+
+
+class TestReaderRole:
+    """M2-Phase1: reader_role — default 'Reader', None→'' (disabled)."""
+
+    def test_default_is_reader(self) -> None:
+        """reader_role defaults to 'Reader'."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings()
+        assert s.reader_role == "Reader"
+
+    def test_none_normalized_to_empty_string(self) -> None:
+        """reader_role=None is normalized to '' (feature disabled)."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(reader_role=None)  # type: ignore[arg-type]
+        assert s.reader_role == ""
+
+    def test_custom_value_passes_through(self) -> None:
+        """A custom role name passes through unchanged."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(reader_role="ReadOnlyRole")
+        assert s.reader_role == "ReadOnlyRole"
+
+    def test_empty_string_passes_through(self) -> None:
+        """Empty string explicitly disables the role (passes through as-is)."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(reader_role="")
+        assert s.reader_role == ""
+
+
+class TestM2RegressionEntraIdentities:
+    """M2 regression: entra_identities + build_identity_map() unchanged after shared-helper refactor.
+
+    These tests verify that refactoring to _validate_identity_map() /
+    _build_identity_map_from() does not alter any observable behavior of the
+    existing entra_identities validation and build_identity_map() paths.
+    """
+
+    def test_valid_entra_map_still_accepted(self) -> None:
+        """Regression: valid entra_identities still accepted after shared-helper refactor."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(entra_identities={_FAKE_OID_1: {"id": "colombod"}})
+        assert s.entra_identities is not None
+        assert s.entra_identities[_FAKE_OID_1]["id"] == "colombod"
+
+    def test_entra_empty_dict_still_raises_at_least_one_entry(self) -> None:
+        """Regression: entra_identities={} still raises 'at least one entry' after refactor."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="at least one entry"):
+            Settings(entra_identities={})
+
+    def test_entra_invalid_guid_still_raises_valid_guid(self) -> None:
+        """Regression: invalid GUID still raises 'valid GUID' after shared-helper refactor."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="valid GUID"):
+            Settings(entra_identities={"not-a-guid": {"id": "colombod"}})
+
+    def test_entra_all_zeros_still_rejected(self) -> None:
+        """Regression: all-zeros GUID still rejected after shared-helper refactor."""
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(
+                entra_identities={
+                    "00000000-0000-0000-0000-000000000000": {"id": "colombod"}
+                }
+            )
+
+    def test_entra_keys_still_lowercased(self) -> None:
+        """Regression: UPPERCASE GUID keys still normalized to lowercase after refactor."""
+        from context_intelligence_server.config import Settings
+
+        lower = _FAKE_OID_UPPER.lower()
+        s = Settings(entra_identities={_FAKE_OID_UPPER: {"id": "colombod"}})
+        assert s.entra_identities is not None
+        assert lower in s.entra_identities
+        assert _FAKE_OID_UPPER not in s.entra_identities
+
+    def test_build_identity_map_still_returns_oid_to_id(self) -> None:
+        """Regression: build_identity_map() still returns {oid_lower: id} after refactor."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(entra_identities={_FAKE_OID_1: {"id": "colombod"}})
+        result = s.build_identity_map()
+        assert result[_FAKE_OID_1] == "colombod"
+
+    def test_build_identity_map_none_still_returns_empty(self) -> None:
+        """Regression: build_identity_map() with None entra_identities returns {} after refactor."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings()
+        assert s.build_identity_map() == {}

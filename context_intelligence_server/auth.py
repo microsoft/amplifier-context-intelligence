@@ -67,7 +67,8 @@ class AuthError(Exception):
               tenant, fails signature verification, uses a disallowed algorithm,
               or is missing required claims (``oid``, ``scp``).
         403 — token is cryptographically valid but the ``oid`` is not in the
-              identity map (``bearer_identity_unbound``).
+              identity map (``bearer_identity_unbound``), or a service token
+              with no qualifying App Role.
 
     ``reason``:
         Short human-readable message for logging / response bodies.  The 403
@@ -79,6 +80,18 @@ class AuthError(Exception):
         super().__init__(reason)
         self.status_code = status_code
         self.reason = reason
+
+
+def _first_nonblank(*values: Any) -> str | None:
+    """Return the first value that is a non-empty, non-whitespace str, else None.
+
+    Used to chain service created_by candidates with truthiness semantics:
+    empty/whitespace/non-string candidates fall through (B6/B8).
+    """
+    for v in values:
+        if isinstance(v, str) and v.strip():
+            return v
+    return None
 
 
 def _resolve_token(token: str, keystore: dict[str, str]) -> str | None:
@@ -95,9 +108,9 @@ def _resolve_token(token: str, keystore: dict[str, str]) -> str | None:
 class PrincipalResolver(Protocol):
     """Resolves a raw bearer token string to a contributor id.
 
-    Returns ``(contributor_id, roles)`` on success, or ``None`` when the token
-    is not recognised (caller should respond 401).  Implementations may also
-    raise :class:`AuthError` to signal specific auth failures (401 or 403);
+    Returns ``(contributor_id, roles, is_service)`` on success, or ``None`` when
+    the token is not recognised (caller should respond 401).  Implementations may
+    also raise :class:`AuthError` to signal specific auth failures (401 or 403);
     the middleware dispatches the exact ``status_code`` from the exception.
 
     The ``roles`` element (a list of strings) carries the token's App-Role
@@ -105,15 +118,21 @@ class PrincipalResolver(Protocol):
     The middleware stores these on ``scope["state"]["roles"]`` so downstream
     dependencies (e.g. ``require_admin``) can read them without re-parsing.
 
+    ``is_service`` is ``True`` for app/service tokens resolved by the service
+    branch, ``False`` for delegated user tokens and static-key tokens.  The
+    middleware writes this onto ``scope["state"]["is_service"]`` so route
+    capability deps (``require_write`` / ``require_read``) can gate service
+    principals without re-parsing the token.
+
     Only one concrete implementation exists today: :class:`StaticKeyResolver`.
     The ``EntraResolver`` (JWT via JWKS) is added in T4.  Do NOT add a third
     resolver without a separate design review.
 
-    T5 protocol change: ``resolve()`` previously returned ``str | None``.
-    Changed to ``tuple[str, list[str]] | None`` to carry the ``roles`` claim
-    from the Entra JWT so the middleware can set ``is_admin``/``roles`` on
-    scope state without a second token parse.  ``StaticKeyResolver`` always
-    returns an empty roles list.
+    M2 protocol change: ``resolve()`` previously returned
+    ``tuple[str, list[str]] | None``.  Changed to
+    ``tuple[str, list[str], bool] | None`` to carry the ``is_service`` flag
+    so the middleware can set capability state without re-parsing the token.
+    ``StaticKeyResolver`` always returns ``is_service=False``.
     """
 
     @property
@@ -126,14 +145,18 @@ class PrincipalResolver(Protocol):
         """
         ...
 
-    def resolve(self, token: str) -> tuple[str, list[str]] | None:
-        """Return ``(contributor_id, roles)`` or ``None`` if token not recognised.
+    def resolve(self, token: str) -> tuple[str, list[str], bool] | None:
+        """Return ``(contributor_id, roles, is_service)`` or ``None`` if token not recognised.
 
         Raises :class:`AuthError` (with ``status_code`` 401 or 403) when the
         token is present but invalid or maps to an unauthorised identity.
 
         ``roles`` is a list of App-Role strings (from the Entra ``roles``
         claim).  ``StaticKeyResolver`` always returns ``[]``.
+
+        ``is_service`` is ``True`` for app/service tokens (no ``scp`` claim,
+        routed through the service branch); ``False`` for delegated user tokens
+        and static-key tokens.
         """
         ...
 
@@ -147,34 +170,32 @@ class EntraResolver:
     explicit ``tid`` + ``scp`` + ``oid`` checks, then ``oid → contributor_id``
     lookup via *identity_map*.
 
-    V1 scope: delegated USER tokens from the ``az`` CLI client.
-    ``scp`` must contain ``access_as_user``; ``oid`` is extracted and mapped.
-    Service-to-service is NOT built; the seam (step 2 ``extract_principal``)
-    accommodates it later without touching validation logic.
+    M2: adds a second branch for app/service tokens (no ``scp``) selected by
+    a ``scp``-presence discriminator, authorized by App-Role alone, with a
+    fail-loud ``created_by`` derived from stable claims.
 
     Raises:
         :class:`AuthError` (401): Token is missing/malformed/expired/wrong-aud/
-            wrong-iss/wrong-tid/fails-sig-verification/wrong-alg, or is missing
-            required claims (``oid``, ``scp``).
+            wrong-iss/wrong-tid/fails-sig-verification/wrong-alg, [B1] anomaly,
+            or missing/invalid identity claim.
         :class:`AuthError` (403): Token is cryptographically valid but the
-            lowercased ``oid`` is not in *identity_map*
-            (``bearer_identity_unbound``).
+            lowercased ``oid`` is not in *identity_map* (user branch), or no
+            qualifying App Role is present (service branch).
         RuntimeError: At construction if eager JWKS prefetch fails — the server
             must refuse to start rather than lazily fail at first request (§8b).
 
     Args:
-        client_id:    Azure App Registration client ID (GUID).
-        tenant_id:    Azure AD tenant ID (GUID).
-        identity_map: ``{oid_lower -> contributor_id}`` — built by
-                      :meth:`~context_intelligence_server.config.Settings.build_identity_map`.
-                      MUST be non-empty (config validator ensures this).
-        jwks_client:  Injectable JWKS client for tests.  Must expose
-                      ``fetch_data() -> None`` and
-                      ``get_signing_key_from_jwt(token) -> obj`` where
-                      ``obj.key`` is the signing key.  When ``None`` the default
-                      builds a ``PyJWKClient`` pointed at
-                      ``https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys``
-                      and calls ``fetch_data()`` eagerly.
+        client_id:            Azure App Registration client ID (GUID).
+        tenant_id:            Azure AD tenant ID (GUID).
+        identity_map:         ``{oid_lower -> contributor_id}`` — built by
+                              :meth:`~context_intelligence_server.config.Settings.build_identity_map`.
+                              MUST be non-empty (config validator ensures this).
+        service_identity_map: ``{oid_lower -> contributor_id}`` for service
+                              principals.  Optional; ``{}`` = no service map.
+        service_data_role:    App Role name granting write access.  ``""`` disables.
+        reader_role:          App Role name granting read-only access.  ``""`` disables.
+        entra_admin_role:     App Role name granting admin access.  ``""`` disables.
+        jwks_client:          Injectable JWKS client for tests.
 
     Note — JWKS caching (T5):
         Per-``kid`` caching and lifespan-bounded refresh are handled by
@@ -189,11 +210,20 @@ class EntraResolver:
         tenant_id: str,
         identity_map: dict[str, str],
         *,
+        service_identity_map: dict[str, str] | None = None,  # NEW (M2)
+        service_data_role: str = "",  # NEW (M2)
+        reader_role: str = "",  # NEW (M2)
+        entra_admin_role: str = "",  # NEW (M2)
         jwks_client: Any = None,
     ) -> None:
         self._client_id = client_id
         self._tenant_id = tenant_id
         self._identity_map = identity_map
+        # M2 service-path config — fail-closed defaults (empty disables each role).
+        self._service_identity_map: dict[str, str] = service_identity_map or {}
+        self._service_data_role = service_data_role
+        self._reader_role = reader_role
+        self._entra_admin_role = entra_admin_role
         # Accept both the bare client GUID (ID-token aud) and the api:// form
         # (access-token aud when access_as_user scope is exposed).  Matches
         # the Team Pulse mirror and the Q-AUD confirmation from §2b.
@@ -247,37 +277,44 @@ class EntraResolver:
         """Always True — EntraResolver is always active (identity map is non-empty by construction)."""
         return True
 
-    def resolve(self, token: str) -> tuple[str, list[str]]:
-        """Validate Entra JWT and return the mapped contributor id and roles.
+    def resolve(self, token: str) -> tuple[str, list[str], bool]:
+        """Validate Entra JWT; return (contributor_id, roles, is_service).
+
+        Implements the dual-path discriminator (M2):
+        - Tokens with ``scp`` present → USER / delegated branch (unchanged from V1).
+        - Tokens without ``scp`` → SERVICE / app branch (new in M2).
+        The ``[B1]`` anomaly check fires first when both ``scp`` and
+        ``idtyp=app`` are present — neither branch can claim such a token
+        (fail-closed, 401).
 
         Args:
             token: Raw bearer token string (``Authorization: Bearer`` prefix
                    already stripped by the middleware).
 
         Returns:
-            A ``(contributor_id, roles)`` tuple where *contributor_id* is
-            mapped from the token's ``oid`` claim and *roles* is the token's
-            ``roles`` claim (App Role assignments) as a list of strings, or
-            ``[]`` when the claim is absent or not a list.
-
-            The ``roles`` list is stored by the middleware on
-            ``scope["state"]["roles"]`` so ``require_admin`` can check it
-            without re-parsing the token.  Only the ``roles`` claim is
-            returned — ``groups`` is intentionally excluded (TB-09).
+            A ``(contributor_id, roles, is_service)`` 3-tuple.
+            *contributor_id* is mapped from ``oid`` (user branch) or derived
+            via ``service_identity_map``/``appid``/``azp``/``oid`` (service
+            branch).  *roles* is the token's App Role assignments as a list of
+            strings.  *is_service* is ``True`` for app/service tokens,
+            ``False`` for delegated user tokens.
 
         Raises:
-            AuthError(401): Any JWT validation failure (signature, audience,
-                issuer, expiry, algorithm, missing/wrong ``tid``/``scp``/``oid``).
-            AuthError(403): Valid token whose ``oid`` is not in *identity_map*.
+            AuthError(401): JWT validation failure, wrong tenant, [B1] anomaly,
+                missing/invalid ``oid`` (user branch), or no resolvable identity
+                (service branch).
+            AuthError(403): Valid user token with unmapped ``oid``, or valid
+                service token with no qualifying App Role [D7].
         """
+        # ---- SHARED VALIDATION (both paths) — UNCHANGED from V1 ----
         try:
             key = self._jwks_client.get_signing_key_from_jwt(token).key
             claims = jwt.decode(
                 token,
                 key,
                 algorithms=["RS256"],  # H1: pin RS256, reject alg=none / HS256
-                audience=self._expected_aud,
-                issuer=self._expected_issuer,
+                audience=self._expected_aud,  # B7: aud enforced here
+                issuer=self._expected_issuer,  # B7: iss enforced here
                 options={"require": ["exp", "iss", "aud"]},
             )
         except jwt.PyJWTError as exc:
@@ -293,52 +330,137 @@ class EntraResolver:
         if claims.get("tid") != self._tenant_id:
             raise AuthError(401, "Token from wrong tenant")
 
-        # scp must contain access_as_user (delegated user flow only — V1).
-        # Space-split to avoid substring false-positives (e.g. "not_access_as_user").
-        # Guard: a non-string scp (e.g. list from a malformed token) must be treated
-        # as missing rather than crashing on .split() — FAIL-2 fix.
+        # ---- DISCRIMINATOR (M2) — scp PRIMARY, idtyp CONFIRMATION ----
+        # scp normalization is IDENTICAL to V1 (non-string -> "").
         _scp_raw = claims.get("scp")
         scp: str = _scp_raw if isinstance(_scp_raw, str) else ""
-        if "access_as_user" not in scp.split():
+        has_scp: bool = bool(
+            scp.split()
+        )  # any whitespace-delimited scope token present
+
+        # idtyp normalization [B2]: non-string -> "", then strip().lower().
+        _idtyp_raw = claims.get("idtyp")
+        idtyp: str = _idtyp_raw.strip().lower() if isinstance(_idtyp_raw, str) else ""
+
+        # [B1] Branches MUST be mutually exclusive.  A token bearing BOTH a
+        # delegated scope AND idtyp=="app" is anomalous (no legitimate Entra
+        # token does this) -> fail closed.  Checked FIRST so neither branch
+        # can claim it.
+        if has_scp and idtyp == "app":
             raise AuthError(
                 401,
-                f"Token missing required scope 'access_as_user' (got scp={scp!r})",
+                "Ambiguous token: carries both delegated 'scp' and idtyp='app'; "
+                "refusing to classify as either user or service",
             )
 
-        # oid is required.  Missing/non-string/whitespace oid is a broken/
-        # service token → 401, NOT 403 (AC12 — TP omits this; we add it).
-        # isinstance guard prevents AttributeError on non-string oid values
-        # (e.g. int 42, list) that would crash on .lower() — FAIL-1/FAIL-3 fix.
-        oid = claims.get("oid")
-        if not isinstance(oid, str) or not oid.strip():
-            raise AuthError(401, "Token missing or invalid 'oid' claim")
-
-        # Map oid → contributor — unrecognised oid is a 403 (identity_unbound).
-        # Both sides are lowercased: config validator lowercases keys at build
-        # time; we lowercase the claim for robustness (AC12).
-        oid_lower = oid.lower()
-        contributor_id = self._identity_map.get(oid_lower)
-        if contributor_id is None:
-            raise AuthError(
-                403,
-                f"Identity not authorized: oid {oid_lower!r} is not in the "
-                f"identity map; contact the server administrator to add this "
-                f"identity (tenant {self._tenant_id!r})",
+        if has_scp:
+            # =========================================================
+            # USER / DELEGATED BRANCH — BYTE-FOR-BYTE auth.py V1 logic
+            # (only the return arity changes: append is_service=False)
+            # =========================================================
+            if "access_as_user" not in scp.split():
+                raise AuthError(
+                    401,
+                    f"Token missing required scope 'access_as_user' (got scp={scp!r})",
+                )
+            # oid is required.  Missing/non-string/whitespace oid -> 401, NOT 403
+            # (AC12).  isinstance guard prevents AttributeError on non-string oid
+            # (e.g. int 42, list) — FAIL-1/FAIL-3 fix.
+            oid = claims.get("oid")
+            if not isinstance(oid, str) or not oid.strip():
+                raise AuthError(401, "Token missing or invalid 'oid' claim")
+            # Map oid -> contributor — unrecognised oid is a 403 (identity_unbound).
+            # Both sides lowercased: config validator lowercases keys at build time.
+            oid_lower = oid.lower()
+            contributor_id = self._identity_map.get(oid_lower)
+            if contributor_id is None:
+                raise AuthError(
+                    403,
+                    f"Identity not authorized: oid {oid_lower!r} is not in the "
+                    f"identity map; contact the server administrator to add this "
+                    f"identity (tenant {self._tenant_id!r})",
+                )
+            # Roles: list[str] normalization — only `roles`, never `groups` (TB-09).
+            _roles_raw = claims.get("roles")
+            roles: list[str] = (
+                [r for r in _roles_raw if isinstance(r, str)]
+                if isinstance(_roles_raw, list)
+                else []
             )
+            return (
+                contributor_id,
+                roles,
+                False,
+            )  # <-- only delta from V1: third element
 
-        # Extract roles claim (T5: admin authorization for /admin/* endpoints).
-        # roles must be a list of strings; any other type (missing claim, int,
-        # string) is normalised to [] so the resolver is fail-closed on bad
-        # token shapes.  Only `roles` is returned — `groups` is intentionally
-        # excluded so group membership can NEVER grant admin access (TB-09).
+        # =========================================================
+        # SERVICE / APP BRANCH (NEW, M2) — scp ABSENT
+        # =========================================================
+        # Roles normalization is identical to the user branch.
         _roles_raw = claims.get("roles")
-        roles: list[str] = (
+        roles = (
             [r for r in _roles_raw if isinstance(r, str)]
             if isinstance(_roles_raw, list)
             else []
         )
 
-        return (contributor_id, roles)
+        # --- Authorization = ROLE ALONE [D7].  Admit iff a qualifying configured
+        #     role is present.  Empty name disables that role (config.py:504-513).
+        authorized = (
+            (self._service_data_role and self._service_data_role in roles)
+            or (self._reader_role and self._reader_role in roles)
+            or (self._entra_admin_role and self._entra_admin_role in roles)
+        )
+        if not authorized:
+            # 403 message: name the rejected principal (appid preferred over oid)
+            # and the required App Roles.  Do NOT echo roles=[...] in the response
+            # body — that is an internal claim value, not operator guidance (R1).
+            _appid_raw = claims.get("appid")
+            _oid_raw_msg = claims.get("oid")
+            _principal = (
+                _appid_raw
+                if isinstance(_appid_raw, str) and _appid_raw.strip()
+                else (
+                    _oid_raw_msg
+                    if isinstance(_oid_raw_msg, str) and _oid_raw_msg.strip()
+                    else "(unknown)"
+                )
+            )
+            raise AuthError(
+                403,
+                f"Service principal {_principal!r} is not authorized: "
+                f"no qualifying App Role. "
+                f"Required App Roles: "
+                f"write={self._service_data_role!r}, "
+                f"read={self._reader_role!r}, "
+                f"admin={self._entra_admin_role!r}. "
+                f"Assign one as an Application App Role on the service principal "
+                f"in Azure Entra, then re-request a token.",
+            )
+
+        # --- created_by derivation [B6/B8]: stable claims, truthiness chaining,
+        #     NEVER app_displayname (spoofable in Entra — B8), fail-loud.
+        #     Order: service_map[oid] > appid > azp > oid.
+        _oid_raw = claims.get("oid")
+        oid_str = _oid_raw if isinstance(_oid_raw, str) and _oid_raw.strip() else ""
+        oid_lower = oid_str.lower()
+        mapped = self._service_identity_map.get(oid_lower) if oid_lower else None
+
+        created_by = _first_nonblank(
+            mapped,  # 1. operator-assigned contributor id
+            claims.get("appid"),  # 2. app client id (v1.0 token)
+            claims.get("azp"),  # 3. authorized party (v2.0 token)
+            oid_str,  # 4. SP object id (always present; last resort)
+        )
+        if created_by is None:
+            # Unreachable in practice (oid always present); fail-loud, never null.
+            raise AuthError(
+                401,
+                "Service token has no resolvable identity claim "
+                "(service map miss and appid/azp/oid all blank)",
+            )
+
+        return (created_by, roles, True)
 
 
 class StaticKeyResolver:
@@ -376,17 +498,20 @@ class StaticKeyResolver:
         """
         return not self._keystore
 
-    def resolve(self, token: str) -> tuple[str, list[str]] | None:
-        """Return ``(contributor_id, [])`` for *token*, or ``None`` on a miss.
+    def resolve(self, token: str) -> tuple[str, list[str], bool] | None:
+        """Return ``(contributor_id, [], False)`` for *token*, or ``None`` on a miss.
 
         The roles list is always empty for static-key auth — admin authority is
         signalled via ``scope["state"]["is_admin"]`` by the middleware (which
         recognises the admin key before calling this resolver).
+
+        ``is_service`` is always ``False`` for static-key tokens — they behave
+        like humans (always write-capable), preserving static-mode behavior.
         """
         contributor_id = _resolve_token(token, self._keystore)
         if contributor_id is None:
             return None
-        return (contributor_id, [])
+        return (contributor_id, [], False)
 
 
 class BearerTokenMiddleware:
@@ -414,6 +539,10 @@ class BearerTokenMiddleware:
     * ``roles`` (list[str]): App Role assignments from the Entra ``roles``
       claim, or ``[]`` for static-mode tokens.  The ``require_admin``
       dependency checks this list for the ``IdentityAdmin`` role.
+    * ``is_service`` (bool): ``True`` for app/service tokens resolved by the
+      service branch; ``False`` for human/delegated and static-key tokens.
+      Used by ``require_write`` / ``require_read`` in ``main.py`` to gate
+      service principals without re-parsing the token.
 
     T5 — static-mode admin key (ROB F1):
 
@@ -509,6 +638,7 @@ class BearerTokenMiddleware:
                 state["contributor_id"] = "admin"
                 state["is_admin"] = True
                 state["roles"] = []
+                state["is_service"] = False  # admin key behaves like a human (M2)
                 await self.app(scope, receive, send)
                 return
 
@@ -547,7 +677,7 @@ class BearerTokenMiddleware:
             await _send_401(send)
             return
 
-        contributor_id, roles = result
+        contributor_id, roles, is_service = result  # M2: unpack 3-tuple
 
         # Inject authenticated identity and auth metadata into scope state.
         # is_admin is False for regular data keys and for entra tokens (admin
@@ -556,6 +686,7 @@ class BearerTokenMiddleware:
         state["contributor_id"] = contributor_id
         state["is_admin"] = False
         state["roles"] = roles
+        state["is_service"] = is_service  # M2: capability signal for route deps
 
         await self.app(scope, receive, send)
 

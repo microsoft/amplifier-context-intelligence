@@ -52,6 +52,36 @@ az containerapp update \
     "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY=secretref:api-key"
 ```
 
+## Deploying with Entra auth
+
+To run the deployed server in **Microsoft Entra** mode (`auth_mode=entra`) instead
+of static keys, supply the entra settings as env vars / Container Apps secrets. The
+full model is in [entra-auth-setup.md](entra-auth-setup.md); the deployment-relevant
+variables are:
+
+| Env var (`AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_` + …) | Required? | Purpose |
+|---|---|---|
+| `AUTH_MODE=entra` | yes | Select the Entra resolver |
+| `AZURE_CLIENT_ID` | yes | App Registration (client) GUID |
+| `AZURE_TENANT_ID` | yes | Azure AD tenant GUID |
+| `ENTRA_IDENTITIES` (JSON) | yes | `oid → {id}` map for the **user (delegated)** path (**PII** — store as a secret) |
+| `SERVICE_IDENTITIES` (JSON) | no | Optional friendly-`created_by` map for **service** principals — not an auth gate, no runtime CRUD |
+| `SERVICE_DATA_ROLE` | no | App Role granting service write+read (default `Contributor`) |
+| `READER_ROLE` | no | App Role granting service read-only (default `Reader`) |
+
+Store `ENTRA_IDENTITIES` (and `SERVICE_IDENTITIES` if used) as **Container Apps
+secrets**, never plain env vars — oids are personal identifiers.
+
+> **Operator note — service callers must use Managed Identity or federated OIDC,
+> not client secrets.** In a locked-down tenant, the service path (app-only tokens
+> authorized by an Entra App Role) should be driven by a **Managed Identity** or a
+> **federated-OIDC** workload credential. Avoid client secrets / certificates:
+> they are long-lived bearer credentials that the tenant policy typically forbids
+> and that are easy to leak from a container. Assign the `Contributor` (or
+> `Reader`) App Role to the caller's service principal in Entra; that assignment is
+> the authorization — see
+> [identity-management.md → service callers](identity-management.md#service-callers-entra-app-tokens).
+
 ## Step-by-Step Deployment
 
 ### Step 1 — Prerequisites

@@ -58,9 +58,12 @@ class TestStaticKeyResolver:
 
         result = resolver.resolve(token)
         assert result is not None
-        contributor_id, roles = result
+        contributor_id, roles, is_service = result  # M2: 3-tuple
         assert contributor_id == "alice"
         assert roles == []  # static resolver always returns empty roles
+        assert (
+            is_service is False
+        )  # M2: static resolver is always write-capable (is_service=False)
 
     def test_resolve_unknown_token_returns_none(self) -> None:
         """resolve() returns None — never 'unknown' — for an unrecognised token."""
@@ -161,10 +164,10 @@ class TestBearerTokenMiddlewareResolvesViaResolver:
             def auth_enabled(self) -> bool:
                 return True
 
-            def resolve(self, token: str) -> tuple[str, list[str]] | None:
-                # T5: resolve() now returns (contributor_id, roles) tuple.
+            def resolve(self, token: str) -> tuple[str, list[str], bool] | None:
+                # M2: resolve() now returns (contributor_id, roles, is_service) 3-tuple.
                 calls.append(token)
-                return ("tracked-user", [])
+                return ("tracked-user", [], False)
 
         app = AsyncMock()
         middleware = BearerTokenMiddleware(app, resolver=TrackingResolver())

@@ -8,7 +8,7 @@ digraph auth_flow {
         ranksep   = 0.8
         fontname  = "Helvetica"
         fontsize  = 11
-        label     = "Per-Request Authentication Flow\n(context_intelligence_server/auth.py \u2014 BearerTokenMiddleware  \u00b7  routers/admin.py  \u00b7  main.py \u2014 post_events)"
+        label     = "Per-Request Authentication Flow \u2014 M2 dual-path\n(auth.py \u2014 BearerTokenMiddleware  \u00b7  EntraResolver (user + service paths)  \u00b7  per-route require_write / require_read)"
         labelloc  = t
         labeljust = c
     ]
@@ -102,7 +102,7 @@ digraph auth_flow {
         ]
 
         InjectIdentity [
-            label     = "scope[\"state\"][\"contributor_id\"] = contributor_id\n\u2192 await self.app(scope, receive, send)"
+            label     = "scope[\"state\"][\"contributor_id\"] = contributor_id\nscope[\"state\"][\"roles\"] = roles\n\u2192 await self.app(scope, receive, send)"
             fillcolor = "#C8E6C9"
             fontname  = "Helvetica-Bold"
             penwidth  = 2.5
@@ -134,11 +134,11 @@ digraph auth_flow {
     }
 
     // ====================================================================
-    // ENTRA RESOLVER  (auth_mode=entra)
+    // ENTRA RESOLVER  (auth_mode=entra) \u2014 SHARED VALIDATION + USER PATH
     // ====================================================================
     subgraph cluster_entra {
         graph [
-            label     = "EntraResolver  (auth_mode=entra)  \u2014 auth.py\nMicrosoft Entra RS256 JWT; JWKS keys cached per kid (lifespan=300 s)\nmirrors Team Pulse identity/extractors.py"
+            label     = "EntraResolver  (auth_mode=entra)  \u2014 auth.py\nShared: JWKS sig / iss / aud / tid / exp (UNCHANGED)\nthen B1 idtyp-first fork \u2192 USER path (left) or SERVICE path (right) \u2192"
             style     = "filled"
             color     = "#0D47A1"
             fillcolor = "#E3F2FD"
@@ -163,6 +163,15 @@ digraph auth_flow {
             style     = filled
         ]
 
+        // -- B1 / B2: idtyp-first decision  (NEW \u2014 placed BEFORE ScpCheck) --------
+        IdtypCheck [
+            label     = "B1: idtyp-first decision\n(B2) normalize idtyp: non-str\u2192\"\", lower/strip\n\nidtyp==\"app\" AND scp absent?   \u2192  SERVICE path\nscp present AND idtyp!=\"app\"?  \u2192  USER path\nelse (ambiguous token)          \u2192  AuthError(401) fail-closed"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        // -- USER PATH  (existing \u2014 VISUALLY AND BEHAVIORALLY UNCHANGED) --------
         ScpCheck [
             label     = "\"access_as_user\" in\nclaims.get(\"scp\", \"\").split()?"
             shape     = diamond
@@ -178,15 +187,48 @@ digraph auth_flow {
         ]
 
         IdentityLookup [
-            label     = "identity_map.get(oid.lower())\n\u2192 contributor_id str  or  None"
+            label     = "identity_map.get(oid.lower())\n\u2192 contributor_id str  or  None\n(entra_identities \u2014 human oid map)"
             fillcolor = "#BBDEFB"
         ]
 
         OidMapped [
-            label     = "contributor_id found?"
+            label     = "contributor_id found?\n(mapped human oid)"
             shape     = diamond
             fillcolor = "#FFF9C4"
             style     = filled
+        ]
+    }
+
+    // ====================================================================
+    // SERVICE PATH  (NEW \u2014 M2: inside EntraResolver, parallel to user path)
+    // ====================================================================
+    subgraph cluster_service {
+        graph [
+            label     = "SERVICE PATH  (M2 new \u2014 inside EntraResolver)\napp/service tokens: idtyp==\"app\", scp absent\nManaged Identity / Federated Credential (GitHub OIDC / CI)"
+            style     = "filled"
+            color     = "#2E7D32"
+            fillcolor = "#E8F5E9"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        RoleGate [
+            label     = "Role gate \u2014 SOLE authz gate for service path\nroles \u220b Contributor   \u2192  write + read\nroles \u220b Reader        \u2192  read only\nroles \u220b IdentityAdmin  \u2192  admin\nNo role present?"
+            shape     = diamond
+            fillcolor = "#FFF9C4"
+            style     = filled
+        ]
+
+        ServiceCreatedBy [
+            label     = "created_by derivation  (STABLE CLAIMS ONLY \u2014 D7)\nTrusted map: service_identities[oid] \u2192 friendly name\n  (optional override \u2014 NOT a gate; no unmapped\u2192403 here)\nFallback (truthiness, NOT key-presence):\n  appid  \u2192  azp  \u2192  oid\nNEVER app_displayname  (caller-spoofable, often absent)\nFail-loud 403 if all stable claims absent  (B8)"
+            fillcolor = "#BBDEFB"
+        ]
+
+        ServiceContrib [
+            label     = "contributor_id = stable service id (str \u2014 never null)\n  map name (\"ci-pipeline\") or Azure GUID (appid/oid)\nroles = token roles claim\n\u2192 return (contributor_id, roles)"
+            fillcolor = "#C8E6C9"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
         ]
     }
 
@@ -212,9 +254,53 @@ digraph auth_flow {
     ]
 
     Exit403Auth [
-        label     = "HTTP 403  (auth_denied)\noid valid but not in identity_map\noperator action: add oid to entra_identities config"
+        label     = "HTTP 403  (auth_denied)\nUser path: oid valid but not in identity_map\noperator action: add oid to entra_identities config"
         shape     = oval
         fillcolor = "#FFCCBC"
+    ]
+
+    Exit403ServiceNoRole [
+        label     = "HTTP 403  (service \u2014 no role)\n\"app <appid> has no Contributor/Reader role\non this API \u2014 assign one in Entra app-role assignments\"\n(names missing role \u2014 acceptance criterion D7)"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
+    // ====================================================================
+    // PER-ROUTE AUTHORIZATION  (D2 \u2014 downstream of identity injection)
+    // ====================================================================
+    subgraph cluster_per_route_authz {
+        graph [
+            label     = "Per-Route Authorization  (D2 \u2014 auth.py)\nDepends(require_write) on POST /events\nDepends(require_read)  on POST /cypher + GET /blobs/*\nApplied after identity injection; before route handler"
+            style     = "filled"
+            color     = "#E65100"
+            fillcolor = "#FFF8E1"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        RequireWrite [
+            label     = "require_write  (POST /events)\nwrite-capable iff:\n  mapped contributor (str) AND roles\u220bContributor\n  OR service path with roles\u220bContributor\n(B3: contributor_id must be non-null \u2014 None \u2192 403)"
+            fillcolor = "#FFF3E0"
+            fontname  = "Helvetica-Bold"
+        ]
+
+        RequireRead [
+            label     = "require_read  (POST /cypher, GET /blobs/*)\nread-capable iff:\n  write-capable (above)\n  OR roles\u220bReader\nReader \u2192 write route = 403"
+            fillcolor = "#FFF3E0"
+            fontname  = "Helvetica-Bold"
+        ]
+    }
+
+    Exit403RouteAuthz [
+        label     = "HTTP 403  (insufficient capability)\nReader \u2192 write route: \"missing write capability\"\nor no read capability\n(names missing capability \u2014 acceptance criterion D2)"
+        shape     = oval
+        fillcolor = "#FFCCBC"
+    ]
+
+    DataReadExit [
+        label     = "POST /cypher / GET /blobs/* handler\n(route processes read request \u2192 200)"
+        shape     = oval
+        fillcolor = "#E3F2FD"
     ]
 
     // ====================================================================
@@ -244,7 +330,7 @@ digraph auth_flow {
     // ====================================================================
     subgraph cluster_post_events {
         graph [
-            label     = "POST /events  (main.py \u2014 post_events)\ncontributor_id already verified by middleware; stamped before queue append"
+            label     = "POST /events  (main.py \u2014 post_events)\ncontributor_id verified non-null by require_write; stamped before queue append"
             style     = "filled"
             color     = "#1565C0"
             fillcolor = "#E3F2FD"
@@ -275,7 +361,7 @@ digraph auth_flow {
         ]
 
         StampCreatedBy [
-            label     = "body_obj[\"created_by\"] = contributor_id\n(unconditional overwrite \u2014 prevents client spoofing)\nre-serialize as compact JSON"
+            label     = "body_obj[\"created_by\"] = contributor_id\n(unconditional overwrite \u2014 prevents client spoofing)\n(B3: contributor_id always non-null here \u2014 require_write enforces)\nre-serialize as compact JSON"
             fillcolor = "#F5F5F5"
         ]
 
@@ -347,38 +433,66 @@ digraph auth_flow {
     StaticLookup  -> ContribNone    [label = "result (str or None)"]
 
     // ====================================================================
-    // ENTRA RESOLVER EDGES
+    // ENTRA RESOLVER EDGES \u2014 SHARED VALIDATION
     // ====================================================================
-    JwksKey          -> JwtDecode
-    JwtDecode        -> TidCheck        [label = "claims decoded"]
-    TidCheck         -> ScpCheck        [label = "tid match"]
-    ScpCheck         -> OidCheck        [label = "scp ok"]
-    OidCheck         -> IdentityLookup  [label = "valid str"]
-    IdentityLookup   -> OidMapped
+    JwksKey       -> JwtDecode
+    JwtDecode     -> TidCheck       [label = "claims decoded"]
+    TidCheck      -> IdtypCheck     [label = "tid match"]
 
-    // Entra failure exits (all raise AuthError \u2014 caught by middleware)
-    JwksKey          -> AuthErrCatch  [label = "PyJWTError\n\u2192 AuthError(401)",          style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
-    JwtDecode        -> AuthErrCatch  [label = "PyJWTError\n\u2192 AuthError(401)",          style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
-    TidCheck         -> AuthErrCatch  [label = "wrong tenant\n\u2192 AuthError(401)",        style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
-    ScpCheck         -> AuthErrCatch  [label = "missing access_as_user\n\u2192 AuthError(401)", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
-    OidCheck         -> AuthErrCatch  [label = "non-str / empty oid\n\u2192 AuthError(401)", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
-    OidMapped        -> AuthErrCatch  [label = "None\n\u2192 AuthError(403)",               style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    // B1: idtyp-first fork  (NEW \u2014 BEFORE ScpCheck)
+    IdtypCheck    -> ScpCheck       [label = "scp present\nAND idtyp != \"app\"\n\u2192 USER path"]
+    IdtypCheck    -> RoleGate       [label = "idtyp==\"app\"\nAND scp absent\n\u2192 SERVICE path"]
+    IdtypCheck    -> AuthErrCatch   [label = "else (ambiguous\ne.g. scp+idtyp=app)\n\u2192 AuthError(401)\nfail closed", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
 
-    // Entra success \u2014 contributor_id str returns to middleware ContribNone check
-    OidMapped        -> ContribNone   [label = "contributor_id str"]
+    // Shared JWKS / JWT failure exits (all raise AuthError \u2014 caught by middleware)
+    JwksKey       -> AuthErrCatch   [label = "PyJWTError\n\u2192 AuthError(401)",          style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    JwtDecode     -> AuthErrCatch   [label = "PyJWTError\n\u2192 AuthError(401)",          style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    TidCheck      -> AuthErrCatch   [label = "wrong tenant\n\u2192 AuthError(401)",        style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+
+    // USER PATH edges  (UNCHANGED \u2014 Option A: delegated path byte-for-byte identical)
+    ScpCheck      -> OidCheck       [label = "scp ok\n(access_as_user)"]
+    OidCheck      -> IdentityLookup [label = "valid str"]
+    IdentityLookup -> OidMapped
+
+    ScpCheck      -> AuthErrCatch   [label = "missing access_as_user\n\u2192 AuthError(401)", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    OidCheck      -> AuthErrCatch   [label = "non-str / empty oid\n\u2192 AuthError(401)", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    OidMapped     -> AuthErrCatch   [label = "None\n\u2192 AuthError(403)",               style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+
+    // USER PATH success \u2014 contributor_id str returns to middleware ContribNone check
+    OidMapped     -> ContribNone    [label = "contributor_id str\n(mapped human)"]
+
+    // ====================================================================
+    // SERVICE PATH EDGES  (NEW \u2014 M2)
+    // ====================================================================
+    // Role gate: SOLE authz gate; no role \u2192 direct 403 naming the missing role
+    RoleGate      -> Exit403ServiceNoRole  [label = "no role\n\u2192 403\n(names missing role)", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    RoleGate      -> ServiceCreatedBy      [label = "role present\n(Contributor\n| Reader\n| IdentityAdmin)"]
+
+    // created_by derivation: stable claims only; fail-loud if all absent
+    ServiceCreatedBy -> AuthErrCatch       [label = "all stable claims\nabsent \u2192 403  (B8)", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    ServiceCreatedBy -> ServiceContrib     [label = "contributor_id\nresolved"]
+
+    // Service success \u2014 contributor_id str (stable id) returns to middleware
+    ServiceContrib -> ContribNone          [label = "contributor_id str\n(stable service id)"]
 
     // ====================================================================
     // POST-INJECT PATH DISPATCH
     // ====================================================================
-    InjectIdentity    -> PathDispatch
-    PathDispatch      -> AdminPath         [label = "/admin/*"]
-    PathDispatch      -> ValidateTimestamp [label = "data endpoint\n(e.g. POST /events)"]
-    AdminPath         -> ExitAdminResponse
+    InjectIdentity  -> PathDispatch
+    PathDispatch    -> AdminPath         [label = "/admin/*"]
+    PathDispatch    -> RequireWrite      [label = "POST /events"]
+    PathDispatch    -> RequireRead       [label = "POST /cypher\nGET /blobs/*"]
+    AdminPath       -> ExitAdminResponse
+
+    // Per-route capability checks
+    RequireWrite    -> ValidateTimestamp [label = "write-capable\n\u2192 proceed"]
+    RequireWrite    -> Exit403RouteAuthz [label = "no write cap\n\u2192 403", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    RequireRead     -> DataReadExit      [label = "read-capable\n\u2192 proceed"]
+    RequireRead     -> Exit403RouteAuthz [label = "no read cap\n\u2192 403", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
 
     // ====================================================================
     // POST /events FLOW EDGES
     // ====================================================================
-
     ValidateTimestamp -> Exit400           [label = "invalid"]
     ValidateTimestamp -> IdempotencyCheck  [label = "valid"]
     IdempotencyCheck  -> Exit202Dup        [label = "yes (duplicate)"]
@@ -407,7 +521,7 @@ digraph auth_flow {
             fillcolor = "#B2EBF2"
         ]
         LegBlue [
-            label     = "Entra JWT validation"
+            label     = "Entra JWT validation\n(shared + user path)"
             fillcolor = "#BBDEFB"
         ]
         LegGreen [
@@ -415,6 +529,15 @@ digraph auth_flow {
             fillcolor = "#C8E6C9"
             fontname  = "Helvetica-Bold"
             penwidth  = 2.5
+        ]
+        LegServiceGreen [
+            label     = "service path cluster\n(M2 new)"
+            fillcolor = "#E8F5E9"
+        ]
+        LegRouteAuthz [
+            label     = "handler-level node\n(/admin/* \u00b7 require_write \u00b7 require_read)"
+            fillcolor = "#FFF3E0"
+            fontname  = "Helvetica-Bold"
         ]
         LegOval [
             label     = "HTTP boundary"
@@ -433,12 +556,6 @@ digraph auth_flow {
             style     = filled
         ]
 
-        LegAdmin [
-            label     = "/admin/* handler\n(see diagram 08)"
-            fillcolor = "#FFF3E0"
-            fontname  = "Helvetica-Bold"
-        ]
-
-        LegTeal -> LegBlue -> LegGreen -> LegAdmin -> LegOval -> LegError -> LegDecision [style = invis]
+        LegTeal -> LegBlue -> LegGreen -> LegServiceGreen -> LegRouteAuthz -> LegOval -> LegError -> LegDecision [style = invis]
     }
 }

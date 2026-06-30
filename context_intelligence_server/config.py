@@ -45,6 +45,70 @@ _GUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 _ALL_ZEROS_GUID = "00000000-0000-0000-0000-000000000000"
 
 
+def _validate_identity_map(
+    v: dict[str, dict[str, str]] | None,
+    field_name: str,
+) -> dict[str, dict[str, str]] | None:
+    """Shared validator for GUID-keyed identity maps (entra_identities, service_identities).
+
+    Enforces the same rules for both fields so they stay in sync:
+
+    - ``None`` passes through (field is optional).
+    - An empty dict is rejected (fail-closed; omit or null-out to disable).
+    - Every key must be a valid lowercase GUID in 8-4-4-4-12 form after
+      normalization (rejects braces, urn:uuid: prefixes, trailing junk).
+    - The all-zeros GUID is rejected (placeholder sentinel).
+    - Every value must carry a non-empty, non-whitespace ``id`` string.
+    - Keys are normalized to lowercase and returned as such.
+
+    ``field_name`` is included verbatim in error messages so operators can tell
+    which field failed at startup.
+    """
+    if v is None:
+        return None
+    if len(v) == 0:
+        raise ValueError(
+            f"{field_name} must contain at least one entry if specified; "
+            "omit it or use null to disable"
+        )
+    normalized: dict[str, dict[str, str]] = {}
+    for oid, meta in v.items():
+        oid_lower = oid.lower()
+        if not _GUID_RE.fullmatch(oid_lower):
+            raise ValueError(
+                f"{field_name} key {oid!r} must be a valid GUID "
+                "(xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)"
+            )
+        if oid_lower == _ALL_ZEROS_GUID:
+            raise ValueError(
+                f"{field_name} key {oid!r} must not be the all-zeros GUID; "
+                "use the real oid from 'az ad signed-in-user show --query id -o tsv'"
+            )
+        contributor_id = meta.get("id")
+        if not isinstance(contributor_id, str) or not contributor_id.strip():
+            raise ValueError(
+                f"{field_name}[{oid!r}]['id'] must be a non-empty, "
+                f"non-whitespace string, got {contributor_id!r}"
+            )
+        normalized[oid_lower] = meta
+    return normalized
+
+
+def _build_identity_map_from(
+    identity_dict: dict[str, dict[str, str]] | None,
+) -> dict[str, str]:
+    """Shared helper: return ``{oid_lower -> id}`` for a GUID-keyed identity map.
+
+    Returns an empty dict when ``identity_dict`` is ``None`` or empty.
+    Keys are lowercased as a belt-and-suspenders guarantee: the field validator
+    already normalizes them, but both ``build_identity_map()`` and
+    ``build_service_identity_map()`` need identical casing behaviour.
+    """
+    if not identity_dict:
+        return {}
+    return {oid.lower(): meta["id"] for oid, meta in identity_dict.items()}
+
+
 class YamlConfigSettingsSource(PydanticBaseSettingsSource):
     """Load settings from a YAML configuration file.
 
@@ -289,56 +353,17 @@ class Settings(BaseSettings):
     ) -> dict[str, dict[str, str]] | None:
         """Fail-closed: raise unless every entry is ``<GUID> -> {"id": <non-empty str>}``.
 
-        Mirrors ``_validate_api_keys`` exactly, with GUID validation replacing
-        64-hex validation.
-
-        Rejects (by raising ``ValueError`` or pydantic ``ValidationError``):
-        - an explicitly empty dict (omit or null-out to disable Entra auth);
-        - a key that is not a valid GUID in 8-4-4-4-12 lowercase hex form after
-          normalization (rejects braces, urn:uuid: prefixes, trailing junk);
-        - the all-zeros GUID (placeholder sentinel);
-        - a value whose ``id`` is missing, empty, or whitespace-only.
+        Delegates to the shared ``_validate_identity_map()`` helper which enforces
+        GUID key validation, the all-zeros sentinel rejection, non-empty ``id``
+        requirement, and key lowercasing.  See that function's docstring for the
+        full rule set.
 
         This validator runs in ``mode="after"``, so pydantic has already coerced
         the field as ``dict[str, dict[str, str]]`` before this function is called.
         Non-dict values and non-string ``id`` values are caught by pydantic before
-        reaching this code.  The ``if not isinstance(contributor_id, str)`` check
-        fires only when the ``id`` key is *absent* from the dict.
-
-        GUID keys are normalized to lowercase before validation and returned as
-        lowercase so an UPPERCASE oid in a config file maps correctly to the
-        lowercase oid extracted from a JWT claim.
+        reaching this code.
         """
-        if v is None:
-            return None
-        # Fail-closed: an explicitly empty map is a misconfiguration.
-        # Omit entra_identities or set it to null to disable Entra auth.
-        if len(v) == 0:
-            raise ValueError(
-                "entra_identities must contain at least one entry if specified; "
-                "omit it or use null to disable Entra authentication"
-            )
-        normalized: dict[str, dict[str, str]] = {}
-        for oid, meta in v.items():
-            oid_lower = oid.lower()
-            if not _GUID_RE.fullmatch(oid_lower):
-                raise ValueError(
-                    f"entra_identities key {oid!r} must be a valid GUID "
-                    f"(xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)"
-                )
-            if oid_lower == _ALL_ZEROS_GUID:
-                raise ValueError(
-                    f"entra_identities key {oid!r} must not be the all-zeros GUID; "
-                    f"use the real oid from 'az ad signed-in-user show --query id -o tsv'"
-                )
-            contributor_id = meta.get("id")
-            if not isinstance(contributor_id, str) or not contributor_id.strip():
-                raise ValueError(
-                    f"entra_identities[{oid!r}]['id'] must be a non-empty, "
-                    f"non-whitespace string, got {contributor_id!r}"
-                )
-            normalized[oid_lower] = meta
-        return normalized
+        return _validate_identity_map(v, "entra_identities")
 
     @model_validator(mode="after")
     def _validate_entra_config(self) -> "Settings":
@@ -391,9 +416,47 @@ class Settings(BaseSettings):
         validator already normalizes them, but the resolver also lowercases the
         JWT ``oid`` claim before lookup, so both sides use the same casing.
         """
-        if not self.entra_identities:
-            return {}
-        return {oid.lower(): meta["id"] for oid, meta in self.entra_identities.items()}
+        return _build_identity_map_from(self.entra_identities)
+
+    # -------------------------------------------------------------------------
+    # M2 non-interactive auth: service / app-token identity path
+    # -------------------------------------------------------------------------
+    # service_identities: the OID → contributor map for service principals /
+    # managed identities.  Same shape as entra_identities; lives in config
+    # only (no durable store — service identities don't need runtime mutation).
+    #
+    # Shape: { "<oid-GUID>": {"id": "<contributor>"} }
+    #
+    # Validation rules are identical to entra_identities (both delegate to the
+    # shared _validate_identity_map() helper) — GUID keys, non-empty id, no
+    # all-zeros sentinel.
+    #
+    # This field is OPTIONAL.  The service identity path never participates in
+    # the _validate_entra_config cross-field check, so auth_mode=entra boots
+    # with only client_id / tenant_id / entra_identities.
+    service_identities: dict[str, dict[str, str]] | None = None
+
+    @field_validator("service_identities", mode="after")
+    @classmethod
+    def _validate_service_identities(
+        cls, v: dict[str, dict[str, str]] | None
+    ) -> dict[str, dict[str, str]] | None:
+        """Fail-closed: same GUID-map rules as entra_identities (shared helper).
+
+        Delegates to ``_validate_identity_map()``.  See that function's docstring
+        for the full rule set.
+        """
+        return _validate_identity_map(v, "service_identities")
+
+    def build_service_identity_map(self) -> dict[str, str]:
+        """Return ``{oid_lower -> contributor_id}`` for all configured service identities.
+
+        Mirrors ``build_identity_map()`` — returns a plain ``{key: contributor_id}``
+        dict for O(1) lookup after extracting the ``oid`` claim from an app token.
+
+        Returns ``{}`` when ``service_identities`` is ``None`` or empty.
+        """
+        return _build_identity_map_from(self.service_identities)
 
     # -------------------------------------------------------------------------
     # Admin API key (static mode only — gates /admin/* map-mutation endpoints)
@@ -430,6 +493,29 @@ class Settings(BaseSettings):
     @classmethod
     def _normalize_entra_admin_role(cls, v: object) -> str:
         """Normalize None → '' so that entra_admin_role: null disables the admin API."""
+        if v is None:
+            return ""
+        return str(v)
+
+    # M2 service role names
+    #
+    # service_data_role: the Entra App Role name whose presence in an app token's
+    # ``roles`` claim grants the standard Contributor-level data access.  This
+    # mirrors what a delegated user gets via entra_identities, but for service
+    # principals.  Empty string ('') disables the service data path entirely.
+    #
+    # reader_role: the Entra App Role name granting read-only access.  Empty string
+    # disables read-only app-token gating.  Default 'Reader' matches the App
+    # Registration role defined for the M2 service path.
+    #
+    # Both fields normalize None → '' (same pattern as entra_admin_role).
+    service_data_role: str = "Contributor"
+    reader_role: str = "Reader"
+
+    @field_validator("service_data_role", "reader_role", mode="before")
+    @classmethod
+    def _normalize_service_role_fields(cls, v: object) -> str:
+        """Normalize None → '' so that null in config disables the respective role."""
         if v is None:
             return ""
         return str(v)

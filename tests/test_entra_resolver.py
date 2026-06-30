@@ -170,7 +170,7 @@ class TestEntraResolverMockSeam:
             mock_jwt.decode.return_value = claims
             mock_jwt.PyJWTError = __import__("jwt", fromlist=["PyJWTError"]).PyJWTError
             result = resolver.resolve("dummy-token")
-        contributor_id, _roles = result
+        contributor_id, _roles, _is_service = result  # M2: 3-tuple
         return contributor_id
 
     def _resolve_raises_jwt_error(self, exc: Exception) -> "Any":
@@ -287,8 +287,14 @@ class TestEntraResolverMockSeam:
 
     # -- AC3: missing scp → 401 --------------------------------------------
 
-    def test_missing_scp_raises_auth_error_401(self) -> None:
-        """AC3: scp claim absent → AuthError(401)."""
+    def test_missing_scp_raises_auth_error_403(self) -> None:
+        """M2 behavior: scp claim absent → service branch → no qualifying role → AuthError(403).
+
+        V1 behavior was AuthError(401) (missing scope, user branch).
+        Phase 2 routes no-scp tokens to the service branch; with default resolver
+        (all role names empty) there is no qualifying role → 403 (not 401).
+        The crash/500 is still prevented; the status code changed.
+        """
         from context_intelligence_server.auth import AuthError
 
         claims = _valid_claims()
@@ -301,7 +307,7 @@ class TestEntraResolverMockSeam:
             mock_jwt.decode.return_value = claims
             with pytest.raises(AuthError) as exc_info:
                 resolver.resolve("dummy-token")
-        assert exc_info.value.status_code == 401
+        assert exc_info.value.status_code == 403
 
     def test_wrong_scp_raises_auth_error_401(self) -> None:
         """AC3: scp without 'access_as_user' → AuthError(401)."""
@@ -440,9 +446,9 @@ class TestEntraResolverRealCrypto:
         resolver = _make_real_crypto_resolver(public_key)
         token = _sign_jwt(private_key, _valid_real_claims())
         result = resolver.resolve(token)
-        # T5 protocol change: resolve() returns (contributor_id, roles) tuple.
+        # M2 protocol change: resolve() returns (contributor_id, roles, is_service) 3-tuple.
         assert result is not None
-        contributor_id, _roles = result
+        contributor_id, _roles, _is_service = result  # M2: 3-tuple
         assert contributor_id == FAKE_CONTRIBUTOR
 
     # -- Dual-aud: bare GUID AND api:// both succeed (§9 Q-AUD) -----------
@@ -763,12 +769,15 @@ class TestEntraResolverBugRepros:
             self._resolve_with_claims(claims)
         assert exc_info.value.status_code == 401
 
-    def test_fail2_scp_list_raises_auth_error_401_not_attribute_error(self) -> None:
-        """FAIL-2 repro: scp=["access_as_user"] (list) → AuthError(401), NOT AttributeError.
+    def test_fail2_scp_list_raises_auth_error_not_attribute_error(self) -> None:
+        """FAIL-2 repro: scp=["access_as_user"] (list) → AuthError (no crash), NOT AttributeError.
 
         Before fix: truthy list passes ``or ""`` fallback, then ``scp.split()``
         raises AttributeError — escapes as unhandled 500.
-        After fix:  isinstance guard coerces to "" → missing scope → AuthError(401).
+        After V1 fix: isinstance guard coerces to "" → missing scope → AuthError(401).
+        After M2: list scp → "" → no scp → service branch → no qualifying role
+        (default resolver has empty role names) → AuthError(403).
+        The key invariant is preserved: no crash, graceful auth rejection.
         """
         from context_intelligence_server.auth import AuthError
 
@@ -778,7 +787,8 @@ class TestEntraResolverBugRepros:
         ]  # truthy list — exercises the isinstance guard
         with pytest.raises(AuthError) as exc_info:
             self._resolve_with_claims(claims)
-        assert exc_info.value.status_code == 401
+        # M2 behavior: service branch → no qualifying role → 403 (changed from 401 in V1).
+        assert exc_info.value.status_code == 403
 
     def test_fail3_whitespace_oid_raises_auth_error_401_not_403(self) -> None:
         """FAIL-3 repro: oid='   ' (whitespace-only) → AuthError(401), NOT 403.
@@ -837,13 +847,21 @@ class TestEntraResolverScpCoverage:
             self._resolve_with_claims(_valid_claims(scp="xaccess_as_user"))
         assert exc_info.value.status_code == 401
 
-    def test_app_only_token_with_roles_no_scp_is_rejected(self) -> None:
-        """App-only token: 'roles' present but no 'scp' → 401 (delegated flow required in V1)."""
+    def test_app_only_token_with_unrecognized_role_is_rejected(self) -> None:
+        """App-only token: 'roles' present but no 'scp' → M2 service branch → 403.
+
+        V1 behavior: 401 (delegated flow required, rejected in user branch).
+        M2 behavior: no scp → service branch → role "Directory.Read.All" is not a
+        configured App Role (default resolver has empty role names) → AuthError(403).
+        This is the RG-unknown case: service token with an unrecognized role.
+        """
         from context_intelligence_server.auth import AuthError
 
         claims = _valid_claims()
         del claims["scp"]
-        claims["roles"] = ["Directory.Read.All"]  # app-only token pattern
+        claims["roles"] = [
+            "Directory.Read.All"
+        ]  # app-only token, not a configured role
         resolver = _make_resolver()
         with patch("context_intelligence_server.auth.jwt") as mock_jwt:
             import jwt as real_jwt
@@ -852,7 +870,8 @@ class TestEntraResolverScpCoverage:
             mock_jwt.decode.return_value = claims
             with pytest.raises(AuthError) as exc_info:
                 resolver.resolve("dummy-token")
-        assert exc_info.value.status_code == 401
+        # M2 behavior: service branch → no qualifying configured role → 403.
+        assert exc_info.value.status_code == 403
 
 
 # ===========================================================================
@@ -1050,3 +1069,503 @@ class TestEntraResolverEmptyJWKS:
                 identity_map=FAKE_IDENTITY_MAP,
                 jwks_client=_EmptyJWKSClient(),
             )
+
+
+# ===========================================================================
+# M2 SERVICE BRANCH — §7 test matrix (resolver level)
+# ===========================================================================
+
+# Additional fake constants for service tests
+FAKE_SERVICE_OID = "aaaabbbb-1111-1111-1111-ccccddddffff"
+FAKE_APPID = "bbbbcccc-2222-3333-4444-eeeeffff0000"
+FAKE_AZP = "ccccdddd-3333-4444-5555-ffff00001111"
+FAKE_SERVICE_CONTRIBUTOR = "svc-contributor"
+
+
+def _service_claims(
+    oid: str = FAKE_SERVICE_OID,
+    tid: str = FAKE_TENANT_ID,
+    roles: list[str] | None = None,
+    appid: str | None = None,
+    azp: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a minimal valid service-token claims dict (no scp)."""
+    now = int(time.time())
+    claims: dict[str, Any] = {
+        "oid": oid,
+        "tid": tid,
+        "aud": FAKE_CLIENT_ID,
+        "iss": FAKE_ISSUER,
+        "exp": now + 3600,
+        "iat": now - 10,
+        # Deliberately NO "scp" — service / app-only token
+    }
+    if roles is not None:
+        claims["roles"] = roles
+    if appid is not None:
+        claims["appid"] = appid
+    if azp is not None:
+        claims["azp"] = azp
+    if extra:
+        claims.update(extra)
+    return claims
+
+
+def _make_service_resolver(
+    service_map: dict[str, str] | None = None,
+    service_data_role: str = "Contributor",
+    reader_role: str = "Reader",
+    entra_admin_role: str = "IdentityAdmin",
+) -> "Any":
+    """Build an EntraResolver configured with M2 service roles."""
+    from context_intelligence_server.auth import EntraResolver
+
+    return EntraResolver(
+        client_id=FAKE_CLIENT_ID,
+        tenant_id=FAKE_TENANT_ID,
+        identity_map=FAKE_IDENTITY_MAP,
+        service_identity_map=service_map or {},
+        service_data_role=service_data_role,
+        reader_role=reader_role,
+        entra_admin_role=entra_admin_role,
+        jwks_client=_StubJWKSClient("dummy-key"),
+    )
+
+
+class TestM2ServiceBranch:
+    """M2 §7 resolver-level tests — service / app-token path.
+
+    Uses the mock-seam pattern: jwt.decode is patched to return crafted claims
+    dicts.  Tests cover the full §7 matrix (B1/B2/B6/B8/B7/RG/SV/HR/ST rows).
+    """
+
+    def _resolve_service(
+        self,
+        claims: dict[str, Any],
+        resolver: "Any" = None,
+    ) -> "tuple[str, list[str], bool]":
+        """Patch jwt.decode → claims; call resolve(); return 3-tuple."""
+        if resolver is None:
+            resolver = _make_service_resolver()
+        with patch("context_intelligence_server.auth.jwt") as mock_jwt:
+            import jwt as real_jwt
+
+            mock_jwt.PyJWTError = real_jwt.PyJWTError
+            mock_jwt.decode.return_value = claims
+            result = resolver.resolve("dummy-token")
+        assert result is not None
+        return result  # type: ignore[return-value]
+
+    def _resolve_raises(
+        self,
+        claims: dict[str, Any],
+        resolver: "Any" = None,
+    ) -> "Any":
+        """Patch jwt.decode → claims; call resolve(); return raised AuthError."""
+        from context_intelligence_server.auth import AuthError
+
+        if resolver is None:
+            resolver = _make_service_resolver()
+        with patch("context_intelligence_server.auth.jwt") as mock_jwt:
+            import jwt as real_jwt
+
+            mock_jwt.PyJWTError = real_jwt.PyJWTError
+            mock_jwt.decode.return_value = claims
+            with pytest.raises(AuthError) as exc_info:
+                resolver.resolve("dummy-token")
+        return exc_info.value
+
+    # -- B1: mutual exclusion anomaly ----------------------------------------
+
+    def test_b1a_scp_and_idtyp_app_raises_401_ambiguous(self) -> None:
+        """B1-a: scp="access_as_user" AND idtyp="app" → AuthError(401) "Ambiguous token..."."""
+        from context_intelligence_server.auth import AuthError
+
+        claims = _valid_claims()  # has scp="access_as_user"
+        claims["idtyp"] = "app"  # add idtyp=app — anomalous combination
+
+        resolver = _make_service_resolver()
+        with patch("context_intelligence_server.auth.jwt") as mock_jwt:
+            import jwt as real_jwt
+
+            mock_jwt.PyJWTError = real_jwt.PyJWTError
+            mock_jwt.decode.return_value = claims
+            with pytest.raises(AuthError) as exc_info:
+                resolver.resolve("dummy-token")
+        err = exc_info.value
+        assert err.status_code == 401
+        assert "Ambiguous" in err.reason
+
+    def test_b1b_no_scp_no_idtyp_service_admitted(self) -> None:
+        """B1-b: no scp, no idtyp, roles=["Contributor"], appid → service admitted."""
+        claims = _service_claims(roles=["Contributor"], appid=FAKE_APPID)
+        cid, roles, is_service = self._resolve_service(claims)
+        assert cid == FAKE_APPID
+        assert roles == ["Contributor"]
+        assert is_service is True
+
+    # -- B2: idtyp normalization ---------------------------------------------
+
+    def test_b2a_idtyp_mixed_case_space_service_branch(self) -> None:
+        """B2-a: idtyp=" App " (mixed case+space) → normalized "app"; service branch admitted."""
+        claims = _service_claims(roles=["Reader"])
+        claims["idtyp"] = " App "  # mixed case + surrounding whitespace
+        # has_scp=False → B1 check is False → service branch
+        cid, roles, is_service = self._resolve_service(
+            claims, resolver=_make_service_resolver()
+        )
+        assert is_service is True
+        assert roles == ["Reader"]
+
+    def test_b2b_idtyp_int_normalized_to_empty(self) -> None:
+        """B2-b: idtyp=123 (int) → normalized to ""; service branch; admit/deny by roles."""
+        claims = _service_claims(roles=["Contributor"])
+        claims["idtyp"] = 123  # int, not str → normalized to ""
+        cid, roles, is_service = self._resolve_service(claims)
+        assert is_service is True
+        assert roles == ["Contributor"]
+
+    # -- B6: created_by derivation chain -------------------------------------
+
+    def test_b6a_service_map_wins_over_appid(self) -> None:
+        """B6-a: oid in service_identity_map → created_by = mapped contributor id."""
+        service_map = {FAKE_SERVICE_OID.lower(): FAKE_SERVICE_CONTRIBUTOR}
+        claims = _service_claims(
+            oid=FAKE_SERVICE_OID,
+            appid=FAKE_APPID,  # map wins over appid
+            roles=["Contributor"],
+        )
+        cid, _, is_service = self._resolve_service(
+            claims, resolver=_make_service_resolver(service_map=service_map)
+        )
+        assert cid == FAKE_SERVICE_CONTRIBUTOR
+        assert is_service is True
+
+    def test_b6b_blank_appid_falls_through_to_azp(self) -> None:
+        """B6-b: map miss, appid blank → falls through to azp → created_by = azp."""
+        claims = _service_claims(
+            oid=FAKE_SERVICE_OID,
+            appid="  ",  # blank — skipped by _first_nonblank
+            azp=FAKE_AZP,
+            roles=["Reader"],
+        )
+        cid, _, _ = self._resolve_service(claims)
+        assert cid == FAKE_AZP
+
+    def test_b6c_oid_last_resort(self) -> None:
+        """B6-c: map miss, no appid, no azp → created_by = oid (last resort)."""
+        claims = _service_claims(oid=FAKE_SERVICE_OID, roles=["Contributor"])
+        # No appid, no azp in claims
+        cid, _, is_service = self._resolve_service(claims)
+        assert cid == FAKE_SERVICE_OID
+        assert is_service is True
+
+    # -- B8: anti-spoof — app_displayname must never be used -----------------
+
+    def test_b8_anti_spoof_app_displayname_not_used(self) -> None:
+        """B8: app_displayname="alice@contoso.com" (a human UPN) → created_by = appid, NOT display name.
+
+        app_displayname is operator-mutable in Entra (spoofable).  It is deliberately
+        excluded from the derivation chain.  A service whose app_displayname happens
+        to look like a human UPN must never inherit that UPN as its created_by.
+        """
+        claims = _service_claims(
+            oid=FAKE_SERVICE_OID,
+            appid=FAKE_APPID,
+            roles=["Contributor"],
+        )
+        claims["app_displayname"] = "alice@contoso.com"  # human-looking display name
+        cid, _, _ = self._resolve_service(claims)
+        assert cid == FAKE_APPID, "created_by must be appid, not app_displayname"
+        assert cid != "alice@contoso.com", (
+            "app_displayname must never become created_by"
+        )
+
+    # -- B7: aud / iss enforced in shared validation (no new code) -----------
+
+    def test_b7_aud_wrong_raises_401_before_service_branch(self) -> None:
+        """B7-aud: wrong aud → AuthError(401) at jwt.decode; service branch never reached."""
+        from context_intelligence_server.auth import AuthError
+
+        resolver = _make_service_resolver()
+        with patch("context_intelligence_server.auth.jwt") as mock_jwt:
+            import jwt as real_jwt
+
+            mock_jwt.PyJWTError = real_jwt.PyJWTError
+            mock_jwt.decode.side_effect = real_jwt.InvalidAudienceError("bad aud")
+            with pytest.raises(AuthError) as exc_info:
+                resolver.resolve("dummy-token")
+        assert exc_info.value.status_code == 401
+
+    def test_b7_iss_wrong_raises_401_before_service_branch(self) -> None:
+        """B7-iss: wrong iss → AuthError(401) at jwt.decode; service branch never reached."""
+        from context_intelligence_server.auth import AuthError
+
+        resolver = _make_service_resolver()
+        with patch("context_intelligence_server.auth.jwt") as mock_jwt:
+            import jwt as real_jwt
+
+            mock_jwt.PyJWTError = real_jwt.PyJWTError
+            mock_jwt.decode.side_effect = real_jwt.InvalidIssuerError("bad iss")
+            with pytest.raises(AuthError) as exc_info:
+                resolver.resolve("dummy-token")
+        assert exc_info.value.status_code == 401
+
+    # -- RG: role gate -------------------------------------------------------
+
+    def test_rg_none_no_roles_raises_403_naming_roles(self) -> None:
+        """RG-none: service token, roles=[] → AuthError(403) naming Contributor/Reader + principal.
+
+        Security R1: the raw roles list must NOT appear in the reason.
+        User-advocate: the rejected principal identifier (appid or oid) must appear.
+        _service_claims(roles=[]) has no appid → oid (FAKE_SERVICE_OID) is used.
+        """
+        err = self._resolve_raises(_service_claims(roles=[]))
+        assert err.status_code == 403
+        assert "Contributor" in err.reason
+        assert "Reader" in err.reason
+        # Principal identifier (oid as fallback since no appid in this call).
+        assert FAKE_SERVICE_OID in err.reason, (
+            f"403 reason must name the rejected principal oid {FAKE_SERVICE_OID!r}: "
+            f"{err.reason!r}"
+        )
+        # Raw roles list must NOT be echoed (security R1).
+        assert "roles=" not in err.reason, (
+            f"403 reason must NOT echo the raw roles claim: {err.reason!r}"
+        )
+
+    def test_rg_unknown_unrecognized_role_raises_403(self) -> None:
+        """RG-unknown: service token, roles=["SomethingElse"] → AuthError(403)."""
+        err = self._resolve_raises(_service_claims(roles=["SomethingElse"]))
+        assert err.status_code == 403
+
+    def test_rg_reader_admitted(self) -> None:
+        """RG-reader: service token, roles=["Reader"] → admitted (…, ["Reader"], True)."""
+        claims = _service_claims(roles=["Reader"], appid=FAKE_APPID)
+        cid, roles, is_service = self._resolve_service(claims)
+        assert is_service is True
+        assert "Reader" in roles
+
+    def test_rg_disabled_empty_reader_role_raises_403(self) -> None:
+        """RG-disabled: reader_role="" disables that role → AuthError(403) for a Reader token."""
+        claims = _service_claims(roles=["Reader"], appid=FAKE_APPID)
+        # Build resolver with reader_role disabled
+        resolver = _make_service_resolver(
+            reader_role="", service_data_role="Contributor"
+        )
+        err = self._resolve_raises(claims, resolver=resolver)
+        assert err.status_code == 403
+
+    # -- SV-ADM: service IdentityAdmin path ----------------------------------
+
+    def test_sv_adm_identity_admin_admitted(self) -> None:
+        """SV-ADM: service token with IdentityAdmin role admitted; (…, ["IdentityAdmin"], True)."""
+        claims = _service_claims(roles=["IdentityAdmin"], appid=FAKE_APPID)
+        cid, roles, is_service = self._resolve_service(claims)
+        assert is_service is True
+        assert "IdentityAdmin" in roles
+
+    # -- HR: human regression (delegated path unchanged) ----------------------
+
+    def test_hr1_human_unmapped_oid_raises_403(self) -> None:
+        """HR1: human token, oid NOT in identity_map → AuthError(403) — unchanged from V1."""
+        err = self._resolve_raises(_valid_claims(oid=FAKE_OID_2))
+        assert err.status_code == 403
+        assert FAKE_OID_2.lower() in err.reason.lower()
+
+    def test_hr2_human_happy_path_returns_false_is_service(self) -> None:
+        """HR2: human token, mapped oid, roles=["x"] → (contributor, ["x"], False)."""
+        claims = _valid_claims(oid=FAKE_OID_1)
+        claims["roles"] = ["x"]
+        cid, roles, is_service = self._resolve_service(claims)
+        assert cid == FAKE_CONTRIBUTOR
+        assert roles == ["x"]
+        assert is_service is False  # human path: is_service=False
+
+    def test_hr3_human_bad_scp_stays_in_user_branch_401(self) -> None:
+        """HR3: scp="other" (present, not access_as_user) → stays in user branch → AuthError(401)."""
+        err = self._resolve_raises(_valid_claims(scp="other"))
+        assert err.status_code == 401
+
+    # -- ST1: StaticKeyResolver returns is_service=False ---------------------
+
+    def test_st1_static_resolver_returns_3tuple_is_service_false(self) -> None:
+        """ST1: StaticKeyResolver returns (contributor_id, [], False); miss → None."""
+        import hashlib
+
+        from context_intelligence_server.auth import StaticKeyResolver
+
+        token = "test-static-token"
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        resolver = StaticKeyResolver({digest: "static-contributor"})
+
+        result = resolver.resolve(token)
+        assert result is not None
+        cid, roles, is_service = result
+        assert cid == "static-contributor"
+        assert roles == []
+        assert is_service is False  # ST1: static tokens always write-capable
+
+        # Miss → None (backward-compat)
+        assert resolver.resolve("wrong-token") is None
+
+
+# ===========================================================================
+# M2 SERVICE BRANCH — EDGE CASE TESTS (§4 of security fix)
+# ===========================================================================
+
+
+class TestM2ServiceBranchEdgeCases:
+    """Four targeted edge-case tests for the service (app-token) branch.
+
+    These tests use the mock-seam pattern (jwt.decode patched) for speed
+    and to exercise specific claim combinations.
+
+    B1-collision — runtime oid collision: no-scp SERVICE token whose oid
+                   also exists in the human identity_map → service branch wins.
+    foreign-tid  — SERVICE token with wrong tid → AuthError(401).
+    roles-case   — roles=["contributor"] (wrong case) vs "Contributor" → 403
+                   (membership is case-sensitive; pin so a future lowercasing
+                   helper cannot silently leak privilege).
+    roles-nonlist — roles as a bare string → normalized to [] → 403.
+    """
+
+    def _resolve_service(
+        self,
+        claims: dict[str, Any],
+        resolver: "Any" = None,
+    ) -> "tuple[str, list[str], bool]":
+        """Patch jwt.decode → claims; call resolve(); return 3-tuple."""
+        if resolver is None:
+            resolver = _make_service_resolver()
+        with patch("context_intelligence_server.auth.jwt") as mock_jwt:
+            import jwt as real_jwt
+
+            mock_jwt.PyJWTError = real_jwt.PyJWTError
+            mock_jwt.decode.return_value = claims
+            result = resolver.resolve("dummy-token")
+        assert result is not None
+        return result  # type: ignore[return-value]
+
+    def _resolve_raises(
+        self,
+        claims: dict[str, Any],
+        resolver: "Any" = None,
+    ) -> "Any":
+        """Patch jwt.decode → claims; call resolve(); return raised AuthError."""
+        from context_intelligence_server.auth import AuthError
+
+        if resolver is None:
+            resolver = _make_service_resolver()
+        with patch("context_intelligence_server.auth.jwt") as mock_jwt:
+            import jwt as real_jwt
+
+            mock_jwt.PyJWTError = real_jwt.PyJWTError
+            mock_jwt.decode.return_value = claims
+            with pytest.raises(AuthError) as exc_info:
+                resolver.resolve("dummy-token")
+        return exc_info.value
+
+    # -- B1-collision: service branch wins even when oid is in human map -----
+
+    def test_b1_collision_oid_in_human_map_routes_to_service_branch(self) -> None:
+        """B1 runtime collision: no-scp token whose oid is in the human map → service branch.
+
+        The discriminator is scp-ONLY: no scp → service branch, regardless of
+        whether the oid appears in the human identity_map.  The human map lookup
+        only happens in the user branch (has_scp=True).
+
+        This proves that even a misconfigured deployment (same oid in both maps,
+        which B4 prevents at boot) routes correctly at request time:
+        the service branch is taken before the human map is ever consulted.
+        """
+        # FAKE_OID_1 is in FAKE_IDENTITY_MAP (human map) — deliberate collision.
+        claims = _service_claims(
+            oid=FAKE_OID_1,  # exists in human identity_map
+            roles=["Contributor"],
+            appid=FAKE_APPID,
+        )
+        # Build resolver where the SAME oid is in both human map and service map.
+        # (This bypasses B4 which only runs at create_asgi_app time.)
+        resolver = _make_service_resolver(
+            service_map={FAKE_OID_1.lower(): "svc-identity"}
+        )
+        cid, roles, is_service = self._resolve_service(claims, resolver=resolver)
+
+        assert is_service is True, (
+            "No-scp token must route to the SERVICE branch (is_service=True) "
+            "regardless of the oid appearing in the human identity_map."
+        )
+        assert cid == "svc-identity", (
+            f"created_by must come from the service map, not the human map. Got {cid!r}"
+        )
+        assert FAKE_CONTRIBUTOR not in [cid], (
+            f"Human map value {FAKE_CONTRIBUTOR!r} must never be used for a service token."
+        )
+
+    # -- foreign-tid: AuthError(401) at shared validation --------------------
+
+    def test_foreign_tid_service_token_raises_401(self) -> None:
+        """Foreign-tid SERVICE token → AuthError(401) at shared validation (before service branch).
+
+        The tid check happens before the scp discriminator.  A service token
+        from a different tenant must be rejected at 401, not 403, and the
+        service branch must never be reached.
+        """
+        claims = _service_claims(
+            tid="00000000-0000-0000-0000-999999999999",  # wrong tenant
+            roles=["Contributor"],
+            appid=FAKE_APPID,
+        )
+        err = self._resolve_raises(claims)
+        assert err.status_code == 401, (
+            f"Foreign-tid service token must → 401, got {err.status_code}: {err.reason!r}"
+        )
+
+    # -- roles case-variant: case-sensitive membership -----------------------
+
+    def test_roles_lowercase_case_variant_raises_403(self) -> None:
+        """Service token roles=["contributor"] (lowercase) vs "Contributor" → 403.
+
+        Role membership is CASE-SENSITIVE and EXACT.  A token with
+        roles=["contributor"] (all-lowercase) does NOT match the configured
+        service_data_role="Contributor".
+
+        This test PINS the case-sensitive behavior so a future "helpful"
+        lowercasing helper cannot silently grant privilege to a mis-cased role.
+        """
+        claims = _service_claims(
+            roles=["contributor"],  # lowercase — wrong case
+            appid=FAKE_APPID,
+        )
+        # Resolver configured with service_data_role="Contributor" (capital C)
+        resolver = _make_service_resolver(service_data_role="Contributor")
+        err = self._resolve_raises(claims, resolver=resolver)
+        assert err.status_code == 403, (
+            f"Lowercase 'contributor' must NOT match 'Contributor' (case-sensitive): "
+            f"got status={err.status_code}, reason={err.reason!r}"
+        )
+
+    # -- roles non-list: normalized to [] → 403 ------------------------------
+
+    def test_roles_as_bare_string_normalized_to_empty_list_403(self) -> None:
+        """SERVICE token with roles as a bare string → normalized to [] → 403.
+
+        The roles normalization logic:
+            isinstance(_roles_raw, list) → [r for r in list if isinstance(r, str)]
+            otherwise                    → []
+
+        A bare string (not a list) is not a legitimate Entra roles value.
+        It must be normalized to [] (no roles) and rejected with 403, not
+        accidentally treated as a single-element list.
+        """
+        claims = _service_claims(appid=FAKE_APPID)
+        # Inject roles as a bare string — not a list
+        claims["roles"] = "Contributor"  # type: ignore[assignment]
+
+        err = self._resolve_raises(claims)
+        assert err.status_code == 403, (
+            f"roles='Contributor' (bare string) must normalize to [] and → 403, "
+            f"got status={err.status_code}, reason={err.reason!r}"
+        )

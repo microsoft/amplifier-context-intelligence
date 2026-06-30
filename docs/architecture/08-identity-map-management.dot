@@ -8,7 +8,7 @@ digraph identity_map_management {
         ranksep   = 0.80
         fontname  = "Helvetica"
         fontsize  = 11
-        label     = "Runtime Identity-Map Management \u2014 Admin API + Live Store\n(context_intelligence_server/routers/admin.py \u00b7 identity_store.py \u00b7 auth.py)"
+        label     = "Runtime Identity-Map Management \u2014 Admin API + Live Store\n(context_intelligence_server/routers/admin.py \u00b7 identity_store.py \u00b7 auth.py)\nM2: /admin/identities + /admin/keys CRUD UNCHANGED \u00b7 service_identities is static config only (no /admin/services \u2014 see annotation below)"
         labelloc  = t
         labeljust = c
     ]
@@ -431,6 +431,38 @@ digraph identity_map_management {
     EffLookup     -> EffResolved
 
     // ====================================================================
+    // SERVICE IDENTITIES \u2014 STATIC CONFIG ANNOTATION
+    // (explicitly outside the runtime-CRUD scope of this diagram)
+    // ====================================================================
+    subgraph cluster_service_static {
+        graph [
+            label     = "service_identities \u2014 STATIC CONFIG  (outside this diagram\u2019s scope)\nno /admin/services endpoint \u00b7 no IdentityStore \u00b7 no durable file on /data"
+            style     = "dashed"
+            color     = "#E65100"
+            fillcolor = "#FFF3E0"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        ServiceStaticNote [
+            label     = "service_identities \u2014 STATIC CONFIG ONLY\n\u2022 Plain dict built at boot: build_service_identity_map()\n\u2022 Source: settings.service_identities (env-var / config)\n\u2022 NOT an IdentityStore \u00b7 NO durable file on /data\n\u2022 NO /admin/services endpoint (deliberately excluded)\n   \u2014 adding a service caller = config change + redeploy\n\u2022 Passed as read-only reference to EntraResolver at boot\n\u2022 B4: disjoint from entra_identities by startup invariant\n   (see diagram 07 for boot wiring + B4 gate)\n\u2022 Optional friendly-name override; NOT an authz gate"
+            fillcolor = "#FFF3E0"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+    }
+
+    // Annotation edge: contrast live entra dict (runtime-mutable) with static service map
+    LiveEntra -> ServiceStaticNote [
+        label      = "contrast: service_identities\nis static config, not via\nIdentityStore / /admin/*"
+        style      = dashed
+        color      = "#E65100"
+        fontcolor  = "#E65100"
+        constraint = false
+        arrowhead  = open
+    ]
+
+    // ====================================================================
     // LEGEND
     // ====================================================================
     subgraph cluster_legend {
@@ -467,6 +499,10 @@ digraph identity_map_management {
             style     = filled
             fillcolor = "#FFF8E1"
         ]
+        LegOrange [
+            label     = "static config annotation\n(no CRUD / no /admin/* API)"
+            fillcolor = "#FFF3E0"
+        ]
         LegOval [
             label     = "HTTP boundary"
             shape     = oval
@@ -484,6 +520,6 @@ digraph identity_map_management {
             style     = filled
         ]
 
-        LegTeal -> LegGreen -> LegBlue -> LegGrey -> LegFile -> LegOval -> LegError -> LegDiamond [style = invis]
+        LegTeal -> LegGreen -> LegBlue -> LegGrey -> LegFile -> LegOrange -> LegOval -> LegError -> LegDiamond [style = invis]
     }
 }
