@@ -113,7 +113,7 @@ jobs:
       - name: Acquire access token for api://${AZURE_CLIENT_ID}/.default
         id: get_token
         run: |
-          TOKEN=$(az account get-access-token --resource "api://${{ vars.AZURE_CLIENT_ID }}" --query accessToken -o tsv)
+          TOKEN=$(az account get-access-token --scope "api://${{ vars.AZURE_CLIENT_ID }}/.default" --query accessToken -o tsv)
           if [ -z "$TOKEN" ]; then
             echo "::error::az account get-access-token returned no token. Check the federated credential subject and the resource URI api://${{ vars.AZURE_CLIENT_ID }}."
             exit 1
@@ -389,7 +389,7 @@ jobs:
         if: ${{ vars.ACCEPTANCE_SERVER_URL != '' && vars.AZURE_READER_CLIENT_ID != '' }}
         continue-on-error: true
         run: |
-          READER_TOKEN=$(az account get-access-token --resource "api://${{ vars.AZURE_CLIENT_ID }}" --query accessToken -o tsv)
+          READER_TOKEN=$(az account get-access-token --scope "api://${{ vars.AZURE_CLIENT_ID }}/.default" --query accessToken -o tsv)
           if [ -z "$READER_TOKEN" ]; then
             echo "::error::Failed to acquire a Reader-scoped access token via AZURE_READER_CLIENT_ID"
             exit 1
