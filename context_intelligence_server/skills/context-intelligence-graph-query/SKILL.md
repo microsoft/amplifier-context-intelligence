@@ -954,6 +954,13 @@ ORDER BY tc.started_at
 LIMIT 50
 ```
 
+> **Bind `$cutoff_time` as a temporal, not a string.** Pass a Python `datetime`
+> object (the driver converts it to ZONED DATETIME) or wrap a literal as
+> `datetime('2026-05-01T00:00:00Z')`. Binding a bare ISO string makes
+> `tc.started_at > $cutoff_time` a `ZONED DATETIME > STRING` comparison, which
+> evaluates to null — **zero rows, no error** (the "false horizon" footgun; see
+> Pitfall #12 and issue #10).
+
 **Common filter strategies:**
 - Filter by `session_id` first to scope to one session before retrieving detailed data.
 - Use `tool_name` filters to narrow tool call queries to the tool you care about.
@@ -1082,6 +1089,15 @@ no error is raised, no results are returned, the query silently produces nothing
 `datetime('2026-05-01')` instead. ORDER BY on temporal columns requires no change. See
 "Temporal Property Types" at the top of Section 2 for the full list of ZONED DATETIME
 properties.
+
+> **Aggregations over a _mixed-type_ column lie silently too.** If a property is
+> mid-migration (some rows STRING, some ZONED DATETIME), `max(e.occurred_at)` /
+> `min(...)` returns the extreme **STRING** — Neo4j orders every string above
+> every temporal regardless of the actual instant — so a recency probe reports a
+> stale "data ends" horizon while newer, correctly-typed rows exist. This is a
+> distinct (and more insidious) failure mode than the single-literal comparison
+> above. Run `scripts/migrate-dates.py --dry-run` and confirm zero pending
+> before trusting any `max()`/recency query.
 
 - `duration.between(s.started_at, s.ended_at)` computes elapsed time (session length,
   tool-call duration) and returns a Neo4j DURATION value (e.g. PT1H30M).
