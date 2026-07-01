@@ -90,32 +90,42 @@ boot the map is authoritative in the durable `/data` volume
 (`entra_identities_store_path`, e.g. `/data/identity/entra-identities.json`), and a
 routine redeploy (including `amplifier-online up`) leaves that volume untouched.
 
-You only need to seed when the server comes up on a **fresh / empty `/data`** — a
-brand-new environment, or a DR rebuild where the volume was lost (an empty
-`entra_identities` map is a fail-closed startup error, so the server won't serve
-until it's populated).
+Because `amplifier-online up` ships `amplifier-online.yaml` **verbatim** (no
+`${VAR}`, shell, file, or secret expansion), the `entra_identities` map — **PII,
+intentionally not in the manifest or this repo** — cannot be supplied through `up`
+itself. It is applied over the runtime admin API right after `up`. An empty
+`entra_identities` map is a fail-closed startup error, so this onboarding is
+required before the server will serve on a fresh volume. Once `/data` is populated
+it is authoritative, so re-running the seed is a harmless idempotent no-op.
 
-Use the operator-supplied seeder — it reads an **uncommitted, git-ignored** local
-file and applies it over the runtime admin API (`PUT /admin/identities/{oid}`, no
-bulk endpoint, so it loops idempotent PUTs). Run it as an **IdentityAdmin** (the
-`entra_admin_role` App Role):
+**One-command deploy (recommended).** The repo-root `deploy.sh` runs
+`amplifier-online up` and then the seeder, in one shot:
 
 ```bash
-# 1. Create the uncommitted seed file from the example (NEVER commit the real one):
+# 1. One-time: create the uncommitted seed file from the example, then edit it to
+#    hold the real  "<oid>": {"id":"<github-handle>"}  entries. It is git-ignored.
 cp scripts/entra-identities.example.json scripts/entra-identities.local.json
-#    …then edit it to contain the real  "<oid>": {"id":"<github-handle>"}  entries.
-#    scripts/entra-identities.local.json is git-ignored.
 
-# 2. Point at the deployed server and the app-registration audience, az login as
-#    an IdentityAdmin, then dry-run and apply:
+# 2. az login as an IdentityAdmin, point at the server + app-reg audience, deploy:
+az login                                                    # IdentityAdmin identity
 export SERVER_URL="https://<your-server-fqdn-or-apim-gateway>"
 export AUTH_RESOURCE="api://<client_id>"
-az login   # as an IdentityAdmin identity
+export SEED_FILE="scripts/entra-identities.local.json"
+./deploy.sh                 # = amplifier-online up  +  seed (idempotent)
+#   ./deploy.sh --no-seed   # deploy only, skip the seed step
+```
+
+**Seeder alone.** `deploy.sh` calls `scripts/seed-entra-identities.sh`, which you
+can also run directly (e.g. to re-seed without redeploying). It reads the same
+uncommitted local file and applies it over `PUT /admin/identities/{oid}` (no bulk
+endpoint, so it loops idempotent PUTs):
+
+```bash
 ./scripts/seed-entra-identities.sh --check   # dry run — shows what it WOULD PUT
 ./scripts/seed-entra-identities.sh           # apply + verify all oids present
 ```
 
-The script fails loud if the seed file is missing/empty (it will not "seed
+The seeder fails loud if the seed file is missing/empty (it will not "seed
 nothing"), is idempotent (re-adding an existing mapping is a `200` no-op), and
 verifies every oid is present in the live map afterward. See
 [identity-management.md](identity-management.md) for the admin API details.

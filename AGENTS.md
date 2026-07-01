@@ -255,22 +255,31 @@ The deployment manifest is `amplifier-online.yaml` (stack `web-app-aca`). The
 `entra_identities` oid→handle map is **PII and is intentionally NOT in the manifest
 or this repo** — see the secret-hygiene note above.
 
-**Post-deploy step (conditional):**
-- **Routine deploy / `amplifier-online up`:** nothing to do. The identity map is
-  authoritative in the durable `/data` volume after first boot, and `up` leaves
-  that volume untouched (a reconcile only touches what the manifest declares).
-- **FRESH / EMPTY `/data` only** (new environment or DR rebuild): after the server
-  is up, seed the map by running, as an `IdentityAdmin`:
-  ```bash
-  export SERVER_URL="https://<server-fqdn-or-apim-gateway>"
-  export AUTH_RESOURCE="api://<client_id>"
-  ./scripts/seed-entra-identities.sh --check   # dry run
-  ./scripts/seed-entra-identities.sh           # apply + verify
-  ```
-  The real map is supplied via an **uncommitted, git-ignored** local file
-  (`scripts/entra-identities.local.json`, from `scripts/entra-identities.example.json`).
-  The server fails closed on an empty `entra_identities` map, so this step is
-  required before it will serve on a fresh volume.
+**One-command deploy** — use the repo-root wrapper, which runs `amplifier-online up`
+and then onboards the identity map in a single shot:
+```bash
+export SERVER_URL="https://<server-fqdn-or-apim-gateway>"   # for the seed step
+export AUTH_RESOURCE="api://<client_id>"                    # token audience
+export SEED_FILE="scripts/entra-identities.local.json"     # uncommitted map
+./deploy.sh
+```
+`deploy.sh` = `amplifier-online up` **+** `scripts/seed-entra-identities.sh`. The
+seed is **idempotent and no-ops once `/data` is populated**, so it is safe on every
+deploy: a fresh/empty `/data` gets onboarded, an existing one is left untouched.
+Use `./deploy.sh --no-seed` for a deploy-only run.
+
+**Why a wrapper and not the manifest:** `amplifier-online up` ships
+`amplifier-online.yaml` verbatim (no `${VAR}`/shell/secret expansion), so the
+`entra_identities` map — **PII, intentionally NOT in the manifest or this repo** —
+cannot be supplied through `up` itself. The map lives in an **uncommitted,
+git-ignored** local file (`scripts/entra-identities.local.json`, from
+`scripts/entra-identities.example.json`) and is applied over the admin API
+(`PUT /admin/identities/{oid}`) right after `up`. The server fails closed on an
+empty `entra_identities` map, so this onboarding is required before it serves on a
+fresh volume.
+
+Under the hood the seeder can also be run alone (`./scripts/seed-entra-identities.sh
+--check` for a dry run) — see `docs/azure-deployment.md`.
 
 Full runbook: `docs/azure-deployment.md` → "Seeding the identity map on a FRESH
 `/data`". Tooling: `scripts/seed-entra-identities.sh` (idempotent, fail-loud, no
