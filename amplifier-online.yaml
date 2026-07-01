@@ -113,13 +113,13 @@ services:
 # Optional managed databases (provisions isolated resources for this project)
 resources:
   postgres:
-    enabled: false  # Injects DATABASE_URL environment variable
+    enabled: false  # Injects DB_HOST, DB_NAME, DB_USER, DB_PASSWORD (no DATABASE_URL)
   cosmos:
-    enabled: false  # Injects COSMOS_ENDPOINT and COSMOS_KEY
+    enabled: false  # Keyless (managed identity): injects COSMOS_ENDPOINT + COSMOS_DATABASE (no COSMOS_KEY)
   redis:
     enabled: false  # Keyless (managed identity): injects REDIS_HOST + REDIS_PORT (Azure Managed Redis)
   storage:
-    enabled: false  # Injects STORAGE_ACCOUNT_NAME (ADLS Gen2 blob store, NOT a filesystem)
+    enabled: false  # Keyless (managed identity): injects STORAGE_ACCOUNT, STORAGE_FILESYSTEM, STORAGE_ENDPOINT (ADLS Gen2)
 
 # NOTE: This service is PUBLIC — reachable at the APIM gateway URL above
 # (auth.expose: true provisions public ingress + an APIM front). Access requires
