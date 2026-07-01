@@ -249,6 +249,33 @@ Both auth modes can add/remove identities **at runtime, no restart**, via the
 
 Canonical guide: `docs/identity-management.md`.
 
+### Deploying to Azure / Amplifier Online — post-deploy identity seed
+
+The deployment manifest is `amplifier-online.yaml` (stack `web-app-aca`). The
+`entra_identities` oid→handle map is **PII and is intentionally NOT in the manifest
+or this repo** — see the secret-hygiene note above.
+
+**Post-deploy step (conditional):**
+- **Routine deploy / `amplifier-online up`:** nothing to do. The identity map is
+  authoritative in the durable `/data` volume after first boot, and `up` leaves
+  that volume untouched (a reconcile only touches what the manifest declares).
+- **FRESH / EMPTY `/data` only** (new environment or DR rebuild): after the server
+  is up, seed the map by running, as an `IdentityAdmin`:
+  ```bash
+  export SERVER_URL="https://<server-fqdn-or-apim-gateway>"
+  export AUTH_RESOURCE="api://<client_id>"
+  ./scripts/seed-entra-identities.sh --check   # dry run
+  ./scripts/seed-entra-identities.sh           # apply + verify
+  ```
+  The real map is supplied via an **uncommitted, git-ignored** local file
+  (`scripts/entra-identities.local.json`, from `scripts/entra-identities.example.json`).
+  The server fails closed on an empty `entra_identities` map, so this step is
+  required before it will serve on a fresh volume.
+
+Full runbook: `docs/azure-deployment.md` → "Seeding the identity map on a FRESH
+`/data`". Tooling: `scripts/seed-entra-identities.sh` (idempotent, fail-loud, no
+real oids committed).
+
 ### Local static run (web UI + admin) — the common single-box setup
 
 For a local server with static keys, the browser dashboard, and runtime
