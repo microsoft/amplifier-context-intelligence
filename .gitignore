@@ -12,3 +12,10 @@ config/secrets.env
 
 # Test artifacts
 MagicMock/
+
+# DR/first-boot identity seed — contains REAL Entra object IDs (PII). NEVER commit.
+# The live oid->handle map is authoritative in the server's /data volume after
+# first boot; this file only re-seeds a FRESH/empty /data. See
+# scripts/seed-entra-identities.sh and scripts/entra-identities.example.json.
+scripts/entra-identities.local.json
+entra-identities.local.json

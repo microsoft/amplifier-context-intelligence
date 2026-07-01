@@ -82,6 +82,44 @@ secrets**, never plain env vars — oids are personal identifiers.
 > the authorization — see
 > [identity-management.md → service callers](identity-management.md#service-callers-entra-app-tokens).
 
+### Seeding the identity map on a FRESH `/data` (DR / first boot)
+
+The `ENTRA_IDENTITIES` map (oid → `{id}`) is **PII and is never committed** to this
+repo or the deployment manifest. In steady state you don't re-seed it: after first
+boot the map is authoritative in the durable `/data` volume
+(`entra_identities_store_path`, e.g. `/data/identity/entra-identities.json`), and a
+routine redeploy (including `amplifier-online up`) leaves that volume untouched.
+
+You only need to seed when the server comes up on a **fresh / empty `/data`** — a
+brand-new environment, or a DR rebuild where the volume was lost (an empty
+`entra_identities` map is a fail-closed startup error, so the server won't serve
+until it's populated).
+
+Use the operator-supplied seeder — it reads an **uncommitted, git-ignored** local
+file and applies it over the runtime admin API (`PUT /admin/identities/{oid}`, no
+bulk endpoint, so it loops idempotent PUTs). Run it as an **IdentityAdmin** (the
+`entra_admin_role` App Role):
+
+```bash
+# 1. Create the uncommitted seed file from the example (NEVER commit the real one):
+cp scripts/entra-identities.example.json scripts/entra-identities.local.json
+#    …then edit it to contain the real  "<oid>": {"id":"<github-handle>"}  entries.
+#    scripts/entra-identities.local.json is git-ignored.
+
+# 2. Point at the deployed server and the app-registration audience, az login as
+#    an IdentityAdmin, then dry-run and apply:
+export SERVER_URL="https://<your-server-fqdn-or-apim-gateway>"
+export AUTH_RESOURCE="api://<client_id>"
+az login   # as an IdentityAdmin identity
+./scripts/seed-entra-identities.sh --check   # dry run — shows what it WOULD PUT
+./scripts/seed-entra-identities.sh           # apply + verify all oids present
+```
+
+The script fails loud if the seed file is missing/empty (it will not "seed
+nothing"), is idempotent (re-adding an existing mapping is a `200` no-op), and
+verifies every oid is present in the live map afterward. See
+[identity-management.md](identity-management.md) for the admin API details.
+
 ## Step-by-Step Deployment
 
 ### Step 1 — Prerequisites
