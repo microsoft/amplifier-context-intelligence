@@ -22,7 +22,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from neo4j import AsyncGraphDatabase
+from neo4j import READ_ACCESS, WRITE_ACCESS, AsyncGraphDatabase
 
 from context_intelligence_server import __version__
 from context_intelligence_server.auth import (
@@ -59,6 +59,12 @@ from context_intelligence_server.registry import SessionRegistry
 _settings = get_settings()
 
 logger = logging.getLogger("context_intelligence_server")
+
+
+def _neo4j_access_const(mode: str) -> str:
+    """Map our config string ("READ"/"WRITE") to the driver's access-mode constant."""
+    return READ_ACCESS if mode == "READ" else WRITE_ACCESS
+
 
 # ---------------------------------------------------------------------------
 # Module-level live identity-map stores (T3)
@@ -137,11 +143,24 @@ def _recover_one_session(
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application lifespan: configure logging and create shared Neo4j driver."""
     setup_logging()
-    logger.info("lifespan_startup: creating Neo4j driver url=%s", _settings.neo4j_url)
-    app.state.neo4j_driver = AsyncGraphDatabase.driver(
-        _settings.neo4j_url,
-        auth=(_settings.neo4j_user, _settings.neo4j_password),
+    _admin = _settings.resolve_neo4j_admin()
+    _query = _settings.resolve_neo4j_query()
+    logger.info(
+        "lifespan_startup: creating Neo4j drivers admin_url=%s query_url=%s query_access_mode=%s",
+        _admin.url,
+        _query.url,
+        _query.access_mode,
     )
+    # Admin (read/write): schema init + all mutation paths. Keep the existing
+    # app.state.neo4j_driver NAME so nothing that reads it silently breaks.
+    app.state.neo4j_driver = AsyncGraphDatabase.driver(_admin.url, auth=_admin.auth)
+    # Cypher-query (read-intent): /cypher + dashboard reads.
+    app.state.neo4j_query_driver = AsyncGraphDatabase.driver(
+        _query.url, auth=_query.auth
+    )
+    # Stash the resolved query access_mode so /cypher opens READ sessions without
+    # re-resolving settings on every request.
+    app.state.neo4j_query_access_mode = _query.access_mode
     # Initialize schema (indexes + uniqueness constraints) BEFORE the server starts
     # accepting requests.  This ensures the Session uniqueness constraint is active
     # before any concurrent flush() transactions execute MERGE, which prevents the
@@ -195,8 +214,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         yield
     finally:
-        logger.info("lifespan_shutdown: closing Neo4j driver")
+        logger.info("lifespan_shutdown: closing Neo4j drivers")
         await app.state.neo4j_driver.close()
+        await app.state.neo4j_query_driver.close()
 
 
 app = FastAPI(
@@ -295,6 +315,27 @@ def _assert_admin_not_exempt() -> None:
             )
 
 
+def _assert_neo4j_clients_explicit(settings: Settings) -> None:
+    """Startup assertion (doc 11 gap #12): the deployed profile MUST declare the
+    structured neo4j.admin / neo4j.cypher_query clients explicitly.
+
+    When settings.neo4j_require_explicit_clients is True, refuse to boot if the
+    server silently fell back to the legacy flat neo4j_* fields (settings.neo4j is
+    None). Back-compat fallback is allowed ONLY when the flag is False (dev / test /
+    transition). This makes a silent partial-config fallback impossible in the
+    deployed profile.
+    """
+    if settings.neo4j_require_explicit_clients and settings.neo4j is None:
+        raise RuntimeError(
+            "Neo4j config invariant violated: neo4j_require_explicit_clients=True but "
+            "the structured `neo4j` block (admin + cypher_query) is absent — the server "
+            "would silently fall back to legacy neo4j_* fields. The deployed profile MUST "
+            "declare both clients explicitly (doc 11 §Backward-compatibility). Set the "
+            "`neo4j` block in amplifier-online.yaml / server-config.yaml, or unset "
+            "neo4j_require_explicit_clients for a dev/transition deploy."
+        )
+
+
 def create_asgi_app(
     settings: Settings | None = None,
     *,
@@ -331,6 +372,7 @@ def create_asgi_app(
     _assert_admin_not_exempt()
 
     s = settings if settings is not None else _settings
+    _assert_neo4j_clients_explicit(s)
 
     # Reset both stores; the active mode sets exactly one of them below.
     # app.state.* mirrors the module-level globals so the /admin router can
@@ -529,8 +571,16 @@ if _settings.web_ui_enabled:
 @app.get("/status")
 async def get_status(request: Request) -> dict[str, Any]:
     response = build_status_response(registry, _start_time)
-    response["neo4j_connected"] = await _check_neo4j_connected(request.app)
-    response["neo4j_url"] = _settings.neo4j_url
+    response["neo4j_connected"] = await _check_driver_connected(
+        request.app, "neo4j_driver"
+    )
+    # Additive (Concern B, council review): surface the query (read-intent)
+    # driver's connectivity too, so a misconfigured cypher_query client shows
+    # up here instead of on the first /cypher call.
+    response["neo4j_query_connected"] = await _check_driver_connected(
+        request.app, "neo4j_query_driver"
+    )
+    response["neo4j_url"] = _settings.resolve_neo4j_admin().url
     response["neo4j_browser_url"] = _settings.neo4j_browser_url
     # Additive, aggregate-only conservation metrics (D3). /status is
     # unauthenticated, so this block must NOT carry the per-key table or the
@@ -575,9 +625,15 @@ async def get_status(request: Request) -> dict[str, Any]:
     return response
 
 
-async def _check_neo4j_connected(app_instance: FastAPI) -> bool:
-    """Check Neo4j connectivity via the driver's verify_connectivity method."""
-    driver = getattr(app_instance.state, "neo4j_driver", None)
+async def _check_driver_connected(app_instance: FastAPI, attr_name: str) -> bool:
+    """Check a Neo4j driver's connectivity via verify_connectivity().
+
+    *attr_name* names the app.state attribute holding the driver -- either
+    "neo4j_driver" (admin) or "neo4j_query_driver" (cypher_query). Defensive:
+    returns False (never raises, never 500s /status) when the driver is
+    absent or verify_connectivity() raises for any reason.
+    """
+    driver = getattr(app_instance.state, attr_name, None)
     if driver is None:
         return False
     try:
@@ -694,13 +750,16 @@ if _settings.web_ui_enabled:
 @app.post("/cypher", dependencies=[Depends(require_read)])
 async def post_cypher(body: CypherRequest, request: Request) -> Response:
     """Proxy a Cypher query to Neo4j and return the results as JSON."""
-    driver = request.app.state.neo4j_driver
+    driver = request.app.state.neo4j_query_driver
+    access_mode = request.app.state.neo4j_query_access_mode
     params = dict(body.params)
     if body.workspace is not None and body.workspace != "*":
         params["workspace"] = body.workspace
     rows: list[dict] = []
     try:
-        async with driver.session() as session:
+        async with driver.session(
+            default_access_mode=_neo4j_access_const(access_mode)
+        ) as session:
             result = await session.run(body.query, params)
             async for record in result:
                 rows.append(dict(record))

@@ -170,12 +170,17 @@ class _MockNeo4jSession:
 
 
 class _MockNeo4jDriver:
-    """Driver mock; delegates to a single _MockNeo4jSession."""
+    """Driver mock; delegates to a single _MockNeo4jSession.
+
+    Accepts (and ignores) ``default_access_mode`` so it stays compatible with
+    the two-client split's ``driver.session(default_access_mode=...)`` call
+    in ``post_cypher`` (main.py).
+    """
 
     def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
         self._rows = rows
 
-    def session(self) -> _MockNeo4jSession:
+    def session(self, default_access_mode: str | None = None) -> _MockNeo4jSession:
         return _MockNeo4jSession(self._rows)
 
 
@@ -484,9 +489,13 @@ class TestM2CapabilityDeps:
         private_key, asgi = service_asgi
         token = _sign_jwt(private_key, _service_claims(roles=["Reader"]))
 
-        # Mock the neo4j driver on app.state (raising=False since lifespan didn't run)
+        # Mock the neo4j QUERY (read-intent) driver on app.state -- /cypher reads
+        # app.state.neo4j_query_driver + neo4j_query_access_mode (two-client
+        # split, doc 12), not the admin neo4j_driver. (raising=False since
+        # lifespan didn't run.)
         mock_driver = _MockNeo4jDriver(rows=[{"n": {"label": "Session"}}])
-        monkeypatch.setattr(app.state, "neo4j_driver", mock_driver, raising=False)
+        monkeypatch.setattr(app.state, "neo4j_query_driver", mock_driver, raising=False)
+        monkeypatch.setattr(app.state, "neo4j_query_access_mode", "READ", raising=False)
 
         async with _make_client(asgi) as c:
             resp = await c.post(
@@ -521,9 +530,12 @@ class TestM2CapabilityDeps:
         private_key, asgi = service_asgi
         token = _sign_jwt(private_key, _service_claims(roles=["Reader"]))
 
-        # Mock neo4j driver — the "mutation" is accepted by the mock (no real DB)
+        # Mock the neo4j QUERY (read-intent) driver — /cypher reads
+        # app.state.neo4j_query_driver (two-client split, doc 12). The
+        # "mutation" is accepted by the mock (no real DB).
         mock_driver = _MockNeo4jDriver(rows=[])
-        monkeypatch.setattr(app.state, "neo4j_driver", mock_driver, raising=False)
+        monkeypatch.setattr(app.state, "neo4j_query_driver", mock_driver, raising=False)
+        monkeypatch.setattr(app.state, "neo4j_query_access_mode", "READ", raising=False)
 
         # A MUTATING Cypher query — at M2 this is allowed through require_read
         mutating_query = "CREATE (n:M2SoftGapNode {id: 'soft-gap-test'}) RETURN n"
