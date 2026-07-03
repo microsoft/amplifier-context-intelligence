@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Literal, Tuple, Type
 
 import yaml
-from pydantic import field_validator, model_validator
+from pydantic import BaseModel, field_validator, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import (
     BaseSettings,
@@ -161,11 +161,81 @@ class YamlConfigSettingsSource(PydanticBaseSettingsSource):
         }
 
 
+class Neo4jClientConfig(BaseModel):
+    """One Neo4j logical client (admin OR cypher_query). Same shape for both.
+
+    Future RBAC fields (rbac_role, database, etc.) land in THIS object -- no
+    new top-level knobs later (doc 11 Structured config).
+    """
+
+    url: str
+    username: str = "neo4j"
+    password: str = ""
+    # access_mode steers session routing/intent. "WRITE" for admin, "READ" for
+    # cypher_query. On a Community single instance over bolt:// this is a
+    # routing HINT, not server-side enforcement (doc 11 Honest caveat).
+    access_mode: Literal["READ", "WRITE"] = "WRITE"
+
+    @property
+    def auth(self) -> tuple[str, str] | None:
+        """Return (username, password), or None when password is empty.
+
+        Mirrors the existing registry.py semantics: an empty password means
+        "no auth" (None), so behavior is identical to today's flat path.
+        """
+        return (self.username, self.password) if self.password else None
+
+
+class Neo4jConfig(BaseModel):
+    """The structured `neo4j` block: two same-shaped clients.
+
+    When present, BOTH sub-clients are required (pydantic enforces this), so
+    the only fallback case the startup guard must detect is
+    `Settings.neo4j is None`.
+    """
+
+    admin: Neo4jClientConfig
+    cypher_query: Neo4jClientConfig
+
+    @model_validator(mode="after")
+    def _validate_access_modes(self) -> "Neo4jConfig":
+        """Enforce role/access_mode correctness -- fail loud, not silent.
+
+        `Neo4jClientConfig.access_mode` defaults to "WRITE", so a `cypher_query`
+        block that is a copy-paste of `admin` (or simply omits `access_mode`)
+        would silently behave as a WRITE-capable "read" client -- defeating the
+        entire point of the two-client split. Reject that at construction time:
+
+        - `admin.access_mode` MUST be "WRITE" (the read/write client).
+        - `cypher_query.access_mode` MUST be "READ" (the read-intent client).
+
+        Both violations are reported together so the operator sees one clear
+        message naming exactly which client has the wrong access_mode.
+        """
+        errors: list[str] = []
+        if self.admin.access_mode != "WRITE":
+            errors.append(
+                f"neo4j.admin.access_mode must be 'WRITE', got "
+                f"{self.admin.access_mode!r}"
+            )
+        if self.cypher_query.access_mode != "READ":
+            errors.append(
+                f"neo4j.cypher_query.access_mode must be 'READ', got "
+                f"{self.cypher_query.access_mode!r}"
+            )
+        if errors:
+            raise ValueError(
+                "Neo4j client config invariant violated: " + "; ".join(errors)
+            )
+        return self
+
+
 class Settings(BaseSettings):
     """Application settings for the Context Intelligence Server."""
 
     model_config = SettingsConfigDict(
-        env_prefix="AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_"
+        env_prefix="AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_",
+        env_nested_delimiter="__",
     )
 
     # -------------------------------------------------------------------------
@@ -607,6 +677,42 @@ class Settings(BaseSettings):
     neo4j_user: str = "neo4j"
     neo4j_password: str = "password"
     neo4j_browser_url: str = "http://localhost:7474"
+
+    # Structured two-client config (doc 11). OPTIONAL for backward-compat: when
+    # absent, BOTH clients fall back to the legacy flat neo4j_* fields above.
+    # The real amplifier-online.yaml MUST set this explicitly (see
+    # neo4j_require_explicit_clients + the startup guard).
+    neo4j: Neo4jConfig | None = None
+
+    # Deployed-profile signal (gap #12). When True, the startup guard REFUSES to
+    # boot on the legacy fallback (i.e. neo4j is None) -- the deployed system must
+    # declare admin + cypher_query explicitly, even pointing at the same instance.
+    # Default False so existing deployments / server-config.yaml keep booting on
+    # the legacy fallback during the transition.
+    # Env: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_REQUIRE_EXPLICIT_CLIENTS=true
+    neo4j_require_explicit_clients: bool = False
+
+    def resolve_neo4j_admin(self) -> Neo4jClientConfig:
+        """Admin (read/write) client config. Structured block wins; else legacy flat."""
+        if self.neo4j is not None:
+            return self.neo4j.admin
+        return Neo4jClientConfig(
+            url=self.neo4j_url,
+            username=self.neo4j_user,
+            password=self.neo4j_password,
+            access_mode="WRITE",
+        )
+
+    def resolve_neo4j_query(self) -> Neo4jClientConfig:
+        """Read-intent client config. Structured block wins; else legacy flat + READ."""
+        if self.neo4j is not None:
+            return self.neo4j.cypher_query
+        return Neo4jClientConfig(
+            url=self.neo4j_url,
+            username=self.neo4j_user,
+            password=self.neo4j_password,
+            access_mode="READ",
+        )
 
     # -------------------------------------------------------------------------
     # Storage paths

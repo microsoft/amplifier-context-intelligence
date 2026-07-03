@@ -555,14 +555,10 @@ class SessionRegistry:
         if session_id not in self._workers:
             settings = get_settings()
             blob_store = AsyncDiskBlobStore(root=settings.blob_path)
-            neo4j_auth = (
-                (settings.neo4j_user, settings.neo4j_password)
-                if settings.neo4j_password
-                else None
-            )
+            _admin = settings.resolve_neo4j_admin()
             neo4j_store = Neo4jGraphStore(
-                uri=settings.neo4j_url,
-                auth=neo4j_auth,
+                uri=_admin.url,
+                auth=_admin.auth,
                 flush_chunk_rows=settings.neo4j_flush_chunk_rows,
                 flush_chunk_bytes=settings.neo4j_flush_chunk_bytes,
                 neo4j_lock_timeout=settings.neo4j_lock_timeout,

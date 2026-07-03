@@ -379,11 +379,16 @@ async def test_cypher_proxy_returns_results(
 ) -> None:
     """POST /cypher returns 200 with {results: [...]} from Neo4j."""
     mock_row = {"name": "Alice"}
+    # /cypher reads app.state.neo4j_query_driver (two-client split, doc 12),
+    # not the admin neo4j_driver.
     monkeypatch.setattr(
         main_module.app.state,
-        "neo4j_driver",
+        "neo4j_query_driver",
         MockNeo4jDriver(rows=[mock_row]),
         raising=False,
+    )
+    monkeypatch.setattr(
+        main_module.app.state, "neo4j_query_access_mode", "READ", raising=False
     )
 
     response = await client.post("/cypher", json={"query": "MATCH (n) RETURN n"})
@@ -399,11 +404,16 @@ async def test_cypher_workspace_injection(
 ) -> None:
     """POST /cypher injects workspace into params when workspace is not None or '*'."""
     captured_params: dict[str, Any] = {}
+    # /cypher reads app.state.neo4j_query_driver (two-client split, doc 12),
+    # not the admin neo4j_driver.
     monkeypatch.setattr(
         main_module.app.state,
-        "neo4j_driver",
+        "neo4j_query_driver",
         MockNeo4jDriver(captured=captured_params),
         raising=False,
+    )
+    monkeypatch.setattr(
+        main_module.app.state, "neo4j_query_access_mode", "READ", raising=False
     )
 
     await client.post(
@@ -426,11 +436,16 @@ async def test_cypher_star_workspace_not_injected(
 ) -> None:
     """POST /cypher does NOT inject workspace when workspace='*' (cross-workspace)."""
     captured_params: dict[str, Any] = {}
+    # /cypher reads app.state.neo4j_query_driver (two-client split, doc 12),
+    # not the admin neo4j_driver.
     monkeypatch.setattr(
         main_module.app.state,
-        "neo4j_driver",
+        "neo4j_query_driver",
         MockNeo4jDriver(captured=captured_params),
         raising=False,
+    )
+    monkeypatch.setattr(
+        main_module.app.state, "neo4j_query_access_mode", "READ", raising=False
     )
 
     await client.post(
@@ -445,11 +460,16 @@ async def test_cypher_neo4j_error_returns_500(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """POST /cypher returns 500 with error detail when Neo4j raises an exception."""
+    # /cypher reads app.state.neo4j_query_driver (two-client split, doc 12),
+    # not the admin neo4j_driver.
     monkeypatch.setattr(
         main_module.app.state,
-        "neo4j_driver",
+        "neo4j_query_driver",
         MockNeo4jDriver(exc=RuntimeError("Connection refused")),
         raising=False,
+    )
+    monkeypatch.setattr(
+        main_module.app.state, "neo4j_query_access_mode", "READ", raising=False
     )
 
     response = await client.post("/cypher", json={"query": "MATCH (n) RETURN n"})
@@ -881,7 +901,8 @@ class TestMainDispatch:
 async def test_lifespan_creates_and_closes_driver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Lifespan creates a Neo4j driver at startup and closes it at shutdown."""
+    """Lifespan creates BOTH Neo4j drivers (admin + query) at startup and
+    closes BOTH at shutdown (Neo4j two-client split, doc 12)."""
     mock_driver = MagicMock()
     mock_driver.close = AsyncMock()
 
@@ -897,13 +918,20 @@ async def test_lifespan_creates_and_closes_driver(
         async with lifespan(main_module.app):
             # setup_logging() is called once during startup
             mock_setup_logging.assert_called_once()
-            # During lifespan: driver factory must have been called
-            mock_driver_factory.assert_called_once()
-            # The driver is accessible via app.state
+            # During lifespan: driver factory must have been called TWICE --
+            # once for the admin (read/write) client, once for the
+            # cypher_query (read-intent) client.
+            assert mock_driver_factory.call_count == 2
+            # Both drivers are accessible via app.state (same mock object
+            # here since the factory is patched with a single return_value).
             assert main_module.app.state.neo4j_driver is mock_driver
+            assert main_module.app.state.neo4j_query_driver is mock_driver
+            # The resolved query access_mode is stashed for /cypher.
+            assert main_module.app.state.neo4j_query_access_mode == "READ"
 
-        # After lifespan exits: close() must have been called
-        mock_driver.close.assert_awaited_once()
+        # After lifespan exits: close() must have been awaited for BOTH
+        # drivers (admin + query).
+        assert mock_driver.close.await_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1114,6 +1142,67 @@ async def test_status_includes_neo4j_connected_false_when_no_driver(
     assert response.status_code == 200
     data = response.json()
     assert data["neo4j_connected"] is False
+
+
+# ---------------------------------------------------------------------------
+# Concern B (council review) -- /status neo4j_query_connected field tests
+# ---------------------------------------------------------------------------
+
+
+async def test_status_includes_neo4j_query_connected_true(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/status additively includes neo4j_query_connected: true when the query
+    (read-intent) driver's verify_connectivity() succeeds."""
+    mock_driver = AsyncMock()
+    mock_driver.verify_connectivity = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        main_module.app.state, "neo4j_query_driver", mock_driver, raising=False
+    )
+
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["neo4j_query_connected"] is True
+    # Additive: existing field is untouched by this test's monkeypatch.
+    assert "neo4j_connected" in data
+
+
+async def test_status_includes_neo4j_query_connected_false_on_error(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/status includes neo4j_query_connected: false when the query driver's
+    verify_connectivity() raises -- a misconfigured cypher_query client must
+    surface here, not just on the first /cypher call."""
+    mock_driver = AsyncMock()
+    mock_driver.verify_connectivity = AsyncMock(
+        side_effect=Exception("connection refused")
+    )
+    monkeypatch.setattr(
+        main_module.app.state, "neo4j_query_driver", mock_driver, raising=False
+    )
+
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["neo4j_query_connected"] is False
+
+
+async def test_status_includes_neo4j_query_connected_false_when_no_driver(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/status includes neo4j_query_connected: false when neo4j_query_driver is
+    not set on app.state (defensive -- must never 500)."""
+    if hasattr(main_module.app.state, "neo4j_query_driver"):
+        monkeypatch.delattr(main_module.app.state, "neo4j_query_driver", raising=False)
+
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["neo4j_query_connected"] is False
 
 
 # ---------------------------------------------------------------------------

@@ -72,7 +72,12 @@ class MockNeo4jSession:
 
 
 class MockNeo4jDriver:
-    """Driver mock; delegates to a single MockNeo4jSession with the given config."""
+    """Driver mock; delegates to a single MockNeo4jSession with the given config.
+
+    Accepts (and ignores) ``default_access_mode`` so it stays compatible with
+    the two-client split's ``driver.session(default_access_mode=...)`` call in
+    ``post_cypher`` (main.py).
+    """
 
     def __init__(
         self,
@@ -84,7 +89,7 @@ class MockNeo4jDriver:
         self._exc = exc
         self._captured = captured
 
-    def session(self) -> MockNeo4jSession:
+    def session(self, default_access_mode: str | None = None) -> MockNeo4jSession:
         return MockNeo4jSession(self._rows, self._exc, self._captured)
 
 
@@ -96,6 +101,7 @@ def anyio_backend() -> str:
 @pytest.fixture(autouse=True)
 def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
     from unittest.mock import patch
+    from context_intelligence_server.config import Neo4jClientConfig
     from context_intelligence_server.config import Settings as _Settings
 
     _real = _Settings()
@@ -116,6 +122,26 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
         neo4j_flush_chunk_rows: int = _real.neo4j_flush_chunk_rows
         neo4j_flush_chunk_bytes: int = _real.neo4j_flush_chunk_bytes
         neo4j_lock_timeout: float = _real.neo4j_lock_timeout
+
+        # Neo4j two-client split (doc 12): SessionRegistry.get_or_create() calls
+        # settings.resolve_neo4j_admin() directly, so this proxy (which stands
+        # in for get_settings() inside registry.py) must implement it too --
+        # mirrors Settings' legacy-fallback resolver behavior exactly.
+        def resolve_neo4j_admin(self) -> Neo4jClientConfig:
+            return Neo4jClientConfig(
+                url=self.neo4j_url,
+                username=self.neo4j_user,
+                password=self.neo4j_password,
+                access_mode="WRITE",
+            )
+
+        def resolve_neo4j_query(self) -> Neo4jClientConfig:
+            return Neo4jClientConfig(
+                url=self.neo4j_url,
+                username=self.neo4j_user,
+                password=self.neo4j_password,
+                access_mode="READ",
+            )
 
     with patch(
         "context_intelligence_server.registry.get_settings",
