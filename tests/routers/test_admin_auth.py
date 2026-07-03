@@ -243,7 +243,9 @@ async def entra_auth_client(
 
     _private_key, public_key = rsa_keypair
     settings = _make_entra_settings(tmp_path)
-    middleware = create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient(public_key))
+    middleware = create_asgi_app(
+        settings=settings, _jwks_client=_StubJWKSClient(public_key)
+    )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=middleware), base_url="http://test"
     ) as c:
@@ -259,7 +261,9 @@ async def entra_no_role_client(
 
     _private_key, public_key = rsa_keypair
     settings = _make_entra_settings(tmp_path, entra_admin_role="")
-    middleware = create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient(public_key))
+    middleware = create_asgi_app(
+        settings=settings, _jwks_client=_StubJWKSClient(public_key)
+    )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=middleware), base_url="http://test"
     ) as c:
@@ -372,23 +376,28 @@ class TestStaticModeAdminAuth:
         )
         assert resp.status_code == 503
 
-    # -- admin key also works on data endpoints (valid principal) -----------
+    # -- admin key is NOT a data-ingestion identity (scoped to /admin/*) -----
 
     @pytest.mark.anyio
-    async def test_admin_key_reaches_data_endpoint(
+    async def test_admin_key_rejected_on_data_endpoint(
         self, static_auth_client: httpx.AsyncClient
     ) -> None:
-        """Admin key is a valid principal that can reach data endpoints (POST /events)."""
-        # We just verify the middleware doesn't 401 it on /events.
-        # POST /events needs a proper body; 422 means auth passed.
+        """A bare admin key is REJECTED (401) on POST /events.
+
+        The admin-key fast-path is scoped to /admin/* routes only: the admin key
+        is an administration credential, not a data-ingestion identity. On a data
+        route it falls through to the keystore resolver; since the admin key is
+        not a registered data key here, it is rejected — rather than posting
+        events attributed to a synthetic ``created_by="admin"``. (An operator who
+        wants to both administer and contribute holds two keys, or registers the
+        admin token as a data key too.)
+        """
         resp = await static_auth_client.post(
             "/events",
             json={},
             headers={"Authorization": f"Bearer {FAKE_ADMIN_RAW_KEY}"},
         )
-        # 422 = auth passed but request body validation failed — NOT 401/403
-        assert resp.status_code != 401
-        assert resp.status_code != 403
+        assert resp.status_code == 401
 
 
 # ===========================================================================
@@ -597,9 +606,7 @@ class TestEntraModeAdminAuth:
 class TestExemptSetStartupAssertion:
     """create_asgi_app raises at startup if /admin is in any exempt set (TB-07)."""
 
-    def test_admin_in_exempt_paths_raises_at_startup(
-        self, tmp_path: Path
-    ) -> None:
+    def test_admin_in_exempt_paths_raises_at_startup(self, tmp_path: Path) -> None:
         """Injecting /admin into _EXEMPT_PATHS before create_asgi_app → RuntimeError."""
         from unittest.mock import patch  # noqa: PLC0415
 
