@@ -10,6 +10,8 @@ import jwt  # pyjwt[crypto] — added in T1; used by EntraResolver
 from jwt import PyJWKClient
 from typing_extensions import Protocol
 
+from context_intelligence_server.config import ALL_ZEROS_GUID, GUID_RE
+
 _log = logging.getLogger(__name__)
 
 # JWKS signing-key cache TTL passed to PyJWKClient.
@@ -475,6 +477,71 @@ class EntraResolver:
 
         return (created_by, roles, True)
 
+    def resolve_principal_id(self, oid: str) -> tuple[str, list[str], bool]:
+        """Resolve an EasyAuth-injected browser oid to a contributor id.
+
+        doc 14 (EasyAuth browser-identity spec) §3.3: this is the browser-path
+        counterpart to :meth:`resolve` — it runs the SAME map lookup and 401/403
+        semantics as the JWT user branch (see ``resolve()`` above, "oid is
+        required" / "Map oid -> contributor") but with NO JWT to verify, since
+        the oid arrives as a bare, untrusted header value rather than inside a
+        cryptographically-signed token. It therefore re-validates GUID shape and
+        the all-zeros sentinel that the JWT path takes for granted (the JWT path
+        only ever sees oids that already survived the config-time GUID/sentinel
+        gate baked into the identity map).
+
+        Trust in the oid's authenticity rests entirely OUTSIDE this method — on
+        sole-ingress topology (EasyAuth is the only thing that can reach this
+        server) — see the middleware caller and the module-level design note in
+        doc 14 §4 row 7. This method's job is only: is the credential well-formed,
+        and is it bound to a contributor?
+
+        Args:
+            oid: The raw value of the ``X-MS-CLIENT-PRINCIPAL-ID`` header, or
+                 ``""`` if the header was present but empty, or ``None``-like
+                 (never actually ``None`` — callers pass a ``str``).
+
+        Returns:
+            ``(contributor_id, roles, is_service)`` — ``roles`` is always ``[]``
+            and ``is_service`` is always ``False`` in this spike (Step 2).
+            Browser-path admin authority (reading the additive
+            ``entra_identities[oid]["admin"]`` key) is Step 3 (doc 14 §2.3/C5) —
+            NOT wired here.
+
+        Raises:
+            AuthError(401): oid missing/empty/whitespace-only, not a valid GUID,
+                or the all-zeros sentinel (doc 14 §4 rows 1-4; row 4 per C4/R2).
+            AuthError(403): oid is a valid, non-sentinel GUID but not in the
+                identity map (doc 14 §4 row 5, "identity_unbound" — names the
+                oid for onboarding, mirrors the JWT branch's 403 message shape).
+        """
+        # rows 1-2: missing / empty / whitespace-only.
+        if not isinstance(oid, str) or not oid.strip():
+            raise AuthError(401, "EasyAuth principal id missing or empty")
+        candidate = oid.strip().lower()
+        # row 3: malformed / non-GUID.
+        if not GUID_RE.fullmatch(candidate):
+            raise AuthError(401, f"EasyAuth principal id {oid!r} is not a valid GUID")
+        # row 4: all-zeros sentinel (C4/R2: 401, treated as a bad credential —
+        # matches the identity map's build-time ban on this placeholder).
+        if candidate == ALL_ZEROS_GUID:
+            raise AuthError(401, "EasyAuth principal id is the all-zeros sentinel")
+        # row 5: valid but unbound -> 403 identity_unbound (names the oid for
+        # onboarding). self._identity_map is the SAME live entra_store.flat_dict
+        # the JWT user branch reads, so an /admin put()/delete() is visible to
+        # the browser path immediately -- same guarantee the Bearer path enjoys.
+        contributor_id = self._identity_map.get(candidate)
+        if contributor_id is None:
+            raise AuthError(
+                403,
+                f"identity_unbound: oid {candidate!r} (provider=aad) is not in "
+                f"the identity map; contact the server administrator to add "
+                f"this identity (tenant {self._tenant_id!r})",
+            )
+        # row 6: accept. roles=[] in the spike (browser admin is Step 3);
+        # is_service=False (browser = human-like).
+        return (contributor_id, [], False)
+
 
 class StaticKeyResolver:
     """Resolves tokens via a pre-built ``{sha256_hex(token) -> contributor_id}`` keystore.
@@ -525,6 +592,31 @@ class StaticKeyResolver:
         if contributor_id is None:
             return None
         return (contributor_id, [], False)
+
+
+class EasyAuthResolveFn(Protocol):
+    """Callable contract for resolving an EasyAuth browser oid (doc 14 §3.1/C3).
+
+    C3 (BINDING, supersedes the bare ``Callable[[str], tuple[str, list[str],
+    bool]]`` in the pre-council draft): a NAMED Protocol instead of a bare
+    positional-tuple callable type, so Step 3 (browser-admin, richer return
+    shape) can widen what this returns without a signature-shaped churn at
+    every call site.
+
+    ``None`` wired into :class:`BearerTokenMiddleware` means EasyAuth trust is
+    OFF; a bound :meth:`EntraResolver.resolve_principal_id` means it is ON.
+    The middleware only ever sees this Protocol — it stays ignorant of
+    ``EntraResolver``'s concrete type (R5, doc 14 §9).
+    """
+
+    def __call__(self, oid: str) -> tuple[str, list[str], bool]:
+        """Resolve *oid* to ``(contributor_id, roles, is_service)``.
+
+        Raises :class:`AuthError` (401 or 403) on an invalid/unbound oid —
+        see :meth:`EntraResolver.resolve_principal_id` for the concrete
+        implementation and the full 401/403 row mapping.
+        """
+        ...
 
 
 class BearerTokenMiddleware:
@@ -580,6 +672,7 @@ class BearerTokenMiddleware:
         resolver: PrincipalResolver | None = None,
         exempt_paths: frozenset[str] | None = None,
         admin_api_key_digest: str | None = None,
+        easyauth_resolve: EasyAuthResolveFn | None = None,
     ) -> None:
         self.app = app
         if resolver is not None:
@@ -604,6 +697,14 @@ class BearerTokenMiddleware:
         # the data keystore.  None means admin key is not configured (static
         # mode) or is irrelevant (entra mode — admin is via roles claim).
         self._admin_api_key_digest: str | None = admin_api_key_digest
+        # EasyAuth browser-identity trust (doc 14 §3.1/R5): trust is expressed
+        # by WIRING A CALLABLE, not a bool the middleware interprets. `None` =
+        # off (static mode, or entra mode with trust_easyauth_principal=False);
+        # a bound `EntraResolver.resolve_principal_id` = on. This keeps the
+        # middleware ignorant of EntraResolver's concrete type and makes "off"
+        # structurally unrepresentable outside entra mode (main.py only wires
+        # this in the entra branch).
+        self._easyauth_resolve: EasyAuthResolveFn | None = easyauth_resolve
 
     async def __call__(
         self, scope: MutableMapping[str, Any], receive: Any, send: Any
@@ -629,10 +730,71 @@ class BearerTokenMiddleware:
             return
 
         # Extract bearer token from headers.
-        token = _extract_bearer_token(scope.get("headers", []))
+        headers = scope.get("headers", [])
+        token = _extract_bearer_token(headers)
         if token is None:
+            # No Bearer token. Fall through to the EasyAuth browser-identity
+            # source (doc 14 §3.1) if it has been wired ON (entra mode +
+            # trust_easyauth_principal=True, see main.py wiring). `None` means
+            # off — original behaviour (401) is unchanged.
+            if self._easyauth_resolve is not None:
+                try:
+                    oid = _extract_easyauth_oid(headers)
+                except AuthError as exc:
+                    # TB-2: 2+ X-MS-CLIENT-PRINCIPAL-ID headers (smuggling anomaly).
+                    _log.info(
+                        "auth_event=auth_denied: %s (status=%d)",
+                        exc.reason,
+                        exc.status_code,
+                    )
+                    await _send_error(send, exc.status_code, exc.reason)
+                    return
+                if oid is None:
+                    # row 1: no EasyAuth header at all — no credential presented.
+                    # F5: log it (unlike the other 401s here, this path names no
+                    # oid) so an operator can distinguish "EasyAuth stripped/ate
+                    # the header" from "trust off / unrelated 401".
+                    _log.info(
+                        "auth_event=auth_denied: no bearer and no EasyAuth "
+                        "principal header (trust on)"
+                    )
+                    await _send_401(send)
+                    return
+                try:
+                    contributor_id, roles, is_service = self._easyauth_resolve(oid)
+                except AuthError as exc:
+                    # rows 2-5: empty / malformed / all-zeros / unbound.
+                    _log.info(
+                        "auth_event=auth_denied: %s (status=%d)",
+                        exc.reason,
+                        exc.status_code,
+                    )
+                    await _send_error(send, exc.status_code, exc.reason)
+                    return
+                # row 6: accept.
+                state = scope.setdefault("state", {})
+                state["contributor_id"] = contributor_id
+                state["is_admin"] = False  # browser-path admin is Step 3
+                state["roles"] = roles  # [] in the spike
+                state["is_service"] = is_service  # False (browser = human-like)
+                await self.app(scope, receive, send)
+                return
+            # Neither Bearer nor EasyAuth trust.
             await _send_401(send)
             return
+
+        # C6 (BINDING) — co-presence anomaly log. If BOTH a Bearer token AND an
+        # X-MS-CLIENT-PRINCIPAL-ID header are present, Bearer wins (below,
+        # UNCHANGED existing logic) but the co-presence is logged as a
+        # structured, greppable event — the fingerprint of a client injecting
+        # the header directly rather than EasyAuth injecting it. This is a
+        # tolerated benign double-send (not a hard rejection, R4/C6), but it
+        # must be surfaced, not silently accepted.
+        if self._easyauth_resolve is not None and easyauth_id_header_present(headers):
+            # Non-raising presence probe: bearer already won, so a duplicate
+            # EasyAuth header (TB-2) is moot here — do NOT raise, just surface
+            # the co-presence anomaly.
+            _log.warning("auth_event=easyauth_header_with_bearer")
 
         # T5 / ROB F1 — static-mode admin key check, SCOPED to /admin/* routes.
         #
@@ -736,6 +898,92 @@ def _extract_bearer_token(headers: list[tuple[bytes, bytes]]) -> str | None:
             if decoded.startswith("Bearer "):
                 return decoded[7:]
     return None
+
+
+def _header_value(headers: list[tuple[bytes, bytes]], name: bytes) -> str | None:
+    """Case-insensitive ASGI header lookup, decoded latin-1 (mirrors ``_extract_bearer_token``).
+
+    doc 14 §3.2 / C7: on a DUPLICATE header (the same header name sent more than
+    once), this returns the FIRST match, matching iteration order of the ASGI
+    ``headers`` list. This behaviour is deliberately defined (not left as an
+    accident of dict-building) so a client sending two
+    ``X-MS-CLIENT-PRINCIPAL-ID`` headers has a predictable, tested outcome.
+
+    Returns ``None`` when the header is absent entirely; returns ``""`` when the
+    header is present but empty (callers distinguish "absent" from "empty").
+    """
+    target = name.lower()
+    for header_name, value in headers:
+        if header_name.lower() == target:
+            return value.decode("latin-1")
+    return None
+
+
+_EASYAUTH_ID_HEADER = b"x-ms-client-principal-id"
+
+
+def _count_header(headers: list[tuple[bytes, bytes]], name: bytes) -> int:
+    """Count case-insensitive occurrences of header *name* in the ASGI list."""
+    target = name.lower()
+    return sum(1 for header_name, _ in headers if header_name.lower() == target)
+
+
+def easyauth_id_header_present(headers: list[tuple[bytes, bytes]]) -> bool:
+    """True if at least one ``X-MS-CLIENT-PRINCIPAL-ID`` header is present.
+
+    Non-raising presence probe used by the C6 co-presence anomaly log (where a
+    Bearer token is present and wins regardless): it must NOT raise on a
+    duplicate header, since bearer-wins short-circuits the EasyAuth path before
+    the TB-2 duplicate check would ever matter.
+    """
+    return _count_header(headers, _EASYAUTH_ID_HEADER) >= 1
+
+
+def _extract_easyauth_oid(headers: list[tuple[bytes, bytes]]) -> str | None:
+    """Extract the EasyAuth-injected browser oid from ASGI headers.
+
+    doc 14 §3.2 as amended by C2 (BINDING, supersedes the original base64
+    ``X-MS-CLIENT-PRINCIPAL`` blob fallback): SCALAR-ONLY. Reads
+    ``X-MS-CLIENT-PRINCIPAL-ID`` (the oid EasyAuth injects as a plain header)
+    and returns it verbatim, or ``None`` if the header is absent entirely.
+
+    **TB-2 hardening (adversarial review).** A legitimate EasyAuth edge injects
+    EXACTLY ONE ``X-MS-CLIENT-PRINCIPAL-ID`` header and strips any inbound
+    copies. Two or more occurrences is therefore an anomaly — the fingerprint of
+    a caller smuggling a forged value ahead of (or behind) the real one. Rather
+    than silently pick first-or-last (which would let the attacker choose which
+    wins by ordering), this raises :class:`AuthError` (401) so the middleware
+    rejects the whole request. This is scoped to the EasyAuth header ONLY;
+    ``_header_value`` / ``_extract_bearer_token`` keep their first-match
+    behaviour for all other headers.
+
+    The base64 ``X-MS-CLIENT-PRINCIPAL`` claims-blob fallback described in the
+    pre-council draft of this spec is intentionally NOT implemented here — C2
+    deleted it (untested accept-path, duplicate-``typ``-key ambiguity, no size
+    bound, and EasyAuth always sends the scalar header anyway). A
+    ``X-MS-CLIENT-PRINCIPAL`` blob with no scalar ``-ID`` header present is
+    therefore treated as "no EasyAuth identity" (returns ``None`` -> 401 at the
+    caller), matching doc 14 §10 C2's redefinition of Test A case A7.
+
+    Returns:
+        The single header value (may be ``""`` —
+        ``EntraResolver.resolve_principal_id`` rejects an empty string), or
+        ``None`` if no EasyAuth identity is present at all.
+
+    Raises:
+        AuthError(401): two or more ``X-MS-CLIENT-PRINCIPAL-ID`` headers (TB-2).
+    """
+    count = _count_header(headers, _EASYAUTH_ID_HEADER)
+    if count == 0:
+        return None
+    if count >= 2:
+        raise AuthError(
+            401,
+            "Multiple X-MS-CLIENT-PRINCIPAL-ID headers present; the EasyAuth "
+            "edge injects exactly one, so this is an anomaly (possible header "
+            "smuggling) — refusing to pick one",
+        )
+    return _header_value(headers, _EASYAUTH_ID_HEADER)
 
 
 async def _send_error(send: Any, status_code: int, detail: str) -> None:

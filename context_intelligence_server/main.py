@@ -315,6 +315,93 @@ def _assert_admin_not_exempt() -> None:
             )
 
 
+def _assert_capability_routes_not_exempt(settings: Settings) -> None:
+    """Startup assertion (TB-7 structural guard): a route gated by
+    ``require_read`` / ``require_write`` must NEVER sit in an auth-exempt set.
+
+    Called by ``create_asgi_app`` immediately after ``_assert_admin_not_exempt``.
+
+    Why this exists (TB-7, adversarial review): ``_is_write_capable`` (authz.py)
+    fails OPEN on an unpopulated ``scope["state"]`` — an absent ``is_service``
+    key defaults to "human-like", which is write-capable. That default is only
+    reachable for a request that never passed through the middleware's
+    identity-setting path, i.e. an AUTH-EXEMPT route. Today no capability-gated
+    route is exempt, so the fail-open default is unreachable. This guard makes
+    that a STRUCTURAL, boot-time invariant instead of a latent assumption: if a
+    future change ever adds a ``require_read``/``require_write`` route to an
+    exempt set (or exempts a prefix that swallows one), the server refuses to
+    start with a loud, specific error — closing the footgun without touching the
+    deferred ``_is_write_capable`` semantic fix (Step 3).
+
+    Unlike ``_assert_admin_not_exempt`` (which only string-matches the ``/admin``
+    path prefix against the exempt sets), this guard must actually INSPECT each
+    route's dependency tree to discover which routes carry the capability
+    dependencies — the gate is expressed via ``Depends(require_read/write)``,
+    not via a path convention. It walks ``route.dependant`` recursively,
+    collecting every ``.call``, and flags a route whose dependency tree includes
+    ``require_read`` or ``require_write``.
+
+    Raises:
+        RuntimeError: naming the offending route path, which capability
+            dependency it carries, and which exempt entry matched.
+    """
+    import context_intelligence_server.auth as _auth_module  # noqa: PLC0415
+    from fastapi.routing import APIRoute  # noqa: PLC0415
+
+    from context_intelligence_server.authz import (  # noqa: PLC0415
+        require_read,
+        require_write,
+    )
+
+    _capability_deps = {require_read: "require_read", require_write: "require_write"}
+
+    def _collect_calls(dependant: Any) -> list[Any]:
+        """Recursively collect every ``.call`` in a FastAPI dependant tree."""
+        calls: list[Any] = []
+        call = getattr(dependant, "call", None)
+        if call is not None:
+            calls.append(call)
+        for sub in getattr(dependant, "dependencies", []):
+            calls.extend(_collect_calls(sub))
+        return calls
+
+    # Select the exempt set that will actually be active for this config, so the
+    # guard checks exactly what the middleware will enforce (web_ui_enabled True
+    # uses the full set; False uses the smaller api-only set).
+    active_exempt: frozenset[str] = (
+        _auth_module._EXEMPT_PATHS
+        if settings.web_ui_enabled
+        else _auth_module._EXEMPT_PATHS_API_ONLY
+    )
+    exempt_prefixes: tuple[str, ...] = _auth_module._EXEMPT_PREFIXES
+
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        calls = _collect_calls(route.dependant)
+        gating = [name for dep, name in _capability_deps.items() if dep in calls]
+        if not gating:
+            continue
+        path = route.path
+        if path in active_exempt:
+            raise RuntimeError(
+                f"Security invariant violated (TB-7): route {path!r} is gated by "
+                f"{gating!r} but is present in the active auth-exempt set "
+                f"(exact-path match). A capability-gated route MUST NOT be "
+                f"auth-exempt — require_read/require_write fail OPEN on an "
+                f"unpopulated request state. Remove {path!r} from the exempt set."
+            )
+        for prefix in exempt_prefixes:
+            if path.startswith(prefix):
+                raise RuntimeError(
+                    f"Security invariant violated (TB-7): route {path!r} is gated "
+                    f"by {gating!r} but is matched by the auth-exempt prefix "
+                    f"{prefix!r}. A capability-gated route MUST NOT be auth-exempt "
+                    f"— require_read/require_write fail OPEN on an unpopulated "
+                    f"request state. Remove or narrow the exempt prefix."
+                )
+
+
 def _assert_neo4j_clients_explicit(settings: Settings) -> None:
     """Startup assertion (doc 11 gap #12): the deployed profile MUST declare the
     structured neo4j.admin / neo4j.cypher_query clients explicitly.
@@ -372,6 +459,13 @@ def create_asgi_app(
     _assert_admin_not_exempt()
 
     s = settings if settings is not None else _settings
+
+    # TB-7 structural assertion: no require_read/require_write route may be
+    # auth-exempt (those deps fail OPEN on unpopulated request state). Runs here,
+    # right after the admin guard, so a misconfiguration refuses to boot loudly.
+    # Takes the active settings so it checks the exempt set that web_ui_enabled
+    # will actually select below.
+    _assert_capability_routes_not_exempt(s)
     _assert_neo4j_clients_explicit(s)
 
     # Reset both stores; the active mode sets exactly one of them below.
@@ -468,7 +562,16 @@ def create_asgi_app(
         )
         # Entra mode does not use admin_api_key_digest (admin via roles claim).
         admin_api_key_digest = None
+        # doc 14 (EasyAuth browser-identity spec) §6.1: wire the EasyAuth
+        # browser-identity source ONLY when trust_easyauth_principal=True.
+        # `None` = off (the callable-not-bool wiring, R5) — a static-mode
+        # server can never grow an EasyAuth path since this is only reachable
+        # inside the entra branch.
+        easyauth_resolve = (
+            resolver.resolve_principal_id if s.trust_easyauth_principal else None
+        )
     else:
+        easyauth_resolve = None
         # Build and load the API-key store.
         key_store = IdentityStore(Path(s.api_keys_store_path))
         key_store.load()
@@ -536,6 +639,7 @@ def create_asgi_app(
         resolver=resolver,
         exempt_paths=exempt,
         admin_api_key_digest=admin_api_key_digest,
+        easyauth_resolve=easyauth_resolve,
     )
 
 

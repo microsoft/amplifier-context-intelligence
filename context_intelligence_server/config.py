@@ -12,6 +12,7 @@ Values are resolved in this priority order (highest first):
 import hashlib
 import os
 import re
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, Tuple, Type
@@ -39,16 +40,24 @@ _CONFIG_FILE_DEFAULT = "server-config.yaml"
 # re.fullmatch() anchors the match to the full string, so braces, urn:uuid:
 # prefixes, and trailing junk are all rejected without explicit anchors in the
 # pattern.
-_GUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# PUBLIC names (doc 14 section 2.3 / C4): promoted so auth.py's
+# EntraResolver.resolve_principal_id() (EasyAuth browser-identity path) can
+# import the single source of truth for GUID shape + sentinel ban instead of
+# duplicating the regex.
+GUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 # The all-zeros sentinel is explicitly rejected — a placeholder accidentally
 # left in config should never authorize anyone.
-_ALL_ZEROS_GUID = "00000000-0000-0000-0000-000000000000"
+ALL_ZEROS_GUID = "00000000-0000-0000-0000-000000000000"
+
+# Back-compat aliases: routers/admin.py imports the previous private names.
+_GUID_RE = GUID_RE
+_ALL_ZEROS_GUID = ALL_ZEROS_GUID
 
 
 def _validate_identity_map(
-    v: dict[str, dict[str, str]] | None,
+    v: dict[str, dict[str, str | bool]] | None,
     field_name: str,
-) -> dict[str, dict[str, str]] | None:
+) -> dict[str, dict[str, str | bool]] | None:
     """Shared validator for GUID-keyed identity maps (entra_identities, service_identities).
 
     Enforces the same rules for both fields so they stay in sync:
@@ -63,6 +72,11 @@ def _validate_identity_map(
 
     ``field_name`` is included verbatim in error messages so operators can tell
     which field failed at startup.
+
+    The ``str | bool`` value type accommodates entra_identities' additive
+    ``"admin"`` key (doc 14 §2.3/C5); ``service_identities`` never populates
+    that key but shares this same permissive value type since only ``id`` is
+    ever inspected here.
     """
     if v is None:
         return None
@@ -71,7 +85,7 @@ def _validate_identity_map(
             f"{field_name} must contain at least one entry if specified; "
             "omit it or use null to disable"
         )
-    normalized: dict[str, dict[str, str]] = {}
+    normalized: dict[str, dict[str, str | bool]] = {}
     for oid, meta in v.items():
         oid_lower = oid.lower()
         if not _GUID_RE.fullmatch(oid_lower):
@@ -95,7 +109,7 @@ def _validate_identity_map(
 
 
 def _build_identity_map_from(
-    identity_dict: dict[str, dict[str, str]] | None,
+    identity_dict: Mapping[str, Mapping[str, str | bool]] | None,
 ) -> dict[str, str]:
     """Shared helper: return ``{oid_lower -> id}`` for a GUID-keyed identity map.
 
@@ -103,10 +117,19 @@ def _build_identity_map_from(
     Keys are lowercased as a belt-and-suspenders guarantee: the field validator
     already normalizes them, but both ``build_identity_map()`` and
     ``build_service_identity_map()`` need identical casing behaviour.
+
+    The value type is ``str | bool`` (the additive ``admin`` key, C5); ``id`` is
+    guaranteed a ``str`` by ``_validate_identity_map`` (TB-4), so the
+    ``isinstance`` narrow below is a static-typing formality that also drops any
+    non-``id`` keys (e.g. ``admin``) from the flat contributor map.
     """
     if not identity_dict:
         return {}
-    return {oid.lower(): meta["id"] for oid, meta in identity_dict.items()}
+    return {
+        oid.lower(): cid
+        for oid, meta in identity_dict.items()
+        if isinstance((cid := meta["id"]), str)
+    }
 
 
 class YamlConfigSettingsSource(PydanticBaseSettingsSource):
@@ -236,6 +259,14 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_",
         env_nested_delimiter="__",
+        # doc 14 EasyAuth browser-identity spec, C1 (council-binding, unanimous):
+        # freeze Settings post-construction. Without this, trust_easyauth_principal
+        # (or any other field) could be flipped after boot with no re-validation,
+        # silently defeating the fail-closed _validate_entra_config gate above.
+        # A repo-wide grep (see doc 14 build report) found NO code that mutates a
+        # constructed Settings instance's attributes, so this tightens a guarantee
+        # nothing depended on breaking.
+        frozen=True,
     )
 
     # -------------------------------------------------------------------------
@@ -381,6 +412,18 @@ class Settings(BaseSettings):
     # Env: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_WEB_UI_ENABLED=false
     web_ui_enabled: bool = True
 
+    # trust_easyauth_principal (doc 14 EasyAuth browser-identity spec, section 2.1):
+    # honor the EasyAuth-injected X-MS-CLIENT-PRINCIPAL-ID header as a browser
+    # identity source inside auth_mode="entra". FAIL-CLOSED default (off).
+    #
+    # Only meaningful when auth_mode="entra" AND web_ui_enabled=True (enforced by
+    # the _validate_entra_config startup gate below). The header is trusted ONLY
+    # because EasyAuth is the sole ingress (proven by the deploy-time Test B
+    # topology probe, doc 13 Gate #2) -- the app performs NO cryptographic
+    # verification of the principal (see EntraResolver.resolve_principal_id).
+    # Env: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_TRUST_EASYAUTH_PRINCIPAL=true
+    trust_easyauth_principal: bool = False
+
     # azure_client_id / azure_tenant_id: the App Registration coordinates.
     # Both are required when auth_mode="entra".  Empty / whitespace-only
     # strings are normalized to None so that a template placeholder in a YAML
@@ -414,13 +457,69 @@ class Settings(BaseSettings):
     # NOTE: oid is a persistent personal identifier.  Do NOT commit real oid
     # values to product repos — use env/secret injection or a git-ignored map
     # (see §3 PII note in the auth plan).
-    entra_identities: dict[str, dict[str, str]] | None = None
+    # doc 14 (EasyAuth browser-identity spec) §2.3/C5 (FROZEN shape): the value
+    # type is widened from dict[str, str] to dict[str, str | bool] SOLELY so an
+    # entry can additionally carry "admin": <bool> (default false; consumed in
+    # Step 3 -- NOT read anywhere in this spike). Without this widening,
+    # pydantic's field-level coercion rejects a literal YAML `admin: true`
+    # (a Python bool) before _validate_identity_map ever runs -- confirmed by
+    # test_additive_admin_key_validates. service_identities does NOT need this
+    # (no browser-admin concept there) and is intentionally left as
+    # dict[str, str].
+    entra_identities: dict[str, dict[str, str | bool]] | None = None
+
+    @field_validator("entra_identities", mode="before")
+    @classmethod
+    def _validate_entra_identities_raw_types(cls, v: Any) -> Any:
+        """Strict RAW-input type gate (TB-4/TB-5) — runs BEFORE pydantic coercion.
+
+        Adversarial-review hardening. The ``str | bool`` value type widen (C5,
+        for the additive ``admin`` key) opened two coercion holes that only a
+        ``mode="before"`` validator can close, because by ``mode="after"``
+        pydantic has already coerced the values and the original intent is lost:
+
+        - **TB-4** — ``{"id": True}``: bool is truthy, so a naive presence check
+          would let ``id`` resolve to a Python ``bool``. (The ``mode="after"``
+          ``isinstance(id, str)`` check already rejects this, but we also reject
+          it here, explicitly, on the raw value.)
+        - **TB-5** — ``{"admin": 1}``: pydantic's ``str | bool`` union coerces
+          int ``1`` -> ``True`` *before* the after-validator runs, hiding a
+          malformed config. And ``{"admin": "false"}`` (a truthy STRING) would
+          survive as ``"false"`` and, if Step 3 consumed it naively, GRANT admin
+          — the exact opposite of intent. So ``admin``, if present, MUST be a
+          real ``bool`` (reject ``"true"``/``"false"`` strings and ``1``/``0``).
+
+        ``admin`` is a browser-path concept that only exists on
+        ``entra_identities`` (doc 14 §2.3/C5), so this gate is entra-only.
+        Non-dict shapes are passed through untouched for pydantic / the
+        ``mode="after"`` validator to reject with their standard messages.
+        """
+        if not isinstance(v, dict):
+            return v
+        for oid, meta in v.items():
+            if not isinstance(meta, dict):
+                continue  # shape error — let pydantic/after-validator handle it
+            if "id" in meta and not isinstance(meta["id"], str):
+                raise ValueError(
+                    f"entra_identities[{oid!r}]['id'] must be a string, "
+                    f"got {type(meta['id']).__name__} ({meta['id']!r})"
+                )
+            # bool is a subclass of int, but isinstance(1, bool) is False, so
+            # this correctly rejects 1/0 while accepting True/False.
+            if "admin" in meta and not isinstance(meta["admin"], bool):
+                raise ValueError(
+                    f"entra_identities[{oid!r}]['admin'] must be a bool "
+                    f"(true/false), got {type(meta['admin']).__name__} "
+                    f"({meta['admin']!r}); string 'true'/'false' and 1/0 are "
+                    "rejected fail-closed so a truthy non-bool cannot grant admin"
+                )
+        return v
 
     @field_validator("entra_identities", mode="after")
     @classmethod
     def _validate_entra_identities(
-        cls, v: dict[str, dict[str, str]] | None
-    ) -> dict[str, dict[str, str]] | None:
+        cls, v: dict[str, dict[str, str | bool]] | None
+    ) -> dict[str, dict[str, str | bool]] | None:
         """Fail-closed: raise unless every entry is ``<GUID> -> {"id": <non-empty str>}``.
 
         Delegates to the shared ``_validate_identity_map()`` helper which enforces
@@ -429,8 +528,10 @@ class Settings(BaseSettings):
         full rule set.
 
         This validator runs in ``mode="after"``, so pydantic has already coerced
-        the field as ``dict[str, dict[str, str]]`` before this function is called.
-        Non-dict values and non-string ``id`` values are caught by pydantic before
+        the field as ``dict[str, dict[str, str | bool]]`` before this function is
+        called (the ``str | bool`` value type reserves the additive ``"admin"``
+        key, doc 14 §2.3/C5).  Non-dict values and non-string ``id`` values are
+        caught by pydantic before
         reaching this code.
         """
         return _validate_identity_map(v, "entra_identities")
@@ -473,6 +574,28 @@ class Settings(BaseSettings):
                     "Entra auth misconfiguration (startup refused): "
                     + "; ".join(errors)
                 )
+        # doc 14 EasyAuth browser-identity spec, section 2.2: trust_easyauth_principal
+        # is only coherent inside the entra+web-UI world. Joined into the SAME
+        # aggregated check (separate from the auth_mode=="entra" block above) so
+        # this fires even when auth_mode != "entra" (the block above is skipped
+        # entirely in that case).
+        if self.trust_easyauth_principal:
+            easyauth_errors: list[str] = []
+            if self.auth_mode != "entra":
+                easyauth_errors.append(
+                    "trust_easyauth_principal=True requires auth_mode='entra' -- "
+                    "there is no identity map to resolve the header against"
+                )
+            if not self.web_ui_enabled:
+                easyauth_errors.append(
+                    "trust_easyauth_principal=True requires web_ui_enabled=True -- "
+                    "the EasyAuth header is a browser identity source"
+                )
+            if easyauth_errors:
+                raise ValueError(
+                    "EasyAuth trust misconfiguration (startup refused): "
+                    + "; ".join(easyauth_errors)
+                )
         return self
 
     def build_identity_map(self) -> dict[str, str]:
@@ -504,13 +627,17 @@ class Settings(BaseSettings):
     # This field is OPTIONAL.  The service identity path never participates in
     # the _validate_entra_config cross-field check, so auth_mode=entra boots
     # with only client_id / tenant_id / entra_identities.
-    service_identities: dict[str, dict[str, str]] | None = None
+    # Value type is ``str | bool`` purely to share the ``_validate_identity_map``
+    # helper and ``_build_identity_map_from`` with entra_identities without
+    # dict-invariance friction (the ``admin`` key is entra-only and is never
+    # read from service identities; only ``id`` is inspected here).
+    service_identities: dict[str, dict[str, str | bool]] | None = None
 
     @field_validator("service_identities", mode="after")
     @classmethod
     def _validate_service_identities(
-        cls, v: dict[str, dict[str, str]] | None
-    ) -> dict[str, dict[str, str]] | None:
+        cls, v: dict[str, dict[str, str | bool]] | None
+    ) -> dict[str, dict[str, str | bool]] | None:
         """Fail-closed: same GUID-map rules as entra_identities (shared helper).
 
         Delegates to ``_validate_identity_map()``.  See that function's docstring

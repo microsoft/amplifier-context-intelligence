@@ -709,6 +709,69 @@ class TestValidateEntraIdentities:
         s = Settings(entra_identities=None)
         assert s.entra_identities is None
 
+    def test_additive_admin_key_validates(self) -> None:
+        """doc 14 §2.3/C5 (FROZEN shape): entra_identities[oid]["admin"]: bool
+
+        is an additive, optional key. _validate_identity_map only requires a
+        non-empty "id" -- an entry that ALSO carries "admin": true must pass
+        untouched (no validator change needed; consuming the key is Step 3).
+        """
+        from context_intelligence_server.config import Settings
+
+        s = Settings(entra_identities={_FAKE_OID_1: {"id": "colombod", "admin": True}})
+        assert s.entra_identities is not None
+        assert s.entra_identities[_FAKE_OID_1]["id"] == "colombod"
+        assert s.entra_identities[_FAKE_OID_1]["admin"] is True
+
+    def test_admin_false_validates(self) -> None:
+        """TB-5: admin: false (explicit, the default) is a valid bool and passes."""
+        from context_intelligence_server.config import Settings
+
+        s = Settings(entra_identities={_FAKE_OID_1: {"id": "colombod", "admin": False}})
+        assert s.entra_identities is not None
+        assert s.entra_identities[_FAKE_OID_1]["admin"] is False
+
+    def test_id_bool_rejected(self) -> None:
+        """TB-4: {"id": True} MUST raise — the str|bool widen (C5) must not let a
+
+        truthy bool masquerade as a contributor id (resolve_principal_id would
+        otherwise return contributor_id=True, a bool).
+        """
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="must be a string"):
+            Settings(entra_identities={_FAKE_OID_1: {"id": True}})
+
+    def test_admin_string_false_rejected(self) -> None:
+        """TB-5: admin: "false" (a truthy STRING) MUST raise fail-closed.
+
+        A naive Step-3 consumer reading a truthy string would GRANT admin — the
+        exact opposite of intent. Only a real bool is accepted.
+        """
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="admin.*must be a bool"):
+            Settings(
+                entra_identities={_FAKE_OID_1: {"id": "colombod", "admin": "false"}}
+            )
+
+    def test_admin_int_rejected(self) -> None:
+        """TB-5: admin: 1 MUST raise — pydantic's str|bool union would otherwise
+
+        coerce int 1 -> True BEFORE the after-validator, hiding a bad config.
+        The mode="before" gate rejects it on the raw value.
+        """
+        from pydantic import ValidationError
+
+        from context_intelligence_server.config import Settings
+
+        with pytest.raises(ValidationError, match="admin.*must be a bool"):
+            Settings(entra_identities={_FAKE_OID_1: {"id": "colombod", "admin": 1}})
+
     def test_empty_dict_raises(self) -> None:
         """§8b: entra_identities={} raises ValidationError (fail-closed, mirrors api_keys)."""
         from pydantic import ValidationError

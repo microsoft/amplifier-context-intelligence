@@ -280,7 +280,11 @@ async def test_list_blobs_returns_empty_for_session_with_no_blobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /blobs/{session_id} returns 200 with empty blobs list for session with no blobs."""
-    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    monkeypatch.setattr(
+        main_module,
+        "_settings",
+        main_module._settings.model_copy(update={"blob_path": str(tmp_path)}),
+    )
 
     response = await client.get("/blobs/no-blobs-session")
     assert response.status_code == 200
@@ -295,7 +299,11 @@ async def test_list_blobs_returns_correct_uris_for_existing_blobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /blobs/{session_id} returns 200 with correct ci-blob:// URIs for existing blobs."""
-    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    monkeypatch.setattr(
+        main_module,
+        "_settings",
+        main_module._settings.model_copy(update={"blob_path": str(tmp_path)}),
+    )
 
     session_id = "blob-list-session"
     blob_dir = tmp_path / session_id / "blobs"
@@ -319,7 +327,11 @@ async def test_get_blob_returns_200_with_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /blobs/{session_id}/{key} returns 200 with blob content for existing blob."""
-    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    monkeypatch.setattr(
+        main_module,
+        "_settings",
+        main_module._settings.model_copy(update={"blob_path": str(tmp_path)}),
+    )
 
     session_id = "test-session"
     key = "my-key"
@@ -340,7 +352,11 @@ async def test_get_blob_returns_404_for_missing_blob(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /blobs/{session_id}/{key} returns 404 with 'not found' in detail for missing blob."""
-    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    monkeypatch.setattr(
+        main_module,
+        "_settings",
+        main_module._settings.model_copy(update={"blob_path": str(tmp_path)}),
+    )
 
     response = await client.get("/blobs/missing-session/missing-key")
     assert response.status_code == 404
@@ -642,7 +658,11 @@ async def test_logs_stream_returns_200_event_stream(
 
     log_file = tmp_path / "server.jsonl"
     log_file.write_text("")
-    monkeypatch.setattr(main_module._settings, "log_path", str(log_file))
+    monkeypatch.setattr(
+        main_module,
+        "_settings",
+        main_module._settings.model_copy(update={"log_path": str(log_file)}),
+    )
 
     # httpx ASGI transport never signals disconnect, so patch is_disconnected
     # to return True so the SSE generator's tail loop terminates cleanly.
@@ -667,7 +687,11 @@ async def test_logs_stream_backfills_existing_lines(
     log_file = tmp_path / "server.jsonl"
     lines = [json.dumps({"level": "INFO", "msg": f"line {i}"}) for i in range(5)]
     log_file.write_text("\n".join(lines) + "\n")
-    monkeypatch.setattr(main_module._settings, "log_path", str(log_file))
+    monkeypatch.setattr(
+        main_module,
+        "_settings",
+        main_module._settings.model_copy(update={"log_path": str(log_file)}),
+    )
 
     # httpx ASGI transport never signals disconnect, so patch is_disconnected
     # to return True so the SSE generator's tail loop terminates cleanly.
@@ -701,7 +725,11 @@ async def test_logs_stream_absent_log_file_returns_empty_stream(
     absent_file = tmp_path / "nonexistent.jsonl"
     # Deliberately do NOT create the file
     assert not absent_file.exists()
-    monkeypatch.setattr(main_module._settings, "log_path", str(absent_file))
+    monkeypatch.setattr(
+        main_module,
+        "_settings",
+        main_module._settings.model_copy(update={"log_path": str(absent_file)}),
+    )
 
     async def mock_is_disconnected(self: StarletteRequest) -> bool:  # noqa: ARG001
         return True
@@ -734,7 +762,11 @@ async def test_logs_stream_tail_lines_have_no_trailing_newline(
 
     log_file = tmp_path / "server.jsonl"
     log_file.write_text('{"level": "INFO", "msg": "hello"}\n')
-    monkeypatch.setattr(main_module._settings, "log_path", str(log_file))
+    monkeypatch.setattr(
+        main_module,
+        "_settings",
+        main_module._settings.model_copy(update={"log_path": str(log_file)}),
+    )
 
     async def mock_is_disconnected(self: StarletteRequest) -> bool:  # noqa: ARG001
         return True
