@@ -17,7 +17,7 @@ import httpx  # noqa: E402
 import pytest  # noqa: E402
 
 
-from context_intelligence_server.main import app, registry  # noqa: E402
+from context_intelligence_server.main import app, asgi_app, registry  # noqa: E402
 from context_intelligence_server.services import HookStateService  # noqa: E402
 
 
@@ -180,8 +180,32 @@ def reset_registry() -> Generator[None, None, None]:
 
 @pytest.fixture
 async def client() -> AsyncGenerator[httpx.AsyncClient, None]:
+    # Commit 3 (doc 16 §9): route the default fixture through `asgi_app` — the
+    # auth-wrapped ASGI app — NOT the bare `app`. Under the suite's
+    # ALLOW_UNAUTHENTICATED=true opt-out the middleware short-circuits (no scope
+    # state populated) and W1's _is_write_capable honours the flag, so these tests
+    # stay green — but they now traverse the REAL middleware stack instead of
+    # passing gated routes via "no middleware ran".
+    #
+    # TB-N1 guard: create_asgi_app(settings=...) MUTATES the shared module-level
+    # app.state (there is a single FastAPI `app`; every call reconfigures it). A
+    # sibling test building an auth-enabled app (allow_unauthenticated=False) leaves
+    # app.state.allow_unauthenticated=False behind; W1's _is_write_capable reads that
+    # flag LIVE, so it would fail-close and 403 this fixture's gated-route requests.
+    # Reset it to the suite's dev opt-out (conftest sets ALLOW_UNAUTHENTICATED=true at
+    # import) so gated-route `client` tests are order-independent w.r.t. THIS flag.
+    #
+    # SCOPE (do not over-read): this resets ONLY allow_unauthenticated — the one field
+    # proven to poison client tests (adversarial order: 28 failures without this line).
+    # create_asgi_app also leaks auth_mode / reader_role / service_data_role / the
+    # stores onto the same singleton; those are NOT reset here because no current
+    # `client` test observes them (the client /status callers assert status_code +
+    # neo4j fields only, never response["auth"]). The real fix — create_asgi_app
+    # mutates a shared singleton with no teardown — is tracked (SCRATCH: Commit-3
+    # follow-ups), not patched field-by-field here.
+    app.state.allow_unauthenticated = True
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
+        transport=httpx.ASGITransport(app=asgi_app),
         base_url="http://test",
     ) as c:
         yield c
@@ -195,7 +219,6 @@ async def auth_client(
     import hashlib  # noqa: PLC0415
 
     from context_intelligence_server.auth import StaticKeyResolver  # noqa: PLC0415
-    from context_intelligence_server.main import asgi_app  # noqa: PLC0415
 
     # Build a StaticKeyResolver that maps sha256("test-secret") → "owner" so existing
     # integration tests that send `Authorization: Bearer test-secret` continue to work.
