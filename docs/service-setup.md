@@ -387,6 +387,35 @@ mkdir -p "${DATA_DIR}/blobs" "${DATA_DIR}/logs" "${DATA_DIR}/queues"
 
 ## 5. Linux — systemd User Service
 
+> ⚠️ **Single-instance invariant — run the server ONLY via this service.**
+> Exactly **one** `context-intelligence-server` process may serve a given
+> `(server_port, neo4j_url)` at a time. Once it is installed as a service, start,
+> stop, and restart it **only** through `systemctl` (or launchd on macOS). Do
+> **not** also launch it by hand — `uv run uvicorn …`, `python -m uvicorn …`, or a
+> binary from a stray venv (`/opt/…`, a leftover `.venv`). The `--reload` dev
+> command in the README is for throwaway local boxes only.
+>
+> **Why it matters:** extra copies silently bind-race the same port and share the
+> same Neo4j + queue store. The kernel gives the socket to one; the rest keep
+> running as **orphans on possibly-older code**, still draining events into the
+> same graph. Real incidents this caused: an old orphan re-stamping
+> `created_by="admin"` *after* an auth fix was deployed (corrupting attribution),
+> and the event hook getting spurious **HTTP 401** floods from an orphan with a
+> stale keystore. When behavior contradicts the code you just deployed, the
+> question is **"which running copy answered this?"** — `ss` (who holds the
+> socket) beats `ps` (who's merely alive).
+>
+> **Restart safely and verify a single listener:**
+> ```bash
+> sudo systemctl restart context-intelligence-server.service   # or: systemctl --user restart …
+> ss -ltnp | grep ':8000'          # expect ONE pid (+ its worker), nothing else
+> ps -eo pid,args | grep 'context_intelligence_server.main:asgi_app' | grep -v grep   # expect NONE outside the service
+> # kill -TERM <pid> any orphan found, then re-check; SIGKILL only if it lingers
+> curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/events -d '{}'   # → 401 = up + auth enforced
+> ```
+> If orphans exist, fix whatever launched them (a manual `uv run`, an old deploy
+> script, a duplicate unit) so this service is the **only** entry point.
+
 ### Create the unit file
 
 ```bash
@@ -566,6 +595,7 @@ bypass the browser cache.
 | macOS: plist loaded but service not running | launchd silently failed | Check `server.stderr.log` for startup errors |
 | Events stop dispatching, circuit breaker tripped | `context_intelligence_api_key` missing from `~/.amplifier/settings.yaml` | Add `context_intelligence_api_key: "<key>"` under `overrides.hook-context-intelligence.config` |
 | Dashboard shows "Enter your API key" and won't load | API key prompt is active | Paste the raw API token you saved at setup into the prompt. It is not in `server-config.yaml` (which holds only the digest under `api_keys`); if lost, rotate it per [managing-api-keys.md](managing-api-keys.md) |
+| Data attributed to the wrong `created_by`, client gets **HTTP 401** floods, or behavior contradicts the deployed code | **Multiple server instances** running at once (an orphan from a manual `uv run`/old deploy racing the service on the same port + Neo4j — see the single-instance invariant at the top of §5) | `ss -ltnp \| grep ':8000'` and `ps -eo pid,args \| grep asgi_app \| grep -v grep`; `kill -TERM` every process **not** owned by the service manager, then `sudo systemctl restart context-intelligence-server.service` and re-verify a single listener. Fix whatever launched the extra copies so the service is the only entry point. |
 
 ---
 
