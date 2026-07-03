@@ -704,7 +704,13 @@ async def get_status(request: Request) -> dict[str, Any]:
         request.app, "neo4j_query_driver"
     )
     response["neo4j_url"] = _settings.resolve_neo4j_admin().url
-    response["neo4j_browser_url"] = _settings.neo4j_browser_url
+    # doc 16 W4: hide the 7474 HTTP browser URL unless dev / explicit opt-in.
+    # Key is ALWAYS present (stable /status shape) but null when hidden so the
+    # dashboard treats absence-of-value as "not available". Bolt url (neo4j_url)
+    # and health stay visible.
+    response["neo4j_browser_url"] = (
+        _settings.neo4j_browser_url if _settings.neo4j_browser_url_visible() else None
+    )
     # Additive, aggregate-only conservation metrics (D3). /status is
     # unauthenticated, so this block must NOT carry the per-key table or the
     # dead-letter listing — both are authenticated-only.

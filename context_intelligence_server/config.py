@@ -805,6 +805,20 @@ class Settings(BaseSettings):
     neo4j_password: str = "password"
     neo4j_browser_url: str = "http://localhost:7474"
 
+    # Development mode. True reveals local-only surfaces (e.g. the Neo4j browser
+    # URL on /status); default False (production) hides them. Scoped bool, NOT a
+    # general "environment" string: this is the only consumer today, and a bool
+    # cannot sprout `if environment == "..."` sprawl or a case-sensitivity foot-gun
+    # (council W4). Widen to an environment enum later IF a real second consumer
+    # appears. Env: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_IS_DEVELOPMENT=true
+    is_development: bool = False
+
+    # Explicit opt-in to expose the Neo4j Browser (7474 HTTP) URL on /status even
+    # outside development. Default False -> hidden (fail-safe). In Azure this stays
+    # False: the browser URL points into a private VNet and must not be surfaced.
+    # Env: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SHOW_NEO4J_BROWSER_URL=true
+    show_neo4j_browser_url: bool = False
+
     # Structured two-client config (doc 11). OPTIONAL for backward-compat: when
     # absent, BOTH clients fall back to the legacy flat neo4j_* fields above.
     # The real amplifier-online.yaml MUST set this explicitly (see
@@ -840,6 +854,13 @@ class Settings(BaseSettings):
             password=self.neo4j_password,
             access_mode="READ",
         )
+
+    def neo4j_browser_url_visible(self) -> bool:
+        """True iff the Neo4j Browser (7474 HTTP) URL may be surfaced on /status.
+
+        Fail-safe hidden: only development OR the explicit opt-in reveals it.
+        """
+        return self.is_development or self.show_neo4j_browser_url
 
     # -------------------------------------------------------------------------
     # Storage paths
