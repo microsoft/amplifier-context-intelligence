@@ -50,6 +50,19 @@ _EXEMPT_PATHS_API_ONLY: frozenset[str] = frozenset(
 # Path prefixes that are exempt from authentication (static assets).
 _EXEMPT_PREFIXES: tuple[str, ...] = ("/static/", "/skills/")
 
+# Route prefix of the admin router (mirrors routers/admin.py:
+# ``APIRouter(prefix="/admin", ...)``).  The static-mode admin-key fast-path is
+# scoped to these paths: the admin key is an administration credential, NOT a
+# data-ingestion identity, so it must only short-circuit auth on /admin/* — never
+# on data routes like POST /events (where it would otherwise stamp a synthetic
+# ``created_by="admin"`` and let a bare admin key post events).
+_ADMIN_ROUTE_PREFIX: str = "/admin"
+
+
+def _is_admin_route(path: str) -> bool:
+    """True for the admin router's own paths (``/admin`` and ``/admin/...``)."""
+    return path == _ADMIN_ROUTE_PREFIX or path.startswith(_ADMIN_ROUTE_PREFIX + "/")
+
 
 # ---------------------------------------------------------------------------
 # Auth error — carries a specific HTTP status code
@@ -621,17 +634,28 @@ class BearerTokenMiddleware:
             await _send_401(send)
             return
 
-        # T5 / ROB F1 — static-mode admin key check.
+        # T5 / ROB F1 — static-mode admin key check, SCOPED to /admin/* routes.
         #
-        # The admin key is NOT in the data keystore, so it would normally fail
-        # the resolver and produce a 401.  Check the bearer token's sha256
-        # against the admin-key digest BEFORE calling the resolver.  A match
-        # authenticates the request directly with contributor_id="admin" and
-        # is_admin=True — the resolver is bypassed entirely.
+        # The admin key gates the /admin/* endpoints ONLY — it is an
+        # administration credential, not a data-ingestion identity.  It is NOT in
+        # the data keystore, so on an admin route it would fail the resolver and
+        # produce a 401; the fast-path below checks the bearer token's sha256
+        # against the admin-key digest BEFORE the resolver so an admin-key bearer
+        # authenticates with is_admin=True (which require_admin needs).
+        #
+        # Restricting this to admin routes is the fix for the identity-conflation
+        # bug: on a data route (e.g. POST /events) the admin key MUST NOT
+        # short-circuit auth. Instead it falls through to the resolver, so:
+        #   - a token that is ALSO a registered data key resolves to its real
+        #     contributor id (created_by reflects that id, never "admin"); and
+        #   - a bare admin key that is not a data key is correctly rejected (401)
+        #     rather than posting events attributed to a synthetic "admin".
+        # is_admin is only ever read on /admin/* (require_admin), so scoping the
+        # fast-path there loses no authorization capability.
         #
         # Note: entra mode does not use admin_api_key_digest (it is always
         # None in entra mode); admin authority comes from the roles claim.
-        if self._admin_api_key_digest is not None:
+        if self._admin_api_key_digest is not None and _is_admin_route(path):
             token_digest = hashlib.sha256(token.encode()).hexdigest()
             if token_digest == self._admin_api_key_digest:
                 state = scope.setdefault("state", {})
