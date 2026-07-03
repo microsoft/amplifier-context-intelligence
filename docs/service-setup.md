@@ -127,7 +127,7 @@ AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE=$HOME/.config/context-intellig
 **6. Verify**:
 
 ```bash
-curl -sS http://localhost:8000/status | jq '.auth'
+curl -sS -H "Authorization: Bearer <token>" http://localhost:8000/status | jq '.auth'
 # → {"mode":"static","admin_api_enabled":true}
 curl -sS http://localhost:8000/version
 # → {"version":"6.0.0"}
@@ -356,7 +356,7 @@ stays fresh without a restart: [identity-management.md](identity-management.md).
 | `server_host` | `0.0.0.0` | Bind address. `0.0.0.0` = all interfaces; `127.0.0.1` = localhost only |
 | `server_port` | `8000` | Listen port |
 | `log_level` | `INFO` | Verbosity (`DEBUG` / `INFO` / `WARNING` / `ERROR`) |
-| `api_key` | *(your secret)* | Legacy single bearer token (folds to contributor id `owner`). All endpoints except `/status` and static routes require `Authorization: Bearer <value>`. The server verifies it as `sha256(token)`. |
+| `api_key` | *(your secret)* | Legacy single bearer token (folds to contributor id `owner`). All endpoints except `/version` and static routes require `Authorization: Bearer <value>`. The server verifies it as `sha256(token)`. |
 | `api_keys` | *(map)* | Per-contributor keystore: `sha256_hex(token) -> {id: <contributor>}`. The file holds digests; clients send raw tokens. `api_keys: {}` is a hard startup error (omit/`null` to disable auth). See [managing-api-keys.md](managing-api-keys.md). |
 
 ### Neo4j settings
@@ -582,8 +582,10 @@ overrides:
 ## 8. Verification
 
 ```bash
-# Health check (always unauthenticated)
-curl http://localhost:8000/status
+# Liveness check (always unauthenticated)
+curl http://localhost:8000/version
+# Full status (requires auth once an API key is configured)
+curl -H "Authorization: Bearer <token>" http://localhost:8000/status
 # → {"status":"ok","neo4j_connected":true,"neo4j_query_connected":true,"neo4j_url":"bolt://localhost:37687","neo4j_browser_url":"http://localhost:37474",...}
 #
 # Both neo4j_url and neo4j_browser_url are read verbatim from server-config.yaml.

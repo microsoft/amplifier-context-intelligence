@@ -104,11 +104,10 @@ function fmtTs(ts) {
   }
 }
 
-// ── Authenticated fetch wrappers ────────────────────────────────────────────
-// Each wrapper attaches the HTTP status to thrown errors (err.status) so
-// action handlers can branch on 401/400 honestly. worker_key is
-// encodeURIComponent'd defensively (it is a file stem: a session UUID or a
-// _no_session__<workspace-slug>); an unsafe key yields HTTP 400 from the server.
+// ── Authenticated fetch (read-only) ─────────────────────────────────────────
+// The wrapper attaches the HTTP status to thrown errors (err.status) so the
+// caller can branch on 401 (auth lost) honestly. Only the read-only list fetch
+// remains; drain (replay/purge) moved to the admin surface (doc 04 §3).
 
 function _httpError(label, res) {
   const err = new Error(`${label} failed: ${res.status}`);
@@ -122,26 +121,17 @@ export async function fetchDeadLetters() {
   return res.json();
 }
 
-export async function replayWorker(workerKey) {
-  const url = `/queues/dead-letter/${encodeURIComponent(workerKey)}/replay`;
-  const res = await fetch(url, { method: 'POST', headers: authHeaders() });
-  if (!res.ok) throw _httpError('replay', res);
-  return res.json();
-}
-
-export async function purgeWorker(workerKey) {
-  const url = `/queues/dead-letter/${encodeURIComponent(workerKey)}/purge`;
-  const res = await fetch(url, { method: 'POST', headers: authHeaders() });
-  if (!res.ok) throw _httpError('purge', res);
-  return res.json();
-}
+// NOTE (doc 04 §3): dead-letter DRAIN (replay/purge) is an ADMIN operation and
+// lives ONLY on the admin surface. The general dashboard is READ-ONLY for dead
+// letters — it fetches and renders the list (above), but never mutates. The
+// replay/purge fetch wrappers, action buttons, and confirm flow were removed
+// from this panel accordingly; the backend routes now live under /admin/* and
+// require admin authority.
 
 // ── DOM render functions (invoked by dashboard.js / tests) ───────────────────
-// Module-scoped state for the last rendered entries, used to re-render the
-// table after an inline Purge confirm is cancelled. No DOM is touched at module
-// load — only inside the functions below.
-
-let lastEntries = [];
+// No DOM is touched at module load — only inside the functions below. These are
+// all READ-ONLY: they render the invariant/totals cards and the dead-letter
+// LIST. There are no mutation controls here (see doc 04 §3 note above).
 
 // renderQueues(status) — the load-bearing entry point. Receives the WHOLE
 // /status object and extracts status.metrics ITSELF (do not pass .metrics in).
@@ -178,31 +168,19 @@ function renderTotals(metrics) {
     .join('');
 }
 
-// actionsCellHtml(d) — Replay + Purge buttons for one dead-letter row.
-function actionsCellHtml(d) {
-  const key = escapeAttr(d.workerKey);
-  return `<td class="actions" data-key="${key}">`
-    + `<button class="btn btn-primary" data-action="replay" data-key="${key}" `
-    + `aria-label="Replay dead-lettered events for ${key}">Replay</button>`
-    + `<button class="btn btn-danger" data-action="purge" data-key="${key}" `
-    + `aria-label="Purge dead-lettered events for ${key}">Purge</button>`
-    + `</td>`;
-}
-
-// renderDeadLetters(entries) — render the dead-letter table body. Poll guard:
-// if an inline Purge confirm is open, bail so the 3s poll cannot wipe an
-// irreversible-action confirmation out from under the user.
+// renderDeadLetters(entries) — render the READ-ONLY dead-letter table body
+// (worker key, item count, last error, last timestamp). No action controls:
+// drain (replay/purge) is admin-only and lives on the admin surface (doc 04 §3).
 export function renderDeadLetters(entries) {
   const body = document.getElementById('dead-letter-body');
   if (!body) return;
-  if (body.querySelector('.actions[data-confirming]')) return; // poll guard
-  lastEntries = entries || [];
-  if (lastEntries.length === 0) {
-    body.innerHTML = `<tr class="table-empty"><td class="all-clear" colspan="4">`
+  const list = entries || [];
+  if (list.length === 0) {
+    body.innerHTML = `<tr class="table-empty"><td class="all-clear" colspan="3">`
       + `● No dead letters — all clear</td></tr>`;
     return;
   }
-  body.innerHTML = lastEntries.map(entry => {
+  body.innerHTML = list.map(entry => {
     const d = deadLetterRowData(entry);
     const key = escapeAttr(d.workerKey);
     const err = escapeAttr(d.lastError);
@@ -211,94 +189,15 @@ export function renderDeadLetters(entries) {
       + `<td>${escapeAttr(d.itemCount)}</td>`
       + `<td class="result-error dl-error" title="${err}">${err}</td>`
       + `<td>${escapeAttr(fmtTs(d.lastTs))}</td>`
-      + actionsCellHtml(d)
       + `</tr>`;
   }).join('');
 }
 
 // renderDeadLetterError() — a failed dead-letter LOAD renders a distinct
-// "couldn't load" row, NOT an all-clear row. Respects the poll guard.
+// "couldn't load" row, NOT an all-clear row.
 export function renderDeadLetterError() {
   const body = document.getElementById('dead-letter-body');
   if (!body) return;
-  if (body.querySelector('.actions[data-confirming]')) return; // poll guard
-  body.innerHTML = `<tr class="table-empty"><td class="result-error" colspan="4">`
+  body.innerHTML = `<tr class="table-empty"><td class="result-error" colspan="3">`
     + `Couldn't load dead-letter queues — retrying…</td></tr>`;
-}
-
-// showRowBadge(workerKey, text, cls) — replace a row's actions cell with a
-// single status badge (honest feedback after an action completes).
-export function showRowBadge(workerKey, text, cls) {
-  const body = document.getElementById('dead-letter-body');
-  if (!body) return;
-  const cell = body.querySelector(`.actions[data-key="${escapeAttr(workerKey)}"]`);
-  if (cell) cell.innerHTML = `<span class="badge ${cls}">${escapeAttr(text)}</span>`;
-}
-
-// handleActionError(err, workerKey, onAuthLost) — error honesty.
-// 401 → auth lost; 400 → distinct 'Invalid'; else → 'Failed — retry'.
-export function handleActionError(err, workerKey, onAuthLost) {
-  if (err && err.status === 401) {
-    if (typeof onAuthLost === 'function') onAuthLost();
-  } else if (err && err.status === 400) {
-    showRowBadge(workerKey, 'Invalid', 'badge-error');
-  } else {
-    showRowBadge(workerKey, 'Failed — retry', 'badge-error');
-  }
-}
-
-// beginPurgeConfirm(cell, workerKey) — replace the action buttons with an
-// inline confirm (Purge is irreversible). Marks the cell data-confirming so
-// the poll guard leaves it alone, and moves focus to Cancel (Focus-to-Cancel).
-export function beginPurgeConfirm(cell, workerKey) {
-  if (!cell) return;
-  const key = escapeAttr(workerKey);
-  cell.setAttribute('data-confirming', '1');
-  cell.innerHTML = `<span class="confirm-q">Purge ${key}?</span>`
-    + `<button class="btn btn-danger" data-action="purge-confirm" data-key="${key}">Confirm</button>`
-    + `<button class="btn" data-action="purge-cancel" data-key="${key}" id="purge-cancel">Cancel</button>`;
-  const cancel = cell.querySelector('#purge-cancel');
-  if (cancel) cancel.focus();
-}
-
-// wireDeadLetterActions({onAuthLost}) — attach delegated click/keydown handlers
-// to #dead-letter-body for replay / purge / purge-confirm / purge-cancel.
-// Escape cancels an open confirm.
-export function wireDeadLetterActions({ onAuthLost } = {}) {
-  const body = document.getElementById('dead-letter-body');
-  if (!body) return;
-
-  body.addEventListener('click', async (ev) => {
-    const btn = ev.target.closest('button[data-action]');
-    if (!btn) return;
-    const action = btn.getAttribute('data-action');
-    const key = btn.getAttribute('data-key');
-    const cell = btn.closest('.actions');
-
-    if (action === 'replay') {
-      try {
-        const r = await replayWorker(key);
-        showRowBadge(key, `Re-enqueued ${r.replayed ?? 0}`, 'badge-primary');
-      } catch (err) {
-        handleActionError(err, key, onAuthLost);
-      }
-    } else if (action === 'purge') {
-      beginPurgeConfirm(cell, key);
-    } else if (action === 'purge-confirm') {
-      try {
-        const r = await purgeWorker(key);
-        showRowBadge(key, `Purged ${r.purged ?? 0}`, 'badge-primary');
-      } catch (err) {
-        handleActionError(err, key, onAuthLost);
-      }
-    } else if (action === 'purge-cancel') {
-      renderDeadLetters(lastEntries);
-    }
-  });
-
-  body.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Escape' && body.querySelector('.actions[data-confirming]')) {
-      renderDeadLetters(lastEntries);
-    }
-  });
 }

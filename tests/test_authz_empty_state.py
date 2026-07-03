@@ -172,35 +172,15 @@ def test_require_admin_denies_on_absent_state_key() -> None:
     assert exc_info.value.status_code == 403
 
 
-@pytest.mark.xfail(
-    reason=(
-        "TB-7: require_write fails OPEN on unpopulated scope state "
-        "(_is_write_capable defaults is_service->False->write-capable); "
-        "fail-closed tightening deferred to Step 3 (see docs/14). When Step 3 "
-        "tightens _is_write_capable this flips XFAIL->XPASS and FAILs the suite, "
-        "forcing removal of this marker."
-    ),
-    strict=True,
-)
 def test_require_write_should_deny_on_empty_scope_state() -> None:
-    """DESIRED (fails today -> XFAIL): require_write should DENY on empty state."""
+    """require_write DENIES on empty state (Step 3, doc 16 W1: fail-closed)."""
     req = _fake_request({}, _ENTRA_APP_STATE)
     with pytest.raises(HTTPException):
         require_write(req)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "TB-7: require_read fails OPEN on unpopulated scope state "
-        "(_is_write_capable defaults is_service->False->write-capable); "
-        "fail-closed tightening deferred to Step 3 (see docs/14). When Step 3 "
-        "tightens _is_write_capable this flips XFAIL->XPASS and FAILs the suite, "
-        "forcing removal of this marker."
-    ),
-    strict=True,
-)
 def test_require_read_should_deny_on_empty_scope_state() -> None:
-    """DESIRED (fails today -> XFAIL): require_read should DENY on empty state."""
+    """require_read DENIES on empty state (Step 3, doc 16 W1: fail-closed)."""
     req = _fake_request({}, _ENTRA_APP_STATE)
     with pytest.raises(HTTPException):
         require_read(req)

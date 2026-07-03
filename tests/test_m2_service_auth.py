@@ -704,11 +704,16 @@ class TestStatusAdditiveFields:
 
         Existing fields (mode, admin_api_enabled, entra_admin_role) must remain
         untouched — this is an additive-only change.
+
+        Step 3 (doc 16 W3): /status now requires auth, so this request carries a
+        valid human bearer token (any authenticated principal passes; /status has
+        no capability dependency).
         """
-        _, asgi = service_asgi
+        private_key, asgi = service_asgi
+        token = _sign_jwt(private_key, _human_claims())
 
         async with _make_client(asgi) as c:
-            resp = await c.get("/status")
+            resp = await c.get("/status", headers={"Authorization": f"Bearer {token}"})
 
         assert resp.status_code == 200
         data = resp.json()
@@ -942,11 +947,14 @@ class TestPhase4RouteGuard:
         )
 
     def test_data_read_routes_have_read_gate(self) -> None:
-        """Data-exposing GET routes in _REQUIRED_READ_GATED carry require_read/write.
+        """Data-exposing GET routes in _REQUIRED_READ_GATED carry a read gate.
 
-        Best-effort assertion: confirms the listed data-read routes are
-        capability-gated so Reader-only service tokens are subject to the same
-        gating as write routes.
+        Step 3 (doc 16 W2): dead-letter LIST is open to any authenticated
+        principal, so it is gated by require_read (NOT require_admin — the
+        destructive purge/replay mutations are the admin-tier routes, and they
+        relocated to POST /admin/queues/dead-letter/* where the mutating-route
+        guard below covers them). This asserts the TRUE gate on the list route:
+        require_read/require_write, deliberately NOT accepting require_admin.
         """
         from fastapi.routing import APIRoute  # noqa: PLC0415
 
@@ -974,7 +982,7 @@ class TestPhase4RouteGuard:
                 )
 
         assert not unguarded, (
-            "Data-exposing read route(s) have no capability gate:\n"
+            "Data-exposing read route(s) have no read-capability gate:\n"
             + "\n".join(sorted(unguarded))
         )
 

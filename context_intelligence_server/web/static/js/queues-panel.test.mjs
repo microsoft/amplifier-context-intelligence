@@ -90,8 +90,6 @@ const {
   renderDeadLetters,
   renderDeadLetterError,
   fetchDeadLetters,
-  replayWorker,
-  purgeWorker,
 } = mod;
 
 function resetFetch() { fetchCalls = []; nextFetchResponse = null; }
@@ -224,27 +222,16 @@ describe('fetch wrappers', () => {
     assert.deepEqual(out.dead_letters[0], { worker_key: 'w1', item_count: 1 });
   });
 
-  test('replayWorker() POSTs to encoded .../replay with auth header', async () => {
-    nextFetchResponse = { ok: true, status: 200, json: async () => ({ worker_key: 'a/b c', replayed: 4 }) };
-    const out = await replayWorker('a/b c');
-    assert.equal(fetchCalls[0].url, '/queues/dead-letter/a%2Fb%20c/replay');
-    assert.equal(fetchCalls[0].opts.method, 'POST');
-    assert.equal(fetchCalls[0].opts.headers['Authorization'], 'Bearer tok-123');
-    assert.equal(out.replayed, 4);
-  });
-
-  test('purgeWorker() POSTs to encoded .../purge', async () => {
-    nextFetchResponse = { ok: true, status: 200, json: async () => ({ worker_key: 'w1', purged: 2 }) };
-    const out = await purgeWorker('w1');
-    assert.equal(fetchCalls[0].url, '/queues/dead-letter/w1/purge');
-    assert.equal(fetchCalls[0].opts.method, 'POST');
-    assert.equal(out.purged, 2);
-  });
+  // NOTE (doc 04 §3): replayWorker/purgeWorker were REMOVED from this panel —
+  // dead-letter drain (replay/purge) is admin-only and lives on the admin
+  // surface. The general dashboard fetches the list read-only (above) and never
+  // mutates, so there are no POST /queues/dead-letter/.../{replay,purge} calls
+  // here to test.
 
   test('non-ok response throws with err.status attached', async () => {
     nextFetchResponse = { ok: false, status: 400, json: async () => ({}) };
     await assert.rejects(
-      () => replayWorker('w1'),
+      () => fetchDeadLetters(),
       (err) => { assert.equal(err.status, 400); return true; }
     );
   });
@@ -262,13 +249,16 @@ describe('fetch wrappers', () => {
 // poll-vs-confirm guard + dead-letter rendering
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('renderDeadLetters() poll-vs-confirm guard', () => {
+describe('renderDeadLetters() — read-only list (drain controls removed, doc 04 §3)', () => {
   beforeEach(() => { setupDom(); });
 
-  test('empty list → all-clear row', () => {
+  test('empty list → all-clear row spanning the 3 read-only columns', () => {
     renderDeadLetters([]);
-    assert.ok(els['dead-letter-body'].innerHTML.includes('all clear'),
-      els['dead-letter-body'].innerHTML);
+    const html = els['dead-letter-body'].innerHTML;
+    assert.ok(html.includes('all clear'), html);
+    // colspan matches the header column count after the Actions column was
+    // removed (Worker, Count, Last error = 3).
+    assert.ok(html.includes('colspan="3"'), html);
   });
 
   test('entries → rows include worker key + item count', () => {
@@ -278,25 +268,18 @@ describe('renderDeadLetters() poll-vs-confirm guard', () => {
     assert.ok(html.includes('3'), html);
   });
 
-  test('does NOT wipe an open Purge confirm (poll guard)', () => {
-    const body = els['dead-letter-body'];
-    body.innerHTML = '<tr>CONFIRM-OPEN</tr>';
-    body._confirmOpen = makeElement('cell'); // .actions[data-confirming] present
-    renderDeadLetters([{ worker_key: 'w1', item_count: 9 }]);
-    assert.equal(body.innerHTML, '<tr>CONFIRM-OPEN</tr>', 'poll must not overwrite open confirm');
+  test('rows carry NO drain controls (replay/purge are admin-only, doc 04 §3)', () => {
+    renderDeadLetters([{ worker_key: 'w1', item_count: 9, last_error: 'boom', last_ts: null }]);
+    const html = els['dead-letter-body'].innerHTML;
+    assert.ok(!/data-action/.test(html), `unexpected action control in row: ${html}`);
+    assert.ok(!/Replay|Purge/.test(html), `unexpected drain button in row: ${html}`);
+    assert.ok(!/class="actions"/.test(html), `unexpected actions cell in row: ${html}`);
   });
 
-  test('renderDeadLetterError also respects the confirm guard', () => {
-    const body = els['dead-letter-body'];
-    body.innerHTML = '<tr>CONFIRM-OPEN</tr>';
-    body._confirmOpen = makeElement('cell');
+  test('renderDeadLetterError renders the retry message', () => {
     renderDeadLetterError();
-    assert.equal(body.innerHTML, '<tr>CONFIRM-OPEN</tr>');
-  });
-
-  test('renderDeadLetterError renders the retry message when no confirm open', () => {
-    renderDeadLetterError();
-    assert.ok(els['dead-letter-body'].innerHTML.includes("Couldn't load dead-letter queues"),
-      els['dead-letter-body'].innerHTML);
+    const html = els['dead-letter-body'].innerHTML;
+    assert.ok(html.includes("Couldn't load dead-letter queues"), html);
+    assert.ok(html.includes('colspan="3"'), html);
   });
 });

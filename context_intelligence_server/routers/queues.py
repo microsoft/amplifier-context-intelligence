@@ -15,11 +15,24 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException  # noqa: F401  (HTTPException per spec)
 from fastapi.requests import Request
 
-from context_intelligence_server.authz import require_read, require_write
+from context_intelligence_server.authz import require_read
+from context_intelligence_server.routers.admin import require_admin
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Second router: dead-letter admin mutations (purge/replay) live under /admin so
+# the static admin-key fast-path (auth._is_admin_route, /admin/* ONLY) can reach
+# them (council TB-1 fix, doc 16 W2). require_admin in static mode allows only
+# when scope state has is_admin=True, and that flag is set ONLY on /admin/* paths;
+# a require_admin route OFF /admin/* would be unreachable by the static admin key.
+# require_admin is applied router-wide here (mirrors admin.py) — do NOT add a
+# per-route Depends(require_admin).
+dead_letter_admin_router = APIRouter(
+    prefix="/admin",
+    dependencies=[Depends(require_admin)],
+)
 
 
 def _decode_payload(record: dict[str, Any]) -> bytes:
@@ -63,10 +76,7 @@ async def list_dead_letters(request: Request) -> dict[str, Any]:
     return {"dead_letters": entries}
 
 
-@router.post(
-    "/queues/dead-letter/{worker_key:path}/purge",
-    dependencies=[Depends(require_write)],
-)
+@dead_letter_admin_router.post("/queues/dead-letter/{worker_key:path}/purge")
 async def purge_dead_letters(worker_key: str, request: Request) -> dict[str, Any]:
     """Purge all dead-letter records for ``worker_key``.
 
@@ -83,10 +93,7 @@ async def purge_dead_letters(worker_key: str, request: Request) -> dict[str, Any
     return {"worker_key": worker_key, "purged": purged}
 
 
-@router.post(
-    "/queues/dead-letter/{worker_key:path}/replay",
-    dependencies=[Depends(require_write)],
-)
+@dead_letter_admin_router.post("/queues/dead-letter/{worker_key:path}/replay")
 async def replay_dead_letters(worker_key: str, request: Request) -> dict[str, Any]:
     """Re-enqueue every dead-letter record for ``worker_key`` then purge them.
 

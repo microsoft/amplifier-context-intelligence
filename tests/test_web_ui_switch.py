@@ -154,8 +154,12 @@ class TestCreateAsgiAppExemptPaths:
             "it is an unauthenticated log drain if exempt"
         )
 
-    def test_web_ui_disabled_status_still_exempt(self) -> None:
-        """/status is always exempt, even in api-only mode."""
+    def test_web_ui_disabled_status_not_exempt(self) -> None:
+        """/status is NOT exempt in api-only mode (Step 3, doc 16 W3).
+
+        /status now requires auth in every config; /version is the
+        unauthenticated liveness carve-out.
+        """
         from context_intelligence_server.config import Settings  # noqa: PLC0415
         from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
@@ -164,8 +168,11 @@ class TestCreateAsgiAppExemptPaths:
         )
         wrapped = create_asgi_app(settings=settings)
 
-        assert "/status" in wrapped._exempt_paths, (
-            "/status must be exempt even in api-only mode (health check)"
+        assert "/status" not in wrapped._exempt_paths, (
+            "/status must NOT be exempt (Step 3 W3) — /version is the liveness carve-out"
+        )
+        assert "/version" in wrapped._exempt_paths, (
+            "/version must remain exempt even in api-only mode (health check)"
         )
 
     def test_web_ui_enabled_uses_full_exempt_paths(self) -> None:
@@ -305,14 +312,18 @@ class TestApiOnlyHttpBehavior:
     # Paths that MUST still be reachable
     # ------------------------------------------------------------------
 
-    async def test_status_exempt_in_api_only_mode(
+    async def test_status_requires_auth_in_api_only_mode(
         self, api_only_client: httpx.AsyncClient
     ) -> None:
-        """GET /status → 200 without token — always exempt (health check)."""
+        """GET /status without token → 401 in api-only mode (Step 3, doc 16 W3).
+
+        /status is no longer in _EXEMPT_PATHS_API_ONLY; /version is the
+        unauthenticated liveness carve-out instead.
+        """
         response = await api_only_client.get("/status")
-        assert response.status_code == 200, (
-            f"GET /status must return 200 in api-only mode (always exempt), "
-            f"got {response.status_code}"
+        assert response.status_code == 401, (
+            f"GET /status without token must return 401 in api-only mode "
+            f"(no longer exempt, Step 3 W3), got {response.status_code}"
         )
 
     async def test_skills_prefix_not_auth_blocked_in_api_only_mode(

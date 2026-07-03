@@ -348,6 +348,14 @@ def _require_key_store(request: Request) -> IdentityStore:
 # Router
 # ---------------------------------------------------------------------------
 
+# NOTE (doc 16 W2, council crusty F-W2b): this is NOT the only ``/admin``-prefixed
+# router. A SECOND one — ``dead_letter_admin_router`` in ``routers/queues.py`` —
+# also mounts under ``/admin`` for the dead-letter drain routes
+# (``POST /admin/queues/dead-letter/{worker_key}/{purge,replay}``). The path
+# spaces are disjoint (``/admin/identities`` + ``/admin/keys`` here vs
+# ``/admin/queues/dead-letter/*`` there), and both share this same
+# ``require_admin`` dependency object so the admin gate + test override identity
+# apply uniformly. Both must be ``include_router``'d in ``main.py``.
 router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin)])
 
 

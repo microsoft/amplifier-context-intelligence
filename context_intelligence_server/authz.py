@@ -21,21 +21,34 @@ from fastapi import HTTPException, Request
 def _is_write_capable(request: Request) -> bool:
     """True for any human/static principal; for a service iff it holds Contributor.
 
-    When ``is_service`` is absent from scope state the principal defaults to
-    False (human-like), making it write-capable.  This default is ONLY
-    reachable in two safe situations:
-
-    1. ``allow_unauthenticated=True`` (dev/test mode, no credential required).
-    2. Auth-exempt paths (/status, /version, /skills/*) — none of which carry
-       a capability gate, so this function is never called for them.
+    Fail-closed on unpopulated scope state (Step 3, doc 16 W1): when
+    ``is_service`` is absent from scope state entirely, the request never
+    passed through BearerTokenMiddleware's identity-setting path. That is
+    only a safe situation when the server is explicitly in the
+    ``allow_unauthenticated=True`` dev/test opt-out (read from
+    ``app.state.allow_unauthenticated``) — otherwise this denies.
 
     In auth-enabled production mode BearerTokenMiddleware ALWAYS sets
-    ``is_service`` on scope state before any route handler or dependency runs,
-    so the default is never exercised in that path.
+    ``is_service`` on scope state before any route handler or dependency runs
+    (auth.py), and the boot guard (``_assert_capability_routes_not_exempt``,
+    main.py) keeps every capability-gated route non-exempt, so the
+    absent-``is_service`` branch is unreachable in production.
+
+    Once ``is_service`` IS present, ``False`` (human / static / easyauth)
+    remains always write-capable — unchanged.
     """
     state: dict = request.scope.get("state", {})
-    if not state.get("is_service", False):
-        return True  # human / static — always write-capable, unchanged
+    if "is_service" not in state:
+        # Unpopulated scope state → fail CLOSED (Step 3, doc 16 W1).
+        # In auth-enabled mode this branch is unreachable: middleware always
+        # sets is_service (auth.py) and the boot guard keeps capability
+        # routes non-exempt (main.py). It is reachable ONLY in the explicit
+        # allow_unauthenticated dev/test opt-out, where the middleware
+        # short-circuits without populating state. Honour that opt-out;
+        # otherwise deny.
+        return bool(getattr(request.app.state, "allow_unauthenticated", False))
+    if not state["is_service"]:
+        return True  # human / static / easyauth — write-capable, unchanged
     roles: list[str] = state.get("roles", [])
     role: str = getattr(request.app.state, "service_data_role", "")
     return bool(role) and role in roles

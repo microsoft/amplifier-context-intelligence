@@ -1,5 +1,5 @@
 import { fetchStatus, postCypher } from './api.js';
-import { renderQueues, fetchDeadLetters, renderDeadLetters, renderDeadLetterError, wireDeadLetterActions } from './queues-panel.js';
+import { renderQueues, fetchDeadLetters, renderDeadLetters, renderDeadLetterError } from './queues-panel.js';
 
 function timeAgo(ts) {
   if (!ts) return '-';
@@ -101,7 +101,9 @@ function setTab(name) {
 document.getElementById('tab-overview')?.addEventListener('click', () => setTab('overview'));
 document.getElementById('tab-queues')?.addEventListener('click', () => setTab('queues'));
 document.getElementById('hint-go-queues')?.addEventListener('click', () => setTab('queues'));
-wireDeadLetterActions({ onAuthLost });
+// Dead-letter drain (replay/purge) is admin-only and lives on the admin surface
+// (doc 04 §3); the general dashboard renders the dead-letter list read-only, so
+// there are no action handlers to wire here.
 
 async function refresh() {
   try {

@@ -16,7 +16,7 @@ services:
       neo4j:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/status"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/version"]
       interval: 10s
       timeout: 5s
       retries: 3

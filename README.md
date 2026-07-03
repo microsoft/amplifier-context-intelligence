@@ -320,7 +320,7 @@ The server looks for `server-config.yaml` in the **working directory** by defaul
 
 ```bash
 AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE=/etc/ci-server/config.yaml \
-  uvicorn context_intelligence_server.main:app
+  uvicorn context_intelligence_server.main:asgi_app
 ```
 
 #### Option B — Environment variables
@@ -333,7 +333,7 @@ AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_BROWSER_URL=http://localhost:7474 \
 AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD="" \
 AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH=/tmp/ci-blobs \
 AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_PATH=/tmp/ci-logs/server.jsonl \
-  uvicorn context_intelligence_server.main:app --reload
+  uvicorn context_intelligence_server.main:asgi_app --reload
 ```
 
 #### Option C — Mix both
@@ -350,17 +350,18 @@ log_path:  /data/ci-logs/server.jsonl
 ```bash
 # Override only the password at runtime (e.g. from a secrets manager)
 AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD=hunter2 \
-  uvicorn context_intelligence_server.main:app
+  uvicorn context_intelligence_server.main:asgi_app
 ```
 
 ### 4. Start the server
 
 ```bash
 # With auto-reload (development)
-uvicorn context_intelligence_server.main:app --reload
+uvicorn context_intelligence_server.main:asgi_app --reload
 
-# Production — bind explicitly
-uvicorn context_intelligence_server.main:app \
+# Production — bind explicitly (MUST serve asgi_app: the auth-wrapped ASGI app;
+# main:app is the bare app with NO auth middleware)
+uvicorn context_intelligence_server.main:asgi_app \
   --host 0.0.0.0 \
   --port 8000 \
   --workers 1

@@ -1,15 +1,60 @@
-"""Tests for the GET /queues/dead-letter endpoint."""
+"""Tests for the dead-letter endpoints (list / purge / replay).
+
+Step 3 (doc 16 W2): list is gated by require_read at GET /queues/dead-letter;
+purge/replay are gated by require_admin and live UNDER /admin at
+POST /admin/queues/dead-letter/{worker}/{purge,replay}. This file exercises the
+dead-letter *business logic* (aggregation, purge, replay mechanics) with the
+require_admin dependency bypassed via the standard FastAPI override mechanism —
+the same pattern used by the /admin router's own route tests. Authorization
+itself (tier boundary + the TB-1 positive-admin proof) is covered separately by
+tests/test_dead_letter_requires_admin.py, which deliberately does NOT override
+require_admin.
+"""
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Generator
 from pathlib import Path
 
 import httpx
 import pytest
 
-from context_intelligence_server.main import registry
+from context_intelligence_server.authz import require_read
+from context_intelligence_server.main import app, registry
 from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.routers.admin import require_admin
+
+
+@pytest.fixture(autouse=True)
+def _bypass_dead_letter_auth() -> Generator[None, None, None]:
+    """!!! AUTHORIZATION IS DISABLED FOR EVERY TEST IN THIS FILE !!!
+
+    This autouse fixture overrides BOTH dead-letter gates to no-ops —
+    require_read (the list gate) and require_admin (the purge/replay gate) — so
+    the tests below exercise dead-letter BUSINESS LOGIC ONLY (aggregation /
+    purge / replay mechanics). It deliberately provides ZERO authorization
+    coverage. (Overriding require_read also keeps these tests independent of the
+    shared module-level app.state.allow_unauthenticated flag, which a sibling
+    test constructing an auth-enabled app via create_asgi_app can flip.)
+
+    REAL authorization — the tier boundary (list open to any authenticated
+    principal; purge/replay admin-only) AND the council TB-1 positive-admin
+    proof (static admin key + entra admin role reaching the handler through the
+    real gate) — is proven in tests/test_dead_letter_requires_admin.py, which
+    routes through the real asgi_app and does NOT override either gate.
+
+    ⚠️ If you add a NEW route test HERE, it inherits these overrides and gets NO
+    auth coverage. Either add the auth assertion to test_dead_letter_requires_admin.py
+    or scope/remove these overrides for your test. (Council: cranky-old-sam + tester-breaker.)
+    """
+    app.dependency_overrides[require_admin] = lambda: None
+    app.dependency_overrides[require_read] = lambda: None
+    try:
+        yield
+    finally:
+        app.dependency_overrides.pop(require_admin, None)
+        app.dependency_overrides.pop(require_read, None)
 
 
 def _point_registry_at(tmp_path: Path) -> QueueManager:
@@ -61,13 +106,18 @@ class TestDeadLetterList:
     async def test_dead_letter_list_requires_auth(
         self, auth_client: httpx.AsyncClient, tmp_path: Path
     ) -> None:
+        """Middleware-level authentication is still enforced (401 without any
+        token) even though this file bypasses the require_admin authorization
+        gate. Real non-admin-principal authorization (403) is covered by
+        tests/test_dead_letter_requires_admin.py."""
         _point_registry_at(tmp_path)
 
-        # No token -> 401
+        # No token -> 401 (BearerTokenMiddleware, unaffected by the
+        # require_admin override above).
         response = await auth_client.get("/queues/dead-letter")
         assert response.status_code == 401
 
-        # Valid token -> 200
+        # Valid token -> 200 (require_admin bypassed by the module fixture).
         response = await auth_client.get(
             "/queues/dead-letter",
             headers={"Authorization": "Bearer test-secret"},
@@ -86,7 +136,7 @@ class TestDeadLetterPurge:
         await qm.dead_letter("k1", b'{"a": 1}\n', "boom-1")
         await qm.dead_letter("k1", b'{"a": 2}\n', "boom-2")
 
-        response = await client.post("/queues/dead-letter/k1/purge")
+        response = await client.post("/admin/queues/dead-letter/k1/purge")
         assert response.status_code == 200
         assert response.json() == {"worker_key": "k1", "purged": 2}
         assert await qm.read_dead_letters("k1") == []
@@ -97,7 +147,7 @@ class TestDeadLetterPurge:
     ) -> None:
         _point_registry_at(tmp_path)
 
-        response = await client.post("/queues/dead-letter/nope/purge")
+        response = await client.post("/admin/queues/dead-letter/nope/purge")
         assert response.status_code == 200
         assert response.json() == {"worker_key": "nope", "purged": 0}
 
@@ -107,7 +157,7 @@ class TestDeadLetterPurge:
     ) -> None:
         _point_registry_at(tmp_path)
 
-        response = await client.post("/queues/dead-letter/a%2Fb/purge")
+        response = await client.post("/admin/queues/dead-letter/a%2Fb/purge")
         assert response.status_code == 400
 
 
@@ -135,7 +185,7 @@ class TestDeadLetterReplay:
 
         before = registry.pipeline_counters()
 
-        response = await client.post("/queues/dead-letter/k1/replay")
+        response = await client.post("/admin/queues/dead-letter/k1/replay")
         assert response.status_code == 200
         assert response.json() == {"worker_key": "k1", "replayed": 2}
 
@@ -170,7 +220,7 @@ class TestDeadLetterReplay:
 
         before = registry.pipeline_counters()
 
-        response = await client.post("/queues/dead-letter/nope/replay")
+        response = await client.post("/admin/queues/dead-letter/nope/replay")
         assert response.status_code == 200
         assert response.json() == {"worker_key": "nope", "replayed": 0}
 

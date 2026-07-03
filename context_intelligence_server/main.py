@@ -42,7 +42,10 @@ from context_intelligence_server.config import Settings, get_settings
 from context_intelligence_server.identity_store import IdentityStore
 from context_intelligence_server.dashboard import build_status_response
 from context_intelligence_server.routers.admin import router as admin_router
-from context_intelligence_server.routers.queues import router as queues_router
+from context_intelligence_server.routers.queues import (
+    dead_letter_admin_router,
+    router as queues_router,
+)
 from context_intelligence_server.routers.skills import SkillRegistry
 from context_intelligence_server.routers.skills import router as skills_router
 from context_intelligence_server.routers.version import router as version_router
@@ -219,6 +222,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await app.state.neo4j_query_driver.close()
 
 
+# NOTE (doc 16 §10.2): `app` is the BARE FastAPI app — NO auth middleware and
+# NO fail-closed startup gate. It exists only for internal wiring and tests.
+# The ONLY deployable entrypoint is `asgi_app` (defined below): serving `main:app`
+# directly ships an unauthenticated server. Deploy `main:asgi_app`, never `main:app`.
 app = FastAPI(
     title="Context Intelligence Server",
     version=__version__,
@@ -233,6 +240,9 @@ app.include_router(admin_router)
 app.include_router(skills_router)
 app.include_router(version_router)
 app.include_router(queues_router)
+# doc 16 W2: dead-letter purge/replay live under /admin so the static admin-key
+# fast-path (auth._is_admin_route) can reach them; list stays on queues_router.
+app.include_router(dead_letter_admin_router)
 _start_time = time.time()
 registry = SessionRegistry()
 # Expose the registry singleton on app.state so routers can read it via
@@ -352,8 +362,13 @@ def _assert_capability_routes_not_exempt(settings: Settings) -> None:
         require_read,
         require_write,
     )
+    from context_intelligence_server.routers.admin import require_admin  # noqa: PLC0415
 
-    _capability_deps = {require_read: "require_read", require_write: "require_write"}
+    _capability_deps = {
+        require_read: "require_read",
+        require_write: "require_write",
+        require_admin: "require_admin",
+    }
 
     def _collect_calls(dependant: Any) -> list[Any]:
         """Recursively collect every ``.call`` in a FastAPI dependant tree."""
@@ -487,6 +502,10 @@ def create_asgi_app(
     # M2: service capability role names for require_write / require_read deps.
     app.state.service_data_role = s.service_data_role
     app.state.reader_role = s.reader_role
+    # Step 3 (doc 16 W1): expose the dev/test opt-out to the capability
+    # predicate. _is_write_capable() fails closed on unpopulated scope state
+    # UNLESS this flag is set — the only sanctioned empty-state write path.
+    app.state.allow_unauthenticated = s.allow_unauthenticated
 
     # Compute the admin-key digest for the middleware (static mode only).
     # The middleware checks the bearer token's sha256 against this digest BEFORE

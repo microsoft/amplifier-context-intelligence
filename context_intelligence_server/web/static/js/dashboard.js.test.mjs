@@ -272,10 +272,12 @@ describe('dashboard.js Queues tab wiring (C2 re-arch)', () => {
     );
   });
 
-  test('wires dead-letter actions and the hint-go-queues shortcut', () => {
+  test('does NOT wire dead-letter drain actions (admin-only, doc 04 §3) and keeps the hint-go-queues shortcut', () => {
+    // Dead-letter drain (replay/purge) is admin-only and lives on the admin
+    // surface (doc 04 §3). The general dashboard must NOT wire drain controls.
     assert.ok(
-      jsSource.includes('wireDeadLetterActions('),
-      'dashboard.js should call wireDeadLetterActions(...)'
+      !jsSource.includes('wireDeadLetterActions('),
+      'dashboard.js must NOT call wireDeadLetterActions(...) — drain is admin-only (doc 04 §3)'
     );
     assert.ok(
       jsSource.includes('hint-go-queues'),

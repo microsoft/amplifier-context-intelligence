@@ -165,8 +165,11 @@ def test_compose_server_has_healthcheck(compose: dict) -> None:
     hc = server["healthcheck"]
     test_cmd = hc.get("test", "")
     test_str = str(test_cmd)
-    assert "curl" in test_str and "localhost:8000/status" in test_str, (
-        "healthcheck must use curl to check http://localhost:8000/status"
+    # Step 3 (doc 16 W5-b): /status now requires auth, so the healthcheck
+    # probes /version — the unauthenticated liveness carve-out — instead.
+    assert "curl" in test_str and "localhost:8000/version" in test_str, (
+        "healthcheck must use curl to check http://localhost:8000/version "
+        "(/status now requires auth, Step 3 W3)"
     )
 
 
