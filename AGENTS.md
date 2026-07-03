@@ -89,9 +89,67 @@ Or use Docker Compose to run everything together:
 ./start.sh
 ```
 
+> ⚠️ **The `uvicorn … --reload` command above is DEV-ONLY.** For any persistent /
+> shared server, start it **only** through its service manager (systemd / launchd)
+> — never with an ad-hoc `uvicorn` or `uv run` invocation. See
+> **[Single-instance invariant](#single-instance-invariant--one-server-per-port-neo4j)**
+> below for why, and `docs/service-setup.md` §5 for the how.
+
 ---
 
 ## Key Conventions
+
+### Single-instance invariant — one server per (port, Neo4j)
+
+**Exactly ONE `context-intelligence-server` process may serve a given
+`(server_port, neo4j_url)` pair at a time. Start and stop it ONLY through the
+service manager** (systemd unit `context-intelligence-server.service`, or the
+macOS launchd agent). **Never** launch a second copy by hand —
+`uv run uvicorn …`, `python -m uvicorn …`, or a binary from an ad-hoc venv
+(`/opt/…`, a stray `.venv`). The `--reload` dev command is the only exception,
+and only on a throwaway local box that nothing else talks to.
+
+**Why this is load-bearing, not style.** Multiple processes silently bind-race
+the same port and share the same Neo4j + queue store. The kernel hands the socket
+to whichever process grabbed it; the losers keep running as orphans. Consequences
+observed in production:
+
+- **Mixed code versions serving one database.** An old orphan still running
+  *pre-fix* code drains buffered events and writes graph data under the wrong
+  rules — e.g. re-stamping `created_by="admin"` after an auth fix
+  (`0e87f35`) was deployed. A corrected binary and a broken one fight over the
+  same graph.
+- **Spurious client `401` floods.** The event-shipping hook may hit an orphan
+  with a stale keystore / different config and get rejected, even though the
+  correct listener would accept the same token.
+- **Symptoms that contradict the code you're reading** — because "the server"
+  was never one process. When behavior makes no sense, ask **"which running copy
+  answered this request?"** `ss -ltnp` (who holds the socket) beats `ps` (who's
+  merely alive).
+
+**Restart safely — always verify a single listener:**
+
+```bash
+# 1. Restart the ONE managed instance (Linux systemd shown; use launchctl on macOS)
+sudo systemctl restart context-intelligence-server.service     # system service
+#   systemctl --user restart context-intelligence-server        # user service
+
+# 2. Confirm exactly ONE process family owns :8000
+ss -ltnp | grep ':8000'          # expect a single pid (+ its worker)
+
+# 3. Hunt strays — there should be NONE outside the service manager
+ps -eo pid,args | grep 'context_intelligence_server.main:asgi_app' | grep -v grep
+
+# 4. Kill any orphan found in step 3 (SIGTERM; SIGKILL only if it lingers), then re-verify
+#    kill -TERM <pid>
+
+# 5. Health: unauthenticated POST must return 401 (auth enforced AND server responding)
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/events -d '{}'   # → 401
+```
+
+If you find orphans, whatever launched them (a manual `uv run`, an old deploy
+script, a duplicate service unit) must be fixed so the service manager is the
+**only** entry point — otherwise they regrow.
 
 ### Neo4j / APOC setup
 
