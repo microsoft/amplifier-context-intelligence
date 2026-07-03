@@ -63,6 +63,24 @@ api_key: ""                 # Empty or absent = legacy auth disabled. Set to a n
 #     id: alice
 
 # -----------------------------------------------------------------------------
+# Admin key (static mode only) — gates the /admin/* endpoints for RUNTIME
+# keystore management (add/revoke/rotate keys without a restart). Separate from
+# the data-auth keys above; it never sends events. Leave unset if you don't use
+# the /admin API (config-file-only deployments). Full guide: §10 of
+# docs/managing-api-keys.md.
+#
+# Store the DIGEST at rest, exactly like api_keys — never the raw token. Derive
+# it with the same one-liner (sha256 of the raw admin token). Send the RAW token
+# as `Authorization: Bearer <token>` when calling /admin/*.
+# Env var: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY_SHA256
+#
+# admin_api_key_sha256: "2222222222222222222222222222222222222222222222222222222222222222"   # sha256(admin-token)
+#
+# Legacy raw form below still works but is DEPRECATED (plaintext at rest; logs a
+# startup warning). If both are set, admin_api_key_sha256 wins and this is ignored.
+# admin_api_key: ""
+
+# -----------------------------------------------------------------------------
 # Storage paths
 # All three directories are created automatically on first start.
 # -----------------------------------------------------------------------------
