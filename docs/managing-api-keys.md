@@ -288,6 +288,104 @@ authorization boundary.
 
 ---
 
+## 10. The admin key (`admin_api_key_sha256`)
+
+### What it is
+
+A **single, separate credential** that gates the server's `/admin/*` endpoints.
+It is **not** part of the data-auth keystore (`api_key` / `api_keys`) and is
+never used to send events — it authorizes *administration* of the keystore, not
+contribution to the graph. It applies to **static mode only**; in `auth_mode=entra`
+the admin capability is granted by an Entra app-role claim (`entra_admin_role`)
+instead, and the admin key is ignored.
+
+### What it's needed for / what it does
+
+It unlocks **runtime management of the per-contributor keystore with no restart** —
+the `/admin/keys` API described in [identity-management.md](identity-management.md):
+
+- **Add** a peer key while the server is running (`PUT /admin/keys`).
+- **Revoke** a peer key (`DELETE /admin/keys`).
+- **Rotate** keys without editing YAML and restarting.
+
+Without an admin key configured, `/admin/*` is **disabled** (callers get 403/503)
+and the only way to change keys is the config-file path (edit `api_keys`, restart).
+So you need the admin key **only if** you want live keystore management; a static,
+config-file-only deployment can leave it unset.
+
+How verification works (same one-way shape as data keys): a caller sends
+`Authorization: Bearer <raw_admin_token>`; the server computes `sha256(token)` and
+compares it to the configured admin digest. Match → the request is treated as
+admin (`is_admin=True`) and **bypasses the data keystore**; miss → falls through
+to normal auth. The admin check runs **before** the keystore resolver.
+
+### How to set it up
+
+1. **Generate a token and its digest** (token never touches shell history):
+
+   ```bash
+   python3 - <<'PY'
+   import secrets, hashlib
+   t = secrets.token_urlsafe(32)
+   print("admin token: ", t)                                    # keep secret; use as Bearer
+   print("admin digest:", hashlib.sha256(t.encode()).hexdigest())  # goes in config
+   PY
+   ```
+
+2. **Store the digest at rest** in `server-config.yaml` (or via env var
+   `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY_SHA256`):
+
+   ```yaml
+   admin_api_key_sha256: "<64-hex admin digest>"
+   ```
+
+3. **Restart** the server. Confirm it came up admin-enabled — the startup log
+   reads `create_asgi_app: auth_mode=static admin_api=enabled`, and unauthenticated
+   `/status` reports `auth.admin_api_key_configured: true`.
+
+4. **Use the raw token** to call the admin API:
+
+   ```bash
+   curl -H "Authorization: Bearer <raw_admin_token>" https://<host>/admin/keys
+   ```
+
+**Capture the raw token when you mint it.** The server keeps only the digest and
+cannot give the token back; lose it and you mint a new one and update the config.
+
+### Storage at rest — digest, not raw token
+
+`admin_api_key_sha256` stores the **one-way SHA-256 digest**, so a leak of the
+config file yields no usable admin credential — the same guarantee `api_keys`
+provides. The legacy raw field `admin_api_key: "<token>"` still works (it is
+hashed at load) but is **deprecated**: it puts the secret in plaintext at rest,
+and the server logs a startup warning when it is used. If both are set,
+`admin_api_key_sha256` wins and the raw field is ignored.
+
+To migrate off the raw field: compute the digest of your existing admin token
+(step 1's one-liner), move it to `admin_api_key_sha256`, delete the raw
+`admin_api_key`, and restart.
+
+### Security notes
+
+- Treat the admin token like **root** for this server: it can add/revoke any
+  contributor key. Keep it separate from ordinary per-peer ingestion tokens.
+- Don't reuse the admin token as a data-ingestion key. If you do, the admin
+  fast-path authenticates it as `admin` **before** the keystore resolver, so your
+  events are stamped `created_by=admin` instead of your real contributor `id`.
+- Rotate it independently of data keys; because client and server hold the secret
+  in different forms (raw vs digest), rotate **both sides together**.
+
+### Validation (fail-closed)
+
+| Rule | Behavior |
+|------|----------|
+| `admin_api_key_sha256` not exactly 64 hex chars | **Hard startup error.** (Uppercase is accepted and normalized to lowercase.) |
+| `admin_api_key_sha256: ""` (empty string) | Normalized to unset (admin disabled), mirrors `admin_api_key`. |
+| Both `admin_api_key` and `admin_api_key_sha256` set | Digest wins; raw ignored; startup warning. |
+| Raw `admin_api_key` set (no digest) | Works, but logs a deprecation warning. |
+
+---
+
 ## See also
 
 - [peer-onboarding.md](peer-onboarding.md) — the guide to hand a peer who receives a token.
