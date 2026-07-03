@@ -52,6 +52,23 @@ Key facts that follow from this:
 > [identity-management.md](identity-management.md). Both edit the same map — the
 > in-process keystore that is the source of truth at runtime.
 
+> **Admin key: store the digest, not the raw token.** The admin credential that
+> gates `/admin/*` follows the same at-rest rule as `api_keys` — store its
+> **SHA-256 digest**, never the raw token. Set `admin_api_key_sha256:` to the
+> 64-hex digest (derived with the one-liner in §2). A config-file leak then
+> yields only a one-way digest, not a usable admin credential. The legacy raw
+> `admin_api_key:` field still works (it is hashed at load) but is **deprecated**
+> — the server logs a warning at startup and, if both are set,
+> `admin_api_key_sha256` wins and the raw field is ignored. Env var:
+> `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY_SHA256`.
+>
+> ```yaml
+> # Recommended — digest at rest:
+> admin_api_key_sha256: "<64-hex sha256 of the admin token>"
+> # Deprecated — raw token at rest (still works, warns):
+> # admin_api_key: "<raw admin token>"
+> ```
+
 ---
 
 ## 2. The two one-liners

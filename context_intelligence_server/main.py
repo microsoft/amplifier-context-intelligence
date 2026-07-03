@@ -346,7 +346,7 @@ def create_asgi_app(
     # test-specific settings (passed via create_asgi_app(settings=...)) take
     # effect without relying on the module-level cached get_settings().
     app.state.auth_mode = s.auth_mode
-    app.state.admin_api_key_configured = s.admin_api_key is not None
+    app.state.admin_api_key_configured = s.resolve_admin_api_key_digest() is not None
     app.state.entra_admin_role = s.entra_admin_role
     # M2: service capability role names for require_write / require_read deps.
     app.state.service_data_role = s.service_data_role
@@ -356,13 +356,26 @@ def create_asgi_app(
     # The middleware checks the bearer token's sha256 against this digest BEFORE
     # calling the resolver, so the admin key can authenticate even though it is
     # not in the data keystore (ROB F1).
-    import hashlib as _hashlib  # noqa: PLC0415
-
-    admin_api_key_digest: str | None = (
-        _hashlib.sha256(s.admin_api_key.encode()).hexdigest()
-        if s.admin_api_key is not None
-        else None
-    )
+    #
+    # Storage-at-rest is resolved by Settings: the RECOMMENDED admin_api_key_sha256
+    # (digest at rest) is used verbatim; the legacy raw admin_api_key (DEPRECATED,
+    # plaintext at rest) is hashed by the resolver.  Surface the deprecation and
+    # precedence as one-time startup warnings so operators can migrate.
+    admin_api_key_digest: str | None = s.resolve_admin_api_key_digest()
+    if s.admin_api_key is not None and s.admin_api_key_sha256 is not None:
+        logger.warning(
+            "Both admin_api_key and admin_api_key_sha256 are configured; using "
+            "admin_api_key_sha256 (digest at rest) and IGNORING the raw "
+            "admin_api_key. Remove the raw admin_api_key from your config."
+        )
+    elif s.admin_api_key is not None:
+        logger.warning(
+            "admin_api_key is configured as a RAW token, which stores the secret "
+            "in plaintext at rest. This is DEPRECATED. Store its SHA-256 digest in "
+            "admin_api_key_sha256 instead (see docs/managing-api-keys.md): "
+            'python3 -c "import hashlib,sys;print(hashlib.sha256('
+            'sys.argv[1].encode()).hexdigest())" "<token>"'
+        )
 
     if s.auth_mode == "entra":
         # Build and load the entra identity store.
@@ -449,8 +462,8 @@ def create_asgi_app(
     if s.auth_mode == "static":
         _admin_status = (
             "enabled"
-            if s.admin_api_key is not None
-            else "disabled (admin_api_key not set)"
+            if s.resolve_admin_api_key_digest() is not None
+            else "disabled (admin_api_key/admin_api_key_sha256 not set)"
         )
     else:
         _admin_status = (
@@ -531,7 +544,7 @@ async def get_status(request: Request) -> dict[str, Any]:
     _admin_key_set = getattr(
         request.app.state,
         "admin_api_key_configured",
-        _settings.admin_api_key is not None,
+        _settings.resolve_admin_api_key_digest() is not None,
     )
     _entra_admin_role = getattr(
         request.app.state, "entra_admin_role", _settings.entra_admin_role

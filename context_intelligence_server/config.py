@@ -474,6 +474,74 @@ class Settings(BaseSettings):
         """Normalize empty string to None (mirrors _normalize_api_key)."""
         return None if v == "" else v  # type: ignore[return-value]
 
+    # admin_api_key_sha256 is the RECOMMENDED way to configure the admin key:
+    # store the SHA-256 hex digest of the admin token at rest, never the raw
+    # token — mirroring how the data-auth ``api_keys`` map stores digests, not
+    # tokens (see docs/managing-api-keys.md).  A leak of the config file then
+    # yields only a one-way digest, not a usable admin credential.
+    #
+    # The legacy raw ``admin_api_key`` above still works for back-compat (it is
+    # hashed at load time, exactly like the legacy singular ``api_key``), but is
+    # DEPRECATED because it stores the secret in plaintext at rest.  When both
+    # are set, ``admin_api_key_sha256`` wins and the raw field is ignored
+    # (surfaced as a startup warning in create_asgi_app).
+    #
+    # Set via YAML or the env var
+    # ``AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY_SHA256``.  Empty
+    # string normalises to None (mirrors admin_api_key).
+    admin_api_key_sha256: str | None = None
+
+    @field_validator("admin_api_key_sha256", mode="before")
+    @classmethod
+    def _normalize_admin_api_key_sha256(cls, v: object) -> str | None:
+        """Normalize empty string to None (mirrors _normalize_admin_api_key)."""
+        return None if v == "" else v  # type: ignore[return-value]
+
+    @field_validator("admin_api_key_sha256", mode="after")
+    @classmethod
+    def _validate_admin_api_key_sha256(cls, v: str | None) -> str | None:
+        """Fail-closed: require a 64-char lowercase SHA-256 hex digest (or None).
+
+        Mirrors ``_validate_api_keys``' digest check so a misconfigured admin
+        digest fails loudly at startup rather than silently rejecting every
+        admin request at runtime.  An UPPERCASE digest is normalized to
+        lowercase so it matches ``hashlib.sha256(...).hexdigest()``.
+        """
+        if v is None:
+            return None
+        digest_lower = v.strip().lower()
+        if len(digest_lower) != 64 or not all(
+            c in "0123456789abcdef" for c in digest_lower
+        ):
+            raise ValueError(
+                f"admin_api_key_sha256 must be a 64-character SHA-256 hex digest, "
+                f"got {v!r}. Derive it with: python3 -c "
+                f'"import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode())'
+                f'.hexdigest())" "<token>" (see docs/managing-api-keys.md).'
+            )
+        return digest_lower
+
+    def resolve_admin_api_key_digest(self) -> str | None:
+        """Return the admin key's sha256-hex digest, or None if not configured.
+
+        Precedence:
+        - ``admin_api_key_sha256`` (digest stored at rest, RECOMMENDED) is used
+          verbatim (already validated/lowercased).
+        - the legacy raw ``admin_api_key`` (DEPRECATED, plaintext at rest) is
+          hashed here over its UTF-8 bytes so the derived digest matches the
+          bearer token sent in the Authorization header.
+        - ``None`` when neither is set (admin API disabled in static mode).
+
+        Pure function (no logging/side effects) so it is safe to call from
+        config, request handlers, and status endpoints.  The one-time
+        deprecation/precedence warnings are emitted by create_asgi_app().
+        """
+        if self.admin_api_key_sha256 is not None:
+            return self.admin_api_key_sha256
+        if self.admin_api_key is not None:
+            return hashlib.sha256(self.admin_api_key.encode()).hexdigest()
+        return None
+
     # -------------------------------------------------------------------------
     # Entra admin role (entra mode only — gates /admin/* map-mutation endpoints)
     # -------------------------------------------------------------------------
