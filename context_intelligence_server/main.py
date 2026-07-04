@@ -681,6 +681,16 @@ if _settings.web_ui_enabled:
     async def dashboard() -> FileResponse:
         return FileResponse(_WEB_DIR / "dashboard.html")
 
+    @app.get("/admin-ui", response_class=HTMLResponse)
+    async def admin_ui() -> FileResponse:
+        # Exempt shell (auth._EXEMPT_PATHS). The page itself carries no data;
+        # its JS attaches Authorization: Bearer <admin key> to every /admin/*,
+        # /queues/*, and /status fetch. The shell MUST NOT live under /admin/*:
+        # that prefix is gated for EVERY request incl. a browser navigation
+        # (auth._is_admin_route, auth.py:62-64) and a navigation can carry no
+        # bearer header -> it would 401 before any JS runs.
+        return FileResponse(_WEB_DIR / "admin.html")
+
 
 # ---------------------------------------------------------------------------
 # M2 — service capability dependencies (moved to authz.py to avoid circular import)

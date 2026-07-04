@@ -554,3 +554,35 @@ a, button { transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1); }
 
 /* D-2: keep table headers on one line; .table-scroll gives the overflow escape hatch */
 .data-table th { white-space: nowrap; }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Admin UI (doc 17 §E.4) — token-only additions, per doc 06 B.7. All
+   additive, dark-mode-inherited, no new hue/radius/font.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* Admin eyebrow — the single admin signal (uses the unused --accent, theme.css:20-21,43-44) */
+.pill.admin {
+  background: color-mix(in oklch, var(--accent) 55%, transparent);
+  color: var(--accent-foreground);
+  border-color: color-mix(in oklch, var(--accent-foreground) 30%, transparent);
+}
+.pill.admin::before { background: var(--accent-foreground); }
+
+/* Generalize .log-filter (theme.css:276-287) into a reusable admin form input + invalid state */
+.input {
+  background: color-mix(in oklch, var(--muted) 60%, transparent);
+  color: var(--foreground);
+  border: 1px solid var(--border);
+  border-radius: 0.6rem;
+  padding: 0.35rem 0.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  outline: none;
+}
+.input:focus { border-color: var(--ring); box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring) 25%, transparent); }
+.input[aria-invalid="true"] { border-color: var(--destructive); box-shadow: 0 0 0 3px color-mix(in oklch, var(--destructive) 22%, transparent); }
+.field-error { font-size: 0.8rem; color: var(--destructive); }
+
+/* Row-level degraded (parallels .invariant.degraded, theme.css:450-453) */
+.data-table tr.degraded td { box-shadow: inset 3px 0 0 var(--destructive); }
+.data-table tr.degraded td:first-child { color: var(--destructive); font-weight: 600; }

@@ -33,6 +33,7 @@ _EXEMPT_PATHS: frozenset[str] = frozenset(
         "/logs/stream",
         "/",
         "/dashboard",
+        "/admin-ui",  # <-- ADD: exempt admin SHELL only; /admin/* stays gated
         "/docs",
         "/openapi.json",
     }

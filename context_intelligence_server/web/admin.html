@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Admin &middot; Context Intelligence</title>
+  <link rel="icon" href="https://avatars.githubusercontent.com/u/240397093" />
+  <link rel="stylesheet" href="/static/css/theme.css" />
+  <script src="/static/js/theme.js"></script>
+</head>
+<body>
+  <div class="glow-top-left"></div>
+  <div class="glow-bottom-right"></div>
+
+  <div class="page">
+    <!-- Admin auth overlay (doc 17 §D.3) — a DISTINCT login from the dashboard's,
+         storing ci_admin_key (not ci_api_key). -->
+    <div id="admin-auth-overlay" style="position:fixed;inset:0;z-index:9999;background:var(--background);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1rem;">
+      <img src="https://avatars.githubusercontent.com/u/240397093" alt="Amplifier" style="width:64px;height:64px;border-radius:50%;" />
+      <h2 style="margin:0;font-size:1.25rem;">Context Intelligence &mdash; Admin</h2>
+      <p style="margin:0;color:var(--muted-foreground);">Enter the admin key</p>
+      <p style="margin:0;color:var(--muted-foreground);font-size:0.82rem;max-width:22rem;text-align:center;">
+        This is the admin credential &mdash; separate from your dashboard API key.
+      </p>
+      <input id="admin-auth-token-input" type="password" placeholder="Admin key&hellip;" style="padding:0.5rem 0.75rem;border:1px solid var(--border);border-radius:0.375rem;background:var(--input);color:var(--foreground);font-size:1rem;width:20rem;max-width:90vw;" />
+      <button id="admin-auth-submit-btn" style="padding:0.5rem 1.5rem;background:var(--primary);color:var(--primary-foreground);border:none;border-radius:0.375rem;cursor:pointer;font-size:1rem;">Unlock</button>
+      <p id="admin-auth-error" style="margin:0;color:var(--destructive);display:none;">Invalid admin key. Please try again.</p>
+    </div>
+
+    <!-- Nav -->
+    <nav class="topnav">
+      <div class="brand">
+        <img src="https://avatars.githubusercontent.com/u/240397093" alt="Amplifier" />
+        <span class="brand-name">Context Intelligence</span>
+      </div>
+      <a href="/">Home</a>
+      <a href="/dashboard">Dashboard</a>
+      <a href="/admin-ui" class="active">Admin</a>
+      <a href="/docs" target="_blank">API</a>
+      <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()">&#x263E;</button>
+    </nav>
+
+    <!-- Admin eyebrow row: the single admin signal + a live refresh-freshness
+         signal + sign-out (clear ci_admin_key + re-show the overlay). -->
+    <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;margin-bottom:1rem;">
+      <span class="pill admin" style="margin-bottom:0;">Admin &middot; Restricted</span>
+      <span id="admin-refresh-status" class="card-description"></span>
+      <button type="button" class="btn" id="admin-signout-btn" style="margin-left:auto;">Sign out</button>
+    </div>
+
+    <!-- Tab bar -->
+    <div class="tab-bar" role="tablist" aria-label="Admin sections">
+      <button type="button" class="tab active" id="tab-deadletters" data-tab="deadletters" role="tab" aria-controls="panel-deadletters" aria-selected="true">Dead-letters</button>
+      <button type="button" class="tab" id="tab-identity" data-tab="identity" role="tab" aria-controls="panel-identity" aria-selected="false">Identity</button>
+      <button type="button" class="tab" id="tab-metrics" data-tab="metrics" role="tab" aria-controls="panel-metrics" aria-selected="false">Queue metrics</button>
+    </div>
+
+    <!-- Dead-letters tab (P1) -->
+    <section id="panel-deadletters" class="tab-panel" role="tabpanel" aria-labelledby="tab-deadletters">
+      <p class="section-label">Dead-letter queues</p>
+      <div class="card" style="padding:0;overflow:hidden;">
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead><tr>
+              <th>Worker</th><th>Count</th><th>Last error</th><th>Last seen</th><th>Actions</th>
+            </tr></thead>
+            <tbody id="admin-dl-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- Identity tab (P2) — mode-aware: API keys (static) OR OID identities (entra) -->
+    <section id="panel-identity" class="tab-panel" role="tabpanel" aria-labelledby="tab-identity" hidden>
+      <p class="section-label">API keys (static mode)</p>
+      <div class="card" id="identity-keys-card"><span class="card-description">Loading…</span></div>
+
+      <p class="section-label">OID identities (entra mode)</p>
+      <div class="card" id="identity-identities-card"><span class="card-description">Loading…</span></div>
+    </section>
+
+    <!-- Queue metrics tab (P3) -->
+    <section id="panel-metrics" class="tab-panel" role="tabpanel" aria-labelledby="tab-metrics" hidden>
+      <div style="display:flex;gap:0.75rem;flex-wrap:wrap;margin-bottom:1.5rem;">
+        <div class="stat-chip"><span class="stat-label">Neo4j</span><span class="stat-value" id="admin-neo4j-status">&mdash;</span></div>
+        <div class="stat-chip"><span class="stat-label">Neo4j Bolt</span><span class="stat-value" id="admin-neo4j-url" style="font-size:0.78rem;font-family:monospace;">&mdash;</span></div>
+        <div class="stat-chip"><span class="stat-label">Neo4j Browser</span><span class="stat-value"><a id="admin-neo4j-browser-url" href="#" target="_blank" style="font-size:0.78rem;font-family:monospace;color:var(--primary);">&mdash;</a></span></div>
+      </div>
+
+      <p class="section-label">Pipeline invariant</p>
+      <div class="invariant card" id="admin-invariant-card">
+        <span class="invariant-legend">accepted &minus; written &minus; in-queue &minus; dead-letter = residual</span>
+        <div class="invariant-row">
+          <span class="invariant-eq" id="admin-invariant-eq">&mdash;</span>
+          <span class="badge" id="admin-invariant-badge">&mdash;</span>
+        </div>
+      </div>
+
+      <p class="section-label">Queue totals</p>
+      <div id="admin-totals-row" style="display:flex;gap:0.75rem;flex-wrap:wrap;margin-bottom:1.5rem;"></div>
+    </section>
+  </div>
+
+  <script type="module" src="/static/js/admin/admin.js"></script>
+  <script>
+    // set correct icon after theme.js runs
+    const btn = document.getElementById('theme-toggle');
+    if (btn) btn.textContent = document.documentElement.classList.contains('dark') ? '\u2600' : '\u263e';
+  </script>
+</body>
+</html>
