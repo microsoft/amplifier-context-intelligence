@@ -179,8 +179,9 @@ class TestMiddlewareWithKeystore:
 
         assert scope.get("state", {}).get("contributor_id") == "alice"
 
-    async def test_status_requires_token(self) -> None:
-        """/status requires a valid token (Step 3, doc 16 W3) — no longer exempt."""
+    async def test_status_stays_exempt(self) -> None:
+        """/status stays exempt from auth -- it is the Azure Container Apps
+        liveness/health probe and must never require a token."""
         app = AsyncMock()
         middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
 
@@ -189,8 +190,7 @@ class TestMiddlewareWithKeystore:
         send = AsyncMock()
 
         await middleware(scope, receive, send)
-        app.assert_not_called()
-        assert send.call_args_list[0][0][0]["status"] == 401
+        app.assert_called_once_with(scope, receive, send)
 
     async def test_non_http_scope_passes_through(self) -> None:
         """Non-HTTP scopes (e.g. websocket, lifespan) are not intercepted."""
@@ -404,12 +404,13 @@ class TestAuthEnforcedViaAsgiApp:
         )
         assert response.status_code != 401
 
-    async def test_status_without_token_returns_401(
+    async def test_status_without_token_returns_200(
         self, auth_client: httpx.AsyncClient
     ) -> None:
-        """GET /status now requires auth (Step 3, doc 16 W3) — 401 without a token."""
+        """GET /status stays exempt from auth -- it is the Azure Container Apps
+        liveness/health probe and must never require a token."""
         response = await auth_client.get("/status")
-        assert response.status_code == 401
+        assert response.status_code == 200
 
     async def test_blobs_without_token_returns_401(
         self, auth_client: httpx.AsyncClient

@@ -828,11 +828,12 @@ async def _auth_client(
 class TestAuthMiddleware:
     """Bearer token middleware integration tests against the real app."""
 
-    async def test_status_requires_token_when_api_key_set(self) -> None:
-        """/status now requires auth (Step 3, doc 16 W3) when api_key is set."""
+    async def test_status_stays_exempt_when_api_key_set(self) -> None:
+        """/status stays exempt from auth even when api_key is set -- it is the
+        Azure Container Apps liveness/health probe and must never require a token."""
         async with _auth_client() as c:
             response = await c.get("/status")
-        assert response.status_code == 401
+        assert response.status_code == 200
 
     async def test_events_returns_401_without_token_when_api_key_set(self) -> None:
         """POST /events returns 401 when api_key is configured and no token sent."""

@@ -1,8 +1,11 @@
-"""W3 (doc 16 §5.3) — /status now requires auth; /version remains the
-unauthenticated liveness carve-out.
+"""/status MUST remain a public, unauthenticated route -- it is the Azure
+Container Apps liveness/health probe. Gating it breaks the deployment.
+
+This test is a tripwire: it fails loudly if anyone ever removes /status from
+the exempt sets (_EXEMPT_PATHS / _EXEMPT_PATHS_API_ONLY).
 
 Exercises BOTH auth-exempt sets (full-web _EXEMPT_PATHS and API-only
-_EXEMPT_PATHS_API_ONLY) so a future change can't silently re-exempt /status
+_EXEMPT_PATHS_API_ONLY) so a future change can't silently re-gate /status
 in one set while leaving the other correct.
 """
 
@@ -14,8 +17,20 @@ from pathlib import Path
 import httpx
 import pytest
 
-_DATA_TOKEN = "status-auth-w3-test-token"  # noqa: S105 (test fixture, not a real secret)
+from context_intelligence_server.auth import _EXEMPT_PATHS, _EXEMPT_PATHS_API_ONLY
+
+_DATA_TOKEN = "status-public-guard-test-token"  # noqa: S105 (test fixture, not a real secret)
 _DATA_DIGEST = hashlib.sha256(_DATA_TOKEN.encode()).hexdigest()
+
+
+def test_status_in_exempt_paths() -> None:
+    """/status must be present in the full-web exempt set."""
+    assert "/status" in _EXEMPT_PATHS
+
+
+def test_status_in_exempt_paths_api_only() -> None:
+    """/status must be present in the API-only exempt set (the Azure/ACA config)."""
+    assert "/status" in _EXEMPT_PATHS_API_ONLY
 
 
 def _make_settings(tmp_path: Path, *, web_ui_enabled: bool):
@@ -32,8 +47,8 @@ def _make_settings(tmp_path: Path, *, web_ui_enabled: bool):
 
 
 @pytest.mark.anyio
-async def test_status_requires_auth_when_web_ui_enabled(tmp_path: Path) -> None:
-    """GET /status with no Authorization header → 401 (web_ui_enabled=True,
+async def test_status_stays_public_when_web_ui_enabled(tmp_path: Path) -> None:
+    """GET /status with no Authorization header -> 200 (web_ui_enabled=True,
     exercises _EXEMPT_PATHS)."""
     from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
@@ -44,13 +59,14 @@ async def test_status_requires_auth_when_web_ui_enabled(tmp_path: Path) -> None:
         transport=httpx.ASGITransport(app=wrapped), base_url="http://test"
     ) as c:
         resp = await c.get("/status")
-    assert resp.status_code == 401
+    assert resp.status_code == 200
 
 
 @pytest.mark.anyio
-async def test_status_requires_auth_when_api_only(tmp_path: Path) -> None:
-    """GET /status with no Authorization header → 401 (web_ui_enabled=False,
-    exercises _EXEMPT_PATHS_API_ONLY — the Azure/API-only config)."""
+async def test_status_stays_public_when_api_only(tmp_path: Path) -> None:
+    """GET /status with no Authorization header -> 200 (web_ui_enabled=False,
+    exercises _EXEMPT_PATHS_API_ONLY -- the Azure/API-only config used by ACA
+    liveness/health probes)."""
     from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
     settings = _make_settings(tmp_path, web_ui_enabled=False)
@@ -60,16 +76,15 @@ async def test_status_requires_auth_when_api_only(tmp_path: Path) -> None:
         transport=httpx.ASGITransport(app=wrapped), base_url="http://test"
     ) as c:
         resp = await c.get("/status")
-    assert resp.status_code == 401
+    assert resp.status_code == 200
 
 
 @pytest.mark.anyio
-async def test_status_authenticated_returns_200(tmp_path: Path) -> None:
-    """TB-5: /status WITH a valid bearer token → 200 (auth-enabled app).
+async def test_status_authenticated_also_returns_200(tmp_path: Path) -> None:
+    """/status WITH a valid bearer token -> also 200 (auth-enabled app).
 
-    Guards against an "always-401 even with valid auth" regression — proves the
-    middleware admits an authenticated principal to /status (which carries no
-    capability dependency), not merely that it rejects the unauthenticated case.
+    /status is exempt, so a request never NEEDS a token -- but a request that
+    happens to carry a valid one must not be rejected either.
     """
     from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
@@ -87,9 +102,8 @@ async def test_status_authenticated_returns_200(tmp_path: Path) -> None:
 
 @pytest.mark.anyio
 async def test_version_still_exempt(tmp_path: Path) -> None:
-    """GET /version with no Authorization header → 200 for both exempt sets —
-    pins the liveness carve-out so a future change can't silently re-exempt
-    /status by widening the set."""
+    """GET /version with no Authorization header -> 200 for both exempt sets --
+    pins the liveness carve-out alongside /status."""
     from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
     for web_ui_enabled in (True, False):

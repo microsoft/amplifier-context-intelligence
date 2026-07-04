@@ -28,6 +28,7 @@ JWKS_CACHE_LIFESPAN_SECONDS: int = 300
 # Used when web_ui_enabled=True (the default full-web mode).
 _EXEMPT_PATHS: frozenset[str] = frozenset(
     {
+        "/status",
         "/version",
         "/logs/stream",
         "/",
@@ -43,6 +44,7 @@ _EXEMPT_PATHS: frozenset[str] = frozenset(
 # remain an unauthenticated log drain.
 _EXEMPT_PATHS_API_ONLY: frozenset[str] = frozenset(
     {
+        "/status",
         "/version",
     }
 )

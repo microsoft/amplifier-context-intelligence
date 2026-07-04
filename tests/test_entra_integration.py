@@ -339,17 +339,18 @@ class TestEntraAuthIntegrationOverHTTP:
     # Exempt paths: /status and /skills/* open under entra mode
     # ------------------------------------------------------------------
 
-    async def test_status_endpoint_requires_auth_under_entra_mode(
+    async def test_status_endpoint_exempt_under_entra_mode(
         self,
         entra_auth_client: httpx.AsyncClient,
     ) -> None:
-        """GET /status → 401 without any token (Step 3, doc 16 W3) — entra mode active.
+        """GET /status → 200 without any token — exempt path, entra mode active.
 
-        /status is no longer an exempt path; /version is the liveness carve-out.
+        /status is the Azure Container Apps liveness/health probe and must
+        never require auth, in any auth mode.
         """
         response = await entra_auth_client.get("/status")
-        assert response.status_code == 401, (
-            f"Expected 401 for /status (no longer exempt, Step 3 W3), got "
+        assert response.status_code == 200, (
+            f"Expected 200 for /status (always exempt), got "
             f"{response.status_code}: {response.text}"
         )
 

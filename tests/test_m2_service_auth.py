@@ -705,9 +705,10 @@ class TestStatusAdditiveFields:
         Existing fields (mode, admin_api_enabled, entra_admin_role) must remain
         untouched — this is an additive-only change.
 
-        Step 3 (doc 16 W3): /status now requires auth, so this request carries a
-        valid human bearer token (any authenticated principal passes; /status has
-        no capability dependency).
+        /status is exempt from auth (Azure Container Apps liveness/health probe),
+        but this request still carries a valid human bearer token to prove /status
+        does not REJECT an authenticated principal either (any authenticated
+        principal passes; /status has no capability dependency).
         """
         private_key, asgi = service_asgi
         token = _sign_jwt(private_key, _human_claims())

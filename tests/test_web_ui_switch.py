@@ -154,11 +154,11 @@ class TestCreateAsgiAppExemptPaths:
             "it is an unauthenticated log drain if exempt"
         )
 
-    def test_web_ui_disabled_status_not_exempt(self) -> None:
-        """/status is NOT exempt in api-only mode (Step 3, doc 16 W3).
+    def test_web_ui_disabled_status_stays_exempt(self) -> None:
+        """/status IS exempt in api-only mode -- it is the Azure Container Apps
+        liveness/health probe and must NEVER require auth.
 
-        /status now requires auth in every config; /version is the
-        unauthenticated liveness carve-out.
+        /status and /version are both unauthenticated liveness carve-outs.
         """
         from context_intelligence_server.config import Settings  # noqa: PLC0415
         from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
@@ -168,8 +168,8 @@ class TestCreateAsgiAppExemptPaths:
         )
         wrapped = create_asgi_app(settings=settings)
 
-        assert "/status" not in wrapped._exempt_paths, (
-            "/status must NOT be exempt (Step 3 W3) — /version is the liveness carve-out"
+        assert "/status" in wrapped._exempt_paths, (
+            "/status must stay exempt -- it is the unauthenticated health/liveness probe"
         )
         assert "/version" in wrapped._exempt_paths, (
             "/version must remain exempt even in api-only mode (health check)"
@@ -312,18 +312,18 @@ class TestApiOnlyHttpBehavior:
     # Paths that MUST still be reachable
     # ------------------------------------------------------------------
 
-    async def test_status_requires_auth_in_api_only_mode(
+    async def test_status_stays_public_in_api_only_mode(
         self, api_only_client: httpx.AsyncClient
     ) -> None:
-        """GET /status without token → 401 in api-only mode (Step 3, doc 16 W3).
+        """GET /status without token → 200 in api-only mode.
 
-        /status is no longer in _EXEMPT_PATHS_API_ONLY; /version is the
-        unauthenticated liveness carve-out instead.
+        /status IS in _EXEMPT_PATHS_API_ONLY -- it is the Azure Container Apps
+        liveness/health probe and must never require auth, alongside /version.
         """
         response = await api_only_client.get("/status")
-        assert response.status_code == 401, (
-            f"GET /status without token must return 401 in api-only mode "
-            f"(no longer exempt, Step 3 W3), got {response.status_code}"
+        assert response.status_code == 200, (
+            f"GET /status without token must return 200 in api-only mode "
+            f"(exempt -- health/liveness probe), got {response.status_code}"
         )
 
     async def test_skills_prefix_not_auth_blocked_in_api_only_mode(
