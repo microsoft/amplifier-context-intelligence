@@ -22,6 +22,13 @@ logger = logging.getLogger("context_intelligence_server")
 _DRAIN_MAX_BATCH = 100
 _DRAIN_POLL_INTERVAL = 0.05  # idle poll cadence; bounded by flush_timeout
 
+# A positive residual must PERSIST this long before it is called degraded.
+# Must exceed the worst-case transient-skew window: the derive_all_stats
+# cache TTL (1.0s) plus the /status poll cadence (~3s). 15s is >10x the cache
+# TTL, so any in-flight two-clock skew clears well before it trips degraded,
+# while a genuine (monotonic, non-clearing) silent drop still trips it.
+_RESIDUAL_DEGRADED_GRACE = 15.0
+
 
 @dataclass
 class SessionWorker:
@@ -73,6 +80,11 @@ class SessionRegistry:
         self._written_total: int = 0
         self._replayed_total: int = 0
         self._write_retries_total: int = 0
+        # FIX B: monotonic timestamp when the residual first went positive and
+        # stayed unexplained. None means "clean". Gates the degraded flag so a
+        # transient two-clock skew never latches; only a sustained positive
+        # residual (real silent drop) does.
+        self._residual_positive_since: float | None = None
 
     def _ensure_infra(self) -> None:
         """Build the shared QueueManager + write semaphore on first use.
@@ -113,6 +125,34 @@ class SessionRegistry:
         """Count events re-driven from the log during recovery."""
         self._replayed_total += n
 
+    def record_purged(self, n: int) -> None:
+        """Remove n purged dead-letters from the accepted total (conservation).
+
+        A bare dead-letter purge unlinks the .dead.jsonl file, dropping `dead`
+        by n. Those lines were counted in `accepted` at ingest but never
+        `written`; discarding them from disk must also discard them from
+        `accepted`, or the residual latches at +n forever. Symmetric to
+        record_replayed, which moves lines dead -> in_queue and therefore must
+        NOT touch accepted.
+
+        Clamp: accepted can never fall below written. Under the single-writer
+        guarantee the clamp can never legitimately engage (a dead line is
+        accepted-but-not-written, so n <= accepted - written); if it does, log
+        a warning as an accounting-drift signal rather than silently masking it.
+        """
+        if n <= 0:
+            return
+        target = self._accepted_total - n
+        floored = max(self._written_total, target)
+        if floored != target:
+            logger.warning(
+                "record_purged clamp engaged accepted=%d written=%d purge=%d",
+                self._accepted_total,
+                self._written_total,
+                n,
+            )
+        self._accepted_total = floored
+
     def record_write_retry(self) -> None:
         """Count a single transient Neo4j-write retry attempt."""
         self._write_retries_total += 1
@@ -147,9 +187,13 @@ class SessionRegistry:
 
             residual = accepted - written - in_queue - dead
 
-        A nonzero residual means events were silently dropped; ``degraded`` is
-        True whenever the residual is nonzero OR any line has been dead-lettered
-        (dead letters are accounted-for losses, but still a degraded state).
+        ``degraded`` is True whenever ``dead > 0`` (an accounted-for loss, no
+        grace period) OR the residual is POSITIVE and has stayed positive for
+        at least ``_RESIDUAL_DEGRADED_GRACE`` seconds. A negative residual is
+        never degraded (it is benign two-clock skew between the live counters
+        and the cached disk snapshot, clamped to a ``lost`` value of zero), and
+        a positive residual that clears before the grace window elapses is
+        treated as the same transient skew rather than real loss.
 
         IMPORTANT caveats:
         - This is a LIVE per-process measure, not an all-time audit. Finalized
@@ -174,7 +218,25 @@ class SessionRegistry:
         residual = (
             counters["accepted_total"] - counters["written_total"] - in_queue - dead
         )
-        degraded = residual != 0 or dead > 0
+        # A NEGATIVE residual is never data loss: written+in_queue+dead cannot
+        # legitimately exceed accepted, so residual<0 is purely a sampling skew
+        # between the fresh counters and the cached disk snapshot. Clamp the
+        # loss signal at zero -- only a positive residual can mean real loss.
+        lost = max(0, residual)
+        now = time.monotonic()
+        if lost > 0:
+            if self._residual_positive_since is None:
+                self._residual_positive_since = now
+            sustained = (
+                now - self._residual_positive_since
+            ) >= _RESIDUAL_DEGRADED_GRACE
+        else:
+            self._residual_positive_since = None
+            sustained = False
+        # dead>0 is an accounted-for loss and is degraded immediately (no grace).
+        # A positive residual is degraded only once it has PERSISTED past the
+        # grace window -- transient in-flight skew clears before then.
+        degraded = dead > 0 or sustained
         return {
             "accepted_total": counters["accepted_total"],
             "written_total": counters["written_total"],
