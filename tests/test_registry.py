@@ -1487,11 +1487,21 @@ class TestPipelineMetrics:
         assert "oldest_unflushed_age" not in metrics
 
     async def test_nonzero_residual_is_degraded(
-        self, reg_qm: tuple[SessionRegistry, Any]
+        self, reg_qm: tuple[SessionRegistry, Any], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """accepted=4/written=1 with no pending and no dead -> residual==3
-        (events neither written nor queued nor dead): degraded True."""
+        (events neither written nor queued nor dead): degraded True once the
+        positive residual has persisted past _RESIDUAL_DEGRADED_GRACE.
+
+        FIX B adaptation: a bare positive residual is no longer degraded on
+        the very first observation (that would be the false-positive bug this
+        fix corrects -- see TestDegradedFalsePositiveFix). The grace window is
+        collapsed to 0.0 here so the test still proves "a real, non-clearing
+        positive residual reports degraded", without asserting the transient
+        no-grace-period behavior that used to cause false positives.
+        """
         reg, _qm = reg_qm
+        monkeypatch.setattr(registry_module, "_RESIDUAL_DEGRADED_GRACE", 0.0)
         reg.seed_counters(accepted=4, written=1)
 
         metrics = await reg.pipeline_metrics()
@@ -1517,6 +1527,95 @@ class TestPipelineMetrics:
 
         assert metrics["residual"] == 0
         assert metrics["dead_letter_total"] == 1
+        assert metrics["degraded"] is True
+
+
+# ---------------------------------------------------------------------------
+# FIX B: degraded false-positive fix. A bare dead-letter purge (record_purged)
+# keeps the residual conserved at zero, a NEGATIVE residual (transient
+# two-clock skew between the live counters and the cached disk snapshot) never
+# reports degraded, an accounted-for dead letter still reports degraded
+# immediately (no grace period), and only a POSITIVE residual that has
+# persisted past _RESIDUAL_DEGRADED_GRACE reports degraded.
+# ---------------------------------------------------------------------------
+
+
+class TestDegradedFalsePositiveFix:
+    async def test_purge_decrements_accepted_residual_stays_zero(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """N dead-letters with accepted=N/written=0/in_queue=0: purging them
+        via queue_manager.purge_dead_letters + registry.record_purged must
+        drop accepted_total by N so the residual stays conserved at zero
+        (not latch at +N forever)."""
+        reg, qm = reg_qm
+        sid = "fixb-purge"
+        n = 3
+        for i in range(n):
+            await qm.dead_letter(
+                sid, _line(f"bad{i}", "/ws", {"session_id": sid}), "boom"
+            )
+        reg.seed_counters(accepted=n, written=0)
+
+        purged = await qm.purge_dead_letters(sid)
+        reg.record_purged(purged)
+
+        assert reg.pipeline_counters()["accepted_total"] == 0
+
+        metrics = await reg.pipeline_metrics()
+        assert metrics["residual"] == 0
+        assert metrics["degraded"] is False
+
+    async def test_transient_in_queue_not_degraded(
+        self, reg_qm: tuple[SessionRegistry, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """accepted=written=2 with ONE uncommitted (in-flight) line -> in_queue=1,
+        dead=0 -> residual==-1. Must NOT be degraded, even with the grace
+        window collapsed to 0.0, because a negative residual is clamped to
+        lost=max(0,-1)=0 -- it can never be a positive, sustained loss."""
+        reg, qm = reg_qm
+        sid = "fixb-transient"
+        monkeypatch.setattr(registry_module, "_RESIDUAL_DEGRADED_GRACE", 0.0)
+
+        reg.record_accepted(2)
+        reg.record_written(2)
+        await qm.append(sid, _line("tool:pre", "/ws", {"session_id": sid}))
+
+        metrics = await reg.pipeline_metrics()
+
+        assert metrics["residual"] == -1
+        assert metrics["degraded"] is False
+
+    async def test_dead_letter_reports_degraded(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """A dead-lettered line (accounted-for loss) reports degraded=True on
+        the very first pipeline_metrics() call -- no grace-period dependence,
+        unlike a bare positive residual."""
+        reg, qm = reg_qm
+        sid = "fixb-dead"
+        await qm.dead_letter(sid, _line("bad", "/ws", {"session_id": sid}), "boom")
+        reg.seed_counters(accepted=1, written=0)
+
+        metrics = await reg.pipeline_metrics()
+
+        assert metrics["dead_letter_total"] >= 1
+        assert metrics["degraded"] is True
+
+    async def test_sustained_drop_reports_degraded(
+        self, reg_qm: tuple[SessionRegistry, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """accepted=2/written=1 with in_queue=0/dead=0 -> residual==+1 (a real,
+        silent drop). With the grace window collapsed to 0.0, the very first
+        positive-residual observation is already 'sustained' and must report
+        degraded=True."""
+        reg, _qm = reg_qm
+        monkeypatch.setattr(registry_module, "_RESIDUAL_DEGRADED_GRACE", 0.0)
+        reg.seed_counters(accepted=2, written=1)
+
+        metrics = await reg.pipeline_metrics()
+
+        assert metrics["residual"] == 1
         assert metrics["degraded"] is True
 
 

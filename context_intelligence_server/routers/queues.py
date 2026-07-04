@@ -79,6 +79,7 @@ async def purge_dead_letters(worker_key: str, request: Request) -> dict[str, Any
         purged = await registry.queue_manager.purge_dead_letters(worker_key)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    registry.record_purged(purged)
     return {"worker_key": worker_key, "purged": purged}
 
 
