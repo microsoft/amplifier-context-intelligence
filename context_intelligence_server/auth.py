@@ -698,6 +698,19 @@ class BearerTokenMiddleware:
 
         if result is None:
             # Backward-compat path: StaticKeyResolver returns None on a miss.
+            # Log it with the SAME greppable auth_event=auth_denied marker as the
+            # AuthError branch above so a static-key rejection is not invisible in
+            # server.jsonl. Without this line a genuine 401 leaves zero trace,
+            # which made a real "Bearer [REDACTED]" rejection look impossible to
+            # diagnose. The raw token is intentionally NOT logged (credential
+            # hygiene); a short sha256 fingerprint is emitted so operators can
+            # correlate the rejected credential (e.g. the redaction sentinel
+            # "[REDACTED]" has a recognisable digest) without exposing a secret.
+            _log.info(
+                "auth_event=auth_denied: static key not recognized (status=401) "
+                "token_sha256=%s",
+                hashlib.sha256(token.encode()).hexdigest()[:12],
+            )
             await _send_401(send)
             return
 

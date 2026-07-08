@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 from unittest.mock import AsyncMock
 
 import httpx
@@ -97,6 +98,59 @@ class TestMiddlewareWithKeystore:
         app.assert_not_called()
         response_start = send.call_args_list[0][0][0]
         assert response_start["status"] == 401
+
+    async def test_wrong_token_logs_auth_denied(self, caplog) -> None:
+        """A static-key miss (result is None) must log auth_event=auth_denied.
+
+        Regression guard: this 401 path previously returned without any log
+        line, so a genuine rejection (e.g. a redacted 'Bearer [REDACTED]')
+        left zero trace in server.jsonl and looked impossible to diagnose.
+        """
+        app = AsyncMock()
+        middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
+
+        scope = _make_scope_with_auth("wrong-token", "/events")
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        with caplog.at_level(logging.INFO, logger="context_intelligence_server.auth"):
+            await middleware(scope, receive, send)
+
+        app.assert_not_called()
+        assert send.call_args_list[0][0][0]["status"] == 401
+        # A greppable auth_denied marker is emitted, with a token fingerprint
+        # (sha256 prefix) and NOT the raw token.
+        messages = [r.getMessage() for r in caplog.records]
+        denied = [m for m in messages if "auth_event=auth_denied" in m]
+        assert denied, f"expected an auth_denied log; got {messages!r}"
+        expected_fp = hashlib.sha256(b"wrong-token").hexdigest()[:12]
+        assert any(expected_fp in m for m in denied)
+        assert not any("wrong-token" in m for m in messages)
+
+    async def test_redacted_sentinel_token_logs_recognisable_digest(
+        self, caplog
+    ) -> None:
+        """The '[REDACTED]' sentinel 401 is logged with its recognisable digest.
+
+        This is the exact failure the fix makes visible: a resumed session
+        mounting a redacted credential sends 'Bearer [REDACTED]'.
+        """
+        app = AsyncMock()
+        middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
+
+        scope = _make_scope_with_auth("[REDACTED]", "/events")
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        with caplog.at_level(logging.INFO, logger="context_intelligence_server.auth"):
+            await middleware(scope, receive, send)
+
+        assert send.call_args_list[0][0][0]["status"] == 401
+        fp = hashlib.sha256(b"[REDACTED]").hexdigest()[:12]
+        assert any(
+            "auth_event=auth_denied" in r.getMessage() and fp in r.getMessage()
+            for r in caplog.records
+        )
 
     async def test_valid_token_passes_through(self) -> None:
         """Request with correct bearer token reaches the app."""
