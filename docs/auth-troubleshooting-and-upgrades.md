@@ -278,3 +278,86 @@ So future readers can verify rather than trust:
   (`Destination`, `validate_destinations`).
 - Hook auth header construction: the hook's `context_intelligence/auth.py`
   (`ApiKeyAuth`, `EntraTokenAuth`, `build_auth_strategy`).
+
+---
+
+## 9. Neo4j two-client split (admin / cypher_query)
+
+The server talks to Neo4j through **two internal clients**:
+
+- **admin** — read/write. Used for ingest (`POST /events` drains) and schema.
+- **cypher_query** — read-intent. Used for `POST /cypher` and dashboard reads.
+
+This lets you give the read path a **separate credential** (and optionally a
+**separate URL**, e.g. a read replica), so you can tighten data access later
+**without a server code change** — you only edit config.
+
+### 9.1 It is opt-in and backward compatible
+
+You do **not** have to change anything. When the structured `neo4j:` block is
+absent, both clients are synthesized from the legacy flat keys
+(`neo4j_url` / `neo4j_user` / `neo4j_password`), differing only by an
+`access_mode` hint. Existing deployments keep booting unchanged.
+
+### 9.2 Opting into separate credentials / URLs
+
+Replace the flat keys with a structured block:
+
+```yaml
+neo4j:
+  admin:
+    url: bolt://localhost:7687
+    username: neo4j
+    password: "<write-password>"
+    access_mode: WRITE          # MUST be WRITE
+  cypher_query:
+    url: bolt://localhost:7687   # or a read-replica URL for separate-URL setups
+    username: reader
+    password: "<read-password>"
+    access_mode: READ           # MUST be READ (default is WRITE — omitting it fails startup)
+```
+
+Environment-variable form uses the `__` nested delimiter, e.g.
+`AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__URL` and
+`...NEO4J__CYPHER_QUERY__ACCESS_MODE=READ`.
+
+**Rules enforced at startup (fail-loud):** when the `neo4j:` block is present,
+**both** `admin` and `cypher_query` are required, and the model validator
+rejects boot unless `admin.access_mode == WRITE` and
+`cypher_query.access_mode == READ`. The error names the offending client:
+`Neo4j client config invariant violated: neo4j.cypher_query.access_mode must be 'READ', got 'WRITE'`.
+
+To require the explicit block in a deployed profile (and refuse the legacy
+fallback even when both clients would point at the same instance), set:
+
+```yaml
+neo4j_require_explicit_clients: true   # default false
+```
+
+### 9.3 Enforcement caveat — Community vs Enterprise
+
+`access_mode: READ` makes the server open `/cypher` sessions in **read mode**.
+On **Neo4j Community 5.26.x**, a write attempted inside a READ-mode session is
+rejected at the session level (`Neo.ClientError.Statement.AccessMode:
+Writing in read access mode not allowed`) — so the read *path* is protected.
+
+But this is **session-mode** enforcement, **not per-credential RBAC**. Community
+has no way to stop the `cypher_query` **credential** from simply opening a WRITE
+session. To make the read credential *itself* incapable of writing (defense
+against a compromised credential or a code path that opens a write session), you
+need **Neo4j Enterprise RBAC** (assign the read credential a read-only role) or a
+DB-level restricted user. Splitting the credentials in config now is exactly what
+makes that later hardening a **config-only** change — no code, no redeploy of the
+application image.
+
+> **Do not read "READ client" as a security boundary on Community.** It is an
+> operational separation and a routing hint that becomes a hard security boundary
+> once backed by Enterprise RBAC or a restricted DB user.
+
+### 9.4 Upgrade note
+
+Upgrading to a build that contains the split requires **no action** — the legacy
+flat keys continue to work. Adopt the `neo4j:` block only when you want separate
+read/write credentials or URLs. The most common first-time error is omitting
+`access_mode: READ` on `cypher_query` (it defaults to `WRITE`), which is a hard
+startup failure with the invariant message shown in § 9.2.

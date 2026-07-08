@@ -365,8 +365,35 @@ stays fresh without a restart: [identity-management.md](identity-management.md).
 |-----|---------|---------|
 | `neo4j_url` | `bolt://localhost:37687` | Bolt/driver URL for all graph operations. Use `bolt://` scheme. Port must match `NEO4J_BOLT_PORT` from Step 2. **Displayed verbatim in the web UI** — use the address reachable by the server process, which may differ from what your browser can reach. |
 | `neo4j_browser_url` | `http://localhost:37474` | Neo4j Browser HTTP UI URL. Port must match `NEO4J_HTTP_PORT` from Step 2. **Displayed verbatim as a clickable link in the web UI.** Use the address reachable from your browser — if Neo4j is on a remote machine this will be that machine's hostname or IP, not `localhost`. Never used for driver connections. |
-| `neo4j_user` | `neo4j` | Auth username |
+| `neo4j_user` | `neo4j` | Auth username (legacy single-credential form). |
 | `neo4j_password` | *(your password)* | Auth password. Always required for Docker deployments. Must match the password passed to `NEO4J_AUTH` when the container was created. |
+
+> **Optional — separate read/write credentials or URLs (two-client split).** The
+> four flat keys above are the legacy single-credential form and keep working
+> unchanged. The `/cypher` endpoint and dashboard reads run through an internal
+> **read** client; ingest and schema changes run through an **admin/write**
+> client. To give them separate credentials (and optionally separate URLs, e.g.
+> a read replica), replace the flat keys with a structured `neo4j:` block:
+>
+> ```yaml
+> neo4j:
+>   admin:
+>     url: bolt://localhost:7687
+>     username: neo4j
+>     password: "<write-password>"
+>     access_mode: WRITE        # MUST be WRITE
+>   cypher_query:
+>     url: bolt://localhost:7687   # or a read replica URL
+>     username: reader
+>     password: "<read-password>"
+>     access_mode: READ         # MUST be READ — default is WRITE, so this is required
+> ```
+>
+> When the `neo4j:` block is present both sub-clients are required, and
+> `access_mode` is validated at startup (`admin` MUST be `WRITE`,
+> `cypher_query` MUST be `READ`) — a wrong or missing `access_mode` is a hard
+> boot failure. Full migration guide and the Community-vs-Enterprise enforcement
+> caveat: [auth-troubleshooting-and-upgrades.md](auth-troubleshooting-and-upgrades.md) § "Neo4j two-client split".
 
 ### Storage settings
 
