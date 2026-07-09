@@ -4,6 +4,7 @@ TDD phase: These tests FAIL before the files are created.
 """
 
 import pathlib
+import re
 import shutil
 
 import pytest
@@ -25,8 +26,31 @@ def test_dockerfile_exists() -> None:
 
 
 def test_dockerfile_base_image() -> None:
+    """The base image must be a Python image at a version the project supports.
+
+    Verifies a capability (a Python >= 3.11 base, per requires-python) rather than
+    a hardcoded image string, so the base can change for security or platform
+    reasons (e.g. Azure Linux) without breaking this test.
+    """
     content = DOCKERFILE.read_text()
-    assert "FROM python:3.11-slim" in content, "Dockerfile must use python:3.11-slim"
+
+    from_lines = [
+        line.strip()
+        for line in content.splitlines()
+        if line.strip().upper().startswith("FROM ")
+    ]
+    assert from_lines, "Dockerfile must declare a base image with FROM"
+
+    base = from_lines[0].lower()
+    assert "python" in base, f"Base image must be a Python image, got: {from_lines[0]}"
+
+    match = re.search(r"python[:/].*?(\d+)\.(\d+)", base)
+    assert match, f"Could not determine Python version from base image: {from_lines[0]}"
+
+    major, minor = int(match.group(1)), int(match.group(2))
+    assert (major, minor) >= (3, 11), (
+        f"Base image Python must be >= 3.11 (requires-python), got {major}.{minor}"
+    )
 
 
 def test_dockerfile_workdir() -> None:
