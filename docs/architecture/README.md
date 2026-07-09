@@ -257,6 +257,27 @@ and their typed relationships (`HAS_EVENT`, `EMITTED`, `REFERENCES_BLOB`).
 
 ---
 
+## Neo4j client topology
+
+The server connects to Neo4j through **two drivers** rather than one. The **admin
+driver** (`neo4j_driver`) is opened in **WRITE** access mode and carries the ingest
+path — the drainer's batch flushes and schema work. The **cypher_query driver**
+(`neo4j_query_driver`) is opened in **READ** access mode and serves `POST /cypher`
+and dashboard reads. Both drivers are created together in the dual-driver lifespan
+at startup and closed together at shutdown. With legacy flat config
+(`neo4j_url` / `neo4j_user` / `neo4j_password`), both drivers fall back to the same
+endpoint and shared credentials, differing only by access-mode hint; a structured
+`neo4j:` block lets the read driver take a separate credential and/or URL (e.g. a
+read replica). Their connection health is reported independently on `/status` as
+`neo4j_connected` (admin) and `neo4j_query_connected` (cypher_query).
+
+> **Note:** the existing `.dot` diagrams (e.g. `05-durable-ingest-queue`) show only
+> the **write path** through the admin driver. The two-driver split is not yet
+> rendered in any diagram — a dedicated topology diagram is a known follow-up. This
+> prose subsection is the interim reference; no new `.dot` is authored in this pass.
+
+---
+
 ## DefaultHandler Flow
 
 ![DefaultHandler Flow](./04-default-handler-flow.png)

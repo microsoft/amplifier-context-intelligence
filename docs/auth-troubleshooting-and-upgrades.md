@@ -361,3 +361,48 @@ flat keys continue to work. Adopt the `neo4j:` block only when you want separate
 read/write credentials or URLs. The most common first-time error is omitting
 `access_mode: READ` on `cypher_query` (it defaults to `WRITE`), which is a hard
 startup failure with the invariant message shown in § 9.2.
+
+### 9.5 Reading the query-driver status
+
+`/status` now exposes a second boolean, **`neo4j_query_connected`**, alongside the
+existing `neo4j_connected`. It reflects whether the **cypher_query** (read) driver
+is connected:
+
+- `true` — the read driver reached its Neo4j endpoint; `/cypher` and dashboard
+  reads can serve.
+- `false` — the read driver is not connected; `/cypher` reads will fail even if
+  ingest is healthy.
+
+`neo4j_query_connected` is **independent** from `neo4j_connected` (the **admin**
+write driver). The two drivers connect separately — one can be up while the other
+is down — so check both fields when diagnosing. On legacy flat config both drivers
+point at the same instance and share credentials, so they will usually agree; a
+disagreement then points at connectivity/routing to one endpoint, not a config
+mismatch.
+
+### 9.6 Query driver down but admin up
+
+**Symptom:** ingest and writes succeed (`neo4j_connected: true`), but `/cypher`
+reads fail and `/status` shows `neo4j_query_connected: false`.
+
+**Diagnosis:** the **cypher_query** client's URL or credentials are wrong, or — on
+a cluster — the read replica it targets is unreachable. On legacy flat config both
+drivers share the same URL and credentials, so a split like this points at
+**connectivity/routing** to the read endpoint (e.g. an unreachable read replica)
+rather than a credential mismatch. On a structured `neo4j:` block with separate
+`cypher_query` settings, re-check that block's URL/username/password and the
+reachability of the read-replica host.
+
+### 9.7 Write via `/cypher` rejected with `Neo.ClientError.Statement.AccessMode`
+
+**Symptom:** a write statement (`CREATE`, `MERGE`, `SET`, `DELETE`, `REMOVE`)
+issued through `POST /cypher` is rejected at runtime with
+`Neo.ClientError.Statement.AccessMode`.
+
+**This is expected, by design.** `/cypher` runs in a **READ-access session**, so
+write statements are refused at the session level. Route writes through the
+**admin/ingest** path (`POST /events`), not `/cypher`. See the enforcement caveat
+in § 9.3: on Community this is session-mode enforcement (an operational separation
+and routing hint), not per-credential RBAC — the read *path* is protected, but
+making the read *credential* itself incapable of writing requires Neo4j Enterprise
+RBAC or a restricted DB user.

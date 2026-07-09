@@ -584,7 +584,7 @@ overrides:
 ```bash
 # Health check (always unauthenticated)
 curl http://localhost:8000/status
-# → {"status":"ok","neo4j_connected":true,"neo4j_url":"bolt://localhost:37687","neo4j_browser_url":"http://localhost:37474",...}
+# → {"status":"ok","neo4j_connected":true,"neo4j_query_connected":true,"neo4j_url":"bolt://localhost:37687","neo4j_browser_url":"http://localhost:37474",...}
 #
 # Both neo4j_url and neo4j_browser_url are read verbatim from server-config.yaml.
 # If Neo4j is on a remote host the response will show those remote addresses.
@@ -614,6 +614,7 @@ bypass the browser cache.
 | `command not found: context-intelligence-server` | `~/.local/bin` not in `PATH` | Add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile |
 | `neo4j_connected: false` | Bolt port mismatch or wrong scheme | Set `neo4j_url` to `bolt://localhost:<NEO4J_BOLT_PORT>` in config — must use `bolt://` not `neo4j://` |
 | `neo4j_connected: false` (connection refused) | Neo4j container not running | `docker ps` to check; `docker start amplifier-context-intelligence-neo4j` to restart |
+| `neo4j_query_connected: false` | The read/cypher_query driver is not connected (ingest via the admin driver may still work) | Check the cypher_query URL/credentials and, if using a cluster/read-replica, its reachability |
 | Dashboard "Neo4j Browser" link doesn't work | `neo4j_browser_url` has wrong host/port | Update `neo4j_browser_url` in `server-config.yaml` to the address reachable from your browser — if Neo4j is remote, use the remote hostname, not `localhost` |
 | Service starts then immediately stops | Config file missing or bad path | `journalctl --user -u context-intelligence-server` to see the error |
 | `Permission denied` on blob/log path | Directories don't exist | `mkdir -p` the paths listed in your config |
