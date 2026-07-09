@@ -29,7 +29,7 @@ def test_skill_file_exists() -> None:
 
 
 def test_frontmatter_version_2() -> None:
-    assert 'version: "2.0.0"' in _content(), "Frontmatter must specify version: 2.0.0"
+    assert 'version: "2.0.1"' in _content(), "Frontmatter must specify version: 2.0.1"
 
 
 def test_frontmatter_name() -> None:
@@ -113,10 +113,9 @@ def test_section_2_data_layer_1_edges_table() -> None:
     assert "Data Layer 1 Edges" in content or "Data layer 1 Edges" in content, (
         "Section 2 must have Data Layer 1 Edges table"
     )
-    assert "HAS_FORK" in content, "Data Layer 1 Edges table must include HAS_FORK"
-    assert "HAS_TOOL_CALL" in content, (
-        "Data Layer 1 Edges table must include HAS_TOOL_CALL"
-    )
+    # NOTE: HAS_FORK and a Layer-1 Session->ToolCall HAS_TOOL_CALL were previously
+    # asserted here but are phantom edges the server never writes (validated against
+    # the live graph). Only HAS_EVENT (Session->Event) is a real Layer-1 edge.
     assert "HAS_EVENT" in content, "Data Layer 1 Edges table must include HAS_EVENT"
 
 
