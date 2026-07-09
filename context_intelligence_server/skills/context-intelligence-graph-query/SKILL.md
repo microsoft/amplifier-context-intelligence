@@ -8,7 +8,9 @@ description: >
   verified Cypher patterns.
 license: MIT
 metadata:
-  version: "2.0.0"
+  version: "2.0.1"
+  changelog:
+    - "2.0.1: Schema accuracy fix: corrected Prompt/SkillLoad/Orchestrator property names, RecipeStep/RecipeRun property placement, RecipeStep→RecipeRun edge (SPAWNED), removed phantom L1 edges, fixed example queries — all validated against the live graph."
 ---
 
 # Context Intelligence Graph Query
@@ -86,10 +88,7 @@ Common event labels: `:ToolPreEvent`, `:ToolPostEvent`, `:ToolErrorEvent`, `:Llm
 
 | Edge | From → To | Meaning |
 |---|---|---|
-| `HAS_FORK` | Session → Session | Parent session forked a child |
-| `HAS_TOOL_CALL` | Session → ToolCall | Session owns a data layer 1 tool call lifecycle node |
 | `HAS_EVENT` | Session → Event | Session owns an event node. Carries edge property `occurred_at` (ZONED DATETIME). |
-| `HAS_EVENT` | ToolCall → Event | Tool call owns its lifecycle events |
 
 ### Data Layer 2 Entity Types
 
@@ -102,11 +101,11 @@ All data layer 2 nodes carry a `workspace` property and an SST type label.
 | Iteration | `:Iteration:SST_EVENT` | Temporal | `{session_id}::iteration::{N}` | `iteration_number`, `started_at` (ZONED DATETIME) |
 | ContentBlock | `:ContentBlock:SST_EVENT` | Temporal | `{session_id}::block::{iteration_N}::{index}` | `block_type`, `block_index`, `started_at` (ZONED DATETIME, when present) |
 | ToolCall | `:ToolCall:SST_EVENT` | Temporal | `{tool_call_id}` (provider UUID directly) | `tool_name`, `tool_call_id`, `result_success`, `result_error`, `result_output`, `started_at` (ZONED DATETIME), `ended_at` (ZONED DATETIME), `parallel_group_id` |
-| Prompt | `:Prompt:SST_EVENT` | Temporal | `{session_id}::prompt::{timestamp}` | `prompt_text`, `started_at` (ZONED DATETIME) |
+| Prompt | `:Prompt:SST_EVENT` | Temporal | `{session_id}::prompt::{timestamp}` | `prompt`, `occurred_at` (ZONED DATETIME) |
 | Cancellation | `:Cancellation:SST_EVENT` | Temporal | `{session_id}::cancellation::{timestamp}` | `occurred_at` (ZONED DATETIME) |
 | ContextCompaction | `:ContextCompaction:SST_EVENT` | Temporal | `{session_id}::compaction::{timestamp}` | `occurred_at` (ZONED DATETIME) |
-| MountPlan | `:MountPlan:SST_THING` | Resource | `{session_id}::mount_plan` | `mount_plan_data` |
-| Orchestrator | `:Orchestrator:SST_CONCEPT` | Abstract | Orchestrator name string (e.g. `loop-streaming`) | `name` |
+| MountPlan | `:MountPlan:SST_THING` | Resource | `{session_id}::mount_plan` | *(labels only — no queryable data properties)* |
+| Orchestrator | `:Orchestrator:SST_CONCEPT` | Abstract | Orchestrator name string (e.g. `loop-streaming`) | `orchestrator` |
 
 ### Data Layer 2 Edge Types
 
@@ -137,9 +136,9 @@ All foundation layer nodes carry a `workspace` property and an SST type label.
 |---|---|---|---|---|
 | Delegation | `:Delegation:SST_EVENT` | Temporal | `{parent_session_id}::delegation::{tool_call_id\|sub_session_id}` | `agent`, `sub_session_id`, `parent_session_id`, `started_at` (ZONED DATETIME), `ended_at` (ZONED DATETIME), `resumed_at` (ZONED DATETIME, when present), `cancelled_at` (ZONED DATETIME, when present), `context_depth`, `context_scope` |
 | Agent | `:Agent:SST_CONCEPT` | Abstract | Agent name string (e.g. `foundation:explorer`) | `agent` |
-| SkillLoad | `:SkillLoad:SST_EVENT` | Temporal | `{session_id}::skill::{skill_name}::{loaded_at_ts}` | `skill_name`, `content_length`, `loaded_at` |
-| RecipeRun | `:RecipeRun:SST_EVENT` | Temporal | `{session_id}::recipe_run::{timestamp}` | `name`, `status`, `current_step`, `total_steps`, `last_loop_iteration_at` (ZONED DATETIME, when present), `loop_completed_at` (ZONED DATETIME, when present) |
-| RecipeStep | `:RecipeStep:SST_EVENT` | Temporal | `{session_id}::recipe_run::{ts}::step::{N}` | `name`, `status`, `step_id` |
+| SkillLoad | `:SkillLoad:SST_EVENT` | Temporal | `{session_id}::skill::{skill_name}::{started_at_ts}` | `skill_name`, `content_length`, `started_at` (ZONED DATETIME) |
+| RecipeRun | `:RecipeRun:SST_EVENT` | Temporal | `{session_id}::recipe_run::{timestamp}` | `name`, `status`, `total_steps`, `last_loop_iteration_at` (ZONED DATETIME, when present), `loop_completed_at` (ZONED DATETIME, when present) |
+| RecipeStep | `:RecipeStep:SST_EVENT` | Temporal | `{session_id}::recipe_run::{ts}::step::{N}` | `name`, `started_at` (ZONED DATETIME), `current_step`, `step_id` (rare — loop-iteration steps only) |
 | Recipe | `:Recipe:SST_CONCEPT` | Abstract | Recipe name string | `name` |
 
 ### Foundation Layer Edge Types
@@ -154,7 +153,7 @@ All foundation layer nodes carry a `workspace` property and an SST type label.
 | `HAS_RECIPE_RUN` | `CONTAINS` | Session → RecipeRun | Session contains this recipe run |
 | `HAS_RECIPE` | `EXPRESSES` | RecipeRun → Recipe | RecipeRun describes its recipe type |
 | `HAS_STEP` | `CONTAINS` | RecipeRun → RecipeStep | RecipeRun contains these steps |
-| `TRIGGERED` | `LEADS_TO` | RecipeStep → RecipeRun(child) | Step spawned a nested recipe |
+| `SPAWNED` | `LEADS_TO` | RecipeStep → RecipeRun(child) | Step spawned a nested recipe |
 | `TRIGGERED` | `LEADS_TO` | RecipeStep → Delegation | Step triggered this delegation |
 | `TRIGGERED` | `LEADS_TO` | RecipeStep → ToolCall | Step triggered this tool call |
 
@@ -182,16 +181,22 @@ Three SST type labels partition the semantic layer:
 MATCH (s:Session {workspace: $workspace})
 WITH s ORDER BY s.started_at DESC LIMIT 1
 MATCH (s)-[:HAS_EXECUTION|HAS_PART*1..3]->(e:SST_EVENT)
-RETURN labels(e) AS types, e.node_id, e.started_at
-ORDER BY e.started_at
+RETURN labels(e) AS types, e.node_id, coalesce(e.started_at, e.occurred_at) AS at
+ORDER BY coalesce(e.started_at, e.occurred_at)
 LIMIT 50
 ```
+
+> **Two temporal keys across `:SST_EVENT`:** span nodes (Iteration, ContentBlock, ToolCall,
+> Session, OrchestratorRun) store `started_at`; occurrence nodes (Prompt, Cancellation,
+> ContextCompaction) store `occurred_at`. When you sweep a MIXED set of event types, use
+> `coalesce(e.started_at, e.occurred_at)` in both the projection and the `ORDER BY` so the
+> occurrence nodes are not silently null (which would sort them out of order).
 
 **Example — find all abstract concepts referenced by a session:**
 
 ```cypher
 MATCH (s:Session {workspace: $workspace})-[:HAS_ATTRIBUTE]->(c:SST_CONCEPT)
-RETURN c.name AS orchestrator_name
+RETURN c.orchestrator AS orchestrator_name
 ```
 
 **Example — find all persistent resources (things) attached to sessions:**
@@ -244,8 +249,13 @@ Session → OrchestratorRun → Iteration → ContentBlock tree.
 MATCH (s:Session {workspace: $workspace, node_id: $session_id})
       -[:HAS_EXECUTION|HAS_PART*]->(descendant)
 RETURN labels(descendant) AS type, descendant.node_id
-ORDER BY descendant.started_at
+ORDER BY coalesce(descendant.started_at, descendant.occurred_at)
 ```
+
+> **Mixed temporal keys:** this sweep reaches both span nodes (`started_at`) and occurrence
+> nodes — Prompt, Cancellation, ContextCompaction — which store `occurred_at`. Sort with
+> `coalesce(descendant.started_at, descendant.occurred_at)` so occurrence nodes are not
+> silently null in the ordering.
 
 **Pattern — reach tool calls specifically (three-hop max):**
 
@@ -273,9 +283,9 @@ MATCH path = (p:Prompt {workspace: $workspace})
              -[:TRIGGERS]->(run:OrchestratorRun)
              -[:ENABLES]->(next_prompt:Prompt)
 WHERE p.session_id = $session_id
-RETURN [node IN nodes(path) | {type: labels(node), id: node.node_id, at: node.started_at}]
+RETURN [node IN nodes(path) | {type: labels(node), id: node.node_id, at: coalesce(node.started_at, node.occurred_at)}]
   AS turn_chain
-ORDER BY p.started_at
+ORDER BY p.occurred_at
 ```
 
 **Pattern — count turns in a session:**
@@ -529,13 +539,13 @@ MATCH (s:Session {workspace: $workspace, node_id: $session_id})
       -[:TRIGGERS]->(run:OrchestratorRun)
       -[:HAS_PART]->(iter:Iteration)
       -[:HAS_TOOL_CALL]->(tc:ToolCall)
-RETURN p.started_at           AS turn_start,
+RETURN p.occurred_at          AS turn_start,
        run.orchestrator_name  AS orchestrator,
        iter.iteration_number  AS iteration,
        tc.tool_name           AS tool,
        tc.result_success      AS succeeded,
        tc.started_at          AS tool_start
-ORDER BY p.started_at, iter.iteration_number, tc.started_at
+ORDER BY p.occurred_at, iter.iteration_number, tc.started_at
 LIMIT 100
 ```
 
@@ -709,8 +719,8 @@ MATCH (s:Session {workspace: $workspace, node_id: $session_id})
       -[:HAS_EXECUTION]->(:OrchestratorRun)
       -[:HAS_PART]->(iter:Iteration)
       -[:HAS_SKILL_LOAD]->(sl:SkillLoad)
-RETURN iter.iteration_number, sl.skill_name, sl.content_length, sl.loaded_at
-ORDER BY iter.iteration_number, sl.loaded_at
+RETURN iter.iteration_number, sl.skill_name, sl.content_length, sl.started_at
+ORDER BY iter.iteration_number, sl.started_at
 LIMIT 100
 ```
 
@@ -721,9 +731,9 @@ MATCH (s:Session {workspace: $workspace, node_id: $session_id})
       -[:HAS_RECIPE_RUN]->(rr:RecipeRun)
       -[:HAS_STEP]->(step:RecipeStep)
 OPTIONAL MATCH (step)-[:TRIGGERED]->(target)
-RETURN rr.name, step.name, step.status,
+RETURN rr.name, step.name, rr.status,
        labels(target) AS triggered_type, target.node_id AS triggered_id
-ORDER BY step.step_id
+ORDER BY step.started_at
 LIMIT 50
 ```
 
