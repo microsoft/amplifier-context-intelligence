@@ -506,7 +506,7 @@ Full runtime onboarding/offboarding runbook and the `/admin/*` API:
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/events` | Ingest a session event (returns 202 immediately) |
-| `GET` | `/status` | Server health, active sessions, completed history, error counts, `neo4j_connected`, `neo4j_url`, `neo4j_browser_url` |
+| `GET` | `/status` | Server health, active sessions, completed history, error counts, `neo4j_connected`, `neo4j_query_connected` (reflects the read/cypher_query driver's connection health), `neo4j_url`, `neo4j_browser_url` |
 | `GET` | `/` | Landing page with navigation cards |
 | `GET` | `/dashboard` | Live monitoring dashboard |
 | `GET` | `/docs` | Swagger API docs |
