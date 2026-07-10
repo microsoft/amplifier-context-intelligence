@@ -49,9 +49,11 @@ docker run -d \
 > Community build matching this Neo4j release from the official compatibility
 > matrix (2.13.x for 5.26.x) —
 > https://neo4j.com/docs/graph-data-science/current/installation/supported-neo4j-versions/
-> This requires network egress at container start; see the air-gapped note
-> below if that's not available. Verify after start with
+> This requires network egress at container start. Set only
+> `NEO4J_dbms_security_procedures_unrestricted=apoc.*,gds.*` (no `allowlist`, which
+> would block built-in `db.*`/`dbms.*` procedures). Verify after start with
 > `docker exec amplifier-context-intelligence-neo4j cypher-shell -u neo4j -p "$NEO4J_PASSWORD" "RETURN gds.version();"`.
+> See [local-development.md](local-development.md) §1 for the local-dev variant.
 
 **3. Make two DISTINCT tokens** — one for data capture, one for admin:
 
@@ -172,19 +174,22 @@ Ensure `~/.local/bin` is in your `PATH`:
 export PATH="$HOME/.local/bin:$PATH"   # add to ~/.bashrc or ~/.zshrc
 ```
 
-### Install Docker
+### Neo4j
 
-Neo4j runs as a Docker container. Install [Docker Desktop](https://docs.docker.com/desktop/)
-or Docker Engine before continuing.
+The server needs **Neo4j 5.x** reachable over **Bolt**, with the **APOC**
+procedures available (and **GDS** for graph-analytics features). Install and run
+it locally per [local-development.md](local-development.md) §1. This service guide
+does not require Docker for Neo4j.
 
 ---
 
 ## 2. Start Neo4j
 
-Run Neo4j as a standalone Docker container. Use **non-standard ports** to
-avoid conflicts with any existing Neo4j installation. Authentication is
-**always required** — the server refuses to connect to an unauthenticated
-Neo4j instance.
+Install and start **Neo4j 5.x** locally with **APOC** (and **GDS** if you use
+graph-analytics features), following [local-development.md](local-development.md)
+§1 (Neo4j Desktop, or a package/tarball install with the plugin JARs).
+Authentication is **always required** — the server refuses to connect to an
+unauthenticated Neo4j instance, so set an initial password:
 
 ```bash
 # Adjust these three values before running
@@ -208,54 +213,46 @@ docker run -d \
 ```
 
 > **APOC + GDS plugins:** `-e 'NEO4J_PLUGINS=["apoc","graph-data-science"]'`
-> enables both, matching the Docker Compose stack. Neo4j 5.x auto-installs the
-> bundled `apoc-core` jar at startup (from `/var/lib/neo4j/labs` into
-> `/var/lib/neo4j/plugins`) with no network fetch required — it re-installs on
-> every container start. GDS is NOT bundled in the image, so the installer
-> resolves and downloads the Community build matching this Neo4j release from
-> the official compatibility matrix (2.13.x for 5.26.x) — this DOES require
-> network egress at container start. Verify with
+> enables both. Neo4j 5.x auto-installs the bundled `apoc-core` jar at startup
+> (from `/var/lib/neo4j/labs` into `/var/lib/neo4j/plugins`) with no network
+> fetch required — it re-installs on every container start. GDS is NOT bundled in
+> the image, so the installer resolves and downloads the Community build matching
+> this Neo4j release from the official compatibility matrix (2.13.x for 5.26.x) —
+> this DOES require network egress at container start. Set only
+> `NEO4J_dbms_security_procedures_unrestricted=apoc.*,gds.*` (do NOT set an
+> `allowlist` of `apoc.*,gds.*` — it would block the built-in `db.*`/`dbms.*`
+> procedures). Verify with
 > `docker exec amplifier-context-intelligence-neo4j cypher-shell -u neo4j -p "${NEO4J_PASSWORD}" "RETURN apoc.version();"`
-> and `"RETURN gds.version();"`.
-> See the README's "Neo4j Plugins (APOC)" section for details. Hosted AuraDB has
-> APOC Core preinstalled.
+> and `"RETURN gds.version();"`. See
+> [local-development.md](local-development.md) §1 for the local-dev variant.
+> Hosted AuraDB has APOC Core preinstalled.
 >
-> **Air-gapped hosts:** `NEO4J_PLUGINS=["apoc","graph-data-science"]` requires
-> internet egress at startup for the GDS half (APOC alone would work offline —
-> it's bundled inside the image at `/var/lib/neo4j/labs/`). For a host with no
-> egress at all, build a Neo4j image with BOTH jars baked in at build time using
-> the repo's `neo4j.Dockerfile` + `docker-compose.airgap.yml`
-> (`docker compose -f docker-compose.yml -f docker-compose.airgap.yml up -d --build`).
-> That build step itself still needs network access (same as pulling the base
-> image); only the resulting container runs egress-free. On a fully disconnected
-> host, also pre-load the base image first:
+> **Air-gapped hosts:** `NEO4J_PLUGINS=["apoc","graph-data-science"]` needs
+> internet egress at startup for the GDS half (APOC alone works offline — it's
+> bundled in the image at `/var/lib/neo4j/labs/`). For a host with no egress,
+> build your own Neo4j image with the matching GDS jar baked into
+> `/var/lib/neo4j/plugins/` at build time (the build step needs network; the
+> resulting container runs egress-free), or serve the jar from an internal
+> mirror. On a fully disconnected host, pre-load the base image too:
 > `docker save neo4j:5.26.22-community -o neo4j.tar` on a connected machine, then
-> `docker load -i neo4j.tar` on the air-gapped host (or use an internal registry
-> mirror).
+> `docker load -i neo4j.tar` on the air-gapped host.
 
-**Wait for Neo4j to be ready** (usually 15–30 seconds):
+**Wait for Neo4j to be ready** (usually 15–30 seconds), then verify APOC:
 
 ```bash
-until curl -s -o /dev/null -w "%{http_code}" \
-    -u "neo4j:${NEO4J_PASSWORD}" \
-    http://localhost:${NEO4J_HTTP_PORT}/db/neo4j/tx \
-    -H "Content-Type: application/json" \
-    -d '{"statements":[{"statement":"RETURN 1"}]}' | grep -q 201; do
-  echo "Waiting for Neo4j..."; sleep 3
-done
-echo "Neo4j ready."
+cypher-shell -u neo4j -p '<your-strong-password>' "RETURN apoc.version();"
 ```
 
 > **Important:** use `bolt://` (not `neo4j://`) for the server connection URL.
 > The routing protocol (`neo4j://`) fails on Community Edition single-node installs.
-> Set `neo4j_url` to `bolt://localhost:${NEO4J_BOLT_PORT}` in your config.
+> Set `neo4j_url` to `bolt://localhost:<NEO4J_BOLT_PORT>` in your config.
 >
-> Neo4j exposes **two ports**: the bolt driver port (`NEO4J_BOLT_PORT`) used for
-> all data operations, and the HTTP browser UI port (`NEO4J_HTTP_PORT`) used only
-> for the Neo4j Browser web interface. Both must be configured separately —
-> `neo4j_url` for the driver connection, `neo4j_browser_url` for the browser link
-> shown in the web UI. Both are displayed verbatim from the config, so if Neo4j
-> is on a remote machine, use that machine's hostname in both values.
+> Neo4j exposes **two ports**: the bolt driver port used for all data operations,
+> and the HTTP browser UI port used only for the Neo4j Browser web interface. Both
+> must be configured separately — `neo4j_url` for the driver connection,
+> `neo4j_browser_url` for the browser link shown in the web UI. Both are displayed
+> verbatim from the config, so if Neo4j is on a remote machine, use that machine's
+> hostname in both values.
 
 ---
 
@@ -314,8 +311,9 @@ recoverable from the config file afterward. The legacy single-key mode
 peers, the empty-`{}` hard-error rule, and the raw-token-vs-digest guardrail — in
 [managing-api-keys.md](managing-api-keys.md).
 
-> If you run under Docker instead, `./start.sh` (or the container entrypoint)
-> bootstraps the `api_keys` keystore and prints the token once — no manual steps.
+> Prefer a one-shot bootstrap? `python scripts/prime-local-config.py` generates the
+> `api_keys` keystore and prints the token once, then writes a ready-to-use
+> `server-config.yaml` — see [local-development.md](local-development.md) §2.
 
 > **Microsoft Entra JWT auth.** Instead of pre-shared keys, the server also supports
 > `auth_mode=entra`, where clients authenticate with Azure AD bearer tokens and the
@@ -375,7 +373,7 @@ stays fresh without a restart: [identity-management.md](identity-management.md).
 | `neo4j_url` | `bolt://localhost:37687` | Bolt/driver URL for all graph operations. Use `bolt://` scheme. Port must match `NEO4J_BOLT_PORT` from Step 2. **Displayed verbatim in the web UI** — use the address reachable by the server process, which may differ from what your browser can reach. |
 | `neo4j_browser_url` | `http://localhost:37474` | Neo4j Browser HTTP UI URL. Port must match `NEO4J_HTTP_PORT` from Step 2. **Displayed verbatim as a clickable link in the web UI.** Use the address reachable from your browser — if Neo4j is on a remote machine this will be that machine's hostname or IP, not `localhost`. Never used for driver connections. |
 | `neo4j_user` | `neo4j` | Auth username (legacy single-credential form). |
-| `neo4j_password` | *(your password)* | Auth password. Always required for Docker deployments. Must match the password passed to `NEO4J_AUTH` when the container was created. |
+| `neo4j_password` | *(your password)* | Auth password. Always required — the server refuses an unauthenticated Neo4j. Must match the password you set on Neo4j (e.g. via `neo4j-admin dbms set-initial-password`). |
 
 > **Optional — separate read/write credentials or URLs (two-client split).** The
 > four flat keys above are the legacy single-credential form and keep working
@@ -606,9 +604,9 @@ curl -s -o /dev/null -w "%{http_code}" \
 ```
 
 If `neo4j_connected` is `false`, check:
-1. Container is running: `docker ps | grep amplifier-context-intelligence-neo4j`
-2. Bolt port in `server-config.yaml` matches the port exposed by Docker (`NEO4J_BOLT_PORT`)
-3. Neo4j password in config matches what was passed to `NEO4J_AUTH` when creating the container
+1. Neo4j is running (e.g. `neo4j status`, or check Neo4j Desktop)
+2. Bolt port in `server-config.yaml` matches the port Neo4j listens on (and the URL uses the `bolt://` scheme)
+3. Neo4j password in config matches the password you set on Neo4j
 
 **Dashboard:** open `http://localhost:8000` — enter the API key from Step 4
 when prompted. If the prompt does not appear, hard-refresh (Ctrl+Shift+R) to
@@ -622,7 +620,7 @@ bypass the browser cache.
 |---------|-------|-----|
 | `command not found: context-intelligence-server` | `~/.local/bin` not in `PATH` | Add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile |
 | `neo4j_connected: false` | Bolt port mismatch or wrong scheme | Set `neo4j_url` to `bolt://localhost:<NEO4J_BOLT_PORT>` in config — must use `bolt://` not `neo4j://` |
-| `neo4j_connected: false` (connection refused) | Neo4j container not running | `docker ps` to check; `docker start amplifier-context-intelligence-neo4j` to restart |
+| `neo4j_connected: false` (connection refused) | Neo4j not running | Check with `neo4j status` (or Neo4j Desktop); start it with `neo4j start` |
 | `neo4j_query_connected: false` | The read/cypher_query driver is not connected (ingest via the admin driver may still work) | Check the cypher_query URL/credentials and, if using a cluster/read-replica, its reachability |
 | Dashboard "Neo4j Browser" link doesn't work | `neo4j_browser_url` has wrong host/port | Update `neo4j_browser_url` in `server-config.yaml` to the address reachable from your browser — if Neo4j is remote, use the remote hostname, not `localhost` |
 | Service starts then immediately stops | Config file missing or bad path | `journalctl --user -u context-intelligence-server` to see the error |
@@ -636,92 +634,11 @@ bypass the browser cache.
 
 ---
 
-## 10. Self-Hosted HTTPS with Caddy (Local / Dev Only)
+## 10. HTTPS / TLS
 
-> **Scope:** This section covers local runs and development cycles only — for users who need HTTPS locally or on a self-hosted VM outside Azure. Production deployments use [Azure Container Apps](azure-deployment.md) which handles TLS automatically. The docker-compose setup exists to support local runs and dev cycles, not production hosting.
-
-### Why Caddy and Not nginx
-
-Caddy issues and renews Let's Encrypt certificates automatically — no certbot sidecar, no cron job, no renewal hook. Compare:
-
-- **nginx**: requires 2 containers (nginx + certbot), a shared volume, a renewal cron job, and an nginx reload hook — 40+ lines of configuration
-- **Caddy**: 3-line Caddyfile, done
-
-Additional Caddy advantages:
-
-- HTTP→HTTPS redirect on by default
-- TLS 1.2+ and modern cipher suites out of the box
-- One addition to docker-compose, zero cert management overhead
-
-nginx remains a valid choice for teams with existing nginx expertise, but carries the certbot-sidecar overhead described above.
-
-### Implementation
-
-Drop a `docker-compose.override.yml` alongside the existing `docker-compose.yml` — no changes to the main compose file are required.
-
-**`docker-compose.override.yml`**
-
-```yaml
-services:
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      - context-intelligence-server
-    networks:
-      - context-intelligence
-
-volumes:
-  caddy_data:
-  caddy_config:
-```
-
-**`Caddyfile`** (place alongside `docker-compose.yml`):
-
-```
-your-domain.example.com {
-    reverse_proxy context-intelligence-server:8000
-}
-```
-
-Start the stack:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
-```
-
-Caddy fetches and renews the Let's Encrypt certificate automatically.
-
----
-
-**Local HTTPS without a domain (testing only)**
-
-For local testing where no public domain is available, use Caddy's internal CA:
-
-**`Caddyfile`** (local testing):
-
-```
-localhost {
-    tls internal
-    reverse_proxy context-intelligence-server:8000
-}
-```
-
-Caddy generates a local CA stored in `caddy_data`. To trust it on the host:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.override.yml exec caddy caddy trust
-```
-
-> **Note:** This is local development only — not suitable for production.
-
----
-
-Finally, update `settings.yaml` with the HTTPS URL — same pattern as the [Azure deployment guide](azure-deployment.md).
+The server speaks plain HTTP; terminate TLS in front of it. In production, the
+[Azure Container Apps](azure-deployment.md) platform edge handles HTTPS
+automatically. For a self-hosted run that needs TLS, put your own reverse proxy
+(nginx, Caddy, etc.) in front of the server and point it at
+`http://localhost:8000`, then update `settings.yaml` with the HTTPS URL — same
+pattern as the [Azure deployment guide](azure-deployment.md).

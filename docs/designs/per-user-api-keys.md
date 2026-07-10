@@ -2,7 +2,8 @@
 
 Status: implemented (server version 5.0.0)
 Scope: `context_intelligence_server/config.py`, `auth.py`, `credentials.py`,
-`neo4j_store.py` / handlers (provenance), `start.sh`, `docker-entrypoint.sh`.
+`neo4j_store.py` / handlers (provenance), `scripts/prime-local-config.py` (local
+bootstrap), `docker-entrypoint.sh` (container image bootstrap).
 
 ---
 
@@ -69,11 +70,12 @@ matches the lowercase `hashlib.sha256(...).hexdigest()` the server computes.
 Non-hex, wrong-length, non-dict values, and missing/blank/whitespace `id` are all
 rejected at startup. (`config.py` `_validate_api_keys`.)
 
-### D5 / O1 — Remove `init`; keep Docker bootstrap emitting `api_keys`
-The `init` subcommand is **removed**. First-run setup is either the Docker
-auto-bootstrap or the manual guide (`docs/managing-api-keys.md`). The bootstrap
-scripts (`start.sh`, `docker-entrypoint.sh`) generate a raw token, write
-`credentials.yaml` with `api_keys: { <digest>: { id: owner } }` (digest only), and
+### D5 / O1 — Remove `init`; keep first-run bootstrap emitting `api_keys`
+The `init` subcommand is **removed**. First-run setup is either the auto-bootstrap
+or the manual guide (`docs/managing-api-keys.md`). The bootstrap scripts
+(`scripts/prime-local-config.py` for local runs, `docker-entrypoint.sh` for the
+container image) generate a raw token, write the config with
+`api_keys: { <digest>: { id: owner } }` (digest only), and
 **print the raw token once** behind a "SAVE THIS TOKEN — it will NOT be shown
 again" banner. Operators can no longer grep the token from `credentials.yaml`;
 only the digest is persisted. (`credentials.py` `generate_credentials` returns the

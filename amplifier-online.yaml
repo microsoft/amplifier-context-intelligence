@@ -36,10 +36,11 @@ auth:
 # NOT use EasyAuth; it validates JWTs in-app (PyJWT + cached JWKS).
 services:
   api:
-    # As-built image, now served from the platform ACR (amplifieronlinecr). v6.0.0
-    # was imported into amplifieronlinecr, which is the only registry the shared CAE
-    # has pull creds for — so this reference makes the pull succeed.
-    image: amplifieronlinecr.azurecr.io/context-intelligence-server:v6.0.0
+    # Image served from the platform ACR (amplifieronlinecr) — the only registry the
+    # shared CAE has pull creds for. Pin to the current built tag (built on the
+    # approved S360 base per docs/azure-deployment.md); bump this when a newer tag
+    # is pushed.
+    image: amplifieronlinecr.azurecr.io/context-intelligence-server:v6.6.6
     port: 8000  # gunicorn + uvicorn; matches EXPOSE 8000 in the Dockerfile
 
     # Persistent /data — backs the oid→contributor store, durable ingest queues,

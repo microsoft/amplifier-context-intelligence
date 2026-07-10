@@ -62,31 +62,24 @@ route them — which scoping `serve` to `/events` does cleanly.
 
 ## 3. Lock the host bindings
 
-By default the server binds `0.0.0.0:8000` and the bundled `docker-compose.yml`
-publishes Neo4j's `7474`/`7687` on **all interfaces**. For a shared deployment,
-close both so Tailscale is the *only* ingress.
+By default the server binds `0.0.0.0:8000`, and a locally-run Neo4j may listen on
+`7474`/`7687`. For a shared deployment, close both so Tailscale is the *only*
+ingress.
 
-In `docker-compose.yml`:
-
-```yaml
-  context-intelligence-server:
-    ports:
-      - "127.0.0.1:8000:8000"   # was "8000:8000" — loopback only
-
-  neo4j:
-    # remove the host "ports:" mapping entirely (7474/7687).
-    # The server reaches Neo4j over the internal compose network (bolt://neo4j:7687).
-    # For local browser/debug access use: docker compose exec neo4j cypher-shell
-```
-
-(If you run the server standalone rather than via Compose, set
-`server_host: 127.0.0.1` in your config instead.)
+- **Server** — set `server_host: 127.0.0.1` in your `server-config.yaml` (loopback
+  only).
+- **Neo4j** — bind it to loopback in `neo4j.conf`:
+  ```properties
+  server.default_listen_address=127.0.0.1
+  # server.bolt.listen_address=127.0.0.1:7687
+  # server.http.listen_address=127.0.0.1:7474
+  ```
+  The server reaches it at `bolt://localhost:7687`.
 
 > **Gate — prove it before continuing.** From another machine on your LAN:
 > `curl http://<this-host-lan-ip>:8000/status` must be **refused**, and
 > `nc -vz <this-host-lan-ip> 7474 7687` must be **refused**. Only `127.0.0.1`
-> should answer. A loopback bind also means no sibling Docker container can reach
-> the server via the bridge gateway.
+> should answer.
 
 ---
 
@@ -206,20 +199,19 @@ The shared graph is the whole value; Neo4j Community ships no backup agent. A
 minimal cold backup:
 
 ```bash
-docker compose stop neo4j        # graceful flush; do NOT use `docker pause` (SIGSTOP can corrupt the WAL)
-tar czf neo4j-$(date +%F).tgz -C <data-store-dir> neo4j
-docker compose start neo4j
+neo4j stop                                  # graceful flush (do NOT kill -STOP — can corrupt the WAL)
+tar czf neo4j-$(date +%F).tgz -C <neo4j-data-dir> .   # e.g. /var/lib/neo4j/data
+neo4j start
 ```
 
-> **Important — restore must run as root inside a container.** Neo4j's data files
-> are owned by the container's uid, so a host-side `rm`/overwrite fails with
-> *Permission denied* and the restore silently does nothing. Do the destructive
-> replace in a throwaway root container:
+> **Restore.** Stop Neo4j, replace the data directory from the archive, then
+> start it again. Run as the account that owns the Neo4j data files (the `neo4j`
+> service user, or your user for a tarball install), or the overwrite fails with
+> *Permission denied* and the restore silently does nothing:
 > ```bash
-> docker compose stop neo4j
-> docker run --rm -v <data-store-dir>:/data -v "$PWD/neo4j-YYYY-MM-DD.tgz":/backup.tgz:ro \
->   alpine sh -c 'rm -rf /data/neo4j && tar xzf /backup.tgz -C /data'
-> docker compose start neo4j
+> neo4j stop
+> rm -rf <neo4j-data-dir>/* && tar xzf neo4j-YYYY-MM-DD.tgz -C <neo4j-data-dir>
+> neo4j start
 > ```
 > Test one restore before you trust it. Also monitor disk — ingested data grows
 > unbounded and there is no ingress size/rate cap.
