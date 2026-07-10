@@ -13,6 +13,69 @@ See [README.md](README.md) for full setup instructions.
 
 ---
 
+## Current Work: Documentation & Setup Cleanup
+
+We are cleaning up this repo's **documentation and setup instructions** so the
+server + Neo4j run locally **without Docker Compose**, with API keys primed for
+local runs. Scope is intentionally narrow — do this and nothing else.
+
+### KEEP (do NOT remove)
+
+- **`Dockerfile` (the server image).** This is the shipping-product container and
+  it is **S360-compliant** via PR #50 (`payneio` — "adopt Azure Linux base +
+  remove EOL packaging tools to clear S360 SCA findings",
+  https://github.com/microsoft/amplifier-context-intelligence/pull/50). Do NOT
+  drop the instructions Amplifier uses to build this container.
+  - **Why it must stay on the approved base** (`mcr.microsoft.com/azurelinux/base/python:...`):
+    the service is scanned by **S360** (Microsoft security compliance) via
+    **Qualys SCA**. Non-approved bases (e.g. Docker Hub `python:*-slim`) and the
+    EOL `pip`/`setuptools`/`wheel` rpms they ship get flagged as CVE findings.
+    Azure Linux is continuously patched via a fix-only feed, so CRITICAL/HIGH
+    clear at build time **without suppression lists**, and the base matches the
+    Azure Linux 3.0 AKS nodes this runs on.
+  - **The full rationale + the remediation pattern to preserve** (remove EOL rpms
+    rather than in-place upgrade; `tdnf update` at build time) live in
+    **`docs/azure-deployment.md` → "Container base image policy (S360 / SCA
+    compliance)"**. Read it before editing the `Dockerfile`.
+  - **Do NOT create new containers on non-approved bases.** This is exactly why
+    Neo4j is a script, not a `neo4j.Dockerfile` — its Docker Hub base would fail
+    S360. Any future container must use an approved MCR Azure Linux base.
+- **`.dockerignore` and `docker-entrypoint.sh`** — both support the server
+  `Dockerfile` build/first-run; they stay with it.
+- **Test containers** — `tests/neo4j/` fixtures and the `docker` dev-dependency
+  spin up throwaway Neo4j for tests. Keeping containers for testing is fine.
+
+### REMOVE
+
+- **`docker-compose.yml` + `docker-compose.airgap.yml`** — the Compose stack
+  hasn't been used in ages. Delete.
+- **`neo4j.Dockerfile`** — we run Neo4j ourselves, so we need a **script, not a
+  container image**. (Its `neo4j:*-community` base is also not an approved base,
+  so it would trip S360 anyway.) Replace with a run/setup script.
+- **`start.sh`** — it only wraps `docker compose up`. Delete once Compose is gone.
+
+### ADD (the real gaps)
+
+- **A script to run Neo4j locally** (install/launch Neo4j 5.x + APOC, `bolt://`
+  auth) — replacing what `neo4j.Dockerfile`/Compose did.
+- **Local credential + API-key priming** — replicate what the container first-run
+  bootstrap generated (Neo4j password + API token + sha256 digest +
+  `server-config.yaml`) for a non-Docker run.
+- **"Ask Amplifier to spin it up" prompts** in the setup instructions.
+
+### Boundaries
+
+- **No additional work** beyond documentation and setup cleanup. Do not refactor
+  server code or change behavior. (Code defaults that assume Compose — e.g.
+  `neo4j_url = neo4j://neo4j:7687`, `/data/...` storage paths — are
+  **documented-around**, not changed.)
+- **Planning docs go in the workspace-root `docs/`** (one level up from this
+  repo), never in this repo's `docs/`.
+- **This repo's `docs/` is product documentation only** — it ships with the
+  server. Keep it that way.
+
+---
+
 ## Project Structure
 
 ```

@@ -1,12 +1,13 @@
 # Managing API Keys
 
 The canonical guide to authentication for `context-intelligence-server` — for a
-human operator or an agent setting one up. Covers the two key modes, the first-run
-Docker bootstrap, adding/revoking/rotating per-peer keys by hand, and the
+human operator or an agent setting one up. Covers the two key modes, the local
+first-run bootstrap, adding/revoking/rotating per-peer keys by hand, and the
 guardrails that keep you from locking yourself (or your peers) out with a 401.
 
-> There is **no `init` subcommand.** Setup is either the Docker first-run
-> bootstrap (below) or the manual steps in this guide.
+> There is **no `init` subcommand.** Setup is either the local first-run
+> bootstrap (`scripts/prime-local-config.py`, below) or the manual steps in this
+> guide.
 
 > To add/remove users at runtime without redeploying, see [docs/identity-management.md](identity-management.md).
 
@@ -106,14 +107,20 @@ python3 -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdi
 
 ---
 
-## 3. First-run Docker bootstrap
+## 3. Local first-run bootstrap
 
-`./start.sh` (Docker Compose) and `docker-entrypoint.sh` (single container) both
-self-bootstrap on first run when no `credentials.yaml` exists. They:
+For a local (non-Docker) run, `scripts/prime-local-config.py` does the credential
+bootstrap in one shot. From the repo root:
 
-1. generate a random Neo4j password and a random raw API token,
-2. write `credentials.yaml` containing the Neo4j credentials and an `api_keys`
-   block holding **only the digest**:
+```bash
+python scripts/prime-local-config.py --neo4j-password '<neo4j-password>'
+```
+
+It:
+
+1. generates a random raw API token,
+2. writes `server-config.yaml` containing the Neo4j connection
+   (`bolt://localhost:7687`) and an `api_keys` block holding **only the digest**:
 
    ```yaml
    api_keys:
@@ -121,7 +128,10 @@ self-bootstrap on first run when no `credentials.yaml` exists. They:
        id: owner
    ```
 
-3. **print the raw token once**, behind this banner:
+   plus a local `./.context-intelligence-data/` tree (`blobs/`, `queues/`,
+   `logs/`, `identity/`), and
+
+3. **prints the raw token once**, behind this banner:
 
    ```
    ========================================================
@@ -133,15 +143,13 @@ self-bootstrap on first run when no `credentials.yaml` exists. They:
    ```
 
 **Capture that token immediately.** It is the bearer token your hook/clients use.
-It is **not** recoverable from `credentials.yaml` — that file holds only the
+It is **not** recoverable from `server-config.yaml` — that file holds only the
 digest. If you lose it, you cannot grep it back; rotate (§6) to issue a new one.
 
-- Docker Compose: the banner is in the `./start.sh` output.
-- Single container: it is in the container's first-run logs —
-  `docker logs <container>` right after the first start.
-
-On every subsequent run the scripts find the existing `credentials.yaml`, print
-"Existing credentials found", and do **not** regenerate or reprint anything.
+The script refuses to overwrite an existing `server-config.yaml` unless you pass
+`--force`. See [local-development.md](local-development.md) §2 for the full flag
+list (`--data-dir`, `--config-path`, `--server-host`/`--server-port`). Prefer to
+do it by hand? Use the two one-liners in §2 and add the `api_keys` entry yourself.
 
 ---
 
@@ -153,9 +161,9 @@ Never share one token across people.
 1. **Generate a token and digest** for the peer (§2). Pick a stable, lowercase
    contributor id (e.g. `alice`, `peer-laptop`).
 
-2. **Add the digest to the keystore.** In your server config (`server-config.yaml`,
-   or the Docker `credentials.yaml`), under `api_keys`, add one entry — the digest
-   is the key, quoted; the value carries `id`:
+2. **Add the digest to the keystore.** In your server config
+   (`server-config.yaml`), under `api_keys`, add one entry — the digest is the key,
+   quoted; the value carries `id`:
 
    ```yaml
    api_keys:
