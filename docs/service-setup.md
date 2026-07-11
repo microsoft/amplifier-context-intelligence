@@ -25,7 +25,7 @@ uv tool install git+https://github.com/microsoft/amplifier-context-intelligence
 #   uv tool install --force /path/to/amplifier-context-intelligence
 ```
 
-**2. Start Neo4j (Docker)** — APOC required; GDS optional:
+**2. Start Neo4j (Docker)** — APOC + GDS (Graph Data Science, Community edition), both required:
 
 ```bash
 NEO4J_BOLT_PORT=37687              # bolt driver (standard would be 7687)
@@ -39,16 +39,18 @@ docker run -d \
   --restart unless-stopped \
   -p ${NEO4J_HTTP_PORT}:7474 -p ${NEO4J_BOLT_PORT}:7687 \
   -e NEO4J_AUTH=neo4j/${NEO4J_PASSWORD} \
-  -e 'NEO4J_PLUGINS=["apoc"]' \
+  -e 'NEO4J_PLUGINS=["apoc","graph-data-science"]' \
+  -e 'NEO4J_dbms_security_procedures_unrestricted=apoc.*,gds.*' \
   -v "${DATA_DIR}/neo4j:/data" \
   neo4j:5.26.22-community
 ```
 
-> **Want GDS (Graph Data Science) too?** Replace the plugins line with
-> `-e 'NEO4J_PLUGINS=["apoc","graph-data-science"]'` and add
-> `-e 'NEO4J_dbms_security_procedures_unrestricted=gds.*,apoc.*'` so the GDS
-> procedures load. Use a Neo4j image whose bundled GDS build matches your Neo4j
-> version. Verify after start with
+> **GDS (Graph Data Science):** the startup plugin-installer resolves the GDS
+> Community build matching this Neo4j release from the official compatibility
+> matrix (2.13.x for 5.26.x) —
+> https://neo4j.com/docs/graph-data-science/current/installation/supported-neo4j-versions/
+> This requires network egress at container start; see the air-gapped note
+> below if that's not available. Verify after start with
 > `docker exec amplifier-context-intelligence-neo4j cypher-shell -u neo4j -p "$NEO4J_PASSWORD" "RETURN gds.version();"`.
 
 **3. Make two DISTINCT tokens** — one for data capture, one for admin:
@@ -199,27 +201,34 @@ docker run -d \
   -p ${NEO4J_HTTP_PORT}:7474 \
   -p ${NEO4J_BOLT_PORT}:7687 \
   -e NEO4J_AUTH=neo4j/${NEO4J_PASSWORD} \
-  -e 'NEO4J_PLUGINS=["apoc"]' \
+  -e 'NEO4J_PLUGINS=["apoc","graph-data-science"]' \
+  -e 'NEO4J_dbms_security_procedures_unrestricted=apoc.*,gds.*' \
   -v "${DATA_DIR}/neo4j:/data" \
   neo4j:5.26.22-community
 ```
 
-> **APOC plugin:** `-e 'NEO4J_PLUGINS=["apoc"]'` enables the APOC plugin, matching
-> the Docker Compose stack. Neo4j 5.x auto-installs the bundled `apoc-core` jar at
-> startup (from `/var/lib/neo4j/labs` into `/var/lib/neo4j/plugins`) and applies
-> APOC's default config — no volume mount or manual jar download is required, and
-> it re-installs on every container start. Verify with
-> `docker exec amplifier-context-intelligence-neo4j cypher-shell -u neo4j -p "${NEO4J_PASSWORD}" "RETURN apoc.version();"`.
+> **APOC + GDS plugins:** `-e 'NEO4J_PLUGINS=["apoc","graph-data-science"]'`
+> enables both, matching the Docker Compose stack. Neo4j 5.x auto-installs the
+> bundled `apoc-core` jar at startup (from `/var/lib/neo4j/labs` into
+> `/var/lib/neo4j/plugins`) with no network fetch required — it re-installs on
+> every container start. GDS is NOT bundled in the image, so the installer
+> resolves and downloads the Community build matching this Neo4j release from
+> the official compatibility matrix (2.13.x for 5.26.x) — this DOES require
+> network egress at container start. Verify with
+> `docker exec amplifier-context-intelligence-neo4j cypher-shell -u neo4j -p "${NEO4J_PASSWORD}" "RETURN apoc.version();"`
+> and `"RETURN gds.version();"`.
 > See the README's "Neo4j Plugins (APOC)" section for details. Hosted AuraDB has
 > APOC Core preinstalled.
 >
-> **Air-gapped hosts:** `NEO4J_PLUGINS=["apoc"]` installs APOC Core from a jar
-> bundled *inside* the image (`/var/lib/neo4j/labs/`) — no internet download — so
-> the line above already works offline. For an air-tight guarantee that skips the
-> installer entirely, build a Neo4j image with the jar baked in using the repo's
-> `neo4j.Dockerfile` + `docker-compose.airgap.yml`
+> **Air-gapped hosts:** `NEO4J_PLUGINS=["apoc","graph-data-science"]` requires
+> internet egress at startup for the GDS half (APOC alone would work offline —
+> it's bundled inside the image at `/var/lib/neo4j/labs/`). For a host with no
+> egress at all, build a Neo4j image with BOTH jars baked in at build time using
+> the repo's `neo4j.Dockerfile` + `docker-compose.airgap.yml`
 > (`docker compose -f docker-compose.yml -f docker-compose.airgap.yml up -d --build`).
-> On a fully disconnected host, also pre-load the base image first:
+> That build step itself still needs network access (same as pulling the base
+> image); only the resulting container runs egress-free. On a fully disconnected
+> host, also pre-load the base image first:
 > `docker save neo4j:5.26.22-community -o neo4j.tar` on a connected machine, then
 > `docker load -i neo4j.tar` on the air-gapped host (or use an internal registry
 > mirror).
