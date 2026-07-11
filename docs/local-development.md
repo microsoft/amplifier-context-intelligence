@@ -40,13 +40,20 @@ docker run -d --name context-intelligence-neo4j \
   -p 7474:7474 -p 7687:7687 \
   -e NEO4J_AUTH=neo4j/<neo4j-password> \
   -e NEO4J_PLUGINS='["apoc","graph-data-science"]' \
+  -e NEO4J_dbms_security_procedures_unrestricted='apoc.*,gds.*' \
   -v "$HOME/.context-intelligence-neo4j/data:/data" \
-  neo4j:5.26-community
+  neo4j:5.26.22-community
 ```
 
-- `NEO4J_PLUGINS` makes the image install **and** configure the plugins at
-  startup (it sets the required `dbms.security.procedures.*` for you). APOC is
-  bundled in the image; GDS is fetched on first start (needs internet once).
+- `NEO4J_PLUGINS` makes the image install the plugins at startup, and
+  `NEO4J_dbms_security_procedures_unrestricted='apoc.*,gds.*'` allows their
+  procedures to load. **Set `unrestricted` only** — do NOT set an `allowlist` of
+  `apoc.*,gds.*`, which would block the built-in `db.*`/`dbms.*` procedures the
+  server needs. APOC is bundled in the image; **GDS is fetched on first start**
+  (needs internet once) — the installer resolves the GDS Community build matching
+  the Neo4j version per the
+  [compatibility matrix](https://neo4j.com/docs/graph-data-science/current/installation/supported-neo4j-versions/)
+  (GDS 2.13.x for Neo4j 5.26.x).
 - The `-v …:/data` volume persists the graph across container restarts.
 - Reachable at `bolt://localhost:7687`; browser UI at `http://localhost:7474`.
 - Manage it with `docker stop/start context-intelligence-neo4j`.
