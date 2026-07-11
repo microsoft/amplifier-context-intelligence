@@ -67,6 +67,72 @@ def _discriminate_root_vs_unresolved(parent_session: dict[str, Any] | None) -> s
     return "unresolved"
 
 
+async def resolve_self_agent(
+    graph: Any,
+    parent_session_id: str,
+    workspace: str,
+    *,
+    max_depth: int = _MAX_SELF_DELEGATION_DEPTH,
+) -> str:
+    """Resolve the real agent behind a 'self' delegation (single logic home).
+
+    This is the ONE canonical implementation of the self-delegation walk. Both
+    the ingestion handler (``DelegationHandler._resolve_self_agent``) and the
+    backfill migration (``scripts/backfill_self_delegation.py``) call it, so the
+    forward-write path and the historical-repair path can never diverge.
+
+    *graph* is any object exposing the ``GraphStore`` reads the walk needs:
+    ``find_delegation_by_sub_session(sub_session_id, workspace)`` and
+    ``get_node(node_id)``. Note ``get_node`` scopes by the store's own
+    ``workspace`` property, so callers reusing one store across workspaces must
+    set ``graph.workspace`` before calling.
+
+    Walks the parent-Delegation chain -- keyed by sub_session_id -- to the
+    nearest non-self ancestor:
+    1. Look up Delegation D where D.sub_session_id == parent_session_id.
+    2. If found and D.agent != "self" -> return D.agent.
+    3. If found and D.agent == "self" -> recurse using D's own
+       parent_session_id (chained self-delegation), guarded by a visited-set +
+       max-depth cap.
+    4. If NOT found -> apply the root-vs-unresolved discriminator
+       (_discriminate_root_vs_unresolved): a lookup miss alone cannot
+       distinguish "genuine root/fork, no spawning Delegation exists" from
+       "spawning Delegation not flushed yet" (ingestion ordering is not
+       guaranteed -- the spawning record lives in the parent session's stream
+       and the self-delegation in the child's; they drain concurrently).
+
+    Returns one of: a real agent name | "root" | "forked" | "unresolved".
+    """
+    visited: set[str] = set()
+    current_session_id = parent_session_id
+
+    for _ in range(max_depth):
+        if current_session_id in visited:
+            return "unresolved"  # cycle guard
+        visited.add(current_session_id)
+
+        parent_delegation = await graph.find_delegation_by_sub_session(
+            current_session_id, workspace
+        )
+        if parent_delegation is None:
+            parent_session = await graph.get_node(current_session_id)
+            return _discriminate_root_vs_unresolved(parent_session)
+
+        parent_agent = parent_delegation.get("agent")
+        if parent_agent != "self":
+            return parent_agent or "unresolved"
+
+        # Chained self-delegation (self -> self -> ...): walk to the
+        # nearest non-self ancestor via the parent Delegation's own parent.
+        next_session_id = parent_delegation.get("parent_session_id")
+        if not next_session_id:
+            return "unresolved"
+        current_session_id = next_session_id
+
+    return "unresolved"  # depth-cap guard (never expected to be reached --
+    # live data shows max self-chain depth is 1; this is safety margin)
+
+
 class DelegationHandler:
     """Enricher handler for delegate lifecycle events.
 
@@ -252,56 +318,14 @@ class DelegationHandler:
     async def _resolve_self_agent(self, parent_session_id: str, workspace: str) -> str:
         """Resolve the real agent behind a 'self' delegation (additive field only).
 
-        node_data["agent"] stays the literal "self" from the raw event; this
-        method only computes the additive resolved_agent field.
-
-        Walks the parent-Delegation chain -- keyed by sub_session_id -- to the
-        nearest non-self ancestor:
-        1. Look up Delegation D where D.sub_session_id == parent_session_id.
-        2. If found and D.agent != "self" -> return D.agent.
-        3. If found and D.agent == "self" -> recurse using D's own
-           parent_session_id (chained self-delegation), guarded by a
-           visited-set + max-depth cap.
-        4. If NOT found -> apply the root-vs-unresolved discriminator (see
-           _discriminate_root_vs_unresolved): a lookup miss alone cannot
-           distinguish "genuine root/fork, no spawning Delegation exists" from
-           "spawning Delegation not flushed yet" (ingestion ordering is not
-           guaranteed -- the spawning record lives in the parent session's
-           stream and the self-delegation in the child's; they drain
-           concurrently).
-
-        Returns one of: a real agent name | "root" | "forked" | "unresolved".
+        Thin delegator to the module-level :func:`resolve_self_agent`, the single
+        logic home shared with the backfill migration. ``node_data["agent"]``
+        stays the literal ``"self"`` from the raw event; this only computes the
+        additive ``resolved_agent`` field.
         """
-        visited: set[str] = set()
-        current_session_id = parent_session_id
-
-        for _ in range(_MAX_SELF_DELEGATION_DEPTH):
-            if current_session_id in visited:
-                return "unresolved"  # cycle guard
-            visited.add(current_session_id)
-
-            parent_delegation = (
-                await self.services.graph.find_delegation_by_sub_session(
-                    current_session_id, workspace
-                )
-            )
-            if parent_delegation is None:
-                parent_session = await self.services.graph.get_node(current_session_id)
-                return _discriminate_root_vs_unresolved(parent_session)
-
-            parent_agent = parent_delegation.get("agent")
-            if parent_agent != "self":
-                return parent_agent or "unresolved"
-
-            # Chained self-delegation (self -> self -> ...): walk to the
-            # nearest non-self ancestor via the parent Delegation's own parent.
-            next_session_id = parent_delegation.get("parent_session_id")
-            if not next_session_id:
-                return "unresolved"
-            current_session_id = next_session_id
-
-        return "unresolved"  # depth-cap guard (never expected to be reached --
-        # live data shows max self-chain depth is 1; this is safety margin)
+        return await resolve_self_agent(
+            self.services.graph, parent_session_id, workspace
+        )
 
     async def _handle_lifecycle(
         self,
