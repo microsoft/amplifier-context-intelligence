@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
 #
-# verify-airgap-apoc.sh — prove APOC loads in Neo4j with ZERO network download.
+# verify-airgap-apoc.sh — prove APOC *and* GDS load in Neo4j with ZERO network
+# download at runtime.
 #
-# Builds the air-tight image from ../../neo4j.Dockerfile (which bakes the APOC
-# Core jar into /var/lib/neo4j/plugins at build time), runs it on a Docker
-# *internal* network (no NAT / no internet egress), and verifies APOC is
-# functional while the container is provably cut off from the internet.
+# Builds the air-tight image from ../../neo4j.Dockerfile (which bakes both the
+# APOC Core jar and the GDS Community jar into /var/lib/neo4j/plugins at BUILD
+# time), runs it on a Docker *internal* network (no NAT / no internet egress),
+# and verifies both plugins are functional while the container is provably cut
+# off from the internet.
 #
-# This is the portable, Docker-only regression check for the air-gapped APOC
-# path. It needs only Docker — no Incus/DTU. Re-run it whenever the Neo4j base
-# image version changes. For deeper, Incus-level isolation see dtu-profile.yaml
-# in this directory.
+# This is the portable, Docker-only regression check for the air-gapped
+# APOC+GDS path. It needs only Docker — no Incus/DTU. Re-run it whenever the
+# Neo4j base image version (or the pinned GDS_VERSION build arg) changes. For
+# deeper, Incus-level isolation see dtu-profile.yaml in this directory.
 #
 # Usage:
 #   test/airgap/verify-airgap-apoc.sh
 #
 # Env overrides:
 #   NEO4J_VERSION   expected APOC/Neo4j version (default: 5.26.22)
+#   GDS_VERSION     expected GDS version, must match neo4j.Dockerfile's
+#                   GDS_VERSION build arg (default: 2.13.8)
 #   IMAGE_TAG       built image tag (default: amplifier-ci-neo4j-apoc-airgap:test)
 #   KEEP            set to 1 to leave the container/network/image for inspection
 #
@@ -24,6 +28,7 @@
 set -euo pipefail
 
 NEO4J_VERSION="${NEO4J_VERSION:-5.26.22}"
+GDS_VERSION="${GDS_VERSION:-2.13.8}"
 IMAGE_TAG="${IMAGE_TAG:-amplifier-ci-neo4j-apoc-airgap:test}"
 KEEP="${KEEP:-0}"
 
@@ -62,6 +67,13 @@ if docker run --rm --entrypoint sh "${IMAGE_TAG}" -c 'ls -1 /var/lib/neo4j/plugi
   pass "apoc.jar present in image at /var/lib/neo4j/plugins/apoc.jar"
 else
   fail "apoc.jar NOT baked into image"
+fi
+
+log "Confirm GDS jar is BAKED into the image layer (present before any run)"
+if docker run --rm --entrypoint sh "${IMAGE_TAG}" -c 'ls -1 /var/lib/neo4j/plugins/graph-data-science.jar' >/dev/null 2>&1; then
+  pass "graph-data-science.jar present in image at /var/lib/neo4j/plugins/graph-data-science.jar"
+else
+  fail "graph-data-science.jar NOT baked into image"
 fi
 
 log "Create an INTERNAL Docker network (no NAT, no internet egress)"

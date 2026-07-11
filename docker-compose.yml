@@ -54,7 +54,17 @@ services:
       # /var/lib/neo4j/labs into /var/lib/neo4j/plugins at startup and applies
       # APOC's default config (incl. unrestricted apoc.*). No volume mount or
       # manual jar download is required; it re-installs on every container start.
-      NEO4J_PLUGINS: '["apoc"]'
+      #
+      # GDS (Graph Data Science) Community plugin. The startup plugin-installer
+      # fetches the version matching this Neo4j release from the official
+      # compatibility matrix (2.13.x for 5.26.x) — see
+      # https://neo4j.com/docs/graph-data-science/current/installation/supported-neo4j-versions/
+      # Requires network egress at container start; use the airgap override
+      # (docker-compose.airgap.yml + neo4j.Dockerfile) if that's not available.
+      NEO4J_PLUGINS: '["apoc","graph-data-science"]'
+      # Unrestricted procedures for BOTH plugins. ONLY `unrestricted` — do NOT
+      # set `allowlist`, that would block built-in db.*/dbms.* procedures.
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
     ports:
       - "7474:7474"
       - "7687:7687"
