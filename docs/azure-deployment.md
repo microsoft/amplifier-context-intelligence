@@ -197,15 +197,22 @@ Back the disk with snapshots or Azure Backup for DR.
 
 ### 2c. Install Neo4j + APOC + GDS
 
-Install a Neo4j **5.x** server (match the line this project targets), then add
-**both** plugins — **APOC** (procedures the server relies on) and **GDS** (Graph
-Data Science):
+Install a Neo4j **Community 5.26 LTS** server (the LTS line this project
+targets — pin to the `5.26.x` series, e.g. `5.26.22`; do **not** move to the
+CalVer `2026.xx` line), then add **both** plugins — **APOC** (procedures the
+server relies on) and **GDS** (Graph Data Science):
 
-1. Install the Neo4j 5.x package for the VM's OS (from Neo4j's official
-   package feed for that distro).
-2. Place the **APOC** and **GDS** plugin JARs — **matched to the exact Neo4j
-   version** — into the Neo4j **plugins** directory (e.g. `/var/lib/neo4j/plugins`
-   or the packaged plugins path). Version-mismatched plugins will refuse to load.
+1. Install the Neo4j **Community 5.26 LTS** package for the VM's OS (from
+   Neo4j's official package feed for that distro), pinned to the `5.26.x` line.
+2. Place the **APOC** and **GDS** plugin JARs — **matched to your Neo4j version**
+   — into the Neo4j **plugins** directory (e.g. `/var/lib/neo4j/plugins` or the
+   packaged plugins path). Version-mismatched plugins refuse to load. **APOC Core**
+   is bundled inside Neo4j 5.x (copy from `labs/`); **GDS** is a separate download
+   pinned to the official
+   [GDS ↔ Neo4j compatibility matrix](https://neo4j.com/docs/graph-data-science/current/installation/supported-neo4j-versions/).
+   For **Neo4j Community 5.26 LTS** use **GDS Community 2.13.11** (the latest
+   `2.13.x` patch — the `2.13` series pairs with the `5.26` line; pin the newest
+   patch so GDS loads on recent `5.26.x` releases).
 3. Configure `neo4j.conf`:
    ```properties
    # Data on the persistent managed disk
@@ -215,9 +222,11 @@ Data Science):
    server.bolt.listen_address=0.0.0.0:7687          # NSG restricts who can reach it
    server.default_advertised_address=<neo4j-private-hostname-or-ip>
 
-   # Allow the plugin procedures the server + analytics use
+   # Allow the plugin procedures the server + analytics use.
+   # Set ONLY `unrestricted` — do NOT set `allowlist` to `apoc.*,gds.*`: an
+   # allowlist restricted to the plugins would block the built-in db.*/dbms.*
+   # procedures the server relies on.
    dbms.security.procedures.unrestricted=apoc.*,gds.*
-   dbms.security.procedures.allowlist=apoc.*,gds.*
 
    # Memory (size to your VM / graph)
    server.memory.heap.initial_size=<e.g. 8g>
