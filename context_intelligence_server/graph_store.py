@@ -93,6 +93,24 @@ class GraphStore(Protocol):
         """
         ...
 
+    async def find_delegation_by_sub_session(
+        self, sub_session_id: str, workspace: str
+    ) -> dict[str, Any] | None:
+        """Return the Delegation node whose ``sub_session_id`` property matches, or ``None``.
+
+        Used to find the Delegation that *spawned* a given session -- i.e. the
+        Delegation node ``D`` where ``D.sub_session_id == sub_session_id``. This
+        is the parent-Delegation lookup the self-delegation resolver needs to
+        find the real agent behind a ``agent == "self"`` delegation, since the
+        correct source of truth is the parent Delegation node, never the parent
+        Session node (which structurally never carries an ``agent`` property).
+
+        Checks the in-memory buffer first, consistent with ``get_node``/
+        ``get_edge`` buffer-first semantics. Returns ``None`` if no matching
+        Delegation node is found in either the buffer or the backing store.
+        """
+        ...
+
     async def flush(self) -> None:
         """Persist all buffered writes to the backing store.
 

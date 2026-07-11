@@ -149,6 +149,29 @@ class GraphState:
         edge = self._edges.get((src_id, dst_id))
         return dict(edge) if edge is not None else None
 
+    async def find_delegation_by_sub_session(
+        self, sub_session_id: str, workspace: str
+    ) -> dict[str, Any] | None:
+        """Return a copy of the Delegation node whose sub_session_id matches, or None.
+
+        Scans the in-memory node store for a node carrying the ``Delegation``
+        label with a matching ``sub_session_id`` property -- the parent
+        Delegation that spawned *sub_session_id*.
+
+        ``GraphState`` is a single-workspace store (workspace is fixed at
+        construction), so the *workspace* argument is accepted for parity with
+        other ``GraphStore`` implementations (e.g. ``Neo4jGraphStore``) but is
+        not used to filter here -- every node in this store already belongs to
+        the same workspace.
+        """
+        for data in self._nodes.values():
+            if (
+                "Delegation" in data.get("labels", [])
+                and data.get("sub_session_id") == sub_session_id
+            ):
+                return dict(data)
+        return None
+
     def remove_edge(self, src_id: str, dst_id: str) -> None:
         """Remove an edge from the in-memory store.
 

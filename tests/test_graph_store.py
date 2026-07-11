@@ -35,6 +35,11 @@ class MinimalGraphStore:
     async def get_edge(self, src_id: str, dst_id: str) -> dict[str, Any] | None:
         return None
 
+    async def find_delegation_by_sub_session(
+        self, sub_session_id: str, workspace: str
+    ) -> dict[str, Any] | None:
+        return None
+
     async def flush(self) -> None:
         pass
 
@@ -91,6 +96,11 @@ class MinimalQueryableStore:
         return None
 
     async def get_edge(self, src_id: str, dst_id: str) -> dict[str, Any] | None:
+        return None
+
+    async def find_delegation_by_sub_session(
+        self, sub_session_id: str, workspace: str
+    ) -> dict[str, Any] | None:
         return None
 
     async def flush(self) -> None:
