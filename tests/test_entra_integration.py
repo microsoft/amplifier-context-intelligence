@@ -8,7 +8,7 @@ Coverage:
   AC2/AC9 — valid entra JWT → 202, created_by stamped as mapped contributor
   AC4      — unmapped oid  → 403 HTTP response
   AC3      — expired / garbage / missing bearer → 401 HTTP response
-  Exempt   — /status and /skills/* pass through without a token
+  Exempt   — /status passes through without a token
   Regression — existing static auth_client path unbroken
 """
 
