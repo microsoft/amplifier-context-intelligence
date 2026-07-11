@@ -352,8 +352,10 @@ class TestDelegationHandlerGuards:
         Real Amplifier versions emit tool_call_id='' (empty string) in
         delegate:agent_spawned.  The handler must still create a Delegation
         node, using sub_session_id as the compound-key fallback.
-        When agent='self' and the parent has no agent property, resolved_agent
-        falls back to 'root-agent' and is_self_delegation is set to True.
+        When agent='self' and there is no parent Delegation and no parent
+        Session node at all, resolved_agent falls to the 'unresolved'
+        sentinel (never the old 'root-agent' fallback) and
+        is_self_delegation is set to True.
         """
         handler = DelegationHandler(services)
         result = await handler(
@@ -372,7 +374,7 @@ class TestDelegationHandlerGuards:
         assert delegation_id in services.graph._nodes
         assert services.graph._nodes[delegation_id]["agent"] == "self"
         assert services.graph._nodes[delegation_id]["is_self_delegation"] is True
-        assert services.graph._nodes[delegation_id]["resolved_agent"] == "root-agent"
+        assert services.graph._nodes[delegation_id]["resolved_agent"] == "unresolved"
 
     async def test_missing_both_tool_call_id_and_sub_session_id_short_circuits(
         self, services: HookStateService
@@ -679,32 +681,54 @@ class TestE10RecipeStepAttribution:
 
 
 class TestSelfDelegationResolution:
-    """self-delegation agent resolution — agent='self' must resolve to the parent's canonical agent."""
+    """self-delegation agent resolution.
 
-    async def test_self_resolves_from_parent_agent(
+    agent='self' must resolve (additively, via resolved_agent) to the nearest
+    non-self ancestor's real agent name, read from the PARENT DELEGATION node
+    (never the parent Session node, which structurally never carries an
+    'agent' property — see delegation.py Defect B / design doc §3).
+
+    Fixtures reflect the real graph shape: a normal spawn creates a Delegation
+    node keyed by the PARENT's own parent_session_id, with sub_session_id ==
+    the spawned sub-session. A self-delegation's resolver walks
+    find_delegation_by_sub_session(parent_session_id) to find that Delegation.
+    """
+
+    async def test_self_resolves_from_parent_delegation_agent(
         self, services: HookStateService
     ) -> None:
-        """agent='self' resolves to parent session's agent property.
+        """agent='self' resolves to the parent DELEGATION's agent (single hop).
 
-        Pre-seed the parent with agent='foundation:explorer' via upsert_node.
+        A normal delegation D1 (agent='foundation:explorer') spawns
+        'ps-named'. A self-delegation is then spawned FROM 'ps-named'. The
+        resolver must walk D1 (found via
+        find_delegation_by_sub_session('ps-named')), NOT read a Session
+        node's 'agent' property.
+
         After spawn:
         - Delegation node carries agent='self', resolved_agent='foundation:explorer',
           is_self_delegation=True.
         - Agent concept node exists at 'foundation:explorer' (not 'self').
         - HAS_AGENT edge targets 'foundation:explorer'.
         """
-        await services.graph.upsert_node(
-            "ps-named",
-            {"labels": ["Session"], "agent": "foundation:explorer"},
-        )
         handler = DelegationHandler(services)
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "parent_session_id": "root-ps",
+                "tool_call_id": "tc-parent",
+                "sub_session_id": "ps-named",
+                "agent": "foundation:explorer",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
         await handler(
             "delegate:agent_spawned",
             {
                 "parent_session_id": "ps-named",
                 "sub_session_id": "ss-self-1",
                 "agent": "self",
-                "timestamp": "2026-01-01T00:00:00Z",
+                "timestamp": "2026-01-01T00:00:01Z",
                 "tool_call_id": "",  # empty — sub_session_id used as fallback key
             },
         )
@@ -726,14 +750,18 @@ class TestSelfDelegationResolution:
             "HAS_AGENT edge must target 'foundation:explorer'"
         )
 
-    async def test_self_falls_back_to_root_agent_when_parent_has_no_agent(
+    async def test_self_resolves_to_root_when_parent_is_root_session(
         self, services: HookStateService
     ) -> None:
-        """agent='self' with a parent node that has no agent property falls back to 'root-agent'.
+        """No parent Delegation exists; parent Session is labeled RootSession -> 'root'.
 
-        No pre-seeding of the parent node.  get_node returns None ->
-        resolved_agent = 'root-agent'.
+        This is the correct terminal state for a genuine root self-delegation:
+        there is no spawning agent because the parent is a root session, not
+        a race-miss.
         """
+        await services.graph.upsert_node(
+            "ps-root", {"labels": ["Session", "RootSession"]}
+        )
         handler = DelegationHandler(services)
         await handler(
             "delegate:agent_spawned",
@@ -742,19 +770,221 @@ class TestSelfDelegationResolution:
                 "sub_session_id": "ss-self-2",
                 "agent": "self",
                 "timestamp": "2026-01-01T00:00:00Z",
-                "tool_call_id": "",  # empty — sub_session_id used as fallback key
+                "tool_call_id": "",
             },
         )
 
         delegation_id = "ps-root::delegation::ss-self-2"
-        assert services.graph._nodes[delegation_id]["resolved_agent"] == "root-agent"
+        assert services.graph._nodes[delegation_id]["resolved_agent"] == "root"
         assert services.graph._nodes[delegation_id]["is_self_delegation"] is True
-        assert "root-agent" in services.graph._nodes, (
-            "Agent concept node must exist at 'root-agent'"
+        assert "root" in services.graph._nodes, (
+            "Agent concept node must exist at the 'root' sentinel"
         )
-        assert "self" not in services.graph._nodes, (
-            "No singleton 'self' agent concept node must be created"
+
+    async def test_self_resolves_to_forked_when_parent_is_forked_session(
+        self, services: HookStateService
+    ) -> None:
+        """No parent Delegation exists; parent Session is labeled ForkedSession -> 'forked'.
+
+        A fork's origin is a FORK/HAS_FORK edge, not an agent Delegation, so
+        'no spawner Delegation' is expected here — a correct, non-failure
+        state, not a race-miss. Keeping this distinct from 'unresolved' keeps
+        the monitored miss-count a real signal (design doc §8c).
+        """
+        await services.graph.upsert_node(
+            "ps-forked", {"labels": ["Session", "ForkedSession"]}
         )
+        handler = DelegationHandler(services)
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "parent_session_id": "ps-forked",
+                "sub_session_id": "ss-self-3",
+                "agent": "self",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "tool_call_id": "",
+            },
+        )
+
+        delegation_id = "ps-forked::delegation::ss-self-3"
+        assert services.graph._nodes[delegation_id]["resolved_agent"] == "forked"
+
+    async def test_self_resolves_to_unresolved_when_parent_session_missing(
+        self, services: HookStateService
+    ) -> None:
+        """No parent Delegation AND no parent Session at all -> 'unresolved', never 'root'.
+
+        This is the ordering-race case: the spawning record has not been
+        flushed yet (ingestion ordering is not guaranteed). The resolver must
+        fail loud with an explicit, monitored sentinel — never silently guess
+        'root' (that was Defect A/B's bug: a fallback that lied quietly).
+        """
+        handler = DelegationHandler(services)
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "parent_session_id": "ps-missing",
+                "sub_session_id": "ss-self-4",
+                "agent": "self",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "tool_call_id": "",
+            },
+        )
+
+        delegation_id = "ps-missing::delegation::ss-self-4"
+        assert services.graph._nodes[delegation_id]["resolved_agent"] == "unresolved"
+
+    async def test_self_resolves_to_unresolved_when_parent_session_has_no_terminal_label(
+        self, services: HookStateService
+    ) -> None:
+        """Parent Session exists but carries no terminal label (bare stub) -> 'unresolved'.
+
+        A bare Session node (e.g. from ensure_session_node's safety-net stub,
+        before SessionHandler enriches it with a type label) must not be
+        mistaken for a genuine root.
+        """
+        await services.graph.upsert_node("ps-bare", {"labels": ["Session"]})
+        handler = DelegationHandler(services)
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "parent_session_id": "ps-bare",
+                "sub_session_id": "ss-self-5",
+                "agent": "self",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "tool_call_id": "",
+            },
+        )
+
+        delegation_id = "ps-bare::delegation::ss-self-5"
+        assert services.graph._nodes[delegation_id]["resolved_agent"] == "unresolved"
+
+    async def test_self_resolves_to_root_despite_incomplete_colabel(
+        self, services: HookStateService
+    ) -> None:
+        """Parent Session labeled RootSession AND IncompleteSession -> 'root', NOT 'unresolved'.
+
+        Live graph data shows IncompleteSession co-labels a terminal label
+        ~41% of the time (a session can reach session:end with
+        session:start/fork permanently missed, out of order — see
+        SessionHandler._handle_end / SessionLabelStateMachine.classify). The
+        discriminator MUST branch on the terminal label only; treating
+        IncompleteSession as a signal would mis-flag hundreds of genuine
+        roots as unresolved (the critical guard from design doc §6.1).
+        """
+        await services.graph.upsert_node(
+            "ps-root-incomplete",
+            {"labels": ["Session", "RootSession", "IncompleteSession"]},
+        )
+        handler = DelegationHandler(services)
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "parent_session_id": "ps-root-incomplete",
+                "sub_session_id": "ss-self-6",
+                "agent": "self",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "tool_call_id": "",
+            },
+        )
+
+        delegation_id = "ps-root-incomplete::delegation::ss-self-6"
+        assert services.graph._nodes[delegation_id]["resolved_agent"] == "root"
+
+    async def test_self_resolves_through_chained_self_delegation(
+        self, services: HookStateService
+    ) -> None:
+        """self -> self -> real agent: resolves to the nearest non-self ancestor (depth 2).
+
+        D1 (agent='foundation:explorer') spawns 'ps-mid'.
+        D2 (agent='self') is spawned FROM 'ps-mid' and itself spawns 'ps-leaf'.
+        D3 (agent='self') is spawned FROM 'ps-leaf' — its resolver must walk
+        PAST D2 (agent='self') to D1's real agent, not stop at D2.
+        """
+        handler = DelegationHandler(services)
+        # D1: real agent spawns ps-mid
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "parent_session_id": "root-ps",
+                "tool_call_id": "tc-d1",
+                "sub_session_id": "ps-mid",
+                "agent": "foundation:explorer",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        # D2: self-delegation spawned FROM ps-mid, itself spawning ps-leaf
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "parent_session_id": "ps-mid",
+                "sub_session_id": "ps-leaf",
+                "agent": "self",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "tool_call_id": "",
+            },
+        )
+        # D3: self-delegation spawned FROM ps-leaf — must walk past D2 to D1
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "parent_session_id": "ps-leaf",
+                "sub_session_id": "ss-self-final",
+                "agent": "self",
+                "timestamp": "2026-01-01T00:00:02Z",
+                "tool_call_id": "",
+            },
+        )
+
+        delegation_id = "ps-leaf::delegation::ss-self-final"
+        assert (
+            services.graph._nodes[delegation_id]["resolved_agent"]
+            == "foundation:explorer"
+        )
+
+    async def test_self_delegation_cycle_guard_terminates_unresolved(
+        self, services: HookStateService
+    ) -> None:
+        """A cyclic parent-Delegation chain terminates at 'unresolved', never loops forever.
+
+        Two self-delegations reference each other's sub_session_id as
+        parent_session_id, forming a cycle. The visited-set guard must break
+        out and return 'unresolved' rather than looping until the depth cap
+        (or worse, forever).
+        """
+        await services.graph.upsert_node(
+            "cycle-a::delegation::x",
+            {
+                "labels": ["Delegation", "SST_EVENT"],
+                "agent": "self",
+                "parent_session_id": "node-b",
+                "sub_session_id": "node-a",
+            },
+        )
+        await services.graph.upsert_node(
+            "cycle-b::delegation::y",
+            {
+                "labels": ["Delegation", "SST_EVENT"],
+                "agent": "self",
+                "parent_session_id": "node-a",
+                "sub_session_id": "node-b",
+            },
+        )
+
+        handler = DelegationHandler(services)
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "parent_session_id": "node-a",
+                "sub_session_id": "ss-cycle-entry",
+                "agent": "self",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "tool_call_id": "",
+            },
+        )
+
+        delegation_id = "node-a::delegation::ss-cycle-entry"
+        assert services.graph._nodes[delegation_id]["resolved_agent"] == "unresolved"
 
     async def test_non_self_stores_agent_on_sub_session_node(
         self, services: HookStateService
@@ -779,3 +1009,92 @@ class TestSelfDelegationResolution:
         )
 
         assert services.graph._nodes["ss-named"]["agent"] == "foundation:explorer"
+
+
+# ---------------------------------------------------------------------------
+# 10. TestIsSelfDelegationFlagBoolean
+# ---------------------------------------------------------------------------
+
+
+class TestIsSelfDelegationFlagBoolean:
+    """Brick 1: is_self_delegation is written unconditionally as True or False, never null.
+
+    Previously written only inside the agent=='self' branch (only as True),
+    so upsert_node's merge semantics left the field null for every non-self
+    delegation — indistinguishable from 'unwritten' under Cypher's
+    null=false comparison.
+    """
+
+    async def test_flag_is_true_for_self_delegation(
+        self, services: HookStateService
+    ) -> None:
+        handler = DelegationHandler(services)
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "parent_session_id": "ps1",
+                "sub_session_id": "ss-self",
+                "agent": "self",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "tool_call_id": "",
+            },
+        )
+        node = services.graph._nodes["ps1::delegation::ss-self"]
+        assert node["is_self_delegation"] is True
+
+    async def test_flag_is_false_for_named_delegation(
+        self, services: HookStateService
+    ) -> None:
+        handler = DelegationHandler(services)
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "parent_session_id": "ps1",
+                "sub_session_id": "ss-named",
+                "agent": "foundation:explorer",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "tool_call_id": "tc-named",
+            },
+        )
+        node = services.graph._nodes["ps1::delegation::tc-named"]
+        assert node["is_self_delegation"] is False
+
+
+# ---------------------------------------------------------------------------
+# 11. TestFindDelegationBySubSessionParity
+# ---------------------------------------------------------------------------
+
+
+class TestFindDelegationBySubSessionParity:
+    """Brick 3: GraphState.find_delegation_by_sub_session, required by the resolver."""
+
+    async def test_finds_delegation_by_sub_session_id(
+        self, services: HookStateService
+    ) -> None:
+        """Returns the Delegation node whose sub_session_id property matches."""
+        handler = DelegationHandler(services)
+        await handler(
+            "delegate:agent_spawned",
+            {
+                "parent_session_id": "ps1",
+                "tool_call_id": "tc-abc",
+                "sub_session_id": "ss1",
+                "agent": "foundation:explorer",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+
+        found = await services.graph.find_delegation_by_sub_session(
+            "ss1", services.graph.workspace
+        )
+        assert found is not None
+        assert found["agent"] == "foundation:explorer"
+        assert found["sub_session_id"] == "ss1"
+
+    async def test_returns_none_when_no_matching_sub_session(
+        self, services: HookStateService
+    ) -> None:
+        found = await services.graph.find_delegation_by_sub_session(
+            "nonexistent-sub-session", services.graph.workspace
+        )
+        assert found is None

@@ -1101,6 +1101,50 @@ class Neo4jGraphStore:
 
         return None
 
+    async def find_delegation_by_sub_session(
+        self, sub_session_id: str, workspace: str
+    ) -> dict[str, Any] | None:
+        """Return the Delegation node whose sub_session_id property matches, or None.
+
+        Finds the Delegation ``D`` where ``D.sub_session_id == sub_session_id``
+        -- i.e. the Delegation that *spawned* the session named by
+        *sub_session_id*. This is the parent-Delegation lookup the
+        self-delegation resolver needs: the correct source of the real agent
+        behind an ``agent == "self"`` delegation is the parent Delegation
+        node, never the parent Session node (which structurally never carries
+        an ``agent`` property).
+
+        Checks the in-memory node buffer first (buffer-first read, consistent
+        with ``get_node``/``get_edge``), then falls back to a Neo4j query
+        scoped to *workspace*. Returns ``None`` if no matching Delegation node
+        is found in either the buffer or the backing store.
+        """
+        for data in self._node_buffer.values():
+            if (
+                "Delegation" in data.get("labels", [])
+                and data.get("sub_session_id") == sub_session_id
+            ):
+                return dict(data)
+
+        # Neo4j fallback
+        try:
+            result = await self._driver.execute_query(
+                "MATCH (d:Delegation {sub_session_id: $sid, workspace: $workspace}) "
+                "RETURN properties(d) AS props",
+                {"sid": sub_session_id, "workspace": workspace},
+                database_=self._database,
+            )
+            records = result.records
+            if records:
+                return {
+                    k: _normalize_temporal(v)
+                    for k, v in dict(records[0]["props"]).items()
+                }
+        except Neo4jError:
+            pass
+
+        return None
+
     async def get_edge(self, src_id: str, dst_id: str) -> dict[str, Any] | None:
         """Return edge data, checking the in-memory buffer first.
 
