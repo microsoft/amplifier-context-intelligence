@@ -48,7 +48,7 @@ _EXEMPT_PATHS_API_ONLY: frozenset[str] = frozenset(
 )
 
 # Path prefixes that are exempt from authentication (static assets).
-_EXEMPT_PREFIXES: tuple[str, ...] = ("/static/", "/skills/")
+_EXEMPT_PREFIXES: tuple[str, ...] = ("/static/",)
 
 # Route prefix of the admin router (mirrors routers/admin.py:
 # ``APIRouter(prefix="/admin", ...)``).  The static-mode admin-key fast-path is

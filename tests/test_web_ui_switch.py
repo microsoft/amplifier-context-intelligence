@@ -9,7 +9,6 @@ Proves:
        GET /docs          → 404
        GET /dashboard invalid bearer → 401 or 404, NEVER a 200 bypass
        GET /logs/stream   → 401 (not in exempt set; middleware gates it)
-       GET /skills/<x>    → NOT 401 (prefix-exempt, bundle path stays)
        GET /status        → 200 (always exempt)
   4. Regression — web_ui_enabled=True (default): existing routes unbroken.
 
@@ -43,7 +42,7 @@ async def api_only_client() -> AsyncGenerator[httpx.AsyncClient, None]:
 
     Mirrors the production setup when web_ui_enabled=False:
     - FastAPI with docs_url=None, redoc_url=None, openapi_url=None
-    - Only /status and /skills/* registered (no /, /dashboard, /logs/stream)
+    - Only /status registered (no /, /dashboard, /logs/stream)
     - BearerTokenMiddleware with _EXEMPT_PATHS_API_ONLY (no web-UI paths exempt)
     """
     from fastapi import FastAPI  # noqa: PLC0415
@@ -53,10 +52,6 @@ async def api_only_client() -> AsyncGenerator[httpx.AsyncClient, None]:
         StaticKeyResolver,
         _EXEMPT_PATHS_API_ONLY,
     )
-    from context_intelligence_server.routers.skills import (  # noqa: PLC0415
-        SkillRegistry,
-        router as skills_router,
-    )
 
     # Mirrors FastAPI construction with web_ui_enabled=False
     mini_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -64,10 +59,6 @@ async def api_only_client() -> AsyncGenerator[httpx.AsyncClient, None]:
     @mini_app.get("/status")
     async def _status() -> dict[str, str]:
         return {"status": "ok"}
-
-    mini_app.include_router(skills_router)
-    # Guard: skills router reads app.state.skill_registry in the handler
-    mini_app.state.skill_registry = SkillRegistry()
 
     resolver = StaticKeyResolver({_DIGEST: "owner"})
     asgi = BearerTokenMiddleware(
@@ -312,16 +303,6 @@ class TestApiOnlyHttpBehavior:
         response = await api_only_client.get("/status")
         assert response.status_code == 200, (
             f"GET /status must return 200 in api-only mode (always exempt), "
-            f"got {response.status_code}"
-        )
-
-    async def test_skills_prefix_not_auth_blocked_in_api_only_mode(
-        self, api_only_client: httpx.AsyncClient
-    ) -> None:
-        """GET /skills/<x> → NOT 401 — prefix-exempt; the bundle fetches skills here."""
-        response = await api_only_client.get("/skills/nonexistent-skill-f4-test")
-        assert response.status_code != 401, (
-            f"GET /skills/* must not return 401 in api-only mode (prefix-exempt), "
             f"got {response.status_code}"
         )
 

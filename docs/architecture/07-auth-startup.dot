@@ -193,7 +193,7 @@ digraph auth_startup {
         ]
 
         ExemptNote [
-            label     = "prefix exemptions always apply\n(regardless of web_ui_enabled):\n  /static/   /skills/"
+            label     = "prefix exemptions always apply\n(regardless of web_ui_enabled):\n  /static/"
             fillcolor = "#FFF9C4"
             style     = filled
         ]

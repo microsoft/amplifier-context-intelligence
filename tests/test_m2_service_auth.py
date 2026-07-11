@@ -217,8 +217,7 @@ async def service_asgi(
     Identity map: FAKE_OID_HUMAN → FAKE_CONTRIBUTOR_HUMAN.
     """
     from context_intelligence_server.config import Settings  # noqa: PLC0415
-    from context_intelligence_server.main import app, create_asgi_app  # noqa: PLC0415
-    from context_intelligence_server.routers.skills import SkillRegistry  # noqa: PLC0415
+    from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
     private_key, public_key = rsa_keypair_cap
 
@@ -235,9 +234,6 @@ async def service_asgi(
         entra_identities_store_path=str(tmp_path / "entra-identities.json"),
         api_keys_store_path=str(tmp_path / "api-keys.json"),
     )
-
-    if not hasattr(app.state, "skill_registry"):
-        app.state.skill_registry = SkillRegistry()
 
     asgi = create_asgi_app(
         settings=settings,
@@ -587,8 +583,7 @@ async def service_asgi_with_map(
     two maps are disjoint and B4 does not fire.
     """
     from context_intelligence_server.config import Settings  # noqa: PLC0415
-    from context_intelligence_server.main import app, create_asgi_app  # noqa: PLC0415
-    from context_intelligence_server.routers.skills import SkillRegistry  # noqa: PLC0415
+    from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
     private_key, public_key = rsa_keypair_cap
 
@@ -608,9 +603,6 @@ async def service_asgi_with_map(
         entra_identities_store_path=str(tmp_path / "entra-identities-map.json"),
         api_keys_store_path=str(tmp_path / "api-keys-map.json"),
     )
-
-    if not hasattr(app.state, "skill_registry"):
-        app.state.skill_registry = SkillRegistry()
 
     asgi = create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient(public_key))
     yield private_key, asgi
@@ -635,8 +627,7 @@ class TestBootDisjointnessInvariant:
         token that matches the wrong identity source.
         """
         from context_intelligence_server.config import Settings  # noqa: PLC0415
-        from context_intelligence_server.main import app, create_asgi_app  # noqa: PLC0415
-        from context_intelligence_server.routers.skills import SkillRegistry  # noqa: PLC0415
+        from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
         _, public_key = rsa_keypair_cap
 
@@ -650,9 +641,6 @@ class TestBootDisjointnessInvariant:
             api_keys_store_path=str(tmp_path / "api-keys-b4.json"),
         )
 
-        if not hasattr(app.state, "skill_registry"):
-            app.state.skill_registry = SkillRegistry()
-
         with pytest.raises(RuntimeError, match=_OVERLAP_OID):
             create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient(public_key))
 
@@ -663,8 +651,7 @@ class TestBootDisjointnessInvariant:
     ) -> None:
         """B4 negative: disjoint entra + service oids → create_asgi_app succeeds."""
         from context_intelligence_server.config import Settings  # noqa: PLC0415
-        from context_intelligence_server.main import app, create_asgi_app  # noqa: PLC0415
-        from context_intelligence_server.routers.skills import SkillRegistry  # noqa: PLC0415
+        from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
         _, public_key = rsa_keypair_cap
 
@@ -680,9 +667,6 @@ class TestBootDisjointnessInvariant:
             entra_identities_store_path=str(tmp_path / "entra-ids-disjoint.json"),
             api_keys_store_path=str(tmp_path / "api-keys-disjoint.json"),
         )
-
-        if not hasattr(app.state, "skill_registry"):
-            app.state.skill_registry = SkillRegistry()
 
         # Must not raise — disjoint config is valid
         create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient(public_key))
@@ -1108,7 +1092,7 @@ class TestIsServiceMissingDefaultBehavior:
     (write-capable).  This is the deliberate design for two safe scenarios:
 
     1. ``allow_unauthenticated=True`` dev mode (no credentials required).
-    2. Auth-exempt paths (/status, /version, /skills/*) — none of which carry
+    2. Auth-exempt paths (/status, /version) — none of which carry
        a capability gate, so _is_write_capable is never called for them.
 
     IN AUTH-ENABLED PRODUCTION MODE: BearerTokenMiddleware ALWAYS sets

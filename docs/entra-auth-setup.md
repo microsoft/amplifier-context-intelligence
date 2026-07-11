@@ -470,8 +470,8 @@ On success the event is queued and the resulting graph nodes are stamped
 `created_by = <your contributor id>` (the `id` the operator mapped your oid to).
 
 > Health/monitoring paths are exempt from auth and need no token: `/status`,
-> `/version`, `/`, `/dashboard`, `/docs`, `/openapi.json`, plus `/static/*` and
-> `/skills/*`. This is the full-web exempt set (`web_ui_enabled=true`, the default).
+> `/version`, `/`, `/dashboard`, `/docs`, `/openapi.json`, plus `/static/*`.
+> This is the full-web exempt set (`web_ui_enabled=true`, the default).
 >
 > **API-only mode (`web_ui_enabled=false`):** the exempt set shrinks to just
 > `{/status, /version}`. The web-UI routes (`/`, `/dashboard`, `/docs`,

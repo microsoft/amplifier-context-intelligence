@@ -129,8 +129,7 @@ async def entra_auth_client(
     so the existing static ``auth_client`` fixture is unaffected.
     """
     from context_intelligence_server.config import Settings  # noqa: PLC0415
-    from context_intelligence_server.main import app, create_asgi_app  # noqa: PLC0415
-    from context_intelligence_server.routers.skills import SkillRegistry  # noqa: PLC0415
+    from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
     _, public_key = rsa_keypair_module
 
@@ -142,11 +141,6 @@ async def entra_auth_client(
             FAKE_OID_MAPPED: {"id": FAKE_CONTRIBUTOR},
         },
     )
-
-    # The lifespan sets app.state.skill_registry in production; in unit tests
-    # the lifespan does not run.  Guard so /skills/* returns 404 (not 500).
-    if not hasattr(app.state, "skill_registry"):
-        app.state.skill_registry = SkillRegistry()
 
     entra_asgi = create_asgi_app(
         settings=entra_settings,
@@ -336,7 +330,7 @@ class TestEntraAuthIntegrationOverHTTP:
         )
 
     # ------------------------------------------------------------------
-    # Exempt paths: /status and /skills/* open under entra mode
+    # Exempt paths: /status opens under entra mode
     # ------------------------------------------------------------------
 
     async def test_status_endpoint_exempt_under_entra_mode(
@@ -348,22 +342,6 @@ class TestEntraAuthIntegrationOverHTTP:
         assert response.status_code == 200, (
             f"Expected 200 for /status (always exempt), got "
             f"{response.status_code}: {response.text}"
-        )
-
-    async def test_skills_path_exempt_under_entra_mode(
-        self,
-        entra_auth_client: httpx.AsyncClient,
-    ) -> None:
-        """GET /skills/<anything> → NOT 401 even with auth_mode=entra.
-
-        The middleware exempts /skills/* entirely; the response comes from the
-        route handler (404 for an unknown skill) rather than from auth
-        middleware (401).
-        """
-        response = await entra_auth_client.get("/skills/nonexistent-skill-for-t8")
-        assert response.status_code != 401, (
-            f"Expected non-401 for /skills/* (always exempt), "
-            f"got {response.status_code}"
         )
 
     # ------------------------------------------------------------------
