@@ -43,8 +43,6 @@ from context_intelligence_server.identity_store import IdentityStore
 from context_intelligence_server.dashboard import build_status_response
 from context_intelligence_server.routers.admin import router as admin_router
 from context_intelligence_server.routers.queues import router as queues_router
-from context_intelligence_server.routers.skills import SkillRegistry
-from context_intelligence_server.routers.skills import router as skills_router
 from context_intelligence_server.routers.version import router as version_router
 from context_intelligence_server.idempotency import EventIdempotencyCache
 from context_intelligence_server.logging_config import setup_logging
@@ -170,19 +168,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     await ensure_neo4j_schema(app.state.neo4j_driver)
     logger.info("lifespan_startup: Neo4j schema initialized")
-    _skills_dir = Path(__file__).parent / "skills"
-    app.state.skill_registry = SkillRegistry()
-    if _skills_dir.exists():
-        app.state.skill_registry.load_from_dir(_skills_dir)
-        logger.info(
-            "lifespan_startup: skill_registry populated count=%d",
-            len(app.state.skill_registry.skill_names),
-        )
-    else:
-        logger.warning(
-            "lifespan_startup: skills directory not found at %s; skill_registry will be empty",
-            _skills_dir,
-        )
     # Crash recovery (decisions #5/#6): on startup, respawn one drainer per
     # session that still has an undrained, complete line. The workspace is
     # parsed from that session's FIRST log line so the respawned worker is
@@ -230,7 +215,6 @@ app = FastAPI(
     openapi_url="/openapi.json" if _settings.web_ui_enabled else None,
 )
 app.include_router(admin_router)
-app.include_router(skills_router)
 app.include_router(version_router)
 app.include_router(queues_router)
 _start_time = time.time()

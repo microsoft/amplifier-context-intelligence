@@ -26,7 +26,7 @@ def _is_write_capable(request: Request) -> bool:
     reachable in two safe situations:
 
     1. ``allow_unauthenticated=True`` (dev/test mode, no credential required).
-    2. Auth-exempt paths (/status, /version, /skills/*) — none of which carry
+    2. Auth-exempt paths (/status, /version) — none of which carry
        a capability gate, so this function is never called for them.
 
     In auth-enabled production mode BearerTokenMiddleware ALWAYS sets

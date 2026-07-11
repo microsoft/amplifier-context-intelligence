@@ -715,7 +715,7 @@ amplifier-context-intelligence/
 │   ├── idempotency.py                   # Idempotent MERGE / dedupe helpers
 │   ├── auth.py                          # Bearer-token API authentication
 │   ├── dashboard.py                     # Dashboard SSE stream
-│   ├── routers/                         # API routers: queues.py, skills.py, version.py
+│   ├── routers/                         # API routers: queues.py, version.py
 │   ├── handlers/                        # Event handlers: data_layer_1/2/3/ + field_lifters/
 │   └── web/                             # Dashboard HTML + static assets
 ├── server-config.example.yaml           # Configuration file template

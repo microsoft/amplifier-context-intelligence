@@ -66,12 +66,6 @@ digraph handler_architecture {
             fontsize  = 10
         ]
 
-        SkillsRouter [
-            style     = "filled,rounded"
-            fillcolor = "#E0E0E0"
-            label     = "skills.py\nSkillRegistry + GET /skills/{name}"
-        ]
-
         VersionRouter [
             style     = "filled,rounded"
             fillcolor = "#E0E0E0"
@@ -84,7 +78,7 @@ digraph handler_architecture {
             label     = "QueuesRouter\n(routers/queues.py)\nGET /queues/dead-letter\nPOST .../replay | .../purge\n[Bearer auth]"
         ]
 
-        SkillsRouter -> VersionRouter -> QueuesRouter [style = invis]
+        VersionRouter -> QueuesRouter [style = invis]
     }
 
     // --- Data Layer 1: Raw event capture ------------------------------------
