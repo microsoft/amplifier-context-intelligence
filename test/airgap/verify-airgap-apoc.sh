@@ -20,7 +20,7 @@
 # Env overrides:
 #   NEO4J_VERSION   expected APOC/Neo4j version (default: 5.26.22)
 #   GDS_VERSION     expected GDS version, must match neo4j.Dockerfile's
-#                   GDS_VERSION build arg (default: 2.13.8)
+#                   GDS_VERSION build arg (default: 2.13.11)
 #   IMAGE_TAG       built image tag (default: amplifier-ci-neo4j-apoc-airgap:test)
 #   KEEP            set to 1 to leave the container/network/image for inspection
 #
@@ -28,7 +28,7 @@
 set -euo pipefail
 
 NEO4J_VERSION="${NEO4J_VERSION:-5.26.22}"
-GDS_VERSION="${GDS_VERSION:-2.13.8}"
+GDS_VERSION="${GDS_VERSION:-2.13.11}"
 IMAGE_TAG="${IMAGE_TAG:-amplifier-ci-neo4j-apoc-airgap:test}"
 KEEP="${KEEP:-0}"
 
