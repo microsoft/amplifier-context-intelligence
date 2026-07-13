@@ -35,10 +35,12 @@ RUN cp /var/lib/neo4j/labs/apoc-*-core.jar /var/lib/neo4j/plugins/apoc.jar
 # whatever connected machine builds the image (same assumption already made
 # for `FROM neo4j:...` itself, which pulls over the network at build time).
 #
-# 2.13.8 is the version matching Neo4j 5.26.x per the official compatibility
+# 2.13.x is the GDS series matching Neo4j 5.26.x per the official compatibility
 # matrix: https://neo4j.com/docs/graph-data-science/current/installation/supported-neo4j-versions/
+# 2.13.11 is the latest available 2.13.x patch; pin the newest patch so GDS loads
+# on recent 5.26 patch releases (older GDS patches can reject a newer Neo4j patch).
 # Bump this ARG in lockstep whenever the base image tag above changes.
-ARG GDS_VERSION=2.13.8
+ARG GDS_VERSION=2.13.11
 RUN wget -q -O /var/lib/neo4j/plugins/graph-data-science.jar \
       "https://graphdatascience.ninja/neo4j-graph-data-science-${GDS_VERSION}.jar" \
     && [ -s /var/lib/neo4j/plugins/graph-data-science.jar ]
