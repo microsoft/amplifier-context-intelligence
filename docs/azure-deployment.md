@@ -71,13 +71,24 @@ Preserve these load-bearing steps when editing the `Dockerfile`:
 
 The image build/run is exercised by `tests/integration/test_docker_image.py`.
 
-### The image is built on the approved base, then deployed by `amplifier-online`
+### The image is built on the approved base, then imported and deployed by `amplifier-online`
 
-You build the server image from this repo's `Dockerfile` (approved base, above)
-and push it to your project's Azure Container Registry (ACR). `amplifier-online`
-then deploys **that pushed image tag** — referenced in `amplifier-online.yaml`
-under `services.<name>.image` — into Azure Container Apps. There is no separate
-hand-rolled `az containerapp create`; `amplifier-online up` owns provisioning.
+You do **not** push to a project ACR. Amplifier Online uses **one shared platform
+registry** (`amplifieronlinecr`, admin disabled) that **no account can push to** —
+a manual `docker push` / `az acr build` against it returns `UNAUTHORIZED`. Instead,
+image delivery is **push-to-deploy**:
+
+1. `amplifier-online cicd create` enrolls this repo and writes a GitHub Actions
+   workflow.
+2. On `git push`, CI builds the image from this repo's `Dockerfile` (approved base,
+   above) and pushes it to **your GitHub repo's `ghcr.io`**.
+3. The Amplifier Online **provisioner imports `ghcr.io → amplifieronlinecr`** and
+   rolls a new Container Apps revision.
+
+So the `services.<name>.image` value in `amplifier-online.yaml`
+(`amplifieronlinecr.azurecr.io/...`) is a **destination the provisioner writes to,
+not a registry you push to**. There is no hand-rolled `az containerapp create`;
+`amplifier-online` owns provisioning, and the CI pipeline owns image build + import.
 
 ### Do NOT create new containers on non-approved bases
 
@@ -102,18 +113,20 @@ Have these in place before you deploy:
   ```
 - **`amplifier-online` CLI** (the deployment tooling this guide uses). Verify it
   is installed and authenticated to the same subscription.
-- **Docker/buildx or `az acr build`** to build and push the server image on the
-  approved base.
+- **GitHub CLI (`gh`)**, authenticated to the repo — `amplifier-online cicd create`
+  uses it to enrol the repo and set the deploy workflow's variables. Image build +
+  push happens **in CI** (to `ghcr.io`); you do **not** build/push locally.
 - `jq` and `curl` (used by the identity-seed step).
 
 **Azure resources / access:**
 
 - A **subscription** and **resource group** you can deploy into.
-- An **Azure Container Registry (ACR)** to hold the server image, and permission
-  to push to it.
-- A **virtual network (VNet)** with:
-  - a subnet **delegated to the Container Apps environment**, and
-  - a subnet for the **Neo4j VM**.
+- **No project ACR to create.** Images live in the **shared platform registry**
+  (`amplifieronlinecr`), which the provisioner writes to via a `ghcr.io → ACR`
+  import — you never push to it (see the image-policy section).
+- **No hand-rolled VNet/subnet/NSG.** The `web-app-aca` app runs in the shared
+  platform VNet; the Neo4j VM is a separate **`vm`-stack** Amplifier Online project
+  that owns its own private subnet placement and NSG (see Step 2).
 - A **Key Vault** for secrets (Neo4j credentials, any static keys), and a
   **managed identity** the container app can use to read those secrets.
 - **Entra (Azure AD) app registration** for the server's JWT auth (if deploying
@@ -130,127 +143,184 @@ Linux base** (see the policy section above) before it is pushed and deployed.
 
 ---
 
-## Step 1 — Build and push the server image (approved base)
+## Step 1 — Enrol the repo for push-to-deploy (CI builds the approved-base image)
 
-Build from this repo's `Dockerfile` (which pins the approved MCR Azure Linux
-base) and push to your ACR. Tag with a version (git-sha-suffixed tags are
-recommended so deployments are traceable):
+You do **not** build or push the image by hand. Amplifier Online delivers images
+**push-to-deploy**: enrol the repo once, then every `git push` builds the image on
+the approved base in CI and hands it to the provisioner to import into the shared
+platform registry.
 
 ```bash
-# Option A: build in the registry (no local Docker needed)
-az acr build \
-  --registry <your-acr> \
-  --image context-intelligence-server:<version> \
-  --file Dockerfile .
-
-# Option B: local buildx, then push
-# docker build -t <your-acr>.azurecr.io/context-intelligence-server:<version> .
-# docker push   <your-acr>.azurecr.io/context-intelligence-server:<version>
+# One-time: generate the GitHub Actions workflow + enrol the repo.
+# Preview first (writes nothing), then create for real:
+amplifier-online cicd create --dry-run
+amplifier-online cicd create
 ```
 
-Confirm the pushed tag exists:
+`cicd create` writes `.github/workflows/api-build-deploy.yaml` and sets the repo
+variables the deploy job needs (`AO_PROVISIONER_URL`, `AO_PROVISIONER_AUDIENCE`,
+`AO_PROJECT_NAME`, and the Entra IDs). Commit the workflow and push:
 
 ```bash
-az acr repository show-tags --name <your-acr> \
-  --repository context-intelligence-server --orderby time_desc -o table
+git add .github/workflows/ && git commit -m "ci: add amplifier-online deploy workflow"
+git push        # CI builds from this repo's Dockerfile (approved base) → ghcr.io,
+                # then the provisioner imports ghcr.io → amplifieronlinecr and rolls a revision
+```
+
+What happens on each push:
+
+1. **Build job** builds the image from this repo's `Dockerfile` (approved MCR Azure
+   Linux base) and pushes it to **`ghcr.io/<owner>/<repo>-api:<sha>`**.
+2. Compliance is enforced **in CI, before the image is imported**: a Trivy scan
+   (fails on CRITICAL/HIGH), an SBOM, and a build-provenance attestation — layered
+   on top of the approved `FROM` base in the Dockerfile.
+3. **Deploy job** authenticates to the provisioner with a GitHub **OIDC** token (no
+   stored Azure secret); the provisioner **imports `ghcr.io → amplifieronlinecr`**
+   and rolls a new Container Apps revision.
+
+> **There is no manual push path.** The shared platform registry
+> (`amplifieronlinecr`) has ACR admin disabled and grants **no** push access — a
+> `docker push` / `az acr build` against it returns `UNAUTHORIZED`. The
+> `amplifieronlinecr.azurecr.io/...` value in the manifest is the **destination the
+> provisioner writes to**, never a registry you push to. The only registry you push
+> to (via CI) is your repo's `ghcr.io`.
+
+Check status after a push:
+
+```bash
+amplifier-online status
 ```
 
 ---
 
-## Step 2 — Provision the Neo4j VM (private, in the VNet)
+## Step 2 — Provision Neo4j as a second `vm`-stack Amplifier Online project
 
-Neo4j runs on a **VM inside the private VNet** — never a public endpoint, never a
-Docker Hub container. Build it once with enough capacity and persistent storage.
+Neo4j is **not** a hand-rolled VM and **not** a container. Amplifier Online has a
+first-class **`vm` stack** whose canonical example is exactly this: a private Neo4j
+VM. Run Neo4j as its **own Amplifier Online project** — a second
+`amplifier-online.yaml` (in its own directory/repo) with `stack: vm`, deployed with
+its own `amplifier-online up`. This keeps the whole system "compliant, via
+`amplifier-online`": the stack inherits the approved VM base image and private
+networking instead of re-deriving them.
 
-### 2a. Size the VM for capacity
+> **Do NOT hand-roll VNet / subnet / NSG / public-IP / data-disk Bicep.** The `vm`
+> stack owns all of it (see the table below). Your job is the manifest + a
+> cloud-init file.
 
-Neo4j is memory- and IO-sensitive. Pick a **memory-optimized** VM SKU and a
-**Premium SSD** data disk:
+### 2a. What the `vm` stack owns (stop re-deriving it)
 
-- **RAM** must comfortably hold: Neo4j **heap** + **page cache** + OS headroom.
-  As a rule of thumb, size **page cache ≥ the on-disk graph size** you expect,
-  and set a **fixed heap** (commonly 8–31 GB; keep heap < 32 GB to retain
-  compressed object pointers). A memory-optimized SKU (E-series class) is the
-  usual starting point; scale RAM to your graph.
-- **vCPU**: size to concurrency; GDS algorithms are CPU-parallel, so more cores
-  help analytics workloads.
-- **Data disk**: a dedicated **Premium SSD** (or Ultra Disk for heavy write/IO)
-  sized above your projected graph + index + transaction-log growth, with room
-  to spare. Keep the database off the OS disk.
+| You used to hand-roll | The `vm` stack gives you |
+|---|---|
+| VNet + subnet placement | VM placed in the shared platform VNet's `vms` subnet automatically |
+| Approved OS base image | Defaults to **Ubuntu 24.04 LTS** (approved); override via `vm.image` |
+| NSG + inbound rules | **Default-deny** NSG; you declare only `ports` + `source` |
+| Public-IP hardening | **No public IP** at all — private-only by construction |
+| Persistent data disk | `data_disk_gib` disk, preserved across idempotent `up` re-runs |
+| First-boot provisioning | `cloud_init` inlined + executed on first boot |
+| SSH exposure | Key-only auth, no public SSH — operate via `az vm run-command` |
 
-Provision from an **approved Azure VM image** (an Azure-published Azure Linux or a
-supported LTS image) to stay within compliance — the same "approved base" logic
-that applies to containers applies to the VM image.
+### 2b. Author the `vm` manifest
 
-### 2b. Persistent storage
+Scaffold it with `amplifier-online init --stack vm` (writes the `vm:` block), then
+fill it in. Shape for this Neo4j:
 
-Put Neo4j's data on the **attached managed data disk**, not the OS disk, so the
-database survives VM reimage/resize:
+```yaml
+name: context-intelligence-neo4j
+stack: vm
 
-1. Attach the Premium SSD data disk to the VM.
-2. Partition, format (e.g. `ext4` or `xfs`), and mount it at a stable path
-   (e.g. `/var/lib/neo4j-data`) via `/etc/fstab` so it re-mounts on reboot.
-3. Point Neo4j's data directory at the mounted disk (see `server.directories.*`
-   below).
+vm:
+  size: Standard_D2as_v5           # memory-optimized SKUs (E-series) for larger graphs
+  admin_username: azureuser
+  ssh_public_key: "ssh-ed25519 AAAA..."   # PUBLIC half only; key auth, no passwords
+  cloud_init: ./cloud-init.yaml            # contents inlined at `up`; runs on first boot
+  data_disk_gib: 64                        # persistent graph store; survives `up` re-runs
+  static_private_ip: 10.100.4.4            # fixes the Bolt endpoint the web app hard-codes
+  ports:
+    - port: 7687                           # Neo4j Bolt — the ONLY inbound rule
+      protocol: Tcp
+      source: cae-infra                    # the CAE app-egress subnet (where the ACA app calls from)
+```
 
-Back the disk with snapshots or Azure Backup for DR.
+- **`static_private_ip`** must be a free address in the `vms` subnet
+  (`10.100.4.0/24`); set it precisely because the web app's `NEO4J_URL` hard-codes
+  `bolt://10.100.4.4:7687`. Neo4j Browser (7474) is **not** exposed — do not add it.
+- Bring this VM up **before** the web app (producer before consumer):
+  `amplifier-online up` from the manifest's directory.
 
-### 2c. Install Neo4j + APOC + GDS
+### 2c. Install Neo4j 5.26 LTS + APOC + GDS 2.13.11 via cloud-init
 
-Install a Neo4j **Community 5.26 LTS** server (the LTS line this project
-targets — pin to the `5.26.x` series, e.g. `5.26.22`; do **not** move to the
-CalVer `2026.xx` line), then add **both** plugins — **APOC** (procedures the
-server relies on) and **GDS** (Graph Data Science):
+Software is installed on first boot by the `cloud_init` file referenced above — not
+by hand. This project targets **Neo4j Community 5.26 LTS** with **GDS Community
+2.13.11** (the latest `2.13.x` patch — the `2.13` series pairs with the `5.26` line
+per the official
+[GDS ↔ Neo4j compatibility matrix](https://neo4j.com/docs/graph-data-science/current/installation/supported-neo4j-versions/);
+pin the newest patch so GDS loads on recent `5.26.x` releases). `./cloud-init.yaml`:
 
-1. Install the Neo4j **Community 5.26 LTS** package for the VM's OS (from
-   Neo4j's official package feed for that distro), pinned to the `5.26.x` line.
-2. Place the **APOC** and **GDS** plugin JARs — **matched to your Neo4j version**
-   — into the Neo4j **plugins** directory (e.g. `/var/lib/neo4j/plugins` or the
-   packaged plugins path). Version-mismatched plugins refuse to load. **APOC Core**
-   is bundled inside Neo4j 5.x (copy from `labs/`); **GDS** is a separate download
-   pinned to the official
-   [GDS ↔ Neo4j compatibility matrix](https://neo4j.com/docs/graph-data-science/current/installation/supported-neo4j-versions/).
-   For **Neo4j Community 5.26 LTS** use **GDS Community 2.13.11** (the latest
-   `2.13.x` patch — the `2.13` series pairs with the `5.26` line; pin the newest
-   patch so GDS loads on recent `5.26.x` releases).
-3. Configure `neo4j.conf`:
-   ```properties
-   # Data on the persistent managed disk
-   server.directories.data=/var/lib/neo4j-data
+```yaml
+#cloud-config
+package_update: true
+packages:
+  - openjdk-21-jre-headless        # Neo4j 5.26 requires Java 21
+  - wget
+  - gnupg
 
-   # Bind Bolt on the private interface only (no public exposure)
-   server.bolt.listen_address=0.0.0.0:7687          # NSG restricts who can reach it
-   server.default_advertised_address=<neo4j-private-hostname-or-ip>
+runcmd:
+  # 1. Format + mount the persistent data disk at Neo4j's data dir
+  - |
+    set -euxo pipefail
+    DISK=$(lsblk -rno NAME,TYPE,MOUNTPOINT | awk '$2=="disk" && $3=="" {print "/dev/"$1}' | head -n1)
+    if ! blkid "$DISK"; then mkfs.ext4 -F "$DISK"; fi
+    mkdir -p /var/lib/neo4j
+    echo "$DISK /var/lib/neo4j ext4 defaults,nofail 0 2" >> /etc/fstab
+    mount -a
+  # 2. Install Neo4j Community 5.26 LTS (pin the 5.26 line; do NOT jump to CalVer 2026.xx)
+  - |
+    set -euxo pipefail
+    wget -qO- https://debian.neo4j.com/neotechnology.gpg.key | gpg --dearmor -o /usr/share/keyrings/neo4j.gpg
+    echo 'deb [signed-by=/usr/share/keyrings/neo4j.gpg] https://debian.neo4j.com stable 5' > /etc/apt/sources.list.d/neo4j.list
+    apt-get update
+    apt-get install -y neo4j=1:5.26.0
+  # 3. Plugins: APOC Core (bundled in labs/) + GDS 2.13.11 (downloaded)
+  - |
+    set -euxo pipefail
+    PLUGINS=/var/lib/neo4j/plugins; mkdir -p "$PLUGINS"
+    cp /var/lib/neo4j/labs/apoc-*-core.jar "$PLUGINS"/ || true
+    wget -qO "$PLUGINS/neo4j-graph-data-science-2.13.11.jar" \
+      https://graphdatascience.ninja/neo4j-graph-data-science-2.13.11.jar
+    chown -R neo4j:neo4j /var/lib/neo4j
+  # 4. Bind Bolt on the private interface + allow the plugin procedures.
+  #    Set ONLY `unrestricted` — an `allowlist` of apoc.*,gds.* would block the
+  #    built-in db.*/dbms.* procedures the server relies on.
+  - |
+    set -euxo pipefail
+    CONF=/etc/neo4j/neo4j.conf
+    sed -i 's/^#\?server.default_listen_address=.*/server.default_listen_address=0.0.0.0/' "$CONF"
+    sed -i 's/^#\?server.bolt.listen_address=.*/server.bolt.listen_address=0.0.0.0:7687/' "$CONF"
+    echo 'dbms.security.procedures.unrestricted=apoc.*,gds.*' >> "$CONF"
+  # 5. Set an initial password, then start. Capture the password into Key Vault
+  #    (kv-context-intel) out of band so the web app's NEO4J_PASSWORD secretRef matches.
+  - neo4j-admin dbms set-initial-password "$(openssl rand -base64 24)"
+  - systemctl enable neo4j
+  - systemctl restart neo4j
+```
 
-   # Allow the plugin procedures the server + analytics use.
-   # Set ONLY `unrestricted` — do NOT set `allowlist` to `apoc.*,gds.*`: an
-   # allowlist restricted to the plugins would block the built-in db.*/dbms.*
-   # procedures the server relies on.
-   dbms.security.procedures.unrestricted=apoc.*,gds.*
+After first boot, confirm the plugins loaded (`az vm run-command` — there is no
+public SSH):
 
-   # Memory (size to your VM / graph)
-   server.memory.heap.initial_size=<e.g. 8g>
-   server.memory.heap.max_size=<e.g. 8g>
-   server.memory.pagecache.size=<e.g. size to graph>
-   ```
-4. Set the initial password from the value you will store in Key Vault:
-   ```bash
-   neo4j-admin dbms set-initial-password "<neo4j-password-from-key-vault>"
-   ```
-5. Enable and start the service; confirm APOC and GDS are loaded:
-   ```cypher
-   RETURN apoc.version();
-   RETURN gds.version();
-   ```
+```cypher
+RETURN apoc.version();
+RETURN gds.version();
+```
 
-### 2d. Network isolation
+### 2d. How the web app reaches it
 
-- Keep the VM on a **private subnet** with **no public IP**.
-- Use an **NSG** that allows inbound **Bolt (7687)** *only* from the Container
-  Apps subnet. Do not open the Neo4j Browser (7474) publicly — reach it via a
-  bastion or private link if needed.
-- The server connects over **plain Bolt on the private network**:
-  `bolt://<neo4j-private-address>:7687`.
+The `web-app-aca` project (Steps 1, 4) reaches Neo4j over **private IP on the shared
+platform VNet**: the ACA container's egress comes from the `cae-infra` subnet, the
+VM's NSG allows `7687` from `cae-infra`, so the app connects to
+`bolt://10.100.4.4:7687` directly — no DNS, no public exposure. The private IP is a
+**coordinate, not a secret** (reachability is already gated by the NSG + no-public-IP
+posture), which is why it sits in plaintext in the web-app manifest while the Neo4j
+**credentials** are Key Vault secretRefs (Step 3). Do not move the IP into Key Vault.
 
 ---
 
@@ -419,7 +489,7 @@ auth:
 
 services:
   api:
-    image: <your-acr>.azurecr.io/context-intelligence-server:<version>
+    image: amplifieronlinecr.azurecr.io/context-intelligence-server:<version>  # shared platform ACR — the provisioner's import destination, NOT a push target
     port: 8000                # matches EXPOSE 8000 in the Dockerfile
 
     volume:                   # persistent /data (identity store, queues, blobs, logs)
@@ -577,35 +647,27 @@ Placeholders in `<angle-brackets>`.
   any non-approved base). If not, STOP — it fails S360.
 - Build from a clean, committed tree; capture `<sha> = git rev-parse --short HEAD`.
 
-**1. Build on the approved base** (semantic + sha-pinned tags for traceability):
+**1. Build + deliver via CI push-to-deploy.** Bump `pyproject.toml`, commit on the
+approved base, and push — CI builds `ghcr.io/<owner>/<repo>-api:<sha>` and the
+provisioner imports it into `amplifieronlinecr`:
 ```bash
-az acr build --registry <your-acr> \
-  --image context-intelligence-server:v6.7.0 \
-  --image context-intelligence-server:v6.7.0-<sha> \
-  --file Dockerfile .
-# (or docker build with both -t tags, then push — see below)
+git commit -am "release: v6.7.0" && git push
+```
+There is **no manual `az acr build`** — the shared platform ACR rejects direct
+pushes (`UNAUTHORIZED`), and compliance is enforced **in CI** (approved `FROM` base
+→ Trivy CRITICAL/HIGH gate → SBOM + provenance attestation) before the image is
+imported. Watch the run and confirm the new revision:
+```bash
+amplifier-online status
 ```
 
-**2. Verify the pushed image is on the approved base BEFORE deploying** (compliance
-gate — never deploy an image whose base you haven't confirmed):
-```bash
-docker run --rm <your-acr>.azurecr.io/context-intelligence-server:v6.7.0 cat /etc/os-release
-# EXPECT Azure Linux (CBL-Mariner) identifiers. Debian/Ubuntu/Alpine → STOP.
-az acr repository show-tags --name <your-acr> \
-  --repository context-intelligence-server --orderby time_desc -o table
-# EXPECT v6.7.0 (and v6.7.0-<sha>) present.
-```
-> **Prefer the CI push-to-deploy path** (`amplifier-online cicd create` + `git
-> push`) if this project is enrolled — CI builds on the approved base and the
-> provisioner imports into ACR, so the compliance gate is enforced by the pipeline
-> rather than operator discipline. Manual build/push is the fallback.
-
-**3. Bump the manifest — the ONLY manifest change.** Edit `amplifier-online.yaml`,
-change *only* the image tag:
+**2. Bump the manifest — the ONLY manifest change.** The image tag in
+`amplifier-online.yaml` records which built tag the app runs; CI produces it and the
+provisioner imports it. Change *only* the tag:
 ```yaml
 services:
   api:
-    image: <your-acr>.azurecr.io/context-intelligence-server:v6.7.0   # was :v6.6.6
+    image: amplifieronlinecr.azurecr.io/context-intelligence-server:v6.7.0   # was :v6.6.6 — platform ACR (import destination)
     port: 8000
 ```
 Do **not** change `name`, `stack`, `port`, the `/data` volume, `resources`, or any
