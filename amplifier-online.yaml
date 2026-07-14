@@ -94,21 +94,43 @@ services:
       - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_PATH
         value: /data/logs/server.jsonl
 
-      # === Neo4j backing service (private static IP, plain Bolt) ===
-      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL
-        value: bolt://10.100.4.4:7687
-      # NEO4J_USER / NEO4J_PASSWORD are SECRETS sourced from Key Vault kv-context-intel.
-      # The manifest has NO field for Container Apps secrets / Key Vault refs (custom
-      # env values are PLAINTEXT app settings) — see GAP #3. Wire these OUT OF BAND
-      # after `up`, then map the prefixed env vars to the secretRefs:
-      #   az containerapp secret set -n context-intelligence-api -g amplifier-online-rg \
+      # === Neo4j backing service — STRUCTURED two-client form (admin + cypher_query) ===
+      # Neo4j Community gives us ONE account. The server (v6.7.0) drives TWO logical
+      # clients — admin (read/write) and cypher_query (read-intent). We point BOTH at
+      # the SAME instance and the SAME credentials, so the two client configs are
+      # IDENTICAL except for access_mode, which the server's validator REQUIRES to be
+      # "WRITE" for admin and "READ" for cypher_query. (On Community access_mode is
+      # only a routing hint, not server-side enforcement — sharing one account is fine.)
+      #
+      # Force the explicit two-client form so the flat fallback can never linger:
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_REQUIRE_EXPLICIT_CLIENTS
+        value: "true"
+      # --- admin (read/write) — NON-SECRET leaves only ---
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__URL
+        value: "bolt://10.100.4.4:7687"
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__ACCESS_MODE
+        value: "WRITE"
+      # --- cypher_query (read-intent) — NON-SECRET leaves only ---
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__URL
+        value: "bolt://10.100.4.4:7687"
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__ACCESS_MODE
+        value: "READ"
+      #
+      # SECRET leaves (__USERNAME / __PASSWORD for BOTH clients) are NEVER in this
+      # manifest — a secretref: string would ship verbatim and never resolve. They are
+      # wired OUT OF BAND after EVERY `up`, mapping all FOUR credential leaves onto the
+      # SAME TWO Key Vault secrets (each referenced twice) so both clients resolve to
+      # identical user+password:
+      #   az containerapp secret set -n context-intelligence-api -g ao-context-intelligence-rg \
       #     --secrets \
-      #       neo4j-user=keyvaultref:https://kv-context-intel.vault.azure.net/secrets/context-intelligence-neo4j-user,identityref:<app-mi-resource-id> \
-      #       neo4j-password=keyvaultref:https://kv-context-intel.vault.azure.net/secrets/context-intelligence-neo4j-password,identityref:<app-mi-resource-id>
-      #   az containerapp update  -n context-intelligence-api -g amplifier-online-rg \
+      #       neo4j-user=keyvaultref:https://kv-context-intel.vault.azure.net/secrets/context-intelligence-neo4j-user,identityref:system \
+      #       neo4j-password=keyvaultref:https://kv-context-intel.vault.azure.net/secrets/context-intelligence-neo4j-password,identityref:system
+      #   az containerapp update  -n context-intelligence-api -g ao-context-intelligence-rg \
       #     --set-env-vars \
-      #       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_USER=secretref:neo4j-user \
-      #       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD=secretref:neo4j-password
+      #       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__USERNAME=secretref:neo4j-user \
+      #       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__PASSWORD=secretref:neo4j-password \
+      #       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__USERNAME=secretref:neo4j-user \
+      #       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__PASSWORD=secretref:neo4j-password
 
 # Optional managed databases (provisions isolated resources for this project)
 resources:
