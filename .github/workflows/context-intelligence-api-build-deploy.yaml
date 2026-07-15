@@ -1,0 +1,123 @@
+name: context-intelligence API Build & Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - 'docker-entrypoint.sh'
+      - 'context_intelligence_server/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-api-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+  attestations: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}-api
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      image-digest: ${{ steps.push.outputs.digest }}
+      image-tag: ${{ github.sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          format: "table"
+          exit-code: "1"
+          severity: "CRITICAL,HIGH"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: "${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          artifact-name: sbom-api.spdx.json
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: "${{ env.IMAGE_NAME }}"
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+      packages: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get OIDC token for provisioner
+        id: oidc
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken('${{ vars.AO_PROVISIONER_AUDIENCE }}');
+            core.setOutput('token', token);
+
+      - name: Deploy via provisioner
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+          DEPLOY_IMAGE: ${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image-tag }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Stateless deploy: send the manifest from the checked-out repo so the
+          # provisioner does not need a server-side copy.
+          MANIFEST_JSON=$(yq -o=json '.' amplifier-online.yaml)
+          curl -sf -X POST \
+            "${{ vars.AO_PROVISIONER_URL }}/deploy/projects/${{ vars.AO_PROJECT_NAME }}" \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg image "$DEPLOY_IMAGE" \
+              --arg service "api" \
+              --arg ghcr "$GHCR_TOKEN" \
+              --argjson manifest "$MANIFEST_JSON" \
+              '{image: $image, service: $service, ghcr_token: $ghcr, manifest: $manifest}')"
