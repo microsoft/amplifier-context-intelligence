@@ -40,14 +40,17 @@ services:
     # shared CAE has pull creds for. Pin to the current built tag (built on the
     # approved S360 base per docs/azure-deployment.md); bump this when a newer tag
     # is pushed.
-    image: amplifieronlinecr.azurecr.io/context-intelligence-server:v6.7.0
+    image: amplifieronlinecr.azurecr.io/context-intelligence-api:latest
     port: 8000  # gunicorn + uvicorn; matches EXPOSE 8000 in the Dockerfile
 
     # Persistent /data — backs the oid→contributor store, durable ingest queues,
     # blobs, and logs. Survives restarts/revision swaps. Single-instance enforced.
     volume:
       mount_path: /data
-      size_gib: 16
+      size_gib: 100      # Premium minimum is 100 GiB (billed on provisioned size)
+      tier: premium      # Premium_LRS SSD share. Standard Azure Files (SMB) per-op
+                         # latency caps the write-heavy queue/blob throughput and
+                         # builds a standing write backlog under pressure.
 
     env:
       # === Force Entra auth (server DEFAULTS to static — must override) ===
