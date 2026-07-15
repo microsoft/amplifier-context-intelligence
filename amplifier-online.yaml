@@ -40,7 +40,7 @@ services:
     # shared CAE has pull creds for. Pin to the current built tag (built on the
     # approved S360 base per docs/azure-deployment.md); bump this when a newer tag
     # is pushed.
-    image: amplifieronlinecr.azurecr.io/context-intelligence-api:latest
+    image: amplifieronlinecr.azurecr.io/context-intelligence-api:b0fc8af
     port: 8000  # gunicorn + uvicorn; matches EXPOSE 8000 in the Dockerfile
 
     # Persistent /data — backs the oid→contributor store, durable ingest queues,
