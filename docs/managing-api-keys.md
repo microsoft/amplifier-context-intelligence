@@ -38,11 +38,17 @@ Key facts that follow from this:
 - The server stores only **digests**, never raw tokens. For `api_keys` you write
   the digest directly. For the legacy `api_key` you write the raw secret and the
   server hashes it at startup.
-- **Auth is disabled** (every request passes) only when *no* keys are configured —
-  `api_keys` omitted or `null` **and** no `api_key`. That is dev-only.
-- **`api_keys: {}` (an explicit empty map) is a hard startup error** — fail-closed.
-  An empty keystore is treated as a misconfiguration, not "auth off". To disable
-  auth, omit `api_keys` or set it to `null`.
+- **Auth is disabled** (every request passes through unauthenticated) only when
+  *no* keys are configured — `api_keys` omitted/`null`/`{}` **and** no `api_key` —
+  **AND** the explicit `allow_unauthenticated: true` opt-out is set. That
+  combination is **dev-only** and the server logs a loud "WIDE OPEN" warning.
+- **`api_keys: {}` (an explicit empty map) now BOOTS fail-CLOSED**, not an error.
+  An empty keystore is a supported **bootstrap** state: the server starts, logs a
+  loud empty-keystore WARNING, and **every request 401s** until keys are onboarded
+  at runtime via `PUT /admin/keys/{sha256hash}` (see §3.1). Onboarding at runtime
+  **requires** an admin credential (`admin_api_key` / `admin_api_key_sha256`);
+  without one, the empty keystore can only be populated by editing `api_keys` in
+  config and restarting.
 - Legacy `api_key` still works unchanged — existing single-key deployments are
   unaffected and need no migration.
 
@@ -150,6 +156,44 @@ The script refuses to overwrite an existing `server-config.yaml` unless you pass
 `--force`. See [local-development.md](local-development.md) §2 for the full flag
 list (`--data-dir`, `--config-path`, `--server-host`/`--server-port`). Prefer to
 do it by hand? Use the two one-liners in §2 and add the `api_keys` entry yourself.
+
+### 3.1 Boot with ZERO keys — the fail-closed bootstrap state
+
+You do **not** have to seed any `api_keys` in config. With `api_keys` omitted/`null`/`{}`
+(and no legacy `api_key`), the server **boots fail-CLOSED**: it starts, logs a loud
+empty-keystore WARNING, and **every data request 401s** until keys are onboarded.
+
+To onboard keys **at runtime** (no restart) you need an **admin credential**
+configured — `admin_api_key_sha256` (recommended) or the legacy `admin_api_key`.
+The admin credential gates `/admin/*` **by itself** (it is not in the data keystore),
+so it works even when the keystore is empty. The sequence:
+
+1. Boot with an empty keystore **and** an admin credential set. Startup logs:
+
+   ```
+   static keystore is EMPTY at startup (0 bound keys) — server is UP but
+   fail-CLOSED; every request will 401 until keys are onboarded. Add the first
+   key with the admin token via PUT /admin/keys/{sha256hash}
+   (store=/data/identity/api-keys.json). Expected on a fresh /data volume.
+   ```
+
+2. Derive a peer token + its sha256 digest (§2), then bind the digest with the
+   admin token:
+
+   ```bash
+   curl -sS -X PUT "$SERVER_URL/admin/keys/<64-hex-sha256>" \
+     -H "Authorization: Bearer <admin-token>" \
+     -H "Content-Type: application/json" \
+     -d '{"id":"alice"}'
+   ```
+
+3. The peer's data request with their raw token now authenticates.
+
+> **If NO admin credential is configured**, an empty keystore cannot be
+> bootstrapped at runtime (the `/admin` API is itself unreachable — every token
+> 401s at the middleware before `require_admin` runs). Startup says so explicitly.
+> In that case the only path is **config-and-restart**: add `api_keys` in config
+> and restart. Set `admin_api_key_sha256` to enable the runtime path instead.
 
 ---
 

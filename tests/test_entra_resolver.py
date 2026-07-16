@@ -709,7 +709,8 @@ class TestMiddlewareAuthError:
             def auth_enabled(self) -> bool:
                 return True
 
-            def resolve(self, token: str) -> str | None:
+            def resolve(self, token: str, *, admin_path: bool = False) -> str | None:
+                _ = admin_path
                 raise RuntimeError("unexpected internal error — simulated bug")
 
         status = await self._call_middleware(_BrokenResolver())

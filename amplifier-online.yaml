@@ -91,9 +91,15 @@ services:
       #     as the Neo4j creds below), or
       #   - pre-populate the /data store at ENTRA_IDENTITIES_STORE_PATH.
       # Format: {"<entra-oid>":{"id":"<github-handle>"}, ...}
-      # The server refuses to start in entra mode with an EMPTY map; after first
-      # boot the /data store + /admin/identities are authoritative (runtime edits
-      # win), so this seed only populates an initially-empty store.
+      # The map is OPTIONAL: in entra mode the server BOOTS with an EMPTY map
+      # (fail-closed + a loud startup WARNING) rather than refusing to start.
+      # The map is populated at runtime via PUT /admin/identities using an
+      # IdentityAdmin-role token — and that role-holder can onboard the first
+      # identity even when their OWN oid is not yet mapped (the /admin-path
+      # bootstrap exemption). Until an oid is bound, that user's data requests
+      # 403. After first boot the /data store + /admin/identities are
+      # authoritative (runtime edits win), so this seed only pre-populates an
+      # initially-empty store.
       # - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES
       #   value: '{"<entra-oid>":{"id":"<github-handle>"}}'   # operator-filled; do NOT commit real oids
       - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES_STORE_PATH

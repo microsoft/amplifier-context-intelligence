@@ -48,13 +48,18 @@ _ALL_ZEROS_GUID = "00000000-0000-0000-0000-000000000000"
 def _validate_identity_map(
     v: dict[str, dict[str, str]] | None,
     field_name: str,
+    *,
+    allow_empty: bool = False,
 ) -> dict[str, dict[str, str]] | None:
     """Shared validator for GUID-keyed identity maps (entra_identities, service_identities).
 
     Enforces the same rules for both fields so they stay in sync:
 
     - ``None`` passes through (field is optional).
-    - An empty dict is rejected (fail-closed; omit or null-out to disable).
+    - An empty dict is rejected (fail-closed; omit or null-out to disable),
+      UNLESS ``allow_empty=True`` (entra_identities only), in which case an
+      empty dict is accepted and returned as ``{}`` so the server can boot on a
+      fresh /data volume and be populated at runtime via the /admin API.
     - Every key must be a valid lowercase GUID in 8-4-4-4-12 form after
       normalization (rejects braces, urn:uuid: prefixes, trailing junk).
     - The all-zeros GUID is rejected (placeholder sentinel).
@@ -67,6 +72,12 @@ def _validate_identity_map(
     if v is None:
         return None
     if len(v) == 0:
+        if allow_empty:
+            # entra_identities ONLY: an explicit empty map is permitted so the
+            # server boots on a fresh /data volume and is populated at runtime
+            # via PUT /admin/identities (bootstrap). service_identities does NOT
+            # pass allow_empty, so {} there remains a fail-closed startup error.
+            return {}
         raise ValueError(
             f"{field_name} must contain at least one entry if specified; "
             "omit it or use null to disable"
@@ -295,13 +306,11 @@ class Settings(BaseSettings):
         """
         if v is None:
             return None
-        # Fail-closed: an explicitly empty map is a misconfiguration, not "auth off".
-        # Omit api_keys or set it to null to disable per-contributor authentication.
+        # An explicitly empty map is a SUPPORTED bootstrap state (symmetric with
+        # entra_identities): the server boots fail-CLOSED with zero keys and is
+        # populated at runtime via the admin API (PUT /admin/keys/{sha256hash}).
         if len(v) == 0:
-            raise ValueError(
-                "api_keys must contain at least one entry if specified; "
-                "omit it or use null to disable authentication"
-            )
+            return {}
         normalized: dict[str, dict[str, str]] = {}
         for digest, meta in v.items():
             digest_lower = digest.lower()
@@ -353,16 +362,22 @@ class Settings(BaseSettings):
     # supporting fields is a hard startup error (AC7 / §8b).
     auth_mode: Literal["static", "entra"] = "static"
 
-    # allow_unauthenticated: explicit opt-out of the fail-closed startup gate.
+    # allow_unauthenticated: the SOLE fail-open trigger in the whole server.
     #
-    # Production deployments MUST have auth configured (api_key / api_keys for
-    # auth_mode=static, or entra_identities for auth_mode=entra).  Setting this
-    # flag to True bypasses the RuntimeError that create_asgi_app() raises when
-    # no credentials are configured, allowing the server to start in
-    # unauthenticated mode (every request passes through).
+    # An empty keystore / identity map alone NO LONGER fails open: the server
+    # BOOTS fail-CLOSED with zero credentials (a supported bootstrap state,
+    # announced by a loud startup WARNING) and every request 401/403s until the
+    # store is populated at runtime via the /admin API.
+    #
+    # The ONLY way to make the server pass EVERY request through unauthenticated
+    # is to set this flag to True AND leave credentials unconfigured
+    # (auth_enabled=False).  In that case the middleware fails open and
+    # create_asgi_app() emits a loud "WIDE OPEN" warning at startup.
     #
     # This flag exists ONLY for the test harness and local dev environments
     # where auth is intentionally disabled.  Never set it in production.
+    # (In auth_mode=entra it has no effect: EntraResolver.auth_enabled is always
+    # True, so the fail-open branch can never fire regardless of this flag.)
     allow_unauthenticated: bool = False
 
     # web_ui_enabled: serve the browser dashboard, OpenAPI docs, and the
@@ -433,7 +448,7 @@ class Settings(BaseSettings):
         Non-dict values and non-string ``id`` values are caught by pydantic before
         reaching this code.
         """
-        return _validate_identity_map(v, "entra_identities")
+        return _validate_identity_map(v, "entra_identities", allow_empty=True)
 
     @model_validator(mode="after")
     def _validate_entra_config(self) -> "Settings":
@@ -443,8 +458,9 @@ class Settings(BaseSettings):
         non-None after normalization:
         - azure_client_id
         - azure_tenant_id
-        - entra_identities (non-empty — field validator already rejects ``{}``,
-          so here we only catch None / omitted)
+
+        entra_identities is NOT required: an empty/omitted identity map is a
+        supported bootstrap state (populate at runtime via /admin/identities).
 
         A single ValueError names every missing field so the operator sees one
         clear startup message rather than cryptic downstream failures.
@@ -463,11 +479,11 @@ class Settings(BaseSettings):
                     "set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_TENANT_ID "
                     "or azure_tenant_id in the config file"
                 )
-            if not self.entra_identities:
-                errors.append(
-                    "entra_identities must be a non-empty map when auth_mode='entra'; "
-                    "provide at least one oid → {id: contributor} entry"
-                )
+            # NOTE: entra_identities is intentionally NOT required here.
+            # An empty/omitted map is a SUPPORTED bootstrap state: the server
+            # boots and operators onboard the first oid at runtime via the
+            # IdentityAdmin-gated /admin/identities API. main.create_asgi_app()
+            # logs a loud warning when the effective map is empty at startup.
             if errors:
                 raise ValueError(
                     "Entra auth misconfiguration (startup refused): "

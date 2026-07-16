@@ -317,7 +317,8 @@ class TestDistinctLogTags:
             def auth_enabled(self) -> bool:
                 return True
 
-            def resolve(self, token: str) -> str:
+            def resolve(self, token: str, *, admin_path: bool = False) -> str:
+                _ = admin_path
                 raise RuntimeError("simulated unexpected internal resolver bug")
 
         middleware = BearerTokenMiddleware(AsyncMock(), resolver=_BrokenResolver())
@@ -363,7 +364,8 @@ class TestDistinctLogTags:
             def auth_enabled(self) -> bool:
                 return True
 
-            def resolve(self, token: str) -> str:
+            def resolve(self, token: str, *, admin_path: bool = False) -> str:
+                _ = admin_path
                 raise AuthError(401, "token rejected — auth_denied path test")
 
         middleware = BearerTokenMiddleware(AsyncMock(), resolver=_DenyingResolver())
@@ -407,7 +409,8 @@ class TestDistinctLogTags:
             def auth_enabled(self) -> bool:
                 return True
 
-            def resolve(self, token: str) -> str:
+            def resolve(self, token: str, *, admin_path: bool = False) -> str:
+                _ = admin_path
                 raise AuthError(401, "normal rejection — severity check")
 
         middleware = BearerTokenMiddleware(AsyncMock(), resolver=_DenyingResolver())
@@ -455,7 +458,8 @@ class TestDistinctLogTags:
             def auth_enabled(self) -> bool:
                 return True
 
-            def resolve(self, token: str) -> str:
+            def resolve(self, token: str, *, admin_path: bool = False) -> str:
+                _ = admin_path
                 raise RuntimeError("boom — credentials are safe in this test")
 
         middleware = BearerTokenMiddleware(AsyncMock(), resolver=_BrokenResolver())

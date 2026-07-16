@@ -17,8 +17,12 @@
 # There is no bulk endpoint, so it loops one idempotent PUT per oid.
 #
 # SAFETY:
-#   - Fails loud if the seed file is missing/empty (refuses to "seed nothing";
-#     an empty entra_identities map is a fail-closed startup error server-side).
+#   - Fails loud if the seed file is missing/empty (refuses to "seed nothing").
+#     Note: an empty entra_identities map is NOT a startup error server-side —
+#     it is a supported bootstrap state (the server BOOTS fail-closed and warns,
+#     then is populated at runtime via /admin/identities). This script's
+#     empty-seed guard is a local convenience so you don't invoke it with
+#     nothing to seed, not a server-side requirement.
 #   - Idempotent: re-adding an existing mapping is a 200 no-op.
 #   - Never deletes anything; only ensures each oid->handle mapping is present.
 #   - --check does a dry run (prints what it WOULD PUT, makes no writes).

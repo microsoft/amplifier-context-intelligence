@@ -158,7 +158,9 @@ class PrincipalResolver(Protocol):
         """
         ...
 
-    def resolve(self, token: str) -> tuple[str, list[str], bool] | None:
+    def resolve(
+        self, token: str, *, admin_path: bool = False
+    ) -> tuple[str, list[str], bool] | None:
         """Return ``(contributor_id, roles, is_service)`` or ``None`` if token not recognised.
 
         Raises :class:`AuthError` (with ``status_code`` 401 or 403) when the
@@ -170,6 +172,15 @@ class PrincipalResolver(Protocol):
         ``is_service`` is ``True`` for app/service tokens (no ``scp`` claim,
         routed through the service branch); ``False`` for delegated user tokens
         and static-key tokens.
+
+        ``admin_path`` (keyword-only, default ``False``) signals that the
+        request targets an ``/admin/*`` route. When ``True``, ``EntraResolver``
+        relaxes ONLY the identity-map membership check (an unbound-but-valid
+        oid is admitted so an IdentityAdmin role-holder can bootstrap the map);
+        NO token-authenticity check (signature/issuer/audience/expiry/tenant/
+        scope/oid-presence) is ever relaxed. ``StaticKeyResolver`` ignores this
+        parameter entirely — its admin authorization is via a separate
+        admin-key fast-path, not map membership.
         """
         ...
 
@@ -202,7 +213,15 @@ class EntraResolver:
         tenant_id:            Azure AD tenant ID (GUID).
         identity_map:         ``{oid_lower -> contributor_id}`` — built by
                               :meth:`~context_intelligence_server.config.Settings.build_identity_map`.
-                              MUST be non-empty (config validator ensures this).
+                              MAY be empty at construction: an empty map is a
+                              supported bootstrap state (the server boots
+                              fail-closed and is populated at runtime via the
+                              IdentityAdmin-gated /admin/identities API). A live
+                              reference is passed so runtime PUT/DELETE are
+                              visible immediately. On a data route an unmapped
+                              oid still 403s; the map-miss is exempted ONLY for
+                              /admin/* paths (``admin_path=True``) so a role-
+                              holder can bootstrap the first identity.
         service_identity_map: ``{oid_lower -> contributor_id}`` for service
                               principals.  Optional; ``{}`` = no service map.
         service_data_role:    App Role name granting write access.  ``""`` disables.
@@ -290,7 +309,9 @@ class EntraResolver:
         """Always True — EntraResolver is always active (identity map is non-empty by construction)."""
         return True
 
-    def resolve(self, token: str) -> tuple[str, list[str], bool]:
+    def resolve(
+        self, token: str, *, admin_path: bool = False
+    ) -> tuple[str, list[str], bool]:
         """Validate Entra JWT; return (contributor_id, roles, is_service).
 
         Implements the dual-path discriminator (M2):
@@ -387,12 +408,29 @@ class EntraResolver:
             oid_lower = oid.lower()
             contributor_id = self._identity_map.get(oid_lower)
             if contributor_id is None:
-                raise AuthError(
-                    403,
-                    f"Identity not authorized: oid {oid_lower!r} is not in the "
-                    f"identity map; contact the server administrator to add this "
-                    f"identity (tenant {self._tenant_id!r})",
-                )
+                # BOOTSTRAP EXEMPTION — /admin/* paths ONLY (admin_path=True):
+                # a cryptographically-valid delegated token whose oid is not yet
+                # bound is admitted to routing so an IdentityAdmin role-holder can
+                # populate the map on a fresh deployment. Authorization is still
+                # enforced downstream by require_admin on the `roles` claim; a
+                # non-admin unbound token reaches /admin and is 403'd there.
+                #
+                # SECURITY: this relaxes ONLY the oid->id map-membership lookup.
+                # All JWT authenticity checks (signature, issuer, audience,
+                # expiry, tenant, access_as_user scope, oid presence) have already
+                # passed above and are NOT affected. On every non-admin path
+                # admin_path is False, so an unmapped oid is still a hard 403.
+                if not admin_path:
+                    raise AuthError(
+                        403,
+                        f"Identity not authorized: oid {oid_lower!r} is not in the "
+                        f"identity map; contact the server administrator to add this "
+                        f"identity (tenant {self._tenant_id!r})",
+                    )
+                # Provisional contributor id = the oid itself, so the admin audit
+                # log records who performed the bootstrap mutation even though
+                # they are not yet a mapped contributor.
+                contributor_id = oid_lower
             # Roles: list[str] normalization — only `roles`, never `groups` (TB-09).
             _roles_raw = claims.get("roles")
             roles: list[str] = (
@@ -495,10 +533,14 @@ class StaticKeyResolver:
     def auth_enabled(self) -> bool:
         """True when at least one key is configured (authentication is active).
 
-        ``False`` means the keystore is empty — the server is in
-        unauthenticated mode (explicit ``allow_unauthenticated`` opt-out only;
-        :func:`~context_intelligence_server.main.create_asgi_app` refuses to
-        start with ``auth_enabled=False`` unless that flag is set).
+        ``False`` means the keystore is empty. This alone NO LONGER makes the
+        server pass requests through: an empty keystore now boots fail-CLOSED
+        (a supported bootstrap state) and every request 401s until keys are
+        onboarded via the /admin/keys API. The ONLY way requests pass through
+        unauthenticated is the explicit ``allow_unauthenticated=True`` opt-out
+        combined with this returning ``False`` — see
+        :class:`BearerTokenMiddleware` and
+        :func:`~context_intelligence_server.main.create_asgi_app`.
         """
         return bool(self._keystore)
 
@@ -511,7 +553,9 @@ class StaticKeyResolver:
         """
         return not self._keystore
 
-    def resolve(self, token: str) -> tuple[str, list[str], bool] | None:
+    def resolve(
+        self, token: str, *, admin_path: bool = False
+    ) -> tuple[str, list[str], bool] | None:
         """Return ``(contributor_id, [], False)`` for *token*, or ``None`` on a miss.
 
         The roles list is always empty for static-key auth — admin authority is
@@ -520,7 +564,13 @@ class StaticKeyResolver:
 
         ``is_service`` is always ``False`` for static-key tokens — they behave
         like humans (always write-capable), preserving static-mode behavior.
+
+        ``admin_path`` is accepted for Protocol compatibility with
+        :class:`EntraResolver` but is unused here: static-mode admin
+        authorization goes through the admin-key fast-path (matched before
+        this resolver is ever called), not identity-map membership.
         """
+        _ = admin_path  # unused: static-mode admin uses the admin-key fast-path
         contributor_id = _resolve_token(token, self._keystore)
         if contributor_id is None:
             return None
@@ -535,11 +585,15 @@ class BearerTokenMiddleware:
     or a raw *keystore* dict for backward compatibility with tests that
     construct the middleware directly.
 
-    When the resolver's ``auth_enabled`` property is ``False`` (i.e. a
-    :class:`StaticKeyResolver` built with an empty keystore), all requests
-    pass through without authentication — the explicit ``allow_unauthenticated``
-    opt-out path.  :func:`~context_intelligence_server.main.create_asgi_app`
-    prevents booting in this state at the application level.
+    Fail-open pass-through happens ONLY when BOTH conditions hold: the
+    middleware was constructed with ``allow_unauthenticated=True`` (the explicit
+    test/dev opt-out) AND the resolver's ``auth_enabled`` property is ``False``
+    (i.e. a :class:`StaticKeyResolver` built with an empty keystore). An empty
+    keystore ALONE no longer passes requests through — with the production
+    default (``allow_unauthenticated=False``) an empty keystore fail-CLOSES:
+    the request falls through to token extraction and the resolver returns
+    ``None`` → 401. Entra mode is unaffected: ``EntraResolver.auth_enabled`` is
+    always ``True``, so this fail-open branch can never fire there.
 
     On a successful match the following keys are injected into
     ``scope["state"]`` so downstream handlers can read authenticated identity
@@ -580,8 +634,14 @@ class BearerTokenMiddleware:
         resolver: PrincipalResolver | None = None,
         exempt_paths: frozenset[str] | None = None,
         admin_api_key_digest: str | None = None,
+        allow_unauthenticated: bool = False,
     ) -> None:
         self.app = app
+        # Explicit opt-out (test/dev ONLY): when True AND the resolver has no
+        # credentials configured (auth_enabled is False), ALL requests pass
+        # through unauthenticated. An empty keystore ALONE no longer fails
+        # open — see the fail-open check in __call__ for the full rationale.
+        self._allow_unauthenticated: bool = allow_unauthenticated
         if resolver is not None:
             # Preferred path: caller explicitly constructed and wired the resolver.
             self.resolver: PrincipalResolver = resolver
@@ -612,16 +672,27 @@ class BearerTokenMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Fail-open when auth is disabled (resolver.auth_enabled is False).
-        # Uses the protocol property rather than isinstance(resolver, StaticKeyResolver)
-        # so the check works for any resolver that opts out of authentication.
-        # In practice this path is only reached by the allow_unauthenticated opt-out;
-        # create_asgi_app() refuses to start with auth_enabled=False in production.
-        if not self.resolver.auth_enabled:
+        # Fail-open pass-through ONLY when the operator EXPLICITLY opted out via
+        # allow_unauthenticated=True (test/dev) AND the resolver has no
+        # credentials configured. An empty keystore ALONE no longer fails open:
+        # with allow_unauthenticated=False (production default) an empty static
+        # keystore fail-CLOSES — the request falls through to token extraction
+        # and the resolver returns None -> 401. This is the change that makes an
+        # empty-keystore boot a SAFE bootstrap state instead of a wide-open one.
+        #
+        # SECURITY: entra mode is unaffected — EntraResolver.auth_enabled is
+        # always True, so `not self.resolver.auth_enabled` is always False and
+        # this branch can never fire in entra mode regardless of the flag.
+        if self._allow_unauthenticated and not self.resolver.auth_enabled:
             await self.app(scope, receive, send)
             return
 
         path: str = scope.get("path", "")
+        # Compute once: is this an /admin/* route? Used by BOTH the static-mode
+        # admin-key fast-path below AND the entra bootstrap exemption passed into
+        # resolver.resolve(admin_path=...). Scoping the map-membership exemption
+        # to admin paths is what keeps every data route hard-gated.
+        is_admin_path: bool = _is_admin_route(path)
         if path in self._exempt_paths or any(
             path.startswith(p) for p in _EXEMPT_PREFIXES
         ):
@@ -655,7 +726,7 @@ class BearerTokenMiddleware:
         #
         # Note: entra mode does not use admin_api_key_digest (it is always
         # None in entra mode); admin authority comes from the roles claim.
-        if self._admin_api_key_digest is not None and _is_admin_route(path):
+        if self._admin_api_key_digest is not None and is_admin_path:
             token_digest = hashlib.sha256(token.encode()).hexdigest()
             if token_digest == self._admin_api_key_digest:
                 state = scope.setdefault("state", {})
@@ -667,7 +738,11 @@ class BearerTokenMiddleware:
                 return
 
         try:
-            result = self.resolver.resolve(token)
+            # admin_path=True relaxes ONLY the oid->id map-membership lookup for
+            # /admin/* (bootstrap): an unbound-but-valid delegated token reaches
+            # require_admin, which then authorizes on the role claim. On every
+            # non-admin path admin_path=False, so an unmapped oid is still 403.
+            result = self.resolver.resolve(token, admin_path=is_admin_path)
         except AuthError as exc:
             # EntraResolver (and future resolvers) raise AuthError to communicate
             # 401 vs 403.  Dispatch the status code directly.
