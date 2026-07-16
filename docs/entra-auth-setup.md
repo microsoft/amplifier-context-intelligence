@@ -10,6 +10,10 @@
 > variables / a secret store, or a **git-ignored** config file. See §2 (PII warning).
 
 > To add/remove users at runtime without redeploying, see [docs/identity-management.md](identity-management.md).
+>
+> For a concise cross-mode reference — the two identity maps, how admin is
+> authorized in each mode, what gates data vs. `/admin/*` routes, and the
+> **empty-map bootstrap sequence** — see [docs/auth-flows.md](auth-flows.md).
 
 ---
 
@@ -331,31 +335,35 @@ That GUID is the map **key**; you choose the contributor **value** (`id`).
 
 ### 2.5 What the startup validator does (fail-closed)
 
-The config validators (`config.py`) enforce the map shape **at startup** and the
-server **refuses to boot** on misconfiguration — there is no silent fail-open.
+The config validators (`config.py`) enforce the map shape **at startup**. Required
+fields are still hard-required, and a *malformed* map is still fatal — there is no
+silent fail-open. **But an empty or omitted identity map is NOT an error:** it is a
+supported **bootstrap** state (see §2.5.1).
+
+**`azure_client_id` and `azure_tenant_id` are still REQUIRED** in `auth_mode=entra`.
+Their absence is a hard startup error.
 
 **On success:** the server starts normally and entra auth is active. (No special
-log line — a clean boot means the validators passed.)
+log line — a clean boot means the validators passed. If the effective identity map
+is empty, the server logs a loud bootstrap WARNING; see §2.5.1.)
 
 **On misconfiguration**, the server raises and exits with one of these (the message
 names both the env var and the YAML key):
 
-- Missing required field(s) — a single combined message:
+- Missing required field(s) — a single combined message (note: only
+  `azure_client_id` / `azure_tenant_id` appear here now; `entra_identities` is no
+  longer required):
 
   ```
   Entra auth misconfiguration (startup refused): azure_client_id is required when
   auth_mode='entra'; set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_CLIENT_ID or
   azure_client_id in the config file; azure_tenant_id is required when
-  auth_mode='entra'; …; entra_identities must be a non-empty map when
-  auth_mode='entra'; provide at least one oid → {id: contributor} entry
+  auth_mode='entra'; set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_TENANT_ID or
+  azure_tenant_id in the config file
   ```
 
-- An **empty** identity map (`entra_identities: {}`) — rejected, not "auth off":
-
-  ```
-  entra_identities must contain at least one entry if specified; omit it or use
-  null to disable Entra authentication
-  ```
+The following map-*shape* violations are still fatal (a present-but-malformed entry
+is a mistake, never a bootstrap state):
 
 - A malformed oid key:
 
@@ -378,9 +386,43 @@ names both the env var and the YAML key):
   ```
 
 > **Fail-closed by default.** `allow_unauthenticated` defaults to **`false`**. A
-> server with **no** auth configured **refuses to start** (loud `RuntimeError`). The
-> `allow_unauthenticated=true` opt-out exists only for the test harness / local dev —
-> **never set it in production.**
+> server with **no** identity map configured **still boots** — but **fail-CLOSED**:
+> it logs a loud startup WARNING and every **delegated (human)** token receives a
+> **403** until identities are onboarded (see §2.5.1). The **only** way to make the
+> server pass every request through **unauthenticated** is the explicit
+> `allow_unauthenticated=true` opt-out (which itself logs a loud "WIDE OPEN"
+> warning) — it exists only for the test harness / local dev, **never set it in
+> production.** Note: in `auth_mode=entra` the opt-out has **no effect** — entra is
+> always authentication-enabled, so an empty map fail-closes regardless.
+
+### 2.5.1 Boot with an EMPTY map — the supported bootstrap state
+
+An **empty or omitted** `entra_identities` map is a first-class **bootstrap** state,
+not an error. On a fresh `/data` volume the server **boots and serves**, and logs:
+
+```
+entra identity map is EMPTY at startup (0 bound oids) — server is UP and serving,
+but every delegated (human) token will receive 403 until identities are onboarded.
+Bind the first user with an IdentityAdmin-role token via
+PUT /admin/identities/{oid} (store=/data/identity/entra-identities.json).
+This is expected on a fresh /data volume.
+```
+
+While the map is empty:
+
+- **Data/non-admin routes** (e.g. `POST /events`) are **hard-gated by map
+  membership** — a valid delegated token whose oid is unmapped gets **403**.
+- **`/admin/*` routes are NOT gated by map membership.** They are authorized by
+  **role** (the `IdentityAdmin` App Role in the token's `roles` claim). This is the
+  **admin-path bootstrap exemption**: an `IdentityAdmin` role-holder can call
+  `PUT /admin/identities/{oid}` to bind the **first** identity **even when their own
+  oid is not yet in the map**. No token-authenticity check is relaxed — only the
+  oid→id map-membership lookup, and only on `/admin/*`.
+
+So the day-zero sequence is: **boot empty → an `IdentityAdmin` token calls
+`PUT /admin/identities/{oid}` → the first identity is bound → that user (and any
+others onboarded the same way) can now use the data API.** A config-file seed is
+**optional** (see §2.6, step 3).
 
 ### 2.6 The recovery loop — binding a new developer (a `403`)
 
@@ -400,12 +442,16 @@ To bind them:
 2. **Verify** the oid maps to the right person (`az ad user show --id <oid> --query
    userPrincipalName -o tsv`) **before** adding it — see §4.1 (write-once is permanent).
 3. Bind it. Two paths:
-   - **Runtime, no restart (preferred):** `PUT /admin/identities/{oid}` with an
-     `IdentityAdmin` token — effective on the user's **next request**. Full runbook:
-     [identity-management.md](identity-management.md).
-   - **Config + restart (bootstrap):** add `"<oid>": {id: <contributor>}` to
-     `entra_identities` and restart. Use this for the day-zero seed; runtime
-     onboarding should use the `/admin` API above.
+   - **Runtime, no restart (preferred — and the primary bootstrap path):**
+     `PUT /admin/identities/{oid}` with an `IdentityAdmin` token — effective on the
+     user's **next request**. This works even on a **completely empty** map: an
+     `IdentityAdmin` role-holder can onboard the **first** identity **even when
+     their own oid is not yet mapped** (the `/admin`-path bootstrap exemption).
+     Full runbook: [identity-management.md](identity-management.md).
+   - **Config + restart (OPTIONAL seed):** add `"<oid>": {id: <contributor>}` to
+     `entra_identities` and restart. A config seed is **no longer required** — it
+     only pre-populates an initially-empty store. The primary path is boot-empty +
+     the `/admin` API above.
 
 The next call from that user → `created_by = <contributor>`.
 

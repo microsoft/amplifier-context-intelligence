@@ -457,20 +457,26 @@ class TestBuildKeystore:
 
 
 class TestPhase1FailClosedEmptyApiKeys:
-    """T1.1: api_keys={} is a configuration error; auth-off requires None / omission."""
+    """T1.1 (updated): api_keys={} is now a SUPPORTED bootstrap state (symmetric
+    with entra_identities) — the server boots fail-CLOSED with zero keys and is
+    populated at runtime via PUT /admin/keys/{sha256hash}. api_keys=None
+    (omitted) still disables auth entirely.
+    """
 
-    def test_api_keys_empty_dict_raises(self) -> None:
-        """T1.1: Settings(api_keys={}) raises ValidationError (fail-closed).
+    def test_api_keys_empty_dict_now_returns_empty_dict(self) -> None:
+        """Settings(api_keys={}) now returns {} instead of raising.
 
-        An explicitly empty map is a misconfiguration, not "auth disabled".
-        Omit api_keys or set it to null to disable per-contributor auth.
+        (Previously: raised ValidationError 'at least one entry' — fail-closed
+        was implemented as a startup refusal. Now: boots fail-closed instead —
+        the empty keystore alone yields a resolver with auth_enabled=False,
+        and BearerTokenMiddleware fail-CLOSES on that unless the operator
+        opts out via allow_unauthenticated=True. See the empty-keystore
+        bootstrap tests in test_t7_wire.py / test_main.py.)
         """
-        from pydantic import ValidationError
-
         from context_intelligence_server.config import Settings
 
-        with pytest.raises(ValidationError, match="at least one entry"):
-            Settings(api_keys={})
+        s = Settings(api_keys={})
+        assert s.api_keys == {}
 
     def test_api_keys_none_is_allowed(self) -> None:
         """T1.1: api_keys=None (omitted) disables auth — no ValidationError raised.
@@ -709,14 +715,18 @@ class TestValidateEntraIdentities:
         s = Settings(entra_identities=None)
         assert s.entra_identities is None
 
-    def test_empty_dict_raises(self) -> None:
-        """§8b: entra_identities={} raises ValidationError (fail-closed, mirrors api_keys)."""
-        from pydantic import ValidationError
+    def test_empty_dict_now_returns_empty_dict(self) -> None:
+        """entra_identities={} is now a SUPPORTED bootstrap state — returns {}.
 
+        (Previously: raised ValidationError 'at least one entry'. The empty map
+        is now accepted via allow_empty=True so the server boots on a fresh
+        /data volume and is populated at runtime via PUT /admin/identities.
+        service_identities={} still raises — see the service-identities suite.)
+        """
         from context_intelligence_server.config import Settings
 
-        with pytest.raises(ValidationError, match="at least one entry"):
-            Settings(entra_identities={})
+        s = Settings(entra_identities={})
+        assert s.entra_identities == {}
 
     def test_non_guid_key_raises(self) -> None:
         """§8b: a key that is not a GUID raises ValidationError."""
@@ -973,19 +983,23 @@ class TestCrossFieldEntraValidation:
                 entra_identities={_FAKE_OID_1: {"id": "colombod"}},
             )
 
-    def test_entra_mode_none_identities_raises(self) -> None:
-        """AC7: auth_mode=entra + entra_identities=None → startup refused."""
-        from pydantic import ValidationError
-
+    def test_entra_mode_none_identities_boots(self) -> None:
+        """entra_identities=None is now a SUPPORTED bootstrap state — the server
+        boots. (Previously: AC7 startup refused with a ValidationError.)
+        main.create_asgi_app() logs a loud warning when the effective map is
+        empty at startup; see the empty-map bootstrap tests in test_t7_wire.py
+        / test_main.py.
+        """
         from context_intelligence_server.config import Settings
 
-        with pytest.raises(ValidationError, match="entra_identities"):
-            Settings(
-                auth_mode="entra",
-                azure_client_id=_FAKE_CLIENT_ID,
-                azure_tenant_id=_FAKE_TENANT_ID,
-                entra_identities=None,
-            )
+        s = Settings(
+            auth_mode="entra",
+            azure_client_id=_FAKE_CLIENT_ID,
+            azure_tenant_id=_FAKE_TENANT_ID,
+            entra_identities=None,
+        )
+        assert s.entra_identities is None
+        assert s.build_identity_map() == {}
 
     def test_static_mode_no_entra_fields_required(self) -> None:
         """§8b regression: auth_mode=static does not require azure_* or entra_identities."""
@@ -1082,16 +1096,19 @@ class TestT3EnvVarPath:
         with pytest.raises(ValidationError, match="valid GUID"):
             Settings()
 
-    def test_env_var_empty_dict_raises(self, monkeypatch) -> None:
-        """Env-var path: empty {} is rejected (fail-closed, same as direct construction)."""
-        from pydantic import ValidationError
+    def test_env_var_empty_dict_now_boots(self, monkeypatch) -> None:
+        """Env-var path: empty {} is now a SUPPORTED bootstrap state — returns {}.
 
+        Symmetric with direct construction (test_empty_dict_now_returns_empty_dict):
+        an explicitly empty entra_identities map boots the server (populate at
+        runtime via PUT /admin/identities) instead of raising a startup error.
+        """
         monkeypatch.setenv(self._ENTRA_KEY, "{}")
 
         from context_intelligence_server.config import Settings
 
-        with pytest.raises(ValidationError, match="at least one entry"):
-            Settings()
+        s = Settings()
+        assert s.entra_identities == {}
 
     def test_env_var_string_value_raises(self, monkeypatch) -> None:
         """Env-var path: string (non-dict) value is rejected by pydantic dict_type coercion."""
@@ -1600,14 +1617,17 @@ class TestM2RegressionEntraIdentities:
         assert s.entra_identities is not None
         assert s.entra_identities[_FAKE_OID_1]["id"] == "colombod"
 
-    def test_entra_empty_dict_still_raises_at_least_one_entry(self) -> None:
-        """Regression: entra_identities={} still raises 'at least one entry' after refactor."""
-        from pydantic import ValidationError
+    def test_entra_empty_dict_now_returns_empty_dict(self) -> None:
+        """entra_identities={} is now a SUPPORTED bootstrap state — returns {}.
 
+        (Previously: raised ValidationError 'at least one entry'. allow_empty=True
+        is passed ONLY for entra_identities; service_identities={} still raises —
+        see test_service_identities_empty_dict_raises.)
+        """
         from context_intelligence_server.config import Settings
 
-        with pytest.raises(ValidationError, match="at least one entry"):
-            Settings(entra_identities={})
+        s = Settings(entra_identities={})
+        assert s.entra_identities == {}
 
     def test_entra_invalid_guid_still_raises_valid_guid(self) -> None:
         """Regression: invalid GUID still raises 'valid GUID' after shared-helper refactor."""

@@ -105,7 +105,41 @@ class TestMiddlewareUsesAuthEnabled:
     """Middleware checks resolver.auth_enabled, not isinstance(resolver, StaticKeyResolver)."""
 
     async def test_middleware_passes_through_when_auth_enabled_false(self) -> None:
-        """Middleware passes request through when resolver.auth_enabled is False (fail-open)."""
+        """Middleware passes request through when resolver.auth_enabled is False
+        AND allow_unauthenticated=True is explicitly set (fail-open opt-out).
+
+        An empty keystore ALONE no longer fails open — that requires the
+        explicit allow_unauthenticated=True opt-out (test/dev only). This test
+        still proves the middleware checks resolver.auth_enabled (not
+        isinstance(resolver, StaticKeyResolver)) as the gate condition.
+        """
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        from context_intelligence_server.auth import (  # noqa: PLC0415
+            BearerTokenMiddleware,
+            StaticKeyResolver,
+        )
+
+        app = AsyncMock()
+        middleware = BearerTokenMiddleware(
+            app, resolver=StaticKeyResolver({}), allow_unauthenticated=True
+        )
+        scope = {"type": "http", "path": "/events", "headers": []}
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        await middleware(scope, receive, send)
+
+        app.assert_called_once_with(scope, receive, send)
+
+    async def test_middleware_401s_when_auth_enabled_false_without_opt_out(
+        self,
+    ) -> None:
+        """resolver.auth_enabled=False alone (no allow_unauthenticated) -> 401.
+
+        This is the core security fix: an empty keystore no longer fails open
+        by default. It fails CLOSED — a safe bootstrap state.
+        """
         from unittest.mock import AsyncMock  # noqa: PLC0415
 
         from context_intelligence_server.auth import (  # noqa: PLC0415
@@ -121,7 +155,9 @@ class TestMiddlewareUsesAuthEnabled:
 
         await middleware(scope, receive, send)
 
-        app.assert_called_once_with(scope, receive, send)
+        app.assert_not_called()
+        response_start = send.call_args_list[0][0][0]
+        assert response_start["status"] == 401
 
     def test_middleware_call_does_not_use_isinstance_on_static_resolver(self) -> None:
         """BearerTokenMiddleware.__call__ must not do isinstance(resolver, StaticKeyResolver).
@@ -199,38 +235,67 @@ class TestCreateAsgiAppWire:
 
 
 class TestCreateAsgiAppFailClosed:
-    """AC13: create_asgi_app() refuses to start when auth_enabled=False."""
+    """AC13 (updated): create_asgi_app() now BOOTS fail-CLOSED with an empty
+    keystore instead of refusing to start. Wide-open pass-through is reachable
+    ONLY via the explicit allow_unauthenticated=True opt-out."""
 
-    def test_static_mode_no_keys_raises_runtime_error(self, tmp_path: Any) -> None:
-        """AC13 (CRITICAL): auth_mode=static + no api_key/api_keys raises RuntimeError.
+    async def test_static_mode_no_keys_boots_fail_closed(
+        self, tmp_path: Any, caplog: Any
+    ) -> None:
+        """auth_mode=static + no api_key/api_keys now BOOTS fail-CLOSED (no RuntimeError).
 
-        This is the primary proof of the fail-closed gate.  Before T7 the server
-        booted silently in this state — every request passed unauthenticated.
-        Note: allow_unauthenticated=False is set explicitly here because the test
-        harness sets the env var AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ALLOW_UNAUTHENTICATED=true
-        to prevent the module-level import from raising; we override it for this specific
-        test to prove the production gate fires.
+        NEW contract (empty-map bootstrap fix): an empty keystore is a SUPPORTED
+        bootstrap state, not a startup error. create_asgi_app() constructs the
+        app, logs a loud empty-keystore warning, and every real request
+        fail-CLOSES with 401 until keys are onboarded via the admin API. (This
+        replaces the old behavior, which raised RuntimeError to refuse startup.)
 
-        api_keys_store_path is pointed at a non-existent tmp_path location to ensure
-        this test is isolated from any pre-seeded /data/identity/api-keys.json that
-        may exist on machines where the server has previously run (e.g. DTU environments).
-        Without this, a pre-seeded store file would cause the IdentityStore to load keys
-        and the fail-closed gate would never fire.
+        allow_unauthenticated=False is set explicitly because the test harness
+        sets the env var AMPLIFIER_..._ALLOW_UNAUTHENTICATED=true; we pin the
+        production default here so the fail-CLOSED path (not the wide-open
+        opt-out) is what gets proven. api_keys_store_path points at a
+        non-existent tmp_path location so the store is guaranteed empty
+        regardless of any pre-seeded /data/identity/api-keys.json.
         """
+        import logging  # noqa: PLC0415
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
         from context_intelligence_server.config import Settings  # noqa: PLC0415
         from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
-        # Explicitly set allow_unauthenticated=False to simulate production config.
-        # api_keys_store_path points to a non-existent tmp_path location to guarantee
-        # the store is empty regardless of any pre-seeded /data/identity/ files.
         settings = Settings(
             auth_mode="static",
             allow_unauthenticated=False,
             api_keys_store_path=str(tmp_path / "api-keys.json"),
         )
 
-        with pytest.raises(RuntimeError, match="[Nn]o authentication"):
-            create_asgi_app(settings=settings)
+        # 1. Construction SUCCEEDS (no RuntimeError) and logs the empty-keystore warning.
+        with caplog.at_level(
+            logging.WARNING, logger="context_intelligence_server.main"
+        ):
+            wrapped = create_asgi_app(settings=settings)
+
+        assert wrapped is not None
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("static keystore is EMPTY" in m for m in messages), (
+            f"expected an empty-keystore warning at startup; got {messages!r}"
+        )
+
+        # 2. A real request fail-CLOSES with 401 (empty keystore, no opt-out).
+        scope = {
+            "type": "http",
+            "path": "/events",
+            "method": "POST",
+            "headers": [(b"authorization", b"Bearer some-unregistered-token")],
+        }
+        send = AsyncMock()
+        await wrapped(scope, AsyncMock(), send)
+
+        response_start = send.call_args_list[0][0][0]
+        assert response_start["type"] == "http.response.start"
+        assert response_start["status"] == 401, (
+            "empty keystore + allow_unauthenticated=False must fail-CLOSED (401)"
+        )
 
     def test_allow_unauthenticated_bypasses_refusal(self) -> None:
         """allow_unauthenticated=True allows booting with no keys (explicit opt-out).
@@ -254,32 +319,60 @@ class TestCreateAsgiAppFailClosed:
 
 
 class TestEntraModeConfigValidation:
-    """auth_mode=entra with missing/empty identity map is caught at Settings() construction."""
+    """auth_mode=entra with missing/empty identity map is now a SUPPORTED
+    bootstrap state — Settings() constructs successfully. client_id/tenant_id
+    are still required (their absence still raises)."""
 
-    def test_entra_missing_identities_raises_validation_error(self) -> None:
-        """auth_mode=entra + entra_identities=None raises pydantic ValidationError."""
+    def test_entra_missing_identities_now_boots(self) -> None:
+        """auth_mode=entra + entra_identities=None now BOOTS (no ValidationError).
+
+        NEW contract: an omitted identity map is a supported bootstrap state.
+        Settings constructs; the map is populated at runtime via
+        PUT /admin/identities. client_id/tenant_id remain required.
+        """
+        from context_intelligence_server.config import Settings  # noqa: PLC0415
+
+        s = Settings(
+            auth_mode="entra",
+            azure_client_id=FAKE_CLIENT_ID,
+            azure_tenant_id=FAKE_TENANT_ID,
+            # entra_identities omitted → now a supported bootstrap state
+        )
+        assert s.auth_mode == "entra"
+        assert s.entra_identities is None
+        assert s.build_identity_map() == {}
+
+    def test_entra_empty_identities_dict_now_boots(self) -> None:
+        """auth_mode=entra + entra_identities={} now BOOTS and returns {}.
+
+        NEW contract: an explicitly empty map is accepted (allow_empty=True) so
+        the server boots on a fresh /data volume.
+        """
+        from context_intelligence_server.config import Settings  # noqa: PLC0415
+
+        s = Settings(
+            auth_mode="entra",
+            azure_client_id=FAKE_CLIENT_ID,
+            azure_tenant_id=FAKE_TENANT_ID,
+            entra_identities={},  # empty dict → now a supported bootstrap state
+        )
+        assert s.entra_identities == {}
+        assert s.build_identity_map() == {}
+
+    def test_entra_missing_client_id_still_raises(self) -> None:
+        """Regression guard: client_id/tenant_id are STILL required in entra mode.
+
+        The empty-map relaxation must NOT weaken the azure_client_id /
+        azure_tenant_id cross-field requirement.
+        """
         from pydantic import ValidationError  # noqa: PLC0415
 
         from context_intelligence_server.config import Settings  # noqa: PLC0415
 
-        with pytest.raises(ValidationError, match="[Ee]ntra auth misconfiguration"):
+        with pytest.raises(ValidationError, match="azure_client_id"):
             Settings(
                 auth_mode="entra",
-                azure_client_id=FAKE_CLIENT_ID,
                 azure_tenant_id=FAKE_TENANT_ID,
-                # entra_identities omitted → caught by _validate_entra_config
-            )
-
-    def test_entra_empty_identities_dict_raises_validation_error(self) -> None:
-        """auth_mode=entra + entra_identities={} raises pydantic ValidationError."""
-        from pydantic import ValidationError  # noqa: PLC0415
-
-        from context_intelligence_server.config import Settings  # noqa: PLC0415
-
-        with pytest.raises(ValidationError):
-            Settings(
-                auth_mode="entra",
-                azure_client_id=FAKE_CLIENT_ID,
-                azure_tenant_id=FAKE_TENANT_ID,
-                entra_identities={},  # empty dict → field validator catches it
+                entra_identities={},
+                # azure_client_id omitted → still a startup error
             )

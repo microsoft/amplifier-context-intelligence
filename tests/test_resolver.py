@@ -164,8 +164,12 @@ class TestBearerTokenMiddlewareResolvesViaResolver:
             def auth_enabled(self) -> bool:
                 return True
 
-            def resolve(self, token: str) -> tuple[str, list[str], bool] | None:
+            def resolve(
+                self, token: str, *, admin_path: bool = False
+            ) -> tuple[str, list[str], bool] | None:
                 # M2: resolve() now returns (contributor_id, roles, is_service) 3-tuple.
+                # admin_path is accepted for Protocol compatibility (unused here).
+                _ = admin_path
                 calls.append(token)
                 return ("tracked-user", [], False)
 
@@ -218,8 +222,14 @@ class TestBearerTokenMiddlewareResolvesViaResolver:
         await middleware(scope, AsyncMock(), AsyncMock())
         assert scope.get("state", {}).get("contributor_id") == "compat-user"
 
-    async def test_fail_open_when_static_resolver_is_empty(self) -> None:
-        """Empty StaticKeyResolver => fail-open (auth disabled), request passes."""
+    async def test_empty_static_resolver_fails_closed_by_default(self) -> None:
+        """Empty StaticKeyResolver + allow_unauthenticated=False (default) -> 401.
+
+        This used to fail-open (pass through unauthenticated). An empty
+        keystore alone no longer opens the server wide up — it now fail-closes
+        (a SAFE bootstrap state) unless the operator explicitly opts out via
+        allow_unauthenticated=True (see the companion test below).
+        """
         from context_intelligence_server.auth import (  # noqa: PLC0415
             BearerTokenMiddleware,
             StaticKeyResolver,
@@ -227,6 +237,31 @@ class TestBearerTokenMiddlewareResolvesViaResolver:
 
         app = AsyncMock()
         middleware = BearerTokenMiddleware(app, resolver=StaticKeyResolver({}))
+        scope = _make_scope("/events")
+
+        receive = AsyncMock()
+        send = AsyncMock()
+        await middleware(scope, receive, send)
+
+        app.assert_not_called()
+        response_start = send.call_args_list[0][0][0]
+        assert response_start["status"] == 401
+
+    async def test_empty_static_resolver_passes_through_with_opt_out(self) -> None:
+        """Empty StaticKeyResolver + allow_unauthenticated=True -> wide-open pass-through.
+
+        This is the ONLY path that still fails open, and it requires an
+        explicit, deliberate opt-out (test/dev only).
+        """
+        from context_intelligence_server.auth import (  # noqa: PLC0415
+            BearerTokenMiddleware,
+            StaticKeyResolver,
+        )
+
+        app = AsyncMock()
+        middleware = BearerTokenMiddleware(
+            app, resolver=StaticKeyResolver({}), allow_unauthenticated=True
+        )
         scope = _make_scope("/events")
 
         receive = AsyncMock()

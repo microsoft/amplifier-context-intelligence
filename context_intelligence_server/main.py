@@ -339,12 +339,16 @@ def create_asgi_app(
     real network calls.  Production deployments leave it as ``None``; the
     resolver builds a real ``PyJWKClient`` internally.
 
+    Startup behavior on an EMPTY store:
+        An empty keystore (static) or empty identity map (entra) NO LONGER
+        raises — it is a supported bootstrap state. The server BOOTS
+        fail-CLOSED and logs a loud startup WARNING; every request 401/403s
+        until the store is populated at runtime via the /admin API. Wide-open
+        pass-through is reachable ONLY via the explicit
+        ``settings.allow_unauthenticated=True`` opt-out combined with no
+        credentials configured, which additionally logs a "WIDE OPEN" warning.
+
     Raises:
-        RuntimeError: When the chosen resolver has ``auth_enabled=False``
-            (no credentials configured for the selected mode) AND
-            ``settings.allow_unauthenticated`` is ``False`` (default).
-            This is the fail-closed startup gate — the server must never boot
-            silently unauthenticated in production.
         RuntimeError: (TB-07) When any ``/admin`` path or prefix appears in an
             auth-exempt set.  The admin API surface must never be unguarded.
     """
@@ -418,6 +422,21 @@ def create_asgi_app(
         _entra_identity_store = entra_store
         app.state.entra_identity_store = entra_store
 
+        # Bootstrap visibility: announce an EMPTY identity map loudly at startup.
+        # This is a SUPPORTED state, not an error — the server is up and serving.
+        # Delegated (human) tokens will 403 until an IdentityAdmin role-holder
+        # binds the first oid via PUT /admin/identities/{oid}. Without this line
+        # an empty map would be silent and look like a misconfiguration.
+        if not entra_store.flat_dict:
+            logger.warning(
+                "entra identity map is EMPTY at startup (0 bound oids) — server "
+                "is UP and serving, but every delegated (human) token will "
+                "receive 403 until identities are onboarded. Bind the first user "
+                "with an IdentityAdmin-role token via PUT /admin/identities/{oid} "
+                "(store=%s). This is expected on a fresh /data volume.",
+                s.entra_identities_store_path,
+            )
+
         # B4: boot disjointness invariant — each oid must belong to exactly one
         # identity source.  Building the service map here (not inline in the
         # EntraResolver call) lets us check the overlap BEFORE construction so
@@ -467,21 +486,46 @@ def create_asgi_app(
         _api_key_store = key_store
         app.state.api_key_store = key_store
 
+        # Bootstrap visibility: announce an EMPTY keystore loudly at startup.
+        # This is a SUPPORTED state (fail-CLOSED, not fail-open) — the server
+        # is up and serving, but every request 401s until keys are onboarded.
+        if not key_store.flat_dict:
+            if s.resolve_admin_api_key_digest() is not None:
+                logger.warning(
+                    "static keystore is EMPTY at startup (0 bound keys) — server "
+                    "is UP but fail-CLOSED; every request will 401 until keys are "
+                    "onboarded. Add the first key with the admin token via "
+                    "PUT /admin/keys/{sha256hash} (store=%s). Expected on a fresh "
+                    "/data volume.",
+                    s.api_keys_store_path,
+                )
+            else:
+                logger.warning(
+                    "static keystore is EMPTY at startup (0 bound keys) AND no "
+                    "admin_api_key/admin_api_key_sha256 is configured — server is "
+                    "UP but fail-CLOSED and CANNOT be bootstrapped at runtime (the "
+                    "/admin API is unreachable without an admin key: every token "
+                    "401s at the middleware before require_admin runs). Set "
+                    "admin_api_key/admin_api_key_sha256 to enable runtime "
+                    "onboarding, or add api_keys in config and restart. (store=%s)",
+                    s.api_keys_store_path,
+                )
+
         # Pass key_store.flat_dict (the LIVE dict) so the resolver sees any
         # put()/delete() made by /admin immediately, no restart required.
         resolver = StaticKeyResolver(key_store.flat_dict)
 
-    # Fail-closed gate: refuse to start if authentication is not configured.
-    # The only valid exception is allow_unauthenticated=True, an explicit opt-out
-    # for test harnesses and local dev environments — never set in production.
-    if not resolver.auth_enabled and not s.allow_unauthenticated:
-        raise RuntimeError(
-            "No authentication configured — the server refuses to start. "
-            "For auth_mode='static': set api_key or api_keys in the config. "
-            "For auth_mode='entra': set azure_client_id, azure_tenant_id, and "
-            "entra_identities. "
-            "To allow unauthenticated access (TEST/DEV ONLY) set "
-            "allow_unauthenticated: true in the config."
+    # Wide-open warning: fires ONLY on the explicit allow_unauthenticated
+    # opt-out combined with no credentials configured. An empty keystore/map
+    # ALONE no longer triggers this (and no longer refuses to start) — it now
+    # boots fail-closed instead (see the empty-map/keystore warnings above).
+    if s.allow_unauthenticated and not resolver.auth_enabled:
+        logger.warning(
+            "allow_unauthenticated=True AND no credentials configured — the "
+            "server is WIDE OPEN: EVERY request is admitted UNAUTHENTICATED. "
+            "This opt-out is for TEST/DEV ONLY and must NEVER be set in "
+            "production. Configure api_key/api_keys (static) or entra_identities "
+            "(entra) and unset allow_unauthenticated to enforce authentication."
         )
 
     # Log admin capability status for operator visibility (E: status surfacing).
@@ -520,6 +564,7 @@ def create_asgi_app(
         resolver=resolver,
         exempt_paths=exempt,
         admin_api_key_digest=admin_api_key_digest,
+        allow_unauthenticated=s.allow_unauthenticated,
     )
 
 

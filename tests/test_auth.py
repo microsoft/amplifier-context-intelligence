@@ -38,10 +38,21 @@ def _keystore(token: str, contributor_id: str = "tester") -> dict[str, str]:
 
 
 class TestMiddlewareNoApiKey:
-    """When keystore is empty (no keys configured), all requests pass through."""
+    """When keystore is empty (no keys configured), the server now FAIL-CLOSES
+    by default — an empty keystore alone no longer opens the server wide up.
+    Pass-through requires the explicit allow_unauthenticated=True opt-out
+    (test/dev only); see TestMiddlewareAllowUnauthenticatedOptOut below.
+    """
 
-    async def test_request_passes_without_keystore_configured(self) -> None:
-        """Empty keystore means no auth required — request reaches the app."""
+    async def test_request_401s_without_keystore_configured_by_default(
+        self,
+    ) -> None:
+        """Empty keystore + allow_unauthenticated=False (default) -> fail-closed 401.
+
+        This used to fail-open (pass through unauthenticated). Empty is now a
+        SAFE bootstrap state: the server boots but every request 401s until
+        keys/identities are onboarded via the admin API.
+        """
         app = AsyncMock()
         middleware = BearerTokenMiddleware(app, keystore={})
 
@@ -50,10 +61,13 @@ class TestMiddlewareNoApiKey:
         send = AsyncMock()
 
         await middleware(scope, receive, send)
-        app.assert_called_once_with(scope, receive, send)
+        app.assert_not_called()
+        response_start = send.call_args_list[0][0][0]
+        assert response_start["type"] == "http.response.start"
+        assert response_start["status"] == 401
 
-    async def test_request_passes_with_none_keystore(self) -> None:
-        """None keystore (default) is equivalent to empty — no auth required."""
+    async def test_request_401s_with_none_keystore_by_default(self) -> None:
+        """None keystore (default) is equivalent to empty -> fail-closed 401."""
         app = AsyncMock()
         middleware = BearerTokenMiddleware(app)  # keystore=None → {}
 
@@ -62,7 +76,47 @@ class TestMiddlewareNoApiKey:
         send = AsyncMock()
 
         await middleware(scope, receive, send)
+        app.assert_not_called()
+        response_start = send.call_args_list[0][0][0]
+        assert response_start["status"] == 401
+
+
+class TestMiddlewareAllowUnauthenticatedOptOut:
+    """The ONLY wide-open path: explicit allow_unauthenticated=True opt-out
+    (test/dev only) combined with no credentials configured (auth_enabled=False).
+    """
+
+    async def test_request_passes_with_empty_keystore_and_opt_out(self) -> None:
+        """Empty keystore + allow_unauthenticated=True -> wide-open pass-through."""
+        app = AsyncMock()
+        middleware = BearerTokenMiddleware(app, keystore={}, allow_unauthenticated=True)
+
+        scope = _make_scope("/events")
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        await middleware(scope, receive, send)
         app.assert_called_once_with(scope, receive, send)
+
+    async def test_request_401s_with_nonempty_keystore_despite_opt_out(
+        self,
+    ) -> None:
+        """allow_unauthenticated=True has NO effect when the keystore is
+        non-empty — auth_enabled is True, so the fail-open branch never fires
+        and normal token validation applies (missing token -> 401).
+        """
+        app = AsyncMock()
+        middleware = BearerTokenMiddleware(
+            app, keystore=_keystore("secret-token"), allow_unauthenticated=True
+        )
+
+        scope = _make_scope("/events")
+        receive = AsyncMock()
+        send = AsyncMock()
+
+        await middleware(scope, receive, send)
+        app.assert_not_called()
+        assert send.call_args_list[0][0][0]["status"] == 401
 
 
 class TestMiddlewareWithKeystore:
