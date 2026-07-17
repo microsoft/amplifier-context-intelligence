@@ -449,6 +449,72 @@ class TestSessionEnd:
         assert node["status"] != "aborted"
         assert node["status"] == "completed"
 
+    async def test_end_persists_parent_id_when_present(
+        self, services: HookStateService
+    ) -> None:
+        """session:end must persist parent_id when the end payload carries one.
+
+        Previously _handle_end's upsert_node call never wrote parent_id, so a
+        session that reached session:end WITHOUT a captured start/fork left
+        parent_id unset entirely — indistinguishable from a session that
+        genuinely has no parent. When the end payload does carry parent_id,
+        it must now be persisted.
+        """
+        handler = SessionHandler(services)
+        await handler(
+            "session:end",
+            {
+                "session_id": "s1",
+                "parent_id": "parent-from-end",
+                "timestamp": "2026-01-01T01:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        assert node.get("parent_id") == "parent-from-end", (
+            "session:end must persist parent_id when present in the payload"
+        )
+
+    async def test_end_accepts_parent_key_for_parent_id(
+        self, services: HookStateService
+    ) -> None:
+        """session:end must accept the 'parent' emitter key (via _parent_of), not just 'parent_id'."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:end",
+            {
+                "session_id": "s1",
+                "parent": "parent-via-parent-key",
+                "timestamp": "2026-01-01T01:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        assert node.get("parent_id") == "parent-via-parent-key"
+
+    async def test_end_without_parent_id_does_not_write_parent_id_key(
+        self, services: HookStateService
+    ) -> None:
+        """session:end without parent_id in the payload must NOT fabricate one.
+
+        Behavior must be unchanged when parent_id is absent: no parent_id key
+        is written by the end-handler's upsert (parent_id stays whatever it
+        was, or absent entirely).
+        """
+        handler = SessionHandler(services)
+        await handler(
+            "session:end",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T01:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("s1")
+        assert node is not None
+        assert node.get("parent_id") is None, (
+            "session:end must not fabricate parent_id when absent from the payload"
+        )
+
 
 class TestSessionResumeNotClaimed:
     """session:resume must NOT be in SessionHandler.handled_events."""
@@ -2004,6 +2070,14 @@ class TestClassifyMatrix:
     Pure unit test — no fixtures, no Neo4j.
     The test fails at collection with ImportError because LabelTransition
     and SessionLabelStateMachine do not yet exist.  This IS the RED.
+
+    "StubSession" removal: every cell that assigns a REAL terminal label
+    (including IncompleteSession) also removes "StubSession" — see the
+    NOTE in classify() itself. Cells that are pure no-ops (current_type
+    already matches/exceeds the target) do NOT add "StubSession" to
+    remove, because by the time a node reaches one of those states its
+    StubSession marker has already been cleared by the transition that
+    got it there.
     """
 
     CASES: list[tuple[str, str | None, bool, list[str], list[str]]] = [
@@ -2016,28 +2090,84 @@ class TestClassifyMatrix:
         ("start", "SubSession", True, [], []),
         ("start", "SubSession", False, [], []),
         ("start", "RootSession", False, [], []),
-        ("start", "RootSession", True, ["SubSession", "SST_EVENT"], ["RootSession"]),
-        ("start", None, True, ["Session", "SubSession", "SST_EVENT"], []),
-        ("start", None, False, ["RootSession", "Session", "SST_EVENT"], []),
+        (
+            "start",
+            "RootSession",
+            True,
+            ["SubSession", "SST_EVENT"],
+            ["RootSession", "StubSession"],
+        ),
+        (
+            "start",
+            None,
+            True,
+            ["Session", "SubSession", "SST_EVENT"],
+            ["StubSession"],
+        ),
+        (
+            "start",
+            None,
+            False,
+            ["RootSession", "Session", "SST_EVENT"],
+            ["StubSession"],
+        ),
         # ------------------------------------------------------------------
         # event=fork
         # ------------------------------------------------------------------
         ("fork", "ForkedSession", True, [], []),
         ("fork", "ForkedSession", False, [], []),
-        ("fork", "RootSession", True, ["ForkedSession", "SST_EVENT"], ["RootSession"]),
-        ("fork", "RootSession", False, ["ForkedSession", "SST_EVENT"], ["RootSession"]),
-        ("fork", "SubSession", True, ["ForkedSession", "SST_EVENT"], ["SubSession"]),
-        ("fork", "SubSession", False, ["ForkedSession", "SST_EVENT"], ["SubSession"]),
-        ("fork", None, True, ["Session", "ForkedSession", "SST_EVENT"], []),
-        ("fork", None, False, ["Session", "ForkedSession", "SST_EVENT"], []),
+        (
+            "fork",
+            "RootSession",
+            True,
+            ["ForkedSession", "SST_EVENT"],
+            ["RootSession", "StubSession"],
+        ),
+        (
+            "fork",
+            "RootSession",
+            False,
+            ["ForkedSession", "SST_EVENT"],
+            ["RootSession", "StubSession"],
+        ),
+        (
+            "fork",
+            "SubSession",
+            True,
+            ["ForkedSession", "SST_EVENT"],
+            ["SubSession", "StubSession"],
+        ),
+        (
+            "fork",
+            "SubSession",
+            False,
+            ["ForkedSession", "SST_EVENT"],
+            ["SubSession", "StubSession"],
+        ),
+        (
+            "fork",
+            None,
+            True,
+            ["Session", "ForkedSession", "SST_EVENT"],
+            ["StubSession"],
+        ),
+        (
+            "fork",
+            None,
+            False,
+            ["Session", "ForkedSession", "SST_EVENT"],
+            ["StubSession"],
+        ),
         # ------------------------------------------------------------------
         # event=end
         # ------------------------------------------------------------------
         # Bare sessions (no prior start/fork) receive IncompleteSession marker,
         # not a fabricated Root/Sub terminal.  has_parent is irrelevant here —
         # the server never guesses; it marks and surfaces the health signal.
-        ("end", None, True, ["IncompleteSession", "SST_EVENT"], []),
-        ("end", None, False, ["IncompleteSession", "SST_EVENT"], []),
+        # IncompleteSession is a confirmed (if incomplete) terminal, so
+        # StubSession is cleared here too.
+        ("end", None, True, ["IncompleteSession", "SST_EVENT"], ["StubSession"]),
+        ("end", None, False, ["IncompleteSession", "SST_EVENT"], ["StubSession"]),
         ("end", "RootSession", True, [], []),
         ("end", "SubSession", False, [], []),
         ("end", "ForkedSession", True, [], []),
@@ -2058,6 +2188,244 @@ class TestClassifyMatrix:
         sm = SessionLabelStateMachine()
         t = sm.classify(current_type=current_type, event=event, has_parent=has_parent)
         assert t == LabelTransition(add=add, remove=remove)
+
+
+# ---------------------------------------------------------------------------
+# TestStubSessionMarker — ensure_session_node marks permanently-orphaned stubs
+#
+# :RootSession is applied by exactly one trigger: a session:start event for a
+# bare, parentless session. Nodes created purely as a reference (a delegation
+# target, a fork/start parent) by ensure_session_node — BEFORE their own
+# lifecycle events arrive — are indistinguishable-by-label from a node about
+# to be enriched, UNLESS this permanently-orphaned state is made observable.
+# "StubSession" is that marker: added only on the create branch of
+# ensure_session_node, and cleared the moment a real terminal label
+# (RootSession/SubSession/ForkedSession/IncompleteSession) is assigned via
+# genuine lifecycle enrichment.
+# ---------------------------------------------------------------------------
+
+
+class TestStubSessionMarker:
+    """StubSession is added when ensure_session_node creates a bare node from
+    a reference, and cleared by SessionLabelStateMachine.classify() the
+    moment a real terminal label is assigned."""
+
+    async def test_ensure_session_node_create_branch_adds_stub_session(
+        self, services: HookStateService
+    ) -> None:
+        """A node created by ensure_session_node's create branch (absent from
+        both cache and graph) must carry StubSession alongside Session."""
+        await services.ensure_session_node("stub-only", {})
+        node = await services.graph.get_node("stub-only")
+        assert node is not None
+        assert "Session" in node["labels"]
+        assert "StubSession" in node["labels"], (
+            "ensure_session_node must mark a freshly-created bare node as "
+            "StubSession so a permanently-orphaned stub is observable."
+        )
+
+    async def test_ensure_session_node_existing_branch_does_not_add_stub_session(
+        self, services: HookStateService
+    ) -> None:
+        """The 'already exists in graph' branch of ensure_session_node must NOT
+        add StubSession — it must not strip or alter existing labels.
+
+        This models a node that already reached a real terminal label
+        (RootSession here) via its own lifecycle event; a later
+        ensure_session_node call referencing the same session_id (e.g. from
+        an unrelated delegation) must be a pure label-preserving no-op.
+        """
+        # Pre-populate the graph with a node that already has a real terminal
+        # label, simulating "already exists in graph" on the next call.
+        await services.graph.upsert_node(
+            "already-enriched",
+            {"labels": ["Session", "RootSession"], "status": "running"},
+        )
+        # _seen_sessions cache is empty, so this call hits Tier 2 (graph query)
+        # and takes the "existing is not None" branch.
+        await services.ensure_session_node("already-enriched", {})
+
+        node = await services.graph.get_node("already-enriched")
+        assert node is not None
+        assert "StubSession" not in node["labels"], (
+            "ensure_session_node must NOT add StubSession when the node "
+            "already exists in the graph — that branch must never strip or "
+            "alter existing labels."
+        )
+        assert "RootSession" in node["labels"], (
+            "Existing terminal label must survive the ensure_session_node no-op"
+        )
+
+    async def test_ensure_session_node_existing_bare_stub_branch_does_not_add_stub_session(
+        self, services: HookStateService
+    ) -> None:
+        """The 'already exists' branch must not add StubSession even when the
+        existing node is itself still bare (no terminal label yet) — this
+        branch only ever writes ["Session"], never StubSession, regardless of
+        the existing node's current label state."""
+        await services.graph.upsert_node(
+            "already-bare", {"labels": ["Session"], "status": "running"}
+        )
+        await services.ensure_session_node("already-bare", {})
+
+        node = await services.graph.get_node("already-bare")
+        assert node is not None
+        assert "StubSession" not in node["labels"], (
+            "The 'already exists' branch must never add StubSession, even to "
+            "a node that is itself still bare."
+        )
+
+    # -----------------------------------------------------------------
+    # Full lifecycle: stub created by reference, then StubSession cleared
+    # by whichever terminal label the session's own lifecycle event assigns.
+    # -----------------------------------------------------------------
+
+    async def test_stub_then_parentless_start_gains_root_session_clears_stub(
+        self, services: HookStateService
+    ) -> None:
+        """A stub later reached by its own parentless session:start must gain
+        RootSession AND lose StubSession."""
+        await services.ensure_session_node("later-root", {})
+        stub = await services.graph.get_node("later-root")
+        assert stub is not None
+        assert "StubSession" in stub["labels"]
+
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "later-root",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+
+        node = await services.graph.get_node("later-root")
+        assert node is not None
+        assert "RootSession" in node["labels"]
+        assert "StubSession" not in node["labels"], (
+            "Genuine session:start enrichment must clear the StubSession marker"
+        )
+
+    async def test_stub_then_start_with_parent_gains_sub_session_clears_stub(
+        self, services: HookStateService
+    ) -> None:
+        """A stub later reached by session:start WITH a parent must gain
+        SubSession AND lose StubSession."""
+        await services.ensure_session_node("later-sub", {})
+        stub = await services.graph.get_node("later-sub")
+        assert stub is not None
+        assert "StubSession" in stub["labels"]
+
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "later-sub",
+                "parent_id": "some-parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+
+        node = await services.graph.get_node("later-sub")
+        assert node is not None
+        assert "SubSession" in node["labels"]
+        assert "StubSession" not in node["labels"]
+
+    async def test_stub_then_fork_gains_forked_session_clears_stub(
+        self, services: HookStateService
+    ) -> None:
+        """A stub later reached by session:fork must gain ForkedSession AND
+        lose StubSession."""
+        await services.ensure_session_node("later-fork", {})
+        stub = await services.graph.get_node("later-fork")
+        assert stub is not None
+        assert "StubSession" in stub["labels"]
+
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "later-fork",
+                "parent_id": "some-parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+
+        node = await services.graph.get_node("later-fork")
+        assert node is not None
+        assert "ForkedSession" in node["labels"]
+        assert "StubSession" not in node["labels"]
+
+    async def test_stub_then_end_without_start_gains_incomplete_session_clears_stub(
+        self, services: HookStateService
+    ) -> None:
+        """A stub that reaches session:end with no prior start/fork must gain
+        IncompleteSession AND lose StubSession — IncompleteSession is a
+        confirmed (if incomplete) terminal outcome, not an orphaned stub."""
+        await services.ensure_session_node("later-incomplete", {})
+        stub = await services.graph.get_node("later-incomplete")
+        assert stub is not None
+        assert "StubSession" in stub["labels"]
+
+        handler = SessionHandler(services)
+        await handler(
+            "session:end",
+            {
+                "session_id": "later-incomplete",
+                "timestamp": "2026-01-01T01:00:00Z",
+            },
+        )
+
+        node = await services.graph.get_node("later-incomplete")
+        assert node is not None
+        assert "IncompleteSession" in node["labels"]
+        assert "StubSession" not in node["labels"], (
+            "IncompleteSession is a confirmed terminal outcome; StubSession "
+            "must be cleared even though the session never had a real start"
+        )
+
+    async def test_late_parent_stub_created_by_start_carries_stub_session(
+        self, services: HookStateService
+    ) -> None:
+        """The parent stub created via ensure_session_node inside _handle_start
+        (session.py:196, when a child's session:start names a not-yet-seen
+        parent) must carry StubSession — it is exactly the reference-created
+        stub this marker exists for."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:start",
+            {
+                "session_id": "child-of-late-parent",
+                "parent_id": "late-parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        parent_node = await services.graph.get_node("late-parent")
+        assert parent_node is not None
+        assert "StubSession" in parent_node["labels"], (
+            "A parent stub created by the child's session:start (parent not "
+            "yet seen) must carry StubSession until the parent's own "
+            "lifecycle event arrives"
+        )
+
+    async def test_late_parent_stub_created_by_fork_carries_stub_session(
+        self, services: HookStateService
+    ) -> None:
+        """The parent stub created via ensure_session_node inside _handle_fork
+        (session.py:262, when a child's session:fork names a not-yet-seen
+        parent) must carry StubSession."""
+        handler = SessionHandler(services)
+        await handler(
+            "session:fork",
+            {
+                "session_id": "fork-child-of-late-parent",
+                "parent_id": "late-fork-parent",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+        parent_node = await services.graph.get_node("late-fork-parent")
+        assert parent_node is not None
+        assert "StubSession" in parent_node["labels"]
 
 
 # ---------------------------------------------------------------------------
