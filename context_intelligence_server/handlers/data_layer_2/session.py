@@ -71,29 +71,49 @@ class SessionLabelStateMachine:
     def classify(
         self, current_type: str | None, event: str, has_parent: bool
     ) -> LabelTransition:
+        # NOTE on "StubSession" removal below: StubSession is a plain observability
+        # marker (added by services.ensure_session_node when a node is created from
+        # a reference — delegation, fork/start parent — before its own lifecycle
+        # events arrive).  It is not part of the RootSession/SubSession/ForkedSession
+        # terminal lattice.  Every branch below that assigns a REAL terminal label
+        # (including IncompleteSession, a confirmed-if-incomplete terminal) also
+        # clears StubSession, so genuine late enrichment removes the marker.  Removing
+        # a label that isn't present is a silent no-op (see GraphState.set_labels /
+        # Neo4jGraphStore.set_labels), so it is always safe to include in `remove`.
         if event == "start":
             if current_type in ("ForkedSession", "SubSession"):
                 return LabelTransition()
             if current_type == "RootSession":
                 if has_parent:
                     return LabelTransition(
-                        add=["SubSession", "SST_EVENT"], remove=["RootSession"]
+                        add=["SubSession", "SST_EVENT"],
+                        remove=["RootSession", "StubSession"],
                     )
                 return LabelTransition()
             # bare session (current_type is None)
             if has_parent:
-                return LabelTransition(add=["Session", "SubSession", "SST_EVENT"])
-            return LabelTransition(add=["RootSession", "Session", "SST_EVENT"])
+                return LabelTransition(
+                    add=["Session", "SubSession", "SST_EVENT"],
+                    remove=["StubSession"],
+                )
+            return LabelTransition(
+                add=["RootSession", "Session", "SST_EVENT"],
+                remove=["StubSession"],
+            )
 
         if event == "fork":
             if current_type == "ForkedSession":
                 return LabelTransition()
             if current_type in ("RootSession", "SubSession"):
                 return LabelTransition(
-                    add=["ForkedSession", "SST_EVENT"], remove=[current_type]
+                    add=["ForkedSession", "SST_EVENT"],
+                    remove=[current_type, "StubSession"],
                 )
             # bare session (current_type is None)
-            return LabelTransition(add=["Session", "ForkedSession", "SST_EVENT"])
+            return LabelTransition(
+                add=["Session", "ForkedSession", "SST_EVENT"],
+                remove=["StubSession"],
+            )
 
         if event == "end":
             if current_type is not None:
@@ -101,12 +121,17 @@ class SessionLabelStateMachine:
             # Bare session: session:start/fork was permanently lost.  Rather than
             # fabricating a real terminal (Sub/Root), mark it explicitly so it
             # stays outside the clean terminal space and surfaces as a health signal.
+            # IncompleteSession IS a confirmed (if incomplete) terminal outcome — the
+            # node is no longer an orphaned stub, it is a diagnosed data-loss case —
+            # so StubSession is cleared here too.
             #
             # NOTE: if a real start/fork ever arrives AFTER this end (out-of-order,
             # vanishingly rare), _handle_start/_handle_fork will classify normally
             # and add the real terminal.  IncompleteSession may then coexist as an
             # audit trail — that is acceptable; no special stripping is needed.
-            return LabelTransition(add=["IncompleteSession", "SST_EVENT"])
+            return LabelTransition(
+                add=["IncompleteSession", "SST_EVENT"], remove=["StubSession"]
+            )
 
         raise ValueError(f"classify() received unknown event: {event!r}")
 
@@ -290,15 +315,22 @@ class SessionHandler:
         _warn_if_dual_terminal(labels, session_id)
         parent_id = _parent_of(data)
 
-        await self.services.graph.upsert_node(
-            session_id,
-            {
-                "labels": ["Session", "SST_EVENT"],
-                "ended_at": timestamp,
-                "status": "completed",
-                "session_id": session_id,
-            },
-        )
+        end_node_data: dict[str, Any] = {
+            "labels": ["Session", "SST_EVENT"],
+            "ended_at": timestamp,
+            "status": "completed",
+            "session_id": session_id,
+        }
+        # Persist parent_id when the end payload carries one.  _handle_start and
+        # _handle_fork already write parent_id, but a session that reaches
+        # session:end WITHOUT a captured start/fork previously never had
+        # parent_id recorded at all — leaving `parent_id IS NULL` ambiguous
+        # between "genuinely no parent" and "parent never recorded". Only write
+        # when present in the payload; never fabricate a value when absent.
+        if parent_id:
+            end_node_data["parent_id"] = parent_id
+
+        await self.services.graph.upsert_node(session_id, end_node_data)
 
         # SOURCED_FROM bridge: Session -> data_layer_1 session:end event
         data_layer_1_node_id = make_node_id(session_id, "session:end", timestamp)

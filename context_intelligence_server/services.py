@@ -295,8 +295,17 @@ class HookStateService:
         # Node absent from both cache and graph — create it as a bare Session node.
         # ensure_session_node is a safety net; SessionHandler is the sole authority
         # on session type labels (RootSession, SubSession, ForkedSession).
+        #
+        # "StubSession" marks this node as created by a reference (delegation,
+        # fork/start parent) BEFORE its own lifecycle events arrived.  If those
+        # events never arrive, the node stays bare forever — indistinguishable
+        # by label from a node about to be enriched.  StubSession makes that
+        # permanently-orphaned state observable.  It is a plain marker, not a
+        # terminal label: SessionLabelStateMachine.classify() removes it the
+        # moment a real terminal label (RootSession/SubSession/ForkedSession/
+        # IncompleteSession) is assigned via genuine lifecycle enrichment.
         node_data: dict[str, Any] = {
-            "labels": ["Session"],
+            "labels": ["Session", "StubSession"],
             "status": "running",
             "session_id": session_id,  # explicit property — enables direct query without HAS_EVENT traversal
         }
