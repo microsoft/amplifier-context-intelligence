@@ -17,7 +17,7 @@ Amplifier CLI sessions
 |   under a global write semaphore         |------->| Property graph       |
 | - Retry + dead-letter + crash recovery   |        | 5 node / 8 edge types|
 | - Blob storage (large payloads to disk)  |        +----------------------+
-| - Dashboard + API docs + Cypher proxy    |
+| - API docs (/docs) + Cypher proxy        |
 +------------------------------------------+
 ```
 
@@ -75,11 +75,10 @@ empty-`{}` hard-error rule, and the raw-token-vs-digest guardrail — is in
 > `api_keys` keystore and prints the token once — no manual steps. See
 > [docs/local-development.md](docs/local-development.md).
 
-> **Local static run with the web dashboard + runtime admin API?** For a
-> copy-paste path that strings install → Neo4j → `server-config.yaml`
-> (`api_keys` + `admin_api_key` + `web_ui_enabled: true`) → run → verify → use
-> `/admin/*`, see the **"Local quickstart — static mode with web UI + admin"**
-> section in [docs/service-setup.md](docs/service-setup.md).
+> **Local static run with the runtime admin API?** For a copy-paste path that
+> strings install → Neo4j → `server-config.yaml` (`api_keys` + `admin_api_key`)
+> → run → verify → use `/admin/*`, see the **"Local quickstart — static mode
+> with admin"** section in [docs/service-setup.md](docs/service-setup.md).
 
 ---
 
@@ -224,9 +223,10 @@ provenance field. A missing/invalid credential is a **401**; a valid credential
 that lacks the needed binding or role is a **403** — a delegated user whose `oid`
 is unmapped, or a service token with no qualifying App Role (its 403 body names the
 `appid`/`oid` and the required roles). **Behavior change (M2):** a token with no
-`scp` and no qualifying role now returns **403** (previously **401**). Health and
-(in full-web mode) the dashboard/docs paths are exempt; in API-only mode
-(`web_ui_enabled=false`) the exempt set shrinks to `{/status, /version}`.
+`scp` and no qualifying role now returns **403** (previously **401**). The server is
+headless, so there is a single fixed exempt set that never requires a token:
+`{/status, /version, /docs, /openapi.json}` — health/version plus the always-on
+OpenAPI/Swagger surface.
 
 **Admin authority** is a separate layer that gates the `/admin/*` identity-map
 endpoints: in static mode a dedicated `admin_api_key` (recognized by the
@@ -260,10 +260,9 @@ Full runtime onboarding/offboarding runbook and the `/admin/*` API:
 |--------|------|-------------|
 | `POST` | `/events` | Ingest a session event (returns 202 immediately) |
 | `GET` | `/status` | Server health, active sessions, completed history, error counts, `neo4j_connected`, `neo4j_query_connected` (reflects the read/cypher_query driver's connection health), `neo4j_url`, `neo4j_browser_url` |
-| `GET` | `/` | Landing page with navigation cards |
-| `GET` | `/dashboard` | Live monitoring dashboard |
-| `GET` | `/docs` | Swagger API docs |
-| `GET` | `/logs/stream` | Server-Sent Events — live structured log tail |
+| `GET` | `/version` | Server version (`{"version": "..."}`) — always unauthenticated |
+| `GET` | `/docs` | Swagger UI — always on (auth-exempt) |
+| `GET` | `/openapi.json` | OpenAPI spec — always on (auth-exempt) |
 | `GET` | `/blobs/{session_id}` | List all blob URIs for a session |
 | `GET` | `/blobs/{session_id}/{key}` | Retrieve a stored blob |
 | `POST` | `/cypher` | Proxy a Cypher query to Neo4j |
@@ -317,7 +316,7 @@ Values are resolved with this priority (highest first):
 | Environment variable | YAML key | Default | Description |
 |----------------------|----------|---------|-------------|
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE` | *(env only)* | `server-config.yaml` | Path to the YAML config file |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY` | `api_key` | *(empty — auth disabled)* | Legacy single bearer token (folds to contributor id `owner`). When set, all API endpoints except `/status` and static routes require `Authorization: Bearer <value>`. The server verifies a request by computing `sha256(token)` and matching it. Coexists with `api_keys`. See [docs/managing-api-keys.md](docs/managing-api-keys.md). |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY` | `api_key` | *(empty — auth disabled)* | Legacy single bearer token (folds to contributor id `owner`). When set, all API endpoints except the fixed exempt set (`/status`, `/version`, `/docs`, `/openapi.json`) require `Authorization: Bearer <value>`. The server verifies a request by computing `sha256(token)` and matching it. Coexists with `api_keys`. See [docs/managing-api-keys.md](docs/managing-api-keys.md). |
 | *(YAML only)* | `api_keys` | *(empty — disabled)* | Per-contributor keystore: a map of `sha256_hex(token) -> {id: <contributor>}`. The server stores only digests; the peer sends the **raw** token and the server hashes it to look up the contributor. `api_keys: {}` (empty map) is a **hard startup error** — omit or use `null` to disable auth. The matched `id` is recorded as `created_by` on graph nodes. See [docs/managing-api-keys.md](docs/managing-api-keys.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AUTH_MODE` | `auth_mode` | `static` | Selects the active resolver: `static` (sha256 keystore, the `api_key`/`api_keys` path above) or `entra` (Microsoft Entra JWT validation via JWKS). Exactly one mode is active. `entra` requires the three fields below. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_CLIENT_ID` | `azure_client_id` | *(empty)* | App Registration (client) GUID. **Required when `auth_mode=entra`** (startup refuses otherwise). See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
@@ -331,16 +330,15 @@ Values are resolved with this priority (highest first):
 | *(YAML only)* | `api_keys_store_path` | `/data/identity/api-keys.json` | Durable JSON file backing the **static** identity map (`sha256(key) -> contributor`). The in-process map is seeded from `api_keys` on first boot, then this file is the source of truth for runtime `/admin/keys` edits. |
 | *(YAML only)* | `entra_identities_store_path` | `/data/identity/entra-identities.json` | Durable JSON file backing the **entra** identity map (`oid -> contributor`). Seeded from `entra_identities` on first boot, then this file is the source of truth for runtime `/admin/identities` edits. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ALLOW_UNAUTHENTICATED` | `allow_unauthenticated` | `false` | Opt-out of the fail-closed startup gate so the server can boot with no auth configured (every request passes through). **TEST/DEV ONLY — never set in production.** |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_WEB_UI_ENABLED` | `web_ui_enabled` | `true` | When `false`, locks down to API-only: no OpenAPI schema / Swagger UI, and the index, dashboard, static assets, and `/logs/stream` routes are unregistered and removed from the auth-exempt set (`/logs/stream` becomes auth-gated). |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL` | `neo4j_url` | `neo4j://neo4j:7687` | Neo4j bolt/driver URL used for all graph operations. **Displayed verbatim in the web UI.** May point to a remote host — `bolt://db.internal:7687` is valid. Use `bolt://` scheme for Community Edition single-node installs. |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_BROWSER_URL` | `neo4j_browser_url` | `http://localhost:7474` | Neo4j Browser HTTP UI URL. **Displayed verbatim as a clickable link in the web UI.** Set to the address reachable from your browser — not necessarily `localhost` if Neo4j is on a remote machine. |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL` | `neo4j_url` | `neo4j://neo4j:7687` | Neo4j bolt/driver URL used for all graph operations. **Surfaced verbatim in the `/status` response (`neo4j_url`).** May point to a remote host — `bolt://db.internal:7687` is valid. Use `bolt://` scheme for Community Edition single-node installs. |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_BROWSER_URL` | `neo4j_browser_url` | `http://localhost:7474` | Neo4j Browser HTTP UI URL. **Surfaced verbatim in the `/status` response (`neo4j_browser_url`).** Set to the address reachable from your browser — not necessarily `localhost` if Neo4j is on a remote machine. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_USER` | `neo4j_user` | `neo4j` | Neo4j username (legacy single-credential form; used for both internal clients when the structured `neo4j:` block is omitted). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD` | `neo4j_password` | `password` | Neo4j password (legacy single-credential form). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__URL` | `neo4j.admin.url` | *(required if block set)* | **Two-client split (opt-in).** Bolt URL for the **admin / WRITE** client (ingest + schema). Note the `__` nested delimiter. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__USERNAME` | `neo4j.admin.username` | `neo4j` | Username for the admin/WRITE client. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__PASSWORD` | `neo4j.admin.password` | *(empty = no-auth, dev only)* | Password for the admin/WRITE client. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__ACCESS_MODE` | `neo4j.admin.access_mode` | `WRITE` | **MUST be `WRITE`** — startup fails otherwise. |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__URL` | `neo4j.cypher_query.url` | *(required if block set)* | Bolt URL for the **cypher_query / READ** client (`POST /cypher` + dashboard reads). May differ from admin (e.g. a read replica). |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__URL` | `neo4j.cypher_query.url` | *(required if block set)* | Bolt URL for the **cypher_query / READ** client (`POST /cypher` reads). May differ from admin (e.g. a read replica). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__USERNAME` | `neo4j.cypher_query.username` | `neo4j` | Username for the read client (use a separate, ideally read-only, credential). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__PASSWORD` | `neo4j.cypher_query.password` | *(empty = no-auth, dev only)* | Password for the read client. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__ACCESS_MODE` | `neo4j.cypher_query.access_mode` | `WRITE` | **MUST be set to `READ`** — the default is `WRITE`, so omitting it is a hard startup error. |
@@ -353,7 +351,7 @@ Values are resolved with this priority (highest first):
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_LEVEL` | `log_level` | `INFO` | Log level (`DEBUG`/`INFO`/`WARNING`/`ERROR`) |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVER_HOST` | `server_host` | `0.0.0.0` | Bind host |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVER_PORT` | `server_port` | `8000` | Bind port |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_DASHBOARD_INACTIVE_TIMEOUT` | `dashboard_inactive_timeout` | `1800.0` | Seconds before a session is hidden from the dashboard (30 min) |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_STATUS_INACTIVE_TIMEOUT` | `status_inactive_timeout` | `1800.0` | Seconds before a session is hidden from the `/status` active-sessions list (30 min) |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_STALE_SESSION_TIMEOUT` | `stale_session_timeout` | `432000.0` | Seconds before a session worker is reaped (5 days) |
 
 > **Note:** `CONFIG_FILE` is resolved before any other setting and cannot itself be set from the YAML file — only from the environment.
@@ -455,7 +453,7 @@ uv run pytest tests/ -q
 ```
 amplifier-context-intelligence/
 ├── context_intelligence_server/         # Ingestion server (FastAPI)
-│   ├── main.py                          # App factory, lifespan, static files
+│   ├── main.py                          # App factory, lifespan, routes
 │   ├── config.py                        # Pydantic Settings + YAML source
 │   ├── queue_manager.py                 # Durable per-session append-log (persist-then-202)
 │   ├── registry.py                      # Per-session drainers (drain_worker, write semaphore, retry/dead-letter)
@@ -466,10 +464,9 @@ amplifier-context-intelligence/
 │   ├── blob_store.py                    # AsyncDiskBlobStore
 │   ├── idempotency.py                   # Idempotent MERGE / dedupe helpers
 │   ├── auth.py                          # Bearer-token API authentication
-│   ├── dashboard.py                     # Dashboard SSE stream
+│   ├── status.py                        # Status/version plumbing (EventRingBuffer, build_status_response, SERVER_VERSION)
 │   ├── routers/                         # API routers: queues.py, version.py
-│   ├── handlers/                        # Event handlers: data_layer_1/2/3/ + field_lifters/
-│   └── web/                             # Dashboard HTML + static assets
+│   └── handlers/                        # Event handlers: data_layer_1/2/3/ + field_lifters/
 ├── server-config.example.yaml           # Configuration file template
 ├── scripts/prime-local-config.py        # Local key/config bootstrap (non-Docker)
 └── Dockerfile                           # Ingestion server image (Azure/shipping)

@@ -286,7 +286,7 @@ So future readers can verify rather than trust:
 The server talks to Neo4j through **two internal clients**:
 
 - **admin** — read/write. Used for ingest (`POST /events` drains) and schema.
-- **cypher_query** — read-intent. Used for `POST /cypher` and dashboard reads.
+- **cypher_query** — read-intent. Used for `POST /cypher` reads.
 
 This lets you give the read path a **separate credential** (and optionally a
 **separate URL**, e.g. a read replica), so you can tighten data access later
@@ -368,8 +368,7 @@ startup failure with the invariant message shown in § 9.2.
 existing `neo4j_connected`. It reflects whether the **cypher_query** (read) driver
 is connected:
 
-- `true` — the read driver reached its Neo4j endpoint; `/cypher` and dashboard
-  reads can serve.
+- `true` — the read driver reached its Neo4j endpoint; `/cypher` reads can serve.
 - `false` — the read driver is not connected; `/cypher` reads will fail even if
   ingest is healthy.
 

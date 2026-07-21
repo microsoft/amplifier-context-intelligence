@@ -1,6 +1,5 @@
 """FastAPI application entrypoint for the Context Intelligence Server."""
 
-import asyncio
 import json
 import logging
 import os
@@ -12,16 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import aiofiles
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import (
-    FileResponse,
-    HTMLResponse,
-    JSONResponse,
-    Response,
-    StreamingResponse,
-)
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, Response
 from neo4j import READ_ACCESS, WRITE_ACCESS, AsyncGraphDatabase
 
 from context_intelligence_server import __version__
@@ -30,7 +21,6 @@ from context_intelligence_server.auth import (
     EntraResolver,
     StaticKeyResolver,
     _EXEMPT_PATHS,
-    _EXEMPT_PATHS_API_ONLY,
 )
 from context_intelligence_server.authz import (  # noqa: F401 — re-exported for tests/routes
     _is_write_capable,
@@ -40,7 +30,7 @@ from context_intelligence_server.authz import (  # noqa: F401 — re-exported fo
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import Settings, get_settings
 from context_intelligence_server.identity_store import IdentityStore
-from context_intelligence_server.dashboard import build_status_response
+from context_intelligence_server.status import build_status_response
 from context_intelligence_server.routers.admin import router as admin_router
 from context_intelligence_server.routers.queues import router as queues_router
 from context_intelligence_server.routers.version import router as version_router
@@ -208,11 +198,12 @@ app = FastAPI(
     title="Context Intelligence Server",
     version=__version__,
     lifespan=lifespan,
-    # web_ui_enabled=False locks down to API-only: no OpenAPI schema, no Swagger UI.
-    # Must be set at construction time — FastAPI does not support changing these after init.
-    docs_url="/docs" if _settings.web_ui_enabled else None,
-    redoc_url="/redoc" if _settings.web_ui_enabled else None,
-    openapi_url="/openapi.json" if _settings.web_ui_enabled else None,
+    # Headless server: no browser-facing UI. The OpenAPI contract + Swagger UI
+    # are the developer surface and are always registered; ReDoc is a redundant
+    # second doc UI and is intentionally left off (docs_url=None equivalent).
+    docs_url="/docs",
+    redoc_url=None,
+    openapi_url="/openapi.json",
 )
 app.include_router(admin_router)
 app.include_router(version_router)
@@ -260,34 +251,27 @@ def _validate_data_timestamp(data: dict[str, Any]) -> None:
         )
 
 
-_WEB_DIR = Path(__file__).parent / "web"
-
-
 def _assert_admin_not_exempt() -> None:
     """Startup assertion (TB-07): /admin/* must NEVER be in any exempt set.
 
     Called by ``create_asgi_app`` before constructing the middleware.
     Raises ``RuntimeError`` if any ``/admin`` path or prefix appears in
-    ``_EXEMPT_PATHS``, ``_EXEMPT_PATHS_API_ONLY``, or ``_EXEMPT_PREFIXES``,
-    because that would make the admin API accessible without authentication.
+    ``_EXEMPT_PATHS`` or ``_EXEMPT_PREFIXES``, because that would make the
+    admin API accessible without authentication.
 
     This is a defence-in-depth structural check: it is impossible to
     accidentally ship an unauthenticated admin surface.
     """
     import context_intelligence_server.auth as _auth_module  # noqa: PLC0415
 
-    # Check exact-path exempt sets.
-    for exempt_set_name, exempt_set in (
-        ("_EXEMPT_PATHS", _auth_module._EXEMPT_PATHS),
-        ("_EXEMPT_PATHS_API_ONLY", _auth_module._EXEMPT_PATHS_API_ONLY),
-    ):
-        for path in exempt_set:
-            if path == "/admin" or path.startswith("/admin/"):
-                raise RuntimeError(
-                    f"Security invariant violated: /admin path {path!r} found in "
-                    f"auth.{exempt_set_name}.  The /admin surface MUST be "
-                    f"authenticated — remove it from the exempt set immediately."
-                )
+    # Check the exact-path exempt set.
+    for path in _auth_module._EXEMPT_PATHS:
+        if path == "/admin" or path.startswith("/admin/"):
+            raise RuntimeError(
+                f"Security invariant violated: /admin path {path!r} found in "
+                f"auth._EXEMPT_PATHS.  The /admin surface MUST be "
+                f"authenticated — remove it from the exempt set immediately."
+            )
 
     # Check prefix exempt tuple.
     for prefix in _auth_module._EXEMPT_PREFIXES:
@@ -554,15 +538,10 @@ def create_asgi_app(
     # sha256 of admin_api_key (or None when admin_api_key is not configured).
     app.state.admin_api_key_digest = admin_api_key_digest
 
-    # Select the auth-exempt path set based on web_ui_enabled.
-    # web_ui_enabled=False (api-only): use the smaller set that excludes /logs/stream
-    # and other web-UI paths so they cannot be reached unauthenticated.
-    # web_ui_enabled=True (default): use the full set including web-UI paths.
-    exempt = _EXEMPT_PATHS if s.web_ui_enabled else _EXEMPT_PATHS_API_ONLY
     return BearerTokenMiddleware(
         app,
         resolver=resolver,
-        exempt_paths=exempt,
+        exempt_paths=_EXEMPT_PATHS,
         admin_api_key_digest=admin_api_key_digest,
         allow_unauthenticated=s.allow_unauthenticated,
     )
@@ -571,21 +550,6 @@ def create_asgi_app(
 # Module-level ASGI app used by Gunicorn: context_intelligence_server.main:asgi_app
 # The raw `app` is kept for internal use and testing against un-authed routes.
 asgi_app: BearerTokenMiddleware = create_asgi_app()
-
-
-if _settings.web_ui_enabled:
-    # static mount moved into this block so there is ONE conditional for all web-UI
-    # registrations that appear before the API routes.  (The /logs/stream route has
-    # its own block below because it lives after the /blobs routes in the file.)
-    app.mount("/static", StaticFiles(directory=_WEB_DIR / "static"), name="static")
-
-    @app.get("/", response_class=HTMLResponse)
-    async def index() -> FileResponse:
-        return FileResponse(_WEB_DIR / "index.html")
-
-    @app.get("/dashboard", response_class=HTMLResponse)
-    async def dashboard() -> FileResponse:
-        return FileResponse(_WEB_DIR / "dashboard.html")
 
 
 # ---------------------------------------------------------------------------
@@ -735,45 +699,6 @@ async def get_blob(session_id: str, key: str) -> JSONResponse:
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Blob not found: {uri}")
     return JSONResponse(content=content)
-
-
-if _settings.web_ui_enabled:
-    # /logs/stream is web-UI only — the dashboard consumes it.  When web_ui_enabled=False
-    # this route is absent (→ 404) and the path is not in _EXEMPT_PATHS_API_ONLY, so any
-    # unauthenticated request is gated by the middleware (→ 401).
-    @app.get("/logs/stream")
-    async def stream_logs(request: Request) -> StreamingResponse:
-        """Stream server log lines as Server-Sent Events."""
-        log_path = Path(_settings.log_path)
-
-        async def event_generator() -> AsyncGenerator[str, None]:
-            # Backfill last 200 lines (skip if log file does not yet exist)
-            if log_path.exists():
-                for line in log_path.read_text().splitlines()[-200:]:
-                    yield f"data: {line}\n\n"
-
-            # Tail new lines (return early if log file still does not exist)
-            if not log_path.exists():
-                return
-            async with aiofiles.open(log_path, mode="r") as f:
-                await f.seek(0, 2)
-                while True:
-                    if await request.is_disconnected():
-                        break
-                    line = await f.readline()
-                    if not line:
-                        await asyncio.sleep(0.2)
-                    else:
-                        yield f"data: {line.rstrip()}\n\n"
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
-        )
 
 
 @app.post("/cypher", dependencies=[Depends(require_read)])

@@ -94,9 +94,8 @@ context_intelligence_server/      # FastAPI ingestion server
 ├── routers/                      # API routers (queues.py = dead-letter inspect/replay/purge; admin.py = /admin/* identity-map CRUD)
 ├── auth.py                       # Bearer-token auth middleware (StaticKeyResolver / EntraResolver via PrincipalResolver; BearerTokenMiddleware; admin-key recognition)
 ├── identity_store.py             # Durable JSON identity map (write-file-then-swap, fail-closed load, live flat_dict)
-├── dashboard.py                  # Dashboard SSE stream
-├── models.py                     # Pydantic request/response models
-└── web/                          # Dashboard HTML + static assets
+├── status.py                     # Status/version plumbing (EventRingBuffer, build_status_response, SERVER_VERSION, ring_buffer)
+└── models.py                     # Pydantic request/response models
 
 docs/                             # ⚠️ PRODUCT DOCUMENTATION ONLY
 ├── architecture/                 # DOT diagrams: pipeline, handlers, graph model
@@ -406,10 +405,10 @@ Full runbook: `docs/azure-deployment.md` → "Seeding the identity map on a FRES
 `/data`". Tooling: `scripts/seed-entra-identities.sh` (idempotent, fail-loud, no
 real oids committed).
 
-### Local static run (web UI + admin) — the common single-box setup
+### Local static run (admin) — the common single-box setup
 
-For a local server with static keys, the browser dashboard, and runtime
-onboarding (no restart), set these in `server-config.yaml`:
+The server is **headless** (API-only — no browser dashboard). For a local server with static keys and runtime onboarding (no restart),
+set these in `server-config.yaml`:
 
 - `auth_mode: static` (default) **+** an `api_keys` entry
   (`sha256(token) -> {id: <contributor>}`) — the data credential.
@@ -418,14 +417,15 @@ onboarding (no restart), set these in `server-config.yaml`:
   admin key is recognized *before* the data resolver, so requests bearing it are
   attributed `created_by="admin"` — reusing the capture hook's token stamps your
   captured sessions `admin` instead of the real contributor.
-- `web_ui_enabled: true` (default) — dashboard + `/docs` at `:8000`; `false` =
-  API-only (those routes 404).
 - `api_keys_store_path` — point at a **writable** dir; the `/data/...` default is
   not writable on a normal box. Seeded from `api_keys` on first boot, then it is
   the source of truth for `/admin/keys` edits.
 
+The OpenAPI docs surface (`/docs` + `/openapi.json`) is **always on** and
+auth-exempt — it is not a dashboard and has no toggle.
+
 Copy-paste quickstart: `docs/service-setup.md` ("Local quickstart — static mode
-with web UI + admin"). Runtime runbook: `docs/identity-management.md`.
+with admin"). Runtime runbook: `docs/identity-management.md`.
 
 ---
 

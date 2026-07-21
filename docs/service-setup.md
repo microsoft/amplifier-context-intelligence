@@ -6,11 +6,12 @@ integrated with the Amplifier CLI so sessions are automatically captured.
 
 ---
 
-## Local quickstart — static mode with web UI + admin
+## Local quickstart — static mode with admin
 
-The fastest path to a **local** server (server v6.0.0): static API-key auth, the
-browser dashboard **on**, and the runtime `/admin/*` identity-map API **enabled**.
-Every value below is a **placeholder** — substitute your own. The numbered
+The fastest path to a **local** server (server v6.0.0): static API-key auth and
+the runtime `/admin/*` identity-map API **enabled**. The server is **headless**
+(API-only) — there is no browser dashboard; the OpenAPI docs at `/docs` are always
+on. Every value below is a **placeholder** — substitute your own. The numbered
 sections after this one explain each step in full.
 
 **1. Install uv and the server** (one binary lands in `~/.local/bin`):
@@ -71,7 +72,7 @@ echo "DATA  digest (goes into api_keys):       $DATA_DIGEST"
 echo "ADMIN token (bearer for /admin/* calls): $ADMIN_TOKEN"
 ```
 
-**4. Write `server-config.yaml`** — static mode, web UI on, admin on, **local
+**4. Write `server-config.yaml`** — static mode, admin on, **local
 writable** store paths. Create the dirs, then drop in the file:
 
 ```bash
@@ -93,8 +94,8 @@ api_keys:
 # IMPORTANT: keep this DISTINCT from any data token in api_keys (see note below).
 admin_api_key: "<ADMIN_TOKEN>"
 
-# --- Web dashboard + OpenAPI docs at http://localhost:8000 ---
-web_ui_enabled: true        # default true; set false for an API-only deployment
+# The server is headless (API-only). OpenAPI docs at http://localhost:8000/docs
+# are always on and auth-exempt.
 
 # --- Identity-map store files (LOCAL writable dir — default /data/... is not writable on a normal box) ---
 api_keys_store_path: "/home/you/amplifier-context-intelligence-server-data-store/identity/api-keys.json"
@@ -140,7 +141,9 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8000/events \
 # → 401   (auth is enforced)
 ```
 
-Open `http://localhost:8000` and paste the **DATA token** when prompted.
+Explore the API interactively at `http://localhost:8000/docs` (Swagger UI, always
+on and unauthenticated); data endpoints still require the **DATA token** as
+`Authorization: Bearer <token>`.
 
 **7. Use the admin API** (static — the bearer is the **ADMIN token**):
 
@@ -250,9 +253,9 @@ cypher-shell -u neo4j -p '<your-strong-password>' "RETURN apoc.version();"
 > Neo4j exposes **two ports**: the bolt driver port used for all data operations,
 > and the HTTP browser UI port used only for the Neo4j Browser web interface. Both
 > must be configured separately — `neo4j_url` for the driver connection,
-> `neo4j_browser_url` for the browser link shown in the web UI. Both are displayed
-> verbatim from the config, so if Neo4j is on a remote machine, use that machine's
-> hostname in both values.
+> `neo4j_browser_url` for the Neo4j Browser link surfaced in the `/status`
+> response. Both are displayed verbatim from the config, so if Neo4j is on a
+> remote machine, use that machine's hostname in both values.
 
 ---
 
@@ -289,7 +292,7 @@ curl -o ~/.config/context-intelligence/server-config.yaml \
 
 Edit the file and set values for your machine — at minimum `neo4j_url` (use the
 `bolt://` scheme and your `NEO4J_BOLT_PORT` from Step 2), `neo4j_browser_url`
-(your `NEO4J_HTTP_PORT`, displayed as a clickable link in the web UI), and
+(your `NEO4J_HTTP_PORT`, surfaced in the `/status` response), and
 `neo4j_password`. Configuration keys are grouped into three categories below.
 
 ### Authentication
@@ -329,7 +332,7 @@ peers, the empty-`{}` hard-error rule, and the raw-token-vs-digest guardrail —
 
 ---
 
-### Admin API, web UI, and identity-map stores (the local-static essentials)
+### Admin API and identity-map stores (the local-static essentials)
 
 These cover the three things a local static-mode run usually needs turned on or
 pointed somewhere writable. All are plain `server-config.yaml` keys (or the
@@ -338,7 +341,6 @@ matching `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_*` env var; env wins).
 | Key | Example | Purpose |
 |-----|---------|---------|
 | `admin_api_key` | *(a raw admin token)* | **Enables the `/admin/*` runtime identity-map API in static mode.** A request whose bearer token equals this value is recognised as admin — the middleware checks it **before** the data keystore. Unset/empty → every `/admin/*` call returns **503**; a valid *data* key gets **403**. The admin key cannot be deleted or shadowed via the API (**409**). **Use a token DISTINCT from your data keys** (see caveat). Env: `…_ADMIN_API_KEY`. |
-| `web_ui_enabled` | `true` | **Turns on the browser dashboard at `http://localhost:8000`**, the OpenAPI docs (`/docs`), and the `/logs/stream` tail. **Default `true`.** Set `false` for a locked-down **API-only** deployment — no OpenAPI schema/Swagger UI, and the index/dashboard/static/`/logs/stream` routes are unregistered (those paths 404). Env: `…_WEB_UI_ENABLED`. |
 | `api_keys_store_path` | *(local writable path)* | Durable JSON file backing the static `sha256(key) → contributor` map that `/admin/keys` edits. **The default `/data/identity/api-keys.json` is not writable on a normal box — point it at your data store** (e.g. `…/identity/api-keys.json`). It is **seeded from `api_keys` on first boot**, then this file is the source of truth for runtime edits. |
 | `entra_identities_store_path` | *(local writable path)* | The entra equivalent (`oid → contributor`), used only in `auth_mode=entra`. Same default-not-writable caveat; set it to a writable path even in static mode if you want a clean layout. |
 
@@ -370,14 +372,14 @@ stays fresh without a restart: [identity-management.md](identity-management.md).
 
 | Key | Example | Purpose |
 |-----|---------|---------|
-| `neo4j_url` | `bolt://localhost:37687` | Bolt/driver URL for all graph operations. Use `bolt://` scheme. Port must match `NEO4J_BOLT_PORT` from Step 2. **Displayed verbatim in the web UI** — use the address reachable by the server process, which may differ from what your browser can reach. |
-| `neo4j_browser_url` | `http://localhost:37474` | Neo4j Browser HTTP UI URL. Port must match `NEO4J_HTTP_PORT` from Step 2. **Displayed verbatim as a clickable link in the web UI.** Use the address reachable from your browser — if Neo4j is on a remote machine this will be that machine's hostname or IP, not `localhost`. Never used for driver connections. |
+| `neo4j_url` | `bolt://localhost:37687` | Bolt/driver URL for all graph operations. Use `bolt://` scheme. Port must match `NEO4J_BOLT_PORT` from Step 2. **Surfaced verbatim in the `/status` response** — use the address reachable by the server process, which may differ from what your browser can reach. |
+| `neo4j_browser_url` | `http://localhost:37474` | Neo4j Browser HTTP UI URL. Port must match `NEO4J_HTTP_PORT` from Step 2. **Surfaced verbatim in the `/status` response** (`neo4j_browser_url`). Use the address reachable from your browser — if Neo4j is on a remote machine this will be that machine's hostname or IP, not `localhost`. Never used for driver connections. |
 | `neo4j_user` | `neo4j` | Auth username (legacy single-credential form). |
 | `neo4j_password` | *(your password)* | Auth password. Always required — the server refuses an unauthenticated Neo4j. Must match the password you set on Neo4j (e.g. via `neo4j-admin dbms set-initial-password`). |
 
 > **Optional — separate read/write credentials or URLs (two-client split).** The
 > four flat keys above are the legacy single-credential form and keep working
-> unchanged. The `/cypher` endpoint and dashboard reads run through an internal
+> unchanged. The `/cypher` endpoint reads run through an internal
 > **read** client; ingest and schema changes run through an **admin/write**
 > client. To give them separate credentials (and optionally separate URLs, e.g.
 > a read replica), replace the flat keys with a structured `neo4j:` block:
@@ -608,9 +610,10 @@ If `neo4j_connected` is `false`, check:
 2. Bolt port in `server-config.yaml` matches the port Neo4j listens on (and the URL uses the `bolt://` scheme)
 3. Neo4j password in config matches the password you set on Neo4j
 
-**Dashboard:** open `http://localhost:8000` — enter the API key from Step 4
-when prompted. If the prompt does not appear, hard-refresh (Ctrl+Shift+R) to
-bypass the browser cache.
+**API docs:** the server is headless (no browser dashboard). Explore the API
+interactively at `http://localhost:8000/docs` (Swagger UI) — always on and
+unauthenticated. The raw spec is at `http://localhost:8000/openapi.json`. Data
+endpoints still require the API token from Step 4 as `Authorization: Bearer`.
 
 ---
 
@@ -622,14 +625,13 @@ bypass the browser cache.
 | `neo4j_connected: false` | Bolt port mismatch or wrong scheme | Set `neo4j_url` to `bolt://localhost:<NEO4J_BOLT_PORT>` in config — must use `bolt://` not `neo4j://` |
 | `neo4j_connected: false` (connection refused) | Neo4j not running | Check with `neo4j status` (or Neo4j Desktop); start it with `neo4j start` |
 | `neo4j_query_connected: false` | The read/cypher_query driver is not connected (ingest via the admin driver may still work) | Check the cypher_query URL/credentials and, if using a cluster/read-replica, its reachability |
-| Dashboard "Neo4j Browser" link doesn't work | `neo4j_browser_url` has wrong host/port | Update `neo4j_browser_url` in `server-config.yaml` to the address reachable from your browser — if Neo4j is remote, use the remote hostname, not `localhost` |
+| `neo4j_browser_url` in `/status` points at the wrong host/port | `neo4j_browser_url` misconfigured | Update `neo4j_browser_url` in `server-config.yaml` to the address reachable from your browser — if Neo4j is remote, use the remote hostname, not `localhost` |
 | Service starts then immediately stops | Config file missing or bad path | `journalctl --user -u context-intelligence-server` to see the error |
 | `Permission denied` on blob/log path | Directories don't exist | `mkdir -p` the paths listed in your config |
 | Port 8000 already in use | Conflict with another process | Change `server_port` in config and update the systemd unit |
 | Linux: service doesn't start on boot | Lingering not enabled | `loginctl enable-linger $USER` |
 | macOS: plist loaded but service not running | launchd silently failed | Check `server.stderr.log` for startup errors |
 | Events stop dispatching, circuit breaker tripped | `context_intelligence_api_key` missing from `~/.amplifier/settings.yaml` | Add `context_intelligence_api_key: "<key>"` under `overrides.hook-context-intelligence.config` |
-| Dashboard shows "Enter your API key" and won't load | API key prompt is active | Paste the raw API token you saved at setup into the prompt. It is not in `server-config.yaml` (which holds only the digest under `api_keys`); if lost, rotate it per [managing-api-keys.md](managing-api-keys.md) |
 | Data attributed to the wrong `created_by`, client gets **HTTP 401** floods, or behavior contradicts the deployed code | **Multiple server instances** running at once (an orphan from a manual `uv run`/old deploy racing the service on the same port + Neo4j — see the single-instance invariant at the top of §5) | `ss -ltnp \| grep ':8000'` and `ps -eo pid,args \| grep asgi_app \| grep -v grep`; `kill -TERM` every process **not** owned by the service manager, then `sudo systemctl restart context-intelligence-server.service` and re-verify a single listener. Fix whatever launched the extra copies so the service is the only entry point. |
 
 ---

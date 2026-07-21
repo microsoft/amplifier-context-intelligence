@@ -57,7 +57,7 @@ def test_session_timeout_defaults():
     from context_intelligence_server.config import Settings
 
     s = Settings()
-    assert s.dashboard_inactive_timeout == 1800.0
+    assert s.status_inactive_timeout == 1800.0
     assert s.stale_session_timeout == 432000.0
 
 

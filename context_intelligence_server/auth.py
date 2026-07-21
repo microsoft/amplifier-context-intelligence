@@ -22,33 +22,22 @@ _log = logging.getLogger(__name__)
 # is observed in production metrics).
 JWKS_CACHE_LIFESPAN_SECONDS: int = 300
 
-# Paths that are exempt from authentication (health checks, monitoring, dashboard pages).
-# Used when web_ui_enabled=True (the default full-web mode).
+# Paths that are exempt from authentication: health checks, version info, and
+# the developer-facing OpenAPI/Swagger surface (/docs, /openapi.json). This is
+# a headless, API-only server -- there is no browser dashboard, so there is
+# only ONE exempt-path set.
 _EXEMPT_PATHS: frozenset[str] = frozenset(
     {
         "/status",
         "/version",
-        "/logs/stream",
-        "/",
-        "/dashboard",
         "/docs",
         "/openapi.json",
     }
 )
 
-# Paths exempt from authentication in API-only mode (web_ui_enabled=False).
-# Web-UI-only paths (/logs/stream, /, /dashboard, /docs, /openapi.json) are intentionally
-# absent: those routes are not registered in api-only mode and /logs/stream must not
-# remain an unauthenticated log drain.
-_EXEMPT_PATHS_API_ONLY: frozenset[str] = frozenset(
-    {
-        "/status",
-        "/version",
-    }
-)
-
-# Path prefixes that are exempt from authentication (static assets).
-_EXEMPT_PREFIXES: tuple[str, ...] = ("/static/",)
+# Path prefixes that are exempt from authentication. Empty: the server no
+# longer serves any static assets (the dashboard's /static/ mount was removed).
+_EXEMPT_PREFIXES: tuple[str, ...] = ()
 
 # Route prefix of the admin router (mirrors routers/admin.py:
 # ``APIRouter(prefix="/admin", ...)``).  The static-mode admin-key fast-path is
@@ -650,11 +639,10 @@ class BearerTokenMiddleware:
             # provided (or defaulted-to-empty) keystore dict.
             ks: dict[str, str] = keystore if keystore is not None else {}
             self.resolver = StaticKeyResolver(ks)
-        # Exempt paths: which exact paths bypass auth entirely.  Defaults to the
-        # full web-UI set (_EXEMPT_PATHS); pass _EXEMPT_PATHS_API_ONLY when
-        # web_ui_enabled=False to prevent /logs/stream from being an
-        # unauthenticated log drain.  Path prefixes (_EXEMPT_PREFIXES) are
-        # always applied regardless of this setting.
+        # Exempt paths: which exact paths bypass auth entirely.  Defaults to
+        # the single API-only set (_EXEMPT_PATHS: /status, /version, /docs,
+        # /openapi.json).  Path prefixes (_EXEMPT_PREFIXES) are always applied
+        # in addition to this set.
         self._exempt_paths: frozenset[str] = (
             exempt_paths if exempt_paths is not None else _EXEMPT_PATHS
         )

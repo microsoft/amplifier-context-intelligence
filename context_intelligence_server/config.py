@@ -380,22 +380,6 @@ class Settings(BaseSettings):
     # True, so the fail-open branch can never fire regardless of this flag.)
     allow_unauthenticated: bool = False
 
-    # web_ui_enabled: serve the browser dashboard, OpenAPI docs, and the
-    # streaming log endpoint (/logs/stream).
-    #
-    # Set to False for a locked-down API-only deployment (the CI pilot profile):
-    #   - FastAPI is constructed without docs_url / redoc_url / openapi_url
-    #     (no OpenAPI schema served; no Swagger UI).
-    #   - The index, dashboard, static assets, and /logs/stream routes are NOT
-    #     registered — those paths return 404.
-    #   - /logs/stream, /, /dashboard, /docs, /openapi.json are removed from the
-    #     auth-exempt set so they cannot be reached unauthenticated even if a
-    #     misconfiguration somehow re-adds them.
-    #
-    # Default True preserves the current full-web behaviour.
-    # Env: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_WEB_UI_ENABLED=false
-    web_ui_enabled: bool = True
-
     # azure_client_id / azure_tenant_id: the App Registration coordinates.
     # Both are required when auth_mode="entra".  Empty / whitespace-only
     # strings are normalized to None so that a template placeholder in a YAML
@@ -767,7 +751,7 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # Session lifecycle timeouts
     # -------------------------------------------------------------------------
-    dashboard_inactive_timeout: float = 1800.0  # 30 min  — dashboard visibility
+    status_inactive_timeout: float = 1800.0  # 30 min  — /status visibility
     stale_session_timeout: float = 432000.0  # 5 days  — worker reap
 
     @classmethod
