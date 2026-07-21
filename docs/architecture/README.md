@@ -17,10 +17,11 @@ the FastAPI application and intercepts every HTTP request before routing begins.
 middleware validates the `Authorization: Bearer <token>` header, resolves the token to a
 contributor id via the active `PrincipalResolver`, and injects `contributor_id` into
 `scope["state"]` for downstream handlers; it short-circuits with `401` or `403` on any auth
-failure before the FastAPI route handler is ever invoked. Several paths are always exempt
-(health checks, monitoring, web-UI pages — the exact set depends on `web_ui_enabled`); see
-diagram 06 for the complete per-request decision flow and diagram 07 for how the resolver
-and exempt-path set are selected at boot time.
+failure before the FastAPI route handler is ever invoked. The server is headless (API-only),
+so a single fixed set of paths is always exempt — `{/status, /version, /docs, /openapi.json}`
+(health/version plus the always-on OpenAPI/Swagger surface); there is no `web_ui_enabled`
+branch. See diagram 06 for the complete per-request decision flow and diagram 07 for how the
+resolver and exempt-path set are wired at boot time.
 
 ---
 
@@ -130,11 +131,11 @@ How authentication is wired at boot inside `create_asgi_app()`. The function bra
 
 A fail-closed gate then rejects boot if `resolver.auth_enabled` is `False` and
 `allow_unauthenticated` is not set (the latter is a test/dev-only opt-out, never for
-production). The exempt-path set is selected based on `web_ui_enabled`: the full set
-includes `/logs/stream`, `/`, `/dashboard`, `/docs`, `/openapi.json`; the API-only set
-reduces to `/status` and `/version` so web-UI paths cannot be reached unauthenticated.
-Finally, `BearerTokenMiddleware(app, resolver, exempt_paths)` is assembled and returned as
-`asgi_app` (served by Gunicorn + uvicorn).
+production). The server is headless, so the exempt-path set is a single fixed frozenset —
+`{/status, /version, /docs, /openapi.json}` — with no `web_ui_enabled` branch and no exempt
+prefixes (the `/static` mount was removed). Finally,
+`BearerTokenMiddleware(app, resolver, exempt_paths=_EXEMPT_PATHS)` is assembled and returned
+as `asgi_app` (served by Gunicorn + uvicorn).
 
 ---
 
@@ -263,7 +264,7 @@ The server connects to Neo4j through **two drivers** rather than one. The **admi
 driver** (`neo4j_driver`) is opened in **WRITE** access mode and carries the ingest
 path — the drainer's batch flushes and schema work. The **cypher_query driver**
 (`neo4j_query_driver`) is opened in **READ** access mode and serves `POST /cypher`
-and dashboard reads. Both drivers are created together in the dual-driver lifespan
+reads. Both drivers are created together in the dual-driver lifespan
 at startup and closed together at shutdown. With legacy flat config
 (`neo4j_url` / `neo4j_user` / `neo4j_password`), both drivers fall back to the same
 endpoint and shared credentials, differing only by access-mode hint; a structured
