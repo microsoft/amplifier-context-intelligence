@@ -10,6 +10,7 @@ Values are resolved in this priority order (highest first):
 """
 
 import hashlib
+import logging
 import os
 import re
 from functools import lru_cache
@@ -31,6 +32,25 @@ from pydantic_settings import (
 # instantiated, so the prefix-based machinery cannot apply.
 _CONFIG_FILE_ENV = "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE"
 _CONFIG_FILE_DEFAULT = "server-config.yaml"
+
+logger = logging.getLogger(__name__)
+
+# Config keys that USED to exist and were removed or renamed in the headless
+# refactor.  Pydantic's settings sources silently drop unknown keys, so an
+# operator upgrading a live deployment whose YAML still carries one of these
+# would get a SILENT behaviour change (e.g. a customized timeout reverting to
+# default, or a dashboard toggle becoming a no-op).  We warn loudly instead of
+# failing -- the server must still boot -- so the drop is never invisible.
+_REMOVED_CONFIG_KEYS: dict[str, str] = {
+    "web_ui_enabled": (
+        "removed -- the server is headless-only and has no web UI toggle; "
+        "delete this key from your config"
+    ),
+    "dashboard_inactive_timeout": (
+        "renamed to 'status_inactive_timeout' (same units/behaviour); "
+        "rename this key or your override is ignored and the default is used"
+    ),
+}
 
 # ---------------------------------------------------------------------------
 # GUID validation helpers (Entra identities)
@@ -167,6 +187,20 @@ class YamlConfigSettingsSource(PydanticBaseSettingsSource):
         return None, field_name, False
 
     def __call__(self) -> dict[str, Any]:
+        # Warn (do not fail) when the YAML still carries a config key that was
+        # removed/renamed: pydantic silently drops unknown keys, so without this
+        # the drop would be invisible on an upgrade.
+        for key in self._data:
+            if (
+                key in _REMOVED_CONFIG_KEYS
+                and key not in self.settings_cls.model_fields
+            ):
+                logger.warning(
+                    "Ignoring obsolete config key %r in %s: %s",
+                    key,
+                    self.yaml_file,
+                    _REMOVED_CONFIG_KEYS[key],
+                )
         return {
             k: v for k, v in self._data.items() if k in self.settings_cls.model_fields
         }

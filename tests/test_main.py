@@ -1389,3 +1389,59 @@ async def test_post_events_valid_utc_z_timestamp_returns_202(
         },
     )
     assert response.status_code == 202
+
+
+# ---------------------------------------------------------------------------
+# Headless OpenAPI/Swagger surface: end-to-end, against a booted app
+# ---------------------------------------------------------------------------
+#
+# These replace the coverage lost when tests/test_web_ui_switch.py was deleted.
+# The prior test asserted the "/openapi.json bypass" behaviour at the mock
+# level; this proves the *accepted risk* through the real ASGI app + real
+# BearerTokenMiddleware: the doc surface is reachable unauthenticated, but the
+# data API it documents is NOT, and the admin surface is not disclosed at all.
+
+
+class TestHeadlessDocsSurface:
+    """/docs + /openapi.json are intentionally unauthenticated; data/admin stay gated."""
+
+    async def test_docs_exempt_but_events_gated_end_to_end(self) -> None:
+        """Unauth GET /docs and /openapi.json -> 200; unauth POST /events -> 401.
+
+        Proves the ratified decision end-to-end: the API *shape* is public, but
+        no data call can be made without a bearer token.
+        """
+        async with _auth_client() as c:
+            docs = await c.get("/docs")
+            openapi = await c.get("/openapi.json")
+            events = await c.post(
+                "/events",
+                json={
+                    "event": "tool_use",
+                    "workspace": "/ws",
+                    "data": {
+                        "session_id": "s1",
+                        "timestamp": "2026-06-16T20:17:11.604690+00:00",
+                    },
+                },
+            )
+        assert docs.status_code == 200
+        assert openapi.status_code == 200
+        assert events.status_code == 401
+
+    async def test_admin_schema_not_disclosed_in_openapi(self) -> None:
+        """/admin/* MUST NOT appear in the unauthenticated OpenAPI schema.
+
+        The admin router is registered with include_in_schema=False so the
+        operator-only identity/key surface is not handed to unauthenticated
+        recon via /openapi.json (routing + auth are unaffected).
+        """
+        async with _auth_client() as c:
+            openapi = await c.get("/openapi.json")
+        assert openapi.status_code == 200
+        paths = openapi.json().get("paths", {})
+        admin_paths = [p for p in paths if p.startswith("/admin")]
+        assert admin_paths == [], (
+            f"/admin/* must not appear in the unauthenticated OpenAPI schema; "
+            f"found: {admin_paths}"
+        )
