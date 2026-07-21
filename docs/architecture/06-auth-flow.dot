@@ -60,7 +60,7 @@ digraph auth_flow {
         ]
 
         IsExemptPath [
-            label     = "Exempt path?\nexact: _EXEMPT_PATHS (web_ui_enabled=True)\n  or _EXEMPT_PATHS_API_ONLY (web_ui_enabled=False)\nprefix: /static/ (always exempt)"
+            label     = "Exempt path?\nexact: _EXEMPT_PATHS (headless \\u2014 single fixed set)\n  {/status, /version, /docs, /openapi.json}\nno prefix exemptions (_EXEMPT_PREFIXES = ())"
             shape     = diamond
             fillcolor = "#FFF9C4"
             style     = filled

@@ -11,7 +11,7 @@ from typing import Any
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
-from context_intelligence_server.dashboard import EventRecord, ring_buffer
+from context_intelligence_server.status import EventRecord, ring_buffer
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
 from context_intelligence_server.pipeline import process_event, setup_handlers
 from context_intelligence_server.queue_manager import Batch, QueueManager

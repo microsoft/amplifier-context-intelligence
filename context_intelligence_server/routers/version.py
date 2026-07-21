@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from context_intelligence_server.dashboard import SERVER_VERSION
+from context_intelligence_server.status import SERVER_VERSION
 
 router = APIRouter()
 

@@ -515,15 +515,11 @@ curl -sS -X POST https://<server>/events \
 On success the event is queued and the resulting graph nodes are stamped
 `created_by = <your contributor id>` (the `id` the operator mapped your oid to).
 
-> Health/monitoring paths are exempt from auth and need no token: `/status`,
-> `/version`, `/`, `/dashboard`, `/docs`, `/openapi.json`, plus `/static/*`.
-> This is the full-web exempt set (`web_ui_enabled=true`, the default).
->
-> **API-only mode (`web_ui_enabled=false`):** the exempt set shrinks to just
-> `{/status, /version}`. The web-UI routes (`/`, `/dashboard`, `/docs`,
-> `/openapi.json`) are not registered (→ 404), and `/logs/stream` becomes
-> **auth-gated** — it is removed from the exempt set so it can no longer be reached
-> as an unauthenticated log drain. See the `web_ui_enabled` field in `config.py`.
+> Health/monitoring and API-docs paths are exempt from auth and need no token.
+> The server is **headless** (API-only), so there is a single fixed exempt set —
+> `{/status, /version, /docs, /openapi.json}` — with no `web_ui_enabled` branch and
+> no exempt prefixes (the `/static` mount was removed). `/docs` (Swagger UI) and
+> `/openapi.json` are **always on**. See the `_EXEMPT_PATHS` frozenset in `auth.py`.
 
 ### 3.5 What 401 vs 403 mean **to you**
 
