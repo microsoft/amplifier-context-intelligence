@@ -629,10 +629,16 @@ class TestAuthMiddleware:
 
 
 class TestMainDispatch:
-    """Tests for the CLI entrypoint main() function."""
+    """Tests for the CLI entrypoint main() argparse dispatch (serve / doctor).
+
+    INVARIANT under test: no args (the bare console-script invocation systemd
+    and the macOS launchd agent use) MUST dispatch to serve(). This is the
+    single most important test in this class -- breaking it would break
+    every production restart.
+    """
 
     def test_main_with_no_args_calls_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """main() calls run() when no subcommand is given."""
+        """main() with no argv reads real sys.argv (empty here) -- must serve."""
         from unittest.mock import patch as _patch
 
         import context_intelligence_server.main as _main_mod
@@ -644,22 +650,59 @@ class TestMainDispatch:
 
         mock_run.assert_called_once()
 
-    def test_main_with_non_init_flag_calls_run(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """main() calls run() when flags are present."""
-        from unittest.mock import patch as _patch
-
+    def test_main_empty_argv_list_calls_run_and_not_doctor(self) -> None:
+        """main([]) -- the explicit empty-args form -- calls run() (gunicorn)
+        and must NOT touch the doctor module."""
         import context_intelligence_server.main as _main_mod
 
-        monkeypatch.setattr(
-            "sys.argv", ["context-intelligence-server", "--workers", "2"]
-        )
-
-        with _patch.object(_main_mod, "run") as mock_run:
-            _main_mod.main()
+        with (
+            patch.object(_main_mod, "run") as mock_run,
+            patch("context_intelligence_server.doctor.run_doctor") as mock_doctor,
+        ):
+            _main_mod.main([])
 
         mock_run.assert_called_once()
+        mock_doctor.assert_not_called()
+
+    def test_main_explicit_serve_calls_run(self) -> None:
+        """main(["serve"]) explicitly dispatches to serve, same as no args."""
+        import context_intelligence_server.main as _main_mod
+
+        with patch.object(_main_mod, "run") as mock_run:
+            _main_mod.main(["serve"])
+
+        mock_run.assert_called_once()
+
+    def test_main_doctor_dispatches_run_doctor_fix_false(self) -> None:
+        """main(["doctor"]) calls doctor.run_doctor(fix=False) and sys.exits
+        with its return code."""
+        import context_intelligence_server.main as _main_mod
+
+        with patch(
+            "context_intelligence_server.doctor.run_doctor",
+            new_callable=AsyncMock,
+            return_value=0,
+        ) as mock_doctor:
+            with pytest.raises(SystemExit) as exc_info:
+                _main_mod.main(["doctor"])
+
+        mock_doctor.assert_awaited_once_with(fix=False)
+        assert exc_info.value.code == 0
+
+    def test_main_doctor_fix_dispatches_run_doctor_fix_true(self) -> None:
+        """main(["doctor", "--fix"]) calls doctor.run_doctor(fix=True)."""
+        import context_intelligence_server.main as _main_mod
+
+        with patch(
+            "context_intelligence_server.doctor.run_doctor",
+            new_callable=AsyncMock,
+            return_value=1,
+        ) as mock_doctor:
+            with pytest.raises(SystemExit) as exc_info:
+                _main_mod.main(["doctor", "--fix"])
+
+        mock_doctor.assert_awaited_once_with(fix=True)
+        assert exc_info.value.code == 1
 
 
 async def test_lifespan_creates_and_closes_driver(
