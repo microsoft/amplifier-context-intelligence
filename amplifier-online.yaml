@@ -60,14 +60,6 @@ services:
       - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AUTH_MODE
         value: entra
 
-      # === Lock down to API-only (no browser dashboard / Swagger / static / log stream) ===
-      # web_ui_enabled=false: FastAPI is built without docs_url/redoc_url/openapi_url,
-      # and the index, /dashboard, /static/*, and /logs/stream routes are NOT registered
-      # (they 404) AND are removed from the auth-exempt set. This is the locked-down
-      # "CI pilot profile". Server default is True (full-web) — this override is required
-      # to disable the UI on a public deployment.
-      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_WEB_UI_ENABLED
-        value: "false"
       - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_CLIENT_ID
         value: "53aa4ffd-fbea-40a3-b35c-63fdcb609af1"   # api://53aa4ffd-… audience
       - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_TENANT_ID

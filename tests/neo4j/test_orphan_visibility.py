@@ -43,7 +43,7 @@ from typing import Any
 import pytest
 from neo4j import AsyncGraphDatabase
 
-from context_intelligence_server.dashboard import build_status_response
+from context_intelligence_server.status import build_status_response
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
 from context_intelligence_server.queue_manager import QueueManager
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
@@ -316,7 +316,7 @@ async def test_finalization_orphan_surfaces_on_status(
     session_dicts = {s["session_id"]: s for s in status["sessions"]}
     assert sid in session_dicts, (
         f"Session {sid!r} must appear in status['sessions'] — "
-        "check dashboard_inactive_timeout filter"
+        "check status_inactive_timeout filter"
     )
     assert session_dicts[sid]["orphaned"] is True, (
         f"status['sessions'] entry for {sid!r} must have orphaned: True, "

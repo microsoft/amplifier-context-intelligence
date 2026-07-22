@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from context_intelligence_server.dashboard import build_status_response
+from context_intelligence_server.status import build_status_response
 from context_intelligence_server.pipeline import process_event, setup_handlers
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService

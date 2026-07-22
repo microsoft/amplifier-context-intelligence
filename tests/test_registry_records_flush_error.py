@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 from context_intelligence_server import registry as registry_module
-from context_intelligence_server.dashboard import ring_buffer
+from context_intelligence_server.status import ring_buffer
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 
 

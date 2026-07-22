@@ -163,11 +163,11 @@ digraph auth_startup {
     }
 
     // ====================================================================
-    // EXEMPT PATH SELECTION  (web_ui_enabled)
+    // EXEMPT PATH SET  (headless \u2014 single fixed set)
     // ====================================================================
     subgraph cluster_exempt {
         graph [
-            label     = "Exempt-path selection  (main.py \u2014 create_asgi_app)\ncontrols which paths bypass auth entirely"
+            label     = "Exempt-path set  (auth.py \u2014 _EXEMPT_PATHS)\nheadless / API-only: one fixed frozenset"
             style     = "filled"
             color     = "#006064"
             fillcolor = "#E0F7FA"
@@ -175,27 +175,10 @@ digraph auth_startup {
             fontsize  = 10
         ]
 
-        WebUiCheck [
-            label     = "settings.web_ui_enabled?"
-            shape     = diamond
-            fillcolor = "#FFF9C4"
-            style     = filled
-        ]
-
-        ExemptFull [
-            label     = "exempt = _EXEMPT_PATHS\n{/status, /version, /logs/stream,\n /, /dashboard, /docs, /openapi.json}\nFastAPI: docs_url=\"/docs\"\n  redoc_url=\"/redoc\"\n  openapi_url=\"/openapi.json\"\nWeb routes registered:\n  GET /  GET /dashboard  GET /logs/stream\n  StaticFiles /static"
+        ExemptFixed [
+            label     = "exempt = _EXEMPT_PATHS  (fixed frozenset)\n{/status, /version, /docs, /openapi.json}\nFastAPI: docs_url=\"/docs\"\n  redoc_url=None  (ReDoc disabled)\n  openapi_url=\"/openapi.json\"\nAlways on: /docs (Swagger UI) + /openapi.json spec\nNo web routes, no StaticFiles mount\n_EXEMPT_PREFIXES = ()  (no prefix exemptions)"
             fillcolor = "#B2EBF2"
-        ]
-
-        ExemptApiOnly [
-            label     = "exempt = _EXEMPT_PATHS_API_ONLY\n{/status, /version}\nFastAPI: docs_url=None\n  redoc_url=None\n  openapi_url=None\nWeb routes NOT registered\n(/logs/stream not exempt \u2192 gated by auth)"
-            fillcolor = "#B2EBF2"
-        ]
-
-        ExemptNote [
-            label     = "prefix exemptions always apply\n(regardless of web_ui_enabled):\n  /static/"
-            fillcolor = "#FFF9C4"
-            style     = filled
+            fontname  = "Helvetica-Bold"
         ]
     }
 
@@ -292,19 +275,12 @@ digraph auth_startup {
 
     // Fail-closed gate
     AuthEnabledCheck -> AllowUnauthCheck [label = "False\n(no credentials)"]
-    AuthEnabledCheck -> WebUiCheck       [label = "True"]
+    AuthEnabledCheck -> ExemptFixed      [label = "True"]
     AllowUnauthCheck -> NoAuthFail       [label = "False\n(default \u2014 refuse to start)"]
-    AllowUnauthCheck -> WebUiCheck       [label = "True\n(test/dev only)"]
+    AllowUnauthCheck -> ExemptFixed      [label = "True\n(test/dev only)"]
 
-    // Exempt path selection
-    WebUiCheck       -> ExemptFull       [label = "True\n(default)"]
-    WebUiCheck       -> ExemptApiOnly    [label = "False"]
-    ExemptFull       -> ExemptNote       [style = dotted, color = "#AAAAAA", arrowhead = none]
-    ExemptApiOnly    -> ExemptNote       [style = dotted, color = "#AAAAAA", arrowhead = none]
-
-    // Assembly
-    ExemptFull       -> MiddlewareWrap
-    ExemptApiOnly    -> MiddlewareWrap
+    // Assembly \u2014 single fixed exempt set (headless)
+    ExemptFixed      -> MiddlewareWrap
 
     // Output
     MiddlewareWrap   -> AsgiApp

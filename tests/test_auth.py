@@ -273,8 +273,9 @@ class TestMiddlewareWithKeystore:
         body = json.loads(response_body["body"])
         assert "detail" in body
 
-    async def test_logs_stream_exempt_without_token(self) -> None:
-        """/logs/stream is accessible without any token (EventSource compatibility)."""
+    async def test_logs_stream_gated_without_token(self) -> None:
+        """/logs/stream no longer exists (dashboard removed) and is NOT exempt —
+        an unauthenticated request must be gated (401), never pass through."""
         app = AsyncMock()
         middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
 
@@ -283,10 +284,11 @@ class TestMiddlewareWithKeystore:
         send = AsyncMock()
 
         await middleware(scope, receive, send)
-        app.assert_called_once_with(scope, receive, send)
+        app.assert_not_called()
+        assert send.call_args_list[0][0][0]["status"] == 401
 
-    async def test_index_page_exempt(self) -> None:
-        """GET / without token passes through (dashboard HTML must load before JS auth)."""
+    async def test_index_page_gated(self) -> None:
+        """GET / (removed dashboard route) is NOT exempt — gated (401) without a token."""
         app = AsyncMock()
         middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
 
@@ -295,10 +297,11 @@ class TestMiddlewareWithKeystore:
         send = AsyncMock()
 
         await middleware(scope, receive, send)
-        app.assert_called_once_with(scope, receive, send)
+        app.assert_not_called()
+        assert send.call_args_list[0][0][0]["status"] == 401
 
-    async def test_dashboard_page_exempt(self) -> None:
-        """GET /dashboard without token passes through."""
+    async def test_dashboard_page_gated(self) -> None:
+        """GET /dashboard (removed route) is NOT exempt — gated (401) without a token."""
         app = AsyncMock()
         middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
 
@@ -307,10 +310,14 @@ class TestMiddlewareWithKeystore:
         send = AsyncMock()
 
         await middleware(scope, receive, send)
-        app.assert_called_once_with(scope, receive, send)
+        app.assert_not_called()
+        assert send.call_args_list[0][0][0]["status"] == 401
 
-    async def test_static_assets_exempt(self) -> None:
-        """GET /static/js/api.js without token passes through (static assets must load before auth)."""
+    async def test_static_assets_gated(self) -> None:
+        """GET /static/js/api.js (removed web assets) is NOT exempt — gated (401).
+
+        The server no longer serves any static assets; _EXEMPT_PREFIXES is empty.
+        """
         app = AsyncMock()
         middleware = BearerTokenMiddleware(app, keystore=_keystore("secret-token"))
 
@@ -319,7 +326,8 @@ class TestMiddlewareWithKeystore:
         send = AsyncMock()
 
         await middleware(scope, receive, send)
-        app.assert_called_once_with(scope, receive, send)
+        app.assert_not_called()
+        assert send.call_args_list[0][0][0]["status"] == 401
 
     async def test_docs_page_exempt(self) -> None:
         """GET /docs without token passes through."""

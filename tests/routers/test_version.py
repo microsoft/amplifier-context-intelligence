@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from context_intelligence_server.dashboard import SERVER_VERSION
+from context_intelligence_server.status import SERVER_VERSION
 
 
 class TestGetVersion200:

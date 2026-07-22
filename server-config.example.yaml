@@ -12,9 +12,9 @@
 # -----------------------------------------------------------------------------
 # Neo4j connection
 # neo4j_url is the bolt/neo4j driver URL used for all graph operations.
-# It is also advertised in the web UI (home page Neo4j card and dashboard
-# "Neo4j URL" chip) so operators can see at a glance which database the
-# server is connected to.
+# It is also surfaced in the GET /status response ("neo4j_url" field) so
+# operators/clients can see at a glance which database the server is
+# connected to.
 #
 # These flat keys are the LEGACY single-credential form and remain fully
 # supported. When the structured `neo4j:` block below is omitted, the server
@@ -24,7 +24,7 @@
 # and docs/auth-troubleshooting-and-upgrades.md § "Neo4j two-client split".
 # -----------------------------------------------------------------------------
 neo4j_url: bolt://localhost:7687           # bolt driver URL — use bolt:// for Community Edition single-node
-neo4j_browser_url: http://localhost:7474  # Neo4j HTTP browser UI — displayed as a clickable link in the web UI
+neo4j_browser_url: http://localhost:7474  # Neo4j HTTP browser UI — surfaced verbatim in the GET /status response
 neo4j_user: neo4j
 neo4j_password: ""          # Empty only for local Neo4j with NEO4J_AUTH=none (dev only).
                              # Docker and production deployments always use a password.
@@ -33,8 +33,8 @@ neo4j_password: ""          # Empty only for local Neo4j with NEO4J_AUTH=none (d
 # Neo4j two-client split (OPTIONAL, opt-in) — separate admin (write) and
 # cypher_query (read) clients.
 #
-# Why: the /cypher HTTP endpoint and dashboard reads run through the READ
-# client; ingest/schema writes run through the admin/WRITE client. Giving them
+# Why: the /cypher HTTP endpoint reads run through the READ client; ingest/schema
+# writes run through the admin/WRITE client. Giving them
 # SEPARATE credentials (and optionally separate URLs, e.g. a read replica) lets
 # you tighten data access later WITHOUT a server code change — you only edit
 # this config.
@@ -151,8 +151,7 @@ max_delivery_attempts: 5           # Flush retries for one batch before its offe
 
 # -----------------------------------------------------------------------------
 # Server bind address
-# These two values are combined into the HTTP URL advertised in the web UI
-# (home page "Server URL" chip and dashboard "Server URL" chip).
+# These two values are combined into the HTTP URL the server binds and listens on.
 # Example: server_host=0.0.0.0 + server_port=8000 → http://0.0.0.0:8000
 #
 # Use 0.0.0.0 (the default) to accept connections from all interfaces,
@@ -178,5 +177,5 @@ log_level: INFO              # DEBUG | INFO | WARNING | ERROR
 # -----------------------------------------------------------------------------
 # Session lifecycle timeouts (seconds)
 # -----------------------------------------------------------------------------
-dashboard_inactive_timeout: 1800.0    # 30 min  — hide session from dashboard
+status_inactive_timeout: 1800.0       # 30 min  — hide session from GET /status
 stale_session_timeout: 432000.0       # 5 days  — reap idle session worker
