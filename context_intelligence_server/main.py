@@ -1,9 +1,12 @@
 """FastAPI application entrypoint for the Context Intelligence Server."""
 
+import argparse
+import asyncio
 import json
 import logging
 import os
 import re
+import sys
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -28,7 +31,7 @@ from context_intelligence_server.authz import (  # noqa: F401 — re-exported fo
     require_write,
 )
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
-from context_intelligence_server.config import Settings, get_settings
+from context_intelligence_server.config import Neo4jClientConfig, Settings, get_settings
 from context_intelligence_server.identity_store import IdentityStore
 from context_intelligence_server.status import build_status_response
 from context_intelligence_server.routers.admin import router as admin_router
@@ -52,6 +55,16 @@ logger = logging.getLogger("context_intelligence_server")
 def _neo4j_access_const(mode: str) -> str:
     """Map our config string ("READ"/"WRITE") to the driver's access-mode constant."""
     return READ_ACCESS if mode == "READ" else WRITE_ACCESS
+
+
+def build_neo4j_driver(config: Neo4jClientConfig) -> Any:
+    """Construct an AsyncGraphDatabase driver from a resolved Neo4j client config.
+
+    Shared by ``lifespan()`` (the admin driver, on every server boot) and
+    ``doctor.run_doctor()`` (the CLI), so the two entry points can never
+    construct the connection differently.
+    """
+    return AsyncGraphDatabase.driver(config.url, auth=config.auth)
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +154,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     # Admin (read/write): schema init + all mutation paths. Keep the existing
     # app.state.neo4j_driver NAME so nothing that reads it silently breaks.
-    app.state.neo4j_driver = AsyncGraphDatabase.driver(_admin.url, auth=_admin.auth)
+    # build_neo4j_driver() is the SAME helper doctor.run_doctor() uses, so the
+    # server and the doctor CLI can never construct this connection differently.
+    app.state.neo4j_driver = build_neo4j_driver(_admin)
     # Cypher-query (read-intent): /cypher + dashboard reads.
     app.state.neo4j_query_driver = AsyncGraphDatabase.driver(
         _query.url, auth=_query.auth
@@ -723,9 +738,48 @@ async def post_cypher(body: CypherRequest, request: Request) -> Response:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-def main() -> None:
-    """CLI entrypoint."""
-    run()
+def main(argv: list[str] | None = None) -> None:
+    """CLI entrypoint.
+
+    INVARIANT: no subcommand (or the explicit ``serve`` subcommand) starts the
+    ingestion server. This MUST hold because the systemd unit (and the
+    macOS launchd agent) invoke the bare console script
+    ``context-intelligence-server`` with NO arguments -- that call dispatches
+    to ``serve`` unchanged.
+
+    ``doctor [--fix]`` diagnoses (and, with ``--fix``, repairs) Neo4j graph
+    health -- the two O(graph-size) migration scans (dedup + :Node backfill)
+    that used to run unconditionally at cold start now live ONLY here, never
+    on server boot. See ``context_intelligence_server.doctor``.
+    """
+    parser = argparse.ArgumentParser(prog="context-intelligence-server")
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("serve", help="Start the ingestion server (default).")
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="Diagnose (and optionally repair) Neo4j graph health."
+    )
+    doctor_parser.add_argument(
+        "--fix",
+        action="store_true",
+        help=(
+            "Repair detected issues (duplicate-node dedup + :Node label "
+            "backfill) instead of reporting only."
+        ),
+    )
+
+    args = parser.parse_args(argv)
+
+    if args.command in (None, "serve"):
+        run()
+        return
+
+    # Deferred import: doctor.py imports build_neo4j_driver back from this
+    # module, so importing it at module load time (rather than here, inside
+    # main()) would be a circular import at import time. By the time main()
+    # runs, this module has already finished executing top-to-bottom.
+    from context_intelligence_server import doctor as _doctor  # noqa: PLC0415
+
+    sys.exit(asyncio.run(_doctor.run_doctor(fix=args.fix)))
 
 
 def _effective_worker_count() -> int:

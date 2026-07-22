@@ -291,6 +291,249 @@ _BENIGN_SCHEMA_CODES: frozenset[str] = frozenset(
     }
 )
 
+# ---------------------------------------------------------------------------
+# Fail-loud guard for the :Node uniqueness constraint (Step 6 below).
+#
+# These are the Neo4j error codes that mean "the constraint could not be
+# created because existing data violates it" -- i.e. the graph still has
+# untagged/duplicate legacy nodes. This is NOT benign like the codes above
+# (already-exists / concurrent-creation races); it means the migration
+# (dedup + :Node backfill) has never been run against this graph, and cold
+# start must refuse to silently proceed (re-keyed writers could fork a
+# legacy node's identity). Distinguished from _BENIGN_SCHEMA_CODES so the two
+# cases route to different outcomes: benign -> swallow, data-conflict -> raise.
+# ---------------------------------------------------------------------------
+_CONSTRAINT_DATA_CONFLICT_CODES: frozenset[str] = frozenset(
+    {
+        "Neo.ClientError.Schema.ConstraintValidationFailed",
+        "Neo.DatabaseError.Schema.ConstraintCreationFailed",
+    }
+)
+
+
+def _is_constraint_data_conflict(exc: Exception) -> bool:
+    """Return True when *exc* means a uniqueness constraint could not be
+    created because pre-existing data violates it (untagged/duplicate legacy
+    nodes), as opposed to a benign already-exists/concurrent-race error.
+
+    Kept as a standalone predicate (rather than inlined) so it is directly
+    unit-testable without needing a real Neo4jError from a live driver.
+    """
+    code = getattr(exc, "code", None)
+    return code in _CONSTRAINT_DATA_CONFLICT_CODES
+
+
+# ---------------------------------------------------------------------------
+# Duplicate-node detection/removal Cypher.
+#
+# One shared detection subquery (_DUPLICATE_DETECT_CYPHER) backs both the
+# read-only count (count_duplicate_nodes) and the actual removal
+# (dedup_duplicate_nodes) -- single logic home, never copy-pasted.
+# ---------------------------------------------------------------------------
+_DUPLICATE_DETECT_CYPHER = (
+    "MATCH (n) "
+    "WITH n.node_id AS nid, n.workspace AS ws, collect(n) AS nodes "
+    "WHERE size(nodes) > 1 "
+    # keep the node carrying the most labels (typed > bare placeholder)
+    "WITH nodes, reduce(best = nodes[0], x IN nodes | "
+    "CASE WHEN size(labels(x)) > size(labels(best)) THEN x ELSE best END) "
+    "AS keep "
+    "UNWIND [x IN nodes WHERE x <> keep] AS duplicate"
+)
+_DEDUP_GLOBAL_CYPHER = (
+    f"{_DUPLICATE_DETECT_CYPHER} DETACH DELETE duplicate RETURN count(duplicate) AS c"
+)
+_DUPLICATE_COUNT_CYPHER = f"{_DUPLICATE_DETECT_CYPHER} RETURN count(duplicate) AS c"
+
+_DEDUP_SESSION_CYPHER = (
+    "MATCH (s:Session) "
+    "WITH s.node_id AS nid, s.workspace AS ws, collect(s) AS nodes "
+    "WHERE size(nodes) > 1 "
+    "UNWIND tail(nodes) AS duplicate "
+    "DETACH DELETE duplicate "
+    "RETURN count(duplicate) AS c"
+)
+_DEDUP_EVENT_CYPHER = (
+    "MATCH (e:Event) "
+    "WITH e.node_id AS nid, e.workspace AS ws, collect(e) AS nodes "
+    "WHERE size(nodes) > 1 "
+    "UNWIND tail(nodes) AS duplicate "
+    "DETACH DELETE duplicate "
+    "RETURN count(duplicate) AS c"
+)
+
+# Shared by backfill_node_labels (pre/post count) and count_untagged_nodes --
+# single logic home for the ":Node label missing" count.
+_UNTAGGED_COUNT_CYPHER = (
+    f"MATCH (n) WHERE NOT n:{_UNIVERSAL_NODE_LABEL} RETURN count(n) AS c"
+)
+
+
+async def _run_single_count(session: Any, statement: str) -> int:
+    """Run *statement* (expected to ``RETURN ... AS c``) and return that int.
+
+    Reads via ``async for`` (rather than ``.single()``) so this works against
+    both the real async driver and the test-suite's mock session, which only
+    implements async iteration.
+    """
+    result = await session.run(statement)
+    async for record in result:
+        return int(record["c"])
+    return 0
+
+
+async def dedup_duplicate_nodes(driver: Any, database: str = "neo4j") -> int:
+    """Best-effort removal of duplicate (node_id, workspace) nodes.
+
+    Extracted from what was formerly Step 1 of ``ensure_neo4j_schema`` so it
+    is no longer a per-boot cost -- it now runs ONLY when explicitly invoked
+    (via ``run_repair`` / ``context-intelligence-server doctor --fix``), never
+    on cold start. This is an O(graph-size) full scan; on an already-migrated
+    graph it is pure dead weight, which is exactly why it was moved out of the
+    hot path.
+
+    Three passes, all against the same shared detection query
+    (see module docstring above): global by (node_id, workspace) across every
+    label (required for the :Node uniqueness constraint), then Session- and
+    Event-specific passes (redundant after the global pass, but cheap and
+    explicit). Each pass keeps the richest node (most labels) and
+    ``DETACH DELETE``s the rest.
+
+    Best-effort: a failing pass is logged and treated as 0 removed for that
+    pass; it does not abort the remaining passes.
+
+    Returns:
+        Total number of duplicate nodes removed across all three passes.
+    """
+    removed = 0
+    async with driver.session(database=database) as session:
+        for statement in (
+            _DEDUP_GLOBAL_CYPHER,
+            _DEDUP_SESSION_CYPHER,
+            _DEDUP_EVENT_CYPHER,
+        ):
+            try:
+                removed += await _run_single_count(session, statement)
+            except Exception as exc:  # noqa: BLE001
+                _LOG.warning("dedup_duplicate_nodes: pass failed (non-fatal): %s", exc)
+    return removed
+
+
+async def backfill_node_labels(driver: Any, database: str = "neo4j") -> int:
+    """Best-effort tagging of legacy nodes with the universal ``:Node`` label.
+
+    Extracted from what was formerly Step 5 of ``ensure_neo4j_schema`` so it
+    is no longer a per-boot cost -- it now runs ONLY when explicitly invoked
+    (via ``run_repair`` / ``context-intelligence-server doctor --fix``), never
+    on cold start. This is an O(graph-size) full scan; on an already-migrated
+    graph it is pure dead weight.
+
+    Nodes written before the universal ``:Node`` label existed have no
+    ``:Node`` label, so the indexed MERGE used by writers would CREATE a
+    duplicate of them rather than match them. Tagging every such node makes
+    the universal-identity model consistent graph-wide.
+
+    Batched + idempotent: ``CALL (n) { ... } IN TRANSACTIONS`` commits in
+    chunks (so large graphs don't blow the per-transaction memory cap), and
+    the ``WHERE NOT n:Node`` guard makes re-runs converge to a no-op once the
+    graph is fully tagged.
+
+    Returns:
+        Number of nodes newly tagged (best-effort; 0 if the count could not
+        be determined, e.g. a pre/post count query failed).
+    """
+    async with driver.session(database=database) as session:
+        try:
+            before = await _run_single_count(session, _UNTAGGED_COUNT_CYPHER)
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning("backfill_node_labels: pre-count failed (non-fatal): %s", exc)
+            return 0
+
+        try:
+            await session.run(
+                cast(
+                    LiteralString,
+                    f"MATCH (n) WHERE NOT n:{_UNIVERSAL_NODE_LABEL} "
+                    f"CALL (n) {{ SET n:{_UNIVERSAL_NODE_LABEL} }} "
+                    f"IN TRANSACTIONS OF {int(_NODE_BACKFILL_BATCH)} ROWS",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning(
+                "backfill_node_labels: :Node backfill did not complete "
+                "(non-fatal, re-run doctor --fix): %s",
+                exc,
+            )
+
+        try:
+            remaining = await _run_single_count(session, _UNTAGGED_COUNT_CYPHER)
+        except Exception as exc:  # noqa: BLE001 - observability only
+            _LOG.debug("backfill_node_labels: post-count skipped (benign): %s", exc)
+            return 0
+
+        if remaining:
+            _LOG.warning(
+                "backfill_node_labels: :Node backfill incomplete -- %d node(s) "
+                "still lack the :Node label; re-run doctor --fix.",
+                remaining,
+            )
+        else:
+            _LOG.info("backfill_node_labels: :Node backfill complete (0 untagged).")
+        return max(before - remaining, 0)
+
+
+async def count_untagged_nodes(driver: Any, database: str = "neo4j") -> int:
+    """Read-only: number of nodes still lacking the universal ``:Node`` label.
+
+    No writes. Safe to call at any time, including on every request if needed.
+    """
+    async with driver.session(database=database) as session:
+        return await _run_single_count(session, _UNTAGGED_COUNT_CYPHER)
+
+
+async def count_duplicate_nodes(driver: Any, database: str = "neo4j") -> int:
+    """Read-only: number of duplicate (node_id, workspace) nodes graph-wide.
+
+    Reuses the same detection subquery as ``dedup_duplicate_nodes`` (single
+    logic home) but only counts -- no writes.
+    """
+    async with driver.session(database=database) as session:
+        return await _run_single_count(session, _DUPLICATE_COUNT_CYPHER)
+
+
+async def diagnose(driver: Any, database: str = "neo4j") -> dict[str, int]:
+    """Read-only graph health diagnosis (no writes).
+
+    Returns:
+        ``{"untagged_nodes": int, "duplicate_nodes": int}``. Zero on both
+        means the graph is fully migrated and the :Node uniqueness
+        constraint can be safely established at cold start.
+    """
+    return {
+        "untagged_nodes": await count_untagged_nodes(driver, database=database),
+        "duplicate_nodes": await count_duplicate_nodes(driver, database=database),
+    }
+
+
+async def run_repair(driver: Any, database: str = "neo4j") -> dict[str, int]:
+    """Repair core: dedup -> :Node backfill -> schema DDL. Idempotent.
+
+    This is the shared logic behind ``context-intelligence-server doctor
+    --fix``. It is the ONLY place these O(graph-size) migrations run --
+    never on cold start (see ``ensure_neo4j_schema``, which no longer calls
+    either).
+
+    Returns:
+        ``{"duplicates_removed": int, "nodes_tagged": int}``.
+    """
+    duplicates_removed = await dedup_duplicate_nodes(driver, database=database)
+    nodes_tagged = await backfill_node_labels(driver, database=database)
+    await ensure_neo4j_schema(driver, database=database)
+    return {
+        "duplicates_removed": duplicates_removed,
+        "nodes_tagged": nodes_tagged,
+    }
+
 
 async def ensure_neo4j_schema(
     driver: Any,
@@ -303,9 +546,21 @@ async def ensure_neo4j_schema(
     accepted) so that the uniqueness constraint on Session nodes is active before
     concurrent ``flush()`` transactions execute ``MERGE``.
 
-    Runs a deduplication pass *first* so that any pre-existing duplicate Session
-    and Event nodes (from a previous run without the constraint) do not block
-    constraint creation.
+    IMPORTANT (post-migration-extraction): this function no longer runs the
+    duplicate-node dedup pass or the ``:Node`` label backfill -- those were
+    O(graph-size) full scans that used to run on every cold start regardless
+    of whether the graph needed them (pure dead weight once a graph is
+    migrated). They are now standalone functions (``dedup_duplicate_nodes``,
+    ``backfill_node_labels``) invoked explicitly via ``run_repair`` /
+    ``context-intelligence-server doctor --fix``, never automatically at
+    startup. This function only creates cheap, idempotent (``IF NOT EXISTS``)
+    catalog objects -- indexes and uniqueness constraints -- which are no-ops
+    on an already-migrated graph.
+
+    Because the dedup/backfill no longer run here, the ``:Node`` uniqueness
+    constraint (Step 6) can fail if the graph still has untagged/duplicate
+    legacy nodes. That failure is NOT swallowed like the benign races below --
+    see the fail-loud guard in Step 6.
 
     Args:
         driver:    An ``AsyncDriver`` instance created via
@@ -320,60 +575,15 @@ async def ensure_neo4j_schema(
         unreachable and the connectivity error was swallowed to avoid
         dead-lettering real events). Callers use this to decide whether to retry
         schema init on a later flush rather than latching a half-built schema and
-        leaving the uniqueness constraint permanently absent. The best-effort
-        Step-1 dedup pass does not affect the return value.
+        leaving the uniqueness constraint permanently absent.
+
+    Raises:
+        RuntimeError: if the ``:Node`` uniqueness constraint (Step 6) cannot be
+            created because the graph still has un-migrated legacy data (see
+            ``_is_constraint_data_conflict``). The message points the operator
+            at ``context-intelligence-server doctor --fix``.
     """
     async with driver.session(database=database) as session:
-        # ------------------------------------------------------------------
-        # Step 1: deduplicate any pre-existing duplicate (node_id, workspace)
-        # nodes.  This MUST run before constraint creation so a dirty graph does
-        # not cause the CREATE CONSTRAINT statements (Session, Event, and the
-        # universal :Node constraint in Step 6) to fail.
-        #
-        # Three passes:
-        #   1a. GLOBAL by (node_id, workspace) across EVERY label — required for
-        #       the Step-6 :Node uniqueness constraint, which spans all node
-        #       types (Session/Event/OrchestratorRun/Step/ToolExecution/...).
-        #       Keeps the RICHEST node (most labels) so a fully-typed node always
-        #       wins over a bare :Node placeholder; DETACH DELETE the rest.
-        #       Dups here come from the #19 dead-backfill bug (an indexed
-        #       MERGE (n:Node {...}) duplicated legacy untagged nodes).
-        #   1b/1c. Session / Event specifically — kept for clarity and because
-        #       their per-label uniqueness constraints (Steps 3/4) still apply.
-        #       (Redundant after 1a, but cheap and explicit.)
-        # All passes are best-effort (non-fatal) and do not affect the return.
-        # ------------------------------------------------------------------
-        try:
-            await session.run(
-                "MATCH (n) "
-                "WITH n.node_id AS nid, n.workspace AS ws, collect(n) AS nodes "
-                "WHERE size(nodes) > 1 "
-                # keep the node carrying the most labels (typed > bare placeholder)
-                "WITH nodes, reduce(best = nodes[0], x IN nodes | "
-                "CASE WHEN size(labels(x)) > size(labels(best)) THEN x ELSE best END) "
-                "AS keep "
-                "UNWIND [x IN nodes WHERE x <> keep] AS duplicate "
-                "DETACH DELETE duplicate"
-            )
-            await session.run(
-                "MATCH (s:Session) "
-                "WITH s.node_id AS nid, s.workspace AS ws, collect(s) AS nodes "
-                "WHERE size(nodes) > 1 "
-                "UNWIND tail(nodes) AS duplicate "
-                "DETACH DELETE duplicate"
-            )
-            await session.run(
-                "MATCH (e:Event) "
-                "WITH e.node_id AS nid, e.workspace AS ws, collect(e) AS nodes "
-                "WHERE size(nodes) > 1 "
-                "UNWIND tail(nodes) AS duplicate "
-                "DETACH DELETE duplicate"
-            )
-        except Exception as exc:  # noqa: BLE001
-            _LOG.warning(
-                "ensure_neo4j_schema: deduplication query failed (non-fatal): %s", exc
-            )
-
         # ------------------------------------------------------------------
         # Step 2: create node_id indexes (idempotent via IF NOT EXISTS).
         # ``CREATE INDEX ... IF NOT EXISTS`` is idempotent for serial callers,
@@ -477,9 +687,19 @@ async def ensure_neo4j_schema(
         # Session/Event nodes under load. The two constraints are identical in
         # shape, so both route through the single _create_constraint helper.
         # ------------------------------------------------------------------
-        async def _create_constraint(session: Any, name: str, statement: str) -> bool:
+        async def _create_constraint(
+            session: Any,
+            name: str,
+            statement: str,
+            *,
+            fail_on_data_conflict: bool = False,
+        ) -> bool:
             """Create a uniqueness constraint, tolerating benign races and
-            connectivity errors (never re-raise into the flush path).
+            connectivity errors (never re-raise into the flush path) -- UNLESS
+            *fail_on_data_conflict* is True and the failure means the graph has
+            un-migrated legacy data (see ``_is_constraint_data_conflict``), in
+            which case this raises ``RuntimeError`` with a guided message
+            instead of silently continuing without the constraint.
 
             Benign already-exists / concurrent-schema-race codes (the
             ``_BENIGN_SCHEMA_CODES`` allow-list) are swallowed at DEBUG. Anything
@@ -489,6 +709,7 @@ async def ensure_neo4j_schema(
             is reported generically at ERROR. Crucially, we continue rather than
             re-raise: this runs on the flush path via _ensure_schema, and a re-raise
             would be counted as a flush failure and could dead-letter real events.
+            The one exception is the fail-loud data-conflict case above.
 
             Returns ``True`` when the constraint is established (the statement
             succeeded, or a benign code means the winner created/will create it) and
@@ -507,19 +728,29 @@ async def ensure_neo4j_schema(
                     )
                     # The constraint exists / will exist via the race winner.
                     return True
-                else:
-                    code = exc.code if isinstance(exc, Neo4jError) else None
-                    _LOG.error(
-                        "ensure_neo4j_schema: could not create %s uniqueness "
-                        "constraint (code=%s); continuing without it — duplicate %s "
-                        "data may be present: %s",
-                        name,
-                        code,
-                        name,
-                        exc,
-                    )
-                    # Constraint NOT created: report failure so the caller retries.
-                    return False
+                if (
+                    fail_on_data_conflict
+                    and isinstance(exc, Neo4jError)
+                    and _is_constraint_data_conflict(exc)
+                ):
+                    raise RuntimeError(
+                        "Neo4j graph has un-migrated legacy nodes (untagged "
+                        ":Node or duplicates); cold start no longer "
+                        "auto-migrates. Run: context-intelligence-server "
+                        "doctor --fix"
+                    ) from exc
+                code = exc.code if isinstance(exc, Neo4jError) else None
+                _LOG.error(
+                    "ensure_neo4j_schema: could not create %s uniqueness "
+                    "constraint (code=%s); continuing without it — duplicate %s "
+                    "data may be present: %s",
+                    name,
+                    code,
+                    name,
+                    exc,
+                )
+                # Constraint NOT created: report failure so the caller retries.
+                return False
             # session.run succeeded: the constraint is established.
             return True
 
@@ -543,106 +774,28 @@ async def ensure_neo4j_schema(
         )
 
         # ------------------------------------------------------------------
-        # Step 5: backfill the universal :Node label onto pre-existing nodes.
-        # The non-Session node MERGE targets (n:Node {node_id, workspace}) so it
-        # can use the composite :Node(node_id, workspace) index.  Nodes written
-        # before this label existed have NO :Node label, so the indexed MERGE
-        # would CREATE a duplicate of them rather than match them.  Tag every
-        # such node first.
-        #
-        # This MUST run BEFORE the :Node uniqueness constraint (Step 6): the
-        # constraint cannot be created over a graph that still has untagged nodes
-        # that would become duplicate (node_id, workspace) :Node pairs, and the
-        # re-keyed Session/edge MERGEs on :Node must find pre-existing nodes
-        # rather than fork their identity.
-        #
-        # Batched + idempotent: CALL (n) { ... } IN TRANSACTIONS commits in chunks
-        # (so 1.3M nodes don't blow the per-transaction memory cap), and the
-        # WHERE NOT n:Node guard makes re-runs converge to a no-op once the
-        # graph is fully tagged.  ensure_neo4j_schema is awaited at the top of
-        # _flush_body, so this runs before any flush MERGEs on :Node.
-        # The batch size must be a literal in Cypher, so it is interpolated from
-        # the in-process int constant (never user input).
-        #
-        # Uses the variable-scoped subquery form ``CALL (n) { ... }`` (the
-        # importing-`WITH` form ``CALL { WITH n ... }`` is deprecated in Neo4j 5
-        # and emits an 01N00 deprecation notification on every run).
-        #
-        # NOTE (was a latent bug): this block previously sat after an early
-        # ``return fully_established`` and was therefore DEAD CODE — the backfill
-        # never ran, so legacy untagged nodes silently duplicated on re-write.
-        try:
-            await session.run(
-                cast(
-                    LiteralString,
-                    f"MATCH (n) WHERE NOT n:{_UNIVERSAL_NODE_LABEL} "
-                    f"CALL (n) {{ SET n:{_UNIVERSAL_NODE_LABEL} }} "
-                    f"IN TRANSACTIONS OF {int(_NODE_BACKFILL_BATCH)} ROWS",
-                )
-            )
-        except Exception as exc:  # noqa: BLE001
-            _LOG.warning(
-                "ensure_neo4j_schema: :Node backfill did not complete "
-                "(non-fatal, retried next startup): %s",
-                exc,
-            )
-
-        # Backfill verification (observability): the migration's "is it done?"
-        # signal.  A non-zero remaining-untagged count means the universal :Node
-        # identity is NOT yet established graph-wide, so the Step-6 constraint may
-        # fail and the re-keyed writers can still fork a legacy node's identity.
-        # Surfaced LOUD (never-silent) so an incomplete migration is visible in
-        # logs rather than discovered via duplicate nodes.
-        try:
-            rec = await (
-                await session.run(
-                    f"MATCH (n) WHERE NOT n:{_UNIVERSAL_NODE_LABEL} "
-                    "RETURN count(n) AS remaining"
-                )
-            ).single()
-            remaining = int(rec["remaining"]) if rec is not None else 0
-            if remaining:
-                _LOG.warning(
-                    "ensure_neo4j_schema: :Node backfill incomplete — %d node(s) "
-                    "still lack the :Node label; the universal-identity migration "
-                    "is NOT complete (re-runs next schema init). Do not rely on the "
-                    ":Node uniqueness constraint until this reaches 0.",
-                    remaining,
-                )
-            else:
-                _LOG.info(
-                    "ensure_neo4j_schema: :Node backfill complete (0 untagged nodes)."
-                )
-        except Exception as exc:  # noqa: BLE001 - observability only, never break init
-            _LOG.debug(
-                "ensure_neo4j_schema: backfill verification count skipped (benign): %s",
-                exc,
-            )
-
-        # ------------------------------------------------------------------
         # Step 6: universal :Node identity uniqueness constraint.
         # Every node writer now keys identity on :Node (Session/Event/etc. add
         # their type label via SET), and the cross-session edge writer MERGEs
         # bare :Node endpoint placeholders.  This constraint is the atomicity
         # guard that keeps concurrent MERGEs on (node_id, workspace) from
         # creating divergent duplicate nodes — the role the :Session constraint
-        # used to play for the Session MERGE.  Created AFTER the Step-5 backfill
-        # so no pre-existing untagged duplicate blocks it.
+        # used to play for the Session MERGE.
         #
-        # OPERATIONAL GATE (prod, tracked separately): on the live 1.3M-node
-        # graph, run + verify the backfill completes (count `WHERE NOT n:Node`
-        # -> 0) before relying on this constraint, and do not enable the re-keyed
-        # writers if the constraint is absent.  In the test/fresh-DB path the
-        # backfill is a no-op and this constraint is created up-front.
+        # NO LONGER preceded by an in-line dedup/backfill pass (moved to
+        # dedup_duplicate_nodes / backfill_node_labels, invoked via
+        # run_repair / `doctor --fix`, never automatically at cold start).
+        # If the graph still has untagged/duplicate legacy nodes, this
+        # constraint creation FAILS LOUD (fail_on_data_conflict=True below)
+        # rather than silently continuing without it — see
+        # _is_constraint_data_conflict and _create_constraint.
         #
         # A uniqueness constraint carries its OWN backing range index, and Neo4j
         # refuses to create it while a standalone index on the same (label,
         # properties) exists ("a constraint cannot be created until the index has
         # been dropped").  #19 shipped a plain `idx_node_universal` index on
         # :Node(node_id, workspace); drop it first (IF EXISTS, idempotent) so the
-        # constraint can take over the seek role.  The Step-5 backfill + Step-1
-        # dedup ran first, so the graph satisfies uniqueness before we drop the
-        # index and create the constraint.
+        # constraint can take over the seek role.
         # ------------------------------------------------------------------
         try:
             await session.run("DROP INDEX idx_node_universal IF EXISTS")
@@ -658,6 +811,7 @@ async def ensure_neo4j_schema(
                 "Node",
                 "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "
                 "FOR (n:Node) REQUIRE (n.node_id, n.workspace) IS UNIQUE",
+                fail_on_data_conflict=True,
             )
             and fully_established
         )
