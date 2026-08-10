@@ -3,10 +3,15 @@
 Covers:
 - handled_events == frozenset({'provider:request', 'llm:request', 'llm:response'})
 - provider:request creates Iteration:SST_EVENT node keyed as
-  '{session_id}::iteration::{iteration_number}' with session_id, iteration_number,
-  and started_at; sets active_iteration_id cursor
+  '{session_id}::iteration::{iteration_number}' (no active orchestrator run) or
+  '{session_id}::orch_run::{execution_start_ts}::iteration::{iteration_number}'
+  (P2.1 fix, run-scoped when execution_start_ts is set) with session_id,
+  iteration_number, and started_at; sets active_iteration_id cursor
 - E06: OrchestratorRun -[:HAS_PART {sst_semantic: 'CONTAINS'}]-> Iteration
-  created when execution_start_ts cursor is set; NOT created when None
+  created when execution_start_ts cursor is set (target is the run-scoped
+  iteration_id); NOT created when None
+- P2.1: two iterations sharing the same iteration_number under DIFFERENT
+  orchestrator runs get DISTINCT node_ids (no cross-run collision)
 - llm:request enriches active Iteration with provider, model, message_count, has_system;
   noop when active_iteration_id is None
 - llm:response enriches active Iteration with usage_input, usage_output, usage_cache_write;
@@ -172,7 +177,10 @@ class TestE06HasPartEdge:
     async def test_e06_has_part_edge_created_when_execution_start_ts_is_set(
         self, services: HookStateService
     ) -> None:
-        """E06 edge must be created when execution_start_ts cursor is set before provider:request."""
+        """E06 edge must be created when execution_start_ts cursor is set before provider:request.
+
+        P2.1: the edge target is now the run-scoped iteration_id, not the bare shape.
+        """
         handler = IterationHandler(services)
         # Simulate that execution:start previously fired and set the cursor
         services.data_layer_2.execution_start_ts = "2026-01-01T00:00:00Z"
@@ -185,7 +193,7 @@ class TestE06HasPartEdge:
             },
         )
         orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z"
-        iteration_id = "s1::iteration::1"
+        iteration_id = "s1::orch_run::2026-01-01T00:00:00Z::iteration::1"
         edge = await services.graph.get_edge(orch_run_id, iteration_id)
         assert edge is not None, (
             f"E06 HAS_PART edge from '{orch_run_id}' to '{iteration_id}' must exist "
@@ -196,6 +204,9 @@ class TestE06HasPartEdge:
         )
         assert edge.get("sst_semantic") == "CONTAINS", (
             f"E06 edge must have sst_semantic='CONTAINS'. Got: {edge.get('sst_semantic')}"
+        )
+        assert services.data_layer_2.active_iteration_id == iteration_id, (
+            "active_iteration_id cursor must be set to the run-scoped iteration_id"
         )
 
     async def test_e06_not_created_when_execution_start_ts_is_none(
@@ -218,6 +229,76 @@ class TestE06HasPartEdge:
             f"Only SOURCED_FROM edge should exist when execution_start_ts is None. "
             f"Got {len(services.graph._edges)} edges: {list(services.graph._edges.keys())}"
         )
+        # Falls back to the bare (pre-fix-shaped) id when no orchestrator run is active
+        assert services.data_layer_2.active_iteration_id == "s1::iteration::1"
+
+
+# ---------------------------------------------------------------------------
+# 3b. TestIterationRunScopingP21
+# ---------------------------------------------------------------------------
+
+
+class TestIterationRunScopingP21:
+    """P2.1 (I5/I3 fix): Iteration node_id is run-scoped and does not collide across runs."""
+
+    async def test_same_iteration_number_under_different_runs_gets_distinct_node_ids(
+        self, services: HookStateService
+    ) -> None:
+        """Two iterations sharing iteration_number=1 under DIFFERENT orchestrator runs
+        must produce DISTINCT node_ids and both nodes must independently exist.
+
+        This reproduces the real-world collision: iteration_count is a per-session
+        (not per-run) counter, so after a drainer restart/replay recreates
+        DataLayer2State the counter can restart from zero and reproduce a prior
+        run's iteration_number under a NEW orchestrator run. Before the P2.1 fix,
+        both runs' first iteration would MERGE onto the bare
+        's1::iteration::1' node_id. After the fix, each run's iteration_number=1 is
+        prefixed with its own orch_run_id and the two nodes stay distinct.
+        """
+        handler = IterationHandler(services)
+
+        # --- Run 1: execution_start_ts = t1, iteration_count increments 0 -> 1
+        services.data_layer_2.execution_start_ts = "2026-01-01T00:00:00Z"
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:01Z"},
+        )
+        run1_iteration_id = services.data_layer_2.active_iteration_id
+
+        # --- Simulate a drainer restart: a fresh DataLayer2State would have
+        # iteration_count=0 again. Reproduce that here directly (this is exactly
+        # what a freshly (re)constructed HookStateService looks like), then a
+        # genuinely NEW orchestrator run begins with a different timestamp.
+        services.data_layer_2.iteration_count = 0
+        services.data_layer_2.execution_start_ts = "2026-01-02T00:00:00Z"
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": "2026-01-02T00:00:01Z"},
+        )
+        run2_iteration_id = services.data_layer_2.active_iteration_id
+
+        assert run1_iteration_id == "s1::orch_run::2026-01-01T00:00:00Z::iteration::1"
+        assert run2_iteration_id == "s1::orch_run::2026-01-02T00:00:00Z::iteration::1"
+        assert run1_iteration_id != run2_iteration_id, (
+            "Iteration node_ids for the same iteration_number under different "
+            "orchestrator runs must be distinct (no cross-run collision)."
+        )
+
+        node1 = await services.graph.get_node(run1_iteration_id)
+        node2 = await services.graph.get_node(run2_iteration_id)
+        assert node1 is not None, (
+            f"Run 1's Iteration node '{run1_iteration_id}' must exist"
+        )
+        assert node2 is not None, (
+            f"Run 2's Iteration node '{run2_iteration_id}' must exist"
+        )
+        assert node1.get("iteration_number") == 1
+        assert node2.get("iteration_number") == 1
+        assert node1.get("started_at") == "2026-01-01T00:00:01Z", (
+            "Run 1's Iteration node must retain its own started_at, not run 2's "
+            "(proves the two nodes were never merged together)"
+        )
+        assert node2.get("started_at") == "2026-01-02T00:00:01Z"
 
 
 # ---------------------------------------------------------------------------

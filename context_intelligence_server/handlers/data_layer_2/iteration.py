@@ -64,18 +64,37 @@ class IterationHandler:
     ) -> None:
         """Create Iteration node and set active_iteration_id cursor.
 
-        - Computes iteration_id as '{session_id}::iteration::{iteration_number}'
+        - Computes iteration_id as run-scoped:
+          '{session_id}::orch_run::{execution_start_ts}::iteration::{iteration_number}'
+          when an orchestrator run is active (execution_start_ts cursor set), using the
+          SAME disambiguator OrchestratorRun uses for its own node_id (P2.1 / I5 fix).
+          Falls back to the bare '{session_id}::iteration::{iteration_number}' shape when
+          no run is active -- this bare shape is also what historical (pre-fix) Iteration
+          nodes look like, making them detectable as suspect. See CHANGELOG.md.
         - Sets active_iteration_id cursor on DataLayer2State
         - Creates Iteration:SST_EVENT node with session_id, iteration_number, started_at
         - Conditionally creates E06: OrchestratorRun -[:HAS_PART {sst_semantic: 'CONTAINS'}]->
           Iteration when execution_start_ts cursor is set
+
+        Without run-scoping, iteration_number alone (a counter scoped to the whole
+        session, not the run) can repeat across orchestrator runs -- e.g. after a
+        drainer restart/replay resets the in-memory counter -- causing distinct runs'
+        Iteration nodes to MERGE onto the same node_id (I5) and their usage figures to
+        clobber each other (I3, usage_cache_write in particular).
         """
         # Increment counter to get the next iteration number
         self.services.data_layer_2.iteration_count += 1
         iteration_number = self.services.data_layer_2.iteration_count
 
         timestamp: str = data.get("timestamp", "")
-        iteration_id = f"{session_id}::iteration::{iteration_number}"
+
+        execution_start_ts = self.services.data_layer_2.execution_start_ts
+        orch_run_id: str | None = None
+        if execution_start_ts is not None:
+            orch_run_id = f"{session_id}::orch_run::{execution_start_ts}"
+            iteration_id = f"{orch_run_id}::iteration::{iteration_number}"
+        else:
+            iteration_id = f"{session_id}::iteration::{iteration_number}"
 
         # Set cursor so llm:request and llm:response can find this iteration
         self.services.data_layer_2.active_iteration_id = iteration_id
@@ -92,9 +111,7 @@ class IterationHandler:
         )
 
         # E06 (conditional): OrchestratorRun -[:HAS_PART {sst_semantic: 'CONTAINS'}]-> Iteration
-        execution_start_ts = self.services.data_layer_2.execution_start_ts
-        if execution_start_ts is not None:
-            orch_run_id = f"{session_id}::orch_run::{execution_start_ts}"
+        if orch_run_id is not None:
             await self.services.graph.upsert_edge(
                 orch_run_id,
                 iteration_id,
