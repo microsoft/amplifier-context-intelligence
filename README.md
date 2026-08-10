@@ -29,6 +29,31 @@ for the full ingest/drain flow.
 
 ---
 
+## Upgrading: Cold Start No Longer Auto-Migrates
+
+> ⚠️ **Behavior change.** Earlier versions self-healed an un-migrated Neo4j
+> graph inline at every cold start. They no longer do. If the graph still has
+> untagged `:Node` or duplicate legacy nodes, startup now **fails loud**
+> instead of silently repairing the graph, raising:
+>
+> ```
+> RuntimeError: Neo4j graph has un-migrated legacy nodes (untagged :Node or
+> duplicates); cold start no longer auto-migrates. Run:
+> context-intelligence-server doctor --fix
+> ```
+>
+> **Before upgrading a running deployment**, check the graph and repair it if
+> needed:
+>
+> ```bash
+> context-intelligence-server doctor        # diagnose only (read-only)
+> context-intelligence-server doctor --fix  # repair (dedup + :Node backfill), then start the server
+> ```
+>
+> A freshly-provisioned graph has nothing to migrate and is unaffected.
+
+---
+
 ## Neo4j Plugins (APOC + GDS)
 
 The server needs Neo4j 5.x reachable over Bolt with the **APOC** procedures
