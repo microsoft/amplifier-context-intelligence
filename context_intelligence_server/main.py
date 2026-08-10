@@ -733,6 +733,12 @@ async def post_events(
     body = await http_request.body()
     body_obj = json.loads(body)
     body_obj["created_by"] = contributor_id  # overwrite, never setdefault
+    # I1: lift the optional top-level working_dir envelope field into body_obj["data"]
+    # so it rides the existing data pipeline (registry's _parse_line extracts "data"
+    # wholesale) and reaches ensure_session_node. Forward-only: only set when the client
+    # supplied it; absent/empty leaves Session.working_dir null.
+    if request.working_dir and isinstance(body_obj.get("data"), dict):
+        body_obj["data"]["working_dir"] = request.working_dir
     body = json.dumps(body_obj, separators=(",", ":")).encode()
     await registry.queue_manager.append(worker_key, body)
     registry.record_accepted()  # count the durably-accepted event

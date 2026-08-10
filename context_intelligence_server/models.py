@@ -14,10 +14,19 @@ class EventRequest(BaseModel):
     The Amplifier client must always supply workspace on every event.
     Events without workspace (e.g. an incorrectly configured hook) are
     rejected at the endpoint with HTTP 422.
+
+    working_dir is OPTIONAL (I1) — the bundle hook emits it
+    as a top-level envelope field alongside workspace, but older clients/events
+    won't have it. Absent/empty is fine and leaves the Session node's
+    working_dir property null. Populate-if-missing: the Session node's
+    working_dir is filled in by the first subsequent event (including a
+    re-import via the upload CLI) that carries a non-empty value, but an
+    already-populated value is never overwritten.
     """
 
     event: str
     workspace: str
+    working_dir: str | None = None
     idempotency_key: str | None = None
     data: dict[str, Any]
 

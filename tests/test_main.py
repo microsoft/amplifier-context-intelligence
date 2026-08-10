@@ -1367,6 +1367,73 @@ async def test_post_events_stamps_none_when_no_auth(
     assert body_obj["created_by"] is None
 
 
+async def test_post_events_lifts_working_dir_into_data(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I1: a top-level working_dir envelope field is lifted into data.working_dir."""
+    monkeypatch.setattr(
+        main_module.registry, "get_or_create", lambda *args, **kwargs: MagicMock()
+    )
+    captured: list[bytes] = []
+
+    async def _fake_append(worker_key: str, raw: bytes) -> None:
+        captured.append(raw)
+
+    monkeypatch.setattr(main_module.registry.queue_manager, "append", _fake_append)
+
+    response = await client.post(
+        "/events",
+        json={
+            "event": "session:start",
+            "workspace": "/ws",
+            "working_dir": "/home/user/my-project",
+            "data": {
+                "session_id": "s4",
+                "timestamp": "2026-06-16T20:17:11.604690+00:00",
+            },
+        },
+    )
+
+    assert response.status_code == 202
+    assert len(captured) == 1
+    body_obj = json.loads(captured[0])
+    assert body_obj["data"]["working_dir"] == "/home/user/my-project"
+
+
+async def test_post_events_absent_working_dir_leaves_data_unset(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I1: omitting working_dir must not add the key to data at all (forward-only)."""
+    monkeypatch.setattr(
+        main_module.registry, "get_or_create", lambda *args, **kwargs: MagicMock()
+    )
+    captured: list[bytes] = []
+
+    async def _fake_append(worker_key: str, raw: bytes) -> None:
+        captured.append(raw)
+
+    monkeypatch.setattr(main_module.registry.queue_manager, "append", _fake_append)
+
+    response = await client.post(
+        "/events",
+        json={
+            "event": "session:start",
+            "workspace": "/ws",
+            "data": {
+                "session_id": "s5",
+                "timestamp": "2026-06-16T20:17:11.604690+00:00",
+            },
+        },
+    )
+
+    assert response.status_code == 202
+    assert len(captured) == 1
+    body_obj = json.loads(captured[0])
+    assert "working_dir" not in body_obj["data"]
+
+
 async def test_crash_recovery_passes_created_by_to_get_or_create(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
