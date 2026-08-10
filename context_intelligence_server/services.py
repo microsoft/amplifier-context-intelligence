@@ -256,8 +256,18 @@ class HookStateService:
            ``_seen_sessions`` cache, return immediately.
         2. Graph query — call ``graph.get_node(session_id)``.  If the node
            already exists (e.g. from a previous run), repopulate the cache and
-           return without overwriting any data.  If the node is absent, create
+           return without overwriting any existing data — except ``working_dir``
+           is populate-if-missing (see below).  If the node is absent, create
            it with labels ``["Session"]`` and ``status = 'running'``.
+
+        ``working_dir`` is populate-if-missing on every call, not just node
+        creation: if the incoming event carries a non-empty ``working_dir`` and
+        the node does not already have one, the gap is filled.  An
+        already-populated ``working_dir`` is never overwritten, and an empty/
+        absent incoming value never clears an existing one.  This is what lets
+        re-importing an existing local session (e.g. via the upload CLI)
+        backfill ``working_dir`` on a Session node that was created before the
+        field existed.
 
         This method is a safety net that creates a minimal session node if it
         doesn't exist.  ``SessionHandler`` is the sole authority on session
@@ -285,10 +295,23 @@ class HookStateService:
             #   4. Worker B's flush later issues a fresh MERGE → duplicate node.
             # upsert_node uses union-merge for labels, so existing type labels
             # (e.g. "RootSession") are preserved — this call never strips labels.
-            await self.graph.upsert_node(
-                session_id,
-                {"labels": ["Session"], "status": "running", "session_id": session_id},
-            )
+            stub_data: dict[str, Any] = {
+                "labels": ["Session"],
+                "status": "running",
+                "session_id": session_id,
+            }
+            # I1: populate-if-missing. The node may already
+            # exist with working_dir null/absent (e.g. it predates this event, or was
+            # created via a delegation/fork reference before its own lifecycle events
+            # arrived). If this event carries a non-empty working_dir AND the existing
+            # node does not already have one, fill the gap. Never overwrite an
+            # already-populated value, and never write an empty incoming value —
+            # this is the fix that lets re-importing an existing local session (e.g.
+            # via the upload CLI) backfill working_dir instead of leaving it null
+            # forever because this branch used to return early without touching it.
+            if data.get("working_dir") and not existing.get("working_dir"):
+                stub_data["working_dir"] = data["working_dir"]
+            await self.graph.upsert_node(session_id, stub_data)
             self._seen_sessions.add(session_id)
             return
 
@@ -316,6 +339,13 @@ class HookStateService:
             node_data["started_at"] = _ts
         if "agent" in data:
             node_data["agent"] = data["agent"]
+        # I1: lift working_dir onto the Session node when the
+        # ingest layer supplied it (see main.py post_events). Populate-if-missing: the
+        # already-exists branch above fills the same gap for nodes created before this
+        # field existed, so working_dir is not stuck null forever -- it is backfilled
+        # the next time any event (including a re-import via the upload CLI) carries it.
+        if data.get("working_dir"):
+            node_data["working_dir"] = data["working_dir"]
 
         await self.graph.upsert_node(session_id, node_data)
         self._seen_sessions.add(session_id)  # only cache after successful write

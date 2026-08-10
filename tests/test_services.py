@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import pytest
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from context_intelligence_server.services import (
     GraphState,
     HookConfig,
     HookStateService,
 )
-
 
 # ---------------------------------------------------------------------------
 # HookConfig tests
@@ -657,6 +656,186 @@ class TestEnsureSessionNodeTimestampKey:
         node = await svc.graph.get_node("sess-ts-test")
         assert node is not None
         assert node.get("started_at") == expected_started_at
+
+
+# ---------------------------------------------------------------------------
+# I1: ensure_session_node lifts working_dir onto Session
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureSessionNodeWorkingDir:
+    """ensure_session_node sets Session.working_dir from data['working_dir'] when present.
+
+    Forward-only: absent/empty working_dir leaves the property unset (null on read).
+    """
+
+    async def test_working_dir_set_when_present(self) -> None:
+        """data['working_dir'] must be copied onto the new Session node."""
+        svc = HookStateService()
+        await svc.ensure_session_node(
+            "sess-wd-present",
+            {
+                "timestamp": "2026-01-01T00:00:00Z",
+                "working_dir": "/home/user/my-project",
+            },
+        )
+        node = await svc.graph.get_node("sess-wd-present")
+        assert node is not None
+        assert node.get("working_dir") == "/home/user/my-project", (
+            f"working_dir must be copied from data. Got: {node!r}"
+        )
+
+    async def test_working_dir_absent_leaves_property_unset(self) -> None:
+        """Missing data['working_dir'] must leave the Session node without the property."""
+        svc = HookStateService()
+        await svc.ensure_session_node(
+            "sess-wd-absent",
+            {"timestamp": "2026-01-01T00:00:00Z"},
+        )
+        node = await svc.graph.get_node("sess-wd-absent")
+        assert node is not None
+        assert node.get("working_dir") is None, (
+            f"working_dir must be absent/null when not supplied. Got: {node!r}"
+        )
+
+    async def test_working_dir_empty_string_leaves_property_unset(self) -> None:
+        """Empty-string data['working_dir'] must NOT be written (falsy guard, matches workspace)."""
+        svc = HookStateService()
+        await svc.ensure_session_node(
+            "sess-wd-empty",
+            {"timestamp": "2026-01-01T00:00:00Z", "working_dir": ""},
+        )
+        node = await svc.graph.get_node("sess-wd-empty")
+        assert node is not None
+        assert node.get("working_dir") is None, (
+            f"empty-string working_dir must not be written. Got: {node!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# working_dir populate-if-missing on the ALREADY-EXISTS path.
+#
+# The gap this closes: ensure_session_node's already-exists branch used to
+# upsert a fixed stub ({labels, status, session_id}) and return early,
+# meaning re-importing an existing local JSONL session (e.g. via the upload
+# CLI) never populated working_dir on a Session node that predates the
+# field. Each test below uses two HookStateService instances sharing one
+# GraphState to simulate a fresh process (cold _seen_sessions cache)
+# re-encountering a session that already has a Session node in the graph.
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureSessionNodeWorkingDirPopulateIfMissing:
+    """working_dir is populate-if-missing on the already-exists path too."""
+
+    async def test_fills_null_working_dir_from_later_event(self) -> None:
+        """Existing node with working_dir null + later event with working_dir -> filled."""
+        graph = GraphState()
+        creator = HookStateService(graph_store=graph)
+        await creator.ensure_session_node(
+            "sess-wd-fill-gap", {"timestamp": "2026-01-01T00:00:00Z"}
+        )
+        node = await graph.get_node("sess-wd-fill-gap")
+        assert node is not None
+        assert (
+            node.get("working_dir") is None
+        )  # sanity: gap exists before the fix path runs
+
+        # Fresh service instance == cold _seen_sessions cache, same underlying graph.
+        reimporter = HookStateService(graph_store=graph)
+        await reimporter.ensure_session_node(
+            "sess-wd-fill-gap",
+            {
+                "timestamp": "2026-02-01T00:00:00Z",
+                "working_dir": "/home/user/my-project",
+            },
+        )
+        node = await graph.get_node("sess-wd-fill-gap")
+        assert node is not None
+        assert node.get("working_dir") == "/home/user/my-project", (
+            f"working_dir must be filled in on the already-exists path. Got: {node!r}"
+        )
+
+    async def test_does_not_clobber_already_populated_working_dir(self) -> None:
+        """Existing node with working_dir='/x' + later event with working_dir='/y' -> stays '/x'."""
+        graph = GraphState()
+        creator = HookStateService(graph_store=graph)
+        await creator.ensure_session_node(
+            "sess-wd-no-clobber",
+            {"timestamp": "2026-01-01T00:00:00Z", "working_dir": "/x"},
+        )
+
+        conflicting = HookStateService(graph_store=graph)
+        await conflicting.ensure_session_node(
+            "sess-wd-no-clobber",
+            {"timestamp": "2026-02-01T00:00:00Z", "working_dir": "/y"},
+        )
+        node = await graph.get_node("sess-wd-no-clobber")
+        assert node is not None
+        assert node.get("working_dir") == "/x", (
+            f"an already-populated working_dir must never be overwritten. Got: {node!r}"
+        )
+
+    async def test_empty_incoming_value_does_not_clear_existing_value(self) -> None:
+        """Existing node with working_dir='/x' + later event with working_dir='' -> stays '/x'."""
+        graph = GraphState()
+        creator = HookStateService(graph_store=graph)
+        await creator.ensure_session_node(
+            "sess-wd-empty-no-clear",
+            {"timestamp": "2026-01-01T00:00:00Z", "working_dir": "/x"},
+        )
+
+        empty_event = HookStateService(graph_store=graph)
+        await empty_event.ensure_session_node(
+            "sess-wd-empty-no-clear",
+            {"timestamp": "2026-02-01T00:00:00Z", "working_dir": ""},
+        )
+        node = await graph.get_node("sess-wd-empty-no-clear")
+        assert node is not None
+        assert node.get("working_dir") == "/x", (
+            f"empty incoming working_dir must never null out an existing value. Got: {node!r}"
+        )
+
+    async def test_absent_incoming_value_leaves_absent_value_absent(self) -> None:
+        """Existing node with no working_dir + later event without working_dir -> stays absent."""
+        graph = GraphState()
+        creator = HookStateService(graph_store=graph)
+        await creator.ensure_session_node(
+            "sess-wd-stay-absent", {"timestamp": "2026-01-01T00:00:00Z"}
+        )
+
+        later = HookStateService(graph_store=graph)
+        await later.ensure_session_node(
+            "sess-wd-stay-absent", {"timestamp": "2026-02-01T00:00:00Z"}
+        )
+        node = await graph.get_node("sess-wd-stay-absent")
+        assert node is not None
+        assert node.get("working_dir") is None, (
+            f"working_dir must remain absent when no event ever supplies one. Got: {node!r}"
+        )
+
+    async def test_fill_is_idempotent_no_op_on_repeat(self) -> None:
+        """Once filled, a repeat of the same working_dir is a no-op (still fills correctly)."""
+        graph = GraphState()
+        creator = HookStateService(graph_store=graph)
+        await creator.ensure_session_node(
+            "sess-wd-idempotent", {"timestamp": "2026-01-01T00:00:00Z"}
+        )
+
+        filler = HookStateService(graph_store=graph)
+        await filler.ensure_session_node(
+            "sess-wd-idempotent",
+            {"timestamp": "2026-02-01T00:00:00Z", "working_dir": "/x"},
+        )
+
+        repeat = HookStateService(graph_store=graph)
+        await repeat.ensure_session_node(
+            "sess-wd-idempotent",
+            {"timestamp": "2026-03-01T00:00:00Z", "working_dir": "/x"},
+        )
+        node = await graph.get_node("sess-wd-idempotent")
+        assert node is not None
+        assert node.get("working_dir") == "/x"
 
 
 @pytest.mark.asyncio
