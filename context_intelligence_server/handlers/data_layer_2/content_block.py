@@ -50,8 +50,11 @@ class ContentBlockHandler:
 
         block_index = data.get("block_index")
         iteration_id = self.services.data_layer_2.active_iteration_id
-        # ID format is "{session_id}::iteration::{n}"; [-1] extracts the iteration number.
-        # If the cursor format ever changes, this extraction must be updated to match.
+        # active_iteration_id's trailing "::"-segment is always the plain iteration
+        # number, whether the cursor is the bare "{session_id}::iteration::{n}" shape
+        # or the run-scoped "{session_id}::orch_run::{ts}::iteration::{n}" shape
+        # (P2.1 fix, see IterationHandler) -- [-1] extracts it either way. If the
+        # cursor format ever changes this extraction must be updated to match.
         iteration_n = iteration_id.split("::")[-1] if iteration_id else "0"
         block_node_id = f"{session_id}::block::{iteration_n}::{block_index}"
 
