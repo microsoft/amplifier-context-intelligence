@@ -2,7 +2,16 @@
 # MS with a fix-only security feed, so a build-time `tdnf update` clears reported
 # CRITICAL/HIGH without suppression lists. Also matches the AzureLinux 3.0 AKS
 # nodes this service runs on.
-FROM mcr.microsoft.com/azurelinux/base/python:3.12.9-13-azl3.0.20260706
+#
+# We intentionally track the floating `3.12` azl3 tag rather than pinning a dated
+# snapshot. The Trivy gate scans against an always-current vuln DB (trivy-action
+# @master), so pinning an old base snapshot guarantees eventual scan failure the
+# moment a new CVE lands — a green build today goes red tomorrow with zero code
+# change. Floating the base keeps the newest patched OS packages baked in and,
+# combined with the `tdnf update` below, keeps the image consistently current
+# with the fix-only feed. Reproducibility is deliberately traded for a stronger,
+# self-healing security posture (SFI).
+FROM mcr.microsoft.com/azurelinux/base/python:3.12
 
 # Pull the latest security patches at build time so we don't have to wait for MS
 # to republish the base image. Every azl3 CVE with a fix lands here.
