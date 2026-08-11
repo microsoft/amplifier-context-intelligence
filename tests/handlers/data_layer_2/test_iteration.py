@@ -300,6 +300,41 @@ class TestIterationRunScopingP21:
         )
         assert node2.get("started_at") == "2026-01-02T00:00:01Z"
 
+        # --- Regression guard: exactly ONE distinct HAS_PART parent per Iteration.
+        #
+        # This is the invariant the I5 fix guarantees and the one a revert of
+        # run-scoping would break: pre-fix, both runs' iteration_number=1 would
+        # MERGE onto the SAME bare node_id, so that one node would end up with
+        # TWO distinct OrchestratorRun HAS_PART parents. Post-fix, each run's
+        # Iteration node_id is unique to that run, so each node has exactly one.
+        run1_orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z"
+        run2_orch_run_id = "s1::orch_run::2026-01-02T00:00:00Z"
+
+        def has_part_parents(iteration_id: str) -> list[str]:
+            """Distinct HAS_PART parent ids pointing at *iteration_id* in the fake graph."""
+            return [
+                src
+                for (src, dst), data in services.graph._edges.items()
+                if dst == iteration_id and data.get("type") == "HAS_PART"
+            ]
+
+        run1_parents = has_part_parents(run1_iteration_id)
+        run2_parents = has_part_parents(run2_iteration_id)
+
+        assert run1_parents == [run1_orch_run_id], (
+            f"Run 1's Iteration node '{run1_iteration_id}' must have exactly ONE "
+            f"HAS_PART parent (its own OrchestratorRun). Got: {run1_parents!r}"
+        )
+        assert run2_parents == [run2_orch_run_id], (
+            f"Run 2's Iteration node '{run2_iteration_id}' must have exactly ONE "
+            f"HAS_PART parent (its own OrchestratorRun). Got: {run2_parents!r}"
+        )
+        assert set(run1_parents).isdisjoint(run2_parents), (
+            "No Iteration node may be shared (MERGEd) across the two "
+            "OrchestratorRuns -- each run's iterations must be distinct nodes "
+            "with distinct, non-overlapping HAS_PART parents."
+        )
+
 
 # ---------------------------------------------------------------------------
 # 4. TestLlmRequestUpsertsProperties
