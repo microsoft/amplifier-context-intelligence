@@ -20,10 +20,10 @@ from neo4j import READ_ACCESS, WRITE_ACCESS, AsyncGraphDatabase
 
 from context_intelligence_server import __version__
 from context_intelligence_server.auth import (
+    _EXEMPT_PATHS,
     BearerTokenMiddleware,
     EntraResolver,
     StaticKeyResolver,
-    _EXEMPT_PATHS,
 )
 from context_intelligence_server.authz import (  # noqa: F401 — re-exported for tests/routes
     _is_write_capable,
@@ -32,20 +32,23 @@ from context_intelligence_server.authz import (  # noqa: F401 — re-exported fo
 )
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import Neo4jClientConfig, Settings, get_settings
-from context_intelligence_server.identity_store import IdentityStore
-from context_intelligence_server.status import build_status_response
-from context_intelligence_server.routers.admin import router as admin_router
-from context_intelligence_server.routers.queues import router as queues_router
-from context_intelligence_server.routers.version import router as version_router
 from context_intelligence_server.idempotency import EventIdempotencyCache
+from context_intelligence_server.identity_store import IdentityStore
 from context_intelligence_server.logging_config import setup_logging
 from context_intelligence_server.models import (
     CypherRequest,
     EventRequest,
     EventResponse,
 )
-from context_intelligence_server.neo4j_store import ensure_neo4j_schema
+from context_intelligence_server.neo4j_store import (
+    count_untagged_nodes,
+    ensure_neo4j_schema,
+)
 from context_intelligence_server.registry import SessionRegistry
+from context_intelligence_server.routers.admin import router as admin_router
+from context_intelligence_server.routers.queues import router as queues_router
+from context_intelligence_server.routers.version import router as version_router
+from context_intelligence_server.status import build_status_response
 
 _settings = get_settings()
 
@@ -171,13 +174,33 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info(
         "lifespan_startup: initializing Neo4j schema (indexes + uniqueness constraints)"
     )
-    # Cold start: fail CLOSED on a data conflict (un-migrated legacy nodes) --
-    # refuse to boot rather than accept requests against a graph the running
-    # server's writers could corrupt. Contrast with the mid-flight flush path
-    # (Neo4jGraphStore._ensure_schema), which intentionally leaves this False
-    # so the same conflict does not dead-letter real in-flight activity data.
-    await ensure_neo4j_schema(app.state.neo4j_driver, fail_on_data_conflict=True)
+    # Cold start must NEVER fail due to graph state (design decision:
+    # migration -- dedup + :Node backfill -- lives ONLY in `doctor --fix`
+    # (run_repair), never automatically at boot). Leave fail_on_data_conflict
+    # at its default (False): a :Node constraint data conflict on an
+    # un-migrated/dirty graph is logged as a WARNING naming `doctor --fix`
+    # and this returns False -- it never raises. Contrast with run_repair,
+    # which still opts into fail_on_data_conflict=True (a lingering conflict
+    # AFTER dedup+backfill is a genuine repair failure the operator must see).
+    await ensure_neo4j_schema(app.state.neo4j_driver)
     logger.info("lifespan_startup: Neo4j schema initialized")
+    # Non-fatal migration-health check: if the graph still has nodes lacking
+    # the universal :Node label, log a recommendation to run `doctor --fix`
+    # and keep booting -- writes to untagged legacy nodes may create
+    # duplicates until the graph is repaired, but that is a data-quality
+    # signal, not a reason to refuse service. O(1) via the counts store (see
+    # count_untagged_nodes); a health-check failure must never block startup.
+    try:
+        untagged = await count_untagged_nodes(app.state.neo4j_driver)
+        if untagged:
+            logger.warning(
+                "Neo4j graph has %d node(s) lacking the :Node label; writes to "
+                "them may create duplicates. Run: context-intelligence-server "
+                "doctor --fix to migrate.",
+                untagged,
+            )
+    except Exception as exc:  # noqa: BLE001 - never block startup on a health probe
+        logger.debug("startup migration-health check skipped: %s", exc)
     # Crash recovery (decisions #5/#6): on startup, respawn one drainer per
     # session that still has an undrained, complete line. The workspace is
     # parsed from that session's FIRST log line so the respawned worker is
@@ -282,7 +305,7 @@ def _assert_admin_not_exempt() -> None:
     This is a defence-in-depth structural check: it is impossible to
     accidentally ship an unauthenticated admin surface.
     """
-    import context_intelligence_server.auth as _auth_module  # noqa: PLC0415
+    import context_intelligence_server.auth as _auth_module
 
     # Check the exact-path exempt set.
     for path in _auth_module._EXEMPT_PATHS:
@@ -782,7 +805,7 @@ def main(argv: list[str] | None = None) -> None:
     # module, so importing it at module load time (rather than here, inside
     # main()) would be a circular import at import time. By the time main()
     # runs, this module has already finished executing top-to-bottom.
-    from context_intelligence_server import doctor as _doctor  # noqa: PLC0415
+    from context_intelligence_server import doctor as _doctor
 
     sys.exit(asyncio.run(_doctor.run_doctor(fix=args.fix)))
 

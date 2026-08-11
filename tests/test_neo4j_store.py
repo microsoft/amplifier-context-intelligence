@@ -2930,17 +2930,53 @@ class TestReadOnlyDiagnostics:
     """count_untagged_nodes / count_duplicate_nodes / diagnose -- no writes."""
 
     async def test_count_untagged_nodes_returns_int(self) -> None:
+        """count_untagged_nodes is O(1): total-count minus tagged-count, NOT
+        the ``WHERE NOT n:Node`` AllNodesScan (``_UNTAGGED_COUNT_CYPHER``) --
+        this function is now called on every server boot (main.py's lifespan
+        health check), so it must never regress to an O(graph-size) scan."""
         from context_intelligence_server.neo4j_store import (
+            _TAGGED_NODE_COUNT_CYPHER,
+            _TOTAL_NODE_COUNT_CYPHER,
             _UNTAGGED_COUNT_CYPHER,
             count_untagged_nodes,
         )
 
-        session = _ProgrammableSession(canned={_UNTAGGED_COUNT_CYPHER: [[{"c": 7}]]})
+        session = _ProgrammableSession(
+            canned={
+                _TOTAL_NODE_COUNT_CYPHER: [[{"c": 10}]],
+                _TAGGED_NODE_COUNT_CYPHER: [[{"c": 7}]],
+            }
+        )
         result = await count_untagged_nodes(_FakeDriver(session))
 
-        assert result == 7
-        assert "SET" not in session.executed[0]
-        assert "DETACH DELETE" not in session.executed[0]
+        assert result == 3, "expected total(10) - tagged(7) == 3"
+        assert session.executed == [_TOTAL_NODE_COUNT_CYPHER, _TAGGED_NODE_COUNT_CYPHER]
+        # The AllNodesScan-inducing scan query must NEVER be issued here.
+        assert _UNTAGGED_COUNT_CYPHER not in session.executed
+        assert not any("WHERE NOT" in stmt for stmt in session.executed)
+        assert not any(
+            "SET" in stmt or "DETACH DELETE" in stmt for stmt in session.executed
+        )
+
+    async def test_count_untagged_nodes_never_negative(self) -> None:
+        """A benign race (tagged count observed higher than total, e.g. a
+        concurrent write between the two counts-store reads) must clamp to 0,
+        never return a negative count."""
+        from context_intelligence_server.neo4j_store import (
+            _TAGGED_NODE_COUNT_CYPHER,
+            _TOTAL_NODE_COUNT_CYPHER,
+            count_untagged_nodes,
+        )
+
+        session = _ProgrammableSession(
+            canned={
+                _TOTAL_NODE_COUNT_CYPHER: [[{"c": 5}]],
+                _TAGGED_NODE_COUNT_CYPHER: [[{"c": 6}]],
+            }
+        )
+        result = await count_untagged_nodes(_FakeDriver(session))
+
+        assert result == 0
 
     async def test_count_duplicate_nodes_returns_int(self) -> None:
         from context_intelligence_server.neo4j_store import (
@@ -2957,13 +2993,15 @@ class TestReadOnlyDiagnostics:
     async def test_diagnose_combines_both_counts(self) -> None:
         from context_intelligence_server.neo4j_store import (
             _DUPLICATE_COUNT_CYPHER,
-            _UNTAGGED_COUNT_CYPHER,
+            _TAGGED_NODE_COUNT_CYPHER,
+            _TOTAL_NODE_COUNT_CYPHER,
             diagnose,
         )
 
         session = _ProgrammableSession(
             canned={
-                _UNTAGGED_COUNT_CYPHER: [[{"c": 9}]],
+                _TOTAL_NODE_COUNT_CYPHER: [[{"c": 12}]],
+                _TAGGED_NODE_COUNT_CYPHER: [[{"c": 3}]],
                 _DUPLICATE_COUNT_CYPHER: [[{"c": 5}]],
             }
         )
@@ -3274,10 +3312,17 @@ class TestDataConflictOnFlushPathDoesNotDeadLetter:
             "this is the self-healing behavior the fix restores."
         )
 
-    async def test_lifespan_path_still_fails_closed_on_genuine_conflict(self) -> None:
-        """The cold-start contract is unchanged: calling ensure_neo4j_schema
-        the way main.py's lifespan handler does (fail_on_data_conflict=True)
-        still refuses to boot against a genuinely un-migrated graph."""
+    async def test_doctor_repair_path_still_fails_closed_on_genuine_conflict(
+        self,
+    ) -> None:
+        """The doctor/repair contract is unchanged: calling ensure_neo4j_schema
+        with fail_on_data_conflict=True -- exactly what run_repair does
+        post-dedup/backfill -- still raises on a genuinely unrepairable graph.
+
+        NOT the lifespan path: main.py's lifespan handler no longer opts into
+        fail_on_data_conflict=True (cold start must never fail due to graph
+        state -- see test_main.py's startup tests). This direct-call assertion
+        preserves the doctor CLI's fail-loud contract, not a lifespan claim."""
         session = _ProgrammableSession(
             canned={
                 "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "

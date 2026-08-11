@@ -14,10 +14,12 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import Generator
 from datetime import datetime
-from typing import Any, Generator, LiteralString, cast
+from typing import Any, LiteralString, cast
 
-from neo4j import AsyncGraphDatabase, unit_of_work as _unit_of_work
+from neo4j import AsyncGraphDatabase
+from neo4j import unit_of_work as _unit_of_work
 from neo4j.exceptions import DriverError, Neo4jError
 
 _LOG = logging.getLogger(__name__)
@@ -362,11 +364,28 @@ _DEDUP_EVENT_CYPHER = (
     "RETURN count(duplicate) AS c"
 )
 
-# Shared by backfill_node_labels (pre/post count) and count_untagged_nodes --
-# single logic home for the ":Node label missing" count.
+# Shared by backfill_node_labels (pre/post count) -- single logic home for the
+# ":Node label missing" count. This is an AllNodesScan (O(graph-size)); kept
+# ONLY for backfill_node_labels's pre/post accounting during a doctor --fix
+# repair (an already-expensive O(graph-size) write operation, so an extra
+# O(graph-size) read alongside it is not a new cost). NOT used by
+# count_untagged_nodes below -- that needs an O(1) answer since it now also
+# runs on every server boot (see the counts-store queries below).
 _UNTAGGED_COUNT_CYPHER = (
     f"MATCH (n) WHERE NOT n:{_UNIVERSAL_NODE_LABEL} RETURN count(n) AS c"
 )
+
+# O(1) counts-store queries used by count_untagged_nodes. Neo4j maintains a
+# label-cardinality counts store, so "MATCH (n) RETURN count(n)" and
+# "MATCH (n:Label) RETURN count(n)" are answered directly from that store
+# (NodeCountFromCountStore in EXPLAIN) without touching any node -- unlike
+# "MATCH (n) WHERE NOT n:Label RETURN count(n)", which the planner cannot
+# answer from the counts store and instead executes as an AllNodesScan
+# (confirmed via EXPLAIN against a live Neo4j 5.26 instance). Untagged count
+# is therefore computed as the difference of two O(1) counts rather than a
+# single O(graph-size) scan.
+_TOTAL_NODE_COUNT_CYPHER = "MATCH (n) RETURN count(n) AS c"
+_TAGGED_NODE_COUNT_CYPHER = f"MATCH (n:{_UNIVERSAL_NODE_LABEL}) RETURN count(n) AS c"
 
 
 async def _run_single_count(session: Any, statement: str) -> int:
@@ -485,10 +504,22 @@ async def backfill_node_labels(driver: Any, database: str = "neo4j") -> int:
 async def count_untagged_nodes(driver: Any, database: str = "neo4j") -> int:
     """Read-only: number of nodes still lacking the universal ``:Node`` label.
 
+    O(1) via the counts store: computed as (total node count) minus (:Node
+    count), each answered directly from Neo4j's label-cardinality counts
+    store (NodeCountFromCountStore) -- NOT via the ``WHERE NOT n:Node`` full
+    scan (AllNodesScan) that ``_UNTAGGED_COUNT_CYPHER`` performs. This
+    function is called from ``diagnose`` (doctor) AND from the server's
+    startup health check on every boot, so it must stay O(1) regardless of
+    graph size -- an AllNodesScan here is exactly the 25-30s stall PR #67
+    removed from the write path; re-introducing it via a health check would
+    regress the same problem via a different door.
+
     No writes. Safe to call at any time, including on every request if needed.
     """
     async with driver.session(database=database) as session:
-        return await _run_single_count(session, _UNTAGGED_COUNT_CYPHER)
+        total = await _run_single_count(session, _TOTAL_NODE_COUNT_CYPHER)
+        tagged = await _run_single_count(session, _TAGGED_NODE_COUNT_CYPHER)
+        return max(total - tagged, 0)
 
 
 async def count_duplicate_nodes(driver: Any, database: str = "neo4j") -> int:

@@ -32,25 +32,30 @@ for the full ingest/drain flow.
 ## Upgrading: Cold Start No Longer Auto-Migrates
 
 > ⚠️ **Behavior change.** Earlier versions self-healed an un-migrated Neo4j
-> graph inline at every cold start. They no longer do. If the graph still has
-> untagged `:Node` or duplicate legacy nodes, startup now **fails loud**
-> instead of silently repairing the graph, raising:
+> graph inline at every cold start. They no longer do -- migration (dedup +
+> `:Node` backfill) is now the operator's responsibility via `doctor --fix`.
+>
+> **Startup never fails due to graph state.** If the graph still has untagged
+> `:Node` or duplicate legacy nodes, the server logs a **WARNING** recommending
+> the repair and **continues serving**:
 >
 > ```
-> RuntimeError: Neo4j graph has un-migrated legacy nodes (untagged :Node or
-> duplicates); cold start no longer auto-migrates. Run:
-> context-intelligence-server doctor --fix
+> Neo4j graph has N node(s) lacking the :Node label; writes to them may
+> create duplicates. Run: context-intelligence-server doctor --fix to migrate.
 > ```
 >
-> **Before upgrading a running deployment**, check the graph and repair it if
-> needed:
+> Writes to un-migrated (untagged) nodes may create duplicates until the graph
+> is repaired, so don't ignore the warning indefinitely -- but a dirty graph
+> is a data-quality issue to schedule a fix for, not a reason to refuse
+> service. Check and repair at your convenience:
 >
 > ```bash
 > context-intelligence-server doctor        # diagnose only (read-only)
-> context-intelligence-server doctor --fix  # repair (dedup + :Node backfill), then start the server
+> context-intelligence-server doctor --fix  # repair (dedup + :Node backfill)
 > ```
 >
-> A freshly-provisioned graph has nothing to migrate and is unaffected.
+> A freshly-provisioned graph has nothing to migrate and never logs the
+> warning.
 
 ---
 

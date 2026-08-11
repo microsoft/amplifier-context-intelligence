@@ -836,6 +836,138 @@ async def test_lifespan_skips_recovery_for_empty_workspace(
     assert spawned == []
 
 
+# ---------------------------------------------------------------------------
+# Startup must NEVER fail due to graph state (design decision): migration
+# (dedup + :Node backfill) lives ONLY in `doctor --fix` (run_repair). Cold
+# start calls ensure_neo4j_schema with the DEFAULT (fail_on_data_conflict
+# unset -> False), then runs a non-fatal migration-health check that logs a
+# recommendation to run `doctor --fix` on an un-migrated graph but never
+# raises or blocks the server from accepting requests.
+# ---------------------------------------------------------------------------
+
+
+async def test_lifespan_calls_ensure_schema_without_fail_on_data_conflict() -> None:
+    """Cold start must call ensure_neo4j_schema with its DEFAULT
+    (fail_on_data_conflict=False) -- NOT True. Passing True here would make
+    startup fail closed against graph state, which the design explicitly
+    rejects (only `doctor --fix` / run_repair opts into True)."""
+    mock_driver = _patched_lifespan_deps()
+    mock_ensure_schema = AsyncMock(return_value=True)
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=mock_ensure_schema,
+        ),
+        patch(
+            "context_intelligence_server.main.count_untagged_nodes",
+            new=AsyncMock(return_value=0),
+        ),
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+    mock_ensure_schema.assert_awaited_once()
+    _args, kwargs = mock_ensure_schema.await_args
+    assert kwargs.get("fail_on_data_conflict") is not True, (
+        "lifespan must not opt into fail_on_data_conflict=True -- cold start "
+        "must never fail due to graph state (that contract belongs to "
+        "run_repair / `doctor --fix` only)."
+    )
+
+
+async def test_lifespan_does_not_raise_and_logs_doctor_recommendation_on_dirty_graph(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """On an un-migrated graph (untagged :Node count > 0), startup must NOT
+    raise -- it logs a WARNING recommending `doctor --fix` and keeps
+    booting."""
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "context_intelligence_server.main.count_untagged_nodes",
+            new=AsyncMock(return_value=42),
+        ),
+        caplog.at_level(logging.WARNING),
+    ):
+        async with lifespan(main_module.app):  # MUST NOT raise
+            pass
+
+    assert any(
+        record.levelno == logging.WARNING and "doctor --fix" in record.getMessage()
+        for record in caplog.records
+    ), (
+        "Expected a WARNING naming `doctor --fix` on a dirty graph. "
+        f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+    )
+
+
+async def test_lifespan_skips_warning_on_clean_graph() -> None:
+    """On a fully-migrated graph (untagged count == 0), no doctor
+    recommendation is logged -- the health check is silent when there is
+    nothing to recommend."""
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "context_intelligence_server.main.count_untagged_nodes",
+            new=AsyncMock(return_value=0),
+        ) as mock_count,
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+    mock_count.assert_awaited_once()
+
+
+async def test_lifespan_does_not_raise_when_health_check_itself_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A health-check probe failure (e.g. count_untagged_nodes raising due to
+    a transient connectivity blip) must NEVER block startup -- it is logged
+    at DEBUG and swallowed."""
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "context_intelligence_server.main.count_untagged_nodes",
+            new=AsyncMock(side_effect=RuntimeError("transient connectivity blip")),
+        ),
+        caplog.at_level(logging.DEBUG),
+    ):
+        async with lifespan(main_module.app):  # MUST NOT raise
+            pass
+
+
 async def test_registry_exposed_on_app_state() -> None:
     """The module registry singleton is exposed on app.state for routers.
 

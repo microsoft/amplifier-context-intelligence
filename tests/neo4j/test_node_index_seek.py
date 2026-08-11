@@ -34,9 +34,8 @@ from __future__ import annotations
 from typing import Any, LiteralString, cast
 
 import pytest
+from context_intelligence_server.neo4j_store import Neo4jGraphStore, run_repair
 from neo4j import GraphDatabase
-
-from context_intelligence_server.neo4j_store import Neo4jGraphStore
 
 pytestmark = pytest.mark.neo4j
 
@@ -209,12 +208,18 @@ async def test_non_session_node_merge_idempotent_no_duplicates(
 async def test_preexisting_unlabeled_node_not_duplicated_after_backfill(
     neo4j_container: dict[str, Any],
 ) -> None:
-    """A legacy node (no :Node label) must be adopted by the backfill, not duplicated.
+    """A legacy node (no :Node label), once migrated by the DOCTOR, must be
+    adopted by the indexed MERGE, not duplicated.
 
-    Simulates the live graph: nodes written before the :Node label existed.  The
+    Simulates the live graph: nodes written before the :Node label existed. The
     indexed MERGE on (n:Node {...}) would CREATE a duplicate of such a node
-    unless the ensure_neo4j_schema backfill tags it with :Node first.  This test
-    fails (count == 2) if the fix ships the index without the backfill.
+    unless it has been tagged with :Node first. Post-PR-#67, that tagging is no
+    longer part of cold start / every flush -- ``ensure_neo4j_schema`` no longer
+    backfills. The migration (dedup + :Node backfill) is now the operator's job
+    via ``run_repair`` (``context-intelligence-server doctor --fix``), invoked
+    explicitly here BEFORE the write, mirroring the required real-world sequence
+    (run doctor --fix, then serve writes). This test fails (count == 2) if the
+    indexed MERGE ships without having run the doctor migration first.
     """
     # Seed a legacy node directly: has its type label but NOT :Node.
     seed_driver = GraphDatabase.driver(
@@ -231,14 +236,19 @@ async def test_preexisting_unlabeled_node_not_duplicated_after_backfill(
     finally:
         seed_driver.close()
 
-    # Write the SAME node_id through the fixed store (ensure_neo4j_schema runs the
-    # backfill, then the indexed :Node MERGE must adopt the legacy node).
+    # Run the doctor migration (dedup + :Node backfill + constraint) BEFORE the
+    # write -- this is now the operator's responsibility, not an automatic
+    # cold-start/flush-path side effect.
     store = Neo4jGraphStore(
         uri=neo4j_container["bolt_url"],
         auth=(neo4j_container["user"], neo4j_container["password"]),
         workspace="test",
     )
     try:
+        await run_repair(store._driver, store._database)
+
+        # Write the SAME node_id through the store AFTER migration -- the
+        # indexed :Node MERGE must adopt the now-tagged legacy node.
         await store.upsert_node("legacy-1", {"labels": ["Event"], "v": 2})
         await store.flush()
     finally:
