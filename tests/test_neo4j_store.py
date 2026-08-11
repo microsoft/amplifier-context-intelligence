@@ -3070,7 +3070,11 @@ class TestFailLoudConstraintGuard:
 
     async def test_ensure_neo4j_schema_raises_guided_runtime_error(self) -> None:
         """A data-conflict on the :Node constraint raises RuntimeError naming
-        `doctor --fix`, instead of silently continuing without it."""
+        `doctor --fix`, instead of silently continuing without it -- when the
+        caller explicitly opts in via ``fail_on_data_conflict=True`` (the
+        cold-start / lifespan and doctor-repair contract; see
+        ``test_ensure_neo4j_schema_default_does_not_raise_on_data_conflict``
+        below for the opposite, flush-path-safe default)."""
         conflict_error = Neo4jError._hydrate_neo4j(
             code="Neo.ClientError.Schema.ConstraintValidationFailed",
             message="constraint would be violated by existing data",
@@ -3085,7 +3089,7 @@ class TestFailLoudConstraintGuard:
         )
 
         with pytest.raises(RuntimeError, match="doctor --fix"):
-            await ensure_neo4j_schema(_FakeDriver(session))
+            await ensure_neo4j_schema(_FakeDriver(session), fail_on_data_conflict=True)
 
     async def test_benign_already_exists_does_not_raise(self) -> None:
         """A benign already-exists race on the :Node constraint is still
@@ -3105,3 +3109,212 @@ class TestFailLoudConstraintGuard:
 
         result = await ensure_neo4j_schema(_FakeDriver(session))  # must not raise
         assert result is True
+
+
+# ---------------------------------------------------------------------------
+# TestFailOnDataConflictDefault
+#
+# Regression for the PR #67 merge-blocker (reviewer Salil, commit 14a6d30):
+# ensure_neo4j_schema's :Node constraint step used to hardcode
+# fail_on_data_conflict=True with no way for callers to opt out. That is
+# correct for cold start (main.py:174, refuse to boot) but WRONG for the
+# mid-flight flush path (Neo4jGraphStore._ensure_schema, called from inside
+# _flush_body's try block): a RuntimeError raised there escapes via
+# _flush_body's `except ... raise`, gets caught by the drainer, and
+# dead-letters the ENTIRE in-flight batch of real activity records -- and
+# because _schema_initialized never latches, every subsequent batch dies the
+# same way until an operator runs `doctor --fix`.
+#
+# The fix makes fail_on_data_conflict a keyword-only parameter defaulting to
+# False (safe for the flush path); the lifespan caller (main.py) and the
+# doctor-repair caller (run_repair, post-dedup/backfill the graph should be
+# clean) opt in explicitly with True.
+# ---------------------------------------------------------------------------
+
+
+def _conflict_error() -> Neo4jError:
+    """A genuine :Node-constraint data-conflict error (untagged/duplicate legacy nodes)."""
+    return Neo4jError._hydrate_neo4j(
+        code="Neo.ClientError.Schema.ConstraintValidationFailed",
+        message="constraint would be violated by existing data",
+    )
+
+
+class TestFailOnDataConflictDefault:
+    """ensure_neo4j_schema must default to fail_on_data_conflict=False."""
+
+    async def test_default_does_not_raise_on_data_conflict(self) -> None:
+        """Bare call (no kwarg) on a genuine data-conflict must NOT raise --
+        this is the flush-path-safe default; the caller opts into fail-loud
+        behavior explicitly (see the raises test above)."""
+        session = _ProgrammableSession(
+            canned={
+                "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Node) REQUIRE (n.node_id, n.workspace) IS UNIQUE": [
+                    _conflict_error()
+                ],
+            }
+        )
+
+        result = await ensure_neo4j_schema(_FakeDriver(session))  # MUST NOT raise
+        assert result is False, (
+            "A genuine :Node data conflict must report failure via the return "
+            "value (not raise) when fail_on_data_conflict is left at its "
+            "default, so the caller retries on the next flush rather than "
+            "latching a half-built schema."
+        )
+
+    async def test_default_logs_warning_pointing_at_doctor_fix(self, caplog) -> None:
+        """The default (non-raising) data-conflict path must log an actionable
+        WARNING naming `doctor --fix` -- silent failure here would leave
+        operators with no signal that the constraint is missing."""
+        session = _ProgrammableSession(
+            canned={
+                "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Node) REQUIRE (n.node_id, n.workspace) IS UNIQUE": [
+                    _conflict_error()
+                ],
+            }
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await ensure_neo4j_schema(_FakeDriver(session))
+
+        assert any(
+            r.levelno == logging.WARNING and "doctor --fix" in r.getMessage()
+            for r in caplog.records
+        ), (
+            "Expected a WARNING record naming `doctor --fix`. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
+    async def test_explicit_true_raises_same_as_before(self) -> None:
+        """fail_on_data_conflict=True (the cold-start/doctor-repair contract)
+        preserves the original fail-loud RuntimeError behavior byte-for-byte."""
+        session = _ProgrammableSession(
+            canned={
+                "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Node) REQUIRE (n.node_id, n.workspace) IS UNIQUE": [
+                    _conflict_error()
+                ],
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="doctor --fix"):
+            await ensure_neo4j_schema(_FakeDriver(session), fail_on_data_conflict=True)
+
+
+class TestDataConflictOnFlushPathDoesNotDeadLetter:
+    """END-TO-END regression: a genuine :Node data conflict on the flush path
+    must NOT dead-letter the in-flight batch.
+
+    This is the exact bug reported by Salil in PR #67 review: commit 14a6d30
+    hardcoded fail_on_data_conflict=True inside ensure_neo4j_schema's Step 6,
+    reachable from Neo4jGraphStore._ensure_schema (called from _flush_body's
+    try block on every flush until the schema latches). A RuntimeError raised
+    there escaped via _flush_body's `except ... raise` and dead-lettered the
+    whole batch, with _schema_initialized never latching so every subsequent
+    batch died the same way. This differs from the pre-existing
+    ``test_constraint_failure_on_flush_path_does_not_dead_letter`` test, which
+    uses ``Neo.ClientError.Schema.ConstraintCreationFailed`` -- a code NOT in
+    ``_CONSTRAINT_DATA_CONFLICT_CODES`` (that set requires the
+    ``Neo.DatabaseError.Schema.*`` / ``ConstraintValidationFailed`` codes) --
+    so it never actually exercised the data-conflict raise path this fix
+    addresses.
+    """
+
+    async def test_genuine_data_conflict_on_flush_path_does_not_dead_letter(
+        self, caplog
+    ) -> None:
+        store = _make_store()
+        store._schema_initialized = False
+
+        conflict_error = _conflict_error()
+
+        async def _schema_run(query, *args, **kwargs):
+            if "CREATE CONSTRAINT node_node_id_workspace_unique" in query:
+                raise conflict_error
+            return AsyncMock()
+
+        schema_session = AsyncMock()
+        schema_session.__aenter__ = AsyncMock(return_value=schema_session)
+        schema_session.run = AsyncMock(side_effect=_schema_run)
+
+        mock_tx, write_session = _make_flush_mocks()
+
+        store._driver.session = MagicMock(
+            side_effect=[schema_session, write_session, write_session, write_session]
+        )
+
+        await store.upsert_node("n1", {"labels": ["Session"], "name": "test"})
+
+        with caplog.at_level(logging.DEBUG):
+            await store.flush()  # MUST NOT raise -- must not dead-letter
+
+        assert mock_tx.run.await_count >= 1, (
+            "Node-write transaction must still run despite the :Node "
+            "constraint data conflict -- the batch must not be abandoned."
+        )
+        assert store._node_buffer == {}, (
+            "Buffer must be cleared (success path) — NOT restored-on-failure. "
+            "A non-empty buffer here would mean flush() re-raised and the "
+            "caller (registry._handle_exhausted_batch) would dead-letter "
+            "these real activity records."
+        )
+        assert any(
+            r.levelno == logging.WARNING and "doctor --fix" in r.getMessage()
+            for r in caplog.records
+        ), (
+            "Expected a WARNING naming `doctor --fix` on the flush path. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+        assert store._schema_initialized is False, (
+            "Schema flag must stay False so the NEXT flush retries schema "
+            "init once the graph has been repaired via `doctor --fix` -- "
+            "this is the self-healing behavior the fix restores."
+        )
+
+    async def test_lifespan_path_still_fails_closed_on_genuine_conflict(self) -> None:
+        """The cold-start contract is unchanged: calling ensure_neo4j_schema
+        the way main.py's lifespan handler does (fail_on_data_conflict=True)
+        still refuses to boot against a genuinely un-migrated graph."""
+        session = _ProgrammableSession(
+            canned={
+                "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Node) REQUIRE (n.node_id, n.workspace) IS UNIQUE": [
+                    _conflict_error()
+                ],
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="doctor --fix"):
+            await ensure_neo4j_schema(_FakeDriver(session), fail_on_data_conflict=True)
+
+    async def test_run_repair_still_fails_closed_on_genuine_conflict(self) -> None:
+        """doctor --fix's run_repair calls ensure_neo4j_schema with
+        fail_on_data_conflict=True (post-dedup/backfill the graph should be
+        clean; a lingering conflict here is a genuine repair failure the
+        operator must see, not something to swallow)."""
+        from context_intelligence_server.neo4j_store import (
+            _DEDUP_EVENT_CYPHER,
+            _DEDUP_GLOBAL_CYPHER,
+            _DEDUP_SESSION_CYPHER,
+            _UNTAGGED_COUNT_CYPHER,
+            run_repair,
+        )
+
+        session = _ProgrammableSession(
+            canned={
+                _DEDUP_GLOBAL_CYPHER: [[{"c": 0}]],
+                _DEDUP_SESSION_CYPHER: [[{"c": 0}]],
+                _DEDUP_EVENT_CYPHER: [[{"c": 0}]],
+                _UNTAGGED_COUNT_CYPHER: [[{"c": 0}], [{"c": 0}]],
+                "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Node) REQUIRE (n.node_id, n.workspace) IS UNIQUE": [
+                    _conflict_error()
+                ],
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="doctor --fix"):
+            await run_repair(_FakeDriver(session))

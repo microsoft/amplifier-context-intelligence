@@ -171,7 +171,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info(
         "lifespan_startup: initializing Neo4j schema (indexes + uniqueness constraints)"
     )
-    await ensure_neo4j_schema(app.state.neo4j_driver)
+    # Cold start: fail CLOSED on a data conflict (un-migrated legacy nodes) --
+    # refuse to boot rather than accept requests against a graph the running
+    # server's writers could corrupt. Contrast with the mid-flight flush path
+    # (Neo4jGraphStore._ensure_schema), which intentionally leaves this False
+    # so the same conflict does not dead-letter real in-flight activity data.
+    await ensure_neo4j_schema(app.state.neo4j_driver, fail_on_data_conflict=True)
     logger.info("lifespan_startup: Neo4j schema initialized")
     # Crash recovery (decisions #5/#6): on startup, respawn one drainer per
     # session that still has an undrained, complete line. The workspace is

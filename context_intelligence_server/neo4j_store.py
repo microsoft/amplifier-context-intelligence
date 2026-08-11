@@ -528,7 +528,10 @@ async def run_repair(driver: Any, database: str = "neo4j") -> dict[str, int]:
     """
     duplicates_removed = await dedup_duplicate_nodes(driver, database=database)
     nodes_tagged = await backfill_node_labels(driver, database=database)
-    await ensure_neo4j_schema(driver, database=database)
+    # After dedup + backfill the graph should be clean, so fail CLOSED here:
+    # if the :Node constraint still can't be created, that's a real repair
+    # failure the operator needs to see, not something to silently swallow.
+    await ensure_neo4j_schema(driver, database=database, fail_on_data_conflict=True)
     return {
         "duplicates_removed": duplicates_removed,
         "nodes_tagged": nodes_tagged,
@@ -539,6 +542,8 @@ async def ensure_neo4j_schema(
     driver: Any,
     database: str = "neo4j",
     workspace: str = "",
+    *,
+    fail_on_data_conflict: bool = False,
 ) -> bool:
     """Create Neo4j indexes and constraints idempotently.
 
@@ -559,27 +564,52 @@ async def ensure_neo4j_schema(
 
     Because the dedup/backfill no longer run here, the ``:Node`` uniqueness
     constraint (Step 6) can fail if the graph still has untagged/duplicate
-    legacy nodes. That failure is NOT swallowed like the benign races below --
-    see the fail-loud guard in Step 6.
+    legacy nodes. Whether that failure raises or is swallowed depends on
+    *fail_on_data_conflict* (see below) -- this function has TWO callers with
+    OPPOSITE correctness requirements:
+
+    - **Cold start** (the lifespan handler, ``main.py``): must fail CLOSED.
+      Refusing to boot against an un-migrated graph is correct -- pass
+      ``fail_on_data_conflict=True``.
+    - **Mid-flight flush** (``Neo4jGraphStore._ensure_schema``, called from
+      inside ``_flush_body``'s try block on every flush until the schema
+      latches): must NOT raise. A ``RuntimeError`` escaping here propagates
+      through ``_flush_body``'s ``except ... raise`` and gets counted as a
+      flush failure, which dead-letters the entire in-flight batch of real
+      activity records -- data loss, not merely a refused boot. Leave the
+      default (``False``) at this call site so a data conflict is logged and
+      reported via the return value instead, letting the batch survive and
+      the next flush retry once the graph has been repaired.
 
     Args:
         driver:    An ``AsyncDriver`` instance created via
                    ``AsyncGraphDatabase.driver(...)``.
         database:  Target Neo4j database name (default: ``"neo4j"``).
         workspace: Reserved for future workspace-scoped schema; currently unused.
+        fail_on_data_conflict: When True, a genuine data conflict on the
+                   ``:Node`` uniqueness constraint (Step 6) raises
+                   ``RuntimeError`` (fail-closed; correct for cold start).
+                   When False (default), the same conflict is logged as a
+                   WARNING pointing at ``doctor --fix`` and this function
+                   returns ``False`` instead of raising (fail-open; correct
+                   for the flush path, where raising would dead-letter real
+                   events -- see caller-specific guidance above).
 
     Returns:
         ``True`` iff the schema is **fully established** — every index and
         uniqueness constraint was created (or already exists via a benign race).
-        ``False`` if any index/constraint could not be created (e.g. Neo4j was
-        unreachable and the connectivity error was swallowed to avoid
-        dead-lettering real events). Callers use this to decide whether to retry
-        schema init on a later flush rather than latching a half-built schema and
-        leaving the uniqueness constraint permanently absent.
+        ``False`` if any index/constraint could not be created -- e.g. Neo4j was
+        unreachable and the connectivity error was swallowed, or (when
+        *fail_on_data_conflict* is False) the ``:Node`` constraint hit a data
+        conflict -- to avoid dead-lettering real events. Callers use this to
+        decide whether to retry schema init on a later flush rather than
+        latching a half-built schema and leaving the uniqueness constraint
+        permanently absent.
 
     Raises:
-        RuntimeError: if the ``:Node`` uniqueness constraint (Step 6) cannot be
-            created because the graph still has un-migrated legacy data (see
+        RuntimeError: if *fail_on_data_conflict* is True and the ``:Node``
+            uniqueness constraint (Step 6) cannot be created because the graph
+            still has un-migrated legacy data (see
             ``_is_constraint_data_conflict``). The message points the operator
             at ``context-intelligence-server doctor --fix``.
     """
@@ -728,11 +758,10 @@ async def ensure_neo4j_schema(
                     )
                     # The constraint exists / will exist via the race winner.
                     return True
-                if (
-                    fail_on_data_conflict
-                    and isinstance(exc, Neo4jError)
-                    and _is_constraint_data_conflict(exc)
-                ):
+                is_data_conflict = isinstance(
+                    exc, Neo4jError
+                ) and _is_constraint_data_conflict(exc)
+                if fail_on_data_conflict and is_data_conflict:
                     raise RuntimeError(
                         "Neo4j graph has un-migrated legacy nodes (untagged "
                         ":Node or duplicates); cold start no longer "
@@ -740,15 +769,37 @@ async def ensure_neo4j_schema(
                         "doctor --fix"
                     ) from exc
                 code = exc.code if isinstance(exc, Neo4jError) else None
-                _LOG.error(
-                    "ensure_neo4j_schema: could not create %s uniqueness "
-                    "constraint (code=%s); continuing without it — duplicate %s "
-                    "data may be present: %s",
-                    name,
-                    code,
-                    name,
-                    exc,
-                )
+                if is_data_conflict:
+                    # fail_on_data_conflict is False here (the fail_on_data_conflict
+                    # and is_data_conflict branch above already handled the True
+                    # case). This is the mid-flight flush path
+                    # (Neo4jGraphStore._ensure_schema): a RuntimeError here would
+                    # escape _flush_body's try block and dead-letter the whole
+                    # in-flight batch of real activity records. Log a clear,
+                    # actionable WARNING instead and report failure via the
+                    # return value so _schema_initialized stays False and the
+                    # NEXT flush retries -- self-healing once the graph is
+                    # repaired, with no data lost in the meantime.
+                    _LOG.warning(
+                        "ensure_neo4j_schema: %s uniqueness constraint could "
+                        "not be created — Neo4j graph has un-migrated legacy "
+                        "nodes (untagged :Node or duplicates, code=%s). "
+                        "Continuing without it so the current batch is not "
+                        "dead-lettered; will retry on the next flush. Run: "
+                        "context-intelligence-server doctor --fix",
+                        name,
+                        code,
+                    )
+                else:
+                    _LOG.error(
+                        "ensure_neo4j_schema: could not create %s uniqueness "
+                        "constraint (code=%s); continuing without it — duplicate "
+                        "%s data may be present: %s",
+                        name,
+                        code,
+                        name,
+                        exc,
+                    )
                 # Constraint NOT created: report failure so the caller retries.
                 return False
             # session.run succeeded: the constraint is established.
@@ -785,10 +836,12 @@ async def ensure_neo4j_schema(
         # NO LONGER preceded by an in-line dedup/backfill pass (moved to
         # dedup_duplicate_nodes / backfill_node_labels, invoked via
         # run_repair / `doctor --fix`, never automatically at cold start).
-        # If the graph still has untagged/duplicate legacy nodes, this
-        # constraint creation FAILS LOUD (fail_on_data_conflict=True below)
-        # rather than silently continuing without it — see
-        # _is_constraint_data_conflict and _create_constraint.
+        # If the graph still has untagged/duplicate legacy nodes, whether this
+        # constraint creation FAILS LOUD or logs-and-continues is threaded
+        # through from the outer ``fail_on_data_conflict`` parameter (True for
+        # cold start / doctor --fix, False for the mid-flight flush path —
+        # see the function docstring) — see _is_constraint_data_conflict and
+        # _create_constraint.
         #
         # A uniqueness constraint carries its OWN backing range index, and Neo4j
         # refuses to create it while a standalone index on the same (label,
@@ -811,7 +864,7 @@ async def ensure_neo4j_schema(
                 "Node",
                 "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "
                 "FOR (n:Node) REQUIRE (n.node_id, n.workspace) IS UNIQUE",
-                fail_on_data_conflict=True,
+                fail_on_data_conflict=fail_on_data_conflict,
             )
             and fully_established
         )
