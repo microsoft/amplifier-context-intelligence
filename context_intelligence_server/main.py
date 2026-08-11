@@ -174,33 +174,46 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info(
         "lifespan_startup: initializing Neo4j schema (indexes + uniqueness constraints)"
     )
-    # Cold start must NEVER fail due to graph state (design decision:
-    # migration -- dedup + :Node backfill -- lives ONLY in `doctor --fix`
-    # (run_repair), never automatically at boot). Leave fail_on_data_conflict
-    # at its default (False): a :Node constraint data conflict on an
-    # un-migrated/dirty graph is logged as a WARNING naming `doctor --fix`
-    # and this returns False -- it never raises. Contrast with run_repair,
-    # which still opts into fail_on_data_conflict=True (a lingering conflict
-    # AFTER dedup+backfill is a genuine repair failure the operator must see).
-    await ensure_neo4j_schema(app.state.neo4j_driver)
+    # Cold start FAILS LOUD on schema/data corruption that requires
+    # `doctor --fix` -- an un-migrated graph (duplicate legacy nodes OR
+    # nodes lacking the universal :Node label). Nothing has been written yet
+    # at cold start, so refusing to boot loses no data: this is the safest
+    # possible moment to surface an impossible state as an un-missable
+    # signal rather than a log line someone greps for later. Contrast with
+    # the flush path (Neo4jGraphStore._ensure_schema), which must keep
+    # self-healing and never raise (Salil's blocker -- raising there would
+    # dead-letter real in-flight activity records). fail_on_data_conflict=True
+    # here mirrors run_repair's contract: a :Node constraint data conflict
+    # raises a RuntimeError naming `doctor --fix` instead of being logged
+    # and swallowed.
+    await ensure_neo4j_schema(app.state.neo4j_driver, fail_on_data_conflict=True)
     logger.info("lifespan_startup: Neo4j schema initialized")
-    # Non-fatal migration-health check: if the graph still has nodes lacking
-    # the universal :Node label, log a recommendation to run `doctor --fix`
-    # and keep booting -- writes to untagged legacy nodes may create
-    # duplicates until the graph is repaired, but that is a data-quality
-    # signal, not a reason to refuse service. O(1) via the counts store (see
-    # count_untagged_nodes); a health-check failure must never block startup.
+    # Fail-loud migration-health guard: duplicate nodes are already caught
+    # above by the :Node constraint (fail_on_data_conflict=True); this catches
+    # the OTHER un-migrated shape the constraint can't see on its own --
+    # nodes that simply lack the :Node label altogether, which violate no
+    # constraint and so raise nothing by themselves. O(1) via the counts
+    # store (see count_untagged_nodes) -- this must never regress into the
+    # AllNodesScan stall PR #67 removed from the write path.
+    #
+    # A connectivity/probe failure here is NOT the same as "confirmed
+    # un-migrated" -- it means graph state could not be determined, not that
+    # it was determined to be bad -- so it is logged at DEBUG and swallowed
+    # rather than treated as a corruption finding; the flush path's
+    # self-heal still covers a genuinely dirty graph once it becomes
+    # reachable.
     try:
         untagged = await count_untagged_nodes(app.state.neo4j_driver)
-        if untagged:
-            logger.warning(
-                "Neo4j graph has %d node(s) lacking the :Node label; writes to "
-                "them may create duplicates. Run: context-intelligence-server "
-                "doctor --fix to migrate.",
-                untagged,
-            )
-    except Exception as exc:  # noqa: BLE001 - never block startup on a health probe
-        logger.debug("startup migration-health check skipped: %s", exc)
+    except Exception as exc:  # noqa: BLE001 - connectivity probe, not a confirmed bad state
+        _LOG_MSG = "startup migration-health probe skipped (graph unreachable?): %s"
+        logger.debug(_LOG_MSG, exc)
+        untagged = 0
+    if untagged:
+        raise RuntimeError(
+            f"Neo4j graph has {untagged} node(s) lacking the :Node label "
+            "(un-migrated). Cold start refuses to boot to avoid duplicating "
+            "them on write. Run: context-intelligence-server doctor --fix"
+        )
     # Crash recovery (decisions #5/#6): on startup, respawn one drainer per
     # session that still has an undrained, complete line. The workspace is
     # parsed from that session's FIRST log line so the respawned worker is

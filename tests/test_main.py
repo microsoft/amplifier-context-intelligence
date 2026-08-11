@@ -837,20 +837,25 @@ async def test_lifespan_skips_recovery_for_empty_workspace(
 
 
 # ---------------------------------------------------------------------------
-# Startup must NEVER fail due to graph state (design decision): migration
-# (dedup + :Node backfill) lives ONLY in `doctor --fix` (run_repair). Cold
-# start calls ensure_neo4j_schema with the DEFAULT (fail_on_data_conflict
-# unset -> False), then runs a non-fatal migration-health check that logs a
-# recommendation to run `doctor --fix` on an un-migrated graph but never
-# raises or blocks the server from accepting requests.
+# Cold start FAILS LOUD on schema/data corruption that requires `doctor
+# --fix` (design decision, reversing the lifespan half of f4d8bab): an
+# un-migrated graph -- duplicate legacy nodes (caught by the :Node
+# constraint via fail_on_data_conflict=True) OR nodes lacking the :Node
+# label altogether (caught by the O(1) count_untagged_nodes guard) -- must
+# refuse to boot. Nothing has been written yet at cold start, so refusing to
+# boot loses no data. The migration itself still lives ONLY in `doctor
+# --fix` (run_repair); the flush path still self-heals (see
+# tests/neo4j/test_node_identity_migration.py). A connectivity/probe
+# failure (graph unreachable) is NOT treated as "confirmed un-migrated" and
+# must not crash boot.
 # ---------------------------------------------------------------------------
 
 
-async def test_lifespan_calls_ensure_schema_without_fail_on_data_conflict() -> None:
-    """Cold start must call ensure_neo4j_schema with its DEFAULT
-    (fail_on_data_conflict=False) -- NOT True. Passing True here would make
-    startup fail closed against graph state, which the design explicitly
-    rejects (only `doctor --fix` / run_repair opts into True)."""
+async def test_lifespan_calls_ensure_schema_with_fail_on_data_conflict() -> None:
+    """Cold start must call ensure_neo4j_schema with fail_on_data_conflict=True
+    -- boot refuses to proceed on a genuine :Node constraint data conflict
+    (duplicate legacy nodes), mirroring run_repair's contract. Safe at cold
+    start (nothing flushed yet); the flush path keeps the opposite default."""
     mock_driver = _patched_lifespan_deps()
     mock_ensure_schema = AsyncMock(return_value=True)
     with (
@@ -873,19 +878,17 @@ async def test_lifespan_calls_ensure_schema_without_fail_on_data_conflict() -> N
 
     mock_ensure_schema.assert_awaited_once()
     _args, kwargs = mock_ensure_schema.await_args
-    assert kwargs.get("fail_on_data_conflict") is not True, (
-        "lifespan must not opt into fail_on_data_conflict=True -- cold start "
-        "must never fail due to graph state (that contract belongs to "
-        "run_repair / `doctor --fix` only)."
+    assert kwargs.get("fail_on_data_conflict") is True, (
+        "lifespan must opt into fail_on_data_conflict=True -- cold start "
+        "fails loud on a genuine data conflict (that contract now applies "
+        "at boot too, not just to run_repair / `doctor --fix`)."
     )
 
 
-async def test_lifespan_does_not_raise_and_logs_doctor_recommendation_on_dirty_graph(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """On an un-migrated graph (untagged :Node count > 0), startup must NOT
-    raise -- it logs a WARNING recommending `doctor --fix` and keeps
-    booting."""
+async def test_lifespan_raises_on_ensure_schema_data_conflict() -> None:
+    """When ensure_neo4j_schema itself raises (a genuine :Node constraint
+    data conflict under fail_on_data_conflict=True), lifespan must propagate
+    the RuntimeError -- boot refuses to start."""
     mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
@@ -895,30 +898,51 @@ async def test_lifespan_does_not_raise_and_logs_doctor_recommendation_on_dirty_g
         ),
         patch(
             "context_intelligence_server.main.ensure_neo4j_schema",
-            new=AsyncMock(return_value=False),
+            new=AsyncMock(
+                side_effect=RuntimeError(
+                    "Neo4j :Node constraint data conflict -- run doctor --fix"
+                )
+            ),
+        ),
+        pytest.raises(RuntimeError, match="doctor --fix"),
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+
+async def test_lifespan_raises_on_untagged_nodes() -> None:
+    """On an un-migrated graph (untagged :Node count > 0), startup MUST
+    raise a RuntimeError naming `doctor --fix` -- boot refuses to start
+    rather than silently risking write-path duplication."""
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=AsyncMock(return_value=True),
         ),
         patch(
             "context_intelligence_server.main.count_untagged_nodes",
             new=AsyncMock(return_value=42),
         ),
-        caplog.at_level(logging.WARNING),
+        pytest.raises(RuntimeError, match="doctor --fix") as exc_info,
     ):
-        async with lifespan(main_module.app):  # MUST NOT raise
+        async with lifespan(main_module.app):
             pass
 
-    assert any(
-        record.levelno == logging.WARNING and "doctor --fix" in record.getMessage()
-        for record in caplog.records
-    ), (
-        "Expected a WARNING naming `doctor --fix` on a dirty graph. "
-        f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+    assert "42" in str(exc_info.value), (
+        f"Expected the untagged count in the error message, got: {exc_info.value}"
     )
 
 
-async def test_lifespan_skips_warning_on_clean_graph() -> None:
-    """On a fully-migrated graph (untagged count == 0), no doctor
-    recommendation is logged -- the health check is silent when there is
-    nothing to recommend."""
+async def test_lifespan_does_not_raise_on_clean_graph() -> None:
+    """On a fully-migrated graph (untagged count == 0, no constraint
+    conflict), startup does NOT raise -- the fail-loud guards are silent
+    when there is nothing to report."""
     mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
@@ -945,8 +969,9 @@ async def test_lifespan_does_not_raise_when_health_check_itself_fails(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A health-check probe failure (e.g. count_untagged_nodes raising due to
-    a transient connectivity blip) must NEVER block startup -- it is logged
-    at DEBUG and swallowed."""
+    a transient connectivity blip) must NOT be treated as a confirmed
+    un-migrated graph -- it is logged at DEBUG and swallowed, and boot
+    proceeds. Connectivity failure != confirmed data corruption."""
     mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),

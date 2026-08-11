@@ -35,27 +35,36 @@ for the full ingest/drain flow.
 > graph inline at every cold start. They no longer do -- migration (dedup +
 > `:Node` backfill) is now the operator's responsibility via `doctor --fix`.
 >
-> **Startup never fails due to graph state.** If the graph still has untagged
-> `:Node` or duplicate legacy nodes, the server logs a **WARNING** recommending
-> the repair and **continues serving**:
+> **Cold start REFUSES TO BOOT on an un-migrated graph.** Nothing has been
+> written yet at cold start, so refusing to boot loses no data -- this is the
+> safest possible moment to surface an un-migrated graph as an un-missable
+> failure instead of a warning someone might not notice. Cold start crashes
+> with a `RuntimeError` naming `doctor --fix` when the graph has EITHER
+> duplicate legacy nodes (a `:Node` constraint data conflict) OR any nodes
+> lacking the `:Node` label altogether:
 >
 > ```
-> Neo4j graph has N node(s) lacking the :Node label; writes to them may
-> create duplicates. Run: context-intelligence-server doctor --fix to migrate.
+> Neo4j graph has N node(s) lacking the :Node label (un-migrated). Cold start
+> refuses to boot to avoid duplicating them on write. Run:
+> context-intelligence-server doctor --fix
 > ```
 >
-> Writes to un-migrated (untagged) nodes may create duplicates until the graph
-> is repaired, so don't ignore the warning indefinitely -- but a dirty graph
-> is a data-quality issue to schedule a fix for, not a reason to refuse
-> service. Check and repair at your convenience:
+> Repair, then restart:
 >
 > ```bash
 > context-intelligence-server doctor        # diagnose only (read-only)
 > context-intelligence-server doctor --fix  # repair (dedup + :Node backfill)
 > ```
 >
-> A freshly-provisioned graph has nothing to migrate and never logs the
-> warning.
+> A freshly-provisioned graph has nothing to migrate and boots normally.
+>
+> **The mid-flight flush path is unaffected and still self-heals.** If a
+> data conflict is only discovered after the server is already serving
+> traffic (e.g. a graph that was reachable but dirty), the flush path never
+> raises or dead-letters in-flight activity records -- it logs a warning and
+> retries on the next flush once the graph has been repaired. Only cold
+> start fails loud; a connectivity failure at boot (graph unreachable) is
+> also not treated as "un-migrated" and does not crash startup.
 
 ---
 
