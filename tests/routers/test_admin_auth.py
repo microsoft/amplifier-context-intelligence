@@ -620,21 +620,6 @@ class TestExemptSetStartupAssertion:
             with pytest.raises((RuntimeError, AssertionError)):
                 create_asgi_app(settings=settings)
 
-    def test_admin_path_in_exempt_paths_api_only_raises_at_startup(
-        self, tmp_path: Path
-    ) -> None:
-        """Injecting /admin into _EXEMPT_PATHS_API_ONLY → RuntimeError at startup."""
-        from unittest.mock import patch  # noqa: PLC0415
-
-        from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
-        from context_intelligence_server import auth as _auth  # noqa: PLC0415
-
-        settings = _make_static_settings(tmp_path)
-        bad_exempt = _auth._EXEMPT_PATHS_API_ONLY | {"/admin"}
-        with patch.object(_auth, "_EXEMPT_PATHS_API_ONLY", bad_exempt):
-            with pytest.raises((RuntimeError, AssertionError)):
-                create_asgi_app(settings=settings)
-
     def test_admin_prefix_in_exempt_prefixes_raises_at_startup(
         self, tmp_path: Path
     ) -> None:

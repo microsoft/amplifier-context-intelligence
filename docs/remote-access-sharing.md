@@ -52,11 +52,11 @@ server (gunicorn) bound 127.0.0.1:8000 only   ·   Neo4j bound to loopback, neve
 
 A single `tailscale serve` mount does **two** jobs: it terminates TLS (with an
 automatic MagicDNS certificate) **and** acts as a path allowlist. The second job
-matters because several server endpoints are intentionally unauthenticated
-(`/status`, `/version`, `/`, `/dashboard`, `/docs`, `/openapi.json`, `/logs/stream`,
-`/static/*`). That exempt set is defined in code and is **not**
-configurable, so the only way to keep those endpoints away from peers is to not
-route them — which scoping `serve` to `/events` does cleanly.
+matters because a few server endpoints are intentionally unauthenticated. The
+server is **headless** (API-only), so this is a single fixed set —
+`/status`, `/version`, `/docs`, `/openapi.json`. That exempt set is defined in code
+and is **not** configurable, so the only way to keep those endpoints away from
+peers is to not route them — which scoping `serve` to `/events` does cleanly.
 
 ---
 

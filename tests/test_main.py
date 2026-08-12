@@ -536,242 +536,6 @@ async def test_status_includes_error_count_last_hour(client: httpx.AsyncClient) 
     assert isinstance(data["error_count_last_hour"], int)
 
 
-async def test_dashboard_returns_html(client: httpx.AsyncClient) -> None:
-    """GET / returns 200 with HTML landing page containing polling JavaScript."""
-    response = await client.get("/")
-    assert response.status_code == 200
-    assert "text/html" in response.headers["content-type"]
-    body = response.text
-    assert "Context Intelligence" in body
-    assert "setInterval" in body
-
-
-# ---------------------------------------------------------------------------
-# Index page Neo4j status indicator tests
-# ---------------------------------------------------------------------------
-
-
-async def test_index_no_neo4j_browser_link(client: httpx.AsyncClient) -> None:
-    """GET / must NOT contain a link to localhost:7474 (Neo4j Browser)."""
-    response = await client.get("/")
-    assert response.status_code == 200
-    body = response.text
-    assert "localhost:7474" not in body
-
-
-async def test_index_has_neo4j_status_elements(client: httpx.AsyncClient) -> None:
-    """GET / must contain neo4j-status-desc and neo4j-status-badge elements."""
-    response = await client.get("/")
-    assert response.status_code == 200
-    body = response.text
-    assert 'id="neo4j-status-desc"' in body
-    assert 'id="neo4j-status-badge"' in body
-
-
-async def test_index_js_reads_neo4j_connected(client: httpx.AsyncClient) -> None:
-    """GET / inline JS must read neo4j_connected from status response and update elements."""
-    response = await client.get("/")
-    assert response.status_code == 200
-    body = response.text
-    assert "neo4j_connected" in body
-    assert "neo4j-status-desc" in body
-    assert "neo4j-status-badge" in body
-
-
-# ---------------------------------------------------------------------------
-# Dashboard HTML content tests
-# ---------------------------------------------------------------------------
-
-
-async def test_dashboard_html_includes_completed_sessions_section(
-    client: httpx.AsyncClient,
-) -> None:
-    """GET /dashboard returns HTML with Completed Sessions table body element."""
-    response = await client.get("/dashboard")
-    assert response.status_code == 200
-    body = response.text
-    assert "completed-body" in body
-    assert "Completed sessions" in body
-
-
-async def test_dashboard_html_includes_error_badge(
-    client: httpx.AsyncClient,
-) -> None:
-    """GET /dashboard returns HTML with error-badge element."""
-    response = await client.get("/dashboard")
-    assert response.status_code == 200
-    body = response.text
-    assert "error-badge" in body
-
-
-async def test_dashboard_html_sessions_table_displays_event_name_not_timestamp(
-    client: httpx.AsyncClient,
-) -> None:
-    """Dashboard JS must render s.last_event directly, not via timeAgo().
-
-    s.last_event is an event-name string (e.g. 'tool:pre'), not a Unix timestamp.
-    Passing it to timeAgo() coerces the string to NaN and renders 'NaNs ago'.
-    JS logic is now in the external dashboard.js module.
-    """
-    response = await client.get("/static/js/dashboard.js")
-    assert response.status_code == 200
-    body = response.text
-    # Bug pattern must be absent
-    assert "timeAgo(s.last_event)" not in body
-    # Fix pattern must be present
-    assert "(s.last_event || '-')" in body
-
-
-# ---------------------------------------------------------------------------
-# Lifespan tests
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# GET /logs/stream SSE tests
-# ---------------------------------------------------------------------------
-
-
-async def test_logs_stream_returns_200_event_stream(
-    client: httpx.AsyncClient,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """GET /logs/stream returns 200 with content-type text/event-stream."""
-    from starlette.requests import Request as StarletteRequest
-
-    log_file = tmp_path / "server.jsonl"
-    log_file.write_text("")
-    monkeypatch.setattr(main_module._settings, "log_path", str(log_file))
-
-    # httpx ASGI transport never signals disconnect, so patch is_disconnected
-    # to return True so the SSE generator's tail loop terminates cleanly.
-    async def mock_is_disconnected(self: StarletteRequest) -> bool:  # noqa: ARG001
-        return True
-
-    monkeypatch.setattr(StarletteRequest, "is_disconnected", mock_is_disconnected)
-
-    async with client.stream("GET", "/logs/stream") as response:
-        assert response.status_code == 200
-        assert "text/event-stream" in response.headers["content-type"]
-
-
-async def test_logs_stream_backfills_existing_lines(
-    client: httpx.AsyncClient,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """GET /logs/stream backfills existing log lines as SSE data frames."""
-    from starlette.requests import Request as StarletteRequest
-
-    log_file = tmp_path / "server.jsonl"
-    lines = [json.dumps({"level": "INFO", "msg": f"line {i}"}) for i in range(5)]
-    log_file.write_text("\n".join(lines) + "\n")
-    monkeypatch.setattr(main_module._settings, "log_path", str(log_file))
-
-    # httpx ASGI transport never signals disconnect, so patch is_disconnected
-    # to return True so the SSE generator's tail loop terminates cleanly.
-    async def mock_is_disconnected(self: StarletteRequest) -> bool:  # noqa: ARG001
-        return True
-
-    monkeypatch.setattr(StarletteRequest, "is_disconnected", mock_is_disconnected)
-
-    data_lines: list[str] = []
-    async with client.stream("GET", "/logs/stream") as response:
-        async for line in response.aiter_lines():
-            if line.startswith("data: "):
-                data_lines.append(line[len("data: ") :])
-
-    assert len(data_lines) == 5
-    for i, content in enumerate(data_lines):
-        assert content == lines[i]
-
-
-async def test_logs_stream_absent_log_file_returns_empty_stream(
-    client: httpx.AsyncClient,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """GET /logs/stream returns 200 with no data lines when log file does not exist.
-
-    Previously crashed with FileNotFoundError (500) when log_path was absent.
-    """
-    from starlette.requests import Request as StarletteRequest
-
-    absent_file = tmp_path / "nonexistent.jsonl"
-    # Deliberately do NOT create the file
-    assert not absent_file.exists()
-    monkeypatch.setattr(main_module._settings, "log_path", str(absent_file))
-
-    async def mock_is_disconnected(self: StarletteRequest) -> bool:  # noqa: ARG001
-        return True
-
-    monkeypatch.setattr(StarletteRequest, "is_disconnected", mock_is_disconnected)
-
-    data_lines: list[str] = []
-    async with client.stream("GET", "/logs/stream") as response:
-        assert response.status_code == 200
-        assert "text/event-stream" in response.headers["content-type"]
-        async for line in response.aiter_lines():
-            if line.startswith("data: "):
-                data_lines.append(line[len("data: ") :])
-
-    assert data_lines == []
-
-
-async def test_logs_stream_tail_lines_have_no_trailing_newline(
-    client: httpx.AsyncClient,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """SSE frames from backfill must not contain trailing newlines in the data field.
-
-    Previously, splitlines() in backfill was correct, but the tail path used
-    f.readline() which includes the trailing '\\n', producing triple-newline frames.
-    This test covers the backfill path (splitlines strips correctly).
-    """
-    from starlette.requests import Request as StarletteRequest
-
-    log_file = tmp_path / "server.jsonl"
-    log_file.write_text('{"level": "INFO", "msg": "hello"}\n')
-    monkeypatch.setattr(main_module._settings, "log_path", str(log_file))
-
-    async def mock_is_disconnected(self: StarletteRequest) -> bool:  # noqa: ARG001
-        return True
-
-    monkeypatch.setattr(StarletteRequest, "is_disconnected", mock_is_disconnected)
-
-    data_lines: list[str] = []
-    async with client.stream("GET", "/logs/stream") as response:
-        async for line in response.aiter_lines():
-            if line.startswith("data: "):
-                data_lines.append(line[len("data: ") :])
-
-    assert len(data_lines) == 1
-    assert not data_lines[0].endswith("\n"), (
-        "data field must not contain trailing newline"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Lifespan tests
-# ---------------------------------------------------------------------------
-
-
-async def test_dashboard_html_includes_log_viewer(client: httpx.AsyncClient) -> None:
-    """GET /dashboard returns HTML with log viewer panel; JS module wires up EventSource."""
-    # The dashboard HTML contains the DOM elements
-    html_response = await client.get("/dashboard")
-    assert html_response.status_code == 200
-    assert "log-container" in html_response.text
-    # EventSource and /logs/stream are in the external dashboard.js module
-    js_response = await client.get("/static/js/dashboard.js")
-    assert js_response.status_code == 200
-    js_body = js_response.text
-    assert "EventSource" in js_body
-    assert "/logs/stream" in js_body
-
-
 # ---------------------------------------------------------------------------
 # Auth middleware integration tests
 # ---------------------------------------------------------------------------
@@ -865,10 +629,16 @@ class TestAuthMiddleware:
 
 
 class TestMainDispatch:
-    """Tests for the CLI entrypoint main() function."""
+    """Tests for the CLI entrypoint main() argparse dispatch (serve / doctor).
+
+    INVARIANT under test: no args (the bare console-script invocation systemd
+    and the macOS launchd agent use) MUST dispatch to serve(). This is the
+    single most important test in this class -- breaking it would break
+    every production restart.
+    """
 
     def test_main_with_no_args_calls_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """main() calls run() when no subcommand is given."""
+        """main() with no argv reads real sys.argv (empty here) -- must serve."""
         from unittest.mock import patch as _patch
 
         import context_intelligence_server.main as _main_mod
@@ -880,22 +650,59 @@ class TestMainDispatch:
 
         mock_run.assert_called_once()
 
-    def test_main_with_non_init_flag_calls_run(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """main() calls run() when flags are present."""
-        from unittest.mock import patch as _patch
-
+    def test_main_empty_argv_list_calls_run_and_not_doctor(self) -> None:
+        """main([]) -- the explicit empty-args form -- calls run() (gunicorn)
+        and must NOT touch the doctor module."""
         import context_intelligence_server.main as _main_mod
 
-        monkeypatch.setattr(
-            "sys.argv", ["context-intelligence-server", "--workers", "2"]
-        )
-
-        with _patch.object(_main_mod, "run") as mock_run:
-            _main_mod.main()
+        with (
+            patch.object(_main_mod, "run") as mock_run,
+            patch("context_intelligence_server.doctor.run_doctor") as mock_doctor,
+        ):
+            _main_mod.main([])
 
         mock_run.assert_called_once()
+        mock_doctor.assert_not_called()
+
+    def test_main_explicit_serve_calls_run(self) -> None:
+        """main(["serve"]) explicitly dispatches to serve, same as no args."""
+        import context_intelligence_server.main as _main_mod
+
+        with patch.object(_main_mod, "run") as mock_run:
+            _main_mod.main(["serve"])
+
+        mock_run.assert_called_once()
+
+    def test_main_doctor_dispatches_run_doctor_fix_false(self) -> None:
+        """main(["doctor"]) calls doctor.run_doctor(fix=False) and sys.exits
+        with its return code."""
+        import context_intelligence_server.main as _main_mod
+
+        with patch(
+            "context_intelligence_server.doctor.run_doctor",
+            new_callable=AsyncMock,
+            return_value=0,
+        ) as mock_doctor:
+            with pytest.raises(SystemExit) as exc_info:
+                _main_mod.main(["doctor"])
+
+        mock_doctor.assert_awaited_once_with(fix=False)
+        assert exc_info.value.code == 0
+
+    def test_main_doctor_fix_dispatches_run_doctor_fix_true(self) -> None:
+        """main(["doctor", "--fix"]) calls doctor.run_doctor(fix=True)."""
+        import context_intelligence_server.main as _main_mod
+
+        with patch(
+            "context_intelligence_server.doctor.run_doctor",
+            new_callable=AsyncMock,
+            return_value=1,
+        ) as mock_doctor:
+            with pytest.raises(SystemExit) as exc_info:
+                _main_mod.main(["doctor", "--fix"])
+
+        mock_doctor.assert_awaited_once_with(fix=True)
+        assert exc_info.value.code == 1
 
 
 async def test_lifespan_creates_and_closes_driver(
@@ -1027,6 +834,163 @@ async def test_lifespan_skips_recovery_for_empty_workspace(
             pass
 
     assert spawned == []
+
+
+# ---------------------------------------------------------------------------
+# Cold start FAILS LOUD on schema/data corruption that requires `doctor
+# --fix` (design decision, reversing the lifespan half of f4d8bab): an
+# un-migrated graph -- duplicate legacy nodes (caught by the :Node
+# constraint via fail_on_data_conflict=True) OR nodes lacking the :Node
+# label altogether (caught by the O(1) count_untagged_nodes guard) -- must
+# refuse to boot. Nothing has been written yet at cold start, so refusing to
+# boot loses no data. The migration itself still lives ONLY in `doctor
+# --fix` (run_repair); the flush path still self-heals (see
+# tests/neo4j/test_node_identity_migration.py). A connectivity/probe
+# failure (graph unreachable) is NOT treated as "confirmed un-migrated" and
+# must not crash boot.
+# ---------------------------------------------------------------------------
+
+
+async def test_lifespan_calls_ensure_schema_with_fail_on_data_conflict() -> None:
+    """Cold start must call ensure_neo4j_schema with fail_on_data_conflict=True
+    -- boot refuses to proceed on a genuine :Node constraint data conflict
+    (duplicate legacy nodes), mirroring run_repair's contract. Safe at cold
+    start (nothing flushed yet); the flush path keeps the opposite default."""
+    mock_driver = _patched_lifespan_deps()
+    mock_ensure_schema = AsyncMock(return_value=True)
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=mock_ensure_schema,
+        ),
+        patch(
+            "context_intelligence_server.main.count_untagged_nodes",
+            new=AsyncMock(return_value=0),
+        ),
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+    mock_ensure_schema.assert_awaited_once()
+    _args, kwargs = mock_ensure_schema.await_args
+    assert kwargs.get("fail_on_data_conflict") is True, (
+        "lifespan must opt into fail_on_data_conflict=True -- cold start "
+        "fails loud on a genuine data conflict (that contract now applies "
+        "at boot too, not just to run_repair / `doctor --fix`)."
+    )
+
+
+async def test_lifespan_raises_on_ensure_schema_data_conflict() -> None:
+    """When ensure_neo4j_schema itself raises (a genuine :Node constraint
+    data conflict under fail_on_data_conflict=True), lifespan must propagate
+    the RuntimeError -- boot refuses to start."""
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=AsyncMock(
+                side_effect=RuntimeError(
+                    "Neo4j :Node constraint data conflict -- run doctor --fix"
+                )
+            ),
+        ),
+        pytest.raises(RuntimeError, match="doctor --fix"),
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+
+async def test_lifespan_raises_on_untagged_nodes() -> None:
+    """On an un-migrated graph (untagged :Node count > 0), startup MUST
+    raise a RuntimeError naming `doctor --fix` -- boot refuses to start
+    rather than silently risking write-path duplication."""
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "context_intelligence_server.main.count_untagged_nodes",
+            new=AsyncMock(return_value=42),
+        ),
+        pytest.raises(RuntimeError, match="doctor --fix") as exc_info,
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+    assert "42" in str(exc_info.value), (
+        f"Expected the untagged count in the error message, got: {exc_info.value}"
+    )
+
+
+async def test_lifespan_does_not_raise_on_clean_graph() -> None:
+    """On a fully-migrated graph (untagged count == 0, no constraint
+    conflict), startup does NOT raise -- the fail-loud guards are silent
+    when there is nothing to report."""
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "context_intelligence_server.main.count_untagged_nodes",
+            new=AsyncMock(return_value=0),
+        ) as mock_count,
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+    mock_count.assert_awaited_once()
+
+
+async def test_lifespan_does_not_raise_when_health_check_itself_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A health-check probe failure (e.g. count_untagged_nodes raising due to
+    a transient connectivity blip) must NOT be treated as a confirmed
+    un-migrated graph -- it is logged at DEBUG and swallowed, and boot
+    proceeds. Connectivity failure != confirmed data corruption."""
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "context_intelligence_server.main.count_untagged_nodes",
+            new=AsyncMock(side_effect=RuntimeError("transient connectivity blip")),
+        ),
+        caplog.at_level(logging.DEBUG),
+    ):
+        async with lifespan(main_module.app):  # MUST NOT raise
+            pass
 
 
 async def test_registry_exposed_on_app_state() -> None:
@@ -1625,3 +1589,59 @@ async def test_post_events_valid_utc_z_timestamp_returns_202(
         },
     )
     assert response.status_code == 202
+
+
+# ---------------------------------------------------------------------------
+# Headless OpenAPI/Swagger surface: end-to-end, against a booted app
+# ---------------------------------------------------------------------------
+#
+# These replace the coverage lost when tests/test_web_ui_switch.py was deleted.
+# The prior test asserted the "/openapi.json bypass" behaviour at the mock
+# level; this proves the *accepted risk* through the real ASGI app + real
+# BearerTokenMiddleware: the doc surface is reachable unauthenticated, but the
+# data API it documents is NOT, and the admin surface is not disclosed at all.
+
+
+class TestHeadlessDocsSurface:
+    """/docs + /openapi.json are intentionally unauthenticated; data/admin stay gated."""
+
+    async def test_docs_exempt_but_events_gated_end_to_end(self) -> None:
+        """Unauth GET /docs and /openapi.json -> 200; unauth POST /events -> 401.
+
+        Proves the ratified decision end-to-end: the API *shape* is public, but
+        no data call can be made without a bearer token.
+        """
+        async with _auth_client() as c:
+            docs = await c.get("/docs")
+            openapi = await c.get("/openapi.json")
+            events = await c.post(
+                "/events",
+                json={
+                    "event": "tool_use",
+                    "workspace": "/ws",
+                    "data": {
+                        "session_id": "s1",
+                        "timestamp": "2026-06-16T20:17:11.604690+00:00",
+                    },
+                },
+            )
+        assert docs.status_code == 200
+        assert openapi.status_code == 200
+        assert events.status_code == 401
+
+    async def test_admin_schema_not_disclosed_in_openapi(self) -> None:
+        """/admin/* MUST NOT appear in the unauthenticated OpenAPI schema.
+
+        The admin router is registered with include_in_schema=False so the
+        operator-only identity/key surface is not handed to unauthenticated
+        recon via /openapi.json (routing + auth are unaffected).
+        """
+        async with _auth_client() as c:
+            openapi = await c.get("/openapi.json")
+        assert openapi.status_code == 200
+        paths = openapi.json().get("paths", {})
+        admin_paths = [p for p in paths if p.startswith("/admin")]
+        assert admin_paths == [], (
+            f"/admin/* must not appear in the unauthenticated OpenAPI schema; "
+            f"found: {admin_paths}"
+        )

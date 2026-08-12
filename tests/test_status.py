@@ -1,11 +1,11 @@
-"""Tests for EventRingBuffer and build_status_response in dashboard.py."""
+"""Tests for EventRingBuffer and build_status_response in status.py."""
 
 import asyncio
 import time
 from unittest.mock import MagicMock, patch
 
 
-from context_intelligence_server.dashboard import (
+from context_intelligence_server.status import (
     EventRecord,
     EventRingBuffer,
     build_status_response,
@@ -309,10 +309,10 @@ class TestSessionOrdering:
 
         # Use a very large timeout so all workers are visible regardless of age
         mock_settings = MagicMock()
-        mock_settings.dashboard_inactive_timeout = 9_999_999_999.0
+        mock_settings.status_inactive_timeout = 9_999_999_999.0
 
         with patch(
-            "context_intelligence_server.dashboard.get_settings",
+            "context_intelligence_server.status.get_settings",
             return_value=mock_settings,
         ):
             response = build_status_response(registry, time.time())
@@ -325,16 +325,16 @@ class TestSessionOrdering:
 
 
 # ---------------------------------------------------------------------------
-# TestDashboardVisibilityFiltering
+# TestStatusVisibilityFiltering
 # ---------------------------------------------------------------------------
 
 
-class TestDashboardVisibilityFiltering:
+class TestStatusVisibilityFiltering:
     def setup_method(self) -> None:
         ring_buffer._buffer.clear()
 
     def test_inactive_sessions_hidden(self) -> None:
-        """Workers inactive longer than dashboard_inactive_timeout are hidden.
+        """Workers inactive longer than status_inactive_timeout are hidden.
 
         active worker (5 min = 300 s ago) → visible
         inactive worker (2 hours = 7200 s ago) → hidden (> 1800 s timeout)
@@ -349,10 +349,10 @@ class TestDashboardVisibilityFiltering:
         )
 
         mock_settings = MagicMock()
-        mock_settings.dashboard_inactive_timeout = 1800.0
+        mock_settings.status_inactive_timeout = 1800.0
 
         with patch(
-            "context_intelligence_server.dashboard.get_settings",
+            "context_intelligence_server.status.get_settings",
             return_value=mock_settings,
         ):
             response = build_status_response(registry, time.time())
@@ -368,10 +368,10 @@ class TestDashboardVisibilityFiltering:
         registry._workers["fresh"] = _make_worker("fresh", last_event_time=0.0)
 
         mock_settings = MagicMock()
-        mock_settings.dashboard_inactive_timeout = 1800.0
+        mock_settings.status_inactive_timeout = 1800.0
 
         with patch(
-            "context_intelligence_server.dashboard.get_settings",
+            "context_intelligence_server.status.get_settings",
             return_value=mock_settings,
         ):
             response = build_status_response(registry, time.time())
@@ -395,7 +395,7 @@ class TestBuildStatusResponseServerVersion:
 
     def test_server_version_matches_constant(self) -> None:
         """server_version value matches the module-level SERVER_VERSION constant."""
-        from context_intelligence_server.dashboard import SERVER_VERSION
+        from context_intelligence_server.status import SERVER_VERSION
 
         registry = SessionRegistry()
         result = build_status_response(registry, time.time())
@@ -403,7 +403,7 @@ class TestBuildStatusResponseServerVersion:
 
     def test_server_version_constant_is_nonempty_string(self) -> None:
         """SERVER_VERSION is a non-empty string."""
-        from context_intelligence_server.dashboard import SERVER_VERSION
+        from context_intelligence_server.status import SERVER_VERSION
 
         assert isinstance(SERVER_VERSION, str)
         assert len(SERVER_VERSION) > 0
@@ -437,10 +437,10 @@ class TestBuildStatusResponseOrphanVisibility:
         registry._workers["sess-orphan"] = worker
 
         mock_settings = MagicMock()
-        mock_settings.dashboard_inactive_timeout = 9_999_999_999.0
+        mock_settings.status_inactive_timeout = 9_999_999_999.0
 
         with patch(
-            "context_intelligence_server.dashboard.get_settings",
+            "context_intelligence_server.status.get_settings",
             return_value=mock_settings,
         ):
             response = build_status_response(registry, time.time())
@@ -459,10 +459,10 @@ class TestBuildStatusResponseOrphanVisibility:
         registry._workers["sess-active"] = worker
 
         mock_settings = MagicMock()
-        mock_settings.dashboard_inactive_timeout = 9_999_999_999.0
+        mock_settings.status_inactive_timeout = 9_999_999_999.0
 
         with patch(
-            "context_intelligence_server.dashboard.get_settings",
+            "context_intelligence_server.status.get_settings",
             return_value=mock_settings,
         ):
             response = build_status_response(registry, time.time())
@@ -480,10 +480,10 @@ class TestBuildStatusResponseOrphanVisibility:
         registry._workers["sess-flush"] = worker
 
         mock_settings = MagicMock()
-        mock_settings.dashboard_inactive_timeout = 9_999_999_999.0
+        mock_settings.status_inactive_timeout = 9_999_999_999.0
 
         with patch(
-            "context_intelligence_server.dashboard.get_settings",
+            "context_intelligence_server.status.get_settings",
             return_value=mock_settings,
         ):
             response = build_status_response(registry, time.time())

@@ -100,7 +100,7 @@ def build_status_response(
 
         Note: ``orphaned_sessions`` is the count of ALL registered workers whose
         drain task has completed (``task.done()``).  A worker filtered *out* of
-        the visible ``sessions`` list by ``dashboard_inactive_timeout`` still
+        the visible ``sessions`` list by ``status_inactive_timeout`` still
         contributes to this count but will not appear with ``orphaned: True`` in
         any per-session dict.  For a fresh OOM orphan this asymmetry is
         irrelevant (OOM orphans are recent by definition); it can surface for
@@ -108,7 +108,7 @@ def build_status_response(
     """
     settings = get_settings()
     now = time.time()
-    timeout = settings.dashboard_inactive_timeout
+    timeout = settings.status_inactive_timeout
 
     # Filter: always show workers that have never received an event (last_event_time == 0.0).
     # Hide workers that have been inactive longer than the configured timeout.

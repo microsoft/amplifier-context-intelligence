@@ -527,7 +527,7 @@ class TestRingBufferEmission:
     async def test_ring_buffer_receives_record_after_event(self) -> None:
         """After drain processes an event, ring_buffer contains an EventRecord
         with the correct event, session_id, workspace, and result='ok'."""
-        from context_intelligence_server.dashboard import EventRingBuffer
+        from context_intelligence_server.status import EventRingBuffer
 
         reg = SessionRegistry()
         qm = reg.queue_manager

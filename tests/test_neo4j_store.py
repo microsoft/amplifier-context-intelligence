@@ -645,15 +645,17 @@ class TestSchemaIndexesWorkspace:
             f"Queries issued: {all_queries}"
         )
 
-    async def test_ensure_schema_deduplicates_session_and_event_nodes(self) -> None:
-        """Step 1 must deduplicate duplicate Session AND Event nodes.
+    async def test_ensure_schema_no_longer_deduplicates_session_and_event_nodes(
+        self,
+    ) -> None:
+        """ensure_neo4j_schema (via ``_ensure_schema``) must NOT dedup any more.
 
-        Both Session and Event carry a uniqueness constraint (Steps 3 & 4). With
-        the retry-until-established behavior, a duplicate Event node makes the
-        Event ``CREATE CONSTRAINT`` fail ``ConstraintCreationFailed`` on every
-        flush forever unless a dedup pass clears the duplicates first. The
-        Session dedup already exists; the Event dedup must mirror it so the
-        constraint retry can converge.
+        Formerly Step 1 deduplicated duplicate Session AND Event nodes inline
+        on every schema init (i.e. on every cold start / first flush). That
+        O(graph-size) scan has moved to the standalone
+        ``dedup_duplicate_nodes`` function, invoked ONLY via ``run_repair`` /
+        ``context-intelligence-server doctor --fix`` -- never automatically
+        here. See ``TestDedupDuplicateNodes`` for the coverage that moved.
         """
         store = _make_store()
         store._schema_initialized = False
@@ -672,13 +674,14 @@ class TestSchemaIndexesWorkspace:
         event_dedup = [
             q for q in all_queries if "MATCH (e:Event)" in q and "DETACH DELETE" in q
         ]
-        assert session_dedup, (
-            f"Expected a Session dedup (MATCH (s:Session) ... DETACH DELETE) query. "
+        assert not session_dedup, (
+            f"ensure_neo4j_schema must NOT run the Session dedup any more -- "
+            f"that belongs to dedup_duplicate_nodes/run_repair. "
             f"Queries issued: {all_queries}"
         )
-        assert event_dedup, (
-            f"Expected an Event dedup (MATCH (e:Event) ... DETACH DELETE) query so "
-            f"the Event uniqueness constraint retry can converge. "
+        assert not event_dedup, (
+            f"ensure_neo4j_schema must NOT run the Event dedup any more -- "
+            f"that belongs to dedup_duplicate_nodes/run_repair. "
             f"Queries issued: {all_queries}"
         )
 
@@ -2753,3 +2756,610 @@ class TestEdgeMergeCypherProvenance:
             'expected `if k not in ("type", "created_by")` in source'
         )
         # Phase 6: real-Neo4j edge write-once + cross-session gate
+
+
+# ---------------------------------------------------------------------------
+# Cold-start hot-path extraction: dedup_duplicate_nodes / backfill_node_labels
+# / count_untagged_nodes / count_duplicate_nodes / diagnose / run_repair /
+# the fail-loud :Node constraint guard.
+#
+# These O(graph-size) scans used to run unconditionally inside
+# ensure_neo4j_schema on every cold start. They are now standalone functions
+# invoked ONLY via run_repair / `doctor --fix`.
+# ---------------------------------------------------------------------------
+
+
+class _RowsResult:
+    """Async-iterable result double yielding a fixed list of row dicts."""
+
+    def __init__(self, rows: list[dict]) -> None:
+        self._rows = rows
+
+    def __aiter__(self):
+        return self._agen()
+
+    async def _agen(self):
+        for row in self._rows:
+            yield row
+
+
+class _ProgrammableSession:
+    """Session double keyed by exact-statement -> queue of canned responses.
+
+    Each call to ``run()`` records the executed statement. If the statement
+    exactly matches a key in *canned*, the next queued response is popped and
+    returned (or raised, if it's an Exception); repeated calls to the SAME
+    statement text pop successive values (used to simulate a before/after
+    count changing between two identical-text queries). Unmatched statements
+    (e.g. schema DDL this test doesn't care about) get a generic empty result
+    so they never raise.
+    """
+
+    def __init__(self, canned: dict[str, list] | None = None) -> None:
+        self._canned = {k: list(v) for k, v in (canned or {}).items()}
+        self.executed: list[str] = []
+
+    async def run(self, statement: str, *args: object, **kwargs: object) -> object:
+        self.executed.append(statement)
+        queue = self._canned.get(statement)
+        if queue:
+            value = queue.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return _RowsResult(value)
+        return _RowsResult([])
+
+    async def __aenter__(self) -> "_ProgrammableSession":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+
+class _FakeDriver:
+    """Driver double returning the same session for every ``.session()`` call."""
+
+    def __init__(self, session: _ProgrammableSession) -> None:
+        self._session = session
+
+    def session(self, database: str = "neo4j") -> _ProgrammableSession:
+        return self._session
+
+
+class TestDedupDuplicateNodes:
+    """dedup_duplicate_nodes: extracted former Step 1 of ensure_neo4j_schema."""
+
+    async def test_sums_counts_across_three_passes(self) -> None:
+        from context_intelligence_server.neo4j_store import (
+            _DEDUP_EVENT_CYPHER,
+            _DEDUP_GLOBAL_CYPHER,
+            _DEDUP_SESSION_CYPHER,
+            dedup_duplicate_nodes,
+        )
+
+        session = _ProgrammableSession(
+            canned={
+                _DEDUP_GLOBAL_CYPHER: [[{"c": 3}]],
+                _DEDUP_SESSION_CYPHER: [[{"c": 1}]],
+                _DEDUP_EVENT_CYPHER: [[{"c": 2}]],
+            }
+        )
+        removed = await dedup_duplicate_nodes(_FakeDriver(session))
+
+        assert removed == 6
+        assert session.executed == [
+            _DEDUP_GLOBAL_CYPHER,
+            _DEDUP_SESSION_CYPHER,
+            _DEDUP_EVENT_CYPHER,
+        ]
+
+    async def test_one_pass_failing_is_non_fatal(self) -> None:
+        """A failing pass is logged and treated as 0 removed; others still run."""
+        from context_intelligence_server.neo4j_store import (
+            _DEDUP_EVENT_CYPHER,
+            _DEDUP_GLOBAL_CYPHER,
+            _DEDUP_SESSION_CYPHER,
+            dedup_duplicate_nodes,
+        )
+
+        session = _ProgrammableSession(
+            canned={
+                _DEDUP_GLOBAL_CYPHER: [RuntimeError("boom")],
+                _DEDUP_SESSION_CYPHER: [[{"c": 1}]],
+                _DEDUP_EVENT_CYPHER: [[{"c": 2}]],
+            }
+        )
+        removed = await dedup_duplicate_nodes(_FakeDriver(session))
+
+        assert removed == 3
+        # All three passes were attempted despite the first one raising.
+        assert session.executed == [
+            _DEDUP_GLOBAL_CYPHER,
+            _DEDUP_SESSION_CYPHER,
+            _DEDUP_EVENT_CYPHER,
+        ]
+
+
+class TestBackfillNodeLabels:
+    """backfill_node_labels: extracted former Step 5 of ensure_neo4j_schema."""
+
+    async def test_returns_before_minus_after_count(self) -> None:
+        from context_intelligence_server.neo4j_store import (
+            _UNTAGGED_COUNT_CYPHER,
+            backfill_node_labels,
+        )
+
+        session = _ProgrammableSession(
+            canned={_UNTAGGED_COUNT_CYPHER: [[{"c": 5}], [{"c": 2}]]}
+        )
+        tagged = await backfill_node_labels(_FakeDriver(session))
+
+        assert tagged == 3
+        # pre-count, the SET backfill statement, post-count.
+        assert len(session.executed) == 3
+        assert "IN TRANSACTIONS" in session.executed[1]
+
+    async def test_pre_count_failure_returns_zero(self) -> None:
+        from context_intelligence_server.neo4j_store import (
+            _UNTAGGED_COUNT_CYPHER,
+            backfill_node_labels,
+        )
+
+        session = _ProgrammableSession(
+            canned={_UNTAGGED_COUNT_CYPHER: [RuntimeError("boom")]}
+        )
+        tagged = await backfill_node_labels(_FakeDriver(session))
+
+        assert tagged == 0
+
+    async def test_post_count_failure_returns_zero(self) -> None:
+        from context_intelligence_server.neo4j_store import (
+            _UNTAGGED_COUNT_CYPHER,
+            backfill_node_labels,
+        )
+
+        session = _ProgrammableSession(
+            canned={_UNTAGGED_COUNT_CYPHER: [[{"c": 5}], RuntimeError("boom")]}
+        )
+        tagged = await backfill_node_labels(_FakeDriver(session))
+
+        assert tagged == 0
+
+
+class TestReadOnlyDiagnostics:
+    """count_untagged_nodes / count_duplicate_nodes / diagnose -- no writes."""
+
+    async def test_count_untagged_nodes_returns_int(self) -> None:
+        """count_untagged_nodes is O(1): total-count minus tagged-count, NOT
+        the ``WHERE NOT n:Node`` AllNodesScan (``_UNTAGGED_COUNT_CYPHER``) --
+        this function is now called on every server boot (main.py's lifespan
+        health check), so it must never regress to an O(graph-size) scan."""
+        from context_intelligence_server.neo4j_store import (
+            _TAGGED_NODE_COUNT_CYPHER,
+            _TOTAL_NODE_COUNT_CYPHER,
+            _UNTAGGED_COUNT_CYPHER,
+            count_untagged_nodes,
+        )
+
+        session = _ProgrammableSession(
+            canned={
+                _TOTAL_NODE_COUNT_CYPHER: [[{"c": 10}]],
+                _TAGGED_NODE_COUNT_CYPHER: [[{"c": 7}]],
+            }
+        )
+        result = await count_untagged_nodes(_FakeDriver(session))
+
+        assert result == 3, "expected total(10) - tagged(7) == 3"
+        assert session.executed == [_TOTAL_NODE_COUNT_CYPHER, _TAGGED_NODE_COUNT_CYPHER]
+        # The AllNodesScan-inducing scan query must NEVER be issued here.
+        assert _UNTAGGED_COUNT_CYPHER not in session.executed
+        assert not any("WHERE NOT" in stmt for stmt in session.executed)
+        assert not any(
+            "SET" in stmt or "DETACH DELETE" in stmt for stmt in session.executed
+        )
+
+    async def test_count_untagged_nodes_never_negative(self) -> None:
+        """A benign race (tagged count observed higher than total, e.g. a
+        concurrent write between the two counts-store reads) must clamp to 0,
+        never return a negative count."""
+        from context_intelligence_server.neo4j_store import (
+            _TAGGED_NODE_COUNT_CYPHER,
+            _TOTAL_NODE_COUNT_CYPHER,
+            count_untagged_nodes,
+        )
+
+        session = _ProgrammableSession(
+            canned={
+                _TOTAL_NODE_COUNT_CYPHER: [[{"c": 5}]],
+                _TAGGED_NODE_COUNT_CYPHER: [[{"c": 6}]],
+            }
+        )
+        result = await count_untagged_nodes(_FakeDriver(session))
+
+        assert result == 0
+
+    async def test_count_duplicate_nodes_returns_int(self) -> None:
+        from context_intelligence_server.neo4j_store import (
+            _DUPLICATE_COUNT_CYPHER,
+            count_duplicate_nodes,
+        )
+
+        session = _ProgrammableSession(canned={_DUPLICATE_COUNT_CYPHER: [[{"c": 4}]]})
+        result = await count_duplicate_nodes(_FakeDriver(session))
+
+        assert result == 4
+        assert "DETACH DELETE" not in session.executed[0]
+
+    async def test_diagnose_combines_both_counts(self) -> None:
+        from context_intelligence_server.neo4j_store import (
+            _DUPLICATE_COUNT_CYPHER,
+            _TAGGED_NODE_COUNT_CYPHER,
+            _TOTAL_NODE_COUNT_CYPHER,
+            diagnose,
+        )
+
+        session = _ProgrammableSession(
+            canned={
+                _TOTAL_NODE_COUNT_CYPHER: [[{"c": 12}]],
+                _TAGGED_NODE_COUNT_CYPHER: [[{"c": 3}]],
+                _DUPLICATE_COUNT_CYPHER: [[{"c": 5}]],
+            }
+        )
+        result = await diagnose(_FakeDriver(session))
+
+        assert result == {"untagged_nodes": 9, "duplicate_nodes": 5}
+        # Read-only: no write statement was ever executed.
+        assert not any(
+            "DETACH DELETE" in stmt or " SET " in stmt for stmt in session.executed
+        )
+
+
+class TestRunRepair:
+    """run_repair: the ONLY place dedup + backfill + schema DDL run together."""
+
+    async def test_run_repair_runs_dedup_and_backfill_and_returns_summary(
+        self,
+    ) -> None:
+        from context_intelligence_server.neo4j_store import (
+            _DEDUP_EVENT_CYPHER,
+            _DEDUP_GLOBAL_CYPHER,
+            _DEDUP_SESSION_CYPHER,
+            _UNTAGGED_COUNT_CYPHER,
+            run_repair,
+        )
+
+        session = _ProgrammableSession(
+            canned={
+                _DEDUP_GLOBAL_CYPHER: [[{"c": 2}]],
+                _DEDUP_SESSION_CYPHER: [[{"c": 0}]],
+                _DEDUP_EVENT_CYPHER: [[{"c": 0}]],
+                _UNTAGGED_COUNT_CYPHER: [[{"c": 4}], [{"c": 0}]],
+            }
+        )
+        result = await run_repair(_FakeDriver(session))
+
+        assert result == {"duplicates_removed": 2, "nodes_tagged": 4}
+        # dedup passes + backfill pre/SET/post ran.
+        assert _DEDUP_GLOBAL_CYPHER in session.executed
+        assert _DEDUP_SESSION_CYPHER in session.executed
+        assert _DEDUP_EVENT_CYPHER in session.executed
+        assert session.executed.count(_UNTAGGED_COUNT_CYPHER) == 2
+        # ensure_neo4j_schema's DDL also ran (index/constraint creation).
+        assert any("CREATE CONSTRAINT" in stmt for stmt in session.executed)
+        assert any("CREATE INDEX" in stmt for stmt in session.executed)
+
+
+class TestEnsureNeo4jSchemaNoLongerMigrates:
+    """ensure_neo4j_schema must NOT run dedup or :Node backfill any more."""
+
+    async def test_dedup_and_backfill_queries_not_executed(self) -> None:
+        session = _ProgrammableSession()
+        result = await ensure_neo4j_schema(_FakeDriver(session))
+
+        assert result is True
+        assert not any("DETACH DELETE" in stmt for stmt in session.executed), (
+            "ensure_neo4j_schema must no longer run the dedup DETACH DELETE "
+            "queries -- those moved to dedup_duplicate_nodes/run_repair."
+        )
+        assert not any("IN TRANSACTIONS" in stmt for stmt in session.executed), (
+            "ensure_neo4j_schema must no longer run the :Node backfill -- "
+            "that moved to backfill_node_labels/run_repair."
+        )
+
+    async def test_index_and_constraint_ddl_still_executed(self) -> None:
+        session = _ProgrammableSession()
+        await ensure_neo4j_schema(_FakeDriver(session))
+
+        assert any("CREATE INDEX" in stmt for stmt in session.executed)
+        assert any(
+            "CREATE CONSTRAINT session_node_id_workspace_unique" in stmt
+            for stmt in session.executed
+        )
+        assert any(
+            "CREATE CONSTRAINT event_node_id_workspace_unique" in stmt
+            for stmt in session.executed
+        )
+        assert any(
+            "CREATE CONSTRAINT node_node_id_workspace_unique" in stmt
+            for stmt in session.executed
+        )
+
+
+class TestFailLoudConstraintGuard:
+    """The :Node constraint (Step 6) fails loud on a genuine data conflict."""
+
+    def test_is_constraint_data_conflict_true_for_known_codes(self) -> None:
+        from context_intelligence_server.neo4j_store import (
+            _is_constraint_data_conflict,
+        )
+
+        class _FakeNeo4jError(Exception):
+            def __init__(self, code: str) -> None:
+                super().__init__(code)
+                self.code = code
+
+        assert _is_constraint_data_conflict(
+            _FakeNeo4jError("Neo.ClientError.Schema.ConstraintValidationFailed")
+        )
+        assert not _is_constraint_data_conflict(
+            _FakeNeo4jError("Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists")
+        )
+        assert not _is_constraint_data_conflict(RuntimeError("no .code attribute"))
+
+    async def test_ensure_neo4j_schema_raises_guided_runtime_error(self) -> None:
+        """A data-conflict on the :Node constraint raises RuntimeError naming
+        `doctor --fix`, instead of silently continuing without it -- when the
+        caller explicitly opts in via ``fail_on_data_conflict=True`` (the
+        cold-start / lifespan and doctor-repair contract; see
+        ``test_ensure_neo4j_schema_default_does_not_raise_on_data_conflict``
+        below for the opposite, flush-path-safe default)."""
+        conflict_error = Neo4jError._hydrate_neo4j(
+            code="Neo.ClientError.Schema.ConstraintValidationFailed",
+            message="constraint would be violated by existing data",
+        )
+        session = _ProgrammableSession(
+            canned={
+                "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Node) REQUIRE (n.node_id, n.workspace) IS UNIQUE": [
+                    conflict_error
+                ],
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="doctor --fix"):
+            await ensure_neo4j_schema(_FakeDriver(session), fail_on_data_conflict=True)
+
+    async def test_benign_already_exists_does_not_raise(self) -> None:
+        """A benign already-exists race on the :Node constraint is still
+        swallowed (not treated as a data conflict)."""
+        benign_error = Neo4jError._hydrate_neo4j(
+            code="Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists",
+            message="already exists",
+        )
+        session = _ProgrammableSession(
+            canned={
+                "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Node) REQUIRE (n.node_id, n.workspace) IS UNIQUE": [
+                    benign_error
+                ],
+            }
+        )
+
+        result = await ensure_neo4j_schema(_FakeDriver(session))  # must not raise
+        assert result is True
+
+
+# ---------------------------------------------------------------------------
+# TestFailOnDataConflictDefault
+#
+# Regression for the PR #67 merge-blocker (reviewer Salil, commit 14a6d30):
+# ensure_neo4j_schema's :Node constraint step used to hardcode
+# fail_on_data_conflict=True with no way for callers to opt out. That is
+# correct for cold start (main.py:174, refuse to boot) but WRONG for the
+# mid-flight flush path (Neo4jGraphStore._ensure_schema, called from inside
+# _flush_body's try block): a RuntimeError raised there escapes via
+# _flush_body's `except ... raise`, gets caught by the drainer, and
+# dead-letters the ENTIRE in-flight batch of real activity records -- and
+# because _schema_initialized never latches, every subsequent batch dies the
+# same way until an operator runs `doctor --fix`.
+#
+# The fix makes fail_on_data_conflict a keyword-only parameter defaulting to
+# False (safe for the flush path); the lifespan caller (main.py) and the
+# doctor-repair caller (run_repair, post-dedup/backfill the graph should be
+# clean) opt in explicitly with True.
+# ---------------------------------------------------------------------------
+
+
+def _conflict_error() -> Neo4jError:
+    """A genuine :Node-constraint data-conflict error (untagged/duplicate legacy nodes)."""
+    return Neo4jError._hydrate_neo4j(
+        code="Neo.ClientError.Schema.ConstraintValidationFailed",
+        message="constraint would be violated by existing data",
+    )
+
+
+class TestFailOnDataConflictDefault:
+    """ensure_neo4j_schema must default to fail_on_data_conflict=False."""
+
+    async def test_default_does_not_raise_on_data_conflict(self) -> None:
+        """Bare call (no kwarg) on a genuine data-conflict must NOT raise --
+        this is the flush-path-safe default; the caller opts into fail-loud
+        behavior explicitly (see the raises test above)."""
+        session = _ProgrammableSession(
+            canned={
+                "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Node) REQUIRE (n.node_id, n.workspace) IS UNIQUE": [
+                    _conflict_error()
+                ],
+            }
+        )
+
+        result = await ensure_neo4j_schema(_FakeDriver(session))  # MUST NOT raise
+        assert result is False, (
+            "A genuine :Node data conflict must report failure via the return "
+            "value (not raise) when fail_on_data_conflict is left at its "
+            "default, so the caller retries on the next flush rather than "
+            "latching a half-built schema."
+        )
+
+    async def test_default_logs_warning_pointing_at_doctor_fix(self, caplog) -> None:
+        """The default (non-raising) data-conflict path must log an actionable
+        WARNING naming `doctor --fix` -- silent failure here would leave
+        operators with no signal that the constraint is missing."""
+        session = _ProgrammableSession(
+            canned={
+                "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Node) REQUIRE (n.node_id, n.workspace) IS UNIQUE": [
+                    _conflict_error()
+                ],
+            }
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await ensure_neo4j_schema(_FakeDriver(session))
+
+        assert any(
+            r.levelno == logging.WARNING and "doctor --fix" in r.getMessage()
+            for r in caplog.records
+        ), (
+            "Expected a WARNING record naming `doctor --fix`. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
+    async def test_explicit_true_raises_same_as_before(self) -> None:
+        """fail_on_data_conflict=True (the cold-start/doctor-repair contract)
+        preserves the original fail-loud RuntimeError behavior byte-for-byte."""
+        session = _ProgrammableSession(
+            canned={
+                "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Node) REQUIRE (n.node_id, n.workspace) IS UNIQUE": [
+                    _conflict_error()
+                ],
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="doctor --fix"):
+            await ensure_neo4j_schema(_FakeDriver(session), fail_on_data_conflict=True)
+
+
+class TestDataConflictOnFlushPathDoesNotDeadLetter:
+    """END-TO-END regression: a genuine :Node data conflict on the flush path
+    must NOT dead-letter the in-flight batch.
+
+    This is the exact bug reported by Salil in PR #67 review: commit 14a6d30
+    hardcoded fail_on_data_conflict=True inside ensure_neo4j_schema's Step 6,
+    reachable from Neo4jGraphStore._ensure_schema (called from _flush_body's
+    try block on every flush until the schema latches). A RuntimeError raised
+    there escaped via _flush_body's `except ... raise` and dead-lettered the
+    whole batch, with _schema_initialized never latching so every subsequent
+    batch died the same way. This differs from the pre-existing
+    ``test_constraint_failure_on_flush_path_does_not_dead_letter`` test, which
+    uses ``Neo.ClientError.Schema.ConstraintCreationFailed`` -- a code NOT in
+    ``_CONSTRAINT_DATA_CONFLICT_CODES`` (that set requires the
+    ``Neo.DatabaseError.Schema.*`` / ``ConstraintValidationFailed`` codes) --
+    so it never actually exercised the data-conflict raise path this fix
+    addresses.
+    """
+
+    async def test_genuine_data_conflict_on_flush_path_does_not_dead_letter(
+        self, caplog
+    ) -> None:
+        store = _make_store()
+        store._schema_initialized = False
+
+        conflict_error = _conflict_error()
+
+        async def _schema_run(query, *args, **kwargs):
+            if "CREATE CONSTRAINT node_node_id_workspace_unique" in query:
+                raise conflict_error
+            return AsyncMock()
+
+        schema_session = AsyncMock()
+        schema_session.__aenter__ = AsyncMock(return_value=schema_session)
+        schema_session.run = AsyncMock(side_effect=_schema_run)
+
+        mock_tx, write_session = _make_flush_mocks()
+
+        store._driver.session = MagicMock(
+            side_effect=[schema_session, write_session, write_session, write_session]
+        )
+
+        await store.upsert_node("n1", {"labels": ["Session"], "name": "test"})
+
+        with caplog.at_level(logging.DEBUG):
+            await store.flush()  # MUST NOT raise -- must not dead-letter
+
+        assert mock_tx.run.await_count >= 1, (
+            "Node-write transaction must still run despite the :Node "
+            "constraint data conflict -- the batch must not be abandoned."
+        )
+        assert store._node_buffer == {}, (
+            "Buffer must be cleared (success path) — NOT restored-on-failure. "
+            "A non-empty buffer here would mean flush() re-raised and the "
+            "caller (registry._handle_exhausted_batch) would dead-letter "
+            "these real activity records."
+        )
+        assert any(
+            r.levelno == logging.WARNING and "doctor --fix" in r.getMessage()
+            for r in caplog.records
+        ), (
+            "Expected a WARNING naming `doctor --fix` on the flush path. "
+            f"Records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+        assert store._schema_initialized is False, (
+            "Schema flag must stay False so the NEXT flush retries schema "
+            "init once the graph has been repaired via `doctor --fix` -- "
+            "this is the self-healing behavior the fix restores."
+        )
+
+    async def test_doctor_repair_path_still_fails_closed_on_genuine_conflict(
+        self,
+    ) -> None:
+        """The doctor/repair contract is unchanged: calling ensure_neo4j_schema
+        with fail_on_data_conflict=True -- exactly what run_repair does
+        post-dedup/backfill -- still raises on a genuinely unrepairable graph.
+
+        NOT the lifespan path: main.py's lifespan handler no longer opts into
+        fail_on_data_conflict=True (cold start must never fail due to graph
+        state -- see test_main.py's startup tests). This direct-call assertion
+        preserves the doctor CLI's fail-loud contract, not a lifespan claim."""
+        session = _ProgrammableSession(
+            canned={
+                "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Node) REQUIRE (n.node_id, n.workspace) IS UNIQUE": [
+                    _conflict_error()
+                ],
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="doctor --fix"):
+            await ensure_neo4j_schema(_FakeDriver(session), fail_on_data_conflict=True)
+
+    async def test_run_repair_still_fails_closed_on_genuine_conflict(self) -> None:
+        """doctor --fix's run_repair calls ensure_neo4j_schema with
+        fail_on_data_conflict=True (post-dedup/backfill the graph should be
+        clean; a lingering conflict here is a genuine repair failure the
+        operator must see, not something to swallow)."""
+        from context_intelligence_server.neo4j_store import (
+            _DEDUP_EVENT_CYPHER,
+            _DEDUP_GLOBAL_CYPHER,
+            _DEDUP_SESSION_CYPHER,
+            _UNTAGGED_COUNT_CYPHER,
+            run_repair,
+        )
+
+        session = _ProgrammableSession(
+            canned={
+                _DEDUP_GLOBAL_CYPHER: [[{"c": 0}]],
+                _DEDUP_SESSION_CYPHER: [[{"c": 0}]],
+                _DEDUP_EVENT_CYPHER: [[{"c": 0}]],
+                _UNTAGGED_COUNT_CYPHER: [[{"c": 0}], [{"c": 0}]],
+                "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "
+                "FOR (n:Node) REQUIRE (n.node_id, n.workspace) IS UNIQUE": [
+                    _conflict_error()
+                ],
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="doctor --fix"):
+            await run_repair(_FakeDriver(session))

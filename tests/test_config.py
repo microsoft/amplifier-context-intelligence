@@ -57,7 +57,7 @@ def test_session_timeout_defaults():
     from context_intelligence_server.config import Settings
 
     s = Settings()
-    assert s.dashboard_inactive_timeout == 1800.0
+    assert s.status_inactive_timeout == 1800.0
     assert s.stale_session_timeout == 432000.0
 
 
@@ -1675,3 +1675,47 @@ class TestM2RegressionEntraIdentities:
 
         s = Settings()
         assert s.build_identity_map() == {}
+
+
+# ---------------------------------------------------------------------------
+# Obsolete config-key warnings (headless refactor back-compat)
+# ---------------------------------------------------------------------------
+
+
+def test_obsolete_config_keys_warn_but_do_not_break_startup(
+    tmp_path: Path,
+    monkeypatch: "pytest.MonkeyPatch",
+    caplog: "pytest.LogCaptureFixture",
+) -> None:
+    """A YAML carrying removed/renamed keys still boots, but warns for each.
+
+    Simulates upgrading a live deployment whose server-config.yaml predates the
+    headless refactor: web_ui_enabled and dashboard_inactive_timeout are dropped
+    silently by pydantic, so config.py must log a warning naming each one.
+    """
+    import logging
+
+    cfg = tmp_path / "server-config.yaml"
+    cfg.write_text(
+        "web_ui_enabled: false\n"
+        "dashboard_inactive_timeout: 900.0\n"
+        "neo4j_url: neo4j://localhost:7687\n"
+        "neo4j_password: ''\n"
+    )
+    monkeypatch.setenv("AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE", str(cfg))
+
+    from context_intelligence_server.config import Settings
+
+    with caplog.at_level(logging.WARNING, logger="context_intelligence_server.config"):
+        s = Settings()
+
+    # Startup succeeded and the old override was ignored (default retained).
+    assert not hasattr(s, "web_ui_enabled")
+    assert s.status_inactive_timeout == 1800.0
+
+    warnings = "\n".join(
+        r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+    )
+    assert "web_ui_enabled" in warnings
+    assert "dashboard_inactive_timeout" in warnings
+    assert "status_inactive_timeout" in warnings  # migration hint present

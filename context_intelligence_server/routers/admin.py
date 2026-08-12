@@ -348,7 +348,18 @@ def _require_key_store(request: Request) -> IdentityStore:
 # Router
 # ---------------------------------------------------------------------------
 
-router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin)])
+# include_in_schema=False keeps the /admin/* routes out of the OpenAPI schema
+# (/openapi.json) and Swagger UI (/docs).  Those two doc surfaces are
+# intentionally unauthenticated (see auth._EXEMPT_PATHS); the data API is
+# published there on purpose for interoperability, but the admin/identity
+# surface is operator-only and is not an interop surface, so it is not disclosed
+# to unauthenticated callers.  This is a schema-visibility choice only -- routing
+# and auth are unaffected (admin remains bearer-token + IdentityAdmin gated).
+router = APIRouter(
+    prefix="/admin",
+    dependencies=[Depends(require_admin)],
+    include_in_schema=False,
+)
 
 
 # --- Entra identities -------------------------------------------------------

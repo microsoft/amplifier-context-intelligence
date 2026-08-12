@@ -131,7 +131,8 @@ Verify it's up:
 ```bash
 curl -s http://127.0.0.1:8000/status
 ```
-Then open the dashboard at `http://127.0.0.1:8000/` (if `web_ui_enabled`).
+The server is headless (API-only); explore the API at the always-on Swagger UI
+`http://127.0.0.1:8000/docs`.
 
 **Config resolution** is `env > server-config.yaml > built-in defaults`. Note the
 built-in defaults assume a container (`neo4j://neo4j:7687`, `/data/...` paths);

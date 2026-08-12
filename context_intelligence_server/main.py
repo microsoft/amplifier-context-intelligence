@@ -1,10 +1,12 @@
 """FastAPI application entrypoint for the Context Intelligence Server."""
 
+import argparse
 import asyncio
 import json
 import logging
 import os
 import re
+import sys
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -12,25 +14,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import aiofiles
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import (
-    FileResponse,
-    HTMLResponse,
-    JSONResponse,
-    Response,
-    StreamingResponse,
-)
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, Response
 from neo4j import READ_ACCESS, WRITE_ACCESS, AsyncGraphDatabase
 
 from context_intelligence_server import __version__
 from context_intelligence_server.auth import (
+    _EXEMPT_PATHS,
     BearerTokenMiddleware,
     EntraResolver,
     StaticKeyResolver,
-    _EXEMPT_PATHS,
-    _EXEMPT_PATHS_API_ONLY,
 )
 from context_intelligence_server.authz import (  # noqa: F401 — re-exported for tests/routes
     _is_write_capable,
@@ -38,21 +31,24 @@ from context_intelligence_server.authz import (  # noqa: F401 — re-exported fo
     require_write,
 )
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
-from context_intelligence_server.config import Settings, get_settings
-from context_intelligence_server.identity_store import IdentityStore
-from context_intelligence_server.dashboard import build_status_response
-from context_intelligence_server.routers.admin import router as admin_router
-from context_intelligence_server.routers.queues import router as queues_router
-from context_intelligence_server.routers.version import router as version_router
+from context_intelligence_server.config import Neo4jClientConfig, Settings, get_settings
 from context_intelligence_server.idempotency import EventIdempotencyCache
+from context_intelligence_server.identity_store import IdentityStore
 from context_intelligence_server.logging_config import setup_logging
 from context_intelligence_server.models import (
     CypherRequest,
     EventRequest,
     EventResponse,
 )
-from context_intelligence_server.neo4j_store import ensure_neo4j_schema
+from context_intelligence_server.neo4j_store import (
+    count_untagged_nodes,
+    ensure_neo4j_schema,
+)
 from context_intelligence_server.registry import SessionRegistry
+from context_intelligence_server.routers.admin import router as admin_router
+from context_intelligence_server.routers.queues import router as queues_router
+from context_intelligence_server.routers.version import router as version_router
+from context_intelligence_server.status import build_status_response
 
 _settings = get_settings()
 
@@ -62,6 +58,16 @@ logger = logging.getLogger("context_intelligence_server")
 def _neo4j_access_const(mode: str) -> str:
     """Map our config string ("READ"/"WRITE") to the driver's access-mode constant."""
     return READ_ACCESS if mode == "READ" else WRITE_ACCESS
+
+
+def build_neo4j_driver(config: Neo4jClientConfig) -> Any:
+    """Construct an AsyncGraphDatabase driver from a resolved Neo4j client config.
+
+    Shared by ``lifespan()`` (the admin driver, on every server boot) and
+    ``doctor.run_doctor()`` (the CLI), so the two entry points can never
+    construct the connection differently.
+    """
+    return AsyncGraphDatabase.driver(config.url, auth=config.auth)
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +157,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     # Admin (read/write): schema init + all mutation paths. Keep the existing
     # app.state.neo4j_driver NAME so nothing that reads it silently breaks.
-    app.state.neo4j_driver = AsyncGraphDatabase.driver(_admin.url, auth=_admin.auth)
+    # build_neo4j_driver() is the SAME helper doctor.run_doctor() uses, so the
+    # server and the doctor CLI can never construct this connection differently.
+    app.state.neo4j_driver = build_neo4j_driver(_admin)
     # Cypher-query (read-intent): /cypher + dashboard reads.
     app.state.neo4j_query_driver = AsyncGraphDatabase.driver(
         _query.url, auth=_query.auth
@@ -166,8 +174,46 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info(
         "lifespan_startup: initializing Neo4j schema (indexes + uniqueness constraints)"
     )
-    await ensure_neo4j_schema(app.state.neo4j_driver)
+    # Cold start FAILS LOUD on schema/data corruption that requires
+    # `doctor --fix` -- an un-migrated graph (duplicate legacy nodes OR
+    # nodes lacking the universal :Node label). Nothing has been written yet
+    # at cold start, so refusing to boot loses no data: this is the safest
+    # possible moment to surface an impossible state as an un-missable
+    # signal rather than a log line someone greps for later. Contrast with
+    # the flush path (Neo4jGraphStore._ensure_schema), which must keep
+    # self-healing and never raise (Salil's blocker -- raising there would
+    # dead-letter real in-flight activity records). fail_on_data_conflict=True
+    # here mirrors run_repair's contract: a :Node constraint data conflict
+    # raises a RuntimeError naming `doctor --fix` instead of being logged
+    # and swallowed.
+    await ensure_neo4j_schema(app.state.neo4j_driver, fail_on_data_conflict=True)
     logger.info("lifespan_startup: Neo4j schema initialized")
+    # Fail-loud migration-health guard: duplicate nodes are already caught
+    # above by the :Node constraint (fail_on_data_conflict=True); this catches
+    # the OTHER un-migrated shape the constraint can't see on its own --
+    # nodes that simply lack the :Node label altogether, which violate no
+    # constraint and so raise nothing by themselves. O(1) via the counts
+    # store (see count_untagged_nodes) -- this must never regress into the
+    # AllNodesScan stall PR #67 removed from the write path.
+    #
+    # A connectivity/probe failure here is NOT the same as "confirmed
+    # un-migrated" -- it means graph state could not be determined, not that
+    # it was determined to be bad -- so it is logged at DEBUG and swallowed
+    # rather than treated as a corruption finding; the flush path's
+    # self-heal still covers a genuinely dirty graph once it becomes
+    # reachable.
+    try:
+        untagged = await count_untagged_nodes(app.state.neo4j_driver)
+    except Exception as exc:  # noqa: BLE001 - connectivity probe, not a confirmed bad state
+        _LOG_MSG = "startup migration-health probe skipped (graph unreachable?): %s"
+        logger.debug(_LOG_MSG, exc)
+        untagged = 0
+    if untagged:
+        raise RuntimeError(
+            f"Neo4j graph has {untagged} node(s) lacking the :Node label "
+            "(un-migrated). Cold start refuses to boot to avoid duplicating "
+            "them on write. Run: context-intelligence-server doctor --fix"
+        )
     # Crash recovery (decisions #5/#6): on startup, respawn one drainer per
     # session that still has an undrained, complete line. The workspace is
     # parsed from that session's FIRST log line so the respawned worker is
@@ -208,11 +254,12 @@ app = FastAPI(
     title="Context Intelligence Server",
     version=__version__,
     lifespan=lifespan,
-    # web_ui_enabled=False locks down to API-only: no OpenAPI schema, no Swagger UI.
-    # Must be set at construction time — FastAPI does not support changing these after init.
-    docs_url="/docs" if _settings.web_ui_enabled else None,
-    redoc_url="/redoc" if _settings.web_ui_enabled else None,
-    openapi_url="/openapi.json" if _settings.web_ui_enabled else None,
+    # Headless server: no browser-facing UI. The OpenAPI contract + Swagger UI
+    # are the developer surface and are always registered; ReDoc is a redundant
+    # second doc UI and is intentionally left off (docs_url=None equivalent).
+    docs_url="/docs",
+    redoc_url=None,
+    openapi_url="/openapi.json",
 )
 app.include_router(admin_router)
 app.include_router(version_router)
@@ -260,34 +307,27 @@ def _validate_data_timestamp(data: dict[str, Any]) -> None:
         )
 
 
-_WEB_DIR = Path(__file__).parent / "web"
-
-
 def _assert_admin_not_exempt() -> None:
     """Startup assertion (TB-07): /admin/* must NEVER be in any exempt set.
 
     Called by ``create_asgi_app`` before constructing the middleware.
     Raises ``RuntimeError`` if any ``/admin`` path or prefix appears in
-    ``_EXEMPT_PATHS``, ``_EXEMPT_PATHS_API_ONLY``, or ``_EXEMPT_PREFIXES``,
-    because that would make the admin API accessible without authentication.
+    ``_EXEMPT_PATHS`` or ``_EXEMPT_PREFIXES``, because that would make the
+    admin API accessible without authentication.
 
     This is a defence-in-depth structural check: it is impossible to
     accidentally ship an unauthenticated admin surface.
     """
-    import context_intelligence_server.auth as _auth_module  # noqa: PLC0415
+    import context_intelligence_server.auth as _auth_module
 
-    # Check exact-path exempt sets.
-    for exempt_set_name, exempt_set in (
-        ("_EXEMPT_PATHS", _auth_module._EXEMPT_PATHS),
-        ("_EXEMPT_PATHS_API_ONLY", _auth_module._EXEMPT_PATHS_API_ONLY),
-    ):
-        for path in exempt_set:
-            if path == "/admin" or path.startswith("/admin/"):
-                raise RuntimeError(
-                    f"Security invariant violated: /admin path {path!r} found in "
-                    f"auth.{exempt_set_name}.  The /admin surface MUST be "
-                    f"authenticated — remove it from the exempt set immediately."
-                )
+    # Check the exact-path exempt set.
+    for path in _auth_module._EXEMPT_PATHS:
+        if path == "/admin" or path.startswith("/admin/"):
+            raise RuntimeError(
+                f"Security invariant violated: /admin path {path!r} found in "
+                f"auth._EXEMPT_PATHS.  The /admin surface MUST be "
+                f"authenticated — remove it from the exempt set immediately."
+            )
 
     # Check prefix exempt tuple.
     for prefix in _auth_module._EXEMPT_PREFIXES:
@@ -554,15 +594,10 @@ def create_asgi_app(
     # sha256 of admin_api_key (or None when admin_api_key is not configured).
     app.state.admin_api_key_digest = admin_api_key_digest
 
-    # Select the auth-exempt path set based on web_ui_enabled.
-    # web_ui_enabled=False (api-only): use the smaller set that excludes /logs/stream
-    # and other web-UI paths so they cannot be reached unauthenticated.
-    # web_ui_enabled=True (default): use the full set including web-UI paths.
-    exempt = _EXEMPT_PATHS if s.web_ui_enabled else _EXEMPT_PATHS_API_ONLY
     return BearerTokenMiddleware(
         app,
         resolver=resolver,
-        exempt_paths=exempt,
+        exempt_paths=_EXEMPT_PATHS,
         admin_api_key_digest=admin_api_key_digest,
         allow_unauthenticated=s.allow_unauthenticated,
     )
@@ -571,21 +606,6 @@ def create_asgi_app(
 # Module-level ASGI app used by Gunicorn: context_intelligence_server.main:asgi_app
 # The raw `app` is kept for internal use and testing against un-authed routes.
 asgi_app: BearerTokenMiddleware = create_asgi_app()
-
-
-if _settings.web_ui_enabled:
-    # static mount moved into this block so there is ONE conditional for all web-UI
-    # registrations that appear before the API routes.  (The /logs/stream route has
-    # its own block below because it lives after the /blobs routes in the file.)
-    app.mount("/static", StaticFiles(directory=_WEB_DIR / "static"), name="static")
-
-    @app.get("/", response_class=HTMLResponse)
-    async def index() -> FileResponse:
-        return FileResponse(_WEB_DIR / "index.html")
-
-    @app.get("/dashboard", response_class=HTMLResponse)
-    async def dashboard() -> FileResponse:
-        return FileResponse(_WEB_DIR / "dashboard.html")
 
 
 # ---------------------------------------------------------------------------
@@ -737,45 +757,6 @@ async def get_blob(session_id: str, key: str) -> JSONResponse:
     return JSONResponse(content=content)
 
 
-if _settings.web_ui_enabled:
-    # /logs/stream is web-UI only — the dashboard consumes it.  When web_ui_enabled=False
-    # this route is absent (→ 404) and the path is not in _EXEMPT_PATHS_API_ONLY, so any
-    # unauthenticated request is gated by the middleware (→ 401).
-    @app.get("/logs/stream")
-    async def stream_logs(request: Request) -> StreamingResponse:
-        """Stream server log lines as Server-Sent Events."""
-        log_path = Path(_settings.log_path)
-
-        async def event_generator() -> AsyncGenerator[str, None]:
-            # Backfill last 200 lines (skip if log file does not yet exist)
-            if log_path.exists():
-                for line in log_path.read_text().splitlines()[-200:]:
-                    yield f"data: {line}\n\n"
-
-            # Tail new lines (return early if log file still does not exist)
-            if not log_path.exists():
-                return
-            async with aiofiles.open(log_path, mode="r") as f:
-                await f.seek(0, 2)
-                while True:
-                    if await request.is_disconnected():
-                        break
-                    line = await f.readline()
-                    if not line:
-                        await asyncio.sleep(0.2)
-                    else:
-                        yield f"data: {line.rstrip()}\n\n"
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
-        )
-
-
 @app.post("/cypher", dependencies=[Depends(require_read)])
 async def post_cypher(body: CypherRequest, request: Request) -> Response:
     """Proxy a Cypher query to Neo4j and return the results as JSON."""
@@ -798,9 +779,48 @@ async def post_cypher(body: CypherRequest, request: Request) -> Response:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-def main() -> None:
-    """CLI entrypoint."""
-    run()
+def main(argv: list[str] | None = None) -> None:
+    """CLI entrypoint.
+
+    INVARIANT: no subcommand (or the explicit ``serve`` subcommand) starts the
+    ingestion server. This MUST hold because the systemd unit (and the
+    macOS launchd agent) invoke the bare console script
+    ``context-intelligence-server`` with NO arguments -- that call dispatches
+    to ``serve`` unchanged.
+
+    ``doctor [--fix]`` diagnoses (and, with ``--fix``, repairs) Neo4j graph
+    health -- the two O(graph-size) migration scans (dedup + :Node backfill)
+    that used to run unconditionally at cold start now live ONLY here, never
+    on server boot. See ``context_intelligence_server.doctor``.
+    """
+    parser = argparse.ArgumentParser(prog="context-intelligence-server")
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("serve", help="Start the ingestion server (default).")
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="Diagnose (and optionally repair) Neo4j graph health."
+    )
+    doctor_parser.add_argument(
+        "--fix",
+        action="store_true",
+        help=(
+            "Repair detected issues (duplicate-node dedup + :Node label "
+            "backfill) instead of reporting only."
+        ),
+    )
+
+    args = parser.parse_args(argv)
+
+    if args.command in (None, "serve"):
+        run()
+        return
+
+    # Deferred import: doctor.py imports build_neo4j_driver back from this
+    # module, so importing it at module load time (rather than here, inside
+    # main()) would be a circular import at import time. By the time main()
+    # runs, this module has already finished executing top-to-bottom.
+    from context_intelligence_server import doctor as _doctor
+
+    sys.exit(asyncio.run(_doctor.run_doctor(fix=args.fix)))
 
 
 def _effective_worker_count() -> int:
