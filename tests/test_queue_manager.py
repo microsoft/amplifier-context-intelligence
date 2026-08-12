@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
-
 from context_intelligence_server.queue_manager import Batch, QueueManager
 
 
@@ -136,7 +136,7 @@ async def test_commit_advances_offset(qm):
     await qm.append("s1", b"a")
     await qm.append("s1", b"b")
     first = await qm.read_batch("s1", max_items=1)
-    await qm.commit("s1", first.end_offset)
+    await qm.commit("s1", first.end_offset, None)
     await qm.append("s1", b"c")
     second = await qm.read_batch("s1", max_items=10)
     assert second.lines == [b"b", b"c"]
@@ -149,7 +149,7 @@ async def test_commit_persists_across_a_new_instance(tmp_path):
     await qm1.append("s1", b"a")
     await qm1.append("s1", b"b")
     batch = await qm1.read_batch("s1", max_items=1)
-    await qm1.commit("s1", batch.end_offset)
+    await qm1.commit("s1", batch.end_offset, None)
     qm2 = QueueManager(queues_dir=qdir)  # simulate restart
     resumed = await qm2.read_batch("s1", max_items=10)
     assert resumed.lines == [b"b"]
@@ -157,9 +157,12 @@ async def test_commit_persists_across_a_new_instance(tmp_path):
 
 async def test_commit_is_atomic_no_temp_leftover(qm, tmp_path):
     await qm.append("s1", b"a")
-    await qm.commit("s1", 2)
+    await qm.commit("s1", 2, None)
     qdir = tmp_path / "queues"
-    assert (qdir / "s1.offset").read_text("utf-8") == "2"
+    # I5b: .offset is now a single JSON record {"v":1,"offset":...,"cursor":...}
+    # rather than a bare integer -- see queue_manager.py module docstring.
+    record = json.loads((qdir / "s1.offset").read_text("utf-8"))
+    assert record == {"v": 1, "offset": 2, "cursor": None}
     assert list(qdir.glob("*.tmp")) == []
 
 
@@ -167,7 +170,7 @@ async def test_active_sessions_excludes_fully_committed(qm):
     await qm.append("s_active", b"x")  # appended, never committed -> undrained
     await qm.append("s_done", b"y")
     done = await qm.read_batch("s_done", max_items=10)
-    await qm.commit("s_done", done.end_offset)  # drained
+    await qm.commit("s_done", done.end_offset, None)  # drained
     active = await qm.active_sessions()
     assert active == ["s_active"]
 
@@ -180,7 +183,7 @@ async def test_recover_reports_session_with_uncommitted_complete_line(qm, tmp_pa
     log = tmp_path / "queues" / "s1.log"
     log.write_bytes(b"a\nb\nTORN")  # two complete lines + torn tail
     assert await qm.recover() == ["s1"]
-    await qm.commit("s1", 4)  # past 'a\nb\n' == 4 bytes
+    await qm.commit("s1", 4, None)  # past 'a\nb\n' == 4 bytes
     assert await qm.recover() == []  # only torn tail remains -> not recoverable
 
 
@@ -211,7 +214,7 @@ async def test_read_batch_rejects_unsafe_session_id(qm, bad_id):
 @pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])
 async def test_commit_rejects_unsafe_session_id(qm, bad_id):
     with pytest.raises(ValueError):
-        await qm.commit(bad_id, 0)
+        await qm.commit(bad_id, 0, None)
 
 
 @pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])
@@ -231,7 +234,7 @@ async def test_delete_drained_removes_log_and_offset_keeps_dead(tmp_path) -> Non
 
     qm = QueueManager(queues_dir=tmp_path)
     await qm.append("s", b"line")
-    await qm.commit("s", 5)
+    await qm.commit("s", 5, None)
     await qm.dead_letter("s", b"bad\n", "boom")
 
     await qm.delete_drained("s")
@@ -325,7 +328,7 @@ async def test_recovery_seed_counts_pending_and_committed(qm):
     await qm.append("s1", b"a")
     await qm.append("s1", b"b")
     await qm.append("s1", b"c")
-    await qm.commit("s1", 4)  # commit the first two complete lines
+    await qm.commit("s1", 4, None)  # commit the first two complete lines
 
     accepted, written = await qm.recovery_seed_counts()
 
@@ -336,7 +339,7 @@ async def test_recovery_seed_counts_pending_and_committed(qm):
 async def test_recovery_seed_counts_committed_includes_dead(qm):
     # C=1 committed, P=0 pending, D=1 dead. before-dead == 0.
     await qm.append("s2", b"a")
-    await qm.commit("s2", 2)
+    await qm.commit("s2", 2, None)
     await qm.dead_letter("s2", b"a", error="boom")
 
     accepted, written = await qm.recovery_seed_counts()
@@ -360,10 +363,10 @@ async def test_recovery_seed_counts_residual_is_zero_mixed_shape(qm):
     await qm.append("a", b"1")
     await qm.append("a", b"2")
     await qm.append("a", b"3")
-    await qm.commit("a", 4)
+    await qm.commit("a", 4, None)
     # Key B: 1 committed + 1 dead.
     await qm.append("b", b"x")
-    await qm.commit("b", 2)
+    await qm.commit("b", 2, None)
     await qm.dead_letter("b", b"x", error="boom")
     # Key C: dead-only (log reclaimed).
     await qm.dead_letter("c", b"poison", error="boom")
@@ -453,7 +456,7 @@ async def test_recovery_seed_counts_replay_window_residual_zero(qm):
     # log = [line0 committed][line0 re-appended pending]. C=1, P=1, D=1.
     # The re-appended line is absorbed into accepted_seed (counted in P and D).
     await qm.append("s6", b"a")
-    await qm.commit("s6", 2)
+    await qm.commit("s6", 2, None)
     await qm.dead_letter("s6", b"a", error="boom")
     await qm.append("s6", b"a")  # re-append the dead line for replay
 

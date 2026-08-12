@@ -36,6 +36,18 @@ class IterationHandler:
     def __init__(self, services: HookStateService) -> None:
         self.services = services
 
+    def _current_iteration_scope(self) -> str:
+        """The additive 'run' | 'unscoped' discriminator (D6), sourced from the
+        SAME cursor field (``execution_start_ts``) used to decide the node_id
+        shape. A single source of truth so all three upsert_node call sites
+        (provider:request, llm:request, llm:response) always agree.
+        """
+        return (
+            "run"
+            if self.services.data_layer_2.execution_start_ts is not None
+            else "unscoped"
+        )
+
     async def __call__(self, event: str, data: dict[str, Any]) -> HookResult:
         """Dispatch to the appropriate sub-handler.
 
@@ -99,6 +111,21 @@ class IterationHandler:
         # Set cursor so llm:request and llm:response can find this iteration
         self.services.data_layer_2.active_iteration_id = iteration_id
 
+        # D6: additive, queryable discriminator between a run-scoped iteration
+        # and a legitimate loop-basic session with no active orchestrator run.
+        # Bare shape != state-lost; see the module/method docstrings.
+        iteration_scope = self._current_iteration_scope()
+        if iteration_scope == "unscoped":
+            # INFO (not WARNING, spec §10.4): a loop-basic session with no
+            # execution:start is a normal case, not an alert-worthy anomaly.
+            logger.info(
+                "unscoped_iteration_emitted session=%s iteration_number=%d iteration_id=%s",
+                session_id,
+                iteration_number,
+                iteration_id,
+                extra={"session_id": session_id},
+            )
+
         # Create the Iteration node
         await self.services.graph.upsert_node(
             iteration_id,
@@ -107,6 +134,7 @@ class IterationHandler:
                 "session_id": session_id,
                 "iteration_number": iteration_number,
                 "started_at": timestamp,
+                "iteration_scope": iteration_scope,
             },
         )
 
@@ -144,6 +172,12 @@ class IterationHandler:
                 "model": data.get("model"),
                 "message_count": data.get("message_count"),
                 "has_system": data.get("has_system"),
+                # BLOCKER-2: stamp independently of provider:request's own
+                # write -- an Iteration node must never be created/updated
+                # without a scope value, even if this write is the first one
+                # to ever reach the node (e.g. a dead-lettered provider:request
+                # whose cursor mutation nonetheless survived).
+                "iteration_scope": self._current_iteration_scope(),
             },
         )
 
@@ -174,6 +208,9 @@ class IterationHandler:
                 "usage_input": usage.get("input_tokens"),
                 "usage_output": usage.get("output_tokens"),
                 "usage_cache_write": usage.get("cache_creation_input_tokens"),
+                # BLOCKER-2: see _handle_llm_request -- same completeness
+                # rationale applies to this, the third of the three sites.
+                "iteration_scope": self._current_iteration_scope(),
             },
         )
 

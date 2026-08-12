@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import fnmatch
 import logging
+from dataclasses import asdict
 from datetime import datetime
 from typing import Any
 
@@ -397,3 +399,58 @@ class HookStateService:
                 timestamp,
                 exc_info=True,
             )
+
+    # ------------------------------------------------------------------
+    # Durable cursor (I5b: worker-rebuild cursor durability)
+    # ------------------------------------------------------------------
+
+    def snapshot_cursor(self) -> dict[str, Any]:
+        """Return a JSON-safe snapshot of cross-handler cursor state.
+
+        Full snapshot of ``data_layer_2``/``data_layer_3`` (not a hand-picked
+        subset): every field on those dataclasses is JSON-native, and taking
+        the whole dataclass via ``asdict`` is both simpler and safer than a
+        hand-maintained allowlist that silently misses new fields.
+        """
+        return {
+            "dl2": asdict(self.data_layer_2),
+            "dl3": asdict(self.data_layer_3),
+        }
+
+    def restore_cursor(self, record: dict[str, Any] | None) -> None:
+        """Restore cross-handler cursor state from a persisted snapshot.
+
+        No-op on ``record is None`` (nothing to restore \u2014 e.g. a brand-new
+        session, or a legacy ``.offset`` file with no cursor).  Otherwise,
+        for each of ``data_layer_2``/``data_layer_3``, only the field NAMES
+        present on the current dataclass are assigned \u2014 unknown/renamed keys
+        in the record are dropped, and any field missing from the record
+        keeps its dataclass default.  This field-name filtering (rather than
+        a fixed schema) is what lets the persisted format tolerate dataclass
+        evolution in both directions without a version bump.
+
+        Safe-degrade (D5): any failure while restoring is caught, logged at
+        WARNING, and leaves the dataclasses at their defaults \u2014 a corrupt or
+        unexpected cursor must never crash boot.
+        """
+        if record is None:
+            return
+        try:
+            for key, target in (
+                ("dl2", self.data_layer_2),
+                ("dl3", self.data_layer_3),
+            ):
+                value = record.get(key)
+                if not isinstance(value, dict):
+                    continue
+                valid_fields = {f.name for f in dataclasses.fields(type(target))}
+                for field_name, field_value in value.items():
+                    if field_name in valid_fields:
+                        setattr(target, field_name, field_value)
+            logger.debug(
+                "cursor_restored iteration_count=%s execution_start_ts=%s",
+                self.data_layer_2.iteration_count,
+                self.data_layer_2.execution_start_ts,
+            )
+        except Exception:
+            logger.warning("cursor_restore_failed", exc_info=True)

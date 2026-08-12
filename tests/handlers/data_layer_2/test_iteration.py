@@ -21,10 +21,11 @@ Covers:
 
 from __future__ import annotations
 
+import logging
+
 from context_intelligence_server.handlers.data_layer_2.iteration import IterationHandler
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.utils import make_node_id
-
 
 # ---------------------------------------------------------------------------
 # 1. TestIterationHandlerHandledEvents
@@ -712,4 +713,173 @@ class TestIterationSourcedFrom:
         )
         assert edge.get("type") == "SOURCED_FROM", (
             f"Edge type must be 'SOURCED_FROM'. Got: {edge.get('type')!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TC-10 / BLOCKER-2 -- iteration_scope completeness (spec §10.1, §10.4)
+#
+# The Iteration node is upsert_node'd from THREE sites: provider:request,
+# llm:request, llm:response. Each site stamps the additive 'iteration_scope'
+# ('run' | 'unscoped') property independently, sourced from the SAME cursor
+# field (execution_start_ts) -- so a node can never be created/updated
+# without a scope value, regardless of which of the three sites happens to
+# be the one that actually writes it (e.g. a dead-lettered provider:request
+# whose active_iteration_id mutation nonetheless survives to a later
+# llm:request/llm:response).
+# ---------------------------------------------------------------------------
+
+
+class TestIterationScopeCompleteness:
+    """iteration_scope stamped at ALL THREE upsert_node call sites."""
+
+    async def test_provider_request_unscoped_with_no_execution_start(
+        self, services: HookStateService
+    ) -> None:
+        """TC-10: provider:request with NO preceding execution:start ->
+        iteration_scope == 'unscoped'."""
+        assert services.data_layer_2.execution_start_ts is None
+        handler = IterationHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+        node = await services.graph.get_node("s1::iteration::1")
+        assert node is not None
+        assert node.get("iteration_scope") == "unscoped", (
+            f"Expected iteration_scope='unscoped'. Got: {node!r}"
+        )
+
+    async def test_provider_request_run_scoped_with_execution_start(
+        self, services: HookStateService
+    ) -> None:
+        """TC-10: a normal (execution:start already seen) run stamps 'run'."""
+        services.data_layer_2.execution_start_ts = "2026-01-01T00:00:00Z"
+        handler = IterationHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:01Z"},
+        )
+        node_id = "s1::orch_run::2026-01-01T00:00:00Z::iteration::1"
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert node.get("iteration_scope") == "run", (
+            f"Expected iteration_scope='run'. Got: {node!r}"
+        )
+
+    async def test_unscoped_emitted_log_is_info_not_warning(
+        self, services: HookStateService, caplog
+    ) -> None:
+        """Spec §10.4: the D6 log line for an unscoped iteration must be
+        INFO (or rate-limited), NEVER WARNING -- a loop-basic unscoped
+        session is a normal case, not an alert-worthy anomaly."""
+        handler = IterationHandler(services)
+        with caplog.at_level(
+            logging.INFO,
+            logger="context_intelligence_server.handlers.data_layer_2.iteration",
+        ):
+            await handler(
+                "provider:request",
+                {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+            )
+        unscoped_records = [
+            r for r in caplog.records if "unscoped_iteration_emitted" in r.message
+        ]
+        assert unscoped_records, (
+            "expected an 'unscoped_iteration_emitted' log record to be emitted"
+        )
+        assert all(r.levelno == logging.INFO for r in unscoped_records), (
+            "unscoped_iteration_emitted must log at INFO, got levels: "
+            f"{[r.levelname for r in unscoped_records]}"
+        )
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records), (
+            "no WARNING (or higher) should be emitted for a normal unscoped iteration"
+        )
+
+    async def test_llm_request_stamps_unscoped_independent_of_provider_request(
+        self, services: HookStateService
+    ) -> None:
+        """BLOCKER-2's completeness gap: llm:request must stamp iteration_scope
+        on its OWN upsert_node call, even when the node was never created by
+        provider:request (e.g. a dead-lettered provider:request whose
+        active_iteration_id cursor mutation nonetheless survives). Simulated
+        here by setting the cursor directly, bypassing provider:request."""
+        services.data_layer_2.active_iteration_id = "s1::iteration::99"
+        handler = IterationHandler(services)
+        await handler(
+            "llm:request",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "provider": "anthropic",
+                "model": "claude",
+            },
+        )
+        node = await services.graph.get_node("s1::iteration::99")
+        assert node is not None
+        assert node.get("iteration_scope") == "unscoped", (
+            f"llm:request must stamp iteration_scope='unscoped'. Got: {node!r}"
+        )
+
+    async def test_llm_request_stamps_run_scope_when_execution_start_ts_set(
+        self, services: HookStateService
+    ) -> None:
+        services.data_layer_2.execution_start_ts = "2026-01-01T00:00:00Z"
+        node_id = "s1::orch_run::2026-01-01T00:00:00Z::iteration::1"
+        services.data_layer_2.active_iteration_id = node_id
+        handler = IterationHandler(services)
+        await handler(
+            "llm:request",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "provider": "anthropic",
+                "model": "claude",
+            },
+        )
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert node.get("iteration_scope") == "run", (
+            f"llm:request must stamp iteration_scope='run'. Got: {node!r}"
+        )
+
+    async def test_llm_response_stamps_unscoped_independent_of_provider_request(
+        self, services: HookStateService
+    ) -> None:
+        """Same completeness gap as llm:request, for the third site."""
+        services.data_layer_2.active_iteration_id = "s1::iteration::99"
+        handler = IterationHandler(services)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+        node = await services.graph.get_node("s1::iteration::99")
+        assert node is not None
+        assert node.get("iteration_scope") == "unscoped", (
+            f"llm:response must stamp iteration_scope='unscoped'. Got: {node!r}"
+        )
+
+    async def test_llm_response_stamps_run_scope_when_execution_start_ts_set(
+        self, services: HookStateService
+    ) -> None:
+        services.data_layer_2.execution_start_ts = "2026-01-01T00:00:00Z"
+        node_id = "s1::orch_run::2026-01-01T00:00:00Z::iteration::1"
+        services.data_layer_2.active_iteration_id = node_id
+        handler = IterationHandler(services)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert node.get("iteration_scope") == "run", (
+            f"llm:response must stamp iteration_scope='run'. Got: {node!r}"
         )

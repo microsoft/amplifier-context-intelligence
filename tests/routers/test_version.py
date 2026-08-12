@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from context_intelligence_server.status import SERVER_VERSION
+from context_intelligence_server.status import SCHEMA_VERSION, SERVER_VERSION
 
 
 class TestGetVersion200:
@@ -36,6 +36,32 @@ class TestGetVersion200:
         response = await client.get("/version")
         data = response.json()
         assert data["version"] == SERVER_VERSION
+
+    @pytest.mark.anyio
+    async def test_returns_schema_version_field(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        response = await client.get("/version")
+        data = response.json()
+        assert "schema_version" in data
+
+    @pytest.mark.anyio
+    async def test_schema_version_matches_constant(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        response = await client.get("/version")
+        data = response.json()
+        assert data["schema_version"] == SCHEMA_VERSION
+
+
+class TestSchemaVersionConstant:
+    """SCHEMA_VERSION is a plain integer baseline data point (§10.2)."""
+
+    def test_schema_version_is_int(self) -> None:
+        assert isinstance(SCHEMA_VERSION, int)
+
+    def test_schema_version_initial_value(self) -> None:
+        assert SCHEMA_VERSION == 1
 
 
 class TestGetVersionNoAuth:
