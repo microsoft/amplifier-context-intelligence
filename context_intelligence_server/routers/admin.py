@@ -430,6 +430,72 @@ def _collect_blob_refs(obj: Any, out: set[str]) -> None:
             _collect_blob_refs(item, out)
 
 
+# Reference-scan hardening (docs/plans/2026-08-12-blob-reclaim-reference-scan-
+# hardening.md): the known node properties that can carry a "ci-blob://"
+# token anywhere in the graph, keyed to the property name Cypher matches on.
+#
+# ASSUMPTION -- make it explicit + greppable: the reference scan is scoped to
+# EXACTLY these properties, not an all-property-all-node walk, for
+# performance (a per-property UNION lets Neo4j evaluate ONE property per row
+# instead of toString()-ing every key of every node -- this codebase has
+# scar tissue from a 1.3M-node AllNodesScan stall). Adding a NEW ci-blob
+# carrier property in the future (a new field-lifter, a new enricher
+# property, etc.) REQUIRES adding it to this tuple -- otherwise the reclaim
+# GC will not see refs stored there and could misclassify a live blob as an
+# orphan. Covers every carrier in the hardening doc's table:
+#   data        -- *Event.data (all 14 event types)
+#   tool_input  -- ToolPreEvent/ToolPostEvent.tool_input (L1), ToolCall.tool_input (L2)
+#   prompt      -- PromptSubmitEvent/PromptCompleteEvent.prompt (L1), Prompt.prompt (L2)
+#   response    -- OrchestratorRun.response (L2)
+_BLOB_REF_CARRIER_PROPERTIES: tuple[str, ...] = (
+    "data",
+    "tool_input",
+    "prompt",
+    "response",
+)
+
+# Fallback extraction for carrier values that are NOT valid JSON (a bare
+# string property, e.g. a plain-string tool_input/prompt that itself
+# contains a ci-blob:// URI rather than the {"$blob_ref": "..."} wrapper).
+# Safe here -- unlike a regex over a JSON-*serialized* string (see the B2
+# docstring above) -- because these values are already fully-decoded Neo4j
+# property strings with no JSON escaping left to trip over.
+_BARE_BLOB_URI_RE = re.compile(r'ci-blob://[^"\s]+')
+
+
+def _extract_blob_refs_from_value(val: str, out: set[str]) -> None:
+    """Extract every ``ci-blob://`` URI referenced by one carrier property value.
+
+    Two extraction paths, unioned into *out*:
+
+    1. **Structural (preferred):** ``json.loads(val)`` then recurse with
+       :func:`_collect_blob_refs`. Handles the ``{"$blob_ref": "..."}``
+       JSON-string carriers -- ``neo4j_store._sanitize_properties``
+       JSON-serializes any dict/list property value on write, so
+       ``Event.data``, ``ToolCall.tool_input``, ``Prompt.prompt``, and
+       ``OrchestratorRun.response`` all round-trip through this path when
+       they hold a dict/list.
+    2. **Regex fallback (only on JSON-parse failure):** a plain-string
+       carrier is written through VERBATIM (``_sanitize_properties`` only
+       JSON-serializes dict/list values -- a bare string is stored as-is),
+       so it is never valid JSON and always lands here. Extracts every bare
+       ``ci-blob://[^"\\s]+`` token directly from the decoded string --
+       covers a lifted ``*.tool_input``/``*.prompt`` property that is a
+       plain string mentioning a blob URI.
+
+    A value that is neither valid JSON nor contains a bare token contributes
+    nothing -- this can only ever fail to positively assert a reference,
+    never falsely assert one, matching the conservative-skip contract of
+    :func:`_scan_referenced_uris`.
+    """
+    try:
+        obj = json.loads(val)
+    except (TypeError, ValueError):
+        out.update(_BARE_BLOB_URI_RE.findall(val))
+        return
+    _collect_blob_refs(obj, out)
+
+
 async def _scan_referenced_uris(request: Request) -> set[str]:
     """Enumerate every ``ci-blob://`` URI referenced anywhere in the graph.
 
@@ -438,48 +504,80 @@ async def _scan_referenced_uris(request: Request) -> set[str]:
     (node_id, workspace)-scoped, so a per-workspace scan could delete another
     workspace's live data.
 
-    B1 (council amendment): the scan enumerates ``:Event.data`` only. This is
-    the complete reference carrier by pipeline ordering, not by contract --
-    ``DefaultHandler`` (handlers/data_layer_1/default.py) fires on EVERY
-    unclaimed event and stores the full ``data`` (including ``tool_input``
-    and any ``$blob_ref`` already written by ``blob_processor.py``) as
-    ``json.dumps(data)`` on ``:Event.data`` BEFORE any field-lifter runs and
-    strips/promotes individual fields. See
+    Reference-scan hardening (docs/plans/2026-08-12-blob-reclaim-reference-
+    scan-hardening.md): the referenced set is computed GRAPH-WIDE over the
+    known ``ci-blob://`` carrier properties (:data:`_BLOB_REF_CARRIER_PROPERTIES`
+    -- ``data``, ``tool_input``, ``prompt``, ``response``), not ``Event.data``
+    only. This makes the scan correct BY CONSTRUCTION -- a strict superset of
+    the prior ``Event.data``-only scan -- rather than resting on the
+    (empirically true today, but unenforced) pipeline-ordering invariant that
+    ``DefaultHandler`` always persists every ref onto ``Event.data`` before any
+    field-lifter/enricher can strip or promote it elsewhere. Widening the scan
+    can only ever *protect* more blobs, never delete more: any URI the old
+    scan found is still found here (still scanned via the ``data`` branch),
+    plus any URI that lives ONLY on ``tool_input``/``prompt``/``response`` is
+    now ALSO found. See
     ``tests/neo4j/test_blob_reclaim.py::test_b1_event_data_carries_every_blob_ref``
-    for the regression test that pins this invariant.
+    for the regression test that continues to pin the pipeline-ordering
+    invariant (belt-and-suspenders now, not the sole safety net), and the
+    ``test_*_only_referenced_via_*`` tests alongside it that pin the new
+    per-property carriers directly.
 
-    B2 (council amendment): APOC is NOT used here (removed entirely, no
-    dual-path). Each matching row's ``data`` is ``json.loads``-ed and walked
-    structurally by :func:`_collect_blob_refs`. A malformed/non-JSON ``data``
-    value is logged and skipped conservatively -- it can never positively
-    assert an orphan, only fail to positively assert a reference.
+    Query shape (performance-critical -- see :data:`_BLOB_REF_CARRIER_PROPERTIES`):
+    a ``UNION ALL`` of four single-property predicates, each touching exactly
+    ONE property per row (``data`` restricted to ``:Event``, matching the
+    prior scan's scope for that carrier; the other three unrestricted across
+    labels since ToolCall/Prompt/OrchestratorRun are ordinary nodes). This
+    avoids a pathological ``MATCH (n) ... [k IN keys(n) WHERE toString(n[k])
+    ...]`` all-property-all-node walk, which would toString() every key of
+    every node in the graph -- this codebase has scar tissue from exactly
+    that shape of full scan (a 1.3M-node AllNodesScan stall). ``UNION ALL``
+    (not plain ``UNION``) is deliberate: plain ``UNION``'s implicit DISTINCT
+    would force Neo4j to materialize and dedupe every row before returning
+    the first one, defeating streaming; the Python ``set`` below already
+    dedupes, so ``UNION ALL`` costs nothing and preserves the stream.
+
+    B2 (council amendment, retained): no APOC. Each returned value is
+    extracted via :func:`_extract_blob_refs_from_value` (structural
+    ``json.loads`` + recursive walk, falling back to a bare-token regex only
+    on JSON-parse failure -- see that function's docstring for why the regex
+    path is safe here and was NOT safe for the original ``Event.data`` scan).
+    A malformed/unparseable value is skipped conservatively -- it can never
+    positively assert an orphan, only fail to positively assert a reference.
 
     Streams rows via the async driver iterator rather than materializing all
-    ``data`` strings at once (only the resulting, much smaller, URI set is
-    retained), per the design's "bound its own work" cost note.
+    carrier-property strings at once (only the resulting, much smaller, URI
+    set is retained), per the design's "bound its own work" cost note.
     """
     driver = request.app.state.neo4j_query_driver
     access_mode = _access_mode_const(request.app.state.neo4j_query_access_mode)
     referenced: set[str] = set()
     async with driver.session(default_access_mode=access_mode) as session:
-        # B1: :Event.data is scanned because DefaultHandler persists the full
-        # event data (all $blob_ref values, pre-field-lifting) on every
-        # unclaimed event -- see the docstring above.
+        # Graph-wide, per-property UNION ALL -- see the docstring above for
+        # why this shape (not an all-property walk, not plain UNION).
         result = await session.run(
-            "MATCH (n:Event) WHERE n.data CONTAINS 'ci-blob://' RETURN n.data AS data"
+            "MATCH (n:Event) WHERE n.data CONTAINS 'ci-blob://' "
+            "RETURN n.data AS val "
+            "UNION ALL "
+            "MATCH (n) WHERE n.tool_input IS NOT NULL "
+            "AND toString(n.tool_input) CONTAINS 'ci-blob://' "
+            "RETURN toString(n.tool_input) AS val "
+            "UNION ALL "
+            "MATCH (n) WHERE n.prompt IS NOT NULL "
+            "AND toString(n.prompt) CONTAINS 'ci-blob://' "
+            "RETURN toString(n.prompt) AS val "
+            "UNION ALL "
+            "MATCH (n) WHERE n.response IS NOT NULL "
+            "AND toString(n.response) CONTAINS 'ci-blob://' "
+            "RETURN toString(n.response) AS val"
         )
         async for record in result:
-            data_str = record["data"]
-            try:
-                obj = json.loads(data_str)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "blob_reclaim: unparseable Event.data encountered during "
-                    "reference scan -- skipped conservatively (never causes "
-                    "a delete, may only miss a reference)"
-                )
+            val = record["val"]
+            if not isinstance(val, str):
+                # toString() on a non-null value is always a str; this guards
+                # conservatively against an unexpected driver type mapping.
                 continue
-            _collect_blob_refs(obj, referenced)
+            _extract_blob_refs_from_value(val, referenced)
     return referenced
 
 
