@@ -2078,6 +2078,14 @@ class TestClassifyMatrix:
     remove, because by the time a node reaches one of those states its
     StubSession marker has already been cleared by the transition that
     got it there.
+
+    "IncompleteSession" heal-forward: EVERY start/fork cell (including the
+    former pure no-ops) now also removes "IncompleteSession" — see
+    _heal_forward() in session.py. A node may carry a stale IncompleteSession
+    marker from an earlier out-of-order session:end regardless of which
+    start/fork branch it reaches, so every start/fork transition strips it.
+    The end/None cells are unchanged — session:end still stamps
+    IncompleteSession when genuinely no type is known at end.
     """
 
     CASES: list[tuple[str, str | None, bool, list[str], list[str]]] = [
@@ -2085,78 +2093,78 @@ class TestClassifyMatrix:
         # ------------------------------------------------------------------
         # event=start
         # ------------------------------------------------------------------
-        ("start", "ForkedSession", True, [], []),
-        ("start", "ForkedSession", False, [], []),
-        ("start", "SubSession", True, [], []),
-        ("start", "SubSession", False, [], []),
-        ("start", "RootSession", False, [], []),
+        ("start", "ForkedSession", True, [], ["IncompleteSession"]),
+        ("start", "ForkedSession", False, [], ["IncompleteSession"]),
+        ("start", "SubSession", True, [], ["IncompleteSession"]),
+        ("start", "SubSession", False, [], ["IncompleteSession"]),
+        ("start", "RootSession", False, [], ["IncompleteSession"]),
         (
             "start",
             "RootSession",
             True,
             ["SubSession", "SST_EVENT"],
-            ["RootSession", "StubSession"],
+            ["RootSession", "StubSession", "IncompleteSession"],
         ),
         (
             "start",
             None,
             True,
             ["Session", "SubSession", "SST_EVENT"],
-            ["StubSession"],
+            ["StubSession", "IncompleteSession"],
         ),
         (
             "start",
             None,
             False,
             ["RootSession", "Session", "SST_EVENT"],
-            ["StubSession"],
+            ["StubSession", "IncompleteSession"],
         ),
         # ------------------------------------------------------------------
         # event=fork
         # ------------------------------------------------------------------
-        ("fork", "ForkedSession", True, [], []),
-        ("fork", "ForkedSession", False, [], []),
+        ("fork", "ForkedSession", True, [], ["IncompleteSession"]),
+        ("fork", "ForkedSession", False, [], ["IncompleteSession"]),
         (
             "fork",
             "RootSession",
             True,
             ["ForkedSession", "SST_EVENT"],
-            ["RootSession", "StubSession"],
+            ["RootSession", "StubSession", "IncompleteSession"],
         ),
         (
             "fork",
             "RootSession",
             False,
             ["ForkedSession", "SST_EVENT"],
-            ["RootSession", "StubSession"],
+            ["RootSession", "StubSession", "IncompleteSession"],
         ),
         (
             "fork",
             "SubSession",
             True,
             ["ForkedSession", "SST_EVENT"],
-            ["SubSession", "StubSession"],
+            ["SubSession", "StubSession", "IncompleteSession"],
         ),
         (
             "fork",
             "SubSession",
             False,
             ["ForkedSession", "SST_EVENT"],
-            ["SubSession", "StubSession"],
+            ["SubSession", "StubSession", "IncompleteSession"],
         ),
         (
             "fork",
             None,
             True,
             ["Session", "ForkedSession", "SST_EVENT"],
-            ["StubSession"],
+            ["StubSession", "IncompleteSession"],
         ),
         (
             "fork",
             None,
             False,
             ["Session", "ForkedSession", "SST_EVENT"],
-            ["StubSession"],
+            ["StubSession", "IncompleteSession"],
         ),
         # ------------------------------------------------------------------
         # event=end
@@ -2165,7 +2173,8 @@ class TestClassifyMatrix:
         # not a fabricated Root/Sub terminal.  has_parent is irrelevant here —
         # the server never guesses; it marks and surfaces the health signal.
         # IncompleteSession is a confirmed (if incomplete) terminal, so
-        # StubSession is cleared here too.
+        # StubSession is cleared here too.  UNCHANGED by heal-forward: end is
+        # not a start/fork transition.
         ("end", None, True, ["IncompleteSession", "SST_EVENT"], ["StubSession"]),
         ("end", None, False, ["IncompleteSession", "SST_EVENT"], ["StubSession"]),
         ("end", "RootSession", True, [], []),
@@ -2881,4 +2890,128 @@ class TestIncompleteSessionMarker:
         assert _current_type(labels) is None, (
             "_current_type must ignore IncompleteSession and return None, "
             "so a late start/fork can still classify the session normally"
+        )
+
+    # -----------------------------------------------------------------------
+    # Heal-forward: out-of-order end -> fork/start race
+    #
+    # A forked sub-session's session:end can drain, in an independent queue,
+    # BEFORE its session:fork/session:start.  classify() sees current_type=None
+    # at end -> stamps IncompleteSession.  When the real fork/start is then
+    # processed, it must strip the stale marker (heal-forward), leaving the
+    # node with ONLY the real terminal label.  See
+    # docs/issues/incomplete-session-mislabeling.md and
+    # docs/plans/2026-08-12-incomplete-session-relabel-spec.md.
+    # -----------------------------------------------------------------------
+
+    async def test_out_of_order_end_then_fork_heals_incomplete_session(
+        self, services: HookStateService
+    ) -> None:
+        """end processed BEFORE fork: stale IncompleteSession must be stripped
+        the moment the real session:fork arrives, leaving ForkedSession only.
+        """
+        handler = SessionHandler(services)
+
+        # session:end drains first (simulating the cross-queue race) — stamps
+        # IncompleteSession on the bare node.
+        await handler(
+            "session:end",
+            {"session_id": "s-race-fork", "timestamp": "2026-01-01T01:00:00Z"},
+        )
+        node = await services.graph.get_node("s-race-fork")
+        assert node is not None
+        assert "IncompleteSession" in node["labels"], (
+            "Precondition: out-of-order end must stamp the stale marker"
+        )
+
+        # The real session:fork arrives late.
+        await handler(
+            "session:fork",
+            {
+                "session_id": "s-race-fork",
+                "parent_id": "p-race",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+
+        node = await services.graph.get_node("s-race-fork")
+        assert node is not None
+        labels = node["labels"]
+        assert "ForkedSession" in labels, "Real terminal must be assigned by fork"
+        assert "IncompleteSession" not in labels, (
+            "Heal-forward: session:fork must strip the stale IncompleteSession "
+            "marker left by the out-of-order session:end"
+        )
+
+    async def test_out_of_order_end_then_start_heals_incomplete_session(
+        self, services: HookStateService
+    ) -> None:
+        """end processed BEFORE start (no parent): stale IncompleteSession must
+        be stripped the moment the real session:start arrives, leaving
+        RootSession only.
+        """
+        handler = SessionHandler(services)
+
+        await handler(
+            "session:end",
+            {"session_id": "s-race-root", "timestamp": "2026-01-01T01:00:00Z"},
+        )
+        node = await services.graph.get_node("s-race-root")
+        assert node is not None
+        assert "IncompleteSession" in node["labels"], (
+            "Precondition: out-of-order end must stamp the stale marker"
+        )
+
+        await handler(
+            "session:start",
+            {"session_id": "s-race-root", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+
+        node = await services.graph.get_node("s-race-root")
+        assert node is not None
+        labels = node["labels"]
+        assert "RootSession" in labels, "Real terminal must be assigned by start"
+        assert "IncompleteSession" not in labels, (
+            "Heal-forward: session:start must strip the stale IncompleteSession "
+            "marker left by the out-of-order session:end"
+        )
+
+    async def test_out_of_order_end_then_start_with_parent_heals_to_subsession(
+        self, services: HookStateService
+    ) -> None:
+        """end processed BEFORE start (with parent): stale IncompleteSession
+        must be stripped, leaving SubSession only.
+        """
+        handler = SessionHandler(services)
+
+        await handler(
+            "session:end",
+            {
+                "session_id": "s-race-sub",
+                "parent_id": "p-race-sub",
+                "timestamp": "2026-01-01T01:00:00Z",
+            },
+        )
+        node = await services.graph.get_node("s-race-sub")
+        assert node is not None
+        assert "IncompleteSession" in node["labels"], (
+            "Precondition: out-of-order end must stamp the stale marker"
+        )
+
+        await handler(
+            "session:start",
+            {
+                "session_id": "s-race-sub",
+                "parent_id": "p-race-sub",
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+        )
+
+        node = await services.graph.get_node("s-race-sub")
+        assert node is not None
+        labels = node["labels"]
+        assert "SubSession" in labels, "Real terminal must be assigned by start"
+        assert "IncompleteSession" not in labels, (
+            "Heal-forward: session:start must strip the stale IncompleteSession "
+            "marker left by the out-of-order session:end"
         )

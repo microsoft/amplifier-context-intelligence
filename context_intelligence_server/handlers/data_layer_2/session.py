@@ -61,6 +61,32 @@ class LabelTransition:
     remove: list[str] = field(default_factory=list)
 
 
+def _heal_forward(transition: LabelTransition) -> LabelTransition:
+    """Strip a stale IncompleteSession marker on every start/fork transition.
+
+    IncompleteSession is only ever a correct label at session:end, when
+    genuinely no type is known yet.  It can never legitimately coexist with a
+    real terminal type (RootSession/SubSession/ForkedSession) or with a
+    start/fork event that reconfirms one — co-occurrence is always the
+    out-of-order / false-positive case: a forked sub-session's session:end
+    drained before its session:fork/session:start, stamping the marker before
+    the real terminal arrived (see docs/issues/incomplete-session-mislabeling.md).
+
+    Applied once, uniformly, to the *result* of every start/fork branch —
+    including the no-op branches, where a node may already carry a stale
+    marker from an earlier out-of-order end — rather than hand-editing each
+    branch's `remove` list. This makes the invariant impossible to miss if a
+    branch is added later. REMOVE of an absent label is a documented no-op
+    (see GraphState.set_labels / Neo4jGraphStore.set_labels), so healing is
+    always safe even when no stale marker exists.
+    """
+    if "IncompleteSession" in transition.remove:
+        return transition
+    return LabelTransition(
+        add=transition.add, remove=[*transition.remove, "IncompleteSession"]
+    )
+
+
 class SessionLabelStateMachine:
     """State machine for session type label transitions.
 
@@ -80,40 +106,17 @@ class SessionLabelStateMachine:
         # clears StubSession, so genuine late enrichment removes the marker.  Removing
         # a label that isn't present is a silent no-op (see GraphState.set_labels /
         # Neo4jGraphStore.set_labels), so it is always safe to include in `remove`.
+        #
+        # NOTE on "IncompleteSession" healing: every start/fork transition also
+        # strips IncompleteSession via _heal_forward() below — see that function's
+        # docstring for the invariant. It is applied to the branch's return value
+        # as a single normalization step, not hand-edited per branch, so it
+        # cannot be missed by a future branch.
         if event == "start":
-            if current_type in ("ForkedSession", "SubSession"):
-                return LabelTransition()
-            if current_type == "RootSession":
-                if has_parent:
-                    return LabelTransition(
-                        add=["SubSession", "SST_EVENT"],
-                        remove=["RootSession", "StubSession"],
-                    )
-                return LabelTransition()
-            # bare session (current_type is None)
-            if has_parent:
-                return LabelTransition(
-                    add=["Session", "SubSession", "SST_EVENT"],
-                    remove=["StubSession"],
-                )
-            return LabelTransition(
-                add=["RootSession", "Session", "SST_EVENT"],
-                remove=["StubSession"],
-            )
+            return _heal_forward(self._classify_start(current_type, has_parent))
 
         if event == "fork":
-            if current_type == "ForkedSession":
-                return LabelTransition()
-            if current_type in ("RootSession", "SubSession"):
-                return LabelTransition(
-                    add=["ForkedSession", "SST_EVENT"],
-                    remove=[current_type, "StubSession"],
-                )
-            # bare session (current_type is None)
-            return LabelTransition(
-                add=["Session", "ForkedSession", "SST_EVENT"],
-                remove=["StubSession"],
-            )
+            return _heal_forward(self._classify_fork(current_type, has_parent))
 
         if event == "end":
             if current_type is not None:
@@ -126,14 +129,56 @@ class SessionLabelStateMachine:
             # so StubSession is cleared here too.
             #
             # NOTE: if a real start/fork ever arrives AFTER this end (out-of-order,
-            # vanishingly rare), _handle_start/_handle_fork will classify normally
-            # and add the real terminal.  IncompleteSession may then coexist as an
-            # audit trail — that is acceptable; no special stripping is needed.
+            # which routinely happens for forked sub-sessions whose independent
+            # queue drains before the parent's), _handle_start/_handle_fork now heal
+            # forward — classify() strips IncompleteSession via _heal_forward() the
+            # moment the real start/fork is processed, so the stale marker no
+            # longer coexists with the real terminal. See
+            # docs/issues/incomplete-session-mislabeling.md.
             return LabelTransition(
                 add=["IncompleteSession", "SST_EVENT"], remove=["StubSession"]
             )
 
         raise ValueError(f"classify() received unknown event: {event!r}")
+
+    @staticmethod
+    def _classify_start(current_type: str | None, has_parent: bool) -> LabelTransition:
+        """Compute the start-event transition, before IncompleteSession healing."""
+        if current_type in ("ForkedSession", "SubSession"):
+            return LabelTransition()
+        if current_type == "RootSession":
+            if has_parent:
+                return LabelTransition(
+                    add=["SubSession", "SST_EVENT"],
+                    remove=["RootSession", "StubSession"],
+                )
+            return LabelTransition()
+        # bare session (current_type is None)
+        if has_parent:
+            return LabelTransition(
+                add=["Session", "SubSession", "SST_EVENT"],
+                remove=["StubSession"],
+            )
+        return LabelTransition(
+            add=["RootSession", "Session", "SST_EVENT"],
+            remove=["StubSession"],
+        )
+
+    @staticmethod
+    def _classify_fork(current_type: str | None, has_parent: bool) -> LabelTransition:
+        """Compute the fork-event transition, before IncompleteSession healing."""
+        if current_type == "ForkedSession":
+            return LabelTransition()
+        if current_type in ("RootSession", "SubSession"):
+            return LabelTransition(
+                add=["ForkedSession", "SST_EVENT"],
+                remove=[current_type, "StubSession"],
+            )
+        # bare session (current_type is None)
+        return LabelTransition(
+            add=["Session", "ForkedSession", "SST_EVENT"],
+            remove=["StubSession"],
+        )
 
 
 class SessionHandler:
