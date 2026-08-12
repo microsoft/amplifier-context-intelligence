@@ -71,6 +71,32 @@ async def _create_event_node(
         )
 
 
+async def _create_carrier_node(
+    driver: Any,
+    *,
+    label: str,
+    node_id: str,
+    workspace: str,
+    prop_name: str,
+    prop_value: str,
+) -> None:
+    """Create a bare node of *label* carrying a single non-``data`` property.
+
+    Used to seed a reference that lives ONLY on the given carrier property
+    (``tool_input`` / ``prompt`` / ``response``) with deliberately NO :Event
+    node anywhere in the graph -- proving the reference-scan hardening
+    (docs/plans/2026-08-12-blob-reclaim-reference-scan-hardening.md) finds it
+    via the new per-property UNION branches, not the pre-existing
+    ``:Event.data`` branch.
+    """
+    async with driver.session() as session:
+        await session.run(
+            f"CREATE (n:{label} {{node_id: $node_id, workspace: $workspace}}) "
+            f"SET n.{prop_name} = $prop_value",
+            {"node_id": node_id, "workspace": workspace, "prop_value": prop_value},
+        )
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -565,3 +591,167 @@ async def test_b1_event_data_carries_every_blob_ref(
             f"BLOB_FIELD {field!r} ref must survive verbatim into persisted "
             "Event.data -- this is the invariant the reclaim scan relies on"
         )
+
+
+# ---------------------------------------------------------------------------
+# Reference-scan hardening (docs/plans/2026-08-12-blob-reclaim-reference-
+# scan-hardening.md): a ref living ONLY on a non-Event.data carrier property
+# must still be classified referenced. Each of these tests seeds NO :Event
+# node at all -- proving the new per-property UNION branches (not the
+# pre-existing Event.data branch) find the reference. Every one of these
+# FAILS against the old Event.data-only scan and PASSES after the hardening.
+# ---------------------------------------------------------------------------
+
+
+async def test_toolcall_tool_input_only_reference_is_protected(
+    admin_client: httpx.AsyncClient,
+    tmp_path: Path,
+    neo4j_driver: Any,
+) -> None:
+    """A $blob_ref-shaped reference living ONLY on ToolCall.tool_input (no
+    Event.data anywhere containing it) must be classified referenced.
+
+    Structural-extraction path: tool_input is stored as the JSON string
+    ``{"$blob_ref": "<uri>"}`` (neo4j_store._sanitize_properties
+    JSON-serializes dict property values on write), so this pins the
+    json.loads + _collect_blob_refs branch of _extract_blob_refs_from_value
+    for a non-``data`` carrier.
+    """
+    blob_dir = tmp_path / "blobs"
+    sid = "toolcall-only-sess-1"
+    path = _write_blob(blob_dir, sid, "node1__result", age_seconds=_OLD_AGE_SECONDS)
+    uri = f"ci-blob://{sid}/node1__result"
+
+    await _create_carrier_node(
+        neo4j_driver,
+        label="ToolCall",
+        node_id="toolcall-only-1",
+        workspace="ws-toolcall",
+        prop_name="tool_input",
+        prop_value=json.dumps({"$blob_ref": uri}),
+    )
+
+    resp = await admin_client.post(
+        "/admin/blobs/reclaim", json={"dry_run": True, "min_age_minutes": 15}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["referenced_uris"] >= 1
+    assert body["orphans_found"] == 0, (
+        f"{uri!r} is referenced only via ToolCall.tool_input -- an "
+        "Event.data-only scan would misclassify it as orphan and delete it"
+    )
+    assert uri not in body["sample"]
+    assert path.exists()
+
+
+async def test_plain_string_tool_input_carrier_is_protected(
+    admin_client: httpx.AsyncClient,
+    tmp_path: Path,
+    neo4j_driver: Any,
+) -> None:
+    """A bare-string tool_input (NOT the {"$blob_ref": ...} JSON wrapper)
+    mentioning a ci-blob:// URI must still be classified referenced.
+
+    Regex-fallback path: a plain string is written through verbatim (never
+    JSON-serialized), so json.loads on it raises and
+    _extract_blob_refs_from_value falls back to the bare ci-blob://[^"\\s]+
+    token regex. Pins that fallback for a lifted plain-string carrier.
+    """
+    blob_dir = tmp_path / "blobs"
+    sid = "plain-string-sess-1"
+    path = _write_blob(blob_dir, sid, "node1__result", age_seconds=_OLD_AGE_SECONDS)
+    uri = f"ci-blob://{sid}/node1__result"
+
+    await _create_carrier_node(
+        neo4j_driver,
+        label="ToolCall",
+        node_id="plain-string-toolcall-1",
+        workspace="ws-plain",
+        prop_name="tool_input",
+        prop_value=f"see {uri} for the prior result",
+    )
+
+    resp = await admin_client.post(
+        "/admin/blobs/reclaim", json={"dry_run": True, "min_age_minutes": 15}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["referenced_uris"] >= 1
+    assert body["orphans_found"] == 0, (
+        f"{uri!r} is referenced only via a plain-string tool_input -- the "
+        "regex fallback must extract it even though the property is not "
+        "valid JSON"
+    )
+    assert uri not in body["sample"]
+    assert path.exists()
+
+
+async def test_prompt_prompt_only_reference_is_protected(
+    admin_client: httpx.AsyncClient,
+    tmp_path: Path,
+    neo4j_driver: Any,
+) -> None:
+    """A $blob_ref-shaped reference living ONLY on Prompt.prompt (no
+    Event.data anywhere containing it) must be classified referenced."""
+    blob_dir = tmp_path / "blobs"
+    sid = "prompt-only-sess-1"
+    path = _write_blob(blob_dir, sid, "node1__result", age_seconds=_OLD_AGE_SECONDS)
+    uri = f"ci-blob://{sid}/node1__result"
+
+    await _create_carrier_node(
+        neo4j_driver,
+        label="Prompt",
+        node_id="prompt-only-1",
+        workspace="ws-prompt",
+        prop_name="prompt",
+        prop_value=json.dumps({"$blob_ref": uri}),
+    )
+
+    resp = await admin_client.post(
+        "/admin/blobs/reclaim", json={"dry_run": True, "min_age_minutes": 15}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["referenced_uris"] >= 1
+    assert body["orphans_found"] == 0, (
+        f"{uri!r} is referenced only via Prompt.prompt -- an Event.data-only "
+        "scan would misclassify it as orphan and delete it"
+    )
+    assert uri not in body["sample"]
+    assert path.exists()
+
+
+async def test_orchestrator_run_response_only_reference_is_protected(
+    admin_client: httpx.AsyncClient,
+    tmp_path: Path,
+    neo4j_driver: Any,
+) -> None:
+    """A $blob_ref-shaped reference living ONLY on OrchestratorRun.response
+    (no Event.data anywhere containing it) must be classified referenced."""
+    blob_dir = tmp_path / "blobs"
+    sid = "orchrun-only-sess-1"
+    path = _write_blob(blob_dir, sid, "node1__result", age_seconds=_OLD_AGE_SECONDS)
+    uri = f"ci-blob://{sid}/node1__result"
+
+    await _create_carrier_node(
+        neo4j_driver,
+        label="OrchestratorRun",
+        node_id="orchrun-only-1",
+        workspace="ws-orchrun",
+        prop_name="response",
+        prop_value=json.dumps({"$blob_ref": uri}),
+    )
+
+    resp = await admin_client.post(
+        "/admin/blobs/reclaim", json={"dry_run": True, "min_age_minutes": 15}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["referenced_uris"] >= 1
+    assert body["orphans_found"] == 0, (
+        f"{uri!r} is referenced only via OrchestratorRun.response -- an "
+        "Event.data-only scan would misclassify it as orphan and delete it"
+    )
+    assert uri not in body["sample"]
+    assert path.exists()
