@@ -639,7 +639,9 @@ overrides:
 ## Updating the server (build & deploy a new version — Neo4j-safe)
 
 Runbook for shipping a new version (e.g. `v6.7.0`) without disturbing Neo4j.
-Placeholders in `<angle-brackets>`.
+Placeholders in `<angle-brackets>`. (Illustrative version numbers below are
+NOT kept in lockstep with the current release — e.g. the deploy-safe boot fix
+ships as `6.7.1`; substitute whatever version you are actually shipping.)
 
 **Pre-flight**
 - Repo `pyproject.toml` version == the version you're shipping.
@@ -695,6 +697,19 @@ az containerapp update -n <container-app-name> -g <resource-group> \
 **6. Verify:** `amplifier-online status` + `amplifier-online logs --since 10` —
 expect the new revision Running/Healthy, no `access_mode` validation error, and
 Neo4j connected on **both** clients.
+
+> ⚠️ **`GET /status`'s `schema_health` field is NOT a liveness/readiness signal.**
+> Since 6.7.1 the server never crash-loops on graph migration/reachability
+> state (deploy-safe boot) — a genuine data conflict or an unreachable graph
+> at boot is reported as `schema_health: "degraded"` or `"unknown"` on
+> `GET /status` while the server continues to boot and serve. **Do NOT wire
+> `schema_health` (or `/status` at all) to a Container Apps/Kubernetes
+> liveness or readiness probe** — doing so would recreate the exact
+> crash-loop this fix removes, one layer up, the moment a normal ACA
+> cold-start race or credential rotation makes the probe transiently
+> unreachable. Use a plain HTTP-200 check against `/status` (or `/version`)
+> for liveness if one is needed; treat `schema_health` as an operator/
+> automation signal to read, not a gate to enforce.
 
 ### Neo4j safety — guarantees & do-NOT-touch list
 

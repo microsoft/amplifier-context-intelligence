@@ -115,6 +115,18 @@ def setup_logging() -> None:
     Idempotent: if the root logger already has handlers attached (e.g. because
     the application lifespan is exercised multiple times in tests) this function
     returns immediately without adding duplicate handlers.
+
+    Deploy-safe boot (council amendment, 2026-08-12): this function MUST NEVER
+    raise. The stdout/stderr StreamHandler is configured FIRST and
+    unconditionally, so console logging always exists to report a degraded
+    state. The RotatingFileHandler (and its parent-directory mkdir) is
+    best-effort and wrapped in its own try/except: on failure (e.g. the
+    `/data` volume not yet mounted, or a read-only path on Azure Container
+    Apps) it falls back to console-only and logs a loud WARNING, rather than
+    crash-looping the worker. This is the exact real-process failure a
+    live boot test caught: `setup_logging()` used to `mkdir('/data')` before
+    the lifespan try/except boundary and a `PermissionError` there sank the
+    whole worker with no Neo4j involvement at all.
     """
     settings = get_settings()
     log_path = Path(settings.log_path)
@@ -123,41 +135,52 @@ def setup_logging() -> None:
         log_path = log_path / "server.jsonl"
     log_level = settings.log_level
 
-    # Ensure parent directory exists
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
     formatter = JsonFormatter()
 
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
 
-    # Guard: skip handler registration if our RotatingFileHandler is already present.
-    # Checking for a RotatingFileHandler (rather than any handler) avoids false
-    # positives from pytest's log-capture handler which is always present during tests.
-    if any(
-        isinstance(h, logging.handlers.RotatingFileHandler)
-        for h in root_logger.handlers
-    ):
+    # Guard: skip handler registration if our StreamHandler is already present.
+    # Checking for our own console StreamHandler (rather than any handler)
+    # avoids false positives from pytest's log-capture handler which is always
+    # present during tests. We key off the console handler (not the file
+    # handler) because the file handler may legitimately be ABSENT in a
+    # degraded boot -- if we keyed off the file handler, a degraded first call
+    # would re-run on the next call and stack duplicate console handlers.
+    if any(getattr(h, "_ci_console_handler", False) for h in root_logger.handlers):
         return
 
-    # stdout stream handler
+    # stdout stream handler -- configured FIRST and unconditionally, so console
+    # logging ALWAYS exists (deploy-safe boot: we must be able to report a
+    # degraded state even when file logging is unavailable).
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
+    stream_handler.setLevel(log_level)
+    # Tag so the idempotency guard above can recognise our own console handler.
+    stream_handler._ci_console_handler = True  # type: ignore[attr-defined]
     root_logger.addHandler(stream_handler)
 
-    # rotating file handler
-    file_handler = logging.handlers.RotatingFileHandler(
-        filename=str(log_path),
-        maxBytes=_MAX_BYTES,
-        backupCount=_BACKUP_COUNT,
-    )
-    file_handler.setFormatter(formatter)
-    root_logger.addHandler(file_handler)
-
-    # Gate the handlers at the configured level so the DEBUG-demoted access logs
-    # (below) are hidden at INFO and surface only when the level is DEBUG.
-    stream_handler.setLevel(log_level)
-    file_handler.setLevel(log_level)
+    # rotating file handler -- best-effort. A failure here (unwritable /data,
+    # volume not yet mounted, wrong perms) MUST NOT crash boot; fall back to
+    # console-only. Both the parent-dir mkdir and the handler construction can
+    # raise OSError/PermissionError, so both live inside this guard.
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.handlers.RotatingFileHandler(
+            filename=str(log_path),
+            maxBytes=_MAX_BYTES,
+            backupCount=_BACKUP_COUNT,
+        )
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(log_level)
+        root_logger.addHandler(file_handler)
+    except OSError as exc:
+        # Console logging is already wired above, so this warning is delivered.
+        root_logger.warning(
+            "file logging unavailable at %s, using console only: %s",
+            log_path,
+            exc,
+        )
 
     # Route uvicorn/gunicorn loggers up to the root JsonFormatter so every line
     # from those frameworks is one-line JSON (not plain text) for Azure Log

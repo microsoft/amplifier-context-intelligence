@@ -16,25 +16,34 @@ invoked via the doctor CLI, never automatically on every boot (that was pure
 dead-weight O(graph-size) cost on an already-migrated graph). ``ensure_neo4j_schema``
 now only creates cheap, idempotent indexes/constraints; if the graph still has
 untagged/duplicate legacy data, constraint creation (Step 6) either raises
-(``fail_on_data_conflict=True``) or logs a WARNING and returns ``False`` (the
-default).
+(``fail_on_data_conflict=True``) or logs a WARNING/ERROR and returns ``False``
+(the default) -- and, in the failure case, establishes a fallback
+``idx_node_universal`` index so the write path keeps a ``NodeIndexSeek``
+(see the council amendment B2 note below and
+``tests/neo4j/test_node_index_seek.py``).
 
-Cold start vs. mid-flight flush have OPPOSITE requirements for this function
-(design decision, reversing the lifespan half of commit f4d8bab):
+UPDATE (deploy-safe boot, council amendment 2026-08-12 --
+docs/plans/2026-08-12-deploy-safe-boot-spec.md, workspace root): cold start
+(``main.py``'s ``lifespan()``) no longer fails closed on graph *data* state.
+A deploy must never crash-loop against an un-migrated, unreachable, or
+degraded graph, so lifespan now calls this function with the SAME
+``fail_on_data_conflict=False`` default the mid-flight flush path always
+used, and surfaces the result as a tri-state ``schema_health`` signal on
+``GET /status`` instead of raising (see ``tests/test_main.py``'s
+deploy-safe-boot test block). Only ``run_repair``/``doctor --fix`` still
+opts into ``fail_on_data_conflict=True``:
 
-- **Cold start** (``main.py``'s ``lifespan()``): FAILS LOUD. Nothing has been
-  written yet, so refusing to boot on an un-migrated graph (duplicate legacy
-  :Node-labeled nodes, caught by ``fail_on_data_conflict=True`` here; OR nodes
-  lacking the ``:Node`` label altogether, which the constraint can't see and
-  is instead caught by the separate O(1) ``count_untagged_nodes`` guard) loses
-  no data and surfaces the impossible state immediately.
-- **Mid-flight flush** (``Neo4jGraphStore._ensure_schema``): must NEVER raise
-  -- a ``RuntimeError`` escaping there dead-letters real in-flight activity
-  records (reviewer Salil's PR #67 blocker, commit 14a6d30). Leaves the
-  default ``fail_on_data_conflict=False``: a data conflict is logged as a
-  WARNING and self-heals on the next flush once the graph is repaired.
-- ``run_repair`` / ``doctor --fix`` also opts into ``fail_on_data_conflict=True``
-  (a lingering conflict AFTER dedup+backfill is a genuine repair failure).
+- **Cold start / mid-flight flush** (``main.py``'s ``lifespan()``;
+  ``Neo4jGraphStore._ensure_schema``): must NEVER raise due to graph *data*
+  state. A ``RuntimeError`` escaping the flush path dead-letters real
+  in-flight activity records (reviewer Salil's PR #67 blocker, commit
+  14a6d30); escaping the lifespan crash-loops the deploy (the 2026-08-12
+  incident this amendment fixes). Both leave the default
+  ``fail_on_data_conflict=False``: a data conflict is logged and reported
+  via the return value, self-healing once the graph is repaired.
+- ``run_repair`` / ``doctor --fix`` still opts into ``fail_on_data_conflict=True``
+  (a lingering conflict AFTER dedup+backfill is a genuine repair failure --
+  nothing is at risk of being lost or crash-looped at that point).
 
 See docs/node-identity-migration.md.
 
@@ -50,6 +59,7 @@ from typing import Any
 
 import pytest
 from context_intelligence_server.neo4j_store import (
+    _NODE_MERGE_CYPHER,
     Neo4jGraphStore,
     count_untagged_nodes,
     ensure_neo4j_schema,
@@ -289,8 +299,9 @@ async def _run_migration_assertions(neo4j_container: dict[str, Any]) -> None:
 async def test_cold_start_guard_detects_untagged_only_graph(
     neo4j_container: dict[str, Any],
 ) -> None:
-    """Reproduces main.py's lifespan cold-start guard, against a REAL Neo4j,
-    for the untagged-only shape the :Node constraint alone CANNOT see.
+    """Reproduces the primitives behind main.py's lifespan schema-health
+    computation, against a REAL Neo4j, for the untagged-only shape the
+    :Node constraint alone CANNOT see.
 
     Uses ``_seed_untagged_only_graph`` (NOT ``_seed_dirty_graph``, whose
     duplicate ``dup-1`` :Event nodes trip the separate, always fail-open
@@ -298,22 +309,29 @@ async def test_cold_start_guard_detects_untagged_only_graph(
     ``test_run_repair_dedups_backfills_and_constrains``). Every node seeded
     here has a unique (node_id, workspace) and no label collision, so NO
     uniqueness constraint (Session/Event/Node) sees a conflict -- the ONLY
-    defect is the missing ``:Node`` label, which is exactly why the lifespan
-    guard needs its second, independent check (``count_untagged_nodes``):
-    the constraint step provides no signal for this case on its own.
+    defect is the missing ``:Node`` label, which is exactly why lifespan's
+    schema-health computation needs its second, independent check
+    (``count_untagged_nodes``): the constraint step provides no signal for
+    this case on its own.
 
-    Reproduces the lifespan's two ordered steps directly against the live
-    container (the guard logic is inline in ``main.py``'s ``lifespan()``,
-    not its own importable function):
+    UPDATE (deploy-safe boot, council amendment 2026-08-12): lifespan no
+    longer raises on this condition -- it now calls this function with
+    ``fail_on_data_conflict=False`` (the same default used here for
+    parity/documentation purposes; the constraint would succeed either way,
+    since there is no conflict for it to see) and feeds the two results
+    below into a tri-state ``schema_health`` signal on ``GET /status``
+    (see ``tests/test_main.py::test_lifespan_does_not_raise_on_untagged_nodes``
+    for the unit-level contract). This test still exercises the exact two
+    primitives lifespan calls, directly against a live Neo4j:
 
-      1. ``ensure_neo4j_schema(driver, fail_on_data_conflict=True)`` --
-         succeeds (``True``), no constraint conflict to raise on.
+      1. ``ensure_neo4j_schema(driver, fail_on_data_conflict=False)`` --
+         succeeds (``True``), no constraint conflict for it to see.
       2. ``count_untagged_nodes(driver)`` -- reports > 0.
 
     Together, (1) succeeding and (2) being > 0 is precisely the condition
-    under which ``lifespan()`` raises ``RuntimeError`` naming
-    ``doctor --fix`` -- i.e. the un-migrated (untagged-only) graph IS
-    detected and cold start WOULD refuse to boot.
+    under which lifespan now reports ``schema_health="degraded"`` (never a
+    boot refusal) -- i.e. the un-migrated (untagged-only) graph IS detected,
+    surfaced on ``/status``, and the server boots and serves regardless.
     """
     _wipe(neo4j_container)
     try:
@@ -324,15 +342,17 @@ async def test_cold_start_guard_detects_untagged_only_graph(
             auth=(neo4j_container["user"], neo4j_container["password"]),
         )
         try:
-            # Step 1 (lifespan): fail-loud schema init does NOT raise here --
-            # none of the seeded nodes carry :Node (or collide under any
-            # OTHER constraint), so no constraint sees a conflict. This is
-            # the case the constraint check alone misses.
-            established = await ensure_neo4j_schema(driver, fail_on_data_conflict=True)
+            # Step 1 (lifespan): schema init does NOT fail here -- none of
+            # the seeded nodes carry :Node (or collide under any OTHER
+            # constraint), so no constraint sees a conflict. This is the
+            # case the constraint check alone misses.
+            established = await ensure_neo4j_schema(
+                driver, fail_on_data_conflict=False
+            )
             assert established is True, (
-                "ensure_neo4j_schema(fail_on_data_conflict=True) must succeed "
-                "on an untagged-only (no :Node label anywhere, no duplicates) "
-                "dirty graph -- there is no constraint conflict to raise on."
+                "ensure_neo4j_schema must succeed on an untagged-only (no "
+                ":Node label anywhere, no duplicates) dirty graph -- there "
+                "is no constraint conflict for it to see."
             )
 
             # Step 2 (lifespan): the O(1) untagged guard DOES catch it.
@@ -340,8 +360,8 @@ async def test_cold_start_guard_detects_untagged_only_graph(
             assert untagged > 0, (
                 "count_untagged_nodes must report the seeded untagged legacy "
                 "nodes (legacy-sess-only + legacy-bare) -- this is the exact "
-                "signal main.py's lifespan() uses to raise RuntimeError and "
-                "refuse to boot on an un-migrated graph."
+                "signal main.py's lifespan() feeds into schema_health="
+                "\"degraded\" on GET /status for an un-migrated graph."
             )
         finally:
             await driver.close()
@@ -511,3 +531,150 @@ async def _phase_e_doctor_contract_fails_closed(
             await ensure_neo4j_schema(driver, fail_on_data_conflict=True)
     finally:
         await driver.close()
+
+
+# ---------------------------------------------------------------------------
+# Council amendment B2 (deploy-safe boot, 2026-08-12): degraded mode must
+# never lose the write-path index seek, only atomicity. These tests EXPLAIN
+# the real production node-MERGE query against a live Neo4j to prove the
+# fallback idx_node_universal index keeps a NodeIndexSeek even when the
+# :Node uniqueness constraint cannot be established.
+# ---------------------------------------------------------------------------
+
+def _collect_plan_operators(plan: dict[str, Any]) -> list[str]:
+    """Recursively collect every operatorType in a Neo4j EXPLAIN/PROFILE plan."""
+    ops: list[str] = []
+    if not plan:
+        return ops
+    op = plan.get("operatorType") or plan.get("operator_type")
+    if op:
+        ops.append(op)
+    for child in plan.get("children", []) or []:
+        ops.extend(_collect_plan_operators(child))
+    return ops
+
+
+def _explain_node_merge(container: dict[str, Any]) -> list[str]:
+    """EXPLAIN the production node MERGE query and return its plan operators."""
+    driver = GraphDatabase.driver(
+        container["bolt_url"],
+        auth=(container["user"], container["password"]),
+    )
+    try:
+        with driver.session() as s:
+            result = s.run(
+                "EXPLAIN " + _NODE_MERGE_CYPHER,
+                rows=[{"node_id": "b2-plan-node", "props": {"workspace": _WS}}],
+            )
+            summary = result.consume()
+            plan = summary.plan or {}
+        return _collect_plan_operators(plan)
+    finally:
+        driver.close()
+
+
+async def test_degraded_graph_fallback_index_keeps_node_index_seek(
+    neo4j_container: dict[str, Any],
+) -> None:
+    """On a duplicate-blocked-constraint graph (the :Node constraint CANNOT
+    be established), ensure_neo4j_schema must create the fallback
+    idx_node_universal index -- so the production node-MERGE query plans as
+    a NodeIndexSeek, NEVER a NodeByLabelScan/AllNodesScan (the 25-30s stall
+    PR #67 removed from the write path). Degraded mode costs atomicity
+    only, never the seek.
+    """
+    _wipe(neo4j_container)
+    try:
+        _seed_node_constraint_conflict(neo4j_container)
+
+        driver = AsyncGraphDatabase.driver(
+            neo4j_container["bolt_url"],
+            auth=(neo4j_container["user"], neo4j_container["password"]),
+        )
+        try:
+            established = await ensure_neo4j_schema(
+                driver, fail_on_data_conflict=False
+            )
+            assert established is False, (
+                "the :Node constraint must NOT be established against a "
+                "genuine duplicate-node conflict"
+            )
+        finally:
+            await driver.close()
+
+        # The fallback idx_node_universal must exist despite the constraint
+        # failure (B2: degraded mode never loses the index).
+        sync_driver = GraphDatabase.driver(
+            neo4j_container["bolt_url"],
+            auth=(neo4j_container["user"], neo4j_container["password"]),
+        )
+        try:
+            with sync_driver.session() as s:
+                idx_count = s.run(
+                    "SHOW INDEXES YIELD name WHERE name = 'idx_node_universal' "
+                    "RETURN count(*) AS c"
+                ).single()["c"]
+        finally:
+            sync_driver.close()
+        assert idx_count == 1, (
+            "Fallback idx_node_universal must be created when the :Node "
+            "constraint cannot be established (degraded mode, B2)."
+        )
+
+        ops = _explain_node_merge(neo4j_container)
+        assert ops, f"EXPLAIN returned no plan operators (ops={ops!r})"
+        assert not any("AllNodesScan" in op for op in ops), (
+            "Degraded-mode node MERGE regressed to a full-graph AllNodesScan "
+            f"-- the fallback index did not back the seek. Plan operators: {ops}"
+        )
+        assert not any("NodeByLabelScan" in op for op in ops), (
+            f"Degraded-mode node MERGE did a NodeByLabelScan instead of an "
+            f"index seek. Plan operators: {ops}"
+        )
+        assert any("IndexSeek" in op for op in ops), (
+            "Degraded-mode node MERGE is not index-backed -- expected a "
+            f"NodeIndexSeek from the fallback idx_node_universal. Plan "
+            f"operators: {ops}"
+        )
+    finally:
+        _wipe(neo4j_container)
+
+
+async def test_healthy_graph_keeps_constraint_backed_index_seek(
+    neo4j_container: dict[str, Any],
+) -> None:
+    """On a healthy graph (no data conflict), the :Node uniqueness
+    constraint is established and the node-MERGE query plans as a
+    NodeIndexSeek backed by the constraint's own index -- zero behavior
+    change from before the B2 reorder.
+    """
+    _wipe(neo4j_container)
+    try:
+        driver = AsyncGraphDatabase.driver(
+            neo4j_container["bolt_url"],
+            auth=(neo4j_container["user"], neo4j_container["password"]),
+        )
+        try:
+            established = await ensure_neo4j_schema(
+                driver, fail_on_data_conflict=False
+            )
+            assert established is True, (
+                "ensure_neo4j_schema must fully establish the schema on a "
+                "healthy graph with no data conflict."
+            )
+        finally:
+            await driver.close()
+
+        ops = _explain_node_merge(neo4j_container)
+        assert ops, f"EXPLAIN returned no plan operators (ops={ops!r})"
+        assert not any("AllNodesScan" in op for op in ops), (
+            f"Healthy-graph node MERGE regressed to an AllNodesScan. Plan "
+            f"operators: {ops}"
+        )
+        assert any("IndexSeek" in op for op in ops), (
+            "Healthy-graph node MERGE is not index-backed -- expected a "
+            f"NodeIndexSeek from the :Node uniqueness constraint. Plan "
+            f"operators: {ops}"
+        )
+    finally:
+        _wipe(neo4j_container)

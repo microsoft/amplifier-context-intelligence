@@ -1135,25 +1135,26 @@ async def test_lifespan_no_sweep_when_interval_zero(
 
 
 # ---------------------------------------------------------------------------
-# Cold start FAILS LOUD on schema/data corruption that requires `doctor
-# --fix` (design decision, reversing the lifespan half of f4d8bab): an
-# un-migrated graph -- duplicate legacy nodes (caught by the :Node
-# constraint via fail_on_data_conflict=True) OR nodes lacking the :Node
-# label altogether (caught by the O(1) count_untagged_nodes guard) -- must
-# refuse to boot. Nothing has been written yet at cold start, so refusing to
-# boot loses no data. The migration itself still lives ONLY in `doctor
-# --fix` (run_repair); the flush path still self-heals (see
-# tests/neo4j/test_node_identity_migration.py). A connectivity/probe
-# failure (graph unreachable) is NOT treated as "confirmed un-migrated" and
-# must not crash boot.
+# Deploy-safe boot (council amendment, 2026-08-12; see
+# docs/plans/2026-08-12-deploy-safe-boot-spec.md in the workspace root):
+# a deploy (restart) MUST NEVER crash-loop on graph migration/reachability
+# state. Cold start now calls ensure_neo4j_schema with the SAME
+# fail_on_data_conflict=False default the mid-flight flush path always used,
+# and the untagged-node probe no longer raises on a positive count -- both
+# feed a tri-state schema_health signal ("healthy" / "degraded" / "unknown")
+# surfaced on GET /status (never GET /version -- see B7). The B1 boundary
+# additionally catches ANY exception from the startup sequence (not just
+# these two named sites), so boot proceeds regardless of which of the ~11
+# startup raise sites fails. Only run_repair / `doctor --fix` still opts
+# into fail_on_data_conflict=True -- see
+# tests/neo4j/test_node_identity_migration.py for that (unchanged) contract.
 # ---------------------------------------------------------------------------
 
 
-async def test_lifespan_calls_ensure_schema_with_fail_on_data_conflict() -> None:
-    """Cold start must call ensure_neo4j_schema with fail_on_data_conflict=True
-    -- boot refuses to proceed on a genuine :Node constraint data conflict
-    (duplicate legacy nodes), mirroring run_repair's contract. Safe at cold
-    start (nothing flushed yet); the flush path keeps the opposite default."""
+async def test_lifespan_calls_ensure_schema_with_fail_on_data_conflict_false() -> None:
+    """Cold start must call ensure_neo4j_schema with fail_on_data_conflict=False
+    -- boot never fails closed on a genuine :Node constraint data conflict.
+    That fail-closed contract now belongs ONLY to run_repair/`doctor --fix`."""
     mock_driver = _patched_lifespan_deps()
     mock_ensure_schema = AsyncMock(return_value=True)
     with (
@@ -1176,17 +1177,23 @@ async def test_lifespan_calls_ensure_schema_with_fail_on_data_conflict() -> None
 
     mock_ensure_schema.assert_awaited_once()
     _args, kwargs = mock_ensure_schema.await_args
-    assert kwargs.get("fail_on_data_conflict") is True, (
-        "lifespan must opt into fail_on_data_conflict=True -- cold start "
-        "fails loud on a genuine data conflict (that contract now applies "
-        "at boot too, not just to run_repair / `doctor --fix`)."
+    assert kwargs.get("fail_on_data_conflict") is False, (
+        "lifespan must call ensure_neo4j_schema with fail_on_data_conflict=False "
+        "-- deploy-safe boot never fails closed on graph data state (only "
+        "run_repair/`doctor --fix` opts into True)."
     )
+    assert main_module.app.state.schema_health == "healthy"
 
 
-async def test_lifespan_raises_on_ensure_schema_data_conflict() -> None:
-    """When ensure_neo4j_schema itself raises (a genuine :Node constraint
-    data conflict under fail_on_data_conflict=True), lifespan must propagate
-    the RuntimeError -- boot refuses to start."""
+async def test_lifespan_does_not_raise_when_ensure_schema_itself_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """B1: a non-data-conflict exception escaping ensure_neo4j_schema itself
+    (e.g. a Neo4jError re-raised by _create_index, a TransientError during
+    the ordinary ACA cold-start reachability race, or a rejected credential)
+    is caught by the single lifespan try/except boundary -- boot proceeds
+    and schema_health reports "unknown" (never coerced to "healthy"), never
+    propagating a RuntimeError out of lifespan."""
     mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
@@ -1197,21 +1204,27 @@ async def test_lifespan_raises_on_ensure_schema_data_conflict() -> None:
         patch(
             "context_intelligence_server.main.ensure_neo4j_schema",
             new=AsyncMock(
-                side_effect=RuntimeError(
-                    "Neo4j :Node constraint data conflict -- run doctor --fix"
-                )
+                side_effect=RuntimeError("Neo4j unreachable (TransientError)")
             ),
         ),
-        pytest.raises(RuntimeError, match="doctor --fix"),
+        caplog.at_level(logging.ERROR),
     ):
-        async with lifespan(main_module.app):
+        async with lifespan(main_module.app):  # MUST NOT raise
             pass
 
+    assert main_module.app.state.schema_health == "unknown"
+    assert "startup sequence failed" in (
+        main_module.app.state.schema_degraded_reason or ""
+    )
+    assert any(
+        "startup_degraded" in record.getMessage() for record in caplog.records
+    ), "Expected a loud ERROR-level startup_degraded log."
 
-async def test_lifespan_raises_on_untagged_nodes() -> None:
-    """On an un-migrated graph (untagged :Node count > 0), startup MUST
-    raise a RuntimeError naming `doctor --fix` -- boot refuses to start
-    rather than silently risking write-path duplication."""
+
+async def test_lifespan_does_not_raise_on_untagged_nodes() -> None:
+    """On an un-migrated graph (untagged :Node count > 0), startup no longer
+    raises -- boot proceeds and schema_health reports "degraded" with the
+    untagged count surfaced, rather than refusing to serve."""
     mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
@@ -1227,20 +1240,21 @@ async def test_lifespan_raises_on_untagged_nodes() -> None:
             "context_intelligence_server.main.count_untagged_nodes",
             new=AsyncMock(return_value=42),
         ),
-        pytest.raises(RuntimeError, match="doctor --fix") as exc_info,
     ):
-        async with lifespan(main_module.app):
+        async with lifespan(main_module.app):  # MUST NOT raise
             pass
 
-    assert "42" in str(exc_info.value), (
-        f"Expected the untagged count in the error message, got: {exc_info.value}"
+    assert main_module.app.state.schema_health == "degraded"
+    assert main_module.app.state.schema_untagged_nodes == 42
+    assert "42" in (main_module.app.state.schema_degraded_reason or ""), (
+        f"Expected the untagged count in degraded_reason, got: "
+        f"{main_module.app.state.schema_degraded_reason!r}"
     )
 
 
 async def test_lifespan_does_not_raise_on_clean_graph() -> None:
     """On a fully-migrated graph (untagged count == 0, no constraint
-    conflict), startup does NOT raise -- the fail-loud guards are silent
-    when there is nothing to report."""
+    conflict), startup does NOT raise and schema_health reports "healthy"."""
     mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
@@ -1261,15 +1275,19 @@ async def test_lifespan_does_not_raise_on_clean_graph() -> None:
             pass
 
     mock_count.assert_awaited_once()
+    assert main_module.app.state.schema_health == "healthy"
+    assert main_module.app.state.schema_degraded_reason is None
 
 
-async def test_lifespan_does_not_raise_when_health_check_itself_fails(
+async def test_lifespan_reports_unknown_when_health_check_itself_fails(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A health-check probe failure (e.g. count_untagged_nodes raising due to
-    a transient connectivity blip) must NOT be treated as a confirmed
-    un-migrated graph -- it is logged at DEBUG and swallowed, and boot
-    proceeds. Connectivity failure != confirmed data corruption."""
+    a transient connectivity blip, or Neo4j being unreachable at boot) must
+    NOT be coerced to "healthy" (B3) -- schema_health reports "unknown" and
+    boot proceeds regardless. This is the exact ACA cold-start race the
+    deploy-safe boot fix targets: unreachable-then-reachable must never
+    crash-loop."""
     mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
@@ -1285,10 +1303,142 @@ async def test_lifespan_does_not_raise_when_health_check_itself_fails(
             "context_intelligence_server.main.count_untagged_nodes",
             new=AsyncMock(side_effect=RuntimeError("transient connectivity blip")),
         ),
-        caplog.at_level(logging.DEBUG),
+        caplog.at_level(logging.WARNING),
     ):
         async with lifespan(main_module.app):  # MUST NOT raise
             pass
+
+    assert main_module.app.state.schema_health == "unknown"
+    assert main_module.app.state.schema_untagged_nodes is None
+    assert any(
+        "migration-health probe failed" in record.getMessage()
+        for record in caplog.records
+    ), "Expected a WARNING logging the probe failure."
+
+
+async def test_lifespan_recovery_quarantines_one_bad_session_and_continues(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """B6: a single session whose recovery raises (a corrupt per-session
+    .offset/dead-letter) is quarantined -- logged and skipped -- while other
+    recovered sessions still respawn and boot still completes."""
+    sid_bad = "sess-corrupt"
+    sid_good = "sess-good"
+    qm = registry.queue_manager
+    # Both lines parse fine at the JSON level (a malformed/torn line is
+    # already handled gracefully by _recover_one_session's own internal
+    # try/except -- see test_lifespan_skips_recovery_for_empty_workspace).
+    # B6's NEW defensive guard covers failures that surface only once
+    # recovery actually tries to respawn the drainer for that session (e.g.
+    # a corrupt on-disk queue file the registry discovers at get_or_create
+    # time) -- simulated here via a flaky get_or_create.
+    bad_body = json.dumps(
+        {
+            "event": "tool_use",
+            "workspace": "/bad-ws",
+            "data": {"session_id": sid_bad},
+        }
+    ).encode("utf-8")
+    good_body = json.dumps(
+        {
+            "event": "tool_use",
+            "workspace": "/good-ws",
+            "data": {"session_id": sid_good},
+        }
+    ).encode("utf-8")
+    await qm.append(sid_bad, bad_body)
+    await qm.append(sid_good, good_body)
+
+    spawned: list[tuple] = []
+
+    def _flaky_get_or_create(sid: str, workspace: str, **kw: object) -> None:
+        if sid == sid_bad:
+            raise RuntimeError("simulated corrupt per-session recovery failure")
+        spawned.append((sid, workspace))
+
+    monkeypatch.setattr(registry, "get_or_create", _flaky_get_or_create)
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "context_intelligence_server.main.count_untagged_nodes",
+            new=AsyncMock(return_value=0),
+        ),
+        caplog.at_level(logging.ERROR),
+    ):
+        async with lifespan(main_module.app):  # MUST NOT raise
+            pass
+
+    assert (sid_good, "/good-ws") in spawned, (
+        "The healthy session must still be recovered despite the other "
+        "session's recovery failing."
+    )
+    assert any(
+        "recovery_session_quarantined" in record.getMessage()
+        and sid_bad in record.getMessage()
+        for record in caplog.records
+    ), "Expected the corrupt session to be logged as quarantined."
+    # Boot still reaches a healthy schema state -- the quarantine did not
+    # propagate into (or get masked by) the B1 boundary.
+    assert main_module.app.state.schema_health == "healthy"
+
+
+async def test_status_exposes_schema_health_fields(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /status surfaces schema_health, untagged_nodes, schema_checked_at,
+    and degraded_reason -- the tri-state signal computed once at boot and
+    stashed on app.state (B3/B7)."""
+    main_module.app.state.schema_health = "degraded"
+    main_module.app.state.schema_untagged_nodes = 3
+    main_module.app.state.schema_checked_at = "2026-08-12T00:00:00+00:00"
+    main_module.app.state.schema_degraded_reason = "3 node(s) lacking the :Node label"
+    try:
+        response = await client.get("/status")
+        data = response.json()
+        assert data["schema_health"] == "degraded"
+        assert data["untagged_nodes"] == 3
+        assert data["schema_checked_at"] == "2026-08-12T00:00:00+00:00"
+        assert data["degraded_reason"] == "3 node(s) lacking the :Node label"
+    finally:
+        # Reset so this test doesn't leak state into siblings sharing the
+        # module-level app singleton.
+        main_module.app.state.schema_health = "unknown"
+        main_module.app.state.schema_untagged_nodes = None
+        main_module.app.state.schema_checked_at = None
+        main_module.app.state.schema_degraded_reason = None
+
+
+async def test_status_schema_health_defaults_to_unknown_when_unset(
+    client: httpx.AsyncClient,
+) -> None:
+    """Before lifespan has run (or if app.state was never populated), GET
+    /status must report schema_health="unknown", never a false "healthy"
+    (B3: a probe that hasn't run yet is not the same as a clean graph)."""
+    for attr in (
+        "schema_health",
+        "schema_untagged_nodes",
+        "schema_checked_at",
+        "schema_degraded_reason",
+    ):
+        if hasattr(main_module.app.state, attr):
+            delattr(main_module.app.state, attr)
+
+    response = await client.get("/status")
+    data = response.json()
+    assert data["schema_health"] == "unknown"
+    assert data["untagged_nodes"] is None
+    assert data["degraded_reason"] is None
 
 
 async def test_registry_exposed_on_app_state() -> None:

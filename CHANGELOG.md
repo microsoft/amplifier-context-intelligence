@@ -6,6 +6,62 @@ point now exists (see below), but the *handling* machinery that would consume
 it -- a versioned migration manifest and an automated upgrade/rollback runner
 -- is deliberately deferred to a separate design.
 
+## 6.7.1 -- Deploy-safe boot: server never crash-loops on un-migrated/unreachable/degraded graph state
+
+**Incident:** deploying a restart crash-looped the server against a graph with
+a single legacy node lacking the `:Node` label -- `RuntimeError: ... Cold
+start refuses to boot ... Run: doctor --fix`, `systemd Restart=always` ->
+hard outage, unrecoverable on Azure Container Apps (the private graph is
+unreachable from outside and `doctor --fix` cannot be run to break the loop).
+
+- **Boot never raises on graph/data state (B1).** The entire lifespan
+  startup sequence (schema DDL, the untagged-node probe, the SchemaMeta
+  baseline, and queue crash-recovery/reconcile) is now wrapped in ONE
+  try/except boundary. Whichever of the ~11 startup raise sites fails
+  (unreachable Neo4j, a `TransientError` during the ACA cold-start race,
+  credential rotation, a corrupt per-session `.offset`/dead-letter, a
+  genuine `:Node` constraint data conflict, ...) is logged LOUDLY
+  (`startup_degraded`) and boot proceeds to serve requests. Cold start now
+  calls `ensure_neo4j_schema(..., fail_on_data_conflict=False)` -- the same
+  default the mid-flight flush path already used -- and the untagged-node
+  probe no longer raises on a positive count. Only `run_repair`/
+  `doctor --fix` still fails closed on a genuine post-repair conflict.
+- **Crash recovery is defensive per-session (B6).** A corrupt queue for one
+  session is quarantined (logged, skipped) instead of aborting the whole
+  respawn loop; the B1 boundary is the backstop for anything this doesn't
+  catch.
+- **Degraded mode never loses the write-path index (B2).** The `:Node`
+  uniqueness constraint is now attempted BEFORE any `DROP INDEX
+  idx_node_universal` (previously unconditional and first, which could
+  leave the graph with no index at all if the constraint then failed on
+  duplicates -- regressing the 25-30s `AllNodesScan` stall PR #67 removed).
+  The standalone index is dropped ONLY after the constraint succeeds. If
+  the constraint cannot be created, a fallback `idx_node_universal` index
+  is (re-)created so writes keep a `NodeIndexSeek` -- degraded mode now
+  costs atomicity only, never the seek. A one-time drop-and-retry recovers
+  the constraint automatically once the underlying conflict is fixed (so a
+  prior degraded boot's own fallback index can never permanently lock the
+  graph out of the constraint). Healthy graphs (constraint already
+  present): zero behavior change.
+- **Tri-state migration health on `GET /status` (B3/B7).** New fields
+  `schema_health` (`"healthy"` / `"degraded"` / `"unknown"`),
+  `untagged_nodes` (int|null), `schema_checked_at` (ISO-8601, computed once
+  at boot), and `degraded_reason` (string|null). A probe failure reports
+  `"unknown"`, never coerced to `"healthy"`. **This signal reflects
+  data-migration state, not process liveness, and MUST NOT be wired to a
+  Kubernetes/ACA liveness or readiness probe** -- doing so would recreate
+  the exact crash-loop this fix removes, one layer up. `GET /version` is
+  unchanged except for the version bump below.
+- **Accepted tradeoff:** while degraded (constraint absent), concurrent
+  writes to the same `(node_id, workspace)` can create a NEW duplicate --
+  this is a ratchet, not bounded, so degraded mode is loud (ERROR-logged)
+  rather than silent. Remediation is out-of-band `doctor --fix` (reachable
+  deployments) or the in-place-fix capability tracked separately for ACA.
+- Version bump: `6.7.0` -> `6.7.1`.
+
+See `docs/plans/2026-08-12-deploy-safe-boot-spec.md` (workspace root, not
+shipped) for the full incident writeup and council amendment.
+
 ## Unreleased -- data-quality fixes (I5, I5b, I1, IncompleteSession), schema_version baseline + maintenance scripts
 
 > ⚠️ **ACTION REQUIRED ON UPGRADE IF LEGACY DATA IS PRESENT.**
