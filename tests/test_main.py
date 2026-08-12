@@ -1316,7 +1316,7 @@ async def test_lifespan_seeds_counters_from_disk(tmp_path: Path) -> None:
     await seed_qm.append(sid, line1)
     await seed_qm.append(sid, line2)
     committed = len(line1) + 1  # +1 for the appended trailing newline
-    await seed_qm.commit(sid, committed)
+    await seed_qm.commit(sid, committed, None)
 
     # Fresh registry reusing the same on-disk queue dir.
     reg = SessionRegistry()

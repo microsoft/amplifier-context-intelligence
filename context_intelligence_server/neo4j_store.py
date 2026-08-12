@@ -15,12 +15,14 @@ import json
 import logging
 import re
 from collections.abc import Generator
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, LiteralString, cast
 
 from neo4j import AsyncGraphDatabase
 from neo4j import unit_of_work as _unit_of_work
 from neo4j.exceptions import DriverError, Neo4jError
+
+from context_intelligence_server.status import SCHEMA_VERSION
 
 _LOG = logging.getLogger(__name__)
 
@@ -900,7 +902,111 @@ async def ensure_neo4j_schema(
             and fully_established
         )
 
+        # NOTE: the :SchemaMeta baseline singleton (§10.2 of the cursor-
+        # durability spec) is deliberately NOT created here. This function
+        # runs on THREE paths with very different frequency/concurrency
+        # characteristics: the lifespan startup handler (once), EVERY
+        # Neo4jGraphStore's first flush via ``_ensure_schema`` (one store per
+        # SessionWorker -- i.e. once per worker, concurrently, on every cold
+        # start), and ``run_repair``/``doctor --fix``. A SchemaMeta write
+        # belongs on the startup-only, single-writer path -- see
+        # ``ensure_schema_version_baseline`` below, called exactly once from
+        # ``main.py``'s lifespan handler AFTER this function establishes the
+        # rest of the schema.
+
         return fully_established
+
+
+async def ensure_schema_version_baseline(
+    driver: Any,
+    *,
+    database: str = "neo4j",
+) -> None:
+    """Create the :SchemaMeta uniqueness constraint and baseline singleton.
+
+    BASELINE ONLY (§10.2 of the cursor-durability spec) — create-if-absent,
+    no comparison/migration. Call this **exactly once, from the lifespan
+    startup handler**, AFTER ``ensure_neo4j_schema`` has established the rest
+    of the schema (indexes + uniqueness constraints).
+
+    Why this is its own function, not part of ``ensure_neo4j_schema``:
+    ``ensure_neo4j_schema`` also runs on every ``Neo4jGraphStore``'s first
+    flush via ``_ensure_schema`` (one store per SessionWorker — so once per
+    worker, concurrently, on every cold start) and from
+    ``run_repair``/``doctor --fix``. A SchemaMeta baseline write is a
+    single-writer, startup-only concern; living inside ``ensure_neo4j_schema``
+    would have it fire redundantly (and concurrently) on every worker's first
+    flush instead.
+
+    Ordering matters: the uniqueness constraint on ``(:SchemaMeta).id`` is
+    created FIRST, then the singleton MERGE. This is what makes the
+    create-if-absent MERGE race-free even under concurrent callers — without
+    the constraint, two concurrent MERGEs on a fresh database can each pass
+    the existence check and both create a ``{id: 'singleton'}`` node.
+
+    ``ON CREATE SET`` ONLY: if the node already exists it is left untouched.
+    Reconciling an existing node's ``schema_version`` against the running
+    server's value is deliberately deferred "handling" logic for a later
+    phase — do NOT add an ``ON MATCH SET`` here, and do NOT add a helper
+    that both reads ``SCHEMA_VERSION`` and mutates this node (that coupling
+    is exactly what would let comparison/upgrade logic sneak in unreviewed).
+    The read path (``GET /version``) and this write path stay structurally
+    separate.
+
+    O(1): a single constraint DDL statement plus a MERGE on a fixed singleton
+    key. Never a graph scan.
+
+    Non-fatal by design: any ``Neo4jError``/``DriverError`` here (including a
+    connectivity blip) is logged as a WARNING and swallowed rather than
+    raised, mirroring the tolerant try/except pattern used throughout
+    ``ensure_neo4j_schema`` — a transient failure on this passive data point
+    must never crash server boot.
+
+    Args:
+        driver:   An ``AsyncDriver`` instance created via
+                  ``AsyncGraphDatabase.driver(...)``.
+        database: Target Neo4j database name (default: ``"neo4j"``).
+    """
+    try:
+        async with driver.session(database=database) as session:
+            try:
+                await session.run(
+                    "CREATE CONSTRAINT schemameta_id_unique IF NOT EXISTS "
+                    "FOR (m:SchemaMeta) REQUIRE m.id IS UNIQUE"
+                )
+            except (Neo4jError, DriverError) as exc:
+                if isinstance(exc, Neo4jError) and exc.code in _BENIGN_SCHEMA_CODES:
+                    _LOG.debug(
+                        "ensure_schema_version_baseline: SchemaMeta "
+                        "uniqueness constraint already present (benign "
+                        "concurrent-schema race, code=%s)",
+                        exc.code,
+                    )
+                else:
+                    _LOG.warning(
+                        "ensure_schema_version_baseline: could not create "
+                        "SchemaMeta uniqueness constraint; continuing "
+                        "without it: %s",
+                        exc,
+                    )
+
+            await session.run(
+                "MERGE (m:SchemaMeta {id: 'singleton'}) "
+                "ON CREATE SET m.schema_version = $schema_version, "
+                "m.last_updated = $now",
+                schema_version=SCHEMA_VERSION,
+                now=datetime.now(UTC).isoformat(),
+            )
+    except (Neo4jError, DriverError) as exc:
+        # Mirror the tolerance pattern in ensure_neo4j_schema: never let a
+        # connectivity blip here escape and crash server startup over a
+        # passive baseline data point.
+        _LOG.warning(
+            "ensure_schema_version_baseline: could not write SchemaMeta "
+            "baseline singleton (connectivity error); continuing without "
+            "it: %s",
+            exc,
+        )
 
 
 def _serialized_row_size(value: Any) -> int:

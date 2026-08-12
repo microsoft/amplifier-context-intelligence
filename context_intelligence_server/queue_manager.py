@@ -4,8 +4,20 @@ Disk layout (one set of files per session, keyed by ``session_id``):
 
 - ``<session_id>.log`` — append-only, newline-terminated, opaque ``bytes``.
   Each line is one enqueued record. The log is never rewritten in place.
-- ``<session_id>.offset`` — a single integer: the byte position in the log
-  that has been durably processed (committed). A missing offset file means 0.
+- ``<session_id>.offset`` — a single JSON record, written atomically:
+  ``{"v": 1, "offset": <int>, "cursor": <dict | null>}``. ``offset`` is the
+  byte position in the log that has been durably processed (committed);
+  ``cursor`` is an opaque snapshot of cross-handler session state
+  (``HookStateService.snapshot_cursor()``), persisted so a worker rebuild
+  (crash restart or stale-session reap) restores its in-memory cursor
+  instead of resetting it. The cursor is written INSIDE the same atomic
+  ``os.replace`` as the offset — never as a separate file — so the two can
+  never skew relative to each other: a crash mid-write loses both together,
+  and a successful write always carries a cursor consistent with its offset.
+  Legacy files whose content is a bare integer (pre-upgrade shape) are still
+  accepted on read and yield ``cursor = None``; the next commit rewrites the
+  file in the new JSON form. A missing offset file means offset 0, cursor
+  ``None``.
 - ``<session_id>.dead.jsonl`` — append-only dead-letter records for batches
   that could not be processed after exhausting retries.
 
@@ -13,7 +25,8 @@ Durability note:
     Appends use a plain durable ``write()``. This gives PROCESS-crash
     durability (the bytes are handed to the OS page cache and survive a
     process crash). POWER-LOSS durability via ``fsync`` is deliberately
-    deferred to Phase B3 (fsync group-commit).
+    deferred to Phase B3 (fsync group-commit). This applies equally to the
+    offset+cursor record: no ``fsync`` is issued on that write either.
 
 session_id contract:
     Every public method validates ``session_id`` and raises ``ValueError`` if
@@ -88,13 +101,66 @@ class QueueManager:
     def _dead_path(self, session_id: str) -> Path:
         return self._dir / f"{session_id}.dead.jsonl"
 
-    def _read_committed_offset(self, session_id: str) -> int:
+    def _write_offset_record(
+        self, key: str, offset: int, cursor: dict[str, Any] | None
+    ) -> None:
+        """Sole writer of the ``.offset`` file — a single atomic JSON record.
+
+        Writes ``{"v": 1, "offset": offset, "cursor": cursor}`` to a temp file
+        and ``os.replace``s it into place, so a reader never observes a torn
+        or partial record. Folding the cursor into the same record as the
+        offset (rather than a sidecar file) is what guarantees the two can
+        never skew: a crash loses both together, never one without the other.
+        No ``fsync`` — same process-crash-durable, not-power-durable contract
+        as the rest of this module.
+        """
+        final = self._offset_path(key)
+        tmp = self._dir / f"{key}.offset.tmp"
+        record = {"v": 1, "offset": offset, "cursor": cursor}
+        tmp.write_text(json.dumps(record, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, final)
+
+    def _read_offset_record(self, key: str) -> tuple[int, dict[str, Any] | None]:
+        """Read the ``.offset`` file, returning ``(offset, cursor)``.
+
+        Accepts both the current JSON record shape and the legacy bare-integer
+        shape (pre-upgrade). A missing or empty file yields ``(0, None)``.
+
+        Cursor unreadability degrades to ``None`` (D5: never crash boot over a
+        corrupt/unknown cursor) — an unknown ``v`` or non-dict ``cursor``
+        silently discards the cursor while still honoring the offset. Offset
+        unreadability is NOT degraded: a malformed record (bad JSON, or an
+        ``offset`` that isn't an int) raises ``ValueError`` loudly, exactly as
+        the legacy ``int(text)`` parse did — degrading a corrupt offset to 0
+        would replay the entire log and manufacture duplicate nodes, which is
+        a worse and quieter failure than a loud boot error.
+        """
         try:
-            text = self._offset_path(session_id).read_text("utf-8")
+            text = self._offset_path(key).read_text("utf-8")
         except FileNotFoundError:
-            return 0
+            return 0, None
         text = text.strip()
-        return int(text) if text else 0
+        if not text:
+            return 0, None
+        if text.startswith("{"):
+            try:
+                rec = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Malformed offset record for {key!r}: {exc}") from exc
+            offset = rec.get("offset")
+            if not isinstance(offset, int):
+                raise ValueError(
+                    f"Malformed offset record for {key!r}: offset is not an int"
+                )
+            cursor = rec.get("cursor")
+            if rec.get("v") == 1 and isinstance(cursor, dict):
+                return offset, cursor
+            return offset, None
+        # Legacy bare-integer shape.
+        return int(text), None
+
+    def _read_committed_offset(self, session_id: str) -> int:
+        return self._read_offset_record(session_id)[0]
 
     def _complete_data_end(self, session_id: str) -> int:
         """Byte position after the last complete (newline-terminated) line.
@@ -217,23 +283,29 @@ class QueueManager:
 
         return await asyncio.to_thread(_read)
 
-    async def commit(self, session_id: str, new_offset: int) -> None:
-        """Atomically and durably persist ``new_offset`` (the ack).
+    async def commit(
+        self,
+        session_id: str,
+        new_offset: int,
+        cursor: dict[str, Any] | None,
+    ) -> None:
+        """Atomically and durably persist ``new_offset`` (the ack) + ``cursor``.
 
-        Writes the offset to a temp file and uses ``os.replace`` for an atomic
-        rename, so a reader never observes a torn or partial offset file. No
-        ``fsync`` is issued here: this gives process-crash durability, while
-        power-loss durability is deferred to Phase B3 (fsync group-commit).
+        ``cursor`` has NO default: every call site must spell it explicitly
+        (a deliberate footgun-avoidance choice — see spec §10.4) so it is
+        never accidentally omitted at a commit site.
+
+        Writes the offset+cursor record to a temp file and uses ``os.replace``
+        for an atomic rename, so a reader never observes a torn or partial
+        offset file. No ``fsync`` is issued here: this gives process-crash
+        durability, while power-loss durability is deferred to Phase B3 (fsync
+        group-commit). Folding the cursor into this same atomic write (D1) is
+        what makes offset and cursor always advance together — never skewed.
         """
         self._validate_session_id(session_id)
-        final = self._offset_path(session_id)
-        tmp = self._dir / f"{session_id}.offset.tmp"
-
-        def _commit() -> None:
-            tmp.write_text(str(new_offset), encoding="utf-8")
-            os.replace(tmp, final)
-
-        await asyncio.to_thread(_commit)
+        await asyncio.to_thread(
+            self._write_offset_record, session_id, new_offset, cursor
+        )
 
     async def dead_letter(self, session_id: str, raw: bytes, error: str) -> None:
         """Append one dead-letter record for an unprocessable batch line.
@@ -280,6 +352,16 @@ class QueueManager:
                     pass
 
         await asyncio.to_thread(_delete)
+
+    async def read_cursor(self, session_id: str) -> dict[str, Any] | None:
+        """Return the persisted cursor for ``session_id``, or ``None``.
+
+        ``None`` covers: no offset file, a legacy bare-integer offset file, or
+        a JSON record whose cursor is absent/unreadable (D5 safe-degrade —
+        see ``_read_offset_record``).
+        """
+        self._validate_session_id(session_id)
+        return await asyncio.to_thread(lambda: self._read_offset_record(session_id)[1])
 
     async def read_dead_letters(self, session_id: str) -> list[dict]:
         """Return all dead-letter records for ``session_id`` in append order.
@@ -707,7 +789,7 @@ class QueueManager:
                 log_path = self._log_path(key)
                 if not log_path.exists():
                     continue
-                committed = self._read_committed_offset(key)
+                committed, cursor = self._read_offset_record(key)
                 complete_end = self._complete_data_end(key)
                 pos = committed
                 with open(log_path, "rb") as f:
@@ -721,10 +803,12 @@ class QueueManager:
                         pos += len(raw)
                         total_skipped += 1
                 if pos > committed:
-                    final = self._offset_path(key)
-                    tmp = self._dir / f"{key}.offset.tmp"
-                    tmp.write_text(str(pos), encoding="utf-8")
-                    os.replace(tmp, final)
+                    # Lines skipped here were dead-lettered and therefore never
+                    # dispatched to handlers, so the cursor is unchanged and
+                    # MUST be carried through unmodified (spec §5.1, R2):
+                    # dropping it here would silently wipe cross-handler state
+                    # on the recovery path.
+                    self._write_offset_record(key, pos, cursor)
             self._stats_cache = None
             return total_skipped
 

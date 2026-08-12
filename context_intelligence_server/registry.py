@@ -22,6 +22,13 @@ logger = logging.getLogger("context_intelligence_server")
 _DRAIN_MAX_BATCH = 100
 _DRAIN_POLL_INTERVAL = 0.05  # idle poll cadence; bounded by flush_timeout
 
+# R3 (spec §10.4): pending_tool_block_ids is unbounded and now serialized on
+# every commit (§3 D2). We measure, we do not cap -- capping at serialization
+# would silently drop E09 edges. Only log once the dict is non-trivially
+# sized, so a healthy session (a handful of in-flight tool blocks) never
+# spams a commit-cadence (as frequent as every ~100 events) log line.
+_PENDING_TOOL_BLOCK_LOG_THRESHOLD = 50
+
 # A positive residual must PERSIST this long before it is called degraded.
 # Must exceed the worst-case transient-skew window: the derive_all_stats
 # cache TTL (1.0s) plus the /status poll cadence (~3s). 15s is >10x the cache
@@ -283,6 +290,23 @@ class SessionRegistry:
                 )
             )
 
+    def _log_pending_tool_block_size(self, worker: SessionWorker) -> None:
+        """R3 measurement (spec §10.4): observe ``pending_tool_block_ids``
+        growth at the commit path -- the dict is populated at
+        content_block.py and only drained by a matching tool_call:start pop,
+        so unmatched blocks accumulate for the life of the session and are
+        now serialized on every commit. Measure, do not cap: capping at
+        serialization would silently drop E09 CAUSED edges.
+        """
+        size = len(worker.services.data_layer_2.pending_tool_block_ids)
+        if size > _PENDING_TOOL_BLOCK_LOG_THRESHOLD:
+            logger.info(
+                "pending_tool_block_ids_size session=%s size=%d",
+                worker.session_id,
+                size,
+                extra={"session_id": worker.session_id},
+            )
+
     async def _flush_barrier(self, worker: SessionWorker) -> None:
         """The ONE Neo4j-write boundary: a semaphore-gated, awaited flush.
 
@@ -320,6 +344,19 @@ class SessionRegistry:
         handlers = setup_handlers(worker.services)
         qm = self.queue_manager
         session_id = worker.session_id
+        # I5b: restore the cross-handler cursor persisted alongside the
+        # committed offset. Covers BOTH worker-rebuild triggers through this
+        # single entry point: a crash-restart recovery (main.py) and a
+        # stale-session reap rebuild (this method, below) both spawn the new
+        # worker through get_or_create -> start_drain -> drain_worker.
+        restored_cursor = await qm.read_cursor(session_id)
+        worker.services.restore_cursor(restored_cursor)
+        if restored_cursor:
+            logger.info(
+                "cursor_restored session=%s",
+                session_id,
+                extra={"session_id": session_id},
+            )
         poll_interval = min(flush_timeout, _DRAIN_POLL_INTERVAL)
         idle_elapsed = 0.0
         attempts = 0
@@ -403,7 +440,10 @@ class SessionRegistry:
                     continue
 
                 attempts = 0
-                await qm.commit(session_id, batch.end_offset)
+                self._log_pending_tool_block_size(worker)
+                await qm.commit(
+                    session_id, batch.end_offset, worker.services.snapshot_cursor()
+                )
                 self.record_written(len(batch.lines))
                 logger.debug(
                     "batch_committed events=%d offset=%d",
@@ -453,6 +493,15 @@ class SessionRegistry:
         good lines flush normally. Every line advances the offset past itself
         (commit), so the whole batch is accounted for. No silent loss, no
         binary shrink, no cross-line contamination.
+
+        BLOCKER-1 (phantom-cursor guard, R6xD1): handlers mutate cross-handler
+        cursor state (e.g. IterationHandler sets active_iteration_id /
+        iteration_count) BEFORE their graph write. If that write is the one
+        that fails, discard_buffer() throws away the write but NOT the
+        already-applied in-memory mutation. A pre-line cursor snapshot is
+        taken and, when the line ends up dead-lettered, restored — so the
+        commit below can never persist a cursor pointing at a node that was
+        never written. A line that succeeds keeps its mutation untouched.
         """
         qm = self.queue_manager
         session_id = worker.session_id
@@ -464,6 +513,7 @@ class SessionRegistry:
         offset = batch.start_offset
         for raw in batch.lines:
             line_end = offset + len(raw) + 1  # +1 for the newline read_batch strips
+            pre_line_cursor = worker.services.snapshot_cursor()
             try:
                 event, _ws, data = self._parse_line(raw)
                 await self._process_one(worker, event, data, handlers)
@@ -481,7 +531,13 @@ class SessionRegistry:
                 # it cannot contaminate the NEXT line's flush. A successful flush
                 # clears the buffer itself; only the failure path needs this.
                 worker.services.graph.discard_buffer()
-            await qm.commit(session_id, line_end)
+                # BLOCKER-1: roll the cursor back to its pre-line state so this
+                # line's in-memory mutation (already applied by the handler
+                # before the write above failed) does not enter the committed
+                # snapshot below — its graph write was just discarded.
+                worker.services.restore_cursor(pre_line_cursor)
+            self._log_pending_tool_block_size(worker)
+            await qm.commit(session_id, line_end, worker.services.snapshot_cursor())
             offset = line_end
 
     async def _finalize_session(self, worker: SessionWorker, handlers: Any) -> None:
@@ -501,7 +557,10 @@ class SessionRegistry:
             except Exception:
                 logger.exception("finalize_tail_flush_failed session=%s", session_id)
                 return  # NOT finalized: keep worker alive, leave tail uncommitted
-            await qm.commit(session_id, tail.end_offset)
+            self._log_pending_tool_block_size(worker)
+            await qm.commit(
+                session_id, tail.end_offset, worker.services.snapshot_cursor()
+            )
             self.record_written(len(tail.lines))
             logger.debug(
                 "batch_committed events=%d offset=%d",

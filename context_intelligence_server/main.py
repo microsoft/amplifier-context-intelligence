@@ -43,6 +43,7 @@ from context_intelligence_server.models import (
 from context_intelligence_server.neo4j_store import (
     count_untagged_nodes,
     ensure_neo4j_schema,
+    ensure_schema_version_baseline,
 )
 from context_intelligence_server.registry import SessionRegistry
 from context_intelligence_server.routers.admin import router as admin_router
@@ -275,6 +276,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "(un-migrated). Cold start refuses to boot to avoid duplicating "
             "them on write. Run: context-intelligence-server doctor --fix"
         )
+    # SchemaMeta baseline singleton (§10.2 of the cursor-durability spec).
+    # Deliberately called ONLY here -- startup, single-writer -- NOT from
+    # ensure_neo4j_schema (which also runs on every Neo4jGraphStore's first
+    # flush and from doctor --fix; see ensure_schema_version_baseline's
+    # docstring for why that would be redundant/concurrent instead of
+    # single-writer). Must run AFTER ensure_neo4j_schema above so the rest of
+    # the schema (indexes/constraints) is already established. Non-fatal by
+    # design (see docstring): never raises, so it cannot block server boot.
+    await ensure_schema_version_baseline(app.state.neo4j_driver)
     # Crash recovery (decisions #5/#6): on startup, respawn one drainer per
     # session that still has an undrained, complete line. The workspace is
     # parsed from that session's FIRST log line so the respawned worker is

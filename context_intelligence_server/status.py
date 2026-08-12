@@ -13,6 +13,16 @@ from context_intelligence_server.config import get_settings
 # Resolved once at import time — never changes within a process lifetime.
 SERVER_VERSION: str = _pkg_version("context-intelligence-server")
 
+# Baseline data point only (§10.2 of the cursor-durability spec): a plain integer
+# answering ONLY "does the server's expected schema match the DB's stored schema,
+# yes/no". Covers BOTH the graph schema (indexes/constraints) AND the additive
+# `Iteration.iteration_scope` property — one number for the whole current graph
+# shape. No semantic/dotted versioning. Comparison/upgrade/migration logic that
+# ACTS on this value is deliberately deferred to a later phase — this is a passive
+# data point, exposed read-only via /version and written create-if-absent to
+# Neo4j (see `ensure_neo4j_schema` in neo4j_store.py).
+SCHEMA_VERSION: int = 1
+
 if TYPE_CHECKING:
     from context_intelligence_server.registry import SessionRegistry
 
