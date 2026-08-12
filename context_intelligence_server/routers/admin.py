@@ -33,13 +33,20 @@ log line to stdout → Log Analytics; raw keys are NEVER logged.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from neo4j import READ_ACCESS, WRITE_ACCESS
 from pydantic import BaseModel, field_validator
 
-from context_intelligence_server.config import _ALL_ZEROS_GUID, _GUID_RE
+from context_intelligence_server.config import _ALL_ZEROS_GUID, _GUID_RE, get_settings
 from context_intelligence_server.identity_store import IdentityStore
 
 # ---------------------------------------------------------------------------
@@ -52,6 +59,21 @@ _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 # Maximum contributor id length (TB-12).  Matches the cap implied by config
 # (non-empty, non-whitespace, sane upper bound for an identifier string).
 _MAX_CONTRIBUTOR_LEN = 256
+
+# ---------------------------------------------------------------------------
+# Blob-reclaim constants (see docs/plans/2026-08-12-blob-reclaim-endpoint-spec.md,
+# "Council amendment -- AUTHORITATIVE" section for the governing design)
+# ---------------------------------------------------------------------------
+
+# B3 (council amendment): hard mtime-floor safety net, defense-in-depth behind
+# the durable undrained-queue gate. min_age_minutes below this is rejected
+# (422) rather than silently raised -- a caller passing 0 must not be able to
+# disable the age gate entirely.
+_MIN_AGE_FLOOR_MINUTES = 15
+
+# "sample" is bounded to keep the response small; totals (orphans_found,
+# reclaimable_bytes) remain authoritative even when the sample is truncated.
+_MAX_SAMPLE = 50
 
 # ---------------------------------------------------------------------------
 # Module-level audit logger
@@ -309,6 +331,244 @@ def _audit_delete(request: Request, *, target: str) -> None:
     )
 
 
+def _audit_blob_reclaim_delete(request: Request, *, uri: str) -> None:
+    """Emit one structured audit log line per successfully-deleted blob.
+
+    NEVER logs blob contents -- only the ``ci-blob://`` URI is recorded.
+    """
+    logger.info(
+        "admin.audit action=blob_reclaim target=%s who=%s",
+        uri,
+        _admin_who(request),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Blob reclaim -- orphaned-blob GC (design: docs/plans/2026-08-12-blob-
+# reclaim-endpoint-spec.md, "Council amendment -- AUTHORITATIVE" section)
+# ---------------------------------------------------------------------------
+
+
+def _access_mode_const(mode: str) -> str:
+    """Map the configured query access-mode string ("READ"/"WRITE") to the
+    driver's access-mode constant.
+
+    Deliberately duplicated (not imported) from ``main._neo4j_access_const``:
+    importing from ``main`` here would create a circular import (``main``
+    already imports ``routers.admin`` at module load time). Two lines of
+    duplication is cheaper than that coupling.
+    """
+    return READ_ACCESS if mode == "READ" else WRITE_ACCESS
+
+
+@dataclass(frozen=True)
+class _OnDiskBlob:
+    """One blob file discovered on disk during the reclaim scan."""
+
+    session_id: str
+    key: str
+    uri: str
+    path: Path
+    mtime: float
+    size: int
+
+
+def _scan_disk_blobs(blob_root: Path) -> list[_OnDiskBlob]:
+    """Enumerate on-disk blobs under *blob_root* (step 1 of the design).
+
+    Walks ``<blob_root>/*/blobs/*.json`` -- the exact layout
+    ``AsyncDiskBlobStore`` writes to (``blob_store.py``). ``*.tmp`` residue
+    from an in-progress write (``tempfile.mkstemp(..., suffix=".tmp")``) is
+    skipped defensively, though the ``*.json`` glob already excludes it.
+    A file that vanishes between the glob listing and ``stat()`` (e.g. a
+    concurrent delete) is silently skipped rather than raising.
+    """
+    blobs: list[_OnDiskBlob] = []
+    for p in blob_root.glob("*/blobs/*.json"):
+        if p.name.endswith(".tmp"):
+            continue
+        session_id = p.parent.parent.name
+        key = p.stem
+        try:
+            st = p.stat()
+        except FileNotFoundError:
+            continue
+        blobs.append(
+            _OnDiskBlob(
+                session_id=session_id,
+                key=key,
+                uri=f"ci-blob://{session_id}/{key}",
+                path=p,
+                mtime=st.st_mtime,
+                size=st.st_size,
+            )
+        )
+    return blobs
+
+
+def _collect_blob_refs(obj: Any, out: set[str]) -> None:
+    """Recursively walk a decoded JSON value collecting ``$blob_ref`` URIs.
+
+    B2 (council amendment, highest severity): this is STRUCTURAL extraction
+    over the parsed object, never a regex over the serialized string. A
+    regex anchored on ``ci-blob://`` truncates at the first unescaped
+    special character (e.g. a literal ``"`` in a session_id, which
+    ``queue_manager._validate_session_id`` explicitly permits -- it only
+    rejects ``/ \\ \\0``), silently misclassifying a genuinely-referenced
+    blob as orphan. ``json.loads`` has already resolved all escaping by the
+    time this function runs, so any character in a URI (quotes, non-ASCII)
+    is handled correctly -- there is no APOC path and no regex path.
+    """
+    if isinstance(obj, dict):
+        ref = obj.get("$blob_ref")
+        if isinstance(ref, str):
+            out.add(ref)
+        for v in obj.values():
+            _collect_blob_refs(v, out)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_blob_refs(item, out)
+
+
+async def _scan_referenced_uris(request: Request) -> set[str]:
+    """Enumerate every ``ci-blob://`` URI referenced anywhere in the graph.
+
+    Step 2 of the design -- deliberately GLOBAL, never workspace-filtered
+    (hazard #1): blobs are session_id-scoped while nodes are
+    (node_id, workspace)-scoped, so a per-workspace scan could delete another
+    workspace's live data.
+
+    B1 (council amendment): the scan enumerates ``:Event.data`` only. This is
+    the complete reference carrier by pipeline ordering, not by contract --
+    ``DefaultHandler`` (handlers/data_layer_1/default.py) fires on EVERY
+    unclaimed event and stores the full ``data`` (including ``tool_input``
+    and any ``$blob_ref`` already written by ``blob_processor.py``) as
+    ``json.dumps(data)`` on ``:Event.data`` BEFORE any field-lifter runs and
+    strips/promotes individual fields. See
+    ``tests/neo4j/test_blob_reclaim.py::test_b1_event_data_carries_every_blob_ref``
+    for the regression test that pins this invariant.
+
+    B2 (council amendment): APOC is NOT used here (removed entirely, no
+    dual-path). Each matching row's ``data`` is ``json.loads``-ed and walked
+    structurally by :func:`_collect_blob_refs`. A malformed/non-JSON ``data``
+    value is logged and skipped conservatively -- it can never positively
+    assert an orphan, only fail to positively assert a reference.
+
+    Streams rows via the async driver iterator rather than materializing all
+    ``data`` strings at once (only the resulting, much smaller, URI set is
+    retained), per the design's "bound its own work" cost note.
+    """
+    driver = request.app.state.neo4j_query_driver
+    access_mode = _access_mode_const(request.app.state.neo4j_query_access_mode)
+    referenced: set[str] = set()
+    async with driver.session(default_access_mode=access_mode) as session:
+        # B1: :Event.data is scanned because DefaultHandler persists the full
+        # event data (all $blob_ref values, pre-field-lifting) on every
+        # unclaimed event -- see the docstring above.
+        result = await session.run(
+            "MATCH (n:Event) WHERE n.data CONTAINS 'ci-blob://' RETURN n.data AS data"
+        )
+        async for record in result:
+            data_str = record["data"]
+            try:
+                obj = json.loads(data_str)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "blob_reclaim: unparseable Event.data encountered during "
+                    "reference scan -- skipped conservatively (never causes "
+                    "a delete, may only miss a reference)"
+                )
+                continue
+            _collect_blob_refs(obj, referenced)
+    return referenced
+
+
+async def _select_orphans(request: Request, *, min_age_minutes: int) -> dict[str, Any]:
+    """The ONE selection path shared by dry-run and apply (I5b hard rule).
+
+    Returns a dict with every response field EXCEPT ``dry_run``/``sample``/
+    ``rescanned``/``deleted``/``deleted_bytes`` (the caller fills those in),
+    plus a ``candidates`` key (list[_OnDiskBlob], sorted by uri for
+    deterministic sampling/capping) that the caller pops before returning the
+    response and uses to actually delete in apply mode.
+
+    Safety gates applied to every on-disk blob not in the referenced set
+    (step 3 of the design):
+      1. Undrained-queue gate (primary, durable -- B3): skipped when the
+         session has a live worker (``registry.active_sessions()``) OR its
+         queue is not fully drained (``QueueManager.is_fully_drained``,
+         durable across restarts). Counted as ``skipped_pending_session``.
+      2. mtime floor (defense-in-depth -- B3): skipped when younger than
+         ``min_age_minutes`` (already clamped >= ``_MIN_AGE_FLOOR_MINUTES`` by
+         the request body validator). Counted as ``skipped_recent``.
+    """
+    settings = get_settings()
+    blob_root = Path(settings.blob_path)
+    disk_blobs = _scan_disk_blobs(blob_root)
+
+    referenced = await _scan_referenced_uris(request)
+
+    registry = request.app.state.registry
+    queue_manager = registry.queue_manager
+    live_workers = set(registry.active_sessions())
+
+    now = time.time()
+    age_cutoff_seconds = min_age_minutes * 60
+
+    candidates: list[_OnDiskBlob] = []
+    skipped_recent = 0
+    skipped_pending_session = 0
+    reclaimable_bytes = 0
+
+    for blob in disk_blobs:
+        if blob.uri in referenced:
+            continue
+        if blob.session_id in live_workers or not await queue_manager.is_fully_drained(
+            blob.session_id
+        ):
+            skipped_pending_session += 1
+            continue
+        if now - blob.mtime < age_cutoff_seconds:
+            skipped_recent += 1
+            continue
+        candidates.append(blob)
+        reclaimable_bytes += blob.size
+
+    candidates.sort(key=lambda b: b.uri)
+
+    return {
+        "scanned_disk_blobs": len(disk_blobs),
+        "referenced_uris": len(referenced),
+        "orphans_found": len(candidates),
+        "reclaimable_bytes": reclaimable_bytes,
+        "skipped_recent": skipped_recent,
+        "skipped_pending_session": skipped_pending_session,
+        "candidates": candidates,
+    }
+
+
+class BlobReclaimBody(BaseModel):
+    """Body for POST /admin/blobs/reclaim."""
+
+    dry_run: bool = True
+    min_age_minutes: int = 60
+    max_delete: int | None = None
+
+    @field_validator("min_age_minutes")
+    @classmethod
+    def _min_age_at_least_floor(cls, v: int) -> int:
+        """B3 (council amendment): reject (422) below the hard safety floor
+        rather than silently raising -- a caller passing 0 must not be able
+        to disable the age gate.
+        """
+        if v < _MIN_AGE_FLOOR_MINUTES:
+            raise ValueError(
+                f"min_age_minutes must be >= {_MIN_AGE_FLOOR_MINUTES} "
+                f"(hard safety floor); got {v}"
+            )
+        return v
+
+
 # ---------------------------------------------------------------------------
 # Per-request store dependencies (via app.state — no circular import)
 # ---------------------------------------------------------------------------
@@ -544,3 +804,82 @@ def list_keys(
     return {
         "keys": [{"hash": h, "id": record.get("id", "")} for h, record in store.items()]
     }
+
+
+# --- Blob reclaim (orphaned-blob GC) ----------------------------------------
+
+
+@router.post("/blobs/reclaim", status_code=200)
+async def reclaim_blobs(body: BlobReclaimBody, request: Request) -> dict[str, Any]:
+    """Preview (dry-run) or apply reclamation of orphaned blob files.
+
+    An orphan is an on-disk blob (``<blob_path>/<session_id>/blobs/<key>.json``)
+    whose ``ci-blob://`` URI is referenced by NO ``:Event.data`` anywhere in
+    the graph (scanned globally, across ALL workspaces), and whose session is
+    both fully drained (durable ``QueueManager`` state, not in-memory worker
+    liveness) and older than ``min_age_minutes``. See
+    ``docs/plans/2026-08-12-blob-reclaim-endpoint-spec.md`` for the full
+    design and its council-mandated safety amendments (B1-B3).
+
+    ``dry_run=true`` (default) computes and reports the candidate set without
+    deleting anything. ``dry_run=false`` requires ``max_delete`` (422
+    otherwise -- a conscious blast-radius opt-in for an irreversible,
+    cross-workspace delete) and performs its OWN fresh, authoritative
+    ``_select_orphans`` scan at delete time (``rescanned: true`` in the
+    response) -- it never deletes a URI that is referenced or pending at the
+    moment of deletion, independent of any earlier dry-run preview.
+
+    Deletion is a direct ``os.unlink`` on the blob path (idempotent -- a file
+    already gone is a no-op) capped at ``max_delete``; ``orphans_found`` and
+    ``reclaimable_bytes`` always reflect the FULL candidate set even when
+    ``max_delete`` caps how many are actually removed. One structured audit
+    log line is emitted per successful delete; blob CONTENTS are never
+    logged, only the ``ci-blob://`` URI.
+    """
+    if not body.dry_run and body.max_delete is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "max_delete is required when dry_run=false -- a conscious "
+                "blast-radius opt-in for an irreversible, cross-workspace "
+                "delete. Omit dry_run (or set it true) to preview first."
+            ),
+        )
+
+    # I5b: the ONE selection path. In apply mode this call itself IS the
+    # "own authoritative fresh scan at delete time" the design requires --
+    # there is no earlier cached scan in this request to grow stale.
+    selection = await _select_orphans(request, min_age_minutes=body.min_age_minutes)
+    candidates: list[_OnDiskBlob] = selection.pop("candidates")
+
+    response: dict[str, Any] = {
+        "dry_run": body.dry_run,
+        **selection,
+        "sample": [b.uri for b in candidates[:_MAX_SAMPLE]],
+        "rescanned": not body.dry_run,
+        "deleted": 0,
+        "deleted_bytes": 0,
+    }
+
+    if body.dry_run:
+        return response
+
+    assert body.max_delete is not None  # guaranteed by the 422 guard above
+    deleted = 0
+    deleted_bytes = 0
+    # TOCTOU note: low severity (an unlink of an already-gone file is a
+    # no-op below); this loop runs immediately after the fresh scan above,
+    # well within the age floor, so the window is negligible -- stated, not
+    # assumed (design "RISKS folded in").
+    for blob in candidates[: body.max_delete]:
+        try:
+            os.unlink(blob.path)
+        except FileNotFoundError:
+            continue  # already gone -- idempotent, not an error
+        deleted += 1
+        deleted_bytes += blob.size
+        _audit_blob_reclaim_delete(request, uri=blob.uri)
+
+    response["deleted"] = deleted
+    response["deleted_bytes"] = deleted_bytes
+    return response

@@ -379,6 +379,30 @@ class QueueManager:
 
         return await asyncio.to_thread(_read)
 
+    async def is_fully_drained(self, session_id: str) -> bool:
+        """Return True iff *session_id* has no undrained (unprocessed) log data.
+
+        Durable-state predicate (B3 of the blob-reclaim design, `docs/plans/
+        2026-08-12-blob-reclaim-endpoint-spec.md`): mirrors the per-session
+        check inside :meth:`recover` (committed offset >= complete-data end
+        means fully drained). Derived purely from the ``.log``/``.offset``
+        files on disk, so it is independent of in-memory worker liveness and
+        survives a `kill -9` + restart -- a crashed process's undrained queue
+        still reads as NOT drained here even though no worker is registered
+        for it.
+
+        A session with no ``.log`` file at all reads as fully drained
+        (``0 >= 0``), which is correct: it never had any queued data.
+        """
+        self._validate_session_id(session_id)
+
+        def _check() -> bool:
+            return self._read_committed_offset(session_id) >= self._complete_data_end(
+                session_id
+            )
+
+        return await asyncio.to_thread(_check)
+
     async def active_sessions(self) -> list[str]:
         """Return sorted session_ids with undrained data.
 
