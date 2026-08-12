@@ -23,6 +23,11 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 COPY pyproject.toml .
 COPY context_intelligence_server/ context_intelligence_server/
+# Ship the standalone, out-of-band maintenance/migration scripts in the image so
+# they can be run against a live deployment (e.g. `docker exec ... python
+# scripts/<name>.py`). These are data-rectification tools (never run at startup);
+# see CHANGELOG.md. Required for cloud VMs/ACI where there is no repo checkout.
+COPY scripts/ scripts/
 COPY docker-entrypoint.sh .
 RUN chmod +x docker-entrypoint.sh
 

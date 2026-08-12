@@ -6,7 +6,58 @@ point now exists (see below), but the *handling* machinery that would consume
 it -- a versioned migration manifest and an automated upgrade/rollback runner
 -- is deliberately deferred to a separate design.
 
-## Unreleased -- data-quality fixes (I5, I5b, I1), schema_version baseline + legacy-tagging script
+## Unreleased -- data-quality fixes (I5, I5b, I1, IncompleteSession), schema_version baseline + maintenance scripts
+
+> ⚠️ **ACTION REQUIRED ON UPGRADE IF LEGACY DATA IS PRESENT.**
+> This release changes `IncompleteSession` labeling. New events self-heal, but
+> **historical graphs carry ~52.8% stale `IncompleteSession` markers (~99% false
+> positives) that are NOT corrected automatically.** A one-off, out-of-band
+> reconciliation must be run **once** after this server is deployed and verified:
+>
+> 1. Deploy this release; confirm the server is up (Part 1 heal-forward is live).
+> 2. Read-only check + preview (safe, writes nothing):
+>    `python3 scripts/relabel_incomplete_sessions.py --dry-run`
+> 3. If the built-in reconciliation diagnostic is clean, apply once:
+>    `python3 scripts/relabel_incomplete_sessions.py --apply`
+>    (`--apply` self-refuses if the diagnostic finds unexpected data; idempotent —
+>    safe to re-run; writes an undo-log for `--restore`.)
+>
+> The maintenance scripts now ship **inside the Docker image** under `/app/scripts/`,
+> so on a VM/ACI deployment run them via `docker exec <container> python3
+> scripts/relabel_incomplete_sessions.py --dry-run`. Migrations are **never** run at
+> server startup. Fresh/empty graphs need no action. Tracking: amplifier-support#417.
+
+- **IncompleteSession mislabeling -- heal-forward + one-off backfill.**
+  `IncompleteSession` was a Neo4j label written once at `session:end` when the
+  Session node had no type label yet, and never revised. Forked sub-sessions drain
+  in independent per-session queues with no cross-session ordering, so a child's
+  `session:end` is routinely processed before its `session:fork`/`session:start` ->
+  `classify()` saw no type -> stamped `IncompleteSession`; the later `fork`/`start`
+  added the real terminal but never cleared the stale marker (live bisect: ~52.8%
+  of sessions labeled, ~99.4% false positives -- the node carries its own linked
+  start/fork event; genuine loss ~0.5%).
+  - **Heal-forward (code):** `classify()` now strips `IncompleteSession` on every
+    `start`/`fork` transition via a single `_heal_forward()` normalizer; the `end`
+    branch is unchanged (still the real signal for the genuine ~0.5%). Reuses the
+    existing `set_labels` remove path -- no store/Cypher change. Order-independent.
+  - **Backfill (data rectification, run once):** `scripts/relabel_incomplete_sessions.py`
+    -- standalone, out-of-band, idempotent. Clears `IncompleteSession` only from
+    provably-false-positive nodes (real terminal type OR a linked
+    `SessionStartEvent`/`SessionForkEvent`, following the
+    `(Session)-[:SOURCED_FROM]->(Event)` direction), leaving the genuine ~0.5%
+    untouched. `--apply` is hard-gated behind a read-only reconciliation diagnostic
+    (refuses if any linked-but-untyped nodes exist), batched via
+    `CALL {} IN TRANSACTIONS`, with a touched-id undo-log + `--restore` and a
+    before/after population summary. **SCHEMA_VERSION unchanged** (no bump; handling
+    deferred). See the upgrade notice above.
+
+- **Maintenance/migration scripts now ship in the Docker image.** `scripts/` is
+  `COPY`'d into the runtime image (`/app/scripts/`) so out-of-band data-rectification
+  tools (`relabel_incomplete_sessions.py`, `tag_legacy_pooled_iterations.py`,
+  `repair_dual_labels.py`, ...) can be run against a live cloud deployment via
+  `docker exec ... python3 scripts/<name>.py`. Previously these existed only in the
+  source tree and were unreachable from a running container. Invoke with `python3`
+  (the runtime image has no `python` alias).
 
 - **I5b -- durable handler cursor (fixes the I5 regression on worker rebuild).**
   The run cursor I5's `Iteration.node_id` depends on (`execution_start_ts`,
