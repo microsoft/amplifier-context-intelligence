@@ -10,7 +10,7 @@ import sys
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -144,120 +144,265 @@ def _recover_one_session(
     return True
 
 
+def _record_schema_health(
+    app: FastAPI,
+    constraint_established: bool,
+    untagged: int | None,
+) -> None:
+    """Compute and stash the tri-state schema-health signal on app.state.
+
+    Council amendment B3/B7 (deploy-safe boot, 2026-08-12): health is a
+    tri-state enum, never coerced to a false "healthy":
+
+    - ``"healthy"``  -- the :Node uniqueness constraint is established AND
+      the untagged-node probe ran and found 0.
+    - ``"degraded"`` -- the constraint is absent (a data conflict, logged
+      loudly by ``ensure_neo4j_schema``/B4) OR the probe found untagged
+      nodes. Bounded/repairable, but never silent.
+    - ``"unknown"``  -- *untagged* is None, meaning the probe itself could
+      not run (Neo4j unreachable, credential rejection, etc). A probe that
+      cannot answer must say so, not report green (B3).
+
+    Written prohibition (B7): this is a **data-migration** signal, computed
+    once at boot. It MUST NOT be wired to a Kubernetes/ACA liveness or
+    readiness probe -- doing so would recreate the exact crash-loop this fix
+    removes, one layer up. See docs/azure-deployment.md.
+    """
+    app.state.schema_untagged_nodes = untagged
+    app.state.schema_checked_at = datetime.now(UTC).isoformat()
+
+    if untagged is None:
+        app.state.schema_health = "unknown"
+        app.state.schema_degraded_reason = (
+            "untagged-node probe failed -- graph may be unreachable or "
+            "credentials rejected; schema state could not be determined"
+        )
+        return
+
+    reasons: list[str] = []
+    if not constraint_established:
+        reasons.append(":Node uniqueness constraint absent (data conflict)")
+    if untagged > 0:
+        reasons.append(f"{untagged} node(s) lacking the :Node label")
+
+    if reasons:
+        app.state.schema_health = "degraded"
+        app.state.schema_degraded_reason = "; ".join(reasons)
+        logger.error("schema_degraded: %s", app.state.schema_degraded_reason)
+    else:
+        app.state.schema_health = "healthy"
+        app.state.schema_degraded_reason = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Manage application lifespan: configure logging and create shared Neo4j driver."""
-    setup_logging()
-    _admin = _settings.resolve_neo4j_admin()
-    _query = _settings.resolve_neo4j_query()
-    logger.info(
-        "lifespan_startup: creating Neo4j drivers admin_url=%s query_url=%s query_access_mode=%s",
-        _admin.url,
-        _query.url,
-        _query.access_mode,
-    )
-    # Admin (read/write): schema init + all mutation paths. Keep the existing
-    # app.state.neo4j_driver NAME so nothing that reads it silently breaks.
-    # build_neo4j_driver() is the SAME helper doctor.run_doctor() uses, so the
-    # server and the doctor CLI can never construct this connection differently.
-    app.state.neo4j_driver = build_neo4j_driver(_admin)
-    # Cypher-query (read-intent): /cypher + dashboard reads.
-    app.state.neo4j_query_driver = AsyncGraphDatabase.driver(
-        _query.url, auth=_query.auth
-    )
-    # Stash the resolved query access_mode so /cypher opens READ sessions without
-    # re-resolving settings on every request.
-    app.state.neo4j_query_access_mode = _query.access_mode
-    # Initialize schema (indexes + uniqueness constraints) BEFORE the server starts
-    # accepting requests.  This ensures the Session uniqueness constraint is active
-    # before any concurrent flush() transactions execute MERGE, which prevents the
-    # duplicate-Session-node race condition observed under concurrent upload load.
-    logger.info(
-        "lifespan_startup: initializing Neo4j schema (indexes + uniqueness constraints)"
-    )
-    # Cold start FAILS LOUD on schema/data corruption that requires
-    # `doctor --fix` -- an un-migrated graph (duplicate legacy nodes OR
-    # nodes lacking the universal :Node label). Nothing has been written yet
-    # at cold start, so refusing to boot loses no data: this is the safest
-    # possible moment to surface an impossible state as an un-missable
-    # signal rather than a log line someone greps for later. Contrast with
-    # the flush path (Neo4jGraphStore._ensure_schema), which must keep
-    # self-healing and never raise (Salil's blocker -- raising there would
-    # dead-letter real in-flight activity records). fail_on_data_conflict=True
-    # here mirrors run_repair's contract: a :Node constraint data conflict
-    # raises a RuntimeError naming `doctor --fix` instead of being logged
-    # and swallowed.
-    await ensure_neo4j_schema(app.state.neo4j_driver, fail_on_data_conflict=True)
-    logger.info("lifespan_startup: Neo4j schema initialized")
-    # Fail-loud migration-health guard: duplicate nodes are already caught
-    # above by the :Node constraint (fail_on_data_conflict=True); this catches
-    # the OTHER un-migrated shape the constraint can't see on its own --
-    # nodes that simply lack the :Node label altogether, which violate no
-    # constraint and so raise nothing by themselves. O(1) via the counts
-    # store (see count_untagged_nodes) -- this must never regress into the
-    # AllNodesScan stall PR #67 removed from the write path.
+    """Manage application lifespan: configure logging and create shared Neo4j driver.
+
+    Deploy-safe boot (council amendment, 2026-08-12): the server MUST boot
+    and serve regardless of graph migration/reachability state -- a deploy
+    (restart) must never crash-loop. See
+    docs/plans/2026-08-12-deploy-safe-boot-spec.md for the full incident and
+    rationale. Concretely:
+
+    - Schema DDL no longer fails closed on graph *data* state
+      (``ensure_neo4j_schema(..., fail_on_data_conflict=False)``); a genuine
+      :Node constraint data conflict is logged loudly and degrades
+      ``schema_health`` instead of raising.
+    - The untagged-node probe no longer raises on a positive count; it feeds
+      the same tri-state health signal (see ``_record_schema_health``).
+    - B1: the ENTIRE startup body -- from the FIRST statement
+      (setup_logging), through driver construction and the app.state
+      assignments, to schema DDL, the untagged probe, the SchemaMeta
+      baseline, and queue/recovery/reconcile -- is wrapped in ONE
+      try/except boundary. This is a structural invariant, not a per-site
+      patch list: whichever startup step fails (an unwritable /data log
+      dir before the volume is mounted, Neo4j unreachable, a TransientError
+      during the ACA cold-start race, credential rotation, a corrupt queue
+      file, ...), the exception is logged LOUDLY and boot proceeds. Nothing
+      may sit before the boundary and prevent the ASGI app from reaching
+      `yield` and serving requests. (A live real-process boot test caught
+      the earlier version where setup_logging + driver construction sat
+      BEFORE the try and a PermissionError on `/data` crash-looped the
+      worker with no Neo4j involvement at all.)
+    - B6: crash-recovery iterates sessions defensively -- a corrupt
+      per-session offset/dead-letter quarantines THAT session (logged,
+      skipped) rather than sinking the whole boot; the B1 boundary is the
+      backstop for anything the per-session guard doesn't catch.
+    """
+    # These MUST be set BEFORE the try so they exist on app.state even if the
+    # very first statement inside the boundary raises. The shutdown `finally`
+    # and the /status handler both read them via getattr with defaults, but
+    # seeding them here keeps the tri-state honest from the first instant.
     #
-    # A connectivity/probe failure here is NOT the same as "confirmed
-    # un-migrated" -- it means graph state could not be determined, not that
-    # it was determined to be bad -- so it is logged at DEBUG and swallowed
-    # rather than treated as a corruption finding; the flush path's
-    # self-heal still covers a genuinely dirty graph once it becomes
-    # reachable.
+    # B3/B7: tri-state schema-health defaults -- "unknown" until the startup
+    # sequence below proves otherwise. A boundary failure leaves these at
+    # "unknown" (never coerced to healthy) -- see _record_schema_health.
+    app.state.schema_health = "unknown"
+    app.state.schema_untagged_nodes = None
+    app.state.schema_checked_at = None
+    app.state.schema_degraded_reason = None
+    # Driver slots default to None so the shutdown finally can close them
+    # safely even if construction below never ran (B1: construction is now
+    # INSIDE the boundary, so it can fail without these ever being assigned).
+    app.state.neo4j_driver = None
+    app.state.neo4j_query_driver = None
+    app.state.neo4j_query_access_mode = None
+
+    # B1: ONE loud try/except boundary around the ENTIRE startup body --
+    # setup_logging FIRST, then driver construction, then schema/probe/
+    # recovery. Boot NEVER raises regardless of which step fails.
     try:
-        untagged = await count_untagged_nodes(app.state.neo4j_driver)
-    except Exception as exc:  # noqa: BLE001 - connectivity probe, not a confirmed bad state
-        _LOG_MSG = "startup migration-health probe skipped (graph unreachable?): %s"
-        logger.debug(_LOG_MSG, exc)
-        untagged = 0
-    if untagged:
-        raise RuntimeError(
-            f"Neo4j graph has {untagged} node(s) lacking the :Node label "
-            "(un-migrated). Cold start refuses to boot to avoid duplicating "
-            "them on write. Run: context-intelligence-server doctor --fix"
+        # setup_logging() is itself resilient (never raises -- console
+        # logging is always configured, file logging is best-effort; see
+        # logging_config.setup_logging), but it lives INSIDE the boundary
+        # anyway so the invariant holds structurally rather than depending on
+        # that guarantee. The except handler below uses the module-level
+        # `logger`, which works regardless of whether setup_logging attached
+        # any handlers (Python's lastResort emits to stderr as a floor).
+        setup_logging()
+
+        _admin = _settings.resolve_neo4j_admin()
+        _query = _settings.resolve_neo4j_query()
+        logger.info(
+            "lifespan_startup: creating Neo4j drivers admin_url=%s query_url=%s "
+            "query_access_mode=%s",
+            _admin.url,
+            _query.url,
+            _query.access_mode,
         )
-    # SchemaMeta baseline singleton (§10.2 of the cursor-durability spec).
-    # Deliberately called ONLY here -- startup, single-writer -- NOT from
-    # ensure_neo4j_schema (which also runs on every Neo4jGraphStore's first
-    # flush and from doctor --fix; see ensure_schema_version_baseline's
-    # docstring for why that would be redundant/concurrent instead of
-    # single-writer). Must run AFTER ensure_neo4j_schema above so the rest of
-    # the schema (indexes/constraints) is already established. Non-fatal by
-    # design (see docstring): never raises, so it cannot block server boot.
-    await ensure_schema_version_baseline(app.state.neo4j_driver)
-    # Crash recovery (decisions #5/#6): on startup, respawn one drainer per
-    # session that still has an undrained, complete line. The workspace is
-    # parsed from that session's FIRST log line so the respawned worker is
-    # bound to the same workspace it was originally created with.
-    #
-    # Conservation-counter recovery runs FIRST, and its two steps are
-    # order-load-bearing: reconcile MUST precede seed. recovery_reconcile_dead
-    # advances committed offsets past already-dead pending lines so the
-    # dead-letter counts are settled; only then does recovery_seed_counts read
-    # disk to reconstruct the accepted/written baseline. Seeding before
-    # reconciling would leave a residual==1 false DEGRADED. Both run before the
-    # respawn loop so the respawned drainers start from a conserved baseline.
-    await registry.queue_manager.recovery_reconcile_dead()
-    _accepted_seed, _written_seed = await registry.queue_manager.recovery_seed_counts()
-    registry.seed_counters(_accepted_seed, _written_seed)
-    recovered = await registry.queue_manager.recover()
-    respawned = 0
-    for sid in recovered:
-        batch = await registry.queue_manager.read_batch(sid, max_items=1)
-        if not batch.lines:
-            continue
-        if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
-            respawned += 1
-    logger.info(
-        "lifespan_startup: crash recovery respawned %d/%d drainers",
-        respawned,
-        len(recovered),
-    )
+        # Admin (read/write): schema init + all mutation paths. Keep the
+        # existing app.state.neo4j_driver NAME so nothing that reads it
+        # silently breaks. build_neo4j_driver() is the SAME helper
+        # doctor.run_doctor() uses, so the server and the doctor CLI can
+        # never construct this connection differently. Driver construction is
+        # a non-blocking local object build (no network call) -- but it lives
+        # inside the boundary anyway so a misconfigured URL/auth (e.g. a
+        # malformed bolt scheme) can never crash-loop boot.
+        app.state.neo4j_driver = build_neo4j_driver(_admin)
+        # Cypher-query (read-intent): /cypher + dashboard reads.
+        app.state.neo4j_query_driver = AsyncGraphDatabase.driver(
+            _query.url, auth=_query.auth
+        )
+        # Stash the resolved query access_mode so /cypher opens READ sessions
+        # without re-resolving settings on every request.
+        app.state.neo4j_query_access_mode = _query.access_mode
+
+        # Initialize schema (indexes + uniqueness constraints) BEFORE the
+        # server starts accepting requests. This ensures the Session
+        # uniqueness constraint is active before any concurrent flush()
+        # transactions execute MERGE, which prevents the duplicate-Session-
+        # node race condition observed under concurrent upload load.
+        logger.info(
+            "lifespan_startup: initializing Neo4j schema (indexes + uniqueness constraints)"
+        )
+        # fail_on_data_conflict=False (deploy-safe boot): a genuine :Node
+        # constraint data conflict is logged loudly by ensure_neo4j_schema
+        # (B2/B4: it also establishes a fallback idx_node_universal so the
+        # write path keeps a NodeIndexSeek) and reported via the return
+        # value instead of raising -- boot must never fail closed on graph
+        # *data* state. Only run_repair/`doctor --fix` still opts into
+        # fail_on_data_conflict=True (see ensure_neo4j_schema's docstring).
+        constraint_established = await ensure_neo4j_schema(
+            app.state.neo4j_driver, fail_on_data_conflict=False
+        )
+        logger.info("lifespan_startup: Neo4j schema initialized")
+
+        # Migration-health probe: duplicate nodes are already caught above by
+        # the :Node constraint; this catches the OTHER un-migrated shape the
+        # constraint can't see on its own -- nodes that simply lack the
+        # :Node label altogether, which violate no constraint and so raise
+        # nothing by themselves. O(1) via the counts store (see
+        # count_untagged_nodes) -- this must never regress into the
+        # AllNodesScan stall PR #67 removed from the write path.
+        #
+        # B3: a probe failure is NOT the same as "confirmed clean" -- it
+        # means graph state could not be determined. untagged stays None so
+        # _record_schema_health reports "unknown", never "healthy".
+        try:
+            untagged: int | None = await count_untagged_nodes(app.state.neo4j_driver)
+        except Exception as exc:  # noqa: BLE001 - connectivity probe, not confirmed bad state
+            logger.warning(
+                "startup migration-health probe failed (graph unreachable? "
+                "credentials rejected?): %s",
+                exc,
+            )
+            untagged = None
+
+        _record_schema_health(app, constraint_established, untagged)
+
+        # SchemaMeta baseline singleton (§10.2 of the cursor-durability spec).
+        # Deliberately called ONLY here -- startup, single-writer -- NOT from
+        # ensure_neo4j_schema (which also runs on every Neo4jGraphStore's first
+        # flush and from doctor --fix; see ensure_schema_version_baseline's
+        # docstring for why that would be redundant/concurrent instead of
+        # single-writer). Must run AFTER ensure_neo4j_schema above so the rest of
+        # the schema (indexes/constraints) is already established. Non-fatal by
+        # design (see docstring): never raises, so it cannot block server boot.
+        await ensure_schema_version_baseline(app.state.neo4j_driver)
+
+        # Crash recovery (decisions #5/#6): on startup, respawn one drainer per
+        # session that still has an undrained, complete line. The workspace is
+        # parsed from that session's FIRST log line so the respawned worker is
+        # bound to the same workspace it was originally created with.
+        #
+        # Conservation-counter recovery runs FIRST, and its two steps are
+        # order-load-bearing: reconcile MUST precede seed. recovery_reconcile_dead
+        # advances committed offsets past already-dead pending lines so the
+        # dead-letter counts are settled; only then does recovery_seed_counts read
+        # disk to reconstruct the accepted/written baseline. Seeding before
+        # reconciling would leave a residual==1 false DEGRADED. Both run before the
+        # respawn loop so the respawned drainers start from a conserved baseline.
+        await registry.queue_manager.recovery_reconcile_dead()
+        _accepted_seed, _written_seed = (
+            await registry.queue_manager.recovery_seed_counts()
+        )
+        registry.seed_counters(_accepted_seed, _written_seed)
+        recovered = await registry.queue_manager.recover()
+        respawned = 0
+        for sid in recovered:
+            # B6: iterate defensively -- a corrupt per-session .offset/
+            # dead-letter quarantines THAT session (logged, skipped) rather
+            # than sinking the whole boot via an unhandled exception here.
+            try:
+                batch = await registry.queue_manager.read_batch(sid, max_items=1)
+                if not batch.lines:
+                    continue
+                if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
+                    respawned += 1
+            except Exception:  # quarantine this session, don't sink boot
+                logger.exception("recovery_session_quarantined session=%s", sid)
+        logger.info(
+            "lifespan_startup: crash recovery respawned %d/%d drainers",
+            respawned,
+            len(recovered),
+        )
+    except Exception as exc:  # B1: deploy-safe boot -- NEVER crash-loop
+        logger.exception(
+            "startup_degraded: lifespan startup sequence failed but boot "
+            "continues (deploy-safe boot invariant -- the server must never "
+            "crash-loop on graph/data state)"
+        )
+        app.state.schema_health = "unknown"
+        app.state.schema_degraded_reason = f"startup sequence failed: {exc}"
+        app.state.schema_checked_at = datetime.now(UTC).isoformat()
+
     try:
         yield
     finally:
+        # Defensive shutdown: driver construction is INSIDE the B1 boundary
+        # now, so either driver may be None (construction failed or never
+        # ran). Close only what exists, and never let a close() error escape
+        # shutdown -- it is not a boot concern and must not mask the reason
+        # the app is shutting down.
         logger.info("lifespan_shutdown: closing Neo4j drivers")
-        await app.state.neo4j_driver.close()
-        await app.state.neo4j_query_driver.close()
+        for _attr in ("neo4j_driver", "neo4j_query_driver"):
+            _driver = getattr(app.state, _attr, None)
+            if _driver is None:
+                continue
+            try:
+                await _driver.close()
+            except Exception:  # shutdown best-effort -- never raise here
+                logger.exception("lifespan_shutdown: error closing %s", _attr)
 
 
 app = FastAPI(
@@ -681,6 +826,25 @@ async def get_status(request: Request) -> dict[str, Any]:
             else {}
         ),
     }
+    # B3/B7 (deploy-safe boot, 2026-08-12): tri-state migration/schema health,
+    # computed ONCE at boot (see lifespan's _record_schema_health) --
+    # "healthy" / "degraded" / "unknown". This is a DATA-MIGRATION signal,
+    # not a process-liveness signal, and goes stale after an out-of-band
+    # repair (`doctor --fix`) until the next restart re-probes it.
+    #
+    #   *** MUST NOT be wired to a Kubernetes/ACA liveness or readiness    ***
+    #   *** probe. Doing so would recreate the exact crash-loop this fix  ***
+    #   *** removes, one layer up (see docs/azure-deployment.md).         ***
+    response["schema_health"] = getattr(request.app.state, "schema_health", "unknown")
+    response["untagged_nodes"] = getattr(
+        request.app.state, "schema_untagged_nodes", None
+    )
+    response["schema_checked_at"] = getattr(
+        request.app.state, "schema_checked_at", None
+    )
+    response["degraded_reason"] = getattr(
+        request.app.state, "schema_degraded_reason", None
+    )
     return response
 
 

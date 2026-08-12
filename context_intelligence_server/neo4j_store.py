@@ -598,21 +598,35 @@ async def ensure_neo4j_schema(
     Because the dedup/backfill no longer run here, the ``:Node`` uniqueness
     constraint (Step 6) can fail if the graph still has untagged/duplicate
     legacy nodes. Whether that failure raises or is swallowed depends on
-    *fail_on_data_conflict* (see below) -- this function has TWO callers with
-    OPPOSITE correctness requirements:
+    *fail_on_data_conflict* (see below).
 
-    - **Cold start** (the lifespan handler, ``main.py``): must fail CLOSED.
-      Refusing to boot against an un-migrated graph is correct -- pass
-      ``fail_on_data_conflict=True``.
-    - **Mid-flight flush** (``Neo4jGraphStore._ensure_schema``, called from
-      inside ``_flush_body``'s try block on every flush until the schema
-      latches): must NOT raise. A ``RuntimeError`` escaping here propagates
-      through ``_flush_body``'s ``except ... raise`` and gets counted as a
-      flush failure, which dead-letters the entire in-flight batch of real
-      activity records -- data loss, not merely a refused boot. Leave the
-      default (``False``) at this call site so a data conflict is logged and
-      reported via the return value instead, letting the batch survive and
-      the next flush retry once the graph has been repaired.
+    Deploy-safe boot (council amendment, 2026-08-12): cold start (the
+    lifespan handler, ``main.py``) no longer fails closed on graph *data*
+    state -- a deploy must never crash-loop against an un-migrated,
+    unreachable, or degraded graph. Cold start now calls this with the
+    DEFAULT ``fail_on_data_conflict=False``, same as the mid-flight flush
+    path, and instead surfaces the result as a tri-state ``schema_health``
+    signal on ``GET /status`` (see ``main.py``'s lifespan and
+    ``_record_schema_health``). Only ``run_repair`` / ``doctor --fix``
+    still opts into ``fail_on_data_conflict=True`` -- a lingering conflict
+    there, AFTER dedup+backfill, is a genuine repair failure worth failing
+    loud on.
+
+    - **Cold start / mid-flight flush** (``main.py``'s ``lifespan()``;
+      ``Neo4jGraphStore._ensure_schema``, called from inside
+      ``_flush_body``'s try block on every flush until the schema latches):
+      must NOT raise due to graph *data* state. A ``RuntimeError`` escaping
+      the flush path propagates through ``_flush_body``'s
+      ``except ... raise`` and gets counted as a flush failure, which
+      dead-letters the entire in-flight batch of real activity records --
+      data loss, not merely a refused boot; escaping the lifespan would
+      crash-loop the deploy. Leave the default (``False``) at both call
+      sites so a data conflict is logged and reported via the return value
+      instead.
+    - **``run_repair`` / ``doctor --fix``**: passes
+      ``fail_on_data_conflict=True``. Nothing has been written that could be
+      lost, dedup+backfill have already run, and a genuine post-repair
+      conflict is a real repair failure the operator needs to see.
 
     Args:
         driver:    An ``AsyncDriver`` instance created via
@@ -621,12 +635,12 @@ async def ensure_neo4j_schema(
         workspace: Reserved for future workspace-scoped schema; currently unused.
         fail_on_data_conflict: When True, a genuine data conflict on the
                    ``:Node`` uniqueness constraint (Step 6) raises
-                   ``RuntimeError`` (fail-closed; correct for cold start).
+                   ``RuntimeError`` (fail-closed; correct for
+                   ``run_repair``/``doctor --fix`` only -- see above).
                    When False (default), the same conflict is logged as a
-                   WARNING pointing at ``doctor --fix`` and this function
-                   returns ``False`` instead of raising (fail-open; correct
-                   for the flush path, where raising would dead-letter real
-                   events -- see caller-specific guidance above).
+                   WARNING/ERROR pointing at ``doctor --fix`` and this
+                   function returns ``False`` instead of raising (fail-open;
+                   correct for cold start and the flush path).
 
     Returns:
         ``True`` iff the schema is **fully established** — every index and
@@ -634,10 +648,13 @@ async def ensure_neo4j_schema(
         ``False`` if any index/constraint could not be created -- e.g. Neo4j was
         unreachable and the connectivity error was swallowed, or (when
         *fail_on_data_conflict* is False) the ``:Node`` constraint hit a data
-        conflict -- to avoid dead-lettering real events. Callers use this to
-        decide whether to retry schema init on a later flush rather than
-        latching a half-built schema and leaving the uniqueness constraint
-        permanently absent.
+        conflict even after a drop-and-retry (see Step 6 comments below) --
+        in the latter case a fallback ``idx_node_universal`` index is created
+        so the write path keeps a ``NodeIndexSeek`` instead of an
+        ``AllNodesScan`` (atomicity only is lost, never the seek). Callers
+        use this to decide whether to retry schema init on a later flush
+        rather than latching a half-built schema and leaving the uniqueness
+        constraint permanently absent.
 
     Raises:
         RuntimeError: if *fail_on_data_conflict* is True and the ``:Node``
@@ -876,31 +893,116 @@ async def ensure_neo4j_schema(
         # see the function docstring) — see _is_constraint_data_conflict and
         # _create_constraint.
         #
-        # A uniqueness constraint carries its OWN backing range index, and Neo4j
-        # refuses to create it while a standalone index on the same (label,
-        # properties) exists ("a constraint cannot be created until the index has
-        # been dropped").  #19 shipped a plain `idx_node_universal` index on
-        # :Node(node_id, workspace); drop it first (IF EXISTS, idempotent) so the
-        # constraint can take over the seek role.
+        # Council amendment B2 (deploy-safe boot, 2026-08-12): a uniqueness
+        # constraint carries its OWN backing range index, and Neo4j refuses to
+        # create it while a standalone index on the same (label, properties)
+        # exists ("a constraint cannot be created until the index has been
+        # dropped" -- confirmed live as Neo.ClientError.Schema.IndexAlreadyExists).
+        # The PRE-amendment code unconditionally dropped `idx_node_universal`
+        # BEFORE attempting the constraint every boot -- if the constraint then
+        # failed on a genuine data conflict, boot proceeded with NO index at
+        # all, regressing the AllNodesScan stall PR #67 removed from the write
+        # path. Fixed ordering: attempt the constraint FIRST; only drop the
+        # standalone index after a successful create (zero risk, zero added
+        # cost on the common healthy-graph path, where no such index exists to
+        # begin with -- CREATE CONSTRAINT IF NOT EXISTS is then a no-op). If
+        # the FIRST attempt fails, retry once after dropping
+        # `idx_node_universal` -- this handles the case where the failure is
+        # merely a leftover/fallback standalone index blocking the constraint
+        # (IndexAlreadyExists) rather than a genuine data conflict; without the
+        # retry, a degraded boot's own remediation (the fallback index created
+        # below) would permanently lock the graph out of ever re-establishing
+        # the constraint, even after `doctor --fix` cleans the underlying
+        # data. If the constraint is still not established after the retry,
+        # (re-)create `idx_node_universal` as an explicit fallback so degraded
+        # mode costs atomicity only, never the index seek (B4: loud --
+        # ERROR-logged -- never a silent degradation).
         # ------------------------------------------------------------------
-        try:
-            await session.run("DROP INDEX idx_node_universal IF EXISTS")
-        except (Neo4jError, DriverError) as exc:  # pragma: no cover - tolerate
-            _LOG.debug(
-                "ensure_neo4j_schema: DROP INDEX idx_node_universal skipped "
-                "(benign): %s",
-                exc,
-            )
-        fully_established = (
-            await _create_constraint(
+        _NODE_CONSTRAINT_CYPHER = (
+            "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "
+            "FOR (n:Node) REQUIRE (n.node_id, n.workspace) IS UNIQUE"
+        )
+
+        async def _try_node_constraint() -> bool:
+            return await _create_constraint(
                 session,
                 "Node",
-                "CREATE CONSTRAINT node_node_id_workspace_unique IF NOT EXISTS "
-                "FOR (n:Node) REQUIRE (n.node_id, n.workspace) IS UNIQUE",
+                _NODE_CONSTRAINT_CYPHER,
                 fail_on_data_conflict=fail_on_data_conflict,
             )
-            and fully_established
-        )
+
+        node_constraint_established = await _try_node_constraint()
+
+        if not node_constraint_established:
+            # Only retry when a standalone idx_node_universal is CONFIRMED
+            # present (a cheap, read-only check) -- that specific index is
+            # the one condition that guarantees a genuine-data-conflict-free
+            # retry could succeed (Neo4j refuses CREATE CONSTRAINT while a
+            # standalone index covers the same properties, independent of
+            # whether the underlying data is otherwise clean). If no such
+            # index exists, the failure can only be a genuine data conflict
+            # (or a connectivity/benign race already handled by
+            # _create_constraint above) -- retrying would just repeat the
+            # same failure, so skip it and go straight to the fallback below.
+            try:
+                _idx_present = await _run_single_count(
+                    session,
+                    "SHOW INDEXES YIELD name "
+                    "WHERE name = 'idx_node_universal' "
+                    "RETURN count(*) AS c",
+                )
+            except (Neo4jError, DriverError) as exc:  # pragma: no cover
+                _LOG.debug(
+                    "ensure_neo4j_schema: idx_node_universal existence check "
+                    "skipped (benign): %s",
+                    exc,
+                )
+                _idx_present = 0
+
+            if _idx_present:
+                try:
+                    await session.run("DROP INDEX idx_node_universal IF EXISTS")
+                except (Neo4jError, DriverError) as exc:  # pragma: no cover
+                    _LOG.debug(
+                        "ensure_neo4j_schema: pre-retry DROP INDEX "
+                        "idx_node_universal skipped (benign): %s",
+                        exc,
+                    )
+                else:
+                    node_constraint_established = await _try_node_constraint()
+
+        if node_constraint_established:
+            # Constraint carries its own backing index; a standalone
+            # idx_node_universal (legacy, or a prior degraded boot's
+            # fallback) is now redundant. Drop it ONLY after the constraint
+            # is confirmed established -- never before -- so a degraded boot
+            # is never left with NEITHER the constraint NOR a fallback index.
+            try:
+                await session.run("DROP INDEX idx_node_universal IF EXISTS")
+            except (Neo4jError, DriverError) as exc:  # pragma: no cover
+                _LOG.debug(
+                    "ensure_neo4j_schema: post-success DROP INDEX "
+                    "idx_node_universal skipped (benign): %s",
+                    exc,
+                )
+        else:
+            # Still degraded: genuine data conflict (or connectivity issue)
+            # survived the retry. Loud, not silent (B4) -- create/keep the
+            # fallback index so the write-path MERGE still gets a
+            # NodeIndexSeek; only atomicity is lost, never the seek.
+            _LOG.error(
+                "ensure_neo4j_schema: :Node uniqueness constraint NOT "
+                "established -- creating fallback idx_node_universal so "
+                "writes keep an index seek (atomicity only is lost; "
+                "concurrent-duplicate risk is a RATCHET, not bounded, while "
+                "degraded). Run doctor --fix once the graph is reachable."
+            )
+            await _create_index(
+                "CREATE INDEX idx_node_universal IF NOT EXISTS "
+                "FOR (n:Node) ON (n.node_id, n.workspace)"
+            )
+
+        fully_established = node_constraint_established and fully_established
 
         # NOTE: the :SchemaMeta baseline singleton (§10.2 of the cursor-
         # durability spec) is deliberately NOT created here. This function
