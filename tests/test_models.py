@@ -74,6 +74,61 @@ def test_event_request_workspace_non_empty_accepted():
     assert req.workspace == "my-project-slug"
 
 
+def test_event_request_working_dir_none_accepted():
+    """EventRequest accepts working_dir=None (the default; older clients omit it)."""
+    req = EventRequest(
+        event="session:start",
+        workspace="main",
+        working_dir=None,
+        data={"session_id": "abc123"},
+    )
+    assert req.working_dir is None
+
+
+def test_event_request_working_dir_omitted_defaults_to_none():
+    """EventRequest defaults working_dir to None when the field is absent entirely."""
+    req = EventRequest(
+        event="session:start",
+        workspace="main",
+        data={"session_id": "abc123"},
+    )
+    assert req.working_dir is None
+
+
+def test_event_request_working_dir_valid_path_accepted():
+    """EventRequest accepts a valid non-blank working_dir path."""
+    req = EventRequest(
+        event="session:start",
+        workspace="main",
+        working_dir="/home/user/project",
+        data={"session_id": "abc123"},
+    )
+    assert req.working_dir == "/home/user/project"
+
+
+def test_event_request_working_dir_empty_string_raises():
+    """W-3 defect 1: EventRequest raises ValidationError when working_dir is "" ."""
+    with pytest.raises(ValidationError):
+        EventRequest(
+            event="session:start",
+            workspace="main",
+            working_dir="",
+            data={"session_id": "abc123"},
+        )
+
+
+def test_event_request_working_dir_whitespace_only_raises():
+    """W-3 defect 1: a whitespace-only working_dir (e.g. "   ") must be rejected,
+    not written through to the Session node verbatim."""
+    with pytest.raises(ValidationError):
+        EventRequest(
+            event="session:start",
+            workspace="main",
+            working_dir="   ",
+            data={"session_id": "abc123"},
+        )
+
+
 def test_event_request_data_without_session_id():
     """EventRequest accepts data dict that has no session_id key."""
     req = EventRequest(
