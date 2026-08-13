@@ -68,6 +68,49 @@ for the full ingest/drain flow.
 
 ---
 
+## Upgrading
+
+**Healthy / already-migrated deployments upgrade to `6.8.0` with zero
+action and zero behavior change.** `SCHEMA_VERSION` is unchanged (`1`) --
+this release adds no stored node/edge shape, only server behavior. See
+[CHANGELOG.md](CHANGELOG.md) for the full `6.8.0` entry and
+[migrations/manifest.yaml](migrations/manifest.yaml) for the
+machine-readable upgrade-mechanism entry (`from -> to`, whether it's
+schema-affecting, which script to run, and how to verify).
+
+> ⚠️ **A deployment carrying pre-existing un-migrated / duplicate `:Node`
+> data now boots into MAINTENANCE MODE under `6.8.0`** -- `POST /events`
+> and the query/`cypher` surface return a structured `503` (`Retry-After` +
+> reason) instead of `6.7.1`'s "degraded but still writing" state, which
+> could silently manufacture new duplicates while un-migrated. `GET
+> /status` and `GET /version` stay up throughout and advertise the mode
+> (`healthy` / `maintenance` / `degraded` / `unknown`,
+> `maintenance_started_at`, `maintenance_elapsed_seconds`) -- see
+> [docs/maintenance-mode.md](docs/maintenance-mode.md) for the full
+> contract.
+>
+> **Rectify once, out-of-band -- pick whichever channel you can reach:**
+>
+> ```bash
+> # Local / VM / direct Neo4j access:
+> python migrations/run.py --status   # read-only report (safe, writes nothing)
+> python migrations/run.py --apply    # rectify: dedup + :Node backfill + constraint create
+> ```
+>
+> ```bash
+> # Cloud / ACA, where the private Neo4j is not directly reachable:
+> curl -X POST -H "Authorization: Bearer $ADMIN_KEY" https://<server>/admin/maintenance
+> curl -H "Authorization: Bearer $ADMIN_KEY" https://<server>/admin/maintenance   # poll to completion
+> ```
+>
+> The server **self-clears to healthy with no restart** once rectified (the
+> gate re-probes live; it never latches). Use
+> `context-intelligence-upload` to backfill any events that could not be
+> ingested during the maintenance window. A fresh/empty graph has nothing
+> to rectify and boots normally.
+
+---
+
 ## Neo4j Plugins (APOC + GDS)
 
 The server needs Neo4j 5.x reachable over Bolt with the **APOC** procedures

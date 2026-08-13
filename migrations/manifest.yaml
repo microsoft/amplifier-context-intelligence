@@ -1,0 +1,30 @@
+# Machine-readable upgrade/migration manifest.
+#
+# Establishes the lean upgrade mechanism (docs/plans/2026-08-13-review-remediation-plan.md
+# "Upgrade-path scope"): one ordered entry per server version that requires
+# out-of-band action on the graph. No rollback machinery -- these are
+# forward-only structural rectifications, not reversible schema migrations.
+#
+# Consumed by: operators, and Amplifier deployment automation deciding
+# whether an upgrade needs an out-of-band step before clients resume.
+entries:
+  - id: "6.8.0-maintenance-mode"
+    server_version: "6.8.0"
+    schema_version: 1
+    schema_affecting: false
+    summary: >
+      Adds maintenance mode (gates ingest + query while the :Node uniqueness
+      constraint is absent, structured 503 + Retry-After, live re-probe
+      self-clear, /admin/maintenance execution channel). Does not change any
+      stored node/edge shape -- schema_version stays 1. A deployment with
+      pre-existing un-migrated/duplicate nodes will boot into maintenance
+      mode under 6.8.0 (previously it booted degraded but kept accepting
+      writes); that graph must be rectified once, out-of-band.
+    scripts:
+      - "migrations/run.py --apply"
+    gating: >
+      If GET /status reports mode=maintenance or mode=degraded, run the
+      rectification before clients resume sending events. A healthy graph
+      (schema_health=healthy) needs no action -- boots normally under 6.8.0
+      with zero behavior change.
+    verify: "GET /status shows schema_health=healthy (equivalently mode=healthy)"
