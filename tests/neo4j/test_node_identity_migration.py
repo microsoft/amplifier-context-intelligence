@@ -678,3 +678,106 @@ async def test_healthy_graph_keeps_constraint_backed_index_seek(
         )
     finally:
         _wipe(neo4j_container)
+
+
+# ---------------------------------------------------------------------------
+# Review-remediation gap: idx_node_universal must be DROPPED once a
+# successful run_repair establishes the :Node constraint (Step 6 comment
+# block above: "Constraint carries its own backing index; a standalone
+# idx_node_universal ... is now redundant. Drop it ONLY after the
+# constraint is confirmed established"). No prior test asserted the DROP
+# side of that contract -- test_degraded_graph_fallback_index_keeps_node_
+# index_seek above only proves the index is CREATED/kept while degraded.
+# ---------------------------------------------------------------------------
+
+
+async def test_run_repair_drops_redundant_idx_node_universal_after_success(
+    neo4j_container: dict[str, Any],
+) -> None:
+    """A standalone ``idx_node_universal`` (e.g. left behind by a PRIOR
+    degraded boot, or the pre-amendment code) becomes redundant dead weight
+    the moment the ``:Node`` uniqueness constraint exists -- the constraint
+    carries its own backing range index. This test seeds that exact
+    leftover-index shape on a graph with NO ``:Node`` data conflicts (a
+    single, uniquely-keyed node), so ``run_repair``'s constraint-creation
+    step succeeds cleanly, and proves:
+
+    1. Non-vacuity -- ``idx_node_universal`` genuinely exists BEFORE
+       ``run_repair`` is called (proves the test seed is meaningful, not a
+       vacuous pass against an index that was never there).
+    2. After ``run_repair``: the ``:Node`` uniqueness constraint IS present.
+    3. After ``run_repair``: the now-redundant standalone
+       ``idx_node_universal`` is ABSENT (dropped).
+    """
+    _wipe(neo4j_container)
+    try:
+        driver = GraphDatabase.driver(
+            neo4j_container["bolt_url"],
+            auth=(neo4j_container["user"], neo4j_container["password"]),
+        )
+        try:
+            with driver.session() as s:
+                # A single, uniquely-keyed :Node -- no duplicate (node_id,
+                # workspace) anywhere, so the :Node constraint creation
+                # (Step 6) succeeds cleanly (no data conflict for it to see).
+                s.run(
+                    "CREATE (:Node:Event {node_id: 'evt-clean', workspace: $ws})",
+                    ws=_WS,
+                )
+                # Seed the standalone fallback index directly -- the exact
+                # leftover shape a PRIOR degraded boot (or the
+                # pre-amendment code) leaves behind, which must be cleaned
+                # up once the constraint can finally be established.
+                s.run(
+                    "CREATE INDEX idx_node_universal IF NOT EXISTS "
+                    "FOR (n:Node) ON (n.node_id, n.workspace)"
+                )
+
+            # Non-vacuity: prove the index is genuinely present BEFORE repair.
+            with driver.session() as s:
+                pre_count = s.run(
+                    "SHOW INDEXES YIELD name "
+                    "WHERE name = 'idx_node_universal' "
+                    "RETURN count(*) AS c"
+                ).single()["c"]
+            assert pre_count == 1, (
+                "test setup failed: idx_node_universal must exist BEFORE "
+                f"run_repair for this test to be meaningful, found {pre_count}"
+            )
+        finally:
+            driver.close()
+
+        store = Neo4jGraphStore(
+            uri=neo4j_container["bolt_url"],
+            auth=(neo4j_container["user"], neo4j_container["password"]),
+            workspace=_WS,
+        )
+        try:
+            await run_repair(store._driver, store._database)
+
+            constraint_rows = await store.execute_query(
+                "SHOW CONSTRAINTS YIELD name "
+                "WHERE name = 'node_node_id_workspace_unique' "
+                "RETURN count(*) AS c",
+                workspace="*",
+            )
+            idx_rows_after = await store.execute_query(
+                "SHOW INDEXES YIELD name "
+                "WHERE name = 'idx_node_universal' "
+                "RETURN count(*) AS c",
+                workspace="*",
+            )
+        finally:
+            await store.close()
+
+        assert constraint_rows[0]["c"] == 1, (
+            "the :Node uniqueness constraint was not established by "
+            "run_repair on a clean, conflict-free graph"
+        )
+        assert idx_rows_after[0]["c"] == 0, (
+            "the redundant standalone idx_node_universal must be DROPPED "
+            f"once the :Node constraint is established, found "
+            f"{idx_rows_after[0]['c']} still present"
+        )
+    finally:
+        _wipe(neo4j_container)
