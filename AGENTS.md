@@ -29,7 +29,13 @@ out-of-band upgrade path. Full plan + council verdicts live in the **workspace-r
 **Engagement guardrails** (see the workspace-root `AGENTS.md` for the authoritative
 version): issue-driven only; **minimal, surgical, no-regression** diffs; every fix
 **evidence-backed** and **DTU-validated** (real Neo4j, real restart) before "done";
-migrations run **OUT-OF-BAND**, never in the server startup/critical path.
+migrations/rectification run **OUT-OF-BAND**, never in the server startup/critical
+path. "Out-of-band" now has **two sanctioned execution channels**, both explicitly
+triggered (never at startup) and sharing one mechanism (`neo4j_store.run_repair`):
+(1) the standalone `migrations/run.py --apply` (local/VM/direct-Neo4j), and (2) the
+network-reachable, admin-authenticated `POST /admin/maintenance` (the cloud channel).
+The server itself performs zero migration work automatically — it only assesses,
+advertises (`/status`, `/version`), and gates while degraded.
 
 > **Superseded:** the earlier "Documentation & Setup Cleanup" engagement (remove
 > Docker Compose / `start.sh`, add a local Neo4j script) is **complete/historical**.
