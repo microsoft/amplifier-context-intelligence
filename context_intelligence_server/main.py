@@ -1135,7 +1135,7 @@ async def get_status(request: Request) -> dict[str, Any]:
     # wired into `ensure_schema_version_baseline`'s write path or into
     # `GET /version` (both stay exactly as they were -- see the read/write
     # separation documented on `ensure_schema_version_baseline`). Full
-    # mismatch handling/migration is deferred to amplifier-support#422.
+    # mismatch handling/migration is deferred (tracked separately).
     _schema_driver = getattr(request.app.state, "neo4j_driver", None)
     _graph_schema_version = (
         await read_graph_schema_version(_schema_driver)

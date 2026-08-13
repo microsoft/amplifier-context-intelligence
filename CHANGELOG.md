@@ -176,7 +176,7 @@ shipped) for the full incident writeup and council amendment.
 > The maintenance scripts now ship **inside the Docker image** under `/app/scripts/`,
 > so on a VM/ACI deployment run them via `docker exec <container> python3
 > scripts/relabel_incomplete_sessions.py --dry-run`. Migrations are **never** run at
-> server startup. Fresh/empty graphs need no action. Tracking: amplifier-support#417.
+> server startup. Fresh/empty graphs need no action.
 
 - **IncompleteSession mislabeling -- heal-forward + one-off backfill.**
   `IncompleteSession` was a Neo4j label written once at `session:end` when the

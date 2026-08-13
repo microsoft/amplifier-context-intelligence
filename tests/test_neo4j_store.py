@@ -3291,7 +3291,7 @@ class TestFailLoudConstraintGuard:
 # ---------------------------------------------------------------------------
 # TestFailOnDataConflictDefault
 #
-# Regression for the PR #67 merge-blocker (reviewer Salil, commit 14a6d30):
+# Regression for the PR #67 merge-blocker (commit 14a6d30):
 # ensure_neo4j_schema's :Node constraint step used to hardcode
 # fail_on_data_conflict=True with no way for callers to opt out. That is
 # correct for cold start (main.py:174, refuse to boot) but WRONG for the
@@ -3385,7 +3385,7 @@ class TestDataConflictOnFlushPathDoesNotDeadLetter:
     """END-TO-END regression: a genuine :Node data conflict on the flush path
     must NOT dead-letter the in-flight batch.
 
-    This is the exact bug reported by Salil in PR #67 review: commit 14a6d30
+    This is the exact bug reported in the PR #67 review: commit 14a6d30
     hardcoded fail_on_data_conflict=True inside ensure_neo4j_schema's Step 6,
     reachable from Neo4jGraphStore._ensure_schema (called from _flush_body's
     try block on every flush until the schema latches). A RuntimeError raised

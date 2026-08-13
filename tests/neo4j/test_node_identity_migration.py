@@ -36,7 +36,7 @@ opts into ``fail_on_data_conflict=True``:
 - **Cold start / mid-flight flush** (``main.py``'s ``lifespan()``;
   ``Neo4jGraphStore._ensure_schema``): must NEVER raise due to graph *data*
   state. A ``RuntimeError`` escaping the flush path dead-letters real
-  in-flight activity records (reviewer Salil's PR #67 blocker, commit
+  in-flight activity records (the PR #67 blocker, commit
   14a6d30); escaping the lifespan crash-loops the deploy (the 2026-08-12
   incident this amendment fixes). Both leave the default
   ``fail_on_data_conflict=False``: a data conflict is logged and reported
@@ -139,7 +139,7 @@ def _seed_node_constraint_conflict(container: dict[str, Any]) -> None:
     node_node_id_workspace_unique`` against this seed raises a genuine
     ``Neo.ClientError.Schema.ConstraintValidationFailed`` from a REAL Neo4j
     server (not a synthesized error) -- exactly the conflict the PR #67
-    blocker fix (reviewer Salil) must survive without dead-lettering.
+    blocker fix must survive without dead-lettering.
     """
     driver = GraphDatabase.driver(
         container["bolt_url"],
@@ -373,7 +373,7 @@ async def test_flush_path_self_heals_and_repair_converges_e2e(
     neo4j_container: dict[str, Any],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Live E2E regression for the PR #67 merge-blocker (reviewer Salil, commit
+    """Live E2E regression for the PR #67 merge-blocker (commit
     14a6d30): a genuine :Node constraint data conflict against a REAL Neo4j must
     NOT dead-letter in-flight activity records on the flush path, must self-heal
     once ``doctor --fix`` (``run_repair``) repairs the graph, and the
