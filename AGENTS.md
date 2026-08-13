@@ -13,13 +13,31 @@ See [README.md](README.md) for full setup instructions.
 
 ---
 
-## Current Work: Documentation & Setup Cleanup
+## Current Work: Phase-2 review remediation (server data-quality + deploy safety)
 
-We are cleaning up this repo's **documentation and setup instructions** so the
-server + Neo4j run locally **without Docker Compose**, with API keys primed for
-local runs. Scope is intentionally narrow — do this and nothing else.
+**Active engagement.** We are addressing the issues from Salil's Phase-2 PR review:
+a blob-reclaim cap-inversion, duplicate `Iteration` nodes on the retry path, and —
+the big one — making the server **safe (not merely survivable) on un-migrated /
+degraded graph state**, via a first-class **maintenance mode** (gate ingest + query
+when the `:Node` uniqueness constraint is absent, structured `503` + `Retry-After`,
+`/status` advertising, live re-probe that self-clears without restart) plus an
+explicitly-triggered **`/admin/maintenance`** execution channel and an
+out-of-band upgrade path. Full plan + council verdicts live in the **workspace-root
+`docs/`** (one level up): `docs/plans/2026-08-13-review-remediation-plan.md`,
+`docs/plans/2026-08-13-ws3-implementation-spec.md`, `docs/council/2026-08-13-*`.
 
-### KEEP (do NOT remove)
+**Engagement guardrails** (see the workspace-root `AGENTS.md` for the authoritative
+version): issue-driven only; **minimal, surgical, no-regression** diffs; every fix
+**evidence-backed** and **DTU-validated** (real Neo4j, real restart) before "done";
+migrations run **OUT-OF-BAND**, never in the server startup/critical path.
+
+> **Superseded:** the earlier "Documentation & Setup Cleanup" engagement (remove
+> Docker Compose / `start.sh`, add a local Neo4j script) is **complete/historical**.
+> Its `docs/`-boundary rule and the container base-image policy below are **standing
+> constraints** and still apply. The old "do not refactor server code" boundary does
+> **not** apply to this engagement — server code changes are the point of it.
+
+### Container base image policy (S360 / SCA) — STANDING CONSTRAINT (do NOT remove)
 
 - **`Dockerfile` (the server image).** This is the shipping-product container and
   it is **S360-compliant** via PR #50 (`payneio` — "adopt Azure Linux base +
@@ -141,8 +159,9 @@ docker run -d --name neo4j-ci \
 cp server-config.example.yaml server-config.yaml
 # Edit server-config.yaml with your Neo4j connection details
 
-# 3. Start
-uvicorn context_intelligence_server.main:app --reload
+# 3. Start  (use main:asgi_app — the middleware-wrapped app that enforces bearer auth;
+#            main:app is the bare app with NO auth middleware — dev/testing only)
+uvicorn context_intelligence_server.main:asgi_app --reload
 ```
 
 Or use Docker Compose to run everything together:

@@ -33,6 +33,7 @@ log line to stdout → Log Analytics; raw keys are NEVER logged.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -43,11 +44,17 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from neo4j import READ_ACCESS, WRITE_ACCESS
 from pydantic import BaseModel, Field, field_validator
 
+from context_intelligence_server.blob_processor import (
+    BLOB_REF_CARRIER_PROPERTIES as _BLOB_REF_CARRIER_PROPERTIES,
+)
 from context_intelligence_server.config import _ALL_ZEROS_GUID, _GUID_RE, get_settings
 from context_intelligence_server.identity_store import IdentityStore
+from context_intelligence_server.maintenance import coordinator
+from context_intelligence_server.maintenance_ops import run_maintenance_operation
 
 # ---------------------------------------------------------------------------
 # Validation constants
@@ -447,12 +454,10 @@ def _collect_blob_refs(obj: Any, out: set[str]) -> None:
 #   tool_input  -- ToolPreEvent/ToolPostEvent.tool_input (L1), ToolCall.tool_input (L2)
 #   prompt      -- PromptSubmitEvent/PromptCompleteEvent.prompt (L1), Prompt.prompt (L2)
 #   response    -- OrchestratorRun.response (L2)
-_BLOB_REF_CARRIER_PROPERTIES: tuple[str, ...] = (
-    "data",
-    "tool_input",
-    "prompt",
-    "response",
-)
+# NOTE: the canonical allowlist lives in blob_processor as BLOB_REF_CARRIER_PROPERTIES
+# and is imported (aliased to _BLOB_REF_CARRIER_PROPERTIES) at the top of this module --
+# a single source of truth shared by the mint site (blob_processor) and this reclaim
+# scan. Do NOT re-declare it here.
 
 # Fallback extraction for carrier values that are NOT valid JSON (a bare
 # string property, e.g. a plain-string tool_input/prompt that itself
@@ -494,6 +499,38 @@ def _extract_blob_refs_from_value(val: str, out: set[str]) -> None:
         out.update(_BARE_BLOB_URI_RE.findall(val))
         return
     _collect_blob_refs(obj, out)
+
+
+def _carrier_scan_clause(prop: str) -> str:
+    """Build one ``UNION ALL`` branch of the reclaim reference-scan query
+    for carrier property *prop*.
+
+    ``data`` is special-cased: ``Event.data`` is always a JSON string
+    (``DefaultHandler`` writes ``json.dumps(data)`` -- see
+    ``handlers/data_layer_1/default.py``) and the scan for it is scoped to
+    ``:Event``, matching this carrier's scope in the pre-hardening scan. Every
+    other registered carrier is an unrestricted-label match with
+    ``toString()``, since the property may be lifted onto any node type as a
+    dict, list, or bare string.
+    """
+    if prop == "data":
+        return "MATCH (n:Event) WHERE n.data CONTAINS 'ci-blob://' RETURN n.data AS val"
+    return (
+        f"MATCH (n) WHERE n.{prop} IS NOT NULL "
+        f"AND toString(n.{prop}) CONTAINS 'ci-blob://' "
+        f"RETURN toString(n.{prop}) AS val"
+    )
+
+
+# Generated FROM _BLOB_REF_CARRIER_PROPERTIES (imported from
+# blob_processor.BLOB_REF_CARRIER_PROPERTIES) -- not hand-duplicated -- so the
+# query text can never drift from the allowlist. See
+# tests/test_blob_processor.py for the regression test that locks this
+# agreement structurally (extracts every `n.<prop>` reference out of the
+# built query and diffs it against the allowlist tuple).
+_BLOB_REF_SCAN_QUERY = " UNION ALL ".join(
+    _carrier_scan_clause(prop) for prop in _BLOB_REF_CARRIER_PROPERTIES
+)
 
 
 async def _scan_referenced_uris(request: Request) -> set[str]:
@@ -554,23 +591,11 @@ async def _scan_referenced_uris(request: Request) -> set[str]:
     referenced: set[str] = set()
     async with driver.session(default_access_mode=access_mode) as session:
         # Graph-wide, per-property UNION ALL -- see the docstring above for
-        # why this shape (not an all-property walk, not plain UNION).
-        result = await session.run(
-            "MATCH (n:Event) WHERE n.data CONTAINS 'ci-blob://' "
-            "RETURN n.data AS val "
-            "UNION ALL "
-            "MATCH (n) WHERE n.tool_input IS NOT NULL "
-            "AND toString(n.tool_input) CONTAINS 'ci-blob://' "
-            "RETURN toString(n.tool_input) AS val "
-            "UNION ALL "
-            "MATCH (n) WHERE n.prompt IS NOT NULL "
-            "AND toString(n.prompt) CONTAINS 'ci-blob://' "
-            "RETURN toString(n.prompt) AS val "
-            "UNION ALL "
-            "MATCH (n) WHERE n.response IS NOT NULL "
-            "AND toString(n.response) CONTAINS 'ci-blob://' "
-            "RETURN toString(n.response) AS val"
-        )
+        # why this shape (not an all-property walk, not plain UNION). The
+        # query text is generated from _BLOB_REF_CARRIER_PROPERTIES
+        # (_BLOB_REF_SCAN_QUERY, module level) -- not hand-duplicated here --
+        # so it can never drift from the allowlist.
+        result = await session.run(_BLOB_REF_SCAN_QUERY)
         async for record in result:
             val = record["val"]
             if not isinstance(val, str):
@@ -981,3 +1006,95 @@ async def reclaim_blobs(body: BlobReclaimBody, request: Request) -> dict[str, An
     response["deleted"] = deleted
     response["deleted_bytes"] = deleted_bytes
     return response
+
+
+# --- Maintenance operation (WS-3c; seam + gate built in WS-3a) --------------
+#
+# See docs/plans/2026-08-13-ws3-implementation-spec.md sec 6 for the full
+# design. This endpoint is on ``maintenance.MAINTENANCE_ALLOW_LIST`` (enforced
+# structurally by ``main._assert_maintenance_endpoint_allow_listed`` at
+# startup) so it stays reachable even while the gate is closed -- otherwise
+# it would 503 at exactly the moment it exists to unblock.
+
+
+@router.post("/maintenance", status_code=202)
+async def post_maintenance(request: Request) -> JSONResponse:
+    """Trigger the maintenance repair operation (dedup -> :Node backfill ->
+    schema DDL), reusing the existing ``neo4j_store.run_repair`` -- see
+    ``maintenance_ops.run_maintenance_operation``.
+
+    Single-flight (council MUST-FIX #3): ``coordinator.try_begin_op()`` is a
+    synchronous compare-and-swap with no ``await`` between check and set, so
+    two concurrent POSTs can never both start an op. A second POST while one
+    is running gets **409** with the in-progress ``run_id`` -- it never
+    starts a second op.
+
+    Returns promptly (council MUST-FIX): the operation runs as a background
+    task; this handler returns **202** immediately rather than blocking for
+    the op's full duration (which includes the quiesce sleep + an
+    O(graph-size) dedup pass).
+
+    Idempotent honest re-scan (D-H): POST against an already-clean graph
+    still performs a genuine ``run_repair`` call and returns a **fresh**
+    ``run_id``/``completed_at`` with ``records_affected: 0`` -- it never
+    short-circuits, which would make ``0`` indistinguishable from "did not
+    run" and defeat the freshness marker.
+    """
+    run_id = coordinator.try_begin_op()
+    if run_id is None:
+        current = coordinator.current_op()
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "maintenance operation already running",
+                "run_id": current.run_id,
+                "state": current.state,
+            },
+        )
+
+    settings = get_settings()
+    # Defensive getattr (matches _check_driver_connected's convention above):
+    # lets this route degrade gracefully rather than 500 if ever hit before
+    # lifespan has bound a driver -- run_repair() will raise on a None
+    # driver, which finish_op() records as a normal `failed` outcome.
+    driver = getattr(request.app.state, "neo4j_driver", None)
+    task = asyncio.create_task(
+        run_maintenance_operation(
+            driver,
+            run_id,
+            quiesce_seconds=settings.maintenance_quiesce_seconds,
+        )
+    )
+    coordinator.retain_task(
+        task
+    )  # strong ref -- see MaintenanceCoordinator.retain_task
+
+    op = coordinator.current_op()
+    return JSONResponse(
+        status_code=202,
+        content={"run_id": run_id, "state": op.state, "started_at": op.started_at},
+    )
+
+
+@router.get("/maintenance", status_code=200)
+async def get_maintenance() -> dict[str, Any]:
+    """Report maintenance-operation progress.
+
+    Separate, admin-authenticated route -- council: required, and never
+    folded into ``/status`` (``/status`` is unauthenticated; folding these
+    fields in would be an auth-boundary leak). ``state`` initializes to
+    ``"unknown"`` on boot so "never ran" is distinguishable from "ran, record
+    lost to a crash" (council D4).
+    """
+    st = await coordinator.status()
+    op = st.op
+    return {
+        "mode": st.mode,
+        "state": op.state,
+        "run_id": op.run_id,
+        "started_at": op.started_at,
+        "completed_at": op.completed_at,
+        "elapsed_seconds": st.elapsed_seconds,
+        "records_affected": op.records_affected,
+        "error": op.error,
+    }

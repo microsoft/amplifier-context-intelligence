@@ -902,6 +902,17 @@ class Settings(BaseSettings):
     status_inactive_timeout: float = 1800.0  # 30 min  — /status visibility
     stale_session_timeout: float = 432000.0  # 5 days  — worker reap
 
+    # -------------------------------------------------------------------------
+    # Maintenance mode (WS-3a: live gate + /status; WS-3c wires
+    # POST/GET /admin/maintenance on top of this same coordinator/seam)
+    # -------------------------------------------------------------------------
+    maintenance_probe_ttl_seconds: float = 5.0  # :Node constraint probe cache TTL
+    maintenance_retry_after_seconds: int = 30  # Retry-After on the maintenance 503
+    # WS-3c: bounded pre-op quiesce before run_repair (spec sec 5.3) -- covers
+    # ordinary in-flight flushes (_DRAIN_POLL_INTERVAL is 0.05s); a flush that
+    # outlives this is a residual, DETECTED risk (constraint create fails loud).
+    maintenance_quiesce_seconds: float = 2.0
+
     @classmethod
     def settings_customise_sources(
         cls,

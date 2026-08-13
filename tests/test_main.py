@@ -1395,27 +1395,55 @@ async def test_lifespan_recovery_quarantines_one_bad_session_and_continues(
 
 async def test_status_exposes_schema_health_fields(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /status surfaces schema_health, untagged_nodes, schema_checked_at,
-    and degraded_reason -- the tri-state signal computed once at boot and
-    stashed on app.state (B3/B7)."""
-    main_module.app.state.schema_health = "degraded"
+    and degraded_reason.
+
+    WS-3a DE-LATCHES schema_health/schema_checked_at: they are no longer read
+    verbatim from the app.state boot snapshot -- schema_health is now derived
+    live from the MaintenanceCoordinator's TTL-cached constraint probe (see
+    sec 3a-3), and schema_checked_at is the live-probe timestamp rather than
+    the boot-time one. untagged_nodes and degraded_reason are UNCHANGED:
+    they remain the boot-time values (documented as such; untagged_nodes is
+    explicitly not a gate input).
+    """
+    from context_intelligence_server.maintenance import MaintenanceStatus, OpRecord
+
     main_module.app.state.schema_untagged_nodes = 3
-    main_module.app.state.schema_checked_at = "2026-08-12T00:00:00+00:00"
     main_module.app.state.schema_degraded_reason = "3 node(s) lacking the :Node label"
+    monkeypatch.setattr(
+        main_module.coordinator,
+        "status",
+        AsyncMock(
+            return_value=MaintenanceStatus(
+                mode="degraded",
+                constraint_present=False,
+                reason=":Node uniqueness constraint absent -- migration required",
+                started_at=None,
+                elapsed_seconds=None,
+                op=OpRecord(
+                    state="unknown",
+                    run_id=None,
+                    started_at=None,
+                    completed_at=None,
+                    records_affected=None,
+                    error=None,
+                ),
+            )
+        ),
+    )
     try:
         response = await client.get("/status")
         data = response.json()
         assert data["schema_health"] == "degraded"
-        assert data["untagged_nodes"] == 3
-        assert data["schema_checked_at"] == "2026-08-12T00:00:00+00:00"
+        assert data["untagged_nodes"] == 3  # boot-time value, unchanged
+        assert data["schema_checked_at"] is not None  # live probe timestamp now
         assert data["degraded_reason"] == "3 node(s) lacking the :Node label"
     finally:
         # Reset so this test doesn't leak state into siblings sharing the
         # module-level app singleton.
-        main_module.app.state.schema_health = "unknown"
         main_module.app.state.schema_untagged_nodes = None
-        main_module.app.state.schema_checked_at = None
         main_module.app.state.schema_degraded_reason = None
 
 
@@ -2278,3 +2306,224 @@ class TestHeadlessDocsSurface:
             f"/admin/* must not appear in the unauthenticated OpenAPI schema; "
             f"found: {admin_paths}"
         )
+
+
+# ---------------------------------------------------------------------------
+# WS-3a: maintenance-mode gate + /status additive fields (spec sec 7a)
+# ---------------------------------------------------------------------------
+
+
+def _maintenance_mode_status() -> Any:
+    """Build a MaintenanceStatus reporting mode=="maintenance", for tests
+    that force the gate closed without a real Neo4j driver bound."""
+    from context_intelligence_server.maintenance import MaintenanceStatus, OpRecord
+
+    return MaintenanceStatus(
+        mode="maintenance",
+        constraint_present=False,
+        reason=":Node uniqueness constraint absent -- migration required",
+        started_at="2026-08-13T00:00:00+00:00",
+        elapsed_seconds=1.0,
+        op=OpRecord(
+            state="unknown",
+            run_id=None,
+            started_at=None,
+            completed_at=None,
+            records_affected=None,
+            error=None,
+        ),
+    )
+
+
+class TestMaintenanceGateHttp:
+    """A8-A11 (WS-3a spec sec 7a)."""
+
+    async def test_allow_listed_paths_bypass_the_gate(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A9: /status, /version, /admin/maintenance are NEVER 503'd by the
+        maintenance gate, even while mode == "maintenance"."""
+        monkeypatch.setattr(
+            main_module.coordinator,
+            "status",
+            AsyncMock(return_value=_maintenance_mode_status()),
+        )
+        status_resp = await client.get("/status")
+        version_resp = await client.get("/version")
+        # /admin/maintenance (WS-3c) does not exist yet in this codebase --
+        # what matters here is that the GATE never intercepts it (a 404 from
+        # routing is fine; a 503 from THIS middleware would not be).
+        admin_maint_resp = await client.post("/admin/maintenance")
+
+        assert status_resp.status_code != 503
+        assert version_resp.status_code != 503
+        assert admin_maint_resp.status_code != 503
+
+    async def test_non_allow_listed_path_is_503d_while_gated(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A8 (partial -- unauthenticated path): a non-allow-listed route
+        returns the structured 503 (status/reason/retry_after/schema_health/
+        maintenance_started_at) with a Retry-After header, while gated."""
+        monkeypatch.setattr(
+            main_module.coordinator,
+            "status",
+            AsyncMock(return_value=_maintenance_mode_status()),
+        )
+        resp = await client.get("/blobs/does-not-matter")
+        assert resp.status_code == 503
+        assert "Retry-After" in resp.headers
+        body = resp.json()
+        assert body["status"] == "maintenance"
+        assert body["reason"] == (
+            ":Node uniqueness constraint absent -- migration required"
+        )
+        assert body["retry_after"] == int(resp.headers["Retry-After"])
+        assert body["schema_health"] == "degraded"
+        assert body["maintenance_started_at"] == "2026-08-13T00:00:00+00:00"
+
+    async def test_events_cypher_and_dead_letter_replay_503_while_gated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A8: all three drainer-spawn-adjacent paths (POST /events, POST
+        /cypher, POST /queues/dead-letter/{k}/replay) are gated, through the
+        SAME auth-wrapped app real clients use."""
+        monkeypatch.setattr(
+            main_module.coordinator,
+            "status",
+            AsyncMock(return_value=_maintenance_mode_status()),
+        )
+        headers = {"Authorization": "Bearer test-secret"}
+        async with _auth_client() as c:
+            events_resp = await c.post(
+                "/events",
+                json={
+                    "event": "tool_use",
+                    "workspace": "/ws",
+                    "data": {
+                        "session_id": "s-gated",
+                        "timestamp": "2026-08-13T00:00:00+00:00",
+                    },
+                },
+                headers=headers,
+            )
+            cypher_resp = await c.post(
+                "/cypher", json={"query": "MATCH (n) RETURN n"}, headers=headers
+            )
+            replay_resp = await c.post(
+                "/queues/dead-letter/some-key/replay", headers=headers
+            )
+
+        for resp in (events_resp, cypher_resp, replay_resp):
+            assert resp.status_code == 503
+            assert "Retry-After" in resp.headers
+            assert resp.json()["status"] == "maintenance"
+
+    async def test_status_exposes_maintenance_mode_fields_additively(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """A11: /status exposes mode/maintenance_started_at/
+        maintenance_elapsed_seconds, and every pre-existing key is still
+        present (additive, no regression)."""
+        response = await client.get("/status")
+        assert response.status_code == 200
+        data = response.json()
+        for key in (
+            "mode",
+            "maintenance_started_at",
+            "maintenance_elapsed_seconds",
+            # pre-existing keys, unchanged:
+            "schema_health",
+            "untagged_nodes",
+            "schema_checked_at",
+            "degraded_reason",
+            "neo4j_connected",
+            "neo4j_query_connected",
+            "metrics",
+            "auth",
+            "queue_health",
+        ):
+            assert key in data, f"expected pre-existing/additive key {key!r} in /status"
+        assert data["mode"] in {"healthy", "maintenance", "degraded", "unknown"}
+
+    def test_maintenance_endpoint_allow_listed_assertion_passes_today(self) -> None:
+        """A10 (positive case): the real MAINTENANCE_ALLOW_LIST satisfies the
+        startup assertion as shipped."""
+        main_module._assert_maintenance_endpoint_allow_listed()
+
+    def test_maintenance_endpoint_allow_listed_assertion_raises_if_removed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A10: if /admin/maintenance were removed from the allow-list, the
+        startup assertion raises -- proving the assertion is load-bearing,
+        not a no-op (non-vacuity)."""
+        monkeypatch.setattr(
+            main_module,
+            "MAINTENANCE_ALLOW_LIST",
+            frozenset({"/status", "/version"}),
+        )
+        with pytest.raises(RuntimeError, match="MAINTENANCE_ALLOW_LIST"):
+            main_module._assert_maintenance_endpoint_allow_listed()
+
+
+class TestQueueHealthSeparateFromSchemaHealth:
+    """A14 (W-2): a queue-recovery exception sets queue_health="degraded" and
+    leaves schema_health untouched (a queue fault is not a schema fault)."""
+
+    async def test_queue_recovery_failure_degrades_queue_health_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_driver = MagicMock()
+        mock_driver.close = AsyncMock()
+
+        with (
+            patch("context_intelligence_server.main.setup_logging"),
+            patch(
+                "context_intelligence_server.main.AsyncGraphDatabase.driver",
+                return_value=mock_driver,
+            ),
+            patch(
+                "context_intelligence_server.main.ensure_neo4j_schema",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "context_intelligence_server.main.count_untagged_nodes",
+                new=AsyncMock(return_value=0),
+            ),
+            patch.object(
+                registry.queue_manager,
+                "recovery_reconcile_dead",
+                AsyncMock(side_effect=RuntimeError("disk corrupt")),
+            ),
+        ):
+            async with lifespan(main_module.app):
+                pass
+
+        assert main_module.app.state.queue_health == "degraded"
+        # The schema fault signal is UNAFFECTED by the queue fault (the
+        # entire point of separating the two try/except boundaries).
+        assert main_module.app.state.schema_health == "healthy"
+
+    async def test_queue_recovery_success_leaves_queue_health_healthy(self) -> None:
+        mock_driver = MagicMock()
+        mock_driver.close = AsyncMock()
+
+        with (
+            patch("context_intelligence_server.main.setup_logging"),
+            patch(
+                "context_intelligence_server.main.AsyncGraphDatabase.driver",
+                return_value=mock_driver,
+            ),
+            patch(
+                "context_intelligence_server.main.ensure_neo4j_schema",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "context_intelligence_server.main.count_untagged_nodes",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            async with lifespan(main_module.app):
+                pass
+
+        assert main_module.app.state.queue_health == "healthy"

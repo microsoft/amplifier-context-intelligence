@@ -124,7 +124,7 @@ Point the server at the generated config and start it with uv:
 ```bash
 export AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE="$(pwd)/server-config.yaml"
 uv sync
-uv run uvicorn context_intelligence_server.main:app --host 127.0.0.1 --port 8000
+uv run uvicorn context_intelligence_server.main:asgi_app --host 127.0.0.1 --port 8000
 ```
 
 > `uvicorn --reload` is for **local dev only**. For a persistent/shared run, use
@@ -171,7 +171,7 @@ Show me the API token once and remind me to save it.
 ```
 Set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE to the server-config.yaml in
 the repo root, run `uv sync`, then start the server with
-`uv run uvicorn context_intelligence_server.main:app --host 127.0.0.1 --port 8000`.
+`uv run uvicorn context_intelligence_server.main:asgi_app --host 127.0.0.1 --port 8000`.
 Confirm it's healthy by curling http://127.0.0.1:8000/status.
 ```
 

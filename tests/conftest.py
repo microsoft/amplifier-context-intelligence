@@ -178,6 +178,34 @@ def reset_registry() -> Generator[None, None, None]:
     registry._write_semaphore = None
 
 
+@pytest.fixture(autouse=True)
+def reset_maintenance_coordinator() -> Generator[None, None, None]:
+    """Ensure each test starts with (and leaves) a pristine MaintenanceCoordinator.
+
+    ``context_intelligence_server.maintenance.coordinator`` is a process-wide
+    singleton shared by ``registry.py``'s drain-loop gate and ``main.py``'s
+    HTTP gate/status. Any test that runs the REAL ``lifespan()`` context
+    manager (there are many, pre-dating WS-3a) now ALSO calls
+    ``coordinator.bind_driver(...)`` against whatever mock Neo4j driver that
+    test configured -- often a driver mock whose canned responses were never
+    designed to answer the maintenance constraint-probe query. Without this
+    reset, that leaks into the coordinator's TTL-cached probe/op state and
+    can spuriously close the gate for every OTHER test in the session (test
+    pollution via a shared singleton). Reset by copying in a fresh instance's
+    attributes rather than replacing the object, since other modules hold a
+    direct reference to THIS object (``from ...maintenance import coordinator``).
+    """
+    from context_intelligence_server.maintenance import MaintenanceCoordinator
+    from context_intelligence_server.maintenance import coordinator as _coordinator
+
+    def _reset() -> None:
+        _coordinator.__dict__.update(vars(MaintenanceCoordinator()))
+
+    _reset()
+    yield
+    _reset()
+
+
 @pytest.fixture
 async def client() -> AsyncGenerator[httpx.AsyncClient, None]:
     async with httpx.AsyncClient(
