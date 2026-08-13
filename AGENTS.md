@@ -15,7 +15,7 @@ See [README.md](README.md) for full setup instructions.
 
 ## Current Work: Phase-2 review remediation (server data-quality + deploy safety)
 
-**Active engagement.** We are addressing the issues from Salil's Phase-2 PR review:
+**Active engagement.** We are addressing the issues from the Phase-2 PR review:
 a blob-reclaim cap-inversion, duplicate `Iteration` nodes on the retry path, and —
 the big one — making the server **safe (not merely survivable) on un-migrated /
 degraded graph state**, via a first-class **maintenance mode** (gate ingest + query

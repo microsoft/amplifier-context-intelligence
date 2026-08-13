@@ -1128,7 +1128,7 @@ async def read_graph_schema_version(
     ``status.SCHEMA_VERSION`` themselves for advisory telemetry so a
     server/graph mismatch is *detectable*; this function performs no
     comparison, gating, or migration of any kind. Full mismatch
-    handling/migration is deliberately deferred to amplifier-support#422.
+    handling/migration is deliberately deferred (tracked separately).
 
     Returns ``None`` when the singleton is absent (bootstrap: startup has
     never completed ``ensure_schema_version_baseline`` against this graph)
