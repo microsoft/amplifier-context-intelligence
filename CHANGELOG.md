@@ -6,6 +6,101 @@ point now exists (see below), but the *handling* machinery that would consume
 it -- a versioned migration manifest and an automated upgrade/rollback runner
 -- is deliberately deferred to a separate design.
 
+## 6.8.0 -- Phase-2 review remediation: maintenance mode, retry-loop dedup fix, blob-reclaim/working_dir integrity
+
+**Not schema-affecting.** No stored node/edge shape changes; `SCHEMA_VERSION`
+(`status.py`) stays `1`. See `migrations/manifest.yaml` for the one
+structural-rectification entry this release adds, and the README
+["Upgrading"](README.md#upgrading) section for the operator recovery path.
+
+> ⚠️ **A deployment with pre-existing un-migrated/duplicate `:Node` data will
+> now boot into MAINTENANCE MODE** (ingest + query return `503`) instead of
+> the "degraded but still writing" state 6.7.1 shipped. This is the fix, not
+> a regression -- 6.7.1's degraded mode let concurrent writes manufacture
+> *new* duplicates while un-migrated. If `GET /status` reports
+> `mode=maintenance` or `mode=degraded` after upgrading, rectify **once**,
+> out-of-band, via either:
+> - `python migrations/run.py --apply` (local / VM / direct Neo4j access), or
+> - `POST /admin/maintenance` (cloud / ACA, where the private Neo4j is not
+>   directly reachable) -- poll `GET /admin/maintenance` to completion.
+>
+> The server then self-clears to healthy with **no restart**. A
+> healthy/already-migrated graph boots under 6.8.0 with zero behavior
+> change. Use `context-intelligence-upload` to backfill any events that
+> could not be ingested during a maintenance window.
+
+- **Maintenance mode -- gate ingest + query on degraded schema, never
+  latched (B-1).** The `6.7.1` deploy-safe-boot signal computed
+  `schema_health` once at boot and gated nothing; all write paths (boot
+  recovery, `POST /events`, dead-letter replay) wrote unconditionally even
+  while the `:Node` uniqueness constraint was absent, silently manufacturing
+  *new* duplicates. The gate now lives at the single drain-loop chokepoint
+  (before every batch's `read_batch`/commit), reads a **live, TTL-cached
+  re-probe** of constraint presence (never latched -- a graph repaired
+  out-of-band self-clears without a restart), and returns a structured
+  `503` (`Retry-After` + JSON reason) for both ingest and the query/`cypher`
+  surface. `/status` and `/version` stay up throughout and advertise the
+  mode (`healthy` / `maintenance` / `degraded` / `unknown`,
+  `maintenance_started_at`, `maintenance_elapsed_seconds`). Because the gate
+  sits upstream of the queue-offset commit, a refused write never advances
+  its offset -- kill-9 mid-refuse -> restart -> repair -> exactly-once
+  redelivery, by construction. Entry/exit is logged
+  (`maintenance_entered` / `maintenance_completed`).
+  (`context_intelligence_server/maintenance.py`, `registry.py`,
+  `routers/admin.py`, `main.py`)
+- **`POST` / `GET /admin/maintenance` -- the cloud unblocker.** Assess +
+  advertise + gate alone deadlocks on ACA: an un-migrated graph behind a
+  private Neo4j has no operator who can run a script. `POST
+  /admin/maintenance` triggers the rectification (same `run_repair` the
+  standalone script calls -- one shared logic home, `maintenance_ops.py`)
+  over the network, with atomic (CAS) single-flight, a promptly-returning
+  `202` (never blocks for the op's duration), and no write-bypass (the op
+  never consults the gate -- it just isn't gated in the first place, using
+  the admin driver directly). `GET /admin/maintenance` reports
+  `state`/`run_id`/`started_at`/`records_affected`/error for polling to
+  completion. Both routes are on the maintenance-gate allow-list (with
+  `/status`/`/version`) so they cannot 503 themselves out of existence.
+- **`max_delete` cap-inversion fixed (B-3).** `POST
+  /admin/blob-reclaim`'s `max_delete` had no floor validator; a
+  fat-fingered `0` or negative value inverted the cap into an
+  effectively-unbounded delete. Now `Field(ge=1)` rejects `<1` at the
+  schema boundary with a `422`; the existing apply-mode `422` on `None` is
+  unchanged. (`routers/admin.py`)
+- **Retry-loop duplicate `Iteration` nodes fixed on the common path
+  (B-2).** The `I5` run-scoped `Iteration.node_id` fix stopped duplicates
+  on the normal path, but the flush **retry** branch mutated
+  `iteration_count` before the write and never restored it between
+  attempts -- a transient-fail-then-succeed retry could commit under two
+  different counter values (`::iteration::1` and `::iteration::2` both
+  landing). The existing `snapshot_cursor`/`restore_cursor` guard (already
+  used by the post-budget path) now also wraps the common retry branch:
+  snapshot once per batch, restore to pre-batch state before every replay
+  attempt. (`registry.py`)
+- **`working_dir` integrity.** Blank/whitespace-only `working_dir` is now
+  rejected by the same validator style `workspace` already uses
+  (`models.py`). The "never overwritten" guarantee is now enforced at the
+  Cypher level (`ON CREATE SET` / `coalesce`), closing a cross-replica
+  same-session race that could previously last-write-wins clobber a good
+  value from Python-only discipline. (`neo4j_store.py`)
+- **Blob-carrier allowlist tripwire (W-5).** The hardcoded
+  `_BLOB_REF_CARRIER_PROPERTIES` allowlist used by blob-reclaim's
+  reference scan is now a single source of truth shared with the mint
+  site (`blob_processor.py`), with a fail-closed runtime tripwire so a
+  future blob-ref-carrying property added elsewhere and forgotten in the
+  allowlist cannot let reclaim silently misclassify a live blob as an
+  orphan.
+- **Docs auth-fold.** `README.md` / `docs/local-development.md` previously
+  documented running the server via `main:app` (the bare FastAPI app, no
+  bearer-auth middleware). Corrected to `main:asgi_app` (the
+  middleware-wrapped entrypoint that enforces auth on `/admin/*` and data
+  routes), with a tripwire test.
+- Version bump: `6.7.1` -> `6.8.0` (minor -- new `/admin/maintenance`
+  endpoint and gate behavior change on degraded graphs; no schema change).
+
+See `docs/plans/2026-08-13-review-remediation-plan.md` and
+`docs/plans/2026-08-13-ws3-implementation-spec.md` (workspace root, not
+shipped) for the full remediation writeup and council verdicts.
+
 ## 6.7.1 -- Deploy-safe boot: server never crash-loops on un-migrated/unreachable/degraded graph state
 
 **Incident:** deploying a restart crash-looped the server against a graph with
