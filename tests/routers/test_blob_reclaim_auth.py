@@ -103,3 +103,50 @@ async def test_admin_key_min_age_below_floor_422(
         headers={"Authorization": f"Bearer {FAKE_ADMIN_RAW_KEY}"},
     )
     assert resp.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_admin_key_max_delete_zero_422(
+    static_auth_client: httpx.AsyncClient,
+) -> None:
+    """max_delete=0 is rejected with 422 (Field(ge=1) schema boundary).
+
+    Schema validation runs before the handler, so this never reaches
+    ``_select_orphans`` / Neo4j.
+    """
+    resp = await static_auth_client.post(
+        "/admin/blobs/reclaim",
+        json={"dry_run": True, "max_delete": 0},
+        headers={"Authorization": f"Bearer {FAKE_ADMIN_RAW_KEY}"},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_admin_key_max_delete_negative_422(
+    static_auth_client: httpx.AsyncClient,
+) -> None:
+    """max_delete=-1 is rejected with 422.
+
+    Regression test: without the ``ge=1`` floor, ``candidates[:-1]`` silently
+    inverts the cap into "delete all but one" instead of raising.
+    """
+    resp = await static_auth_client.post(
+        "/admin/blobs/reclaim",
+        json={"dry_run": True, "max_delete": -1},
+        headers={"Authorization": f"Bearer {FAKE_ADMIN_RAW_KEY}"},
+    )
+    assert resp.status_code == 422
+
+
+def test_max_delete_one_is_accepted_by_schema() -> None:
+    """max_delete=1 (the floor) passes schema validation, not rejected.
+
+    Exercised at the model level (not via HTTP) because a valid body
+    proceeds into ``_select_orphans``, which requires a live Neo4j driver
+    on ``request.app.state`` -- out of scope for this auth/router test file.
+    """
+    from context_intelligence_server.routers.admin import BlobReclaimBody
+
+    body = BlobReclaimBody(dry_run=False, max_delete=1)
+    assert body.max_delete == 1

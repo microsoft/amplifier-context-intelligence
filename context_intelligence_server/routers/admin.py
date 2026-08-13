@@ -44,7 +44,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from neo4j import READ_ACCESS, WRITE_ACCESS
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from context_intelligence_server.config import _ALL_ZEROS_GUID, _GUID_RE, get_settings
 from context_intelligence_server.identity_store import IdentityStore
@@ -650,7 +650,7 @@ class BlobReclaimBody(BaseModel):
 
     dry_run: bool = True
     min_age_minutes: int = 60
-    max_delete: int | None = None
+    max_delete: int | None = Field(default=None, ge=1)
 
     @field_validator("min_age_minutes")
     @classmethod
