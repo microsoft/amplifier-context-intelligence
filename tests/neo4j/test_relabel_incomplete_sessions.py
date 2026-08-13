@@ -323,3 +323,165 @@ class TestRestore:
                 assert "ForkedSession" in restored_labels
         finally:
             driver.close()
+
+
+# ---------------------------------------------------------------------------
+# (g) W-1: undo-log is written from a read-only PRE-MUTATION candidate
+#     collection, EXACTLY matching the full false-positive set, and restore
+#     from it fully re-adds the label to every candidate.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.neo4j
+class TestUndoLogCapturesFullPreMutationCandidateSet:
+    """W-1: apply_relabel()'s batched CALL {...} IN TRANSACTIONS OF N ROWS
+    commits per batch, so the undo-log must exist -- complete -- the moment
+    any batch has committed, not only after apply_relabel() returns. This
+    test seeds a NON-VACUOUS candidate set (two distinct false-positive
+    shapes that both clear the B2 gate: a terminal-labeled node, and a
+    terminal-labeled node that ALSO has a linked start event) and asserts
+    the undo-log written by the gated --apply path (run_apply) contains
+    EXACTLY that candidate set, and that restoring from it fully re-adds
+    :IncompleteSession to both.
+    """
+
+    def test_undo_log_exactly_matches_candidates_and_restore_heals_all(
+        self, neo4j_container: dict[str, Any], tmp_path: Any
+    ) -> None:
+        driver = _driver(neo4j_container)
+        try:
+            with driver.session() as s:
+                # Non-vacuity: two distinct false-positive shapes, so the
+                # candidate set has more than one member and is not a
+                # degenerate single-node case. Both carry a terminal label
+                # (so NEITHER trips the B2 linked_but_untyped gate); the
+                # second additionally has a linked start event, to prove the
+                # selector's OR-shape doesn't affect completeness.
+                _seed_session(s, "sess-g1", extra_labels=["ForkedSession"])
+                _seed_session(s, "sess-g2", extra_labels=["SubSession"])
+                _seed_linked_event(s, "sess-g2", "SessionStartEvent", "sess-g2::start")
+
+                # Ground truth: the pre-mutation candidate set, read
+                # independently via the same read-only helper run_apply
+                # uses internally, BEFORE run_apply does anything.
+                expected_candidates = sorted(relabel.collect_false_positive_ids(s))
+                assert expected_candidates == ["sess-g1", "sess-g2"], (
+                    "test setup must be non-vacuous: exactly two "
+                    f"false-positive candidates expected, got {expected_candidates}"
+                )
+
+                undo_log_path = tmp_path / "undo-g.json"
+                exit_code = relabel.run_apply(
+                    s,
+                    batch_size=relabel.DEFAULT_BATCH_SIZE,
+                    undo_log_path=str(undo_log_path),
+                    neo4j_url=neo4j_container["bolt_url"],
+                )
+                assert exit_code == 0
+                assert undo_log_path.exists(), "undo-log file must exist after --apply"
+
+                snap = relabel.read_undo_log(str(undo_log_path))
+                logged_ids = sorted(snap["node_ids"])
+                # (a) The undo log holds EXACTLY the candidate set -- no
+                # more, no less.
+                assert logged_ids == expected_candidates == ["sess-g1", "sess-g2"]
+
+                # Both were actually mutated.
+                assert "IncompleteSession" not in _labels(s, "sess-g1")
+                assert "IncompleteSession" not in _labels(s, "sess-g2")
+
+                # (b) Restoring from the undo log fully re-adds the marker
+                # to every logged node_id.
+                restore_exit_code = relabel.run_restore(
+                    s, str(undo_log_path), batch_size=relabel.DEFAULT_BATCH_SIZE
+                )
+                assert restore_exit_code == 0
+                assert "IncompleteSession" in _labels(s, "sess-g1")
+                assert "IncompleteSession" in _labels(s, "sess-g2")
+        finally:
+            driver.close()
+
+
+@pytest.mark.neo4j
+class TestUndoLogSourcedFromPreMutationReadNotApplyReturnValue:
+    """W-1: the undo-log must be sourced from a read-only, pre-mutation
+    collection of the candidate set (``collect_false_positive_ids``) -- NOT
+    derived from whatever ``apply_relabel()`` happens to report as touched.
+
+    Proven by monkeypatching ``apply_relabel`` to still perform the REAL
+    mutation (so the graph state and restore path stay meaningful) but
+    report a deliberately WRONG, truncated touched set. Under the pre-fix
+    ordering (log written from apply_relabel's return value, AFTER the
+    mutation), the undo-log would contain only the truncated set. Under the
+    fix, run_apply captures the full candidate set via a separate read
+    BEFORE calling apply_relabel at all, so the log is unaffected by
+    whatever apply_relabel reports.
+    """
+
+    def test_undo_log_unaffected_by_apply_relabels_return_value(
+        self,
+        neo4j_container: dict[str, Any],
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        driver = _driver(neo4j_container)
+        try:
+            with driver.session() as s:
+                _seed_session(s, "sess-h1", extra_labels=["ForkedSession"])
+                _seed_session(s, "sess-h2", extra_labels=["RootSession"])
+
+                expected_candidates = sorted(relabel.collect_false_positive_ids(s))
+                assert expected_candidates == ["sess-h1", "sess-h2"], (
+                    "test setup must be non-vacuous: exactly two "
+                    f"false-positive candidates expected, got {expected_candidates}"
+                )
+
+                real_apply_relabel = relabel.apply_relabel
+
+                def _fake_apply_relabel(session, batch_size):
+                    # Perform the REAL mutation (so the restore-path
+                    # assertions below stay meaningful) but report a
+                    # deliberately WRONG, truncated touched set -- the
+                    # shape of divergence a mid-run crash would produce if
+                    # the undo-log were sourced from this return value.
+                    real_apply_relabel(session, batch_size)
+                    return ["sess-h1"]  # deliberately omits sess-h2
+
+                monkeypatch.setattr(relabel, "apply_relabel", _fake_apply_relabel)
+
+                undo_log_path = tmp_path / "undo-h.json"
+                exit_code = relabel.run_apply(
+                    s,
+                    batch_size=relabel.DEFAULT_BATCH_SIZE,
+                    undo_log_path=str(undo_log_path),
+                    neo4j_url=neo4j_container["bolt_url"],
+                )
+                assert exit_code == 0
+                assert undo_log_path.exists()
+
+                snap = relabel.read_undo_log(str(undo_log_path))
+                logged_ids = sorted(snap["node_ids"])
+
+                # THE core assertion: the log holds the FULL pre-mutation
+                # candidate set, not apply_relabel's (faked, truncated)
+                # return value. If run_apply sourced the log from
+                # touched_ids (the pre-fix ordering), logged_ids would
+                # equal ["sess-h1"] here.
+                assert logged_ids == expected_candidates == ["sess-h1", "sess-h2"]
+                assert logged_ids != ["sess-h1"], (
+                    "undo log must not be derived from apply_relabel's "
+                    "reported touched set"
+                )
+
+                # Restoring from the (correctly complete) log heals BOTH
+                # nodes, including "sess-h2" which the faked touched-set
+                # omitted -- proving the log's completeness has real
+                # recovery value, not just structural equality.
+                restore_exit_code = relabel.run_restore(
+                    s, str(undo_log_path), batch_size=relabel.DEFAULT_BATCH_SIZE
+                )
+                assert restore_exit_code == 0
+                assert "IncompleteSession" in _labels(s, "sess-h1")
+                assert "IncompleteSession" in _labels(s, "sess-h2")
+        finally:
+            driver.close()

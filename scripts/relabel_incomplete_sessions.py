@@ -67,12 +67,15 @@ A single-statement, server-side batched REMOVE using
 scripts/tag_legacy_pooled_iterations.py -- NOT the per-node Python loop of
 scripts/repair_dual_labels.py).  The false-positive selector
 (_FALSE_POSITIVE_MATCH below) is the ONE module constant reused by the
-diagnostic, count, sample, and apply queries -- one definition of "false
-positive."  ``apply_relabel()`` additionally collects the touched node_ids
-(for the B4 undo-log) via ``RETURN collect(s.node_id)`` after the batched
-CALL block -- the same "outer variable survives the per-batch commits"
-technique ``tag_legacy_pooled_iterations.py`` uses for its ``RETURN
-count(i)``, just projecting ids instead of a count.
+diagnostic, count, sample, collect, and apply queries -- one definition of
+"false positive."  ``apply_relabel()`` additionally collects the node_ids it
+actually touched (for the printed "removed N node(s)" report) via ``RETURN
+collect(s.node_id)`` after the batched CALL block -- the same "outer
+variable survives the per-batch commits" technique
+``tag_legacy_pooled_iterations.py`` uses for its ``RETURN count(i)``, just
+projecting ids instead of a count.  This is a REPORTING count only: the B4
+undo-log is sourced from a separate, EARLIER, read-only collection -- see B4
+below for why.
 
 B2 -- read-only reconciliation diagnostic, REQUIRED before --apply
 --------------------------------------------------------------------
@@ -95,9 +98,20 @@ B3 -- this banner (see POST-DEPLOY GATE above).
 
 B4 -- lightweight rollback
 ---------------------------
---apply writes the touched node_ids to a plain JSON undo-log
-(--undo-log PATH, default a timestamped path in the current directory).  The
-file's header records the Neo4j host and an ISO-8601 generation timestamp.
+--apply writes a plain JSON undo-log (--undo-log PATH, default a timestamped
+path in the current directory) BEFORE it mutates the graph.  The log is
+sourced from ``collect_false_positive_ids()`` -- a read-only, pre-mutation
+collection of the FULL false-positive candidate set (same _FALSE_POSITIVE_MATCH
+selector as everything else) -- NOT from the ids ``apply_relabel()`` reports
+as touched.  This ordering matters: ``apply_relabel()``'s batched
+``CALL { ... } IN TRANSACTIONS OF N ROWS`` COMMITS PER BATCH, so a mid-run
+crash can leave some REMOVEs already durable in Neo4j.  Writing the undo-log
+from the pre-mutation candidate set means that even a crash after batch 1 of
+N still leaves a COMPLETE undo-log on disk -- there is no auditability
+window where a committed removal has no undo record anywhere.  See
+``run_apply()`` for the inline safety argument for why logging the (superset)
+candidate set instead of the (subset) touched set is safe.  The file's
+header records the Neo4j host and an ISO-8601 generation timestamp.
 --restore PATH re-adds :IncompleteSession to exactly those node_ids via the
 same batched ``CALL { ... } IN TRANSACTIONS OF N ROWS`` shape.  No
 edge/temporal snapshot is needed: this is one non-destructive label REMOVE,
@@ -299,6 +313,22 @@ def sample_false_positives(session, limit: int = DEFAULT_SAMPLE_LIMIT) -> list[s
     return [row["node_id"] for row in rows]
 
 
+def collect_false_positive_ids(session) -> list[str]:
+    """Read-only collection of the FULL (unbounded) set of node_ids the B1
+    selector matches -- i.e. every candidate --apply would touch.
+
+    This is the pre-mutation read ``run_apply`` uses to source the B4
+    undo-log BEFORE calling ``apply_relabel`` (see "undo-log-before-mutation"
+    in ``run_apply``'s docstring for the ordering rationale). Unlike
+    ``sample_false_positives`` (bounded by ``DEFAULT_SAMPLE_LIMIT``, for
+    human-readable reporting), this has no LIMIT -- it must capture every
+    candidate so the undo-log is complete even if a subsequent crash
+    prevents ``apply_relabel`` from reporting its own touched set.
+    """
+    result = session.run(f"{_FALSE_POSITIVE_MATCH} RETURN collect(s.node_id) AS ids")
+    return list(result.single()["ids"] or [])
+
+
 # ---------------------------------------------------------------------------
 # Mutating operations
 # ---------------------------------------------------------------------------
@@ -425,8 +455,42 @@ def run_apply(session, batch_size: int, undo_log_path: str, neo4j_url: str) -> i
     2. Run the B2 reconciliation diagnostic.  If linked_but_untyped > 0,
        REFUSE (no write): print the count and up to 20 sample node_ids,
        return 1.
-    3. Otherwise: run apply_relabel(), write the B4 undo-log, print the
-       AFTER population summary, return 0.
+    3. Otherwise: collect the FULL false-positive candidate set (read-only),
+       write the B4 undo-log from THAT set, THEN run apply_relabel() to
+       mutate, print the AFTER population summary, return 0.
+
+    undo-log-before-mutation (W-1 fix)
+    -----------------------------------
+    Step 3 writes the undo-log BEFORE calling apply_relabel(), not after.
+    apply_relabel()'s batched ``CALL { ... } IN TRANSACTIONS OF N ROWS``
+    COMMITS PER BATCH -- each batch's REMOVE is durable in Neo4j the moment
+    that batch completes, well before apply_relabel() returns. If the
+    process crashed mid-run under the OLD ordering (mutate first, log
+    after), some REMOVEs would already be committed with NO undo record
+    anywhere -- an auditability hole. Logging the pre-mutation candidate set
+    first closes that window: even a crash after the very first batch still
+    leaves a COMPLETE undo-log on disk.
+
+    Why logging the (pre-mutation) candidate set instead of apply_relabel's
+    (post-mutation) touched set is safe:
+      - candidate_ids is collected via the exact same _FALSE_POSITIVE_MATCH
+        selector apply_relabel() uses, moments before apply_relabel() runs
+        -- so candidate_ids is a SUPERSET of (on a clean run, EQUAL to)
+        whatever apply_relabel() actually removes.
+      - restore_ids() (the --restore consumer of this log) is idempotent
+        over a superset: it SETs :IncompleteSession on each node_id that
+        still exists. For a node that WAS removed, this correctly restores
+        the marker. For a candidate that -- for any reason -- was NOT
+        removed (still carries :IncompleteSession), the SET is a no-op: the
+        label is already present. So restoring from the candidate superset
+        is always safe -- it never incorrectly re-adds a marker that
+        shouldn't exist, and it never fails to restore a node that WAS
+        removed.
+      - On a clean run (the common case, and the only case this script's
+        idempotent selector allows in practice) candidate_ids == the ids
+        apply_relabel() reports touched, so the printed "removed N node(s)"
+        count is UNCHANGED by this reordering -- only the undo-log's source
+        and its write timing move earlier.
     """
     before = population_summary(session)
     print("POPULATION SUMMARY (before):")
@@ -454,11 +518,19 @@ def run_apply(session, batch_size: int, undo_log_path: str, neo4j_url: str) -> i
         )
         return 1
 
+    # Read-only pre-mutation capture, THEN write the undo-log, THEN mutate.
+    # See the "undo-log-before-mutation (W-1 fix)" note in this function's
+    # docstring for why this order (and logging the candidate superset
+    # rather than apply_relabel's touched subset) is safe.
+    candidate_ids = collect_false_positive_ids(session)
+    write_undo_log(undo_log_path, neo4j_url, candidate_ids)
+    print(
+        f"Undo log written to {undo_log_path} ({len(candidate_ids)} node_id(s), "
+        "pre-mutation candidate set).\n"
+    )
+
     touched_ids = apply_relabel(session, batch_size)
     print(f"APPLIED -- removed :IncompleteSession from {len(touched_ids)} node(s).\n")
-
-    write_undo_log(undo_log_path, neo4j_url, touched_ids)
-    print(f"Undo log written to {undo_log_path} ({len(touched_ids)} node_id(s)).\n")
 
     after = population_summary(session)
     print("POPULATION SUMMARY (after):")
