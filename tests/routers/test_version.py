@@ -5,6 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+import context_intelligence_server.main as main_module
 from context_intelligence_server.status import SCHEMA_VERSION, SERVER_VERSION
 
 
@@ -62,6 +63,37 @@ class TestSchemaVersionConstant:
 
     def test_schema_version_initial_value(self) -> None:
         assert SCHEMA_VERSION == 1
+
+
+class TestGetVersionUnchangedByW4:
+    """W-4 added an advisory graph_schema_version signal to GET /status only.
+
+    GET /version must stay exactly the cheap compiled-in-constant return it
+    was before -- no graph read, no new fields -- per the deliberate
+    read/write separation documented on ``ensure_schema_version_baseline``
+    (neo4j_store.py) and ``read_graph_schema_version``'s docstring.
+    """
+
+    @pytest.mark.anyio
+    async def test_response_shape_unchanged(self, client: httpx.AsyncClient) -> None:
+        response = await client.get("/version")
+        data = response.json()
+        assert set(data.keys()) == {"version", "schema_version"}
+        assert "graph_schema_version" not in data
+        assert "schema_version_current" not in data
+
+    @pytest.mark.anyio
+    async def test_works_with_no_neo4j_driver_configured(
+        self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """/version never touches app.state.neo4j_driver -- it must return
+        200 even when no driver has been configured at all."""
+        if hasattr(main_module.app.state, "neo4j_driver"):
+            monkeypatch.delattr(main_module.app.state, "neo4j_driver", raising=False)
+
+        response = await client.get("/version")
+        assert response.status_code == 200
+        assert response.json()["schema_version"] == SCHEMA_VERSION
 
 
 class TestGetVersionNoAuth:

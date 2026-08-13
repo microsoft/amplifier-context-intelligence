@@ -49,12 +49,13 @@ from context_intelligence_server.neo4j_store import (
     count_untagged_nodes,
     ensure_neo4j_schema,
     ensure_schema_version_baseline,
+    read_graph_schema_version,
 )
 from context_intelligence_server.registry import SessionRegistry
 from context_intelligence_server.routers.admin import router as admin_router
 from context_intelligence_server.routers.queues import router as queues_router
 from context_intelligence_server.routers.version import router as version_router
-from context_intelligence_server.status import build_status_response
+from context_intelligence_server.status import SCHEMA_VERSION, build_status_response
 
 _settings = get_settings()
 
@@ -1125,6 +1126,28 @@ async def get_status(request: Request) -> dict[str, Any]:
     # W-2: queue-recovery health is reported SEPARATELY from schema_health --
     # a queue-recovery fault at boot is not a schema fault (see lifespan).
     response["queue_health"] = getattr(request.app.state, "queue_health", "healthy")
+    # W-4: ADVISORY drift signal ONLY, NOT a guard. Surface the STORED
+    # :SchemaMeta.schema_version (read fresh from the graph) next to the
+    # server's compiled-in SCHEMA_VERSION so a server/graph mismatch is
+    # DETECTABLE by automation -- no gating, no migration, no behavior
+    # change of any kind results from this. `read_graph_schema_version` is a
+    # separate read-only helper (neo4j_store.py); it is intentionally NOT
+    # wired into `ensure_schema_version_baseline`'s write path or into
+    # `GET /version` (both stay exactly as they were -- see the read/write
+    # separation documented on `ensure_schema_version_baseline`). Full
+    # mismatch handling/migration is deferred to amplifier-support#422.
+    _schema_driver = getattr(request.app.state, "neo4j_driver", None)
+    _graph_schema_version = (
+        await read_graph_schema_version(_schema_driver)
+        if _schema_driver is not None
+        else None
+    )
+    response["graph_schema_version"] = _graph_schema_version
+    response["schema_version_current"] = (
+        None
+        if _graph_schema_version is None
+        else _graph_schema_version == SCHEMA_VERSION
+    )
     return response
 
 
