@@ -2190,3 +2190,155 @@ class TestSessionOwnershipInvariant:
 
         # 3. Worker is returned — no exception raised
         assert worker is not None
+
+
+# ---------------------------------------------------------------------------
+# Phantom-cursor guard, common retry branch (budget NOT exhausted): a
+# transient flush failure (proxy: DeadlockDetected) that eventually SUCCEEDS
+# via drain_worker's common retry path must not replay a cursor-mutating
+# handler's write more than once for the same never-committed batch. Mirrors
+# TestDurableLinearPoisonIsolation's BLOCKER-1 guard, but for the
+# retry-then-succeed path (`_handle_exhausted_batch` is never reached here)
+# rather than the give-up (dead-letter) path.
+#
+# These drive the REAL process_event / IterationHandler (not mocked) against
+# the default in-memory GraphState so both the emitted Iteration node_ids and
+# the iteration_count cursor are directly observable — chosen over extending
+# _AccumBufferGraph because GraphState already records real node_ids keyed
+# exactly as the handler creates them, with no test-double changes needed.
+# ---------------------------------------------------------------------------
+
+
+class TestPhantomCursorGuardCommonRetryPath:
+    async def test_transient_flush_failure_then_success_produces_single_iteration(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """Attempt 1's flush fails transiently; attempt 2 succeeds through the
+        COMMON retry branch (budget not exhausted). Before the fix: attempt 1
+        increments iteration_count to 1 and creates node '::iteration::1'; the
+        failed flush is never rolled back, so attempt 2 (replaying the SAME
+        batch) increments iteration_count again to 2 and creates a SECOND node
+        '::iteration::2' for a batch that only ever committed once. After the
+        fix: the cursor is restored before replay, so attempt 2 recomputes
+        iteration_number 1 and only ONE node/commit results.
+        """
+        reg, qm = reg_qm
+        sid = "s-phantom-retry"
+        worker = SessionWorker(
+            session_id=sid,
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+
+        real_flush = worker.services.graph.flush
+        call_count = 0
+
+        async def _flaky_flush() -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("DeadlockDetected")
+            await real_flush()
+
+        worker.services.graph.flush = _flaky_flush  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        await qm.append(
+            sid,
+            _line(
+                "provider:request",
+                "/ws",
+                {"session_id": sid, "timestamp": "2026-06-11T12:00:00+00:00"},
+            ),
+        )
+        task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+        for _ in range(400):
+            await asyncio.sleep(0.01)
+            if (await qm.read_batch(sid, 10)).lines == []:
+                break
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        # Prove a real fail-then-succeed retry actually happened (not a
+        # vacuous pass from the batch never being retried at all).
+        assert call_count >= 2, f"Expected >=2 flush calls, got {call_count}"
+
+        iteration_nodes = sorted(
+            node_id
+            for node_id in worker.services.graph._nodes
+            if "::iteration::" in node_id
+        )
+        assert iteration_nodes == [f"{sid}::iteration::1"], (
+            f"Expected exactly one Iteration node, got: {iteration_nodes}"
+        )
+        assert worker.services.data_layer_2.iteration_count == 1, (
+            "iteration_count cursor must not be advanced beyond the single "
+            "committed iteration; got "
+            f"{worker.services.data_layer_2.iteration_count}"
+        )
+
+    async def test_chained_transient_failures_then_success_produces_single_iteration(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """Two chained transient failures (attempts 1 and 2) before a
+        succeeding attempt 3 — proving the restore-to-pre-batch-snapshot is
+        applied on EVERY failed attempt, not just the first, so a 3rd attempt
+        still rolls back to the ORIGINAL pre-batch cursor state rather than
+        compounding on attempt 2's (already-restored) state.
+        """
+        reg, qm = reg_qm
+        sid = "s-phantom-retry-chain"
+        worker = SessionWorker(
+            session_id=sid,
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+
+        real_flush = worker.services.graph.flush
+        call_count = 0
+
+        async def _flaky_flush() -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:  # two transient failures, then succeed
+                raise RuntimeError("DeadlockDetected")
+            await real_flush()
+
+        worker.services.graph.flush = _flaky_flush  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        await qm.append(
+            sid,
+            _line(
+                "provider:request",
+                "/ws",
+                {"session_id": sid, "timestamp": "2026-06-11T12:00:00+00:00"},
+            ),
+        )
+        task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+        for _ in range(400):
+            await asyncio.sleep(0.01)
+            if (await qm.read_batch(sid, 10)).lines == []:
+                break
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        # Prove all three attempts (2 failures + 1 success) actually ran,
+        # well within the default max_delivery_attempts=5 budget.
+        assert call_count >= 3, f"Expected >=3 flush calls, got {call_count}"
+
+        iteration_nodes = sorted(
+            node_id
+            for node_id in worker.services.graph._nodes
+            if "::iteration::" in node_id
+        )
+        assert iteration_nodes == [f"{sid}::iteration::1"], (
+            f"Expected exactly one Iteration node, got: {iteration_nodes}"
+        )
+        assert worker.services.data_layer_2.iteration_count == 1, (
+            "iteration_count cursor must not be advanced beyond the single "
+            "committed iteration; got "
+            f"{worker.services.data_layer_2.iteration_count}"
+        )

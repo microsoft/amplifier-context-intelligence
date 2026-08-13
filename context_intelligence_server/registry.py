@@ -360,6 +360,10 @@ class SessionRegistry:
         poll_interval = min(flush_timeout, _DRAIN_POLL_INTERVAL)
         idle_elapsed = 0.0
         attempts = 0
+        # Pre-batch cursor snapshot for the common (budget-not-exhausted)
+        # retry branch below -- see the snapshot/restore comment at the
+        # retry `continue` for why this is needed.
+        pre_batch_cursor: dict[str, Any] | None = None
 
         while True:
             try:
@@ -389,6 +393,15 @@ class SessionRegistry:
                 idle_elapsed = 0.0
 
                 # --- dispatch + durable write barrier, one error path ---
+                if attempts == 0:
+                    # First attempt at this (start_offset-identified) batch:
+                    # snapshot the cursor BEFORE any handler mutates it, so a
+                    # failed attempt can restore to this exact pre-batch
+                    # state before replay (see the retry-branch comment
+                    # below). Not re-taken on subsequent attempts of the
+                    # SAME batch (attempts > 0) so a 3rd attempt still rolls
+                    # back to the ORIGINAL pre-batch state, not attempt 2's.
+                    pre_batch_cursor = worker.services.snapshot_cursor()
                 try:
                     saw_terminal = await self._process_batch(worker, batch, handlers)
                     await self._flush_barrier(worker)
@@ -436,6 +449,20 @@ class SessionRegistry:
                     # idempotent MERGE makes the replay a no-op). The backoff
                     # avoids a tight Neo4j-hammering retry loop on a transient
                     # deadlock and keeps retries on the loop's poll cadence.
+                    #
+                    # Phantom-cursor guard (common-path sibling of the
+                    # _handle_exhausted_batch guard above): handlers mutate
+                    # cross-handler cursor state (e.g. IterationHandler's
+                    # iteration_count / active_iteration_id) BEFORE their
+                    # graph write. The MERGE being idempotent does NOT make
+                    # replay a no-op when a handler's node_id is derived from
+                    # a mutable cursor counter -- each replay would advance
+                    # that counter again and mint a NEW node_id for the same
+                    # never-committed batch. Restore the pre-batch snapshot
+                    # before the replay so every attempt starts from
+                    # identical cursor state; only the attempt that actually
+                    # commits leaves its mutation in place.
+                    worker.services.restore_cursor(pre_batch_cursor)
                     await asyncio.sleep(poll_interval)
                     continue
 
