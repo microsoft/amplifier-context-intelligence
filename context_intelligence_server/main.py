@@ -924,9 +924,17 @@ async def get_status(request: Request) -> dict[str, Any]:
     # Live probe timestamp (bounded staleness <= the probe TTL), replacing
     # the old boot-only snapshot timestamp.
     response["schema_checked_at"] = datetime.now(UTC).isoformat()
-    response["degraded_reason"] = getattr(
-        request.app.state, "schema_degraded_reason", None
-    )
+    # degraded_reason is sourced from the SAME live coordinator probe that
+    # drives mode/schema_health above (_maint.reason), NOT the boot-time
+    # app.state snapshot. The snapshot version goes stale after an
+    # out-of-band repair (POST /admin/maintenance or `doctor --fix`): mode
+    # correctly de-latches to "healthy" but the boot-time reason string kept
+    # asserting a constraint-absent condition that was no longer true. This
+    # is the same reason MaintenanceCoordinator.status() already produces
+    # for the 503 body (maintenance_response), so /status and the 503 stay
+    # consistent -- and it naturally clears to None once the live probe
+    # confirms the constraint is present and no maintenance op is running.
+    response["degraded_reason"] = _maint.reason
     # W-2: queue-recovery health is reported SEPARATELY from schema_health --
     # a queue-recovery fault at boot is not a schema fault (see lifespan).
     response["queue_health"] = getattr(request.app.state, "queue_health", "healthy")

@@ -1102,18 +1102,29 @@ async def test_status_exposes_schema_health_fields(
     """GET /status surfaces schema_health, untagged_nodes, schema_checked_at,
     and degraded_reason.
 
-    WS-3a DE-LATCHES schema_health/schema_checked_at: they are no longer read
-    verbatim from the app.state boot snapshot -- schema_health is now derived
-    live from the MaintenanceCoordinator's TTL-cached constraint probe (see
-    sec 3a-3), and schema_checked_at is the live-probe timestamp rather than
-    the boot-time one. untagged_nodes and degraded_reason are UNCHANGED:
-    they remain the boot-time values (documented as such; untagged_nodes is
-    explicitly not a gate input).
+    WS-3a DE-LATCHES schema_health/schema_checked_at/degraded_reason: none of
+    these are read verbatim from the app.state boot snapshot anymore --
+    schema_health and degraded_reason are now both derived live from the
+    MaintenanceCoordinator's TTL-cached constraint probe (the same probe/
+    reason the 503 body reuses), and schema_checked_at is the live-probe
+    timestamp rather than the boot-time one. Only untagged_nodes remains the
+    boot-time value (documented as such; explicitly not a gate input).
+
+    This pins the fix for the stale-signal bug: `degraded_reason` used to be
+    read verbatim from the app.state boot snapshot, so it kept asserting a
+    stale constraint-absent condition even after a live repair de-latched
+    `mode`/`schema_health`. Here the boot-time `schema_degraded_reason` is
+    deliberately set to a DIFFERENT sentence than the live coordinator's
+    `reason` -- the assertion below only passes if degraded_reason is
+    sourced from the live value, not the stale boot snapshot.
     """
     from context_intelligence_server.maintenance import MaintenanceStatus, OpRecord
 
     main_module.app.state.schema_untagged_nodes = 3
-    main_module.app.state.schema_degraded_reason = "3 node(s) lacking the :Node label"
+    # Deliberately a DIFFERENT sentence than the live coordinator reason
+    # below, so the test fails if degraded_reason ever regresses back to
+    # reading the boot-time snapshot.
+    main_module.app.state.schema_degraded_reason = "STALE boot-time reason"
     monkeypatch.setattr(
         main_module.coordinator,
         "status",
@@ -1141,11 +1152,116 @@ async def test_status_exposes_schema_health_fields(
         assert data["schema_health"] == "degraded"
         assert data["untagged_nodes"] == 3  # boot-time value, unchanged
         assert data["schema_checked_at"] is not None  # live probe timestamp now
-        assert data["degraded_reason"] == "3 node(s) lacking the :Node label"
+        # LIVE coordinator reason, NOT the stale boot-time snapshot.
+        assert data["degraded_reason"] == (
+            ":Node uniqueness constraint absent -- migration required"
+        )
     finally:
         # Reset so this test doesn't leak state into siblings sharing the
         # module-level app singleton.
         main_module.app.state.schema_untagged_nodes = None
+        main_module.app.state.schema_degraded_reason = None
+
+
+async def test_status_degraded_reason_self_clears_after_live_repair_no_restart(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE STALE-SIGNAL BUG, DIRECTLY: after an in-server repair (e.g.
+    `POST /admin/maintenance` recreating the :Node uniqueness constraint),
+    `degraded_reason` must update to reflect the new live state -- WITHOUT a
+    restart -- exactly like `mode`/`schema_health` already do (WS-3a).
+
+    Before the fix, `degraded_reason` was read verbatim from the app.state
+    boot snapshot, which is only ever written once during `lifespan`. A
+    live repair flips the coordinator's probe (and thus `mode`), but the
+    boot snapshot never changes for the life of the process -- so
+    `degraded_reason` kept asserting a constraint-absent condition that was
+    now false. Here the SAME running app (no restart, no re-entering
+    `lifespan`) observes the coordinator's probe result change between two
+    successive `GET /status` calls and the reason string tracks it.
+    """
+    from context_intelligence_server.maintenance import MaintenanceStatus, OpRecord
+
+    def _status(
+        *, constraint_present: bool | None, reason: str | None, mode: str
+    ) -> MaintenanceStatus:
+        return MaintenanceStatus(
+            mode=mode,  # type: ignore[arg-type]
+            constraint_present=constraint_present,
+            reason=reason,
+            started_at=None,
+            elapsed_seconds=None,
+            op=OpRecord(
+                state="unknown",
+                run_id=None,
+                started_at=None,
+                completed_at=None,
+                records_affected=None,
+                error=None,
+            ),
+        )
+
+    # Boot-time snapshot: set ONCE, never touched again in this test --
+    # simulating the real lifespan-populated app.state that a stale
+    # implementation would keep reading forever.
+    main_module.app.state.schema_degraded_reason = (
+        ":Node uniqueness constraint absent (data conflict)"
+    )
+    try:
+        # --- Before repair: constraint absent, live-degraded. ---
+        monkeypatch.setattr(
+            main_module.coordinator,
+            "status",
+            AsyncMock(
+                return_value=_status(
+                    constraint_present=False,
+                    reason=(
+                        ":Node uniqueness constraint absent -- migration required"
+                    ),
+                    mode="maintenance",
+                )
+            ),
+        )
+        before = (await client.get("/status")).json()
+        assert before["degraded_reason"] == (
+            ":Node uniqueness constraint absent -- migration required"
+        )
+
+        # --- Repair happens out-of-band (no restart of this process): the
+        # constraint is recreated, the coordinator's live probe now reports
+        # present/healthy. Re-point the SAME coordinator's `status` method --
+        # nothing about app.state.schema_degraded_reason changes.
+        monkeypatch.setattr(
+            main_module.coordinator,
+            "status",
+            AsyncMock(
+                return_value=_status(
+                    constraint_present=True,
+                    reason=None,
+                    mode="healthy",
+                )
+            ),
+        )
+        after = (await client.get("/status")).json()
+
+        # THE FIX: degraded_reason clears to null, tracking the live probe --
+        # it does NOT still say "constraint absent" (the stale boot value).
+        assert after["degraded_reason"] is None, (
+            f"degraded_reason must clear once the live probe reports the "
+            f"constraint present again; got stale value: "
+            f"{after['degraded_reason']!r}"
+        )
+        # Non-vacuity: prove the two calls actually observed different
+        # coordinator states (otherwise this test would trivially pass).
+        assert before["degraded_reason"] != after["degraded_reason"]
+        # And prove it never degenerated into the OLD stale-boot-snapshot
+        # behavior, which would have returned this sentence unchanged on
+        # both calls.
+        assert after["degraded_reason"] != (
+            main_module.app.state.schema_degraded_reason
+        )
+    finally:
         main_module.app.state.schema_degraded_reason = None
 
 
@@ -1154,7 +1270,14 @@ async def test_status_schema_health_defaults_to_unknown_when_unset(
 ) -> None:
     """Before lifespan has run (or if app.state was never populated), GET
     /status must report schema_health="unknown", never a false "healthy"
-    (B3: a probe that hasn't run yet is not the same as a clean graph)."""
+    (B3: a probe that hasn't run yet is not the same as a clean graph).
+
+    degraded_reason is now sourced LIVE from the coordinator (see the
+    stale-signal fix), so with no driver bound the coordinator's own probe
+    reports "unknown" WITH a reason explaining why (unlike the old
+    boot-snapshot-only field, which could be a bare None here purely because
+    the app.state attributes were deleted, never reflecting the true
+    tri-state semantics)."""
     for attr in (
         "schema_health",
         "schema_untagged_nodes",
@@ -1168,7 +1291,8 @@ async def test_status_schema_health_defaults_to_unknown_when_unset(
     data = response.json()
     assert data["schema_health"] == "unknown"
     assert data["untagged_nodes"] is None
-    assert data["degraded_reason"] is None
+    assert data["degraded_reason"] is not None
+    assert "could not determine" in data["degraded_reason"]
 
 
 async def test_registry_exposed_on_app_state() -> None:
