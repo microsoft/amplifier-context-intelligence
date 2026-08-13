@@ -915,6 +915,138 @@ class TestDurableDrainLoop:
             except asyncio.CancelledError:
                 pass
 
+
+class TestMaintenanceGate:
+    """WS-3a spec sec 7a, A6/A7: the drain-loop gate placement guarantees
+    that NOTHING downstream (read_batch/process/flush/commit) runs while
+    the coordinator reports the gate closed, and that a batch gated then
+    un-gated is processed/committed exactly once (no duplicate, no loss)."""
+
+    async def test_gate_closed_blocks_read_batch_and_commit(
+        self, reg_qm: tuple[SessionRegistry, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A6 (MUST-FIX #5 offset ordering): while gated, read_batch is never
+        reached, so qm.commit never runs and the on-disk offset never
+        advances -- proven by reverting: without the gate check, read_batch
+        IS reached immediately (see the companion revert-check below)."""
+        reg, qm = reg_qm
+        sid = "gated-session"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+        await qm.append(sid, _line("tool_call", "/ws", {"session_id": sid}))
+
+        read_batch_spy = AsyncMock(wraps=qm.read_batch)
+        commit_spy = AsyncMock(wraps=qm.commit)
+        monkeypatch.setattr(
+            registry_module.coordinator,
+            "gate_closed",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(qm, "read_batch", read_batch_spy)
+        monkeypatch.setattr(qm, "commit", commit_spy)
+
+        task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        read_batch_spy.assert_not_called()
+        commit_spy.assert_not_called()
+        assert worker.events_processed == 0
+        # The line is still fully queued -- offset never advanced.
+        monkeypatch.undo()
+        remaining = await qm.read_batch(sid, 10)
+        assert len(remaining.lines) == 1
+
+    async def test_revert_check_gate_closed_false_reaches_read_batch(
+        self, reg_qm: tuple[SessionRegistry, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-vacuity companion to the test above: with gate_closed() forced
+        FALSE (i.e. reverting the gate's effect), read_batch/process/commit
+        DO run -- proving the previous test's zero-calls assertion is a real
+        gate effect, not an artifact of the test setup."""
+        reg, qm = reg_qm
+        sid = "ungated-session"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+        await qm.append(sid, _line("tool_call", "/ws", {"session_id": sid}))
+
+        monkeypatch.setattr(
+            registry_module.coordinator,
+            "gate_closed",
+            AsyncMock(return_value=False),
+        )
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ) as mock_process:
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if (await qm.read_batch(sid, 10)).lines == []:
+                    break
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        mock_process.assert_awaited()
+        assert (await qm.read_batch(sid, 10)).lines == []  # offset DID advance
+
+    async def test_gate_reopens_batch_processed_exactly_once(
+        self, reg_qm: tuple[SessionRegistry, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A7: a batch that arrives while gated is processed/committed
+        EXACTLY once after the gate opens -- no duplicate dispatch, no loss."""
+        reg, qm = reg_qm
+        sid = "gate-reopen-session"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+        await qm.append(sid, _line("tool_call", "/ws", {"session_id": sid}))
+
+        gate_state = {"closed": True}
+
+        async def fake_gate_closed() -> bool:
+            return gate_state["closed"]
+
+        monkeypatch.setattr(registry_module, "_GATED_POLL_INTERVAL", 0.05)
+        monkeypatch.setattr(
+            registry_module.coordinator, "gate_closed", fake_gate_closed
+        )
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ) as mock_process:
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            await asyncio.sleep(0.15)
+            assert mock_process.await_count == 0  # still gated: untouched
+
+            gate_state["closed"] = False  # reopen
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                if (await qm.read_batch(sid, 10)).lines == []:
+                    break
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert mock_process.await_count == 1
+        assert worker.events_processed == 1
+        assert (await qm.read_batch(sid, 10)).lines == []
+
+
+class TestDrainWorkerMethodExists:
     def test_drain_worker_is_method_on_registry(self) -> None:
         """drain_worker must be an instance coroutine method on SessionRegistry
         (folded from the queue-era TestDrainLoopCallsProcessEvent)."""

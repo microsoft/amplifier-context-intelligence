@@ -35,6 +35,11 @@ from context_intelligence_server.config import Neo4jClientConfig, Settings, get_
 from context_intelligence_server.idempotency import EventIdempotencyCache
 from context_intelligence_server.identity_store import IdentityStore
 from context_intelligence_server.logging_config import setup_logging
+from context_intelligence_server.maintenance import (
+    MAINTENANCE_ALLOW_LIST,
+    coordinator,
+    maintenance_gate_middleware,
+)
 from context_intelligence_server.models import (
     CypherRequest,
     EventRequest,
@@ -241,6 +246,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.schema_untagged_nodes = None
     app.state.schema_checked_at = None
     app.state.schema_degraded_reason = None
+    # W-2: queue-recovery health is a SEPARATE signal from schema_health --
+    # a queue fault is not a schema fault (see the inner try/except around
+    # the crash-recovery block below). Defaults "healthy"; only the
+    # queue-recovery block itself may downgrade it to "degraded".
+    app.state.queue_health = "healthy"
     # Driver slots default to None so the shutdown finally can close them
     # safely even if construction below never ran (B1: construction is now
     # INSIDE the boundary, so it can fail without these ever being assigned).
@@ -352,29 +362,58 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # disk to reconstruct the accepted/written baseline. Seeding before
         # reconciling would leave a residual==1 false DEGRADED. Both run before the
         # respawn loop so the respawned drainers start from a conserved baseline.
-        await registry.queue_manager.recovery_reconcile_dead()
-        _accepted_seed, _written_seed = (
-            await registry.queue_manager.recovery_seed_counts()
-        )
-        registry.seed_counters(_accepted_seed, _written_seed)
-        recovered = await registry.queue_manager.recover()
-        respawned = 0
-        for sid in recovered:
-            # B6: iterate defensively -- a corrupt per-session .offset/
-            # dead-letter quarantines THAT session (logged, skipped) rather
-            # than sinking the whole boot via an unhandled exception here.
-            try:
-                batch = await registry.queue_manager.read_batch(sid, max_items=1)
-                if not batch.lines:
-                    continue
-                if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
-                    respawned += 1
-            except Exception:  # quarantine this session, don't sink boot
-                logger.exception("recovery_session_quarantined session=%s", sid)
-        logger.info(
-            "lifespan_startup: crash recovery respawned %d/%d drainers",
-            respawned,
-            len(recovered),
+        # W-2: this recovery block is wrapped in its OWN inner try/except,
+        # separate from the outer B1 boundary. A failure here is a QUEUE
+        # fault, not a schema fault -- conflating the two (the pre-W-2
+        # behavior) made a queue-recovery exception masquerade as
+        # schema_health="unknown" with reason "startup sequence failed",
+        # which is operator-misleading. Re-raises nothing: the outer B1
+        # boundary is still the backstop for anything this doesn't catch.
+        try:
+            await registry.queue_manager.recovery_reconcile_dead()
+            _accepted_seed, _written_seed = (
+                await registry.queue_manager.recovery_seed_counts()
+            )
+            registry.seed_counters(_accepted_seed, _written_seed)
+            recovered = await registry.queue_manager.recover()
+            respawned = 0
+            for sid in recovered:
+                # B6: iterate defensively -- a corrupt per-session .offset/
+                # dead-letter quarantines THAT session (logged, skipped)
+                # rather than sinking the whole boot via an unhandled
+                # exception here.
+                try:
+                    batch = await registry.queue_manager.read_batch(sid, max_items=1)
+                    if not batch.lines:
+                        continue
+                    if _recover_one_session(
+                        sid, batch.lines[0], registry.get_or_create
+                    ):
+                        respawned += 1
+                except Exception:  # quarantine this session, don't sink boot
+                    logger.exception("recovery_session_quarantined session=%s", sid)
+            logger.info(
+                "lifespan_startup: crash recovery respawned %d/%d drainers",
+                respawned,
+                len(recovered),
+            )
+        except Exception:  # W-2: a queue fault, not a schema fault
+            logger.exception(
+                "queue_recovery_degraded: queue-recovery sequence failed but "
+                "boot continues (deploy-safe boot invariant) -- this is a "
+                "queue-health signal, distinct from schema_health"
+            )
+            app.state.queue_health = "degraded"
+
+        # WS-3a: wire the live admin driver into the maintenance coordinator
+        # so the gate/status probe can run. Placed after schema-health is
+        # recorded (not inside the W-2 block above) so a queue-recovery
+        # failure never prevents the coordinator from being bound -- the
+        # maintenance gate must reflect graph/schema state, not queue state.
+        coordinator.bind_driver(
+            app.state.neo4j_driver,
+            untagged=untagged,
+            probe_ttl_seconds=_settings.maintenance_probe_ttl_seconds,
         )
     except Exception as exc:  # B1: deploy-safe boot -- NEVER crash-loop
         logger.exception(
@@ -419,6 +458,12 @@ app = FastAPI(
 app.include_router(admin_router)
 app.include_router(version_router)
 app.include_router(queues_router)
+# WS-3a: registered on `app` itself, NOT on the auth-wrapped `asgi_app` --
+# so it cannot be bypassed by the bare `main:app` entrypoint (the same class
+# of bug the auth-fold fix below addresses one layer over). BearerTokenMiddleware
+# wraps `app`, so auth still runs FIRST; an unauthenticated request 401s
+# before it ever reaches this gate.
+app.middleware("http")(maintenance_gate_middleware)
 _start_time = time.time()
 registry = SessionRegistry()
 # Expose the registry singleton on app.state so routers can read it via
@@ -494,6 +539,26 @@ def _assert_admin_not_exempt() -> None:
             )
 
 
+def _assert_maintenance_endpoint_allow_listed() -> None:
+    """Startup assertion (WS-3a MUST-FIX #1): the maintenance-mode allow-list
+    must always contain ``/admin/maintenance``, ``/status``, and ``/version``.
+
+    Called by ``create_asgi_app`` before constructing the middleware, mirroring
+    ``_assert_admin_not_exempt`` above. Without this, ``/admin/maintenance``
+    could accidentally be gated by its own allow-list -- 503ing at precisely
+    the moment it exists to unblock, recreating the ACA deadlock this
+    endpoint was built to close.
+    """
+    required = {"/admin/maintenance", "/status", "/version"}
+    missing = required - MAINTENANCE_ALLOW_LIST
+    if missing:
+        raise RuntimeError(
+            f"Availability invariant violated: {sorted(missing)!r} missing from "
+            f"maintenance.MAINTENANCE_ALLOW_LIST -- these paths must never be "
+            f"gated by maintenance mode."
+        )
+
+
 def _assert_neo4j_clients_explicit(settings: Settings) -> None:
     """Startup assertion (doc 11 gap #12): the deployed profile MUST declare the
     structured neo4j.admin / neo4j.cypher_query clients explicitly.
@@ -553,6 +618,9 @@ def create_asgi_app(
     # This runs before any middleware construction so the failure is loud and
     # immediate — no request ever reaches an unauthenticated /admin endpoint.
     _assert_admin_not_exempt()
+    # WS-3a MUST-FIX #1: /admin/maintenance (and /status, /version) must never
+    # be gated by maintenance mode -- same defence-in-depth pattern as above.
+    _assert_maintenance_endpoint_allow_listed()
 
     s = settings if settings is not None else _settings
     _assert_neo4j_clients_explicit(s)
@@ -826,25 +894,42 @@ async def get_status(request: Request) -> dict[str, Any]:
             else {}
         ),
     }
-    # B3/B7 (deploy-safe boot, 2026-08-12): tri-state migration/schema health,
-    # computed ONCE at boot (see lifespan's _record_schema_health) --
-    # "healthy" / "degraded" / "unknown". This is a DATA-MIGRATION signal,
-    # not a process-liveness signal, and goes stale after an out-of-band
-    # repair (`doctor --fix`) until the next restart re-probes it.
+    # WS-3a: mode/schema_health are now DE-LATCHED -- sourced from the live,
+    # TTL-cached MaintenanceCoordinator probe instead of the boot-only
+    # snapshot. This self-clears after an out-of-band repair (`doctor --fix`
+    # or `POST /admin/maintenance`) within the probe's TTL, with NO restart
+    # required -- the exact latch this replaces.
     #
-    #   *** MUST NOT be wired to a Kubernetes/ACA liveness or readiness    ***
-    #   *** probe. Doing so would recreate the exact crash-loop this fix  ***
-    #   *** removes, one layer up (see docs/azure-deployment.md).         ***
-    response["schema_health"] = getattr(request.app.state, "schema_health", "unknown")
+    #   *** schema_health/mode MUST NOT be wired to a Kubernetes/ACA        ***
+    #   *** liveness or readiness probe. Doing so would recreate the exact ***
+    #   *** crash-loop the deploy-safe-boot fix removes, one layer up      ***
+    #   *** (see docs/azure-deployment.md).                                ***
+    _maint = await coordinator.status()
+    response["mode"] = _maint.mode
+    response["maintenance_started_at"] = _maint.started_at
+    response["maintenance_elapsed_seconds"] = _maint.elapsed_seconds
+    if _maint.constraint_present is None:
+        response["schema_health"] = "unknown"
+    elif _maint.constraint_present is False:
+        response["schema_health"] = "degraded"
+    elif (getattr(request.app.state, "schema_untagged_nodes", None) or 0) > 0:
+        response["schema_health"] = "degraded"
+    else:
+        response["schema_health"] = "healthy"
+    # untagged_nodes stays the BOOT-time value (documented as such, not a
+    # gate input -- the live gate/mode signal is the constraint probe above).
     response["untagged_nodes"] = getattr(
         request.app.state, "schema_untagged_nodes", None
     )
-    response["schema_checked_at"] = getattr(
-        request.app.state, "schema_checked_at", None
-    )
+    # Live probe timestamp (bounded staleness <= the probe TTL), replacing
+    # the old boot-only snapshot timestamp.
+    response["schema_checked_at"] = datetime.now(UTC).isoformat()
     response["degraded_reason"] = getattr(
         request.app.state, "schema_degraded_reason", None
     )
+    # W-2: queue-recovery health is reported SEPARATELY from schema_health --
+    # a queue-recovery fault at boot is not a schema fault (see lifespan).
+    response["queue_health"] = getattr(request.app.state, "queue_health", "healthy")
     return response
 
 

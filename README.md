@@ -149,7 +149,7 @@ python scripts/prime-local-config.py --neo4j-password '<neo4j-password>'
 ```bash
 export AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE="$(pwd)/server-config.yaml"
 uv sync
-uv run uvicorn context_intelligence_server.main:app --host 127.0.0.1 --port 8000
+uv run uvicorn context_intelligence_server.main:asgi_app --host 127.0.0.1 --port 8000
 ```
 
 Open [http://localhost:8000](http://localhost:8000) to confirm the server is

@@ -11,6 +11,7 @@ from typing import Any
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
+from context_intelligence_server.maintenance import coordinator
 from context_intelligence_server.status import EventRecord, ring_buffer
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
 from context_intelligence_server.pipeline import process_event, setup_handlers
@@ -21,6 +22,10 @@ logger = logging.getLogger("context_intelligence_server")
 
 _DRAIN_MAX_BATCH = 100
 _DRAIN_POLL_INTERVAL = 0.05  # idle poll cadence; bounded by flush_timeout
+# Poll cadence while the maintenance gate is closed. Slower than the normal
+# drain cadence on purpose: nothing can be done while gated, so a 20x slower
+# spin costs <=1s of resume latency and avoids N-session busy polling.
+_GATED_POLL_INTERVAL = 1.0
 
 # R3 (spec §10.4): pending_tool_block_ids is unbounded and now serialized on
 # every commit (§3 D2). We measure, we do not cap -- capping at serialization
@@ -367,6 +372,21 @@ class SessionRegistry:
 
         while True:
             try:
+                # Maintenance gate -- FIRST statement inside the loop, before
+                # any consuming step (read_batch/process/flush/commit). This
+                # placement (rather than gating spawn at get_or_create ->
+                # start_drain) is what makes the offset-ordering guarantee
+                # free: everything below is unreachable while gated, so
+                # qm.commit() never runs and the on-disk offset never
+                # advances. Kill-9 mid-maintenance -> restart -> repair ->
+                # replay from the last successfully-flushed offset, exactly
+                # once. Drainers still spawn during maintenance; they idle
+                # here instead of refusing to spawn (which would itself be a
+                # second latch -- see the WS-3a spec sec 3a-2).
+                if await coordinator.gate_closed():
+                    await asyncio.sleep(_GATED_POLL_INTERVAL)
+                    continue
+
                 batch = await qm.read_batch(session_id, max_items=_DRAIN_MAX_BATCH)
 
                 if not batch.lines:
