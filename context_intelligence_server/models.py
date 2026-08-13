@@ -38,6 +38,20 @@ class EventRequest(BaseModel):
             raise ValueError("workspace must not be empty")
         return v
 
+    @field_validator("working_dir")
+    @classmethod
+    def working_dir_must_not_be_blank(cls, v: str | None) -> str | None:
+        """Allow ``None`` (working_dir is optional, unlike workspace) but reject
+        blank/whitespace-only strings.
+
+        Mirrors ``workspace_must_not_be_empty``'s normalize-or-reject stance: a
+        whitespace-only value (e.g. ``"   "``) is never a legitimate path and must
+        not write through to the Session node verbatim.
+        """
+        if v is not None and not v.strip():
+            raise ValueError("working_dir must not be blank")
+        return v
+
 
 class EventResponse(BaseModel):
     """Response returned after an event is accepted."""

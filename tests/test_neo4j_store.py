@@ -2681,6 +2681,145 @@ class TestBuildNodePropsCreatedBy:
 
 
 # ---------------------------------------------------------------------------
+# W-3 defect 2: working_dir DB-level non-overwrite guarantee
+# ---------------------------------------------------------------------------
+# Unit-level coverage for the structural pieces (excluded from row.props,
+# carried separately, coalesce SET present in the Session write). The actual
+# non-overwrite BEHAVIOR against a real graph (existing value survives a
+# conflicting later write) is proven against live Neo4j in
+# tests/neo4j/test_working_dir_non_overwrite.py -- a mocked tx cannot execute
+# Cypher, so it can only assert the query/rows shape, not runtime semantics.
+
+
+class TestBuildNodePropsWorkingDir:
+    """_build_node_props excludes 'working_dir' from the generic props merge.
+
+    working_dir must never ride in ``row.props`` (which is blindly merged via
+    ``SET n += row.props``) -- it travels separately so the Session write can
+    apply ``coalesce(n.working_dir, row.working_dir)`` instead of an overwrite.
+    """
+
+    def test_node_props_excludes_working_dir(self) -> None:
+        """data dict containing working_dir -> built props has NO working_dir key."""
+        from context_intelligence_server.neo4j_store import _build_node_props
+
+        data: dict = {
+            "labels": ["Session"],
+            "working_dir": "/home/user/project",
+            "status": "running",
+        }
+        props = _build_node_props(data, "ws-1")
+
+        assert "working_dir" not in props, (
+            "_build_node_props must NOT include working_dir in props; "
+            "working_dir travels separately so it can be coalesced, not overwritten"
+        )
+
+    def test_node_props_preserves_other_fields_alongside_working_dir(self) -> None:
+        """Excluding working_dir must not disturb other legitimate props."""
+        from context_intelligence_server.neo4j_store import _build_node_props
+
+        data: dict = {
+            "labels": ["Session"],
+            "working_dir": "/home/user/project",
+            "status": "running",
+            "agent": "root",
+        }
+        props = _build_node_props(data, "ws-1")
+
+        assert props.get("status") == "running"
+        assert props.get("agent") == "root"
+        assert props.get("workspace") == "ws-1"
+
+
+class TestSessionMergeWorkingDirCoalesce:
+    """The inline Session MERGE in _write_batch applies a DB-level coalesce for
+    working_dir instead of the blind ``SET n += row.props`` overwrite.
+    """
+
+    def test_session_merge_source_contains_coalesce_clause(self) -> None:
+        """_write_batch source contains the coalesce SET for working_dir on the
+        Session-node write path."""
+        import inspect
+
+        from context_intelligence_server import neo4j_store
+
+        source = inspect.getsource(neo4j_store._write_batch)
+        assert "SET n.working_dir = coalesce(n.working_dir, row.working_dir)" in (
+            source
+        ), (
+            "_write_batch must apply a DB-level coalesce for working_dir on the "
+            "Session-node MERGE so an already-set value is never clobbered"
+        )
+
+    def test_session_merge_coalesce_is_separate_from_props_merge(self) -> None:
+        """The coalesce SET must be a clause distinct from `SET n += row.props`,
+        confirming working_dir cannot ride the blind merge AND be coalesced
+        redundantly (single source of truth for the value)."""
+        import inspect
+
+        from context_intelligence_server import neo4j_store
+
+        source = inspect.getsource(neo4j_store._write_batch)
+        merge_idx = source.index("SET n += row.props, n:Session")
+        coalesce_idx = source.index(
+            "SET n.working_dir = coalesce(n.working_dir, row.working_dir)"
+        )
+        assert coalesce_idx > merge_idx, (
+            "coalesce SET must follow the main props/label SET so it observes "
+            "the fully-applied node state before deciding the working_dir value"
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_row_carries_working_dir_key_when_present(self) -> None:
+        """A Session node with working_dir in its buffered data produces a row
+        whose top-level 'working_dir' key is populated (not nested in props)."""
+        mock_tx, mock_session = _make_flush_mocks()
+        store = Neo4jGraphStore(uri="bolt://fake", auth=("u", "p"), workspace="ws-wd")
+        store._driver.session = lambda **_: mock_session  # type: ignore[method-assign]
+        store._schema_initialized = True
+
+        await store.upsert_node(
+            "sess-1", {"labels": ["Session"], "working_dir": "/repo"}
+        )
+        await store.flush()
+
+        session_calls = [
+            c for c in mock_tx.run.call_args_list if "n:Session" in str(c.args[0])
+        ]
+        assert session_calls, "Expected a Session-node MERGE call"
+        rows = session_calls[0].kwargs.get("rows")
+        assert rows and rows[0].get("working_dir") == "/repo", (
+            f"Expected row['working_dir'] == '/repo', got rows={rows!r}"
+        )
+        assert "working_dir" not in rows[0]["props"], (
+            "working_dir must not also appear inside row['props']"
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_row_omits_working_dir_key_when_absent(self) -> None:
+        """A Session node with no working_dir produces a row with NO top-level
+        'working_dir' key at all (so coalesce(n.working_dir, row.working_dir)
+        sees a missing-map-key null, never an accidental empty string)."""
+        mock_tx, mock_session = _make_flush_mocks()
+        store = Neo4jGraphStore(uri="bolt://fake", auth=("u", "p"), workspace="ws-wd")
+        store._driver.session = lambda **_: mock_session  # type: ignore[method-assign]
+        store._schema_initialized = True
+
+        await store.upsert_node("sess-2", {"labels": ["Session"], "status": "running"})
+        await store.flush()
+
+        session_calls = [
+            c for c in mock_tx.run.call_args_list if "n:Session" in str(c.args[0])
+        ]
+        assert session_calls, "Expected a Session-node MERGE call"
+        rows = session_calls[0].kwargs.get("rows")
+        assert rows and "working_dir" not in rows[0], (
+            f"Expected no 'working_dir' key when absent from source data, got {rows[0]!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # T21: Phase 2E — edge/relationship provenance (write-once, worker-level scalar)
 # ---------------------------------------------------------------------------
 

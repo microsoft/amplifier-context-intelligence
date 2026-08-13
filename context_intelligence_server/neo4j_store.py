@@ -1193,12 +1193,24 @@ def _chunk_list(
 def _build_node_props(data: dict[str, Any], workspace: str) -> dict[str, Any]:
     """Assemble the sanitized props dict for a single node row.
 
-    ``labels`` and ``created_by`` are excluded from the returned dict:
+    ``labels``, ``created_by``, and ``working_dir`` are excluded from the returned dict:
     - ``labels`` are applied separately via ``SET n:Label`` statements (not stored as props).
     - ``created_by`` travels ONLY as the ``$created_by`` query param (never a node property)
       so it cannot affect node identity or clobber the ``ON CREATE SET n.created_by`` stamp.
+    - ``working_dir`` (W-3 defect 2) is deliberately excluded from the blind
+      ``SET n += row.props`` merge -- it travels instead as the row's separate
+      top-level ``working_dir`` key (see ``_write_batch``'s Session-node write), so a
+      DB-level ``coalesce(n.working_dir, row.working_dir)`` can be applied instead of a
+      last-write-wins overwrite. An already-set working_dir must never be clobbered by
+      a cross-writer/replica race; this was previously enforced ONLY in the Python
+      layer (services.py's populate-if-missing check), which does not protect against
+      concurrent writers racing the same node.
     """
-    raw = {k: v for k, v in data.items() if k not in ("labels", "created_by")}
+    raw = {
+        k: v
+        for k, v in data.items()
+        if k not in ("labels", "created_by", "working_dir")
+    }
     _convert_temporal_props(raw)  # ISO str -> datetime, in place
     props = Neo4jGraphStore._sanitize_properties(raw)
     props["workspace"] = workspace
@@ -1240,6 +1252,16 @@ async def _write_batch(
         row: dict[str, Any] = {"node_id": node_id, "props": props}
 
         if "Session" in labels:
+            # W-3 defect 2: working_dir is carried as a separate top-level row key
+            # (never merged via the blind `+=`) so the Session write below can apply
+            # a DB-level `coalesce(n.working_dir, row.working_dir)` instead of an
+            # overwrite. working_dir is a Session-only property (services.py is the
+            # sole writer); non-Session rows never carry it, so the generic
+            # non-Session write path (_NODE_MERGE_CYPHER, other_rows below) is
+            # deliberately left untouched by this change.
+            working_dir_value = data.get("working_dir")
+            if working_dir_value:
+                row["working_dir"] = working_dir_value
             session_rows.append(row)
         else:
             other_rows.append(row)
@@ -1264,12 +1286,38 @@ async def _write_batch(
         # purely (node_id, workspace) on :Node — every node carries :Node, and the
         # :Node uniqueness constraint (ensure_neo4j_schema) makes concurrent MERGEs
         # atomic, the role the :Session constraint used to play for this MERGE.
+        #
+        # W-3 defect 2 (DB-level working_dir non-overwrite guarantee): a second,
+        # separate SET clause is appended AFTER the main `SET n += row.props, n:Session`
+        # — `SET n.working_dir = coalesce(n.working_dir, row.working_dir)`. This is a
+        # minimal, targeted addition, not a rewrite:
+        #   - The MERGE identity clause (the node lookup) is byte-for-byte unchanged,
+        #     so the query plan for finding/creating `n` is unaffected.
+        #   - `row.working_dir` is a plain top-level UNWIND row key (not part of
+        #     row.props), so it never participates in the `+=` merge and cannot be
+        #     blindly overwritten by it. Rows without a working_dir simply omit the
+        #     key, and Cypher map access on a missing key returns null, so
+        #     `coalesce(n.working_dir, null)` is a no-op for every non-working_dir row.
+        #   - When `n.working_dir` is already set, coalesce keeps the EXISTING value
+        #     (the guarantee: an already-populated working_dir is never clobbered by a
+        #     concurrent/replica writer). When `n.working_dir` is null and the row
+        #     supplies one, coalesce fills the gap — the same populate-if-missing rule
+        #     services.py already enforces in Python, now also guaranteed at the DB
+        #     level (defense in depth against races the Python-layer check cannot see).
+        #   - Sequential SET clauses within one statement guarantee ordering: the first
+        #     SET fully applies (including any legitimate working_dir-adjacent props)
+        #     before the second SET reads n.working_dir, so there is no read-before-
+        #     write ambiguity within the single MERGE lock hold.
+        # This is scoped to Session nodes only (working_dir is a Session-only property;
+        # services.py is its sole writer) — the generic non-Session write path
+        # (_NODE_MERGE_CYPHER below) is deliberately left untouched.
         res = await tx.run(
             "UNWIND $rows AS row "
             f"MERGE (n:{_UNIVERSAL_NODE_LABEL} "
             "{node_id: row.node_id, workspace: row.props.workspace}) "
             "ON CREATE SET n.created_by = $created_by "
-            "SET n += row.props, n:Session",
+            "SET n += row.props, n:Session "
+            "SET n.working_dir = coalesce(n.working_dir, row.working_dir)",
             rows=session_rows,
             created_by=created_by,
         )
