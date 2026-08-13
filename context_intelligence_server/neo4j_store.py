@@ -1111,6 +1111,61 @@ async def ensure_schema_version_baseline(
         )
 
 
+async def read_graph_schema_version(
+    driver: Any,
+    *,
+    database: str = "neo4j",
+) -> int | None:
+    """Read-only: the STORED ``:SchemaMeta{id:'singleton'}.schema_version``.
+
+    W-4 -- ADVISORY DRIFT SIGNAL ONLY, NOT A GUARD. This is a separate,
+    read-only companion to ``ensure_schema_version_baseline`` above, kept
+    structurally apart from that write path on purpose (see its docstring's
+    "do NOT add a helper that both reads SCHEMA_VERSION and mutates this
+    node" warning). This function does not import or compare against
+    ``SCHEMA_VERSION`` at all -- it only reads back whatever is stored.
+    Callers (``GET /status``) may compare the returned value against
+    ``status.SCHEMA_VERSION`` themselves for advisory telemetry so a
+    server/graph mismatch is *detectable*; this function performs no
+    comparison, gating, or migration of any kind. Full mismatch
+    handling/migration is deliberately deferred to amplifier-support#422.
+
+    Returns ``None`` when the singleton is absent (bootstrap: startup has
+    never completed ``ensure_schema_version_baseline`` against this graph)
+    or when the read itself fails for any reason (treated as "unknown", not
+    as an error) -- mirrors the never-raise, never-500-``/status`` contract
+    of ``_check_driver_connected`` in ``main.py``.
+
+    O(1): a point lookup by the unique ``id`` key, never a graph scan. Reads
+    via ``async for`` (rather than ``.single()``), the same reason
+    ``_run_single_count`` above does: this works against both the real async
+    driver and the test-suite's mock session, which only implements async
+    iteration.
+
+    Args:
+        driver:   An ``AsyncDriver`` instance created via
+                  ``AsyncGraphDatabase.driver(...)``.
+        database: Target Neo4j database name (default: ``"neo4j"``).
+    """
+    try:
+        async with driver.session(database=database) as session:
+            result = await session.run(
+                "MATCH (m:SchemaMeta {id: 'singleton'}) "
+                "RETURN m.schema_version AS schema_version"
+            )
+            async for record in result:
+                value = record["schema_version"]
+                return int(value) if value is not None else None
+            return None
+    except Exception as exc:  # noqa: BLE001 - defensive: /status must never 500
+        _LOG.warning(
+            "read_graph_schema_version: could not read SchemaMeta singleton "
+            "(connectivity error?); returning None: %s",
+            exc,
+        )
+        return None
+
+
 def _serialized_row_size(value: Any) -> int:
     """Return a cheap conservative proxy for the serialized byte size of *value*.
 

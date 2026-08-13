@@ -6,7 +6,7 @@ import json
 import logging
 from pathlib import Path
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, Self
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -1163,6 +1163,142 @@ async def test_status_exposes_schema_health_fields(
         main_module.app.state.schema_degraded_reason = None
 
 
+# ---------------------------------------------------------------------------
+# W-4: GET /status advisory graph_schema_version / schema_version_current
+# ---------------------------------------------------------------------------
+
+
+class _SchemaMetaResult:
+    """Async-iterable result double yielding a fixed list of row dicts.
+
+    Mirrors ``_RowsResult`` in ``tests/test_neo4j_store.py`` -- exercises the
+    ``async for record in result`` path ``read_graph_schema_version`` uses
+    (not ``.single()``), so this double alone is sufficient.
+    """
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self._rows = rows
+
+    def __aiter__(self) -> Any:
+        return self._agen()
+
+    async def _agen(self) -> Any:
+        for row in self._rows:
+            yield row
+
+
+class _SchemaMetaDriverStub:
+    """Driver double for ``read_graph_schema_version``: doubles as its own
+    session context manager and returns a canned ``:SchemaMeta`` row (or no
+    rows at all, simulating an absent/uninitialized singleton).
+    """
+
+    def __init__(self, schema_version: int | None) -> None:
+        self._schema_version = schema_version
+
+    def session(self, database: str = "neo4j") -> Self:
+        return self
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def run(self, statement: str) -> _SchemaMetaResult:
+        rows: list[dict[str, Any]] = (
+            []
+            if self._schema_version is None
+            else [{"schema_version": self._schema_version}]
+        )
+        return _SchemaMetaResult(rows)
+
+
+async def test_status_exposes_graph_schema_version_when_current(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /status surfaces graph_schema_version sourced from the STORED
+    :SchemaMeta singleton, and schema_version_current: true when it matches
+    the server's compiled-in SCHEMA_VERSION (advisory only -- no gating)."""
+    from context_intelligence_server.status import SCHEMA_VERSION
+
+    monkeypatch.setattr(
+        main_module.app.state,
+        "neo4j_driver",
+        _SchemaMetaDriverStub(SCHEMA_VERSION),
+        raising=False,
+    )
+
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["graph_schema_version"] == SCHEMA_VERSION
+    assert data["schema_version_current"] is True
+
+
+async def test_status_exposes_graph_schema_version_mismatch_detectable(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """W-4: a stored schema_version DIFFERENT from the compiled-in
+    SCHEMA_VERSION is reflected verbatim on /status (detectable drift) and
+    schema_version_current flips to false -- still purely advisory, no
+    behavior change results from the mismatch."""
+    from context_intelligence_server.status import SCHEMA_VERSION
+
+    stored_version = SCHEMA_VERSION - 1 if SCHEMA_VERSION > 0 else SCHEMA_VERSION + 1
+    assert stored_version != SCHEMA_VERSION  # sanity: the whole point of this test
+    monkeypatch.setattr(
+        main_module.app.state,
+        "neo4j_driver",
+        _SchemaMetaDriverStub(stored_version),
+        raising=False,
+    )
+
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["graph_schema_version"] == stored_version
+    assert data["schema_version_current"] is False
+
+
+async def test_status_graph_schema_version_none_when_singleton_absent(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bootstrap case: no :SchemaMeta singleton yet (server never completed
+    startup against this graph) -> graph_schema_version and
+    schema_version_current are both None, never an error / 500."""
+    monkeypatch.setattr(
+        main_module.app.state,
+        "neo4j_driver",
+        _SchemaMetaDriverStub(None),
+        raising=False,
+    )
+
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["graph_schema_version"] is None
+    assert data["schema_version_current"] is None
+
+
+async def test_status_graph_schema_version_none_when_no_driver(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defensive: /status must never 500 when neo4j_driver is unset."""
+    if hasattr(main_module.app.state, "neo4j_driver"):
+        monkeypatch.delattr(main_module.app.state, "neo4j_driver", raising=False)
+
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["graph_schema_version"] is None
+    assert data["schema_version_current"] is None
+
+
 async def test_status_degraded_reason_self_clears_after_live_repair_no_restart(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -2058,14 +2194,24 @@ class TestMaintenanceGateHttp:
         )
         status_resp = await client.get("/status")
         version_resp = await client.get("/version")
-        # /admin/maintenance (WS-3c) does not exist yet in this codebase --
-        # what matters here is that the GATE never intercepts it (a 404 from
-        # routing is fine; a 503 from THIS middleware would not be).
+        # /admin/maintenance IS on the allow-list, so the maintenance GATE must
+        # never intercept it. The route now EXISTS (WS-3c) and may legitimately
+        # return 503 for an UNRELATED reason (no admin_api_key configured in this
+        # test app -> "admin API not enabled"), so assert specifically that this
+        # is NOT the gate's structured maintenance-503, rather than a blanket
+        # != 503. The gate's 503 carries a Retry-After header + a
+        # {"status": "maintenance"} body; the admin-auth 503 carries neither.
         admin_maint_resp = await client.post("/admin/maintenance")
 
         assert status_resp.status_code != 503
         assert version_resp.status_code != 503
-        assert admin_maint_resp.status_code != 503
+        gate_intercepted = (
+            admin_maint_resp.status_code == 503
+            and admin_maint_resp.headers.get("retry-after") is not None
+        )
+        assert not gate_intercepted, (
+            "maintenance gate must not intercept the allow-listed /admin/maintenance"
+        )
 
     async def test_non_allow_listed_path_is_503d_while_gated(
         self, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
