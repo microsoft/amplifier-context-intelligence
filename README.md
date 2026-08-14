@@ -427,7 +427,10 @@ see [docs/azure-deployment.md](docs/azure-deployment.md).
 
 ## Neo4j Graph Model
 
-All nodes carry a `workspace` property for multi-workspace isolation.
+All nodes carry a `workspace` property used to scope queries to one workspace. It is
+an organizing label, **not** an authorization boundary — no credential is bound to a
+workspace, and `"workspace": "*"` (or Cypher that omits the filter) reads across all of
+them. See [docs/remote-access-sharing.md](docs/remote-access-sharing.md) §8.
 
 ### Node types
 
