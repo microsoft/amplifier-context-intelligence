@@ -17,15 +17,18 @@ metadata and tool-call traces, which can include prompts, file paths, and tool
 arguments — is uploaded to a **shared graph that the server owner can query**. You
 contribute data; you don't query the shared graph yourself.
 
-> **Contribute-only — you cannot query the shared graph.** The connection is one-way:
-> your sessions upload, and the *owner* queries them. The query endpoints are not
-> exposed to peers. If someone told you you'd be able to query the shared graph
-> (for example, to read the owner's own sessions), that isn't part of this setup —
-> check with them. Enabling it would require the owner to expose their entire graph
-> for reading, which most owners won't do.
+> **Contribute-only — you upload, you don't query.** Your sessions upload, and the
+> *owner* queries them. That one-way property comes from the owner's **network
+> configuration** — they route only the `/events` path, so the query endpoints aren't
+> reachable — and **not** from your token. The server has no write-only credential:
+> at the application layer any data token that can `POST /events` is also read-capable.
+> The path allowlist is what makes this one-way, so verify it yourself in **step 5C**
+> rather than assuming it. If a query *does* succeed, you are reading the owner's
+> sessions too — tell them; that is almost certainly not what either of you intended.
 
-Traffic is end-to-end encrypted (over the owner's overlay network plus HTTPS) and
-reaches only the upload endpoint. **You can opt out at any time** by removing the
+Traffic is end-to-end encrypted (over the owner's overlay network plus HTTPS), and if
+the owner set sharing up as documented it reaches only the upload endpoint — step 5C
+confirms that. **You can opt out at any time** by removing the
 destination below (or stopping the bundle). Data already uploaded remains in the
 graph unless the owner deletes it.
 
@@ -148,7 +151,29 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<their-node>.<their-tai
 - `422` — authenticated (the empty test body is rejected, which is expected).
 - `401` — key is wrong; re-copy it from the owner.
 
-**C. Real run:** start a normal Amplifier session from a directory your `include`
+**C. The query endpoints really are closed** — this is the check that proves the
+connection is contribute-only. Run it with your own key:
+
+```bash
+BASE=https://<their-node>.<their-tailnet>.ts.net
+KEY=$(grep CI_TEAM_KEY ~/.amplifier/keys.env | cut -d= -f2)
+
+curl -s -o /dev/null -w 'cypher %{http_code}\n' -X POST "$BASE/cypher" \
+  -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"query":"MATCH (s:Session) RETURN count(s)","workspace":"*"}'
+curl -s -o /dev/null -w 'blobs  %{http_code}\n' "$BASE/blobs/any" -H "authorization: Bearer $KEY"
+curl -s -o /dev/null -w 'status %{http_code}\n' "$BASE/status"
+```
+
+- **`404` on all three** — correct. The owner routed only `/events`; nothing else is
+  reachable, so the connection really is contribute-only.
+- **Anything other than `404`** (`200`, `500`, `401`…) — that path *is* reachable, which
+  means the allowlist is not in place. **Stop and tell the owner**: read endpoints are
+  exposed to peers, so your token can read *their* entire graph across all workspaces.
+  That is a misconfiguration on their side (see
+  [remote-access-sharing.md](remote-access-sharing.md) §4), not something you can fix.
+
+**D. Real run:** start a normal Amplifier session from a directory your `include`
 matches. Your events upload automatically in the background. Ask the owner to confirm
 your workspace appears.
 
@@ -159,8 +184,9 @@ your workspace appears.
 | Symptom | Fix |
 |---------|-----|
 | `000` / timeout on step 5A | Open Tailscale; confirm you're connected and accepted the device share |
-| `404` | Server URL typo — must match exactly what the owner gave you |
+| `404` in step 5A or 5B | Server URL typo — must match exactly what the owner gave you (in step 5C, `404` is the *expected* result) |
 | `401` in step 5B | Wrong or stale API key — request it again |
+| Anything but `404` in step 5C | Owner-side misconfiguration — the path allowlist isn't in place and your token can read their whole graph. Report it; don't work around it |
 | Events don't appear | Confirm the bundle is added (`--app`), that `~/.amplifier/keys.env` is loaded, and that your `include` actually matches the directory you ran from (no `include` ⇒ nothing is sent) |
 
 To stop sharing at any time, remove the `team` destination from

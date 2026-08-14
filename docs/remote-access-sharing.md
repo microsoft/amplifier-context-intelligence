@@ -58,6 +58,23 @@ server is **headless** (API-only), so this is a single fixed set —
 and is **not** configurable, so the only way to keep those endpoints away from
 peers is to not route them — which scoping `serve` to `/events` does cleanly.
 
+> **The path allowlist is the read boundary. Treat it as load-bearing.**
+> It matters for a second, larger reason than the unauthenticated endpoints: the
+> server has **no write-only credential**. `require_read` returns early for any
+> principal that passes `require_write`, and every static/human principal is
+> write-capable by construction (`context_intelligence_server/authz.py`). So a peer's
+> `/events` token is *equally* able to call `POST /cypher` — including
+> `{"workspace": "*"}`, which skips workspace filtering entirely — and
+> `GET /blobs/{session_id}`, which has no owner check at all. Nothing in the
+> application layer stops it.
+>
+> Not routing those paths is the *only* thing that makes a peer contribute-only.
+> If you later reach this server any other way — the default `server_host: 0.0.0.0`
+> LAN bind, a reverse proxy that forwards `/`, or the public Azure ingress in
+> [azure-deployment.md](azure-deployment.md) — **every peer token you have already
+> issued becomes a full read credential on the entire graph, across all workspaces.**
+> Re-verify with §4's gate after any change to how the server is exposed.
+
 ---
 
 ## 3. Lock the host bindings
@@ -225,9 +242,16 @@ small group:
 
 | Property | Implication | Harden later by |
 |----------|-------------|-----------------|
-| Single shared API key | Any key holder can read all data via `/cypher`; revoking one peer = un-share the node; rotating the key = re-onboard everyone | Per-peer keys (server change) |
+| **No write-only credential exists** | Any data token that can `POST /events` is also read-capable at the application layer: `POST /cypher` (incl. `workspace: "*"`) and `GET /blobs/{session_id}`. **§4's path allowlist is the only thing keeping peers write-only** — expose this server any other way and every issued peer token becomes a full read credential on the whole graph | A `require_write`-only role for static/human principals (server change — `authz.py`) |
 | Client sets the `workspace` field | A peer can post events tagged with any workspace, including yours; no server-side validation | Server-side workspace validation |
+| `workspace` is not an authorization boundary | Nothing binds a credential to a workspace. It is a label used for filtering, and any read-capable caller can pass `workspace: "*"` to cross all of them | Per-credential workspace scoping enforced on `/cypher` and blob reads (server change) |
 | No ingress rate/size cap | A key holder can fill disk | A reverse-proxy allowlist (e.g. Caddy) or server change |
+
+Per-peer keys **are** available and are what [peer-onboarding.md](peer-onboarding.md)
+assumes — issue each peer their own token via the `api_keys` keystore
+([managing-api-keys.md](managing-api-keys.md)) so you can revoke or rotate one peer
+without re-onboarding the rest. That fixes revocation granularity; it does **not**
+change any row above, since every issued key carries identical capability.
 
 For a handful of close collaborators these are usually acceptable. Make the call
 deliberately rather than by default.
