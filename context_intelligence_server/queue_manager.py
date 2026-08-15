@@ -62,6 +62,15 @@ class QueueManager:
         self._stats_cache: dict[str, Any] | None = None
         self._stats_cache_at: float = 0.0
         self._stats_cache_ttl: float = 1.0
+        # Separate cache for spool_stats() (Change 2 / /status spool block).
+        # A longer TTL than _stats_cache_ttl is fine here: spool_stats() is an
+        # operator-facing "is the backlog growing" signal, not a
+        # correctness-sensitive value, so a few extra seconds of staleness is
+        # an acceptable trade for fewer directory scans under frequent
+        # /status polling.
+        self._spool_cache: dict[str, int] | None = None
+        self._spool_cache_at: float = 0.0
+        self._spool_cache_ttl: float = 5.0
 
     def _log_path(self, session_id: str) -> Path:
         return self._dir / f"{session_id}.log"
@@ -347,6 +356,76 @@ class QueueManager:
         stats = await asyncio.to_thread(_all)
         self._stats_cache = stats
         self._stats_cache_at = now
+        return stats
+
+    async def spool_stats(self) -> dict[str, int]:
+        """Cheap, aggregate-only spool footprint for the unauthenticated /status.
+
+        Incident context: a durable spool silently grew to 38 GB across 583
+        files (largest single file 4.9 GB) with ZERO signal anywhere that it
+        was happening -- the only symptom was a graph that had stopped
+        updating. This method exists so that number is always one field away.
+
+        Returns exactly two aggregate integers:
+
+        - ``pending_sessions``: count of worker keys with a ``.log`` file
+          whose committed offset is strictly less than the file's size, i.e.
+          there is unconsumed data (mirrors ``active_sessions()``'s
+          definition, but via ``stat()`` instead of a full scan-and-compare
+          pass, so it is safe to call on every /status hit).
+        - ``spool_bytes_total``: total bytes on disk across EVERY file in the
+          queue directory (``.log`` + ``.offset`` + ``.dead.jsonl``) -- the
+          same number an operator would get from ``du`` on the spool
+          directory, without shelling out.
+
+        CHEAP BY CONSTRUCTION: this walks the directory and calls ``stat()``
+        on each entry -- O(file count), NEVER O(file bytes). No file content
+        is read (unlike ``derive_all_stats()``, which tail-reads each log to
+        count pending lines). This is deliberately how a 38 GB spool can be
+        sized on every /status poll without walking 38 GB of content.
+        On top of that, results are cached for ``_spool_cache_ttl`` seconds
+        (monotonic clock) so a deployment with a very large number of spool
+        files (thousands of sessions) still does not pay a full directory
+        scan on every request.
+
+        Per the /status aggregate-only contract (D3): NO session ids, NO
+        workspace names, and NO per-key table are returned or computable from
+        this result -- two integers only.
+        """
+        now = time.monotonic()
+        if (
+            self._spool_cache is not None
+            and (now - self._spool_cache_at) < self._spool_cache_ttl
+        ):
+            return self._spool_cache
+
+        def _scan() -> dict[str, int]:
+            spool_bytes_total = 0
+            pending_sessions = 0
+            for entry in self._dir.iterdir():
+                if not entry.is_file():
+                    continue
+                try:
+                    size = entry.stat().st_size
+                except FileNotFoundError:
+                    # Raced with a concurrent delete_drained()/purge; the
+                    # entry no longer exists -- simply exclude it, don't fail
+                    # a cheap, best-effort aggregate over a live directory.
+                    continue
+                spool_bytes_total += size
+                if (
+                    entry.suffix == ".log"
+                    and self._read_committed_offset(entry.stem) < size
+                ):
+                    pending_sessions += 1
+            return {
+                "pending_sessions": pending_sessions,
+                "spool_bytes_total": spool_bytes_total,
+            }
+
+        stats = await asyncio.to_thread(_scan)
+        self._spool_cache = stats
+        self._spool_cache_at = now
         return stats
 
     async def dead_letter_keys(self) -> list[str]:

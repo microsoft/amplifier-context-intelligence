@@ -837,6 +837,176 @@ async def test_lifespan_skips_recovery_for_empty_workspace(
 
 
 # ---------------------------------------------------------------------------
+# Bounded crash-recovery respawn (Change 1): crash_recovery_respawn_limit
+# ---------------------------------------------------------------------------
+
+
+async def _seed_recoverable_session(qm: Any, sid: str, workspace: str) -> None:
+    body = json.dumps(
+        {
+            "event": "tool_use",
+            "workspace": workspace,
+            "data": {"session_id": sid},
+        }
+    ).encode("utf-8")
+    await qm.append(sid, body)
+
+
+async def test_lifespan_default_respawns_all_recovered_sessions_unbounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default (crash_recovery_respawn_limit=None) MUST preserve today's
+    behaviour exactly: every recovered session is respawned on this boot,
+    no matter how many there are."""
+    qm = registry.queue_manager
+    sids = [f"sess-unbounded-{i}" for i in range(10)]
+    for sid in sids:
+        await _seed_recoverable_session(qm, sid, "/ws")
+
+    spawned: list[tuple] = []
+    monkeypatch.setattr(
+        registry, "get_or_create", lambda s, w, **kw: spawned.append((s, w))
+    )
+    assert main_module._settings.crash_recovery_respawn_limit is None
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+    assert {s for s, _w in spawned} == set(sids)
+
+
+async def test_lifespan_respawn_cap_defers_remainder_and_logs_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With a finite crash_recovery_respawn_limit, only that many sessions
+    are respawned THIS boot; the remainder are deferred and a WARNING names
+    the exact respawned/deferred counts + the setting to raise."""
+    qm = registry.queue_manager
+    sids = [f"sess-cap-{i}" for i in range(5)]
+    for sid in sids:
+        await _seed_recoverable_session(qm, sid, "/ws")
+
+    spawned: list[tuple] = []
+    monkeypatch.setattr(
+        registry, "get_or_create", lambda s, w, **kw: spawned.append((s, w))
+    )
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 2)
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        caplog.at_level(logging.WARNING, logger="context_intelligence_server"),
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+    # Exactly the cap's worth of sessions were respawned -- never more.
+    assert len(spawned) == 2
+    # The un-respawned sessions were NEVER passed to get_or_create at all.
+    assert {s for s, _w in spawned}.issubset(set(sids))
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("crash-recovery respawn cap reached" in r.getMessage() for r in warnings)
+    cap_warning = next(
+        r for r in warnings if "crash-recovery respawn cap reached" in r.getMessage()
+    )
+    msg = cap_warning.getMessage()
+    assert "2/2 respawned" in msg  # respawned/attempted this boot
+    assert "3 session(s) deferred" in msg  # 5 recovered - 2 processed = 3
+    assert "crash_recovery_respawn_limit" in msg
+
+
+async def test_lifespan_deferred_sessions_untouched_and_recoverable_next_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deferred sessions are left completely untouched on disk -- no read, no
+    write -- so a SUBSEQUENT boot's recover() call reports them again and can
+    respawn them (no data loss, no corruption)."""
+    qm = registry.queue_manager
+    sids = [f"sess-defer-{i}" for i in range(4)]
+    for sid in sids:
+        await _seed_recoverable_session(qm, sid, "/ws")
+
+    spawned_boot1: list[tuple] = []
+    monkeypatch.setattr(
+        registry, "get_or_create", lambda s, w, **kw: spawned_boot1.append((s, w))
+    )
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 1)
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+    assert len(spawned_boot1) == 1
+    deferred_sids = set(sids) - {s for s, _w in spawned_boot1}
+    assert len(deferred_sids) == 3
+
+    # The deferred sessions' queue lines are STILL fully intact and
+    # recoverable: recover() (a fresh scan, same on-disk state) reports them
+    # again, exactly as before this boot ran.
+    recovered_again = await qm.recover()
+    assert deferred_sids <= set(recovered_again)
+    for sid in deferred_sids:
+        batch = await qm.read_batch(sid, max_items=1)
+        assert batch.lines != []  # data neither dropped nor corrupted
+
+
+async def test_lifespan_respawn_cap_zero_defers_everything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cap of 0 is a valid opt-in (never respawn automatically at boot);
+    every recovered session is deferred, none is touched."""
+    qm = registry.queue_manager
+    sid = "sess-cap-zero"
+    await _seed_recoverable_session(qm, sid, "/ws")
+
+    spawned: list[tuple] = []
+    monkeypatch.setattr(
+        registry, "get_or_create", lambda s, w, **kw: spawned.append((s, w))
+    )
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 0)
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+    assert spawned == []
+    recovered_again = await qm.recover()
+    assert sid in recovered_again
+
+
+# ---------------------------------------------------------------------------
 # Cold start FAILS LOUD on schema/data corruption that requires `doctor
 # --fix` (design decision, reversing the lifespan half of f4d8bab): an
 # un-migrated graph -- duplicate legacy nodes (caught by the :Node
@@ -1207,6 +1377,74 @@ async def test_status_includes_metrics_block(client: httpx.AsyncClient) -> None:
     assert "oldest_unflushed_age" not in metrics
     assert "per_key" not in metrics
     assert "dead_letters" not in data
+
+
+# ---------------------------------------------------------------------------
+# /status spool block (Change 2): pending_sessions + spool_bytes_total
+# ---------------------------------------------------------------------------
+
+
+async def test_status_includes_spool_block(client: httpx.AsyncClient) -> None:
+    """/status carries an additive, aggregate-only spool block so a growing
+    on-disk backlog is never invisible (the 38 GB / two-day incident this
+    guards against had zero signal anywhere)."""
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert "spool" in data
+    spool = data["spool"]
+    assert set(spool.keys()) == {"pending_sessions", "spool_bytes_total"}
+    assert isinstance(spool["pending_sessions"], int)
+    assert isinstance(spool["spool_bytes_total"], int)
+
+
+async def test_status_spool_block_reflects_real_backlog(
+    client: httpx.AsyncClient,
+) -> None:
+    """The spool block's numbers move when there's real undrained data on
+    disk -- not a hardcoded placeholder."""
+    qm = registry.queue_manager
+    body = json.dumps(
+        {
+            "event": "tool_use",
+            "workspace": "/ws",
+            "data": {"session_id": "sess-spool-visible"},
+        }
+    ).encode("utf-8")
+    await qm.append("sess-spool-visible", body)
+    # get_or_create is bypassed here (raw append only) so this line stays
+    # undrained -- exactly the "pending" shape spool_stats() measures.
+
+    response = await client.get("/status")
+    data = response.json()
+
+    assert data["spool"]["pending_sessions"] >= 1
+    assert data["spool"]["spool_bytes_total"] > 0
+
+
+async def test_status_spool_block_never_leaks_session_identifiers(
+    client: httpx.AsyncClient,
+) -> None:
+    """/status is unauthenticated: the spool block must never carry a
+    session id, workspace name, or any per-key table (aggregate-only)."""
+    qm = registry.queue_manager
+    secret_sid = "super-secret-session-id-should-not-leak"
+    body = json.dumps(
+        {
+            "event": "tool_use",
+            "workspace": "/very/private/workspace",
+            "data": {"session_id": secret_sid},
+        }
+    ).encode("utf-8")
+    await qm.append(secret_sid, body)
+
+    response = await client.get("/status")
+    raw_text = response.text
+
+    assert secret_sid not in raw_text
+    assert "/very/private/workspace" not in raw_text
+    assert "per_key" not in response.json()["spool"]
 
 
 # ---------------------------------------------------------------------------

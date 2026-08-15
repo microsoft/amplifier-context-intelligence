@@ -289,6 +289,26 @@ class Settings(BaseSettings):
     server_host: str = "0.0.0.0"
     server_port: int = 8000
 
+    # Gunicorn worker timeouts (run() in main.py). Both were hardcoded until
+    # the incident below made that a problem: a durable-spool boot whose
+    # crash-recovery work is legitimately O(backlog size) (see
+    # crash_recovery_respawn_limit above) can take minutes on a large
+    # backlog, and gunicorn's own worker-timeout watchdog cannot distinguish
+    # "still doing legitimate startup work" from "hung" -- it just SIGKILLs
+    # the worker either way, which then gets restarted by systemd and repeats
+    # the same slow boot forever. Defaults (30s / 10s) are UNCHANGED from the
+    # previous hardcoded values, so this PR is a no-op unless an operator
+    # opts in to raise them for a deployment that expects a slow/large-backlog
+    # boot.
+    #
+    # gunicorn_worker_timeout: seconds gunicorn allows a worker to go silent
+    #   (no heartbeat) before killing it. See gunicorn's `timeout` setting.
+    # gunicorn_graceful_timeout: seconds gunicorn waits for a worker to finish
+    #   handling in-flight work after SIGTERM before force-killing it. See
+    #   gunicorn's `graceful_timeout` setting.
+    gunicorn_worker_timeout: int = 30
+    gunicorn_graceful_timeout: int = 10
+
     # -------------------------------------------------------------------------
     # Authentication
     # -------------------------------------------------------------------------
@@ -775,6 +795,40 @@ class Settings(BaseSettings):
     # a blocked flush from parking indefinitely when db.lock.acquisition.timeout=0
     # (Neo4j default) holds all write_semaphore permits and stalls the pipeline.
     # Set to 0 to disable (no per-transaction timeout).
+
+    # Crash-recovery respawn ceiling (incident: a 38 GB / 583-file durable
+    # spool made cold start respawn 94/94 drainers before the server could
+    # accept a single request; startup took ~4 minutes and RSS peaked at
+    # 43.9 GB, tripping the kernel OOM killer -- which systemd then restarted,
+    # repeating the same unbounded respawn and never letting the backlog
+    # shrink). This mirrors write_concurrency's role as a hard ceiling on a
+    # startup-time resource cost, but bounds the RESPAWN LOOP in
+    # lifespan() (main.py) rather than write-flush concurrency: at most this
+    # many sessions from the recovered backlog get a drainer respawned on
+    # THIS boot; the remainder are DEFERRED -- left completely untouched on
+    # disk (still durable, still recoverable on a later boot, or instantly
+    # via get_or_create() the moment a new event for that session arrives
+    # through POST /events). A deferred backlog is never silent: lifespan()
+    # logs a WARNING naming the exact respawned/deferred counts and this
+    # setting, and /status's spool block (pending_sessions, spool_bytes_total)
+    # makes the backlog observable continuously, not just at boot.
+    #
+    # None (the default) preserves TODAY'S BEHAVIOUR EXACTLY: unbounded,
+    # every recovered session is respawned on this boot, matching every
+    # existing deployment -- this PR is a no-op unless an operator opts in
+    # by setting a finite ceiling.
+    crash_recovery_respawn_limit: int | None = None
+
+    @field_validator("crash_recovery_respawn_limit")
+    @classmethod
+    def _validate_crash_recovery_respawn_limit(cls, v: int | None) -> int | None:
+        """Fail loud on a negative ceiling; None (unbounded) and 0 are valid."""
+        if v is not None and v < 0:
+            raise ValueError(
+                "crash_recovery_respawn_limit must be a non-negative integer "
+                f"or null (unbounded), got {v}"
+            )
+        return v
 
     # -------------------------------------------------------------------------
     # Logging

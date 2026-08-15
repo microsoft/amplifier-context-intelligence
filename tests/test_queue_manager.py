@@ -465,3 +465,115 @@ async def test_recovery_seed_counts_replay_window_residual_zero(qm):
     stats = await qm.derive_all_stats()
     residual = accepted - written - stats["in_queue_total"] - stats["dead_total"]
     assert residual == 0
+
+
+# ---------------------------------------------------------------------------
+# spool_stats (Change 2): cheap, aggregate-only spool footprint for /status
+# ---------------------------------------------------------------------------
+
+
+async def test_spool_stats_counts_pending_session_and_bytes(qm, tmp_path):
+    """A session with unconsumed log data counts as pending; total bytes
+    reflects every file on disk (.log + .offset + .dead.jsonl)."""
+    await qm.append("s1", b"a")
+    await qm.append("s1", b"b")
+
+    stats = await qm.spool_stats()
+
+    assert stats["pending_sessions"] == 1
+    queues_dir = tmp_path / "queues"
+    expected_bytes = sum(p.stat().st_size for p in queues_dir.iterdir())
+    assert stats["spool_bytes_total"] == expected_bytes
+    assert expected_bytes > 0
+
+
+async def test_spool_stats_fully_committed_session_not_pending(qm):
+    """A session whose committed offset reaches EOF is NOT counted as
+    pending, even though its .log/.offset files still occupy disk space
+    (spool_bytes_total still reflects them)."""
+    await qm.append("s1", b"a")
+    line = b"a\n"
+    await qm.commit("s1", len(line))
+
+    stats = await qm.spool_stats()
+
+    assert stats["pending_sessions"] == 0
+    assert stats["spool_bytes_total"] > 0  # log + offset files still on disk
+
+
+async def test_spool_stats_dead_letter_only_session_not_pending(qm):
+    """A dead-letter-only key (no .log) contributes bytes but is never
+    counted as a pending session -- pending_sessions is defined purely over
+    .log files with unconsumed data."""
+    await qm.dead_letter("s-dead", b"poison", error="boom")
+
+    stats = await qm.spool_stats()
+
+    assert stats["pending_sessions"] == 0
+    assert stats["spool_bytes_total"] > 0
+
+
+async def test_spool_stats_multiple_sessions_aggregate(qm):
+    """pending_sessions counts sessions independently; bytes sum across all."""
+    await qm.append("s1", b"a")  # pending
+    await qm.append("s2", b"b")
+    line = b"b\n"
+    await qm.commit("s2", len(line))  # fully committed, not pending
+    await qm.append("s3", b"c")  # pending
+
+    stats = await qm.spool_stats()
+
+    assert stats["pending_sessions"] == 2
+
+
+async def test_spool_stats_returns_only_aggregate_keys_no_identifiers(qm):
+    """/status is unauthenticated: spool_stats() must return ONLY the two
+    aggregate integers -- no session ids, workspace names, or per-key table
+    of any kind, so there's nothing to accidentally leak through /status."""
+    await qm.append("my-secret-session-id", b"a")
+    await qm.dead_letter("another-session-id", b"poison", error="boom")
+
+    stats = await qm.spool_stats()
+
+    assert set(stats.keys()) == {"pending_sessions", "spool_bytes_total"}
+    serialized = repr(stats)
+    assert "my-secret-session-id" not in serialized
+    assert "another-session-id" not in serialized
+
+
+async def test_spool_stats_caches_within_ttl(qm, monkeypatch):
+    """Repeated calls within the TTL window are served from cache -- the
+    directory is not re-scanned on every /status poll."""
+    import pathlib
+
+    await qm.append("s1", b"a")
+
+    calls = {"n": 0}
+    real_iterdir = pathlib.Path.iterdir
+
+    # pathlib.Path instances use __slots__, so the target Path (qm._dir)
+    # cannot be monkeypatched directly -- patch the class method instead,
+    # counting only calls made against qm._dir (this codebase's only other
+    # .iterdir() caller checked clean at write time; see grep before this
+    # test was added).
+    def counting_iterdir(self: pathlib.Path):
+        if self == qm._dir:
+            calls["n"] += 1
+        return real_iterdir(self)
+
+    monkeypatch.setattr(pathlib.Path, "iterdir", counting_iterdir)
+
+    await qm.spool_stats()
+    await qm.spool_stats()  # within TTL -> served from cache
+    assert calls["n"] == 1
+
+    # Age the cache past the TTL; the next call must recompute.
+    qm._spool_cache_at = time.monotonic() - (qm._spool_cache_ttl + 1.0)
+    await qm.spool_stats()
+    assert calls["n"] == 2
+
+
+async def test_spool_stats_empty_directory(qm):
+    """An empty spool directory reports zero for both aggregates."""
+    stats = await qm.spool_stats()
+    assert stats == {"pending_sessions": 0, "spool_bytes_total": 0}
