@@ -72,6 +72,79 @@ def test_settings_has_durable_queue_defaults():
 
 
 # ---------------------------------------------------------------------------
+# crash_recovery_respawn_limit (Change 1)
+# ---------------------------------------------------------------------------
+
+
+def test_crash_recovery_respawn_limit_defaults_to_unbounded():
+    """Default MUST preserve today's behaviour exactly: unbounded (None)."""
+    from context_intelligence_server.config import Settings
+
+    s = Settings()
+    assert s.crash_recovery_respawn_limit is None
+
+
+def test_crash_recovery_respawn_limit_accepts_zero_and_positive():
+    from context_intelligence_server.config import Settings
+
+    assert Settings(crash_recovery_respawn_limit=0).crash_recovery_respawn_limit == 0
+    assert Settings(crash_recovery_respawn_limit=25).crash_recovery_respawn_limit == 25
+
+
+def test_crash_recovery_respawn_limit_rejects_negative():
+    from context_intelligence_server.config import Settings
+
+    with pytest.raises(ValueError, match="crash_recovery_respawn_limit"):
+        Settings(crash_recovery_respawn_limit=-1)
+
+
+def test_crash_recovery_respawn_limit_env_override(monkeypatch):
+    monkeypatch.setenv(
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CRASH_RECOVERY_RESPAWN_LIMIT", "10"
+    )
+    from context_intelligence_server.config import Settings
+
+    assert Settings().crash_recovery_respawn_limit == 10
+
+
+# ---------------------------------------------------------------------------
+# gunicorn_worker_timeout / gunicorn_graceful_timeout (Change 3)
+# ---------------------------------------------------------------------------
+
+
+def test_gunicorn_timeout_defaults_match_previous_hardcoded_values():
+    """Defaults MUST equal the values that used to be hardcoded in run()
+    (main.py) so an operator who sets nothing sees no behaviour change."""
+    from context_intelligence_server.config import Settings
+
+    s = Settings()
+    assert s.gunicorn_worker_timeout == 30
+    assert s.gunicorn_graceful_timeout == 10
+
+
+def test_gunicorn_timeout_overridable():
+    from context_intelligence_server.config import Settings
+
+    s = Settings(gunicorn_worker_timeout=300, gunicorn_graceful_timeout=60)
+    assert s.gunicorn_worker_timeout == 300
+    assert s.gunicorn_graceful_timeout == 60
+
+
+def test_gunicorn_timeout_env_override(monkeypatch):
+    monkeypatch.setenv(
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_GUNICORN_WORKER_TIMEOUT", "120"
+    )
+    monkeypatch.setenv(
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_GUNICORN_GRACEFUL_TIMEOUT", "20"
+    )
+    from context_intelligence_server.config import Settings
+
+    s = Settings()
+    assert s.gunicorn_worker_timeout == 120
+    assert s.gunicorn_graceful_timeout == 20
+
+
+# ---------------------------------------------------------------------------
 # YAML config file tests
 # ---------------------------------------------------------------------------
 

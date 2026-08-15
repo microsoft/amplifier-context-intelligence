@@ -230,13 +230,52 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     _accepted_seed, _written_seed = await registry.queue_manager.recovery_seed_counts()
     registry.seed_counters(_accepted_seed, _written_seed)
     recovered = await registry.queue_manager.recover()
+    # Bound how many drainers this boot respawns (incident: an unbounded
+    # backlog respawned 94/94 drainers before the server could serve a
+    # single request, driving a ~4 minute boot and 43.9 GB RSS that tripped
+    # the OOM killer -- which then never let the backlog shrink because
+    # every restart repeated the same unbounded respawn). None (the default)
+    # preserves today's behaviour exactly: every recovered session is
+    # processed on this boot, unbounded. `recovered` is already sorted
+    # (QueueManager.recover()), so which sessions are processed this boot
+    # vs. deferred is deterministic across restarts of the same backlog.
+    #
+    # Deferred sessions are NOT touched in any way here -- no read, no
+    # write, no drainer -- so they remain exactly as durable and
+    # recoverable as they were before this boot: a later boot's recover()
+    # call reports them again, and a new event for that session arriving
+    # via POST /events spawns its drainer immediately via get_or_create(),
+    # independent of this startup loop.
+    respawn_limit = _settings.crash_recovery_respawn_limit
+    if respawn_limit is not None and len(recovered) > respawn_limit:
+        to_process = recovered[:respawn_limit]
+        deferred_count = len(recovered) - respawn_limit
+    else:
+        to_process = recovered
+        deferred_count = 0
     respawned = 0
-    for sid in recovered:
+    for sid in to_process:
         batch = await registry.queue_manager.read_batch(sid, max_items=1)
         if not batch.lines:
             continue
         if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
             respawned += 1
+    if deferred_count:
+        # Loud on purpose (WARNING, not INFO): a deferred backlog must never
+        # be a silent, un-discoverable fact -- that silence is exactly what
+        # let the 38 GB spool go unnoticed for two days in the incident this
+        # guards against. Names the exact counts and the setting to raise.
+        logger.warning(
+            "lifespan_startup: crash-recovery respawn cap reached "
+            "(crash_recovery_respawn_limit=%d): %d/%d respawned this boot, "
+            "%d session(s) deferred to a later boot (untouched on disk, "
+            "still fully recoverable). Raise crash_recovery_respawn_limit "
+            "to respawn more per boot.",
+            respawn_limit,
+            respawned,
+            len(to_process),
+            deferred_count,
+        )
     logger.info(
         "lifespan_startup: crash recovery respawned %d/%d drainers",
         respawned,
@@ -684,6 +723,14 @@ async def get_status(request: Request) -> dict[str, Any]:
     # unauthenticated, so this block must NOT carry the per-key table or the
     # dead-letter listing — both are authenticated-only.
     response["metrics"] = await registry.pipeline_metrics()
+    # Additive, aggregate-only spool footprint (incident: a 38 GB / 583-file
+    # durable spool grew completely unnoticed -- the only symptom was a graph
+    # that had silently stopped updating). Same /status contract as `metrics`
+    # above: two aggregate integers only, no session ids, no workspace names,
+    # no per-key table. Cheap by construction (stat-only, short-TTL cached) --
+    # see QueueManager.spool_stats() for why this is safe on every poll even
+    # with a huge spool.
+    response["spool"] = await registry.queue_manager.spool_stats()
     # T5 (E): surface auth mode and admin-API capability so operators can
     # confirm admin is enabled without tailing startup logs.  /status is
     # unauthenticated — only config-level boolean flags are exposed here
@@ -928,8 +975,8 @@ def run() -> None:
                 "bind": f"{_settings.server_host}:{_settings.server_port}",
                 "workers": workers,
                 "worker_class": "uvicorn.workers.UvicornWorker",
-                "timeout": 30,
-                "graceful_timeout": 10,
+                "timeout": _settings.gunicorn_worker_timeout,
+                "graceful_timeout": _settings.gunicorn_graceful_timeout,
                 "loglevel": _settings.log_level.lower(),
             }.items():
                 self.cfg.set(key, value)
