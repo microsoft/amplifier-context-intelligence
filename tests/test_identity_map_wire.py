@@ -5,9 +5,12 @@ Tests cover:
   T1 (config additions):
     - admin_api_key: str | None — env AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY
       or YAML admin_api_key; consistent with api_key/api_keys pattern.
-    - api_keys_store_path: str — default "/data/identity/api-keys.json"; env/YAML override.
-    - entra_identities_store_path: str — default "/data/identity/entra-identities.json";
-      env/YAML override.
+    - api_keys_store_path: str — default is a host-writable per-user path
+      (~/.local/share/ci-server/identity/api-keys.json), NOT the container's
+      /data/...; env/YAML override.
+    - entra_identities_store_path: str — same host-writable default pattern
+      (~/.local/share/ci-server/identity/entra-identities.json); env/YAML
+      override.
 
   T3 (IdentityStore wired to BOTH resolvers):
     Static mode:
@@ -154,9 +157,27 @@ class TestT1ApiKeysStorePath:
     """api_keys_store_path: default + env + YAML override."""
 
     def test_default(self) -> None:
+        """Default is a host-writable per-user path, not the container's /data/...
+
+        See _default_identity_store_path() in config.py: the bug this guards
+        against is a silent PermissionError on a host install where /data
+        does not exist/is not writable.
+        """
+        from pathlib import Path  # noqa: PLC0415
+
         from context_intelligence_server.config import Settings  # noqa: PLC0415
 
-        assert Settings().api_keys_store_path == "/data/identity/api-keys.json"
+        default_path = Settings().api_keys_store_path
+        assert not default_path.startswith("/data/")
+        expected = (
+            Path.home()
+            / ".local"
+            / "share"
+            / "ci-server"
+            / "identity"
+            / "api-keys.json"
+        )
+        assert default_path == str(expected)
 
     def test_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(
@@ -182,12 +203,27 @@ class TestT1EntraIdentitiesStorePath:
     """entra_identities_store_path: default + env + YAML override."""
 
     def test_default(self) -> None:
+        """Default is a host-writable per-user path, not the container's /data/...
+
+        Container deployments (e.g. amplifier-online.yaml) set this
+        explicitly via env var, so this default only matters for a plain
+        host install with no override configured.
+        """
+        from pathlib import Path  # noqa: PLC0415
+
         from context_intelligence_server.config import Settings  # noqa: PLC0415
 
-        assert (
-            Settings().entra_identities_store_path
-            == "/data/identity/entra-identities.json"
+        default_path = Settings().entra_identities_store_path
+        assert not default_path.startswith("/data/")
+        expected = (
+            Path.home()
+            / ".local"
+            / "share"
+            / "ci-server"
+            / "identity"
+            / "entra-identities.json"
         )
+        assert default_path == str(expected)
 
     def test_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(
