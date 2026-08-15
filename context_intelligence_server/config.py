@@ -140,6 +140,28 @@ def _build_identity_map_from(
     return {oid.lower(): meta["id"] for oid, meta in identity_dict.items()}
 
 
+def _default_identity_store_path(filename: str) -> str:
+    """Return a host-install-writable default path for an identity-map store file.
+
+    These paths used to default to "/data/identity/<filename>" -- an Azure
+    Files volume path baked in for the container deployment. On a plain
+    (non-container) host install nothing mounts /data, so the
+    seed-on-first-boot write in IdentityStore.seed() silently failed with
+    PermissionError: the server kept running fail-closed on the in-memory
+    map, but nothing was ever persisted to disk, and any key added later via
+    the /admin API would vanish on restart.
+
+    Default to the invoking user's own writable data dir instead, using the
+    same ~/.local/share/ci-server/... layout already illustrated as the
+    host-install convention in YamlConfigSettingsSource's docstring above
+    (its blob_path / log_path example values). Container deployments are
+    unaffected: they set these paths explicitly via env/YAML (e.g.
+    amplifier-online.yaml sets entra_identities_store_path to the mounted
+    /data volume) -- this default only matters when nothing overrides it.
+    """
+    return str(Path.home() / ".local" / "share" / "ci-server" / "identity" / filename)
+
+
 class YamlConfigSettingsSource(PydanticBaseSettingsSource):
     """Load settings from a YAML configuration file.
 
@@ -695,14 +717,21 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # Durable identity-map store paths
     # -------------------------------------------------------------------------
-    # These paths control where the two JSON identity-map files live on the
-    # Azure Files volume (/data).  Both are env/YAML overridable to allow
-    # non-default layouts in development or custom deployments.
+    # These paths control where the two JSON identity-map files live. Both are
+    # env/YAML overridable to allow non-default layouts in development,
+    # custom deployments, or containers -- e.g. amplifier-online.yaml sets
+    # entra_identities_store_path explicitly to the mounted Azure Files
+    # volume (/data/identity/entra-identities.json).
+    #
+    # The DEFAULT (see _default_identity_store_path()) is a host-writable
+    # per-user path, not /data/... -- see that helper's docstring for why.
     #
     # api_keys_store_path:          SHA-256 digest → contributor map (static mode)
     # entra_identities_store_path:  OID → contributor map (entra mode)
-    api_keys_store_path: str = "/data/identity/api-keys.json"
-    entra_identities_store_path: str = "/data/identity/entra-identities.json"
+    api_keys_store_path: str = _default_identity_store_path("api-keys.json")
+    entra_identities_store_path: str = _default_identity_store_path(
+        "entra-identities.json"
+    )
 
     # -------------------------------------------------------------------------
     # Neo4j

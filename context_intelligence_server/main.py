@@ -605,7 +605,56 @@ def create_asgi_app(
 
 # Module-level ASGI app used by Gunicorn: context_intelligence_server.main:asgi_app
 # The raw `app` is kept for internal use and testing against un-authed routes.
-asgi_app: BearerTokenMiddleware = create_asgi_app()
+#
+# LAZY construction (PEP 562 module __getattr__), NOT built at import time.
+#
+# create_asgi_app() enforces the auth guard: it raises RuntimeError when no
+# authentication is configured at all (see its docstring / _assert_* helpers).
+# That guard is correct and must NOT be weakened. The problem was *timing*:
+# this module used to call create_asgi_app() unconditionally at import time,
+# which meant the console-script entry point (`context-intelligence-server`)
+# imports `main` to reach `main()`, so even `--help`/`--version` constructed
+# the whole ASGI app and hit the guard. An operator with a broken/absent
+# config couldn't ask the binary what version it was -- exactly when they
+# most need to.
+#
+# `_asgi_app` is the cache; `get_asgi_app()` builds-and-caches on first call;
+# `__getattr__` makes `context_intelligence_server.main.asgi_app` /
+# `from context_intelligence_server.main import asgi_app` keep working for
+# anything that reads the module attribute directly (gunicorn's `load()`,
+# tests) -- construction (and therefore the auth guard) now happens on first
+# access instead of at import time. Actually serving (`run()` -> `_App.load()`
+# -> `get_asgi_app()`) still triggers it, so an unconfigured server still
+# fails loud exactly as before -- only bare import / --help / --version are
+# spared.
+_asgi_app: BearerTokenMiddleware | None = None
+
+
+def get_asgi_app() -> BearerTokenMiddleware:
+    """Return the module-level ASGI app, constructing it on first call.
+
+    This is the single lazy-construction point. Internal code (``_App.load()``
+    below) MUST call this function rather than referencing a bare ``asgi_app``
+    global -- a bare name reference is a normal global-variable lookup and
+    would NOT go through ``__getattr__``, so it would raise ``NameError``
+    once the unconditional module-level assignment is removed.
+    """
+    global _asgi_app
+    if _asgi_app is None:
+        _asgi_app = create_asgi_app()
+    return _asgi_app
+
+
+def __getattr__(name: str) -> Any:
+    """PEP 562 module-level lazy attribute access for ``asgi_app``.
+
+    Only intercepts ``asgi_app`` (the sole lazily-constructed module
+    attribute); anything else is a genuine ``AttributeError``, matching
+    normal module attribute-access semantics.
+    """
+    if name == "asgi_app":
+        return get_asgi_app()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -886,6 +935,9 @@ def run() -> None:
                 self.cfg.set(key, value)
 
         def load(self) -> Any:
-            return asgi_app
+            # get_asgi_app() (not the bare `asgi_app` global) -- this is
+            # where lazy construction actually happens for a real serve,
+            # and where the auth guard still fires if unconfigured.
+            return get_asgi_app()
 
     _App().run()
