@@ -55,6 +55,11 @@ docker run -d --name context-intelligence-neo4j \
   [compatibility matrix](https://neo4j.com/docs/graph-data-science/current/installation/supported-neo4j-versions/)
   (GDS 2.13.x for Neo4j 5.26.x).
 - The `-v …:/data` volume persists the graph across container restarts.
+- **No memory limit is set above, on purpose** — for a dev box that is usually
+  fine. Be aware of what it means: Neo4j sizes its page cache and JVM heap from
+  **host** RAM, so on a large machine it will grow to many GB. For anything
+  long-lived or shared, add `--memory` plus explicit heap/page-cache settings —
+  see [operational-hardening.md](operational-hardening.md) §2.
 - Reachable at `bolt://localhost:7687`; browser UI at `http://localhost:7474`.
 - Manage it with `docker stop/start context-intelligence-neo4j`.
 - **Auto-restart on boot:** `--restart unless-stopped` restarts the container

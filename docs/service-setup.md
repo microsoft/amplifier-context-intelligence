@@ -38,13 +38,26 @@ mkdir -p "${DATA_DIR}/neo4j"
 docker run -d \
   --name amplifier-context-intelligence-neo4j \
   --restart unless-stopped \
+  --memory 24g --memory-swap 24g \
   -p ${NEO4J_HTTP_PORT}:7474 -p ${NEO4J_BOLT_PORT}:7687 \
   -e NEO4J_AUTH=neo4j/${NEO4J_PASSWORD} \
   -e 'NEO4J_PLUGINS=["apoc","graph-data-science"]' \
   -e 'NEO4J_dbms_security_procedures_unrestricted=apoc.*,gds.*' \
+  -e NEO4J_server_memory_heap_initial__size=10g \
+  -e NEO4J_server_memory_heap_max__size=10g \
+  -e NEO4J_server_memory_pagecache_size=10g \
   -v "${DATA_DIR}/neo4j:/data" \
   neo4j:5.26.22-community
 ```
+
+> **Memory limits are not optional on a shared host.** Without `--memory` and
+> explicit heap/page-cache settings, Neo4j sizes itself from **host** RAM — on a
+> 121 GB machine it grew to **22 GB** and helped OOM the server. Keep
+> `--memory` ≥ heap + page cache + ~3–4 GB headroom, and scale all three to your
+> box (the `24g/10g/10g` split above suits a host with ≥ 32 GB RAM). The double
+> underscore in `heap_max__size` is required — misspell it and the setting is
+> silently ignored. Rationale, verification commands, and the matching systemd
+> guards: [operational-hardening.md](operational-hardening.md).
 
 > **GDS (Graph Data Science):** the startup plugin-installer resolves the GDS
 > Community build matching this Neo4j release from the official compatibility
@@ -460,6 +473,12 @@ cat > ~/.config/systemd/user/context-intelligence-server.service << 'EOF'
 [Unit]
 Description=Context Intelligence Server
 After=network.target
+# Crash-loop guard: refuse to start again after more than 5 starts within
+# 10 minutes, instead of restarting forever. These two directives belong in
+# [Unit], NOT [Service] -- systemd silently ignores them in the wrong section
+# (they are documented in systemd.unit(5)). See docs/operational-hardening.md §3.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -467,6 +486,12 @@ ExecStart=%h/.local/bin/context-intelligence-server
 Environment=AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE=%h/.config/context-intelligence/server-config.yaml
 Restart=on-failure
 RestartSec=5s
+# Memory ceiling: MemoryHigh throttles/reclaims, MemoryMax is the hard wall.
+# Without these the unit runs at MemoryMax=infinity and a crash-recovery boot
+# over a large queue spool can OOM the whole host. Size to your machine --
+# these values suit a host with >= 32 GB RAM. See docs/operational-hardening.md §3.
+MemoryHigh=20G
+MemoryMax=24G
 StandardOutput=journal
 StandardError=journal
 
@@ -476,6 +501,20 @@ EOF
 ```
 
 `%h` is systemd's specifier for the user home directory — no hardcoded paths.
+
+> **Verify the guards actually took.** `systemd-analyze verify` only *warns*
+> about a misplaced directive (it exits 0 either way), and `MemoryMax` on a
+> `--user` unit is enforced only if the memory controller is delegated to your
+> user slice:
+> ```bash
+> systemd-analyze verify --user ~/.config/systemd/user/context-intelligence-server.service
+> #   silence = good; "Unknown key name 'StartLimitIntervalSec' in section 'Service'" = misplaced
+> cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/cgroup.controllers   # must include: memory
+> systemctl --user show context-intelligence-server -p MemoryHigh -p MemoryMax
+> #   → MemoryHigh=21474836480 / MemoryMax=25769803776  (NOT "infinity")
+> ```
+> Full rationale, the incident that motivated these guards, and the Neo4j-side
+> limits: [operational-hardening.md](operational-hardening.md).
 
 ### Enable and start
 
@@ -633,6 +672,9 @@ endpoints still require the API token from Step 4 as `Authorization: Bearer`.
 | macOS: plist loaded but service not running | launchd silently failed | Check `server.stderr.log` for startup errors |
 | Events stop dispatching, circuit breaker tripped | `context_intelligence_api_key` missing from `~/.amplifier/settings.yaml` | Add `context_intelligence_api_key: "<key>"` under `overrides.hook-context-intelligence.config` |
 | Data attributed to the wrong `created_by`, client gets **HTTP 401** floods, or behavior contradicts the deployed code | **Multiple server instances** running at once (an orphan from a manual `uv run`/old deploy racing the service on the same port + Neo4j — see the single-instance invariant at the top of §5) | `ss -ltnp \| grep ':8000'` and `ps -eo pid,args \| grep asgi_app \| grep -v grep`; `kill -TERM` every process **not** owned by the service manager, then `sudo systemctl restart context-intelligence-server.service` and re-verify a single listener. Fix whatever launched the extra copies so the service is the only entry point. |
+| **Graph silently stops updating** while clients still get `202` from `POST /events` | The drainer is not draining — usually the server is crash-looping (OOM) or Neo4j is unreachable. `202` only means the event was durably appended, never that it reached the graph. | `curl -s http://localhost:8000/status` and check `metrics.in_queue_total` (climbing?), `metrics.degraded`, `orphaned_sessions`, and each session's `last_successful_flush`; then `du -sh <queues_path>` and `systemctl --user show context-intelligence-server -p NRestarts -p Result`. Full symptom/command table: [operational-hardening.md](operational-hardening.md) §6 |
+| Service restarts every few minutes forever, serving nothing; host memory pressure | **Unbounded crash loop.** `Restart=on-failure` with no start limit + `MemoryMax=infinity` + a large queue spool: crash recovery OOMs mid-startup and restarts before it can ever finish. A real incident burned 9.5 CPU-hours over two days this way. | Add `StartLimitIntervalSec`/`StartLimitBurst` (in `[Unit]`) and `MemoryHigh`/`MemoryMax` (in `[Service]`) — see §5 — cap Neo4j's memory, and archive the oversized spool out of the boot path. Full procedure: [operational-hardening.md](operational-hardening.md) |
+| Neo4j process grows to many GB / crowds out the server | No container memory limit and no explicit heap — Neo4j auto-sizes from **host** RAM | `docker update --memory 24g --memory-swap 24g amplifier-context-intelligence-neo4j && docker restart amplifier-context-intelligence-neo4j` (the JVM only re-sizes at startup), then set explicit heap/page-cache env vars — see Step 2 and [operational-hardening.md](operational-hardening.md) §2 |
 | Server refuses to boot / crash-loops with `RuntimeError: Neo4j graph has N node(s) lacking the :Node label (un-migrated). Cold start refuses to boot to avoid duplicating them on write. Run: context-intelligence-server doctor --fix` (or an equivalent `:Node` constraint data-conflict error) | **Un-migrated graph.** Cold start no longer self-heals untagged/duplicate legacy nodes, and it now FAILS LOUD on either shape (behavior change — see the [README upgrade note](../README.md#upgrading-cold-start-no-longer-auto-migrates)): nothing has been written yet at boot, so refusing to start is the safest point to surface the problem. The mid-flight flush path is unaffected and still self-heals if a conflict is only discovered after the server was already serving. | Run `context-intelligence-server doctor --fix` to repair the graph, then restart the service |
 
 ---

@@ -168,6 +168,19 @@ or macOS (launchd), see [docs/service-setup.md](docs/service-setup.md).
 
 ---
 
+## Resource Limits and Crash-Loop Guards
+
+A host install with no memory ceilings will happily take the host down with it,
+**silently** — the only symptom is a graph that stops updating while clients
+keep getting `202`. [docs/operational-hardening.md](docs/operational-hardening.md)
+covers Neo4j heap/page-cache and container limits, `MemoryMax`/`MemoryHigh` and
+`StartLimitBurst` on the systemd unit, `write_concurrency` for backlog drains,
+and the exact commands to detect each symptom. Grounded in a measured two-day
+outage: a 38 GB queue spool, a 22 GB Neo4j, a 43.9 GB OOM-killed startup, and
+≈1,500 pointless restarts.
+
+---
+
 ## Deploying to Azure
 
 See [docs/azure-deployment.md](docs/azure-deployment.md) for a full guide to deploying as an Azure Container App with automatic HTTPS, persistent storage, and Neo4j on AuraDB.

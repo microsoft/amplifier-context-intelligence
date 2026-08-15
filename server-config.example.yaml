@@ -145,8 +145,25 @@ log_path:  ~/amplifier-context-intelligence-server-data-store/logs/server.jsonl
 
 # Durable ingest queue (persist-then-202): each session gets an append-log under
 # queues_path so events survive a crash between the 202 ACK and the Neo4j write.
+#
+# OPERATIONAL WARNING: queues_path has NO size cap and NO alert. It is meant to
+# be transient (drained, then deleted), but when draining stalls it grows
+# without a signal -- a real host install reached 38 GB across 583 files. Boot
+# cost scales with it: crash recovery respawns one drainer per undrained session
+# and reads from disk, so a large spool turns every restart into a multi-minute,
+# memory-heavy operation. Watch it: `du -sh <queues_path>`.
+# See docs/operational-hardening.md.
 queues_path: /data/queues          # Durable per-session append-logs; mirrors blob_path
-write_concurrency: 8               # Max concurrent Neo4j write flushes across all session drainers (starvation guard)
+
+# write_concurrency: max concurrent Neo4j write flushes across all session
+# drainers. Two jobs: starvation guard, AND the cap on peak Neo4j transaction
+# memory during a backlog drain -- exactly what a restart-with-backlog creates.
+#
+# Set this to 4 on any host install whose Neo4j transaction memory you have not
+# explicitly sized. Evidence from a sibling deployment: the default 8 thundered
+# neo4j's ~20.6GiB tx-memory ceiling on a restart-with-backlog -> 307 OOM/hr;
+# 4 stopped it. The cost is drain throughput, and only while a backlog exists.
+write_concurrency: 8               # 4 recommended for host installs -- see docs/operational-hardening.md §4
 max_delivery_attempts: 5           # Flush retries for one batch before its offending line is dead-lettered
 
 # -----------------------------------------------------------------------------
