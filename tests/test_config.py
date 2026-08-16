@@ -84,6 +84,41 @@ def test_crash_recovery_respawn_limit_defaults_to_unbounded():
     assert s.crash_recovery_respawn_limit is None
 
 
+def test_crash_recovery_sweep_interval_defaults_to_300():
+    """A finite ceiling drains its deferred tail via a periodic sweep; the
+    default interval must be a sane positive value so a finite cap is safe
+    out of the box (not silently stranded)."""
+    from context_intelligence_server.config import Settings
+
+    assert Settings().crash_recovery_sweep_interval_seconds == 300
+
+
+def test_crash_recovery_sweep_interval_accepts_zero_and_positive():
+    from context_intelligence_server.config import Settings
+
+    assert (
+        Settings(
+            crash_recovery_sweep_interval_seconds=0
+        ).crash_recovery_sweep_interval_seconds
+        == 0
+    )
+    assert (
+        Settings(
+            crash_recovery_sweep_interval_seconds=60
+        ).crash_recovery_sweep_interval_seconds
+        == 60
+    )
+
+
+def test_crash_recovery_sweep_interval_rejects_negative():
+    import pytest
+
+    from context_intelligence_server.config import Settings
+
+    with pytest.raises(ValueError):
+        Settings(crash_recovery_sweep_interval_seconds=-1)
+
+
 def test_crash_recovery_respawn_limit_accepts_zero_and_positive():
     from context_intelligence_server.config import Settings
 

@@ -15,7 +15,7 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal, Tuple, Type
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, field_validator, model_validator
@@ -164,7 +164,7 @@ class YamlConfigSettingsSource(PydanticBaseSettingsSource):
 
     def __init__(
         self,
-        settings_cls: Type[BaseSettings],
+        settings_cls: type[BaseSettings],
         yaml_file: Path | None = None,
     ) -> None:
         super().__init__(settings_cls)
@@ -830,6 +830,37 @@ class Settings(BaseSettings):
             )
         return v
 
+    # Crash-recovery deferred-backlog SWEEP interval (seconds). Only relevant
+    # when crash_recovery_respawn_limit is FINITE. Without this, a finite cap
+    # would drain the head of the backlog on boot and leave the deferred tail
+    # untouched until either a restart or a NEW event for that exact session
+    # arrives -- so a backlog of already-COMPLETED sessions (the incident's
+    # shape) would never drain at all, and a cap of 0 would strand EVERYTHING
+    # permanently. This sweep periodically re-runs recover() and tops the
+    # drainer pool back up to the ceiling: because respawn is idempotent
+    # (get_or_create) and recover() drops sessions the moment they finish, the
+    # number of live recovered drainers stays <= the ceiling while the deferred
+    # tail advances in deterministic sorted order as head sessions drain.
+    #
+    # Default 300s applies ONLY when a finite ceiling is set; with the default
+    # crash_recovery_respawn_limit=None (unbounded) there is no deferred tail
+    # and NO sweep task is ever started -- so every existing deployment is
+    # completely unaffected. Set to 0 to DISABLE the sweep even under a finite
+    # ceiling (the deferred tail then drains only on restart or a new event --
+    # an explicit, documented choice, not a silent surprise).
+    crash_recovery_sweep_interval_seconds: int = 300
+
+    @field_validator("crash_recovery_sweep_interval_seconds")
+    @classmethod
+    def _validate_crash_recovery_sweep_interval(cls, v: int) -> int:
+        """Fail loud on a negative interval; 0 (disabled) and positive are valid."""
+        if v < 0:
+            raise ValueError(
+                "crash_recovery_sweep_interval_seconds must be a non-negative "
+                f"integer (0 disables the sweep), got {v}"
+            )
+        return v
+
     # -------------------------------------------------------------------------
     # Logging
     # -------------------------------------------------------------------------
@@ -845,12 +876,12 @@ class Settings(BaseSettings):
     @classmethod
     def settings_customise_sources(
         cls,
-        settings_cls: Type[BaseSettings],
+        settings_cls: type[BaseSettings],
         init_settings: PydanticBaseSettingsSource,
         env_settings: PydanticBaseSettingsSource,
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
-    ) -> Tuple[PydanticBaseSettingsSource, ...]:
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
         # Priority: programmatic > env vars > YAML file > defaults
         return (
             init_settings,

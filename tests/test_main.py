@@ -1007,6 +1007,134 @@ async def test_lifespan_respawn_cap_zero_defers_everything(
 
 
 # ---------------------------------------------------------------------------
+# Deferred-backlog sweep (ci_pr73-rt7): a finite crash_recovery_respawn_limit
+# must NOT permanently strand the deferred tail. The periodic sweep re-runs
+# recovery and tops the drainer pool up to the ceiling as head sessions drain.
+# ---------------------------------------------------------------------------
+
+
+async def test_crash_recovery_topup_drains_deferred_tail_across_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deferred tail is not stranded: with ceiling=2, pass 1 dispatches the
+    2 head sessions; once those finish draining (drop out of recover()), pass 2
+    dispatches the previously-deferred 2. Live recovered drainers never exceed
+    the ceiling."""
+    qm = registry.queue_manager
+    sids = sorted(f"sess-sweep-{i}" for i in range(4))
+    for sid in sids:
+        await _seed_recoverable_session(qm, sid, "/ws")
+
+    spawned: list[str] = []
+    monkeypatch.setattr(registry, "get_or_create", lambda s, w, **kw: spawned.append(s))
+
+    # Pass 1: only the ceiling's worth (2) are dispatched; the tail is deferred.
+    dispatched = await main_module._crash_recovery_topup(2)
+    assert dispatched == 2
+    assert set(spawned) == set(sids[:2])
+
+    # The 2 head sessions finish draining -> commit them to EOF so recover()
+    # stops reporting them (exactly what a real drainer does on completion).
+    for sid in sids[:2]:
+        batch = await qm.read_batch(sid, max_items=10)
+        await qm.commit(sid, batch.end_offset)
+
+    # Pass 2: the previously-DEFERRED tail is now dispatched -- not stranded.
+    spawned.clear()
+    dispatched = await main_module._crash_recovery_topup(2)
+    assert dispatched == 2
+    assert set(spawned) == set(sids[2:])
+
+
+async def test_lifespan_enables_sweep_under_finite_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A finite ceiling with a positive interval starts the background sweep
+    (logged), so the deferred tail drains progressively rather than only on
+    restart."""
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 2)
+    monkeypatch.setattr(
+        main_module._settings, "crash_recovery_sweep_interval_seconds", 300
+    )
+    monkeypatch.setattr(registry, "get_or_create", lambda *a, **kw: MagicMock())
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        caplog.at_level(logging.INFO, logger="context_intelligence_server"),
+    ):
+        async with lifespan(main_module.app):
+            pass  # task is created on entry and cancelled cleanly on exit
+
+    assert any(
+        "crash_recovery_sweep: enabled" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_lifespan_no_sweep_when_limit_unbounded(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Default (unbounded) ceiling: there is no deferred tail, so NO sweep task
+    is started -- existing deployments are completely unaffected."""
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", None)
+    monkeypatch.setattr(registry, "get_or_create", lambda *a, **kw: MagicMock())
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        caplog.at_level(logging.INFO, logger="context_intelligence_server"),
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+    assert not any(
+        "crash_recovery_sweep: enabled" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_lifespan_no_sweep_when_interval_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """interval=0 is an explicit opt-out: even under a finite ceiling the sweep
+    is not started (documented tradeoff: tail drains only on restart/new event)."""
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 2)
+    monkeypatch.setattr(
+        main_module._settings, "crash_recovery_sweep_interval_seconds", 0
+    )
+    monkeypatch.setattr(registry, "get_or_create", lambda *a, **kw: MagicMock())
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        caplog.at_level(logging.INFO, logger="context_intelligence_server"),
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+    assert not any(
+        "crash_recovery_sweep: enabled" in r.getMessage() for r in caplog.records
+    )
+
+
+# ---------------------------------------------------------------------------
 # Cold start FAILS LOUD on schema/data corruption that requires `doctor
 # --fix` (design decision, reversing the lifespan half of f4d8bab): an
 # un-migrated graph -- duplicate legacy nodes (caught by the :Node
@@ -1394,9 +1522,14 @@ async def test_status_includes_spool_block(client: httpx.AsyncClient) -> None:
 
     assert "spool" in data
     spool = data["spool"]
-    assert set(spool.keys()) == {"pending_sessions", "spool_bytes_total"}
+    assert set(spool.keys()) == {
+        "pending_sessions",
+        "spool_bytes_total",
+        "corrupt_offsets",
+    }
     assert isinstance(spool["pending_sessions"], int)
     assert isinstance(spool["spool_bytes_total"], int)
+    assert isinstance(spool["corrupt_offsets"], int)
 
 
 async def test_status_spool_block_reflects_real_backlog(
@@ -1445,6 +1578,51 @@ async def test_status_spool_block_never_leaks_session_identifiers(
     assert secret_sid not in raw_text
     assert "/very/private/workspace" not in raw_text
     assert "per_key" not in response.json()["spool"]
+
+
+async def test_status_corrupt_offset_returns_200_and_surfaces_count(
+    client: httpx.AsyncClient,
+) -> None:
+    """Regression (ci_pr73-267): a corrupt .offset previously 500'd /status via
+    derive_all_stats() (which runs before spool_stats in get_status). /status
+    must now stay 200 AND surface the corruption as spool.corrupt_offsets -- the
+    only signal (no logging, so the polled health path is never flooded)."""
+    qm = registry.queue_manager
+    await qm.append("sess-corrupt-offset", b"a")
+    qm._offset_path("sess-corrupt-offset").write_text("not-a-number", encoding="utf-8")
+    qm._spool_cache = None  # bypass TTL cache so the corruption is seen now
+
+    response = await client.get("/status")
+
+    assert response.status_code == 200  # was 500 before the fix
+    assert response.json()["spool"]["corrupt_offsets"] >= 1
+
+
+async def test_status_returns_200_when_spool_dir_unavailable(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (ci_pr73-ueh): /status is the ACA health probe. spool_stats()
+    scans the queue dir with iterdir() (raises on a missing dir), unlike the
+    glob()-based sibling readers. A transiently-unavailable queue dir (e.g. an
+    Azure Files SMB remount) must NOT turn /status into a 500 -> failed probe
+    -> container restart loop. It must return 200 with a degraded sentinel."""
+    qm = registry.queue_manager
+    # Point the scan at a directory that does not exist so iterdir() raises,
+    # exactly as it would during an SMB mount drop. Bypass the TTL cache so the
+    # scan actually runs on this call.
+    monkeypatch.setattr(qm, "_dir", tmp_path / "gone")
+    monkeypatch.setattr(qm, "_spool_cache", None)
+
+    response = await client.get("/status")
+
+    assert response.status_code == 200
+    assert response.json()["spool"] == {
+        "pending_sessions": -1,
+        "spool_bytes_total": -1,
+        "corrupt_offsets": -1,
+    }
 
 
 # ---------------------------------------------------------------------------

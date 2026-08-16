@@ -33,6 +33,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# Fixed buffer size for streaming scans over a session ``.log`` (last-newline
+# search and newline counting). Bounds boot-time and /status memory to O(chunk)
+# instead of O(file): a durable log can be multi-GB (4.9 GB in the incident),
+# and loading one into RAM just to count newlines is what drove ~44 GB RSS at
+# startup. 1 MiB balances syscall count against per-scan memory.
+_SCAN_CHUNK_BYTES = 1 << 20
+
 
 @dataclass(frozen=True)
 class Batch:
@@ -95,13 +102,74 @@ class QueueManager:
         A torn trailing line (bytes after the final newline) is ignored: the
         returned offset is one past the last ``\\n``, or 0 when the log is
         missing or contains no complete line.
+
+        Streams BACKWARD from EOF in fixed chunks to find the last ``\\n`` --
+        O(tail) memory and I/O, never O(file). This log can be multi-GB (the
+        durable spool grew to a 4.9 GB single file in the incident); reading
+        the whole thing into RAM just to find the final newline is exactly the
+        boot-time memory blowup this avoids.
         """
+        path = self._log_path(session_id)
         try:
-            data = self._log_path(session_id).read_bytes()
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                pos = f.tell()
+                while pos > 0:
+                    read_size = min(_SCAN_CHUNK_BYTES, pos)
+                    pos -= read_size
+                    f.seek(pos)
+                    buf = f.read(read_size)
+                    idx = buf.rfind(b"\n")
+                    if idx != -1:
+                        return pos + idx + 1
+            return 0
         except FileNotFoundError:
             return 0
-        last_nl = data.rfind(b"\n")
-        return last_nl + 1 if last_nl != -1 else 0
+
+    @staticmethod
+    def _stream_newlines(path: Path, start: int = 0, end: int | None = None) -> int:
+        """Count ``\\n`` bytes in ``path``'s byte range ``[start, end)`` -- streamed.
+
+        ``end=None`` counts to EOF. Reads the range in fixed-size chunks
+        (O(chunk) memory) instead of materialising the whole file (or a slice
+        copy of it) in RAM, which is what ``read_bytes()`` +
+        ``data[a:b].count(b"\\n")`` did on multi-GB spool files. Numerically
+        identical to that slice-count for any range; a missing file counts 0.
+
+        Path-based (not session-id-based) so it serves both ``.log`` scans
+        (``_count_newlines``) and the whole-file ``.dead.jsonl`` count
+        (``_count_dead``).
+        """
+        if end is not None and end <= start:
+            return 0
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                remaining = None if end is None else end - start
+                count = 0
+                while True:
+                    to_read = (
+                        _SCAN_CHUNK_BYTES
+                        if remaining is None
+                        else min(_SCAN_CHUNK_BYTES, remaining)
+                    )
+                    if to_read <= 0:
+                        break
+                    buf = f.read(to_read)
+                    if not buf:
+                        break
+                    count += buf.count(b"\n")
+                    if remaining is not None:
+                        remaining -= len(buf)
+                return count
+        except FileNotFoundError:
+            return 0
+
+    def _count_newlines(
+        self, session_id: str, start: int = 0, end: int | None = None
+    ) -> int:
+        """Streamed newline count over a session ``.log``'s ``[start, end)``."""
+        return self._stream_newlines(self._log_path(session_id), start, end)
 
     @staticmethod
     def _validate_session_id(session_id: str) -> None:
@@ -279,12 +347,13 @@ class QueueManager:
         Returns 0 when no dead-letter file exists. Dead-letter records are
         always written newline-terminated, so counting newlines yields the
         number of complete records.
+
+        Streamed (bounded memory), not ``read_bytes()``: a .dead.jsonl is
+        usually small but is NOT bounded -- a systematically-failing session
+        dead-letters every line -- and this is called on the same boot and
+        polled-/status paths as the .log scans.
         """
-        try:
-            data = self._dead_path(worker_key).read_bytes()
-        except FileNotFoundError:
-            return 0
-        return data.count(b"\n")
+        return self._stream_newlines(self._dead_path(worker_key))
 
     def _all_worker_keys(self) -> list[str]:
         """Return the sorted union of ``.log`` and ``.dead.jsonl`` stems.
@@ -330,17 +399,26 @@ class QueueManager:
             in_queue_total = 0
             dead_total = 0
             for worker_key in self._all_worker_keys():
-                committed = self._read_committed_offset(worker_key)
-                in_queue = 0
                 try:
-                    with open(self._log_path(worker_key), "rb") as f:
-                        f.seek(committed)
-                        data = f.read()
-                    last_nl = data.rfind(b"\n")
-                    if last_nl != -1:
-                        in_queue = data[: last_nl + 1].count(b"\n")
-                except FileNotFoundError:
-                    in_queue = 0
+                    committed = self._read_committed_offset(worker_key)
+                except (OSError, ValueError):
+                    # /status calls this (via pipeline_metrics); a corrupt or
+                    # transiently-unreadable .offset must NOT 500 the health
+                    # probe. Degrade to 0 for this key's stats -- mirroring the
+                    # existing missing-file->0 convention in
+                    # _read_committed_offset, and tending the conservation
+                    # residual negative (benign, never a false `degraded`).
+                    # Deliberately NO logging here: /status is polled, and a
+                    # per-scan warning on a persistently-corrupt offset would
+                    # flood the hot path. The visibility signal is the aggregate
+                    # `spool.corrupt_offsets` field (see spool_stats()).
+                    committed = 0
+                # Streamed count of complete lines from committed -> EOF.
+                # Equivalent to the old f.read() + data[:last_nl+1].count(b"\n")
+                # (every b"\n" lies at or before the last one), but without
+                # materialising the undrained tail -- which can be gigabytes
+                # under a large backlog on this (polled) /status path.
+                in_queue = self._count_newlines(worker_key, committed)
                 dead = self._count_dead(worker_key)
                 per_key.append(
                     {"worker_key": worker_key, "in_queue": in_queue, "dead": dead}
@@ -391,6 +469,28 @@ class QueueManager:
         Per the /status aggregate-only contract (D3): NO session ids, NO
         workspace names, and NO per-key table are returned or computable from
         this result -- two integers only.
+
+        HEALTH-ENDPOINT SAFE: /status is the unauthenticated health probe (the
+        ACA liveness surface). This method therefore MUST NOT be able to raise
+        out to the /status handler -- an uncaught exception there becomes a 500,
+        a failed health probe, and a container restart loop. Two degradation
+        rules make that impossible:
+
+        - A directory-level failure (the queue dir missing/unavailable -- e.g.
+          an Azure Files SMB remount -- or any transient OS error while
+          scanning) returns the degraded sentinel ``{-1, -1}`` instead of
+          raising. Unlike every sibling reader, which uses ``glob()`` (empty on
+          a missing dir), this scan uses ``iterdir()`` (raises on a missing
+          dir), so the guard is mandatory, not cosmetic. The sentinel is NOT
+          cached, so the very next poll re-scans and recovers the real numbers
+          the moment the filesystem is healthy again.
+        - A per-file failure (a raced delete, or a corrupt/unreadable
+          ``.offset``) skips just that entry rather than failing the whole
+          aggregate.
+
+        A ``-1`` in either field is the operator-visible "spool footprint
+        temporarily unavailable" signal -- distinct from a real ``0`` -- and
+        never leaks any identifier.
         """
         now = time.monotonic()
         if (
@@ -402,6 +502,7 @@ class QueueManager:
         def _scan() -> dict[str, int]:
             spool_bytes_total = 0
             pending_sessions = 0
+            corrupt_offsets = 0
             for entry in self._dir.iterdir():
                 if not entry.is_file():
                     continue
@@ -413,17 +514,47 @@ class QueueManager:
                     # a cheap, best-effort aggregate over a live directory.
                     continue
                 spool_bytes_total += size
-                if (
-                    entry.suffix == ".log"
-                    and self._read_committed_offset(entry.stem) < size
-                ):
-                    pending_sessions += 1
+                if entry.suffix == ".log":
+                    try:
+                        committed = self._read_committed_offset(entry.stem)
+                    except ValueError:
+                        # The .offset exists but is not a valid integer -- a
+                        # GENUINELY corrupt offset. This is the one visibility
+                        # signal for it (no logging anywhere, to avoid flooding
+                        # the polled health path): surface it as an aggregate
+                        # count on /status so `spool.corrupt_offsets > 0` is the
+                        # operator's alarm. Count this file's bytes; skip its
+                        # pending calc.
+                        corrupt_offsets += 1
+                        continue
+                    except OSError:
+                        # A transient/racing FS error reading the offset (NOT
+                        # corruption): count bytes, skip pending calc, and do
+                        # NOT inflate corrupt_offsets with a non-corruption cause.
+                        continue
+                    if committed < size:
+                        pending_sessions += 1
             return {
                 "pending_sessions": pending_sessions,
                 "spool_bytes_total": spool_bytes_total,
+                "corrupt_offsets": corrupt_offsets,
             }
 
-        stats = await asyncio.to_thread(_scan)
+        try:
+            stats = await asyncio.to_thread(_scan)
+        except (OSError, ValueError):
+            # Queue dir missing/unavailable (e.g. Azure Files SMB remount) or a
+            # transient FS error mid-scan. /status is the health probe and MUST
+            # return 200 -- degrade to a sentinel and DO NOT cache it, so the
+            # next poll retries immediately once the filesystem recovers. All
+            # three fields are -1 = "temporarily unavailable" (distinct from a
+            # real 0, and from a real corrupt_offsets count).
+            return {
+                "pending_sessions": -1,
+                "spool_bytes_total": -1,
+                "corrupt_offsets": -1,
+            }
+
         self._spool_cache = stats
         self._spool_cache_at = now
         return stats
@@ -505,12 +636,12 @@ class QueueManager:
                 committed = self._read_committed_offset(key)
                 complete_end = self._complete_data_end(key)
                 dead = self._count_dead(key)
-                try:
-                    data = self._log_path(key).read_bytes()
-                except FileNotFoundError:
-                    data = b""
-                before = data[:committed].count(b"\n")
-                pending = data[committed:complete_end].count(b"\n")
+                # Streamed newline counts over byte ranges -- numerically
+                # identical to the old data[:committed].count(b"\n") /
+                # data[committed:complete_end].count(b"\n"), but without loading
+                # the whole (possibly multi-GB) log or its slice copies at boot.
+                before = self._count_newlines(key, 0, committed)
+                pending = self._count_newlines(key, committed, complete_end)
                 written_seed = max(0, before - dead)
                 accepted += written_seed + pending + dead
                 written += written_seed
