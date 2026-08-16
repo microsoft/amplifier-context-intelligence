@@ -9,7 +9,7 @@ import re
 import sys
 import time
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -141,6 +141,67 @@ def _recover_one_session(
         return False
     get_or_create(sid, workspace, created_by=created_by)
     return True
+
+
+async def _crash_recovery_topup(respawn_limit: int | None) -> int:
+    """One bounded crash-recovery pass: respawn drainers for up to
+    ``respawn_limit`` recovered sessions (all of them when ``None``).
+
+    This is the shared body of the boot-time recovery and the periodic sweep.
+    It is SAFE to call repeatedly on a live server because respawn is
+    idempotent -- ``registry.get_or_create`` returns the existing worker for a
+    session that already has a live drainer (no duplicate drainer, no reset).
+    And because ``recover()`` reports only sessions that still have undrained
+    data, a session drops out the moment it finishes, so the number of live
+    RECOVERED drainers stays <= ``respawn_limit`` while the deferred tail
+    advances in deterministic sorted order as head sessions drain.
+
+    Returns the number of sessions DISPATCHED to get_or_create on this pass --
+    an upper bound on newly-spawned drainers, since get_or_create is a no-op
+    for a session that already has a live drainer (see NOTE in the loop).
+    """
+    recovered = await registry.queue_manager.recover()
+    to_process = recovered if respawn_limit is None else recovered[:respawn_limit]
+    respawned = 0
+    for sid in to_process:
+        batch = await registry.queue_manager.read_batch(sid, max_items=1)
+        if not batch.lines:
+            continue
+        # NOTE: _recover_one_session returns True whenever it dispatched to
+        # get_or_create, whether or not a drainer already existed (get_or_create
+        # is idempotent). So this count is "sessions dispatched this pass", an
+        # upper bound on newly-spawned drainers -- fine for an INFO log.
+        if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
+            respawned += 1
+    return respawned
+
+
+async def _crash_recovery_sweep_loop(interval: int, respawn_limit: int) -> None:
+    """Periodically top the recovered-drainer pool back up to the ceiling so a
+    finite ``crash_recovery_respawn_limit`` cannot permanently strand the
+    deferred backlog (the tail only advances as head sessions finish draining).
+
+    Started by ``lifespan`` ONLY when a finite ceiling is configured and the
+    interval is > 0; with the default unbounded ceiling there is no deferred
+    tail and this loop never runs. A single failed tick must never kill the
+    loop, so the body is guarded (CancelledError propagates for clean
+    shutdown; everything else is logged and the loop continues).
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            respawned = await _crash_recovery_topup(respawn_limit)
+            if respawned:
+                logger.info(
+                    "crash_recovery_sweep: dispatched %d recovered session(s) "
+                    "(ceiling=%d) -- draining deferred backlog",
+                    respawned,
+                    respawn_limit,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a sweep tick must never kill the loop
+            logger.warning("crash_recovery_sweep: tick failed, will retry: %s", exc)
 
 
 @asynccontextmanager
@@ -281,9 +342,32 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         respawned,
         len(recovered),
     )
+    # Periodic deferred-backlog sweep: only meaningful under a FINITE ceiling
+    # (a deferred tail can exist). With the default unbounded ceiling
+    # (respawn_limit is None) there is no deferred tail, so NO background task
+    # is started -- existing deployments are completely unaffected. When a
+    # finite ceiling IS set, this drains the deferred tail over time instead of
+    # stranding it until a restart or a new event (see _crash_recovery_sweep_loop
+    # and config.crash_recovery_sweep_interval_seconds).
+    _sweep_task: asyncio.Task[None] | None = None
+    _sweep_interval = _settings.crash_recovery_sweep_interval_seconds
+    if respawn_limit is not None and _sweep_interval > 0:
+        _sweep_task = asyncio.create_task(
+            _crash_recovery_sweep_loop(_sweep_interval, respawn_limit)
+        )
+        logger.info(
+            "crash_recovery_sweep: enabled (interval=%ds, ceiling=%d) -- "
+            "deferred backlog will drain progressively, not just on restart",
+            _sweep_interval,
+            respawn_limit,
+        )
     try:
         yield
     finally:
+        if _sweep_task is not None:
+            _sweep_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await _sweep_task
         logger.info("lifespan_shutdown: closing Neo4j drivers")
         await app.state.neo4j_driver.close()
         await app.state.neo4j_query_driver.close()

@@ -535,7 +535,11 @@ async def test_spool_stats_returns_only_aggregate_keys_no_identifiers(qm):
 
     stats = await qm.spool_stats()
 
-    assert set(stats.keys()) == {"pending_sessions", "spool_bytes_total"}
+    assert set(stats.keys()) == {
+        "pending_sessions",
+        "spool_bytes_total",
+        "corrupt_offsets",
+    }
     serialized = repr(stats)
     assert "my-secret-session-id" not in serialized
     assert "another-session-id" not in serialized
@@ -573,7 +577,211 @@ async def test_spool_stats_caches_within_ttl(qm, monkeypatch):
     assert calls["n"] == 2
 
 
+# ---------------------------------------------------------------------------
+# Streamed boot/stats scans (ci_pr73-xq2): _complete_data_end and
+# _count_newlines must be bounded-memory AND numerically identical to the old
+# read_bytes() + slice-count implementation, including at chunk boundaries.
+# ---------------------------------------------------------------------------
+
+
+def _naive_complete_data_end(data: bytes) -> int:
+    last_nl = data.rfind(b"\n")
+    return last_nl + 1 if last_nl != -1 else 0
+
+
+def test_complete_data_end_matches_naive_and_handles_edges(qm, tmp_path):
+    """Backward-scan _complete_data_end == old rfind(b'\\n')+1 for every shape:
+    empty, no-newline (torn only), trailing newline, torn tail after data."""
+    log = tmp_path / "queues" / "s1.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    for payload in (
+        b"",  # empty
+        b"no-newline-yet",  # single torn line, no complete data
+        b"a\n",  # one complete line
+        b"a\nb\n",  # two complete lines
+        b"a\nb\ntorn-tail",  # complete data + torn trailing line
+    ):
+        log.write_bytes(payload)
+        assert qm._complete_data_end("s1") == _naive_complete_data_end(payload)
+
+
+def test_complete_data_end_missing_log_is_zero(qm):
+    assert qm._complete_data_end("nope") == 0
+
+
+def test_complete_data_end_newline_on_chunk_boundary(qm, tmp_path, monkeypatch):
+    """The backward scan reads fixed non-overlapping windows; a newline landing
+    exactly on a chunk boundary must still be found (regression guard for the
+    streaming rewrite)."""
+    import context_intelligence_server.queue_manager as qm_mod
+
+    monkeypatch.setattr(qm_mod, "_SCAN_CHUNK_BYTES", 8)
+    log = tmp_path / "queues" / "s1.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    # Last newline sits at index 8 (exactly one chunk from the start), followed
+    # by a torn tail so complete_data_end must be 9, spanning a chunk boundary.
+    data = b"01234567\ntail"  # '\n' at index 8
+    log.write_bytes(data)
+    assert qm._complete_data_end("s1") == _naive_complete_data_end(data) == 9
+
+
+def test_count_newlines_matches_naive_across_ranges(qm, tmp_path, monkeypatch):
+    """_count_newlines(start,end) == data[start:end].count(b'\\n') for arbitrary
+    ranges, including across a small chunk size (multi-chunk streaming)."""
+    import context_intelligence_server.queue_manager as qm_mod
+
+    monkeypatch.setattr(qm_mod, "_SCAN_CHUNK_BYTES", 4)
+    log = tmp_path / "queues" / "s1.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    data = b"aa\nbbbb\nc\n\nddddddd\n"
+    log.write_bytes(data)
+
+    n = len(data)
+    for start in range(n + 1):
+        # to-EOF form
+        assert qm._count_newlines("s1", start) == data[start:].count(b"\n")
+        for end in range(start, n + 1):
+            assert qm._count_newlines("s1", start, end) == data[start:end].count(b"\n")
+
+
+def test_count_newlines_missing_and_empty_range(qm):
+    assert qm._count_newlines("missing") == 0
+    assert qm._count_newlines("missing", 0, 0) == 0
+
+
+def test_count_dead_matches_naive_and_streams(qm, tmp_path, monkeypatch):
+    """_count_dead == old data.count(b'\\n') for empty / multi-record / missing,
+    including a newline on a chunk boundary (streamed, not read_bytes)."""
+    import context_intelligence_server.queue_manager as qm_mod
+
+    monkeypatch.setattr(qm_mod, "_SCAN_CHUNK_BYTES", 8)
+    dead = tmp_path / "queues" / "s1.dead.jsonl"
+    dead.parent.mkdir(parents=True, exist_ok=True)
+
+    assert qm._count_dead("missing") == 0
+
+    for payload in (
+        b"",  # empty -> 0
+        b'{"a":1}\n',  # one record
+        b'{"a":1}\n{"b":2}\n{"c":3}\n',  # three records
+        b"01234567\n8\n",  # newline at index 8 == chunk boundary, 2 records
+    ):
+        dead.write_bytes(payload)
+        assert qm._count_dead("s1") == payload.count(b"\n")
+
+
+async def test_recovery_seed_counts_unchanged_under_streaming(qm):
+    """End-to-end: the streamed recovery_seed_counts yields the same
+    (accepted, written) baseline as the semantics it replaced."""
+    # Two complete lines appended, one committed.
+    await qm.append("s1", b"a")
+    await qm.append("s1", b"bb")
+    line1 = b"a\n"
+    await qm.commit("s1", len(line1))  # 1 written, 1 still pending
+
+    accepted, written = await qm.recovery_seed_counts()
+
+    assert written == 1  # one committed line, no dead
+    assert accepted == 2  # one written + one pending
+
+
 async def test_spool_stats_empty_directory(qm):
     """An empty spool directory reports zero for both aggregates."""
     stats = await qm.spool_stats()
-    assert stats == {"pending_sessions": 0, "spool_bytes_total": 0}
+    assert stats == {
+        "pending_sessions": 0,
+        "spool_bytes_total": 0,
+        "corrupt_offsets": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# spool_stats health-endpoint safety (regression, ci_pr73-ueh):
+# /status is the unauthenticated ACA health probe and calls spool_stats()
+# unconditionally. spool_stats() uses iterdir() (raises on a missing dir),
+# unlike every sibling reader which uses glob() (empty on a missing dir), so
+# a transiently-unavailable queue dir or a corrupt .offset MUST degrade to a
+# sentinel, never raise -- an escape becomes a 500 -> failed probe -> restart.
+# ---------------------------------------------------------------------------
+
+
+async def test_spool_stats_missing_directory_returns_sentinel(qm, tmp_path):
+    """A missing queue dir makes iterdir() raise FileNotFoundError; spool_stats
+    must return the degraded sentinel {-1, -1} rather than propagate (which
+    would 500 the /status health probe -- e.g. during an Azure Files remount)."""
+    import shutil
+
+    shutil.rmtree(tmp_path / "queues")
+    qm._spool_cache = None  # bypass the TTL cache so the scan actually runs
+
+    stats = await qm.spool_stats()
+
+    assert stats == {
+        "pending_sessions": -1,
+        "spool_bytes_total": -1,
+        "corrupt_offsets": -1,
+    }
+
+
+async def test_spool_stats_sentinel_is_not_cached(qm, tmp_path):
+    """The degraded sentinel is NOT cached: once the directory is healthy
+    again, the very next call recovers the real aggregate numbers."""
+    import shutil
+
+    queues_dir = tmp_path / "queues"
+    shutil.rmtree(queues_dir)
+    qm._spool_cache = None
+    assert await qm.spool_stats() == {
+        "pending_sessions": -1,
+        "spool_bytes_total": -1,
+        "corrupt_offsets": -1,
+    }
+
+    # Filesystem recovers; no manual cache reset -- the sentinel was never stored.
+    queues_dir.mkdir(parents=True, exist_ok=True)
+    await qm.append("s1", b"a")
+
+    stats = await qm.spool_stats()
+    assert stats["pending_sessions"] == 1
+    assert stats["spool_bytes_total"] > 0
+
+
+async def test_spool_stats_corrupt_offset_does_not_sink_scan(qm):
+    """A corrupt/unreadable .offset for one session must not fail the whole
+    scan (which would 500 /status): that file's bytes still count, only its
+    pending calc is skipped."""
+    await qm.append("s1", b"a")
+    qm._offset_path("s1").write_text("not-a-number", encoding="utf-8")
+    qm._spool_cache = None
+
+    stats = await qm.spool_stats()
+
+    assert stats["spool_bytes_total"] > 0
+    assert isinstance(stats["pending_sessions"], int)
+
+
+async def test_spool_stats_counts_corrupt_offsets(qm):
+    """A non-numeric .offset is surfaced as an aggregate corrupt_offsets count
+    (the ONLY visibility signal -- no logging). A healthy session contributes 0."""
+    await qm.append("s-good", b"a")  # valid: no .offset yet -> committed 0
+    await qm.append("s-bad", b"a")
+    qm._offset_path("s-bad").write_text("not-a-number", encoding="utf-8")
+    qm._spool_cache = None
+
+    stats = await qm.spool_stats()
+
+    assert stats["corrupt_offsets"] == 1
+    assert stats["spool_bytes_total"] > 0  # corrupt file's bytes still counted
+
+
+async def test_spool_stats_healthy_offsets_report_zero_corrupt(qm):
+    """corrupt_offsets is 0 when every .offset is a valid integer (it must not
+    fire on the normal committed-offset path)."""
+    await qm.append("s1", b"a")
+    line = b"a\n"
+    await qm.commit("s1", len(line))  # writes a valid numeric .offset
+    qm._spool_cache = None
+
+    stats = await qm.spool_stats()
+
+    assert stats["corrupt_offsets"] == 0

@@ -166,6 +166,42 @@ queues_path: /data/queues          # Durable per-session append-logs; mirrors bl
 write_concurrency: 8               # 4 recommended for host installs -- see docs/operational-hardening.md §4
 max_delivery_attempts: 5           # Flush retries for one batch before its offending line is dead-lettered
 
+# --- Crash-recovery of the durable queue on startup ---
+# On boot the server respawns one drainer per session that still has undrained
+# data. A very large backlog (measured: 38 GB / 583 files) can respawn so many
+# drainers that boot takes minutes and RSS spikes hard enough to be OOM-killed,
+# which then restart-loops and never lets the backlog shrink.
+#
+# crash_recovery_respawn_limit: ceiling on how many drainers a single boot
+#   respawns. null (DEFAULT) = unbounded = respawn EVERY recovered session on
+#   this boot (the original, pre-hardening behaviour). A finite value caps the
+#   respawn to that many sessions per pass; the remainder are DEFERRED.
+#     WARNING: 0 means "never auto-respawn recovered sessions". Combined with a
+#     disabled sweep (below), a 0 or finite cap would strand the deferred
+#     backlog until a restart or a NEW event for that session arrives -- for a
+#     backlog of already-completed sessions that never happens. Leave the sweep
+#     enabled (its default) so a finite cap drains safely over time.
+crash_recovery_respawn_limit: null
+
+# crash_recovery_sweep_interval_seconds: how often (seconds) a background sweep
+#   re-runs recovery and tops the drainer pool back up to the ceiling, so a
+#   FINITE crash_recovery_respawn_limit drains its deferred tail progressively
+#   instead of stranding it. Only runs when a finite ceiling is set; with the
+#   default null ceiling there is no deferred tail and NO sweep task starts
+#   (existing deployments are unaffected). 0 disables the sweep even under a
+#   finite ceiling (explicit opt-out: the tail then drains only on restart or a
+#   new event).
+crash_recovery_sweep_interval_seconds: 300
+
+# --- Gunicorn worker watchdog timeouts (seconds) ---
+# gunicorn_worker_timeout: how long gunicorn lets a worker go silent before it
+#   SIGKILLs it. A legitimately slow, large-backlog boot can exceed the 30s
+#   default and be killed mid-startup; raise it for deployments that expect a
+#   slow boot. gunicorn_graceful_timeout: shutdown grace window after SIGTERM.
+#   Both defaults are UNCHANGED from the previously-hardcoded values.
+gunicorn_worker_timeout: 30
+gunicorn_graceful_timeout: 10
+
 # -----------------------------------------------------------------------------
 # Server bind address
 # These two values are combined into the HTTP URL the server binds and listens on.
