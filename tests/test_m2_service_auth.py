@@ -123,7 +123,7 @@ def _service_claims(roles: list[str], appid: str = FAKE_APPID) -> dict[str, Any]
 
 
 class _MockBlobStore:
-    """Mock for AsyncDiskBlobStore — yields nothing, never touches filesystem."""
+    """Mock for FileSystemBlobStore — yields nothing, never touches filesystem."""
 
     def __init__(self, root: Any = None) -> None:
         pass

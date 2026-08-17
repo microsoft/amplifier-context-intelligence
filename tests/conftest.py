@@ -107,6 +107,7 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
     _real = _Settings()
 
     class _SettingsProxy:
+        blob_backend: str = _real.blob_backend
         blob_path: str = _real.blob_path
         queues_path: str = str(tmp_path / "queues")
         # Redirect identity-store paths so the registry proxy never touches the

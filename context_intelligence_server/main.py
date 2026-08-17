@@ -11,7 +11,6 @@ import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -32,7 +31,10 @@ from context_intelligence_server.authz import (  # noqa: F401 — re-exported fo
 )
 from context_intelligence_server.config import Neo4jClientConfig, Settings, get_settings
 from context_intelligence_server.idempotency import EventIdempotencyCache
-from context_intelligence_server.identity_store import IdentityStore
+from context_intelligence_server.identity_store import (
+    IdentityStore,
+    create_identity_store,
+)
 from context_intelligence_server.logging_config import setup_logging
 from context_intelligence_server.models import (
     CypherRequest,
@@ -395,9 +397,10 @@ app.state.registry = registry
 # Single shared BlobStore instance for the whole process (T1.5): the /blobs
 # routes above and the registry's session-worker construction both go
 # through registry.blob_store, which lazily builds and caches exactly one
-# AsyncDiskBlobStore. Also mirrored on app.state so other routers (e.g. a
-# future admin reclaim rewire) can reach the same instance without importing
-# the module-level `registry` name.
+# BlobStore (backend selected by create_blob_store() from config). Also
+# mirrored on app.state so other routers (e.g. a future admin reclaim
+# rewire) can reach the same instance without importing the module-level
+# `registry` name.
 app.state.blob_store = registry.blob_store
 idempotency_cache = EventIdempotencyCache()
 
@@ -578,7 +581,7 @@ def create_asgi_app(
 
     if s.auth_mode == "entra":
         # Build and load the entra identity store.
-        entra_store = IdentityStore(Path(s.entra_identities_store_path))
+        entra_store = create_identity_store(s, "entra")
         entra_store.load()
         if not entra_store.exists():
             # First boot: seed in-process map from config.  Converts the flat
@@ -642,7 +645,7 @@ def create_asgi_app(
         admin_api_key_digest = None
     else:
         # Build and load the API-key store.
-        key_store = IdentityStore(Path(s.api_keys_store_path))
+        key_store = create_identity_store(s, "api_key")
         key_store.load()
         if not key_store.exists():
             # First boot: seed from config.  Converts the flat

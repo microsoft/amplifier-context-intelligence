@@ -6,16 +6,19 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
-from context_intelligence_server.blob_store import AsyncDiskBlobStore
+from context_intelligence_server.blob_store import BlobStore, create_blob_store
 from context_intelligence_server.config import get_settings
-from context_intelligence_server.status import EventRecord, ring_buffer
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
 from context_intelligence_server.pipeline import process_event, setup_handlers
-from context_intelligence_server.queue_manager import Batch, QueueManager
+from context_intelligence_server.queue_manager import (
+    Batch,
+    QueueManager,
+    create_queue_manager,
+)
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.status import EventRecord, ring_buffer
 
 logger = logging.getLogger("context_intelligence_server")
 
@@ -69,7 +72,7 @@ class SessionRegistry:
         # before the per-test settings patch applies, so we cannot read
         # settings here — see _ensure_infra().
         self._queue_manager: QueueManager | None = None
-        self._blob_store: AsyncDiskBlobStore | None = None
+        self._blob_store: BlobStore | None = None
         self._write_semaphore: asyncio.Semaphore | None = None
         self._max_delivery_attempts: int = 0
         # Live pipeline-conservation counters (D2): make silently-dropped
@@ -96,7 +99,7 @@ class SessionRegistry:
         """
         if self._queue_manager is None:
             settings = get_settings()
-            self._queue_manager = QueueManager(queues_dir=Path(settings.queues_path))
+            self._queue_manager = create_queue_manager(settings)
             self._write_semaphore = asyncio.Semaphore(settings.write_concurrency)
             self._max_delivery_attempts = settings.max_delivery_attempts
 
@@ -115,17 +118,22 @@ class SessionRegistry:
         return self._write_semaphore
 
     @property
-    def blob_store(self) -> AsyncDiskBlobStore:
-        """The single shared AsyncDiskBlobStore owned by this registry.
+    def blob_store(self) -> BlobStore:
+        """The single shared BlobStore owned by this registry.
 
         Built lazily on first access (same rationale as ``queue_manager``:
         the module-level registry singleton is constructed at import time,
         before any per-test settings patch applies), then reused for every
         session worker and route handler — never one instance per session.
+
+        The concrete backend is selected by ``create_blob_store()`` from
+        config (``settings.blob_backend``) — this registry never references
+        a concrete backend class or ``settings.blob_path`` directly, so
+        swapping backends (e.g. adding Azure) touches only the factory.
         """
         if self._blob_store is None:
             settings = get_settings()
-            self._blob_store = AsyncDiskBlobStore(root=settings.blob_path)
+            self._blob_store = create_blob_store(settings)
         return self._blob_store
 
     def record_accepted(self, n: int = 1) -> None:
@@ -446,7 +454,9 @@ class SessionRegistry:
     ) -> bool:
         """Dispatch each line in the batch; return True if it contained a
         terminal (session:end) event."""
-        from context_intelligence_server.pipeline import TERMINAL_EVENTS  # noqa: PLC0415
+        from context_intelligence_server.pipeline import (
+            TERMINAL_EVENTS,
+        )
 
         saw_terminal = False
         for raw in batch.lines:

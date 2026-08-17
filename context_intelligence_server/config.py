@@ -800,6 +800,12 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # Storage paths
     # -------------------------------------------------------------------------
+    # blob_backend selects the BlobStore implementation via
+    # context_intelligence_server.blob_store.create_blob_store(); "filesystem"
+    # is the only backend implemented today. blob_path is that filesystem
+    # backend's own root -- it is read only by the factory (and here, at
+    # declaration) and is otherwise meaningless to any other backend.
+    blob_backend: str = "filesystem"
     blob_path: str = "/data/blobs"
     queues_path: str = "/data/queues"
 

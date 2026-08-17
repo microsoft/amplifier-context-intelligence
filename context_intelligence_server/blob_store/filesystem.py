@@ -1,4 +1,4 @@
-"""AsyncDiskBlobStore — async, disk-backed blob storage with ci-blob:// URIs.
+"""FileSystemBlobStore \u2014 async, disk-backed blob storage with ci-blob:// URIs.
 
 Disk layout:
     <root>/<session-id>/blobs/<key>.json
@@ -9,11 +9,10 @@ URI scheme:
 All filesystem I/O is wrapped with ``asyncio.to_thread`` to keep the event
 loop non-blocking.
 
-The ``BlobStore`` Protocol is the backend-neutral seam: the only identity
-that crosses the boundary is the ``ci-blob://<session_id>/<key>`` URI, carried
-by :class:`BlobReference`. No ``Path``, on-disk layout, ``dest_dir``, or
-``os.*`` detail appears in the Protocol or in any value it returns — that is
-private to :class:`AsyncDiskBlobStore` (and, later, an Azure equivalent).
+This is a concrete implementation of the :class:`~context_intelligence_server.blob_store.protocol.BlobStore`
+Protocol. No ``Path``, on-disk layout, ``dest_dir``, or ``os.*`` detail
+appears in the Protocol or in any value it returns \u2014 those details are
+private to this class (and, later, an Azure equivalent).
 """
 
 from __future__ import annotations
@@ -24,113 +23,16 @@ import os
 import shutil
 import tempfile
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, cast
+
+from .protocol import BlobNotFoundError, BlobReference
 
 _SCHEME = "ci-blob://"
 
 
-# ---------------------------------------------------------------------------
-# BlobNotFoundError — backend-neutral missing-blob exception (guard #6)
-# ---------------------------------------------------------------------------
-
-
-class BlobNotFoundError(FileNotFoundError):
-    """Raised when a blob addressed by a ``ci-blob://`` URI does not exist.
-
-    Subclasses :class:`FileNotFoundError` so existing ``except
-    FileNotFoundError`` callers keep working unchanged (zero caller churn).
-    The message carries the URI ONLY — never an on-disk path, container, or
-    account — so a future Azure backend can raise the same type/message
-    shape and no caller (or log line) ever learns which backend is in use.
-    """
-
-
-# ---------------------------------------------------------------------------
-# BlobReference — cheap handle: identity + metadata, NO payload, NO Path
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class BlobReference:
-    """Cheap handle — identity + metadata, NO payload, NO Path.
-
-    This is what ``scan()``/``list()`` return and what everything except a
-    payload read passes around. It is what gets serialized on the graph (as
-    its ``.uri``).
-    """
-
-    uri: str  # ci-blob://<session_id>/<key> — the ONLY address callers use
-    session_id: str
-    key: str
-    size: int  # content length in bytes
-    last_modified: float  # epoch seconds: disk st_mtime || azure Last-Modified
-
-
-# ---------------------------------------------------------------------------
-# BlobStore protocol
-# ---------------------------------------------------------------------------
-
-
-@runtime_checkable
-class BlobStore(Protocol):
-    """Protocol for a session-scoped, URI-addressable blob store.
-
-    100% backend-neutral: the only identity that crosses the boundary is the
-    ``ci-blob://`` URI (carried by :class:`BlobReference`). No ``Path``, no
-    on-disk layout, no ``dest_dir``, no ``os.*`` — ever.
-    """
-
-    async def write(
-        self, session_id: str, key: str, value: dict[str, Any] | list[Any]
-    ) -> BlobReference:
-        """Persist *value* as JSON and return a :class:`BlobReference`."""
-        ...
-
-    def list(self, session_id: str) -> AsyncIterator[BlobReference]:
-        """Stream all blob references for *session_id* (one session)."""
-        ...
-
-    def scan(self) -> AsyncIterator[BlobReference]:
-        """Stream all blob references across ALL sessions."""
-        ...
-
-    async def delete(
-        self, uri: str, if_unmodified: BlobReference | None = None
-    ) -> bool:
-        """Delete the blob addressed by *uri*. Idempotent: returns False if absent.
-
-        Args:
-            uri: The ``ci-blob://`` URI to delete.
-            if_unmodified: When provided, this is a **fenced (compare-and-delete)**
-                delete — the store re-checks the blob's current metadata against
-                *if_unmodified* (disk: mtime + size; Azure: ``If-Match`` ETag) and
-                refuses (returns ``False``, does NOT delete) if the blob changed
-                since *if_unmodified* was observed (e.g. by a `scan()`). When
-                ``None`` (default), this is the unconditional idempotent delete.
-        """
-        ...
-
-    async def read(self, uri: str) -> dict[str, Any] | list[Any]:
-        """Resolve *uri* and return the stored value (the sole payload path).
-
-        Raises:
-            ValueError: If *uri* does not match the ``ci-blob://`` scheme.
-            BlobNotFoundError: If no blob exists for *uri*. Subclasses
-                ``FileNotFoundError`` for back-compat; the message carries the
-                URI only — never an on-disk path, container, or account.
-        """
-        ...
-
-
-# ---------------------------------------------------------------------------
-# AsyncDiskBlobStore
-# ---------------------------------------------------------------------------
-
-
-class AsyncDiskBlobStore:
-    """Async, disk-backed implementation of :class:`BlobStore`.
+class FileSystemBlobStore:
+    """Async, disk-backed implementation of :class:`~.protocol.BlobStore`.
 
     Args:
         root: Root directory under which all session blobs are stored.
@@ -155,10 +57,10 @@ class AsyncDiskBlobStore:
         """
         if not uri.startswith(_SCHEME):
             raise ValueError(
-                f"Invalid URI scheme — expected '{_SCHEME}...', got: {uri!r}"
+                f"Invalid URI scheme \u2014 expected '{_SCHEME}...', got: {uri!r}"
             )
         remainder = uri[len(_SCHEME) :]
-        # remainder must be "<session_id>/<key>" — both parts non-empty
+        # remainder must be "<session_id>/<key>" \u2014 both parts non-empty
         if "/" not in remainder:
             raise ValueError(f"URI missing key component: {uri!r}")
         session_id, _, key = remainder.partition("/")
@@ -193,7 +95,7 @@ class AsyncDiskBlobStore:
 
         Creates the directory ``<root>/<session_id>/blobs/`` if needed.
         ``last_modified`` is the storage mtime (from the same ``stat`` call
-        that produces ``size``) — never a writer-clock timestamp.
+        that produces ``size``) \u2014 never a writer-clock timestamp.
         """
         path = self._blob_path(session_id, key)
 
@@ -229,7 +131,7 @@ class AsyncDiskBlobStore:
     async def read(self, uri: str) -> dict[str, Any] | list[Any]:
         """Return the blob addressed by *uri*.
 
-        The session_id is resolved from the URI itself — callers do not
+        The session_id is resolved from the URI itself \u2014 callers do not
         supply it separately (avoids the bundle footgun where the wrong
         session_id is passed).
 
@@ -237,7 +139,7 @@ class AsyncDiskBlobStore:
             ValueError: If *uri* is not a valid ``ci-blob://`` URI.
             BlobNotFoundError: If no blob exists for *uri*. Subclasses
                 ``FileNotFoundError`` for back-compat; the message carries
-                the URI only — never the on-disk path.
+                the URI only \u2014 never the on-disk path.
         """
         session_id, key = self._parse_uri(uri)
         path = self._blob_path(session_id, key)
@@ -290,7 +192,7 @@ class AsyncDiskBlobStore:
     async def scan(self) -> AsyncIterator[BlobReference]:
         """Stream all blob references across ALL sessions.
 
-        Walks ``<root>/*/blobs/*.json`` — session-dir enumeration and each
+        Walks ``<root>/*/blobs/*.json`` \u2014 session-dir enumeration and each
         session's blob-dir scan are offloaded to a thread in small units
         (never one giant ``to_thread`` for the whole tree), so references
         stream out as they are discovered instead of materializing the
@@ -318,15 +220,15 @@ class AsyncDiskBlobStore:
 
         Args:
             uri: The ``ci-blob://`` URI to delete.
-            if_unmodified: When ``None`` (default), unconditional delete —
+            if_unmodified: When ``None`` (default), unconditional delete \u2014
                 unlinks and returns ``True``, or ``False`` if already absent.
                 When provided, this is a **fenced compare-and-delete**: the
                 blob is re-``stat``'d (inside the same thread hop, right
                 before the unlink, to minimise the TOCTOU window) and the
                 delete only proceeds if ``st_mtime``/``st_size`` still match
-                *if_unmodified* — i.e. nothing rewrote the blob since it was
+                *if_unmodified* \u2014 i.e. nothing rewrote the blob since it was
                 observed (e.g. by ``scan()``). If the blob is missing, or it
-                changed, the delete is refused and ``False`` is returned —
+                changed, the delete is refused and ``False`` is returned \u2014
                 the blob is left untouched on disk.
         """
         session_id, key = self._parse_uri(uri)
@@ -349,7 +251,7 @@ class AsyncDiskBlobStore:
                 st.st_mtime != if_unmodified.last_modified
                 or st.st_size != if_unmodified.size
             ):
-                # Blob was rewritten since it was observed — refuse to delete.
+                # Blob was rewritten since it was observed \u2014 refuse to delete.
                 return False
             try:
                 os.unlink(path)
@@ -363,9 +265,9 @@ class AsyncDiskBlobStore:
     async def dump(self, uri: str, dest_dir: Path | str | None = None) -> str:
         """Copy the blob file addressed by *uri* to *dest_dir*.
 
-        Disk-only helper — NOT part of the :class:`BlobStore` Protocol
-        (no production caller; kept as a concrete convenience for external
-        tooling that needs a local export).
+        Disk-only helper \u2014 NOT part of the :class:`~.protocol.BlobStore`
+        Protocol (no production caller; kept as a concrete convenience for
+        external tooling that needs a local export).
 
         Args:
             uri: ``ci-blob://`` URI identifying the blob to copy.

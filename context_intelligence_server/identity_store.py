@@ -42,11 +42,17 @@ File format (both modes share the same abstraction)::
     }
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from context_intelligence_server.config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -236,3 +242,28 @@ class IdentityStore:
             except Exception:
                 pass
             raise
+
+
+def create_identity_store(settings: Settings, kind: str) -> IdentityStore:
+    """Build an ``IdentityStore`` rooted at the configured path for *kind*.
+
+    Construction only \u2014 callers are responsible for ``load()``/``seed()``
+    and any auth-mode wiring (this mirrors ``blob_store.factory.create_blob_store``:
+    a single-backend, config-reading seam that keeps the store paths out of
+    consumers such as ``main.py``).
+
+    Args:
+        settings: The active ``Settings``.
+        kind: ``"entra"`` for the OID identity map, ``"api_key"`` for the
+            SHA-256 digest keystore.
+
+    Raises:
+        ValueError: If *kind* is neither ``"entra"`` nor ``"api_key"``.
+    """
+    if kind == "entra":
+        path = settings.entra_identities_store_path
+    elif kind == "api_key":
+        path = settings.api_keys_store_path
+    else:
+        raise ValueError(f"Unknown identity store kind: {kind!r}")
+    return IdentityStore(Path(path))

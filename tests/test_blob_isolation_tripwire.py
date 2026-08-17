@@ -1,15 +1,18 @@
-"""Tripwire: the blob-store on-disk layout stays inside blob_store.py.
+"""Tripwire: the blob-store on-disk layout stays inside the blob_store package.
 
 Locks the isolation boundary established by the BlobStore refactor
 (see docs/blob-store-abstraction.md). These tests fail loudly if a future
-change lets any module other than ``blob_store.py`` locate the blob root or
-resurrects the old direct-filesystem reclaim implementation -- i.e. if a
-direct-FS blob leak is reintroduced.
+change lets any module other than the ``blob_store/`` package locate the blob
+root or resurrects the old direct-filesystem reclaim implementation -- i.e.
+if a direct-FS blob leak is reintroduced.
 
 Two invariants:
-  1. Only the single construction site (registry.py) and the config field
-     declaration (config.py) may reference ``settings.blob_path`` -- a caller
-     that cannot locate the blob root physically cannot do blob filesystem I/O.
+  1. Only the ``blob_store/`` package (specifically ``factory.py``, the single
+     construction site) and the config field declaration (config.py) may
+     reference ``settings.blob_path`` -- a caller that cannot locate the blob
+     root physically cannot do blob filesystem I/O. Since the config-driven
+     factory refactor, ``registry.py`` no longer references it either -- it
+     goes through ``create_blob_store(settings)`` and never sees the path.
   2. The pre-refactor direct-disk reclaim symbols must never reappear.
 """
 
@@ -33,20 +36,46 @@ def _code_lines(path: pathlib.Path):
 
 def test_blob_root_locatable_only_at_construction_site() -> None:
     """`settings.blob_path` -- the only way to find the on-disk blob root -- is
-    referenced solely where the store is constructed (registry.py) and where the
-    config field is declared (config.py). blob_store.py owns the layout itself."""
-    allowed = {"registry.py", "config.py", "blob_store.py"}
+    referenced solely inside the blob_store/ package (which owns the layout)
+    and where the config field is declared (config.py). registry.py goes
+    through create_blob_store(settings) and never sees the path itself."""
+    blob_store_pkg = PKG / "blob_store"
+    allowed_top_level = {"config.py"}
     offenders: list[str] = []
     for p in PKG.rglob("*.py"):
-        if p.name in allowed:
+        # Anything inside the blob_store/ package owns the layout -- allowed.
+        if blob_store_pkg in p.parents:
+            continue
+        if p.name in allowed_top_level:
             continue
         for lineno, line in _code_lines(p):
             if "blob_path" in line:
                 offenders.append(f"{p.relative_to(PKG)}:{lineno}: {line}")
     assert not offenders, (
-        "blob root re-derived outside the single construction site "
-        "(registry.py)/config -- a caller that can locate the blob root can "
-        "bypass BlobStore and touch disk directly:\n" + "\n".join(offenders)
+        "blob root re-derived outside the blob_store/ package/config -- a "
+        "caller that can locate the blob root can bypass BlobStore and touch "
+        "disk directly:\n" + "\n".join(offenders)
+    )
+
+
+def test_concrete_impl_referenced_only_inside_the_package() -> None:
+    """The concrete ``FileSystemBlobStore`` must appear ONLY inside the
+    ``blob_store/`` package. Production consumers depend on the ``BlobStore``
+    Protocol and obtain instances via ``create_blob_store(settings)`` -- never
+    by naming a concrete backend -- so a disk->Azure swap touches only the
+    package. (Tests are permitted to construct a concrete backend directly.)"""
+    blob_store_pkg = PKG / "blob_store"
+    offenders: list[str] = []
+    for p in PKG.rglob("*.py"):
+        if blob_store_pkg in p.parents:
+            continue
+        for lineno, line in _code_lines(p):
+            if "FileSystemBlobStore" in line:
+                offenders.append(f"{p.relative_to(PKG)}:{lineno}: {line}")
+    assert not offenders, (
+        "concrete FileSystemBlobStore named outside the blob_store/ package -- "
+        "consumers must use the BlobStore Protocol + create_blob_store(settings), "
+        "not a concrete backend:\n" + "\n".join(offenders)
     )
 
 

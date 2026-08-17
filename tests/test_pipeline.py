@@ -578,7 +578,7 @@ async def test_blob_skip_missing_timestamp_logs_warning(
 # the Event node id. Two distinct same-session, same-event, same-millisecond
 # events with DIFFERENT tool_call_id (e.g. parallel tool calls) therefore
 # minted the SAME blob key, and the second write silently clobbered the
-# first via AsyncDiskBlobStore's os.replace -- while the first Event node's
+# first via FileSystemBlobStore's os.replace -- while the first Event node's
 # $blob_ref still pointed at that (now-overwritten) URI.
 # ===========================================================================
 
@@ -590,10 +590,10 @@ async def test_parallel_same_millisecond_events_do_not_collide_on_blob_key(
     """Two events sharing session_id + event name + timestamp (same epoch-ms)
     but with DIFFERENT tool_call_id must mint DISTINCT ci-blob:// URIs, and
     each blob must read back its own payload -- no silent overwrite."""
-    from context_intelligence_server.blob_store import AsyncDiskBlobStore
+    from context_intelligence_server.blob_store import FileSystemBlobStore
     from context_intelligence_server.pipeline import process_event
 
-    blob_store = AsyncDiskBlobStore(root=tmp_path)
+    blob_store = FileSystemBlobStore(root=tmp_path)
 
     worker = MagicMock()
     worker.services.ensure_session_node = AsyncMock()

@@ -1,4 +1,4 @@
-"""Tests for AsyncDiskBlobStore — Write, Read, List, Scan, Delete, Dump.
+"""Tests for FileSystemBlobStore — Write, Read, List, Scan, Delete, Dump.
 
 Covers:
 1.  write/read roundtrip
@@ -31,10 +31,10 @@ from unittest.mock import patch
 
 import pytest
 from context_intelligence_server.blob_store import (
-    AsyncDiskBlobStore,
     BlobNotFoundError,
     BlobReference,
     BlobStore,
+    FileSystemBlobStore,
 )
 
 # ---------------------------------------------------------------------------
@@ -43,12 +43,12 @@ from context_intelligence_server.blob_store import (
 
 
 @pytest.fixture
-def store(tmp_path: Path) -> AsyncDiskBlobStore:
-    """Return a fresh AsyncDiskBlobStore rooted at a temporary directory."""
-    return AsyncDiskBlobStore(root=tmp_path)
+def store(tmp_path: Path) -> FileSystemBlobStore:
+    """Return a fresh FileSystemBlobStore rooted at a temporary directory."""
+    return FileSystemBlobStore(root=tmp_path)
 
 
-async def _list_uris(store: AsyncDiskBlobStore, session_id: str) -> list[str]:
+async def _list_uris(store: FileSystemBlobStore, session_id: str) -> list[str]:
     return [ref.uri async for ref in store.list(session_id)]
 
 
@@ -57,7 +57,7 @@ async def _list_uris(store: AsyncDiskBlobStore, session_id: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-async def test_write_read_roundtrip(store: AsyncDiskBlobStore) -> None:
+async def test_write_read_roundtrip(store: FileSystemBlobStore) -> None:
     """Data written can be read back unchanged."""
     payload = {"event": "tool_call", "tool": "bash", "args": ["ls"]}
     ref = await store.write("session-abc", "tool_call_01", payload)
@@ -70,7 +70,7 @@ async def test_write_read_roundtrip(store: AsyncDiskBlobStore) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_uri_format(store: AsyncDiskBlobStore) -> None:
+async def test_uri_format(store: FileSystemBlobStore) -> None:
     """write() returns a BlobReference whose .uri is ci-blob://<session_id>/<key>."""
     ref = await store.write("session-xyz", "my_key", {"x": 1})
     assert isinstance(ref, BlobReference)
@@ -87,7 +87,7 @@ async def test_uri_format(store: AsyncDiskBlobStore) -> None:
 
 
 async def test_directory_structure_creation(
-    store: AsyncDiskBlobStore, tmp_path: Path
+    store: FileSystemBlobStore, tmp_path: Path
 ) -> None:
     """write() creates <root>/<session_id>/blobs/<key>.json on disk."""
     await store.write("session-123", "blob_key", {"data": "value"})
@@ -103,7 +103,7 @@ async def test_directory_structure_creation(
 
 
 async def test_uri_based_session_id_resolution(
-    store: AsyncDiskBlobStore, tmp_path: Path
+    store: FileSystemBlobStore, tmp_path: Path
 ) -> None:
     """read() resolves the session_id from the URI, not from a parameter."""
     session_id = "session-uri-resolve"
@@ -122,7 +122,7 @@ async def test_uri_based_session_id_resolution(
 # ---------------------------------------------------------------------------
 
 
-async def test_missing_blob_raises_file_not_found(store: AsyncDiskBlobStore) -> None:
+async def test_missing_blob_raises_file_not_found(store: FileSystemBlobStore) -> None:
     """read() raises FileNotFoundError for a URI pointing to a non-existent blob."""
     uri = "ci-blob://session-missing/nonexistent_key"
     with pytest.raises(FileNotFoundError):
@@ -134,7 +134,7 @@ async def test_missing_blob_raises_file_not_found(store: AsyncDiskBlobStore) -> 
 # ---------------------------------------------------------------------------
 
 
-async def test_invalid_uri_raises_value_error(store: AsyncDiskBlobStore) -> None:
+async def test_invalid_uri_raises_value_error(store: FileSystemBlobStore) -> None:
     """read() raises ValueError for URIs that don't match the ci-blob:// scheme."""
     with pytest.raises(ValueError):
         await store.read("not-a-ci-blob-uri")
@@ -151,7 +151,7 @@ async def test_invalid_uri_raises_value_error(store: AsyncDiskBlobStore) -> None
 # ---------------------------------------------------------------------------
 
 
-async def test_empty_list_for_missing_session(store: AsyncDiskBlobStore) -> None:
+async def test_empty_list_for_missing_session(store: FileSystemBlobStore) -> None:
     """list() yields nothing when no blobs exist for the session."""
     result = await _list_uris(store, "session-does-not-exist")
     assert result == []
@@ -162,7 +162,7 @@ async def test_empty_list_for_missing_session(store: AsyncDiskBlobStore) -> None
 # ---------------------------------------------------------------------------
 
 
-async def test_correct_uri_listing(store: AsyncDiskBlobStore) -> None:
+async def test_correct_uri_listing(store: FileSystemBlobStore) -> None:
     """list() yields all blob references for a session, sorted by key."""
     session_id = "session-list"
     await store.write(session_id, "key_b", {"b": 2})
@@ -187,7 +187,7 @@ async def test_correct_uri_listing(store: AsyncDiskBlobStore) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_session_isolation(store: AsyncDiskBlobStore) -> None:
+async def test_session_isolation(store: FileSystemBlobStore) -> None:
     """list() only returns references for the requested session, not other sessions."""
     await store.write("session-alpha", "blob_1", {"alpha": True})
     await store.write("session-beta", "blob_2", {"beta": True})
@@ -209,7 +209,7 @@ async def test_session_isolation(store: AsyncDiskBlobStore) -> None:
 
 async def test_asyncio_to_thread_delegation(tmp_path: Path) -> None:
     """All filesystem I/O is delegated to asyncio.to_thread for non-blocking I/O."""
-    store = AsyncDiskBlobStore(root=tmp_path)
+    store = FileSystemBlobStore(root=tmp_path)
 
     to_thread_calls: list[str] = []
     original_to_thread = asyncio.to_thread
@@ -236,7 +236,7 @@ async def test_asyncio_to_thread_delegation(tmp_path: Path) -> None:
 
 
 async def test_dump_copy_to_specified_dest_dir(
-    store: AsyncDiskBlobStore, tmp_path: Path
+    store: FileSystemBlobStore, tmp_path: Path
 ) -> None:
     """dump() copies the blob file to the specified dest_dir and returns the path."""
     session_id = "session-dump-copy"
@@ -258,7 +258,7 @@ async def test_dump_copy_to_specified_dest_dir(
 # ---------------------------------------------------------------------------
 
 
-async def test_dump_default_dest_dir(store: AsyncDiskBlobStore) -> None:
+async def test_dump_default_dest_dir(store: FileSystemBlobStore) -> None:
     """dump() uses Path(tempfile.gettempdir()) / 'ci-blobs' when dest_dir is None."""
     import tempfile
 
@@ -280,7 +280,7 @@ async def test_dump_default_dest_dir(store: AsyncDiskBlobStore) -> None:
 
 
 async def test_dump_missing_blob_raises_file_not_found(
-    store: AsyncDiskBlobStore,
+    store: FileSystemBlobStore,
 ) -> None:
     """dump() raises FileNotFoundError with 'Blob not found' message for missing blob."""
     uri = "ci-blob://session-nonexistent/missing_blob"
@@ -294,7 +294,7 @@ async def test_dump_missing_blob_raises_file_not_found(
 
 
 async def test_dump_uses_asyncio_to_thread_for_copy2(
-    store: AsyncDiskBlobStore, tmp_path: Path
+    store: FileSystemBlobStore, tmp_path: Path
 ) -> None:
     """dump() delegates shutil.copy2 to asyncio.to_thread for non-blocking I/O."""
     session_id = "session-dump-thread"
@@ -323,8 +323,8 @@ async def test_dump_uses_asyncio_to_thread_for_copy2(
 # ---------------------------------------------------------------------------
 
 
-def test_blob_store_protocol_conformance(store: AsyncDiskBlobStore) -> None:
-    """AsyncDiskBlobStore conforms to the BlobStore protocol."""
+def test_blob_store_protocol_conformance(store: FileSystemBlobStore) -> None:
+    """FileSystemBlobStore conforms to the BlobStore protocol."""
     assert isinstance(store, BlobStore)
 
 
@@ -334,7 +334,7 @@ def test_blob_store_protocol_conformance(store: AsyncDiskBlobStore) -> None:
 
 
 async def test_write_is_atomic_no_torn_file_on_failure(
-    store: AsyncDiskBlobStore, tmp_path: Path
+    store: FileSystemBlobStore, tmp_path: Path
 ) -> None:
     """A failure during os.replace leaves no torn final file and no temp siblings."""
     session_id = "sess-atomic"
@@ -342,7 +342,7 @@ async def test_write_is_atomic_no_torn_file_on_failure(
 
     with (
         patch(
-            "context_intelligence_server.blob_store.os.replace",
+            "context_intelligence_server.blob_store.filesystem.os.replace",
             side_effect=OSError("simulated replace failure"),
         ),
         pytest.raises(OSError),
@@ -359,7 +359,7 @@ async def test_write_is_atomic_no_torn_file_on_failure(
 
 
 async def test_write_replaces_atomically_on_success(
-    store: AsyncDiskBlobStore,
+    store: FileSystemBlobStore,
 ) -> None:
     """On success the final file has the exact JSON, no temp remains, URI is correct."""
     session_id = "sess-atomic"
@@ -380,7 +380,7 @@ async def test_write_replaces_atomically_on_success(
 
 
 async def test_scan_yields_references_across_sessions(
-    store: AsyncDiskBlobStore,
+    store: FileSystemBlobStore,
 ) -> None:
     """scan() streams a BlobReference for every blob across ALL sessions."""
     await store.write("session-scan-a", "k1", {"a": 1})
@@ -400,7 +400,7 @@ async def test_scan_yields_references_across_sessions(
         assert r.last_modified > 0
 
 
-async def test_scan_empty_store_yields_nothing(store: AsyncDiskBlobStore) -> None:
+async def test_scan_empty_store_yields_nothing(store: FileSystemBlobStore) -> None:
     """scan() over an empty store yields no references."""
     refs = [ref async for ref in store.scan()]
     assert refs == []
@@ -411,7 +411,7 @@ async def test_scan_empty_store_yields_nothing(store: AsyncDiskBlobStore) -> Non
 # ---------------------------------------------------------------------------
 
 
-async def test_delete_idempotent_true_then_false(store: AsyncDiskBlobStore) -> None:
+async def test_delete_idempotent_true_then_false(store: FileSystemBlobStore) -> None:
     """delete() returns True the first time (blob existed), False thereafter."""
     ref = await store.write("session-delete", "to_delete", {"gone": "soon"})
 
@@ -426,7 +426,7 @@ async def test_delete_idempotent_true_then_false(store: AsyncDiskBlobStore) -> N
     assert second is False
 
 
-async def test_delete_missing_blob_returns_false(store: AsyncDiskBlobStore) -> None:
+async def test_delete_missing_blob_returns_false(store: FileSystemBlobStore) -> None:
     """delete() on a never-written blob returns False, never raises."""
     result = await store.delete("ci-blob://never-existed/nope")
     assert result is False
@@ -438,7 +438,7 @@ async def test_delete_missing_blob_returns_false(store: AsyncDiskBlobStore) -> N
 
 
 async def test_missing_blob_raises_blob_not_found_error_no_path_leak(
-    store: AsyncDiskBlobStore, tmp_path: Path
+    store: FileSystemBlobStore, tmp_path: Path
 ) -> None:
     """read() of a missing uri raises BlobNotFoundError (a FileNotFoundError
     subclass, for back-compat) whose message carries the uri only — never the
@@ -465,7 +465,7 @@ async def test_missing_blob_raises_blob_not_found_error_no_path_leak(
 
 
 async def test_fenced_delete_succeeds_when_unchanged(
-    store: AsyncDiskBlobStore,
+    store: FileSystemBlobStore,
 ) -> None:
     """delete(uri, if_unmodified=ref) removes the blob when it has not
     changed since ref was observed (e.g. by scan()/list())."""
@@ -479,7 +479,7 @@ async def test_fenced_delete_succeeds_when_unchanged(
 
 
 async def test_fenced_delete_refuses_when_rewritten(
-    store: AsyncDiskBlobStore,
+    store: FileSystemBlobStore,
 ) -> None:
     """delete(uri, if_unmodified=stale_ref) returns False and leaves the
     (new) blob on disk when the blob was rewritten after stale_ref was
@@ -514,7 +514,7 @@ async def test_fenced_delete_refuses_when_rewritten(
 
 
 async def test_fenced_delete_missing_blob_returns_false(
-    store: AsyncDiskBlobStore,
+    store: FileSystemBlobStore,
 ) -> None:
     """delete(uri, if_unmodified=ref) on an already-absent blob returns False."""
     ref = await store.write("session-fence-missing", "gone_key", {"v": 1})
@@ -525,7 +525,7 @@ async def test_fenced_delete_missing_blob_returns_false(
 
 
 async def test_unconditional_delete_still_idempotent(
-    store: AsyncDiskBlobStore,
+    store: FileSystemBlobStore,
 ) -> None:
     """Unconditional delete(uri) (if_unmodified=None, the default) is
     unchanged: True then False, idempotent."""

@@ -516,7 +516,7 @@ amplifier-context-intelligence/
 │   ├── pipeline.py                      # Per-event dispatch spine (invoked by the drainer)
 │   ├── neo4j_store.py                   # Neo4jGraphStore (managed-tx writes)
 │   ├── graph_store.py                   # Graph store protocol / abstraction
-│   ├── blob_store.py                    # AsyncDiskBlobStore
+│   ├── blob_store/                      # BlobStore Protocol + FileSystemBlobStore + config-driven factory
 │   ├── idempotency.py                   # Idempotent MERGE / dedupe helpers
 │   ├── auth.py                          # Bearer-token API authentication
 │   ├── status.py                        # Status/version plumbing (EventRingBuffer, build_status_response, SERVER_VERSION)

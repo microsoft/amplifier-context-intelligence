@@ -31,7 +31,10 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from context_intelligence_server.config import Settings
 
 # Fixed buffer size for streaming scans over a session ``.log`` (last-newline
 # search and newline counting). Bounds boot-time and /status memory to O(chunk)
@@ -729,3 +732,13 @@ class QueueManager:
             return total_skipped
 
         return await asyncio.to_thread(_reconcile)
+
+
+def create_queue_manager(settings: Settings) -> QueueManager:
+    """Build the durable ``QueueManager`` from config.
+
+    Single backend today (on-disk), so this is a thin config-reading seam
+    rather than a multi-backend dispatcher \u2014 but it keeps ``settings.queues_path``
+    out of consumers (mirrors ``blob_store.factory.create_blob_store``).
+    """
+    return QueueManager(queues_dir=Path(settings.queues_path))
