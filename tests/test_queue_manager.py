@@ -6,18 +6,18 @@ import time
 
 import pytest
 
-from context_intelligence_server.queue_manager import Batch, QueueManager
+from context_intelligence_server.queue_manager import Batch, FileSystemQueueManager
 
 
 @pytest.fixture
 def qm(tmp_path):
-    return QueueManager(queues_dir=tmp_path / "queues")
+    return FileSystemQueueManager(queues_dir=tmp_path / "queues")
 
 
 def test_constructor_creates_queues_dir(tmp_path):
     target = tmp_path / "nested" / "queues"
     assert not target.exists()
-    QueueManager(queues_dir=target)
+    FileSystemQueueManager(queues_dir=target)
     assert target.is_dir()
 
 
@@ -145,12 +145,12 @@ async def test_commit_advances_offset(qm):
 
 async def test_commit_persists_across_a_new_instance(tmp_path):
     qdir = tmp_path / "queues"
-    qm1 = QueueManager(queues_dir=qdir)
+    qm1 = FileSystemQueueManager(queues_dir=qdir)
     await qm1.append("s1", b"a")
     await qm1.append("s1", b"b")
     batch = await qm1.read_batch("s1", max_items=1)
     await qm1.commit("s1", batch.end_offset)
-    qm2 = QueueManager(queues_dir=qdir)  # simulate restart
+    qm2 = FileSystemQueueManager(queues_dir=qdir)  # simulate restart
     resumed = await qm2.read_batch("s1", max_items=10)
     assert resumed.lines == [b"b"]
 
@@ -227,9 +227,9 @@ async def test_read_dead_letters_rejects_unsafe_session_id(qm, bad_id):
 
 
 async def test_delete_drained_removes_log_and_offset_keeps_dead(tmp_path) -> None:
-    from context_intelligence_server.queue_manager import QueueManager
+    from context_intelligence_server.queue_manager import FileSystemQueueManager
 
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     await qm.append("s", b"line")
     await qm.commit("s", 5)
     await qm.dead_letter("s", b"bad\n", "boom")
@@ -613,7 +613,7 @@ def test_complete_data_end_newline_on_chunk_boundary(qm, tmp_path, monkeypatch):
     """The backward scan reads fixed non-overlapping windows; a newline landing
     exactly on a chunk boundary must still be found (regression guard for the
     streaming rewrite)."""
-    import context_intelligence_server.queue_manager as qm_mod
+    import context_intelligence_server.queue_manager.filesystem as qm_mod
 
     monkeypatch.setattr(qm_mod, "_SCAN_CHUNK_BYTES", 8)
     log = tmp_path / "queues" / "s1.log"
@@ -628,7 +628,7 @@ def test_complete_data_end_newline_on_chunk_boundary(qm, tmp_path, monkeypatch):
 def test_count_newlines_matches_naive_across_ranges(qm, tmp_path, monkeypatch):
     """_count_newlines(start,end) == data[start:end].count(b'\\n') for arbitrary
     ranges, including across a small chunk size (multi-chunk streaming)."""
-    import context_intelligence_server.queue_manager as qm_mod
+    import context_intelligence_server.queue_manager.filesystem as qm_mod
 
     monkeypatch.setattr(qm_mod, "_SCAN_CHUNK_BYTES", 4)
     log = tmp_path / "queues" / "s1.log"
@@ -652,7 +652,7 @@ def test_count_newlines_missing_and_empty_range(qm):
 def test_count_dead_matches_naive_and_streams(qm, tmp_path, monkeypatch):
     """_count_dead == old data.count(b'\\n') for empty / multi-record / missing,
     including a newline on a chunk boundary (streamed, not read_bytes)."""
-    import context_intelligence_server.queue_manager as qm_mod
+    import context_intelligence_server.queue_manager.filesystem as qm_mod
 
     monkeypatch.setattr(qm_mod, "_SCAN_CHUNK_BYTES", 8)
     dead = tmp_path / "queues" / "s1.dead.jsonl"

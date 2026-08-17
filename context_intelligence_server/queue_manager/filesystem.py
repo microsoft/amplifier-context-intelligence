@@ -1,4 +1,4 @@
-"""On-disk durable queue manager for the event-write pipeline.
+"""FileSystemQueueManager — on-disk durable queue for the event-write pipeline.
 
 Disk layout (one set of files per session, keyed by ``session_id``):
 
@@ -20,6 +20,12 @@ session_id contract:
     it is empty or contains a path separator (``/`` or ``\\``) or a null byte.
     The ``session_id`` is used raw as the filename stem, so it must be a safe,
     single path component.
+
+This is a concrete implementation of the
+:class:`~context_intelligence_server.queue_manager.protocol.QueueManager`
+Protocol. No ``Path``, on-disk layout, or ``os.*`` detail appears in the
+Protocol or in any value it returns — those details are private to this
+class (and, later, an Azure equivalent).
 """
 
 from __future__ import annotations
@@ -29,12 +35,10 @@ import base64
 import json
 import os
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from context_intelligence_server.config import Settings
+from .protocol import Batch
 
 # Fixed buffer size for streaming scans over a session ``.log`` (last-newline
 # search and newline counting). Bounds boot-time and /status memory to O(chunk)
@@ -44,27 +48,11 @@ if TYPE_CHECKING:
 _SCAN_CHUNK_BYTES = 1 << 20
 
 
-@dataclass(frozen=True)
-class Batch:
-    """A contiguous batch of log lines read from a session's append-only log.
+class FileSystemQueueManager:
+    """Manages per-session append-only queues on disk.
 
-    Attributes:
-        session_id: The session the lines belong to.
-        lines: Raw, complete log lines WITHOUT their trailing newline.
-        start_offset: Byte position in the log where this batch begins.
-        end_offset: Byte position in the log AFTER the last returned line.
-            This is the value passed to ``commit``. When no complete lines
-            are available, ``end_offset == start_offset``.
+    Implements :class:`~.protocol.QueueManager`.
     """
-
-    session_id: str
-    lines: list[bytes]
-    start_offset: int
-    end_offset: int
-
-
-class QueueManager:
-    """Manages per-session append-only queues on disk."""
 
     def __init__(self, queues_dir: Path):
         self._dir = Path(queues_dir)
@@ -492,7 +480,7 @@ class QueueManager:
           aggregate.
 
         A ``-1`` in either field is the operator-visible "spool footprint
-        temporarily unavailable" signal -- distinct from a real ``0`` -- and
+        temporarily unavailable" signal -- distinct from a real ``0``, and
         never leaks any identifier.
         """
         now = time.monotonic()
@@ -732,13 +720,3 @@ class QueueManager:
             return total_skipped
 
         return await asyncio.to_thread(_reconcile)
-
-
-def create_queue_manager(settings: Settings) -> QueueManager:
-    """Build the durable ``QueueManager`` from config.
-
-    Single backend today (on-disk), so this is a thin config-reading seam
-    rather than a multi-backend dispatcher \u2014 but it keeps ``settings.queues_path``
-    out of consumers (mirrors ``blob_store.factory.create_blob_store``).
-    """
-    return QueueManager(queues_dir=Path(settings.queues_path))

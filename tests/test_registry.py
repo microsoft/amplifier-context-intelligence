@@ -17,7 +17,7 @@ import pytest
 import context_intelligence_server.registry as registry_module
 from context_intelligence_server.blob_store import FileSystemBlobStore
 from context_intelligence_server.config import get_settings
-from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.queue_manager import FileSystemQueueManager
 from context_intelligence_server.registry import (
     CompletedSession,
     SessionRegistry,
@@ -804,7 +804,7 @@ class TestRegistryOwnsDurableInfra:
         """queue_manager is a QueueManager rooted at settings.queues_path, idempotent."""
         reg = SessionRegistry()
         qm = reg.queue_manager
-        assert isinstance(qm, QueueManager)
+        assert isinstance(qm, FileSystemQueueManager)
 
         # Built from the (patched) settings the registry sees.
         settings = registry_module.get_settings()

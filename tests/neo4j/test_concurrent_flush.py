@@ -25,7 +25,7 @@ from context_intelligence_server.neo4j_store import (
     Neo4jGraphStore,
     ensure_neo4j_schema,
 )
-from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.queue_manager import FileSystemQueueManager
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.utils import make_node_id
@@ -226,7 +226,7 @@ async def test_durable_drain_multi_writer_zero_loss(
         await driver.close()
 
     reg = SessionRegistry()
-    reg._queue_manager = QueueManager(queues_dir=tmp_path / "queues")
+    reg._queue_manager = FileSystemQueueManager(queues_dir=tmp_path / "queues")
     reg._write_semaphore = asyncio.Semaphore(2)
     reg._max_delivery_attempts = 5
     qm = reg._queue_manager
@@ -327,7 +327,7 @@ async def test_durable_poison_isolation_no_contamination(
         await driver.close()
 
     reg = SessionRegistry()
-    reg._queue_manager = QueueManager(queues_dir=tmp_path / "queues")
+    reg._queue_manager = FileSystemQueueManager(queues_dir=tmp_path / "queues")
     reg._write_semaphore = asyncio.Semaphore(2)
     reg._max_delivery_attempts = 2
     qm = reg._queue_manager

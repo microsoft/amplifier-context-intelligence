@@ -164,11 +164,13 @@ async def test_post_events_increments_accepted_counter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A durably-accepted event increments the registry accepted_total (D2)."""
-    from context_intelligence_server.queue_manager import QueueManager
+    from context_intelligence_server.queue_manager import FileSystemQueueManager
 
     # Point the registry at a tmp queue dir so the durable append is isolated.
     monkeypatch.setattr(
-        main_module.registry, "_queue_manager", QueueManager(queues_dir=tmp_path)
+        main_module.registry,
+        "_queue_manager",
+        FileSystemQueueManager(queues_dir=tmp_path),
     )
     monkeypatch.setattr(
         main_module.registry, "get_or_create", lambda *args, **kwargs: MagicMock()
@@ -1314,11 +1316,11 @@ async def test_lifespan_seeds_counters_from_disk(tmp_path: Path) -> None:
     zero residual: 1 committed + 1 pending line yields accepted=2, written=1,
     in_queue=1, residual=0 after reconcile -> seed_counts -> seed_counters.
     """
-    from context_intelligence_server.queue_manager import QueueManager
+    from context_intelligence_server.queue_manager import FileSystemQueueManager
     from context_intelligence_server.registry import SessionRegistry
 
     # Seed a queue dir with one committed line and one still-pending line.
-    seed_qm = QueueManager(queues_dir=tmp_path)
+    seed_qm = FileSystemQueueManager(queues_dir=tmp_path)
     sid = "sess-seed"
     line1 = json.dumps({"event": "a", "workspace": "/ws", "data": {}}).encode("utf-8")
     line2 = json.dumps({"event": "b", "workspace": "/ws", "data": {}}).encode("utf-8")
@@ -1329,7 +1331,7 @@ async def test_lifespan_seeds_counters_from_disk(tmp_path: Path) -> None:
 
     # Fresh registry reusing the same on-disk queue dir.
     reg = SessionRegistry()
-    reg._queue_manager = QueueManager(queues_dir=tmp_path)
+    reg._queue_manager = FileSystemQueueManager(queues_dir=tmp_path)
 
     # Production order: reconcile dead lines BEFORE seeding the counts.
     await reg.queue_manager.recovery_reconcile_dead()

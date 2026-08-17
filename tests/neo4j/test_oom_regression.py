@@ -306,7 +306,7 @@ async def test_finalization_path_freezes_then_restart_then_drains(
     from unittest.mock import AsyncMock
 
     from context_intelligence_server.pipeline import setup_handlers
-    from context_intelligence_server.queue_manager import QueueManager
+    from context_intelligence_server.queue_manager import FileSystemQueueManager
     from context_intelligence_server.registry import SessionRegistry, SessionWorker
     from context_intelligence_server.services import HookStateService
 
@@ -320,7 +320,7 @@ async def test_finalization_path_freezes_then_restart_then_drains(
     # fixture) patches into get_settings().queues_path for every new
     # SessionRegistry() instance constructed in this test.
     queues_dir = tmp_path / "queues"
-    qm = QueueManager(queues_dir=queues_dir)
+    qm = FileSystemQueueManager(queues_dir=queues_dir)
 
     async def _make(
         rows: int, byts: int
