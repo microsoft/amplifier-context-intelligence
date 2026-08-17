@@ -31,12 +31,22 @@ from context_intelligence_server.blob_processor import (
     assert_carrier_registered,
     process_event_data,
 )
+from context_intelligence_server.blob_store import BlobReference
 from context_intelligence_server.routers.admin import (
     _BLOB_REF_CARRIER_PROPERTIES as admin_carrier_properties,
 )
 from context_intelligence_server.routers.admin import (
     _BLOB_REF_SCAN_QUERY,
 )
+
+
+def _ref(uri: str) -> BlobReference:
+    """Build a minimal BlobReference for mocking blob_store.write()."""
+    session_id, _, key = uri.removeprefix("ci-blob://").partition("/")
+    return BlobReference(
+        uri=uri, session_id=session_id, key=key, size=0, last_modified=0.0
+    )
+
 
 # ---------------------------------------------------------------------------
 # 1. Regression lock -- current 4-item allowlist
@@ -128,7 +138,7 @@ async def test_process_event_data_fails_closed_when_data_carrier_unregistered(
 
     data: dict[str, Any] = {"result": {"answer": 42}}
     blob_store = AsyncMock()
-    blob_store.write = AsyncMock(return_value="ci-blob://sess/node__result")
+    blob_store.write = AsyncMock(return_value=_ref("ci-blob://sess/node__result"))
 
     with pytest.raises(UnregisteredBlobCarrierError, match="'data'"):
         await process_event_data(data, blob_store, "sess", "node")
@@ -144,7 +154,7 @@ async def test_process_event_data_succeeds_when_data_carrier_registered() -> Non
     ordinary, correctly-registered path."""
     data: dict[str, Any] = {"result": {"answer": 42}}
     blob_store = AsyncMock()
-    blob_store.write = AsyncMock(return_value="ci-blob://sess/node__result")
+    blob_store.write = AsyncMock(return_value=_ref("ci-blob://sess/node__result"))
 
     await process_event_data(data, blob_store, "sess", "node")
 

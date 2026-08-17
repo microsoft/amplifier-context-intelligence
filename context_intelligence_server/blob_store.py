@@ -8,6 +8,12 @@ URI scheme:
 
 All filesystem I/O is wrapped with ``asyncio.to_thread`` to keep the event
 loop non-blocking.
+
+The ``BlobStore`` Protocol is the backend-neutral seam: the only identity
+that crosses the boundary is the ``ci-blob://<session_id>/<key>`` URI, carried
+by :class:`BlobReference`. No ``Path``, on-disk layout, ``dest_dir``, or
+``os.*`` detail appears in the Protocol or in any value it returns — that is
+private to :class:`AsyncDiskBlobStore` (and, later, an Azure equivalent).
 """
 
 from __future__ import annotations
@@ -17,10 +23,49 @@ import json
 import os
 import shutil
 import tempfile
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
 _SCHEME = "ci-blob://"
+
+
+# ---------------------------------------------------------------------------
+# BlobNotFoundError — backend-neutral missing-blob exception (guard #6)
+# ---------------------------------------------------------------------------
+
+
+class BlobNotFoundError(FileNotFoundError):
+    """Raised when a blob addressed by a ``ci-blob://`` URI does not exist.
+
+    Subclasses :class:`FileNotFoundError` so existing ``except
+    FileNotFoundError`` callers keep working unchanged (zero caller churn).
+    The message carries the URI ONLY — never an on-disk path, container, or
+    account — so a future Azure backend can raise the same type/message
+    shape and no caller (or log line) ever learns which backend is in use.
+    """
+
+
+# ---------------------------------------------------------------------------
+# BlobReference — cheap handle: identity + metadata, NO payload, NO Path
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BlobReference:
+    """Cheap handle — identity + metadata, NO payload, NO Path.
+
+    This is what ``scan()``/``list()`` return and what everything except a
+    payload read passes around. It is what gets serialized on the graph (as
+    its ``.uri``).
+    """
+
+    uri: str  # ci-blob://<session_id>/<key> — the ONLY address callers use
+    session_id: str
+    key: str
+    size: int  # content length in bytes
+    last_modified: float  # epoch seconds: disk st_mtime || azure Last-Modified
 
 
 # ---------------------------------------------------------------------------
@@ -30,41 +75,51 @@ _SCHEME = "ci-blob://"
 
 @runtime_checkable
 class BlobStore(Protocol):
-    """Protocol for a session-scoped, URI-addressable blob store."""
+    """Protocol for a session-scoped, URI-addressable blob store.
+
+    100% backend-neutral: the only identity that crosses the boundary is the
+    ``ci-blob://`` URI (carried by :class:`BlobReference`). No ``Path``, no
+    on-disk layout, no ``dest_dir``, no ``os.*`` — ever.
+    """
 
     async def write(
         self, session_id: str, key: str, value: dict[str, Any] | list[Any]
-    ) -> str:
-        """Persist *value* as JSON and return a ``ci-blob://`` URI."""
+    ) -> BlobReference:
+        """Persist *value* as JSON and return a :class:`BlobReference`."""
         ...
 
-    async def read(self, uri: str) -> dict[str, Any] | list[Any]:
-        """Resolve *uri* and return the stored value.
+    def list(self, session_id: str) -> AsyncIterator[BlobReference]:
+        """Stream all blob references for *session_id* (one session)."""
+        ...
 
-        Raises:
-            ValueError: If *uri* does not match the ``ci-blob://`` scheme.
-            FileNotFoundError: If no blob exists at the resolved path.
+    def scan(self) -> AsyncIterator[BlobReference]:
+        """Stream all blob references across ALL sessions."""
+        ...
+
+    async def delete(
+        self, uri: str, if_unmodified: BlobReference | None = None
+    ) -> bool:
+        """Delete the blob addressed by *uri*. Idempotent: returns False if absent.
+
+        Args:
+            uri: The ``ci-blob://`` URI to delete.
+            if_unmodified: When provided, this is a **fenced (compare-and-delete)**
+                delete — the store re-checks the blob's current metadata against
+                *if_unmodified* (disk: mtime + size; Azure: ``If-Match`` ETag) and
+                refuses (returns ``False``, does NOT delete) if the blob changed
+                since *if_unmodified* was observed (e.g. by a `scan()`). When
+                ``None`` (default), this is the unconditional idempotent delete.
         """
         ...
 
-    async def list(self, session_id: str) -> list[str]:
-        """Return all blob URIs for *session_id*, sorted lexicographically."""
-        ...
-
-    async def dump(self, uri: str, dest_dir: Path | str | None = None) -> str:
-        """Copy the blob file addressed by *uri* to *dest_dir*.
-
-        Args:
-            uri: ``ci-blob://`` URI identifying the blob to copy.
-            dest_dir: Destination directory.  Defaults to
-                ``Path(tempfile.gettempdir()) / 'ci-blobs'``.
-
-        Returns:
-            The destination file path as a string.
+    async def read(self, uri: str) -> dict[str, Any] | list[Any]:
+        """Resolve *uri* and return the stored value (the sole payload path).
 
         Raises:
-            ValueError: If *uri* is not a valid ``ci-blob://`` URI.
-            FileNotFoundError: If no blob exists at the resolved path.
+            ValueError: If *uri* does not match the ``ci-blob://`` scheme.
+            BlobNotFoundError: If no blob exists for *uri*. Subclasses
+                ``FileNotFoundError`` for back-compat; the message carries the
+                URI only — never an on-disk path, container, or account.
         """
         ...
 
@@ -133,17 +188,16 @@ class AsyncDiskBlobStore:
 
     async def write(
         self, session_id: str, key: str, value: dict[str, Any] | list[Any]
-    ) -> str:
-        """Persist *value* as JSON and return a ``ci-blob://`` URI.
+    ) -> BlobReference:
+        """Persist *value* as JSON and return a :class:`BlobReference`.
 
         Creates the directory ``<root>/<session_id>/blobs/`` if needed.
-
-        Returns:
-            A ``ci-blob://<session_id>/<key>`` URI.
+        ``last_modified`` is the storage mtime (from the same ``stat`` call
+        that produces ``size``) — never a writer-clock timestamp.
         """
         path = self._blob_path(session_id, key)
 
-        def _write() -> None:
+        def _write() -> os.stat_result:
             path.parent.mkdir(parents=True, exist_ok=True)
             data = json.dumps(value)
             tmp_fd, tmp_name = tempfile.mkstemp(
@@ -161,9 +215,16 @@ class AsyncDiskBlobStore:
                 except FileNotFoundError:
                     pass
                 raise
+            return path.stat()
 
-        await asyncio.to_thread(_write)
-        return self._make_uri(session_id, key)
+        st = await asyncio.to_thread(_write)
+        return BlobReference(
+            uri=self._make_uri(session_id, key),
+            session_id=session_id,
+            key=key,
+            size=st.st_size,
+            last_modified=st.st_mtime,
+        )
 
     async def read(self, uri: str) -> dict[str, Any] | list[Any]:
         """Return the blob addressed by *uri*.
@@ -174,7 +235,9 @@ class AsyncDiskBlobStore:
 
         Raises:
             ValueError: If *uri* is not a valid ``ci-blob://`` URI.
-            FileNotFoundError: If no blob exists at the resolved path.
+            BlobNotFoundError: If no blob exists for *uri*. Subclasses
+                ``FileNotFoundError`` for back-compat; the message carries
+                the URI only — never the on-disk path.
         """
         session_id, key = self._parse_uri(uri)
         path = self._blob_path(session_id, key)
@@ -186,27 +249,123 @@ class AsyncDiskBlobStore:
                     json.loads(path.read_text(encoding="utf-8")),
                 )
             except FileNotFoundError:
-                raise FileNotFoundError(f"Blob not found: {uri!r} (path: {path})")
+                raise BlobNotFoundError(f"Blob not found: {uri!r}") from None
 
         return await asyncio.to_thread(_read)
 
-    async def list(self, session_id: str) -> list[str]:
-        """Return all blob URIs for *session_id*, sorted lexicographically.
+    async def list(self, session_id: str) -> AsyncIterator[BlobReference]:
+        """Stream all blob references for *session_id*.
 
-        Returns an empty list if the session directory does not exist.
+        Yields nothing if the session's blobs directory does not exist.
+        The scandir + per-entry stat work is offloaded to a thread in small
+        units (per-entry), so the event loop stays responsive and references
+        stream out incrementally rather than blocking on the whole walk.
         """
         blobs_dir = self._root / session_id / "blobs"
 
-        def _list() -> list[str]:
+        def _list_entries() -> list[tuple[str, int, float]]:
             if not blobs_dir.exists():
                 return []
-            keys = sorted(p.stem for p in blobs_dir.glob("*.json"))
-            return [self._make_uri(session_id, key) for key in keys]
+            entries: list[tuple[str, int, float]] = []
+            with os.scandir(blobs_dir) as it:
+                for entry in it:
+                    if not entry.name.endswith(".json"):
+                        continue
+                    st = entry.stat()
+                    key = entry.name[: -len(".json")]
+                    entries.append((key, st.st_size, st.st_mtime))
+            entries.sort(key=lambda e: e[0])
+            return entries
 
-        return await asyncio.to_thread(_list)
+        entries = await asyncio.to_thread(_list_entries)
+        for key, size, last_modified in entries:
+            yield BlobReference(
+                uri=self._make_uri(session_id, key),
+                session_id=session_id,
+                key=key,
+                size=size,
+                last_modified=last_modified,
+            )
+
+    async def scan(self) -> AsyncIterator[BlobReference]:
+        """Stream all blob references across ALL sessions.
+
+        Walks ``<root>/*/blobs/*.json`` — session-dir enumeration and each
+        session's blob-dir scan are offloaded to a thread in small units
+        (never one giant ``to_thread`` for the whole tree), so references
+        stream out as they are discovered instead of materializing the
+        entire store in memory before yielding anything.
+        """
+
+        def _list_session_dirs() -> list[str]:
+            if not self._root.exists():
+                return []
+            with os.scandir(self._root) as it:
+                return sorted(entry.name for entry in it if entry.is_dir())
+
+        session_ids = await asyncio.to_thread(_list_session_dirs)
+        for session_id in session_ids:
+            async for ref in self.list(session_id):
+                yield ref
+
+    async def delete(
+        self, uri: str, if_unmodified: BlobReference | None = None
+    ) -> bool:
+        """Delete the blob addressed by *uri*.
+
+        Idempotent: returns ``False`` (never raises) if the blob is already
+        absent, ``True`` if it existed and was removed.
+
+        Args:
+            uri: The ``ci-blob://`` URI to delete.
+            if_unmodified: When ``None`` (default), unconditional delete —
+                unlinks and returns ``True``, or ``False`` if already absent.
+                When provided, this is a **fenced compare-and-delete**: the
+                blob is re-``stat``'d (inside the same thread hop, right
+                before the unlink, to minimise the TOCTOU window) and the
+                delete only proceeds if ``st_mtime``/``st_size`` still match
+                *if_unmodified* — i.e. nothing rewrote the blob since it was
+                observed (e.g. by ``scan()``). If the blob is missing, or it
+                changed, the delete is refused and ``False`` is returned —
+                the blob is left untouched on disk.
+        """
+        session_id, key = self._parse_uri(uri)
+        path = self._blob_path(session_id, key)
+
+        def _delete() -> bool:
+            if if_unmodified is None:
+                try:
+                    os.unlink(path)
+                    return True
+                except FileNotFoundError:
+                    return False
+
+            # Fenced compare-and-delete: stat first, unlink only if unchanged.
+            try:
+                st = path.stat()
+            except FileNotFoundError:
+                return False
+            if (
+                st.st_mtime != if_unmodified.last_modified
+                or st.st_size != if_unmodified.size
+            ):
+                # Blob was rewritten since it was observed — refuse to delete.
+                return False
+            try:
+                os.unlink(path)
+                return True
+            except FileNotFoundError:
+                # Deleted concurrently between our stat and unlink.
+                return False
+
+        return await asyncio.to_thread(_delete)
 
     async def dump(self, uri: str, dest_dir: Path | str | None = None) -> str:
         """Copy the blob file addressed by *uri* to *dest_dir*.
+
+        Disk-only helper — NOT part of the :class:`BlobStore` Protocol
+        (no production caller; kept as a concrete convenience for external
+        tooling that needs a local export).
 
         Args:
             uri: ``ci-blob://`` URI identifying the blob to copy.

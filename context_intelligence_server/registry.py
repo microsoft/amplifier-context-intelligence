@@ -12,11 +12,11 @@ from typing import Any
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.maintenance import coordinator
-from context_intelligence_server.status import EventRecord, ring_buffer
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
 from context_intelligence_server.pipeline import process_event, setup_handlers
 from context_intelligence_server.queue_manager import Batch, QueueManager
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.status import EventRecord, ring_buffer
 
 logger = logging.getLogger("context_intelligence_server")
 
@@ -81,6 +81,7 @@ class SessionRegistry:
         # before the per-test settings patch applies, so we cannot read
         # settings here — see _ensure_infra().
         self._queue_manager: QueueManager | None = None
+        self._blob_store: AsyncDiskBlobStore | None = None
         self._write_semaphore: asyncio.Semaphore | None = None
         self._max_delivery_attempts: int = 0
         # Live pipeline-conservation counters (D2): make silently-dropped
@@ -117,6 +118,20 @@ class SessionRegistry:
         self._ensure_infra()
         assert self._queue_manager is not None
         return self._queue_manager
+
+    @property
+    def blob_store(self) -> AsyncDiskBlobStore:
+        """The single shared AsyncDiskBlobStore owned by this registry.
+
+        Built lazily on first access (same rationale as ``queue_manager``:
+        the module-level registry singleton is constructed at import time,
+        before any per-test settings patch applies), then reused for every
+        session worker and route handler — never one instance per session.
+        """
+        if self._blob_store is None:
+            settings = get_settings()
+            self._blob_store = AsyncDiskBlobStore(root=settings.blob_path)
+        return self._blob_store
 
     @property
     def write_semaphore(self) -> asyncio.Semaphore:
@@ -518,7 +533,9 @@ class SessionRegistry:
     ) -> bool:
         """Dispatch each line in the batch; return True if it contained a
         terminal (session:end) event."""
-        from context_intelligence_server.pipeline import TERMINAL_EVENTS  # noqa: PLC0415
+        from context_intelligence_server.pipeline import (
+            TERMINAL_EVENTS,
+        )
 
         saw_terminal = False
         for raw in batch.lines:
@@ -660,7 +677,7 @@ class SessionRegistry:
     ) -> SessionWorker:
         if session_id not in self._workers:
             settings = get_settings()
-            blob_store = AsyncDiskBlobStore(root=settings.blob_path)
+            blob_store = self.blob_store
             _admin = settings.resolve_neo4j_admin()
             neo4j_store = Neo4jGraphStore(
                 uri=_admin.url,

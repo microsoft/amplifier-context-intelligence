@@ -14,6 +14,7 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Any
 
+from context_intelligence_server.blob_store import BlobStore
 from context_intelligence_server.handlers.data_layer_2.state import DataLayer2State
 from context_intelligence_server.handlers.data_layer_3.state import DataLayer3State
 
@@ -231,7 +232,7 @@ class HookStateService:
         *,
         created_by: str | None = None,
         raw_config: dict[str, Any] | None = None,
-        blob_store: Any | None = None,
+        blob_store: BlobStore | None = None,
     ) -> None:
         self.config = HookConfig(raw_config or {})
         if graph_store is not None:

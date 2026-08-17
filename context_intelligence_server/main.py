@@ -30,7 +30,6 @@ from context_intelligence_server.authz import (  # noqa: F401 — re-exported fo
     require_read,
     require_write,
 )
-from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import Neo4jClientConfig, Settings, get_settings
 from context_intelligence_server.idempotency import EventIdempotencyCache
 from context_intelligence_server.identity_store import IdentityStore
@@ -372,9 +371,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # boundary is still the backstop for anything this doesn't catch.
         try:
             await registry.queue_manager.recovery_reconcile_dead()
-            _accepted_seed, _written_seed = (
-                await registry.queue_manager.recovery_seed_counts()
-            )
+            (
+                _accepted_seed,
+                _written_seed,
+            ) = await registry.queue_manager.recovery_seed_counts()
             registry.seed_counters(_accepted_seed, _written_seed)
             recovered = await registry.queue_manager.recover()
             respawned = 0
@@ -471,6 +471,13 @@ registry = SessionRegistry()
 # request.app.state.registry instead of importing the module-level name
 # (avoids a circular import between main and the routers package).
 app.state.registry = registry
+# Single shared BlobStore instance for the whole process (T1.5): the /blobs
+# routes above and the registry's session-worker construction both go
+# through registry.blob_store, which lazily builds and caches exactly one
+# AsyncDiskBlobStore. Also mirrored on app.state so other routers (e.g. a
+# future admin reclaim rewire) can reach the same instance without importing
+# the module-level `registry` name.
+app.state.blob_store = registry.blob_store
 idempotency_cache = EventIdempotencyCache()
 
 # Session-less events are keyed by a per-workspace sentinel stem so that events
@@ -675,7 +682,7 @@ def create_asgi_app(
         # Build and load the entra identity store.
         entra_store = IdentityStore(Path(s.entra_identities_store_path))
         entra_store.load()
-        if not entra_store.path.exists():
+        if not entra_store.exists():
             # First boot: seed in-process map from config.  Converts the flat
             # {oid -> contributor_id} from build_identity_map() to the rich
             # {oid -> {"id": contributor_id}} format that IdentityStore expects.
@@ -739,7 +746,7 @@ def create_asgi_app(
         # Build and load the API-key store.
         key_store = IdentityStore(Path(s.api_keys_store_path))
         key_store.load()
-        if not key_store.path.exists():
+        if not key_store.exists():
             # First boot: seed from config.  Converts the flat
             # {sha256_hex -> contributor_id} from build_keystore() to the
             # rich {sha256_hex -> {"id": contributor_id}} format.
@@ -911,9 +918,10 @@ async def get_status(request: Request) -> dict[str, Any]:
     response["maintenance_elapsed_seconds"] = _maint.elapsed_seconds
     if _maint.constraint_present is None:
         response["schema_health"] = "unknown"
-    elif _maint.constraint_present is False:
-        response["schema_health"] = "degraded"
-    elif (getattr(request.app.state, "schema_untagged_nodes", None) or 0) > 0:
+    elif (
+        _maint.constraint_present is False
+        or (getattr(request.app.state, "schema_untagged_nodes", None) or 0) > 0
+    ):
         response["schema_health"] = "degraded"
     else:
         response["schema_health"] = "healthy"
@@ -1037,14 +1045,13 @@ async def post_events(
 
 @app.get("/blobs/{session_id}", dependencies=[Depends(require_read)])
 async def list_blobs(session_id: str) -> JSONResponse:
-    blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
-    uris = await blob_store.list(session_id)
+    uris = [ref.uri async for ref in registry.blob_store.list(session_id)]
     return JSONResponse(content={"session_id": session_id, "blobs": uris})
 
 
 @app.get("/blobs/{session_id}/{key}", dependencies=[Depends(require_read)])
 async def get_blob(session_id: str, key: str) -> JSONResponse:
-    blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
+    blob_store = registry.blob_store
     uri = f"ci-blob://{session_id}/{key}"
     try:
         content = await blob_store.read(uri)

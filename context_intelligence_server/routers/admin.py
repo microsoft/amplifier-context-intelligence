@@ -36,11 +36,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import time
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -51,6 +48,7 @@ from pydantic import BaseModel, Field, field_validator
 from context_intelligence_server.blob_processor import (
     BLOB_REF_CARRIER_PROPERTIES as _BLOB_REF_CARRIER_PROPERTIES,
 )
+from context_intelligence_server.blob_store import BlobReference
 from context_intelligence_server.config import _ALL_ZEROS_GUID, _GUID_RE, get_settings
 from context_intelligence_server.identity_store import IdentityStore
 from context_intelligence_server.maintenance import coordinator
@@ -368,51 +366,6 @@ def _access_mode_const(mode: str) -> str:
     return READ_ACCESS if mode == "READ" else WRITE_ACCESS
 
 
-@dataclass(frozen=True)
-class _OnDiskBlob:
-    """One blob file discovered on disk during the reclaim scan."""
-
-    session_id: str
-    key: str
-    uri: str
-    path: Path
-    mtime: float
-    size: int
-
-
-def _scan_disk_blobs(blob_root: Path) -> list[_OnDiskBlob]:
-    """Enumerate on-disk blobs under *blob_root* (step 1 of the design).
-
-    Walks ``<blob_root>/*/blobs/*.json`` -- the exact layout
-    ``AsyncDiskBlobStore`` writes to (``blob_store.py``). ``*.tmp`` residue
-    from an in-progress write (``tempfile.mkstemp(..., suffix=".tmp")``) is
-    skipped defensively, though the ``*.json`` glob already excludes it.
-    A file that vanishes between the glob listing and ``stat()`` (e.g. a
-    concurrent delete) is silently skipped rather than raising.
-    """
-    blobs: list[_OnDiskBlob] = []
-    for p in blob_root.glob("*/blobs/*.json"):
-        if p.name.endswith(".tmp"):
-            continue
-        session_id = p.parent.parent.name
-        key = p.stem
-        try:
-            st = p.stat()
-        except FileNotFoundError:
-            continue
-        blobs.append(
-            _OnDiskBlob(
-                session_id=session_id,
-                key=key,
-                uri=f"ci-blob://{session_id}/{key}",
-                path=p,
-                mtime=st.st_mtime,
-                size=st.st_size,
-            )
-        )
-    return blobs
-
-
 def _collect_blob_refs(obj: Any, out: set[str]) -> None:
     """Recursively walk a decoded JSON value collecting ``$blob_ref`` URIs.
 
@@ -611,11 +564,19 @@ async def _select_orphans(request: Request, *, min_age_minutes: int) -> dict[str
 
     Returns a dict with every response field EXCEPT ``dry_run``/``sample``/
     ``rescanned``/``deleted``/``deleted_bytes`` (the caller fills those in),
-    plus a ``candidates`` key (list[_OnDiskBlob], sorted by uri for
+    plus a ``candidates`` key (list[BlobReference], sorted by uri for
     deterministic sampling/capping) that the caller pops before returning the
     response and uses to actually delete in apply mode.
 
-    Safety gates applied to every on-disk blob not in the referenced set
+    Pure storage-API consumer (docs/blob-store-abstraction.md, "How
+    routers/admin.py consumes it"): orphan enumeration is
+    ``registry.blob_store.scan()`` -- a stream of :class:`BlobReference`
+    (``uri``/``session_id``/``size``/``last_modified``). References only --
+    the scan never reads a blob's payload, so no JSON is deserialized across
+    the whole store. No ``Path(settings.blob_path)``, no ``glob``, no
+    ``stat`` -- ever, here.
+
+    Safety gates applied to every scanned blob not in the referenced set
     (step 3 of the design):
       1. Undrained-queue gate (primary, durable -- B3): skipped when the
          session has a live worker (``registry.active_sessions()``) OR its
@@ -625,20 +586,18 @@ async def _select_orphans(request: Request, *, min_age_minutes: int) -> dict[str
          ``min_age_minutes`` (already clamped >= ``_MIN_AGE_FLOOR_MINUTES`` by
          the request body validator). Counted as ``skipped_recent``.
     """
-    settings = get_settings()
-    blob_root = Path(settings.blob_path)
-    disk_blobs = _scan_disk_blobs(blob_root)
+    registry = request.app.state.registry
+    disk_blobs = [ref async for ref in registry.blob_store.scan()]
 
     referenced = await _scan_referenced_uris(request)
 
-    registry = request.app.state.registry
     queue_manager = registry.queue_manager
     live_workers = set(registry.active_sessions())
 
     now = time.time()
     age_cutoff_seconds = min_age_minutes * 60
 
-    candidates: list[_OnDiskBlob] = []
+    candidates: list[BlobReference] = []
     skipped_recent = 0
     skipped_pending_session = 0
     reclaimable_bytes = 0
@@ -651,7 +610,7 @@ async def _select_orphans(request: Request, *, min_age_minutes: int) -> dict[str
         ):
             skipped_pending_session += 1
             continue
-        if now - blob.mtime < age_cutoff_seconds:
+        if now - blob.last_modified < age_cutoff_seconds:
             skipped_recent += 1
             continue
         candidates.append(blob)
@@ -690,6 +649,46 @@ class BlobReclaimBody(BaseModel):
                 f"(hard safety floor); got {v}"
             )
         return v
+
+
+# ---------------------------------------------------------------------------
+# Blob-reclaim apply single-flight (item -17v)
+#
+# Serializes APPLY-vs-APPLY only (``dry_run=false``): two concurrent applies
+# must never each run their own independent scan+delete pass over the store
+# at once. This is a small, purpose-built CAS for reclaim specifically -- NOT
+# ``maintenance.coordinator`` above, which tracks actual maintenance-mode
+# operations (schema repair) with its own gate/window semantics; reusing that
+# singleton here would incorrectly couple blob reclaim into the
+# maintenance-mode state machine (e.g. blocking real maintenance repairs
+# while a reclaim runs, or vice versa, for no reason related to either).
+#
+# Mirrors ``MaintenanceCoordinator.try_begin_op``'s contract: a synchronous
+# compare-and-swap with NO ``await`` between check and set, which is atomic
+# under asyncio's single-threaded event loop (no separate lock needed).
+#
+# This guard does NOT handle the scan-vs-ingest race (a blob rewritten
+# between this request's own scan and its own delete) -- that is handled
+# per-blob by the fenced ``blob_store.delete(uri, if_unmodified=ref)`` call
+# in the apply loop below, independent of this lock.
+# ---------------------------------------------------------------------------
+
+_reclaim_apply_running = False
+
+
+def _try_begin_reclaim_apply() -> bool:
+    """Synchronous CAS: True iff this call is the one that started the run."""
+    global _reclaim_apply_running
+    if _reclaim_apply_running:
+        return False
+    _reclaim_apply_running = True
+    return True
+
+
+def _finish_reclaim_apply() -> None:
+    """Release the single-flight slot. Always called from a ``finally``."""
+    global _reclaim_apply_running
+    _reclaim_apply_running = False
 
 
 # ---------------------------------------------------------------------------
@@ -932,17 +931,21 @@ def list_keys(
 # --- Blob reclaim (orphaned-blob GC) ----------------------------------------
 
 
-@router.post("/blobs/reclaim", status_code=200)
-async def reclaim_blobs(body: BlobReclaimBody, request: Request) -> dict[str, Any]:
-    """Preview (dry-run) or apply reclamation of orphaned blob files.
+@router.post("/blobs/reclaim", status_code=200, response_model=None)
+async def reclaim_blobs(
+    body: BlobReclaimBody, request: Request
+) -> dict[str, Any] | JSONResponse:
+    """Preview (dry-run) or apply reclamation of orphaned blobs.
 
-    An orphan is an on-disk blob (``<blob_path>/<session_id>/blobs/<key>.json``)
-    whose ``ci-blob://`` URI is referenced by NO ``:Event.data`` anywhere in
+    An orphan is a stored blob (``ci-blob://<session_id>/<key>``) whose URI is
+    referenced by NO ``:Event.data`` (or other carrier property) anywhere in
     the graph (scanned globally, across ALL workspaces), and whose session is
     both fully drained (durable ``QueueManager`` state, not in-memory worker
     liveness) and older than ``min_age_minutes``. See
     ``docs/plans/2026-08-12-blob-reclaim-endpoint-spec.md`` for the full
-    design and its council-mandated safety amendments (B1-B3).
+    design and its council-mandated safety amendments (B1-B3), and
+    ``docs/blob-store-abstraction.md`` ("How routers/admin.py consumes it")
+    for the storage-isolation contract this endpoint honors.
 
     ``dry_run=true`` (default) computes and reports the candidate set without
     deleting anything. ``dry_run=false`` requires ``max_delete`` (422
@@ -952,12 +955,27 @@ async def reclaim_blobs(body: BlobReclaimBody, request: Request) -> dict[str, An
     response) -- it never deletes a URI that is referenced or pending at the
     moment of deletion, independent of any earlier dry-run preview.
 
-    Deletion is a direct ``os.unlink`` on the blob path (idempotent -- a file
-    already gone is a no-op) capped at ``max_delete``; ``orphans_found`` and
-    ``reclaimable_bytes`` always reflect the FULL candidate set even when
-    ``max_delete`` caps how many are actually removed. One structured audit
-    log line is emitted per successful delete; blob CONTENTS are never
-    logged, only the ``ci-blob://`` URI.
+    Deletion is a **pure storage-API consumer**: every apply request is a
+    fenced ``await blob_store.delete(uri, if_unmodified=ref)`` call -- the
+    store itself performs the compare-and-delete (re-checking the blob's
+    current metadata against the ``BlobReference`` observed by the scan
+    above), never an ``os.unlink``/``.path`` reach-around. A blob rewritten
+    since the scan simply fails the fence (``delete()`` returns ``False``)
+    and is skipped, not force-deleted -- no data loss. Capped at
+    ``max_delete``; ``orphans_found`` and ``reclaimable_bytes`` always
+    reflect the FULL candidate set even when ``max_delete`` caps how many are
+    actually removed. One structured audit log line is emitted per
+    successful delete; blob CONTENTS are never logged, only the
+    ``ci-blob://`` URI.
+
+    Single-flight (item -17v): the APPLY path (``dry_run=false``) is CAS
+    single-flighted (see :func:`_try_begin_reclaim_apply`) so two concurrent
+    applies can never run their own independent, unsynchronized scan+delete
+    passes over the same store at once. A second concurrent apply gets
+    **409** rather than starting a second run. This guard only serializes
+    scan-vs-scan; the scan-vs-ingest race (a blob rewritten between this
+    request's own scan and its own delete) is handled per-blob by the fenced
+    ``delete(if_unmodified=ref)`` call above, not by this lock.
     """
     if not body.dry_run and body.max_delete is None:
         raise HTTPException(
@@ -969,43 +987,61 @@ async def reclaim_blobs(body: BlobReclaimBody, request: Request) -> dict[str, An
             ),
         )
 
-    # I5b: the ONE selection path. In apply mode this call itself IS the
-    # "own authoritative fresh scan at delete time" the design requires --
-    # there is no earlier cached scan in this request to grow stale.
-    selection = await _select_orphans(request, min_age_minutes=body.min_age_minutes)
-    candidates: list[_OnDiskBlob] = selection.pop("candidates")
-
-    response: dict[str, Any] = {
-        "dry_run": body.dry_run,
-        **selection,
-        "sample": [b.uri for b in candidates[:_MAX_SAMPLE]],
-        "rescanned": not body.dry_run,
-        "deleted": 0,
-        "deleted_bytes": 0,
-    }
-
     if body.dry_run:
+        # I5b: the ONE selection path (shared with apply, below).
+        selection = await _select_orphans(request, min_age_minutes=body.min_age_minutes)
+        candidates: list[BlobReference] = selection.pop("candidates")
+        return {
+            "dry_run": True,
+            **selection,
+            "sample": [b.uri for b in candidates[:_MAX_SAMPLE]],
+            "rescanned": False,
+            "deleted": 0,
+            "deleted_bytes": 0,
+        }
+
+    if not _try_begin_reclaim_apply():
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "blob reclaim apply already running"},
+        )
+    try:
+        # I5b: the ONE selection path. In apply mode this call itself IS the
+        # "own authoritative fresh scan at delete time" the design requires --
+        # there is no earlier cached scan in this request to grow stale.
+        selection = await _select_orphans(request, min_age_minutes=body.min_age_minutes)
+        candidates = selection.pop("candidates")
+
+        response: dict[str, Any] = {
+            "dry_run": False,
+            **selection,
+            "sample": [b.uri for b in candidates[:_MAX_SAMPLE]],
+            "rescanned": True,
+            "deleted": 0,
+            "deleted_bytes": 0,
+        }
+
+        assert body.max_delete is not None  # guaranteed by the 422 guard above
+        registry = request.app.state.registry
+        deleted = 0
+        deleted_bytes = 0
+        # Fenced delete, not TOCTOU-vulnerable: blob_store.delete(if_unmodified=)
+        # re-checks the blob's current metadata against the BlobReference
+        # observed by the scan above and refuses (returns False) if it changed
+        # since -- the store does the compare-and-delete, never admin.py.
+        for blob in candidates[: body.max_delete]:
+            deleted_ok = await registry.blob_store.delete(blob.uri, if_unmodified=blob)
+            if not deleted_ok:
+                continue  # changed since scan (or already gone) -- skipped, not an error
+            deleted += 1
+            deleted_bytes += blob.size
+            _audit_blob_reclaim_delete(request, uri=blob.uri)
+
+        response["deleted"] = deleted
+        response["deleted_bytes"] = deleted_bytes
         return response
-
-    assert body.max_delete is not None  # guaranteed by the 422 guard above
-    deleted = 0
-    deleted_bytes = 0
-    # TOCTOU note: low severity (an unlink of an already-gone file is a
-    # no-op below); this loop runs immediately after the fresh scan above,
-    # well within the age floor, so the window is negligible -- stated, not
-    # assumed (design "RISKS folded in").
-    for blob in candidates[: body.max_delete]:
-        try:
-            os.unlink(blob.path)
-        except FileNotFoundError:
-            continue  # already gone -- idempotent, not an error
-        deleted += 1
-        deleted_bytes += blob.size
-        _audit_blob_reclaim_delete(request, uri=blob.uri)
-
-    response["deleted"] = deleted
-    response["deleted_bytes"] = deleted_bytes
-    return response
+    finally:
+        _finish_reclaim_apply()
 
 
 # --- Maintenance operation (WS-3c; seam + gate built in WS-3a) --------------

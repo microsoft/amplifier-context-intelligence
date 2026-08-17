@@ -62,7 +62,7 @@ class IdentityStore:
     """
 
     def __init__(self, path: Path) -> None:
-        self.path = path
+        self._path = path
         # Rich format: {key: {id: ..., display_name?: ...}}
         self._data: dict[str, dict[str, str]] = {}
         # Flat derived cache: {key: contributor_id}.
@@ -80,7 +80,7 @@ class IdentityStore:
         Missing file → empty dict (normal first boot, no log).
         Corrupt / non-dict → empty dict + LOUD error log, never raise.
         """
-        if not self.path.exists():
+        if not self._path.exists():
             # Normal first boot — the file hasn't been written yet.
             self._data = {}
             self._rebuild_flat()
@@ -88,12 +88,12 @@ class IdentityStore:
 
         raw: object
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
             logger.error(
                 "identity_store.load CORRUPT FILE path=%s error=%r — "
                 "failing CLOSED to empty map.  Re-populate via /admin API.",
-                self.path,
+                self._path,
                 exc,
             )
             self._data = {}
@@ -104,7 +104,7 @@ class IdentityStore:
             logger.critical(
                 "identity_store.load INVALID FORMAT path=%s got=%r — "
                 "expected a JSON object at top level.  Failing CLOSED to empty map.",
-                self.path,
+                self._path,
                 type(raw).__name__,
             )
             self._data = {}
@@ -168,7 +168,7 @@ class IdentityStore:
                 "identity_store.seed: could not write seed to %s: %r "
                 "— in-memory map is live but the file is not yet persisted.  "
                 "The next mutation via /admin API will persist the file.",
-                self.path,
+                self._path,
                 exc,
             )
         # Update in-memory regardless — data is from durable config.
@@ -185,6 +185,10 @@ class IdentityStore:
 
     def __len__(self) -> int:
         return len(self._data)
+
+    def exists(self) -> bool:
+        """Whether the store has ever been persisted to its backing file."""
+        return self._path.exists()
 
     # ------------------------------------------------------------------
     # Internals
@@ -203,7 +207,7 @@ class IdentityStore:
                 self.flat_dict[key] = contributor_id
 
     def _write_atomic(self, data: dict[str, dict[str, str]]) -> None:
-        """Write *data* atomically to ``self.path``.
+        """Write *data* atomically to ``self._path``.
 
         Steps:
         1. Create parent directory (parents=True, exist_ok=True).
@@ -216,15 +220,15 @@ class IdentityStore:
         Raises the underlying OS/IO exception so the caller (put/delete)
         knows the write failed and leaves in-process state unchanged.
         """
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_fd, tmp_str = tempfile.mkstemp(dir=str(self.path.parent), suffix=".tmp")
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_str = tempfile.mkstemp(dir=str(self._path.parent), suffix=".tmp")
         tmp_path = Path(tmp_str)
         try:
             with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
                 json.dump(data, fh, indent=2, ensure_ascii=False)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(str(tmp_path), str(self.path))
+            os.replace(str(tmp_path), str(self._path))
         except Exception:
             # Best-effort cleanup of the tempfile before propagating.
             try:

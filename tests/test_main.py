@@ -4,18 +4,19 @@ import asyncio
 import contextlib
 import json
 import logging
-from pathlib import Path
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import Any, Self
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import context_intelligence_server.main as main_module
 import httpx
 import pytest
-
-import context_intelligence_server.main as main_module
 from context_intelligence_server.auth import BearerTokenMiddleware
+from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.main import app, lifespan, registry
 from context_intelligence_server.models import CypherRequest
+
 from tests.conftest import MockNeo4jDriver
 
 
@@ -280,7 +281,9 @@ async def test_list_blobs_returns_empty_for_session_with_no_blobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /blobs/{session_id} returns 200 with empty blobs list for session with no blobs."""
-    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    monkeypatch.setattr(
+        main_module.registry, "_blob_store", AsyncDiskBlobStore(root=tmp_path)
+    )
 
     response = await client.get("/blobs/no-blobs-session")
     assert response.status_code == 200
@@ -295,7 +298,9 @@ async def test_list_blobs_returns_correct_uris_for_existing_blobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /blobs/{session_id} returns 200 with correct ci-blob:// URIs for existing blobs."""
-    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    monkeypatch.setattr(
+        main_module.registry, "_blob_store", AsyncDiskBlobStore(root=tmp_path)
+    )
 
     session_id = "blob-list-session"
     blob_dir = tmp_path / session_id / "blobs"
@@ -319,7 +324,9 @@ async def test_get_blob_returns_200_with_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /blobs/{session_id}/{key} returns 200 with blob content for existing blob."""
-    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    monkeypatch.setattr(
+        main_module.registry, "_blob_store", AsyncDiskBlobStore(root=tmp_path)
+    )
 
     session_id = "test-session"
     key = "my-key"
@@ -340,7 +347,9 @@ async def test_get_blob_returns_404_for_missing_blob(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /blobs/{session_id}/{key} returns 404 with 'not found' in detail for missing blob."""
-    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    monkeypatch.setattr(
+        main_module.registry, "_blob_store", AsyncDiskBlobStore(root=tmp_path)
+    )
 
     response = await client.get("/blobs/missing-session/missing-key")
     assert response.status_code == 404
@@ -682,9 +691,8 @@ class TestMainDispatch:
             "context_intelligence_server.doctor.run_doctor",
             new_callable=AsyncMock,
             return_value=0,
-        ) as mock_doctor:
-            with pytest.raises(SystemExit) as exc_info:
-                _main_mod.main(["doctor"])
+        ) as mock_doctor, pytest.raises(SystemExit) as exc_info:
+            _main_mod.main(["doctor"])
 
         mock_doctor.assert_awaited_once_with(fix=False)
         assert exc_info.value.code == 0
@@ -697,9 +705,8 @@ class TestMainDispatch:
             "context_intelligence_server.doctor.run_doctor",
             new_callable=AsyncMock,
             return_value=1,
-        ) as mock_doctor:
-            with pytest.raises(SystemExit) as exc_info:
-                _main_mod.main(["doctor", "--fix"])
+        ) as mock_doctor, pytest.raises(SystemExit) as exc_info:
+            _main_mod.main(["doctor", "--fix"])
 
         mock_doctor.assert_awaited_once_with(fix=True)
         assert exc_info.value.code == 1
@@ -1352,9 +1359,7 @@ async def test_status_degraded_reason_self_clears_after_live_repair_no_restart(
             AsyncMock(
                 return_value=_status(
                     constraint_present=False,
-                    reason=(
-                        ":Node uniqueness constraint absent -- migration required"
-                    ),
+                    reason=(":Node uniqueness constraint absent -- migration required"),
                     mode="maintenance",
                 )
             ),
@@ -1673,7 +1678,6 @@ async def test_post_events_stamps_contributor_id_from_scope(
     import hashlib
 
     import httpx
-
     from context_intelligence_server.main import asgi_app
 
     monkeypatch.setattr(
@@ -1688,7 +1692,7 @@ async def test_post_events_stamps_contributor_id_from_scope(
 
     # Temporarily configure a StaticKeyResolver on asgi_app so auth injects contributor_id.
     # T2: middleware now uses resolver= seam; patch asgi_app.resolver, not asgi_app.keystore.
-    from context_intelligence_server.auth import StaticKeyResolver  # noqa: PLC0415
+    from context_intelligence_server.auth import StaticKeyResolver
 
     test_token = "test-secret"
     test_keystore = {hashlib.sha256(test_token.encode()).hexdigest(): "alice"}
@@ -1724,7 +1728,6 @@ async def test_post_events_overwrites_client_supplied_created_by(
     import hashlib
 
     import httpx
-
     from context_intelligence_server.main import asgi_app
 
     monkeypatch.setattr(
@@ -1738,7 +1741,7 @@ async def test_post_events_overwrites_client_supplied_created_by(
     monkeypatch.setattr(main_module.registry.queue_manager, "append", _fake_append)
 
     # T2: middleware now uses resolver= seam; patch asgi_app.resolver, not asgi_app.keystore.
-    from context_intelligence_server.auth import StaticKeyResolver  # noqa: PLC0415
+    from context_intelligence_server.auth import StaticKeyResolver
 
     test_token = "test-secret"
     test_keystore = {hashlib.sha256(test_token.encode()).hexdigest(): "real-owner"}

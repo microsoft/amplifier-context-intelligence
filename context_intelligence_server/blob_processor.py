@@ -192,8 +192,8 @@ async def process_event_data(
 
         key = f"{node_id}__{field_name}"
         try:
-            uri = await blob_store.write(session_id, key, value)
-            data[field_name] = {"$blob_ref": uri}
+            ref = await blob_store.write(session_id, key, value)
+            data[field_name] = {"$blob_ref": ref.uri}
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "blob_offload_failed session=%s field=%s node=%s: %s",
