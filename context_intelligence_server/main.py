@@ -321,7 +321,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.neo4j_query_access_mode = None
     # W-2: queue-health defaults to "ok"; the inner queue-recovery try/except
     # below degrades it independently of schema_health.
-    app.state.queue_health = "ok"
+    app.state.queue_health = "healthy"
     # #73: the periodic crash-recovery sweep task is created INSIDE the B1
     # boundary only under a finite ceiling, so seed it to None here so the
     # shutdown `finally` can cancel it safely even if startup never got there.

@@ -1037,7 +1037,7 @@ async def test_crash_recovery_topup_drains_deferred_tail_across_passes(
     # stops reporting them (exactly what a real drainer does on completion).
     for sid in sids[:2]:
         batch = await qm.read_batch(sid, max_items=10)
-        await qm.commit(sid, batch.end_offset)
+        await qm.commit(sid, batch.end_offset, None)
 
     # Pass 2: the previously-DEFERRED tail is now dispatched -- not stranded.
     spawned.clear()

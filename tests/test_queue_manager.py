@@ -496,7 +496,7 @@ async def test_spool_stats_fully_committed_session_not_pending(qm):
     (spool_bytes_total still reflects them)."""
     await qm.append("s1", b"a")
     line = b"a\n"
-    await qm.commit("s1", len(line))
+    await qm.commit("s1", len(line), None)
 
     stats = await qm.spool_stats()
 
@@ -521,7 +521,7 @@ async def test_spool_stats_multiple_sessions_aggregate(qm):
     await qm.append("s1", b"a")  # pending
     await qm.append("s2", b"b")
     line = b"b\n"
-    await qm.commit("s2", len(line))  # fully committed, not pending
+    await qm.commit("s2", len(line), None)  # fully committed, not pending
     await qm.append("s3", b"c")  # pending
 
     stats = await qm.spool_stats()
@@ -680,7 +680,7 @@ async def test_recovery_seed_counts_unchanged_under_streaming(qm):
     await qm.append("s1", b"a")
     await qm.append("s1", b"bb")
     line1 = b"a\n"
-    await qm.commit("s1", len(line1))  # 1 written, 1 still pending
+    await qm.commit("s1", len(line1), None)  # 1 written, 1 still pending
 
     accepted, written = await qm.recovery_seed_counts()
 
@@ -782,7 +782,7 @@ async def test_spool_stats_healthy_offsets_report_zero_corrupt(qm):
     fire on the normal committed-offset path)."""
     await qm.append("s1", b"a")
     line = b"a\n"
-    await qm.commit("s1", len(line))  # writes a valid numeric .offset
+    await qm.commit("s1", len(line), None)  # writes a valid numeric .offset
     qm._spool_cache = None
 
     stats = await qm.spool_stats()
