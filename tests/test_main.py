@@ -14,6 +14,7 @@ import pytest
 
 import context_intelligence_server.main as main_module
 from context_intelligence_server.auth import BearerTokenMiddleware
+from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.main import app, lifespan, registry
 from context_intelligence_server.models import CypherRequest
 from tests.conftest import MockNeo4jDriver
@@ -280,7 +281,9 @@ async def test_list_blobs_returns_empty_for_session_with_no_blobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /blobs/{session_id} returns 200 with empty blobs list for session with no blobs."""
-    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    monkeypatch.setattr(
+        main_module.registry, "_blob_store", AsyncDiskBlobStore(root=tmp_path)
+    )
 
     response = await client.get("/blobs/no-blobs-session")
     assert response.status_code == 200
@@ -295,7 +298,9 @@ async def test_list_blobs_returns_correct_uris_for_existing_blobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /blobs/{session_id} returns 200 with correct ci-blob:// URIs for existing blobs."""
-    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    monkeypatch.setattr(
+        main_module.registry, "_blob_store", AsyncDiskBlobStore(root=tmp_path)
+    )
 
     session_id = "blob-list-session"
     blob_dir = tmp_path / session_id / "blobs"
@@ -319,7 +324,9 @@ async def test_get_blob_returns_200_with_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /blobs/{session_id}/{key} returns 200 with blob content for existing blob."""
-    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    monkeypatch.setattr(
+        main_module.registry, "_blob_store", AsyncDiskBlobStore(root=tmp_path)
+    )
 
     session_id = "test-session"
     key = "my-key"
@@ -340,7 +347,9 @@ async def test_get_blob_returns_404_for_missing_blob(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /blobs/{session_id}/{key} returns 404 with 'not found' in detail for missing blob."""
-    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    monkeypatch.setattr(
+        main_module.registry, "_blob_store", AsyncDiskBlobStore(root=tmp_path)
+    )
 
     response = await client.get("/blobs/missing-session/missing-key")
     assert response.status_code == 404
