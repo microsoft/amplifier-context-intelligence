@@ -41,6 +41,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 
 from context_intelligence_server.config import get_settings
+from context_intelligence_server.neo4j_store import count_untagged_nodes
 
 logger = logging.getLogger("context_intelligence_server")
 
@@ -79,6 +80,10 @@ class MaintenanceStatus:
     started_at: str | None  # when the CURRENT maintenance window opened
     elapsed_seconds: float | None  # None when not in maintenance
     op: OpRecord
+    # Live (TTL-cached) untagged-node count backing the `degraded` term.
+    # Defaulted so existing MaintenanceStatus(...) constructions in tests keep
+    # working; None == the probe could not answer (or no driver bound).
+    untagged_nodes: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -119,11 +124,25 @@ class MaintenanceCoordinator:
         self._boot_untagged: int | None = None
         self._probe_ttl_seconds: float = _PROBE_TTL_SECONDS
 
-        # TTL-cached, single-flight probe state.
+        # TTL-cached, single-flight probe state (constraint presence).
         self._probe_lock = asyncio.Lock()
         self._cache_populated: bool = False
         self._cached_present: bool | None = None
         self._cache_expires_at: float = 0.0  # monotonic clock
+
+        # TTL-cached, single-flight probe state for the untagged-node count --
+        # a SEPARATE cache from the constraint probe above (independent fate:
+        # a count failure must not poison the constraint signal, and vice
+        # versa). This is what de-latches the degraded/untagged half of the
+        # health signal: it self-clears within one TTL after an out-of-band
+        # repair, exactly like the constraint probe, instead of staying pinned
+        # to the boot-time snapshot until a restart. count_untagged_nodes is
+        # O(1) via Neo4j's counts store (see its docstring), so probing it on
+        # the cached path is as cheap as the constraint catalog read.
+        self._untagged_lock = asyncio.Lock()
+        self._untagged_cache_populated: bool = False
+        self._cached_untagged: int | None = None
+        self._untagged_cache_expires_at: float = 0.0  # monotonic clock
 
         # Op state -- init "unknown" (council D4: never-run != crash-lost).
         self._op = OpRecord(
@@ -171,10 +190,19 @@ class MaintenanceCoordinator:
         self._boot_untagged = untagged
         if probe_ttl_seconds is not None:
             self._probe_ttl_seconds = probe_ttl_seconds
-        # Rebinding invalidates any cached probe result.
+        # Rebinding invalidates any cached constraint probe result.
         self._cache_populated = False
         self._cached_present = None
         self._cache_expires_at = 0.0
+        # Seed the untagged cache with the boot-time count so the FIRST
+        # /status (before any live re-probe) reports the same value the old
+        # boot snapshot did -- then let it expire after one TTL so the live
+        # probe takes over and de-latches it. Seeding as populated (not cold)
+        # keeps the existing TTL-cache tests' hit-counts unchanged for the
+        # first in-window call.
+        self._cached_untagged = untagged
+        self._untagged_cache_populated = True
+        self._untagged_cache_expires_at = time.monotonic() + self._probe_ttl_seconds
 
     # -- the constraint probe --------------------------------------------
 
@@ -221,6 +249,48 @@ class MaintenanceCoordinator:
             self._cache_expires_at = time.monotonic() + self._probe_ttl_seconds
             return result
 
+    # -- the untagged-node probe (de-latches the degraded half) ----------
+
+    async def _run_untagged_probe(self) -> int | None:
+        """One live untagged-node count. Tri-state: int / None (unknown).
+
+        ``count_untagged_nodes`` is O(1) via Neo4j's counts store (total minus
+        :Node count), NOT the ``WHERE NOT n:Node`` AllNodesScan -- safe on the
+        cached request path. A probe failure returns None (unknown, no
+        ``degraded`` signal fabricated) exactly as the constraint probe does;
+        it is caught here so it can never poison the independent constraint
+        signal.
+        """
+        if self._driver is None:
+            return None
+        try:
+            return await count_untagged_nodes(self._driver)
+        except Exception as exc:  # noqa: BLE001 -- connectivity probe, not confirmed bad state
+            logger.warning("maintenance_untagged_probe_failed error=%s", exc)
+            return None
+
+    async def _probe_untagged(self) -> int | None:
+        """TTL-cached, single-flight wrapper around ``_run_untagged_probe``.
+
+        Same double-checked-locking shape as ``_probe_constraint_present`` but
+        with its OWN cache/lock so the two probes never share fate. Seeded at
+        ``bind_driver`` with the boot count, then live-refreshed each TTL --
+        this is what lets an out-of-band repair clear ``degraded`` without a
+        restart (the latch this fixes).
+        """
+        now = time.monotonic()
+        if self._untagged_cache_populated and now < self._untagged_cache_expires_at:
+            return self._cached_untagged
+        async with self._untagged_lock:
+            now = time.monotonic()
+            if self._untagged_cache_populated and now < self._untagged_cache_expires_at:
+                return self._cached_untagged
+            result = await self._run_untagged_probe()
+            self._cached_untagged = result
+            self._untagged_cache_populated = True
+            self._untagged_cache_expires_at = time.monotonic() + self._probe_ttl_seconds
+            return result
+
     # -- mode derivation (single source of truth for /status + the gate) --
 
     def _handle_transition(
@@ -264,12 +334,20 @@ class MaintenanceCoordinator:
             self._window_started_at = None
             self._window_started_monotonic = None
 
-    async def _derive_mode(self) -> tuple[MaintenanceMode, str | None, bool | None]:
+    async def _derive_mode(
+        self,
+    ) -> tuple[MaintenanceMode, str | None, bool | None, int | None]:
         """The ONE place mode is computed. Both ``gate_closed`` and
         ``status`` call this so a transition is caught no matter which
         surface is being polled (spec sec 2.4)."""
         op = self._op
         constraint_present = await self._probe_constraint_present()
+        # untagged is only load-bearing for the `degraded` term, which only
+        # applies when the constraint IS present. Probing it only in that
+        # branch keeps the absent/unknown/op-running paths (and their existing
+        # TTL-cache hit-count tests) untouched, and avoids a needless count on
+        # a graph we already know is in maintenance.
+        untagged: int | None = None
 
         if op.state == "running":
             mode: MaintenanceMode = "maintenance"
@@ -280,15 +358,21 @@ class MaintenanceCoordinator:
         elif constraint_present is None:
             mode = "unknown"
             reason = "constraint probe could not determine graph state"
-        elif self._boot_untagged is not None and self._boot_untagged > 0:
-            mode = "degraded"
-            reason = f"{self._boot_untagged} node(s) lacking the :Node label"
         else:
-            mode = "healthy"
-            reason = None
+            # constraint present: consult the LIVE (TTL-cached) untagged count
+            # so an out-of-band repair de-latches degraded->healthy with no
+            # restart. None (probe could not answer) is NOT coerced to
+            # degraded -- no evidence, so healthy stands.
+            untagged = await self._probe_untagged()
+            if untagged is not None and untagged > 0:
+                mode = "degraded"
+                reason = f"{untagged} node(s) lacking the :Node label"
+            else:
+                mode = "healthy"
+                reason = None
 
         self._handle_transition(mode, reason, op.run_id)
-        return mode, reason, constraint_present
+        return mode, reason, constraint_present, untagged
 
     # -- public seam ------------------------------------------------------
 
@@ -299,12 +383,12 @@ class MaintenanceCoordinator:
         ``degraded`` and ``unknown`` do NOT close the gate -- only
         ``mode == "maintenance"`` does (D-C, D-E).
         """
-        mode, _reason, _constraint_present = await self._derive_mode()
+        mode, _reason, _constraint_present, _untagged = await self._derive_mode()
         return mode == "maintenance"
 
     async def status(self) -> MaintenanceStatus:
         """Full snapshot for ``/status`` and ``GET /admin/maintenance``."""
-        mode, reason, constraint_present = await self._derive_mode()
+        mode, reason, constraint_present, untagged = await self._derive_mode()
         elapsed = (
             time.monotonic() - self._window_started_monotonic
             if self._window_started_monotonic is not None
@@ -317,6 +401,7 @@ class MaintenanceCoordinator:
             started_at=self._window_started_at,
             elapsed_seconds=elapsed,
             op=self._op,
+            untagged_nodes=untagged,
         )
 
     def try_begin_op(self) -> str | None:

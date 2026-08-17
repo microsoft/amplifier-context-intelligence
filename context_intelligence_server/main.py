@@ -1100,15 +1100,18 @@ async def get_status(request: Request) -> dict[str, Any]:
         response["schema_health"] = "unknown"
     elif _maint.constraint_present is False:
         response["schema_health"] = "degraded"
-    elif (getattr(request.app.state, "schema_untagged_nodes", None) or 0) > 0:
+    elif (_maint.untagged_nodes or 0) > 0:
         response["schema_health"] = "degraded"
     else:
         response["schema_health"] = "healthy"
-    # untagged_nodes stays the BOOT-time value (documented as such, not a
-    # gate input -- the live gate/mode signal is the constraint probe above).
-    response["untagged_nodes"] = getattr(
-        request.app.state, "schema_untagged_nodes", None
-    )
+    # untagged_nodes is now the LIVE (TTL-cached) count from the same
+    # coordinator probe that drives mode/schema_health -- NOT the boot-time
+    # app.state snapshot. This is the second half of the de-latch: after an
+    # out-of-band repair (POST /admin/maintenance or `doctor --fix`) the count
+    # self-clears within one probe TTL, with NO restart. (Previously this
+    # stayed pinned to the boot value, so schema_health/untagged_nodes kept
+    # reporting `degraded` until the process restarted.)
+    response["untagged_nodes"] = _maint.untagged_nodes
     # Live probe timestamp (bounded staleness <= the probe TTL), replacing
     # the old boot-only snapshot timestamp.
     response["schema_checked_at"] = datetime.now(UTC).isoformat()

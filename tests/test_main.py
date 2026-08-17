@@ -1400,28 +1400,29 @@ async def test_status_exposes_schema_health_fields(
     """GET /status surfaces schema_health, untagged_nodes, schema_checked_at,
     and degraded_reason.
 
-    WS-3a DE-LATCHES schema_health/schema_checked_at/degraded_reason: none of
-    these are read verbatim from the app.state boot snapshot anymore --
-    schema_health and degraded_reason are now both derived live from the
-    MaintenanceCoordinator's TTL-cached constraint probe (the same probe/
-    reason the 503 body reuses), and schema_checked_at is the live-probe
-    timestamp rather than the boot-time one. Only untagged_nodes remains the
-    boot-time value (documented as such; explicitly not a gate input).
+    WS-3a DE-LATCHES schema_health/schema_checked_at/degraded_reason AND
+    (latch-fix) untagged_nodes: none of these are read verbatim from the
+    app.state boot snapshot anymore -- schema_health, degraded_reason and
+    untagged_nodes are all derived live from the MaintenanceCoordinator's
+    TTL-cached probe (the same probe/reason the 503 body reuses), and
+    schema_checked_at is the live-probe timestamp rather than the boot-time
+    one. This means an out-of-band repair self-clears every one of these
+    within one probe TTL, with no restart.
 
-    This pins the fix for the stale-signal bug: `degraded_reason` used to be
-    read verbatim from the app.state boot snapshot, so it kept asserting a
-    stale constraint-absent condition even after a live repair de-latched
-    `mode`/`schema_health`. Here the boot-time `schema_degraded_reason` is
-    deliberately set to a DIFFERENT sentence than the live coordinator's
-    `reason` -- the assertion below only passes if degraded_reason is
-    sourced from the live value, not the stale boot snapshot.
+    This pins the fix for the stale-signal bug: `degraded_reason` AND
+    `untagged_nodes` used to be read verbatim from the app.state boot
+    snapshot, so they kept asserting a stale condition even after a live
+    repair de-latched `mode`/`schema_health`. Here the boot-time snapshot is
+    deliberately set to DIFFERENT values than the live coordinator's -- the
+    assertions below only pass if the response is sourced from the live
+    values, not the stale boot snapshot.
     """
     from context_intelligence_server.maintenance import MaintenanceStatus, OpRecord
 
-    main_module.app.state.schema_untagged_nodes = 3
-    # Deliberately a DIFFERENT sentence than the live coordinator reason
-    # below, so the test fails if degraded_reason ever regresses back to
-    # reading the boot-time snapshot.
+    # Stale boot-time snapshot -- deliberately DIFFERENT from the live
+    # coordinator values below, so the test fails if /status ever regresses
+    # back to reading the boot snapshot for any of these fields.
+    main_module.app.state.schema_untagged_nodes = 999
     main_module.app.state.schema_degraded_reason = "STALE boot-time reason"
     monkeypatch.setattr(
         main_module.coordinator,
@@ -1429,8 +1430,8 @@ async def test_status_exposes_schema_health_fields(
         AsyncMock(
             return_value=MaintenanceStatus(
                 mode="degraded",
-                constraint_present=False,
-                reason=":Node uniqueness constraint absent -- migration required",
+                constraint_present=True,
+                reason="3 node(s) lacking the :Node label",
                 started_at=None,
                 elapsed_seconds=None,
                 op=OpRecord(
@@ -1441,6 +1442,7 @@ async def test_status_exposes_schema_health_fields(
                     records_affected=None,
                     error=None,
                 ),
+                untagged_nodes=3,
             )
         ),
     )
@@ -1448,12 +1450,10 @@ async def test_status_exposes_schema_health_fields(
         response = await client.get("/status")
         data = response.json()
         assert data["schema_health"] == "degraded"
-        assert data["untagged_nodes"] == 3  # boot-time value, unchanged
+        assert data["untagged_nodes"] == 3  # LIVE coordinator value, not boot 999
         assert data["schema_checked_at"] is not None  # live probe timestamp now
         # LIVE coordinator reason, NOT the stale boot-time snapshot.
-        assert data["degraded_reason"] == (
-            ":Node uniqueness constraint absent -- migration required"
-        )
+        assert data["degraded_reason"] == "3 node(s) lacking the :Node label"
     finally:
         # Reset so this test doesn't leak state into siblings sharing the
         # module-level app singleton.

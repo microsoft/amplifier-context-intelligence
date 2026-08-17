@@ -127,11 +127,17 @@ class TestProbeTtlCache:
         coord.bind_driver(driver, probe_ttl_seconds=0.05)
 
         await coord.gate_closed()
-        assert driver.call_count == 1
-        await asyncio.sleep(0.1)
+        # First in-window call: constraint catalog read (cold) + untagged
+        # count (seeded warm at bind_driver, so 0 reads here) == 1 read.
+        hits_after_first = driver.call_count
+        assert hits_after_first == 1
+        await asyncio.sleep(0.1)  # both caches expire
         await coord.gate_closed()
 
-        assert driver.call_count == 2
+        # After expiry a FRESH probe runs -- the load-bearing property is that
+        # the cache expired and re-probed, not the exact read count (which now
+        # also includes the live O(1) untagged count, present-constraint path).
+        assert driver.call_count > hits_after_first
 
 
 # ---------------------------------------------------------------------------
@@ -150,11 +156,18 @@ class TestProbeSingleFlight:
         # Prime + expire the cache once, deterministically.
         await coord.gate_closed()
         await asyncio.sleep(0.05)
-        assert driver.call_count == 1
+        hits_before = driver.call_count
+        assert hits_before == 1
 
         results = await asyncio.gather(*[coord.gate_closed() for _ in range(50)])
 
-        assert driver.call_count == 2  # exactly ONE new probe for all 50 callers
+        # Single-flight: all 50 callers at the expiry boundary collapse to ONE
+        # probe window, NOT 50. That window now reads the constraint catalog
+        # AND the live O(1) untagged count (constraint-present path), so the
+        # increment is a small constant (<= 3), never proportional to the 50
+        # callers -- which is the property this test guards.
+        new_reads = driver.call_count - hits_before
+        assert new_reads <= 3
         assert all(r is False for r in results)  # constraint present -> gate open
 
 
@@ -194,6 +207,100 @@ class TestNoRestartSelfClear:
         driver.present = True  # flips immediately, but cache is still warm
         # NO sleep -- still within the 10s TTL window.
         assert await coord.gate_closed() is True  # stale cached answer
+
+
+# ---------------------------------------------------------------------------
+# A4b -- THE UNTAGGED LATCH: degraded->healthy self-clears with NO restart
+# ---------------------------------------------------------------------------
+
+
+class _FakeUntaggedResult:
+    def __init__(self, count: int) -> None:
+        self._count = count
+        self._yielded = False
+
+    def __aiter__(self) -> _FakeUntaggedResult:
+        return self
+
+    async def __anext__(self) -> dict[str, int]:
+        if self._yielded:
+            raise StopAsyncIteration
+        self._yielded = True
+        return {"c": self._count}
+
+
+class _FakeUntaggedSession:
+    def __init__(self, driver: _FakeUntaggedDriver) -> None:
+        self._driver = driver
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+    async def run(self, cypher: str, *args: Any, **kwargs: Any) -> _FakeUntaggedResult:
+        self._driver.call_count += 1
+        if "SHOW CONSTRAINTS" in cypher:
+            return _FakeUntaggedResult(1)  # constraint present
+        if ":Node)" in cypher:
+            return _FakeUntaggedResult(self._driver.tagged)  # tagged-node count
+        return _FakeUntaggedResult(self._driver.total)  # total-node count
+
+
+class _FakeUntaggedDriver:
+    """Test double: constraint always present; untagged = total - tagged, and
+    both are flippable at runtime so a test can simulate an out-of-band repair
+    tagging the last untagged node WITHOUT a restart."""
+
+    def __init__(self, total: int, tagged: int) -> None:
+        self.total = total
+        self.tagged = tagged
+        self.call_count = 0
+
+    def session(self, **kwargs: Any) -> _FakeUntaggedSession:
+        return _FakeUntaggedSession(self)
+
+
+class TestUntaggedNoRestartSelfClear:
+    async def test_degraded_self_clears_within_ttl_no_restart(self) -> None:
+        """The untagged half of the latch: schema_health/mode report `degraded`
+        (1 node lacking :Node) at boot; an out-of-band repair tags it; the SAME
+        coordinator (no restart) reports `healthy` within one TTL."""
+        driver = _FakeUntaggedDriver(total=1, tagged=0)  # 1 untagged -> degraded
+        coord = MaintenanceCoordinator()
+        coord.bind_driver(driver, untagged=1, probe_ttl_seconds=0.05)
+
+        st = await coord.status()
+        assert st.mode == "degraded"
+        assert st.untagged_nodes == 1
+        assert await coord.gate_closed() is False  # degraded NEVER closes gate
+
+        # Out-of-band repair tags the node -- untagged now 0. NO restart.
+        driver.tagged = 1
+        await asyncio.sleep(0.1)  # let the untagged-probe TTL expire
+
+        st2 = await coord.status()
+        assert st2.mode == "healthy"  # self-cleared, no restart
+        assert st2.untagged_nodes == 0
+        assert st2.reason is None
+
+    async def test_non_vacuous_within_ttl_stays_degraded(self) -> None:
+        """Non-vacuity: without waiting out the TTL the seeded/cached count is
+        returned -- proving the test above exercises the expiry path, not a
+        tautology."""
+        driver = _FakeUntaggedDriver(total=1, tagged=0)
+        coord = MaintenanceCoordinator()
+        coord.bind_driver(driver, untagged=1, probe_ttl_seconds=10.0)  # long TTL
+
+        st = await coord.status()
+        assert st.mode == "degraded"
+
+        driver.tagged = 1  # repaired immediately, but cache still warm
+        # NO sleep -- still within the 10s TTL window.
+        st2 = await coord.status()
+        assert st2.mode == "degraded"  # stale cached count
+        assert st2.untagged_nodes == 1
 
 
 # ---------------------------------------------------------------------------
