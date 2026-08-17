@@ -34,7 +34,7 @@ from context_intelligence_server.idempotency import EventIdempotencyCache
 from context_intelligence_server.identity_store import (
     IdentityStore,
     create_identity_store,
-)
+)  # IdentityStore here is the Protocol (see identity_store/protocol.py)
 from context_intelligence_server.logging_config import setup_logging
 from context_intelligence_server.models import (
     CypherRequest,
@@ -605,8 +605,8 @@ def create_asgi_app(
                 "is UP and serving, but every delegated (human) token will "
                 "receive 403 until identities are onboarded. Bind the first user "
                 "with an IdentityAdmin-role token via PUT /admin/identities/{oid} "
-                "(store=%s). This is expected on a fresh /data volume.",
-                s.entra_identities_store_path,
+                "(see the configured entra identities store-path setting). This "
+                "is expected on a fresh /data volume."
             )
 
         # B4: boot disjointness invariant — each oid must belong to exactly one
@@ -667,9 +667,8 @@ def create_asgi_app(
                     "static keystore is EMPTY at startup (0 bound keys) — server "
                     "is UP but fail-CLOSED; every request will 401 until keys are "
                     "onboarded. Add the first key with the admin token via "
-                    "PUT /admin/keys/{sha256hash} (store=%s). Expected on a fresh "
-                    "/data volume.",
-                    s.api_keys_store_path,
+                    "PUT /admin/keys/{sha256hash} (see the configured "
+                    "api keys store-path setting). Expected on a fresh /data volume."
                 )
             else:
                 logger.warning(
@@ -679,8 +678,8 @@ def create_asgi_app(
                     "/admin API is unreachable without an admin key: every token "
                     "401s at the middleware before require_admin runs). Set "
                     "admin_api_key/admin_api_key_sha256 to enable runtime "
-                    "onboarding, or add api_keys in config and restart. (store=%s)",
-                    s.api_keys_store_path,
+                    "onboarding, or add api_keys in config and restart. (see the "
+                    "configured api keys store-path setting)"
                 )
 
         # Pass key_store.flat_dict (the LIVE dict) so the resolver sees any

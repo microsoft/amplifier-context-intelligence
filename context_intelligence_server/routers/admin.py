@@ -40,7 +40,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, field_validator
 
 from context_intelligence_server.config import _ALL_ZEROS_GUID, _GUID_RE
-from context_intelligence_server.identity_store import IdentityStore
+from context_intelligence_server.identity_store import IdentityStore  # Protocol
 
 # ---------------------------------------------------------------------------
 # Validation constants

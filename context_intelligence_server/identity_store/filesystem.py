@@ -1,19 +1,29 @@
-"""Durable identity-map store for the Context Intelligence Server.
+"""FileSystemIdentityStore -- disk-backed identity map with atomic writes.
 
-Each ``IdentityStore`` wraps ONE JSON file and keeps an in-process dict
-(``_data``) that IS the live source of truth for the single-replica process.
-A second derived dict, ``flat_dict``, exposes ``{key: contributor_id}`` and is
-kept in-sync with ``_data`` via in-place mutations so that any object holding a
-reference to ``flat_dict`` always sees the latest state without a restart.
+Each ``FileSystemIdentityStore`` wraps ONE JSON file and keeps an in-process
+dict (``_data``) that IS the live source of truth for the single-replica
+process. A second derived dict, ``flat_dict``, exposes ``{key: contributor_id}``
+and is kept in-sync with ``_data`` via in-place mutations so that any object
+holding a reference to ``flat_dict`` always sees the latest state without a
+restart.
 
-**Commit order (ROB F2 — NON-NEGOTIABLE)**
+This is a concrete implementation of the
+:class:`~context_intelligence_server.identity_store.protocol.IdentityStore`
+Protocol. No ``Path``, on-disk layout, or ``os.*`` detail appears in the
+Protocol or in any value it returns -- those details are private to this
+class (and, later, an Azure equivalent).
+
+**Commit order (ROB F2 -- NON-NEGOTIABLE)**
 
 On every mutation (put / delete):
 
 1. Build the new data dict (do NOT touch ``_data`` yet).
-2. Serialize and write to a tempfile **in the same directory** as the target file.
-3. ``os.replace()`` the tempfile onto the target (atomic rename on POSIX / Azure Files).
-4. **ONLY IF the above succeeds**: update ``_data`` and ``flat_dict`` in-place.
+2. Serialize and write to a tempfile **in the same directory** as the target
+   file.
+3. ``os.replace()`` the tempfile onto the target (atomic rename on POSIX /
+   Azure Files).
+4. **ONLY IF the above succeeds**: update ``_data`` and ``flat_dict``
+   in-place.
 
 If the file write raises for any reason, ``_data`` and ``flat_dict`` are
 **unchanged** and the exception propagates to the caller (who returns 5xx).
@@ -23,13 +33,13 @@ The file and memory are never out of sync.
 
 On ``load()``:
 
-- Missing file → empty dict (normal first boot). No log, no raise.
-- Corrupt / torn / partial / invalid-JSON file → **empty dict + a LOUD
-  ``logger.error`` / ``logger.critical``**.  The server MUST NOT crash-loop on
-  a bad store file.  An empty map means "nobody is bound yet" — every auth
+- Missing file -> empty dict (normal first boot). No log, no raise.
+- Corrupt / torn / partial / invalid-JSON file -> **empty dict + a LOUD
+  ``logger.error`` / ``logger.critical``**. The server MUST NOT crash-loop on
+  a bad store file. An empty map means "nobody is bound yet" -- every auth
   attempt then fails normally until an admin re-populates via the /admin API.
 
-File format (both modes share the same abstraction)::
+File format (both modes share the same on-disk shape)::
 
     # api-keys.json
     {
@@ -49,21 +59,18 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from context_intelligence_server.config import Settings
 
 logger = logging.getLogger(__name__)
 
 
-class IdentityStore:
+class FileSystemIdentityStore:
     """Durable, write-through identity map backed by a single JSON file.
 
-    See module docstring for the commit-order contract and fail-closed guarantees.
+    See module docstring for the commit-order contract and fail-closed
+    guarantees.
 
     Args:
-        path: Absolute path to the JSON store file.  The parent directory is
+        path: Absolute path to the JSON store file. The parent directory is
               created automatically on the first write.
     """
 
@@ -83,11 +90,11 @@ class IdentityStore:
     def load(self) -> None:
         """Read the file and populate the in-process map.
 
-        Missing file → empty dict (normal first boot, no log).
-        Corrupt / non-dict → empty dict + LOUD error log, never raise.
+        Missing file -> empty dict (normal first boot, no log).
+        Corrupt / non-dict -> empty dict + LOUD error log, never raise.
         """
         if not self._path.exists():
-            # Normal first boot — the file hasn't been written yet.
+            # Normal first boot -- the file hasn't been written yet.
             self._data = {}
             self._rebuild_flat()
             return
@@ -97,7 +104,7 @@ class IdentityStore:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
             logger.error(
-                "identity_store.load CORRUPT FILE path=%s error=%r — "
+                "identity_store.load CORRUPT FILE path=%s error=%r -- "
                 "failing CLOSED to empty map.  Re-populate via /admin API.",
                 self._path,
                 exc,
@@ -108,7 +115,7 @@ class IdentityStore:
 
         if not isinstance(raw, dict):
             logger.critical(
-                "identity_store.load INVALID FORMAT path=%s got=%r — "
+                "identity_store.load INVALID FORMAT path=%s got=%r -- "
                 "expected a JSON object at top level.  Failing CLOSED to empty map.",
                 self._path,
                 type(raw).__name__,
@@ -124,15 +131,15 @@ class IdentityStore:
         self._rebuild_flat()
 
     def put(self, key: str, value: dict[str, str]) -> None:
-        """Upsert *key* → *value*.
+        """Upsert *key* -> *value*.
 
-        Commit order (F2): write tempfile → os.replace → update in-process.
+        Commit order (F2): write tempfile -> os.replace -> update in-process.
         Raises on file-write failure; in-process state is UNCHANGED.
         """
         new_data = dict(self._data)
         new_data[key] = value
         self._write_atomic(new_data)
-        # File write succeeded — now update in-process state.
+        # File write succeeded -- now update in-process state.
         self._data[key] = value
         contributor_id = value.get("id", "")
         if contributor_id:
@@ -143,13 +150,13 @@ class IdentityStore:
     def delete(self, key: str) -> None:
         """Remove *key* from the store.
 
-        Commit order (F2): write tempfile → os.replace → update in-process.
+        Commit order (F2): write tempfile -> os.replace -> update in-process.
         Raises on file-write failure; in-process state is UNCHANGED.
         No-op if *key* is not present.
         """
         new_data = {k: v for k, v in self._data.items() if k != key}
         self._write_atomic(new_data)
-        # File write succeeded — now update in-process state.
+        # File write succeeded -- now update in-process state.
         self._data.pop(key, None)
         self.flat_dict.pop(key, None)
 
@@ -172,12 +179,12 @@ class IdentityStore:
         except Exception as exc:
             logger.warning(
                 "identity_store.seed: could not write seed to %s: %r "
-                "— in-memory map is live but the file is not yet persisted.  "
+                "-- in-memory map is live but the file is not yet persisted.  "
                 "The next mutation via /admin API will persist the file.",
                 self._path,
                 exc,
             )
-        # Update in-memory regardless — data is from durable config.
+        # Update in-memory regardless -- data is from durable config.
         self._data = dict(data)
         self._rebuild_flat()
 
@@ -242,28 +249,3 @@ class IdentityStore:
             except Exception:
                 pass
             raise
-
-
-def create_identity_store(settings: Settings, kind: str) -> IdentityStore:
-    """Build an ``IdentityStore`` rooted at the configured path for *kind*.
-
-    Construction only \u2014 callers are responsible for ``load()``/``seed()``
-    and any auth-mode wiring (this mirrors ``blob_store.factory.create_blob_store``:
-    a single-backend, config-reading seam that keeps the store paths out of
-    consumers such as ``main.py``).
-
-    Args:
-        settings: The active ``Settings``.
-        kind: ``"entra"`` for the OID identity map, ``"api_key"`` for the
-            SHA-256 digest keystore.
-
-    Raises:
-        ValueError: If *kind* is neither ``"entra"`` nor ``"api_key"``.
-    """
-    if kind == "entra":
-        path = settings.entra_identities_store_path
-    elif kind == "api_key":
-        path = settings.api_keys_store_path
-    else:
-        raise ValueError(f"Unknown identity store kind: {kind!r}")
-    return IdentityStore(Path(path))
