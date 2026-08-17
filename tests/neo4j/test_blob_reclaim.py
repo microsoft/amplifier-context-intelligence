@@ -26,6 +26,7 @@ from typing import Any
 
 import httpx
 import pytest
+from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.handlers.data_layer_1.default import DefaultHandler
 from context_intelligence_server.registry import SessionWorker
@@ -127,8 +128,21 @@ async def admin_client(
       separately in ``tests/routers/test_blob_reclaim_auth.py``).
     - ``blob_path`` is redirected to ``tmp_path/blobs`` via the env-var +
       ``get_settings.cache_clear()`` pattern (mirrors
-      ``tests/integration/test_blob_pipeline.py::integration_env``) so the
-      route's own ``get_settings()`` call sees it.
+      ``tests/integration/test_blob_pipeline.py::integration_env``). This
+      still matters for any consumer that reads ``settings.blob_path``
+      directly, but the reclaim route itself now enumerates disk blobs via
+      ``registry.blob_store.scan()`` -- a lazily-built, process-lifetime
+      singleton (see ``SessionRegistry.blob_store`` in registry.py) cached
+      on the module-level ``registry`` that ``create_asgi_app()`` reuses
+      across every test in the session. The autouse ``safe_settings``
+      fixture (tests/conftest.py) monkeypatches
+      ``context_intelligence_server.registry.get_settings`` to a proxy
+      whose ``blob_path`` is frozen to the REAL default (unlike
+      ``queues_path``, it is deliberately NOT redirected there), so the
+      env-var above can never reach ``registry.blob_store``. We inject a
+      fresh ``AsyncDiskBlobStore`` rooted at ``blob_dir`` directly onto the
+      registry singleton instead -- mirroring the ``_MockBlobStore``
+      injection pattern in ``tests/test_m2_service_auth.py``.
     - ``queues_path`` is redirected to the SAME ``tmp_path/queues`` the
       autouse ``safe_settings`` fixture (tests/conftest.py) already points
       ``registry.queue_manager`` at -- no extra wiring needed.
@@ -146,6 +160,13 @@ async def admin_client(
 
     main_module.create_asgi_app()
     main_module.app.dependency_overrides[require_admin] = lambda: None
+
+    # registry.blob_store is a cached-for-the-process singleton (see
+    # docstring above) that the env-var redirect cannot reach -- inject a
+    # real disk-backed store rooted at this test's tmp_path directly.
+    monkeypatch.setattr(
+        main_module.registry, "_blob_store", AsyncDiskBlobStore(root=str(blob_dir))
+    )
 
     query_driver = AsyncGraphDatabase.driver(
         neo4j_container["bolt_url"],
