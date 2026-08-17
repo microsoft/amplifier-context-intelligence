@@ -488,8 +488,12 @@ async def test_blob_processing_called_when_all_conditions_met(
         ) as mock_node_id,
     ):
         await process_event(worker, "session:start", data, pipeline_handlers)
+        # The blob-key node_id must be computed with the SAME disambiguator
+        # (tool_call_id) that handlers/data_layer_1/default.py uses for the
+        # Event node id -- otherwise parallel same-millisecond events collide
+        # on the blob key (see test_blob_node_id_matches_default_handler_event_node_id).
         mock_node_id.assert_called_once_with(
-            "sess-123", "session:start", "2024-01-01T00:00:00Z"
+            "sess-123", "session:start", "2024-01-01T00:00:00Z", None
         )
         mock_process.assert_called_once_with(
             data, worker.services.blob_store, "sess-123", "test-node-id"
@@ -564,6 +568,123 @@ async def test_blob_skip_missing_timestamp_logs_warning(
     assert "sess-123" in caplog.text
     assert "tool_call" in caplog.text
     assert "missing timestamp" in caplog.text
+
+
+# ===========================================================================
+# Blob-key collision regression (data integrity)
+#
+# Root cause: pipeline.py computed the blob-key node_id WITHOUT the
+# tool_call_id disambiguator that handlers/data_layer_1/default.py uses for
+# the Event node id. Two distinct same-session, same-event, same-millisecond
+# events with DIFFERENT tool_call_id (e.g. parallel tool calls) therefore
+# minted the SAME blob key, and the second write silently clobbered the
+# first via AsyncDiskBlobStore's os.replace -- while the first Event node's
+# $blob_ref still pointed at that (now-overwritten) URI.
+# ===========================================================================
+
+
+async def test_parallel_same_millisecond_events_do_not_collide_on_blob_key(
+    pipeline_handlers: Any,
+    tmp_path: Any,
+) -> None:
+    """Two events sharing session_id + event name + timestamp (same epoch-ms)
+    but with DIFFERENT tool_call_id must mint DISTINCT ci-blob:// URIs, and
+    each blob must read back its own payload -- no silent overwrite."""
+    from context_intelligence_server.blob_store import AsyncDiskBlobStore
+    from context_intelligence_server.pipeline import process_event
+
+    blob_store = AsyncDiskBlobStore(root=tmp_path)
+
+    worker = MagicMock()
+    worker.services.ensure_session_node = AsyncMock()
+    worker.services.touch_session = AsyncMock()
+    worker.services.graph = MagicMock()
+    worker.services.graph.flush = AsyncMock()
+    worker.services.blob_store = blob_store
+
+    session_id = "sess-parallel"
+    event_name = "tool_call:end"
+    timestamp = "2024-06-01T12:00:00.000Z"  # fixed -- identical epoch-ms for both
+
+    data_a: dict[str, Any] = {
+        "session_id": session_id,
+        "timestamp": timestamp,
+        "tool_call_id": "call-A",
+        "result": {"payload": "result-from-call-A"},
+    }
+    data_b: dict[str, Any] = {
+        "session_id": session_id,
+        "timestamp": timestamp,
+        "tool_call_id": "call-B",
+        "result": {"payload": "result-from-call-B"},
+    }
+
+    await process_event(worker, event_name, data_a, pipeline_handlers)
+    await process_event(worker, event_name, data_b, pipeline_handlers)
+
+    # (c) each event's data[field] == {"$blob_ref": <its own uri>}
+    assert "$blob_ref" in data_a["result"]
+    assert "$blob_ref" in data_b["result"]
+    uri_a = data_a["result"]["$blob_ref"]
+    uri_b = data_b["result"]["$blob_ref"]
+
+    # (a) distinct URIs -- no collision
+    assert uri_a != uri_b, (
+        f"Blob key collision: both events minted the same URI {uri_a!r} -- "
+        "the second write silently overwrote the first's blob."
+    )
+
+    # (b) both blobs exist and each reads back its OWN distinct payload
+    read_a = await blob_store.read(uri_a)
+    read_b = await blob_store.read(uri_b)
+    assert read_a == {"payload": "result-from-call-A"}
+    assert read_b == {"payload": "result-from-call-B"}
+
+
+async def test_blob_node_id_matches_default_handler_event_node_id(
+    pipeline_handlers: Any,
+) -> None:
+    """Pins the invariant: the blob-key node_id pipeline.process_event computes
+    must EQUAL the event_node_id handlers/data_layer_1/default.py computes for
+    the same event (make_node_id(session_id, event, timestamp,
+    data.get("tool_call_id"))). If these ever drift apart again, the
+    collision this test suite guards against reappears."""
+    from context_intelligence_server.pipeline import process_event
+    from context_intelligence_server.utils import make_node_id
+
+    worker = MagicMock()
+    worker.services.ensure_session_node = AsyncMock()
+    worker.services.touch_session = AsyncMock()
+    worker.services.graph = MagicMock()
+    worker.services.graph.flush = AsyncMock()
+    worker.services.blob_store = MagicMock()  # truthy blob_store
+
+    session_id = "sess-invariant"
+    event_name = "tool_call:end"
+    timestamp = "2024-06-01T12:00:00.000Z"
+    tool_call_id = "call-invariant"
+
+    data = {
+        "session_id": session_id,
+        "timestamp": timestamp,
+        "tool_call_id": tool_call_id,
+    }
+
+    expected_event_node_id = make_node_id(
+        session_id, event_name, timestamp, tool_call_id
+    )
+
+    with patch(
+        "context_intelligence_server.pipeline.process_event_data",
+        new_callable=AsyncMock,
+    ) as mock_process:
+        await process_event(worker, event_name, data, pipeline_handlers)
+        actual_blob_node_id = mock_process.call_args.args[3]
+
+    assert actual_blob_node_id == expected_event_node_id, (
+        "Blob-key node_id has drifted from default.py's event_node_id -- "
+        "this reintroduces the same-millisecond blob-key collision."
+    )
 
 
 # ===========================================================================
