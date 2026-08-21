@@ -267,12 +267,12 @@ async def test_finalization_orphan_surfaces_on_status(
     )
 
     # 5. Committed offset frozen AT the terminal (session:end) record's own
-    #    start -- spec section 7.4 item 2 (Call A, spec section 3): the
-    #    drain now commits UP TO session:end, not past it, so an unfinalized
-    #    session is durably re-derivable (any later drain re-reads
-    #    session:end as the first line of its next batch). terminal_start is
-    #    a QUEUE-PRODUCED value (records[-1].start) -- the test does not
-    #    compute it either, matching the "queue produces offsets" rule.
+    #    start -- the drain commits UP TO session:end, not past it, so an
+    #    unfinalized session is durably re-derivable (any later drain
+    #    re-reads session:end as the first line of its next batch).
+    #    terminal_start is a QUEUE-PRODUCED value (records[-1].start) --
+    #    the test does not compute it either, matching the "queue produces
+    #    offsets" rule.
     terminal_start = first_100.records[-1].start
     post_drain_batch = await qm.read_batch(sid, 1)
     committed_offset = post_drain_batch.start_offset

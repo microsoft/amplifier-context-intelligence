@@ -1,6 +1,6 @@
 """Reproduction / characterization test for a silent tail-drop under load.
 
-CONFIRMED ROOT CAUSE (bug-hunter verified, static analysis):
+Root cause:
 
 - POST /events is fire-and-forget: it durably appends to a per-session
   on-disk log and returns 202 BEFORE any Neo4j write (main.py:875-919).
@@ -146,12 +146,11 @@ async def _drive_drain_to_quiescence(
     (the control case: it keeps idle-polling forever and must be cancelled
     by the caller). Bounded by max_polls * poll_sleep, never unbounded.
 
-    Spec section 7's "Supervision binding":
-    production's ``start_drain`` now ALSO attaches a done-callback
-    (``_on_drain_done``) to every drain task, alongside binding
-    ``worker.task``. This helper attaches it too, so Case B below can
-    observe the real post-fix contract (loud death + self-heal) rather than
-    the pre-fix silent kill the binding used to only reproduce.
+    Supervision binding: production's ``start_drain`` attaches a
+    done-callback (``_on_drain_done``) to every drain task, alongside
+    binding ``worker.task``. This helper attaches it too, so Case B below
+    can observe the real contract (loud death + self-heal) rather than a
+    silent kill.
     """
     task = asyncio.create_task(
         reg.drain_worker(worker, flush_timeout=flush_timeout), name=f"drain-{sid}"
@@ -267,8 +266,7 @@ class TestOversizedEventDefectSilentlyDropsTail:
         solely ``asyncio.CancelledError``) -- killing the drain task exactly
         per the original silent-tail-drop root cause.
 
-        Reproduced symptom (this is the runtime evidence the static analysis
-        lacked) -- items 1-5 are UNCHANGED by this fix, byte-identical injection:
+        Reproduced symptom -- items 1-5 are UNCHANGED by this fix, byte-identical injection:
 
         1. The small PREFIX (small-1, small-2) persisted -- isolation
            committed past them one at a time before reaching the oversized
@@ -440,11 +438,11 @@ class TestOversizedEventDefectSilentlyDropsTail:
         assert sid not in reg.active_sessions(), (
             "the crashed worker must be deregistered by _on_drain_done, or "
             "it is a spent worker (store_closed) that start_drain would "
-            "refuse forever -- see spec section 5.2 / change C13"
+            "refuse forever"
         )
 
         # (9) A fresh respawn (register_for_test + start_drain, mirroring
-        # what get_or_create's else-branch now does per change C12) drains
+        # what get_or_create's else-branch now does) drains
         # the EXACT stranded suffix with no gap and no duplicate: oversized
         # is STILL genuinely poison (its own solo flush always rejects it,
         # same as Case A), but dead_letter is RESTORED to the real

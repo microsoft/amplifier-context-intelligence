@@ -1,10 +1,10 @@
 """Drain supervision + offset-ownership tests.
 
-Every test in this file was RED-first against the pre-fix tree: no
-``add_done_callback``/``_on_drain_done`` exists yet, so an unexpected
-exception kills ``drain_worker`` SILENTLY (nothing logs it, nothing closes
-the store, nothing deregisters, nothing revives it). After the fix
-each of these becomes GREEN.
+Verifies that an unexpected exception raised inside ``drain_worker`` is
+never silent: ``add_done_callback``/``_on_drain_done`` ensures it is
+logged, the store is closed, and the worker is deregistered so a fresh
+one can be created -- rather than leaving a dead, still-registered
+worker behind with nothing to revive it.
 
 Harness -- reuse only what is already proven: a real ``SessionRegistry``, a
 real ``tmp_path``-backed ``QueueManager`` (via ``reg.queue_manager``),
@@ -152,9 +152,10 @@ def _flaky(
 ) -> Callable[..., Awaitable[Any]]:
     """Return an async wrapper around ``original`` that raises ``exc`` on
     its ``on_call``-th invocation (1-based) and delegates to ``original``
-    for every other call. This is the RED-first fault-injection primitive
-    for every site test below -- always a REAL exception type, never a bare
-    ``Exception()`` (spec section 7.2's mandatory fault-type rule)."""
+    for every other call. This is the fault-injection primitive used by
+    every site test below -- always a REAL exception type, never a bare
+    ``Exception()``, so a test can never pass by accident on an
+    over-broad except clause."""
     state = {"n": 0}
 
     async def _wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -259,9 +260,9 @@ def _died_loudly(
 
 
 # ---------------------------------------------------------------------------
-# 7.2 -- Injection matrix: one RED-first test per unguarded failure site.
+# Injection matrix: one test per unguarded failure site.
 #
-# Every test asserts (a)-(e) from spec section 7.2:
+# Every test asserts:
 #   (a) not silently dead   -- drain_worker_died ERROR w/ session id + exc_info
 #   (b) store closed        -- worker.store_closed is True, fake.closed is True
 #   (c) deregistered+respawn drains the exact remaining suffix, no gap/dup
@@ -463,17 +464,18 @@ class TestInjectionMatrix:
     async def test_finalize_tail_read_failure_refinalizes_after_respawn(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """S5 registry.py:495 -- qm.read_batch raises OSError(ESTALE) once,
+        """qm.read_batch raises OSError(ESTALE) once,
         on its SECOND call (the first call reads the main terminal batch;
-        the second is _finalize_session's own tail read). Call A already
-        committed up to session:end durably, so finalize re-runs after
-        respawn to full completion (assert (d))."""
+        the second is _finalize_session's own tail read). The terminal
+        batch was already committed up to session:end durably, so
+        finalize re-runs after respawn to full completion (assert (d))."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-s5-finalize-read"
         # A clean (always-succeeds) graph: this test targets read_batch, not
         # flush -- a batch-size-sensitive fake would force exhaustion on the
-        # very first (2-record) batch and never reach Call A's commit at all.
+        # very first (2-record) batch and never reach the terminal batch's
+        # commit at all.
         graph = _FlakyGraph(fail_when=lambda buf: False)
         worker = _make_worker(sid, graph)
         reg._register_for_test(worker)
@@ -513,13 +515,15 @@ class TestInjectionMatrix:
     async def test_finalize_tail_commit_failure_refinalizes_after_respawn(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """S6 registry.py:504 -- qm.commit raises OSError(ENOSPC) once, on
-        its SECOND call (the first commit is Call A's up-to-session:end
-        commit; the second is _finalize_session's own tail commit)."""
+        """qm.commit raises OSError(ENOSPC) once, on
+        its SECOND call (the first commit is the terminal batch's
+        up-to-session:end commit; the second is _finalize_session's own
+        tail commit)."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-s6-finalize-commit"
-        # Clean graph: this test targets commit, not flush -- see S5's note.
+        # Clean graph: this test targets commit, not flush -- same reasoning
+        # as the previous test.
         graph = _FlakyGraph(fail_when=lambda buf: False)
         worker = _make_worker(sid, graph)
         reg._register_for_test(worker)
@@ -642,12 +646,10 @@ class TestInjectionMatrix:
 
     async def test_flush_failure_uses_real_neo4j_exception_types(self) -> None:
         """Not a crash scenario -- proves the PRE-EXISTING inner retry path
-        (unchanged by this fix) tolerates REAL neo4j driver exception types, not
+        tolerates REAL neo4j driver exception types, not
         just a bare Exception. This is a regression guard for an unchanged
-        code path, so -- unlike the rest of this matrix -- it is expected to
-        PASS both before and after the fix (spec section 7.2's own framing: "the
-        inner retry path is untouched"). Documented, not silently claimed
-        RED."""
+        code path: the inner retry path itself is untouched by this suite's
+        fixes."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-flush-real-exceptions"
@@ -684,7 +686,7 @@ class TestInjectionMatrix:
 
 class TestMechanismSpecific:
     async def test_committed_offset_freezes_AT_the_terminal_line(self) -> None:
-        """Call A: after the terminal batch commits, the first pending
+        """After the terminal batch commits, the first pending
         record parses to session:end -- the offset is frozen AT the
         boundary, not past it. _finalize_session is stubbed out so we can
         inspect queue state before delete_drained would remove the log."""
@@ -783,7 +785,7 @@ class TestMechanismSpecific:
         assert not qm._offset_path(sid).exists()
 
     async def test_no_second_drainer_during_the_finalize_window(self) -> None:
-        """Call B: park qm.delete_drained on an asyncio.Event; while
+        """Park qm.delete_drained on an asyncio.Event; while
         parked, call get_or_create -- must be a no-op (no new task, worker.task
         unchanged). Release; finalization completes cleanly."""
         reg = SessionRegistry()
@@ -814,7 +816,7 @@ class TestMechanismSpecific:
             await asyncio.wait_for(entered_delete.wait(), timeout=5.0)
             assert sid in reg.active_sessions(), (
                 "worker must still be registered while delete_drained is parked "
-                "(Call B: _deregister is the LAST act)"
+                "(_deregister is the LAST act of finalization)"
             )
 
             pre_task = worker.task
@@ -832,7 +834,7 @@ class TestMechanismSpecific:
 
 
 # ---------------------------------------------------------------------------
-# Remaining named tests from the spec's consolidated test table
+# Spent-worker guard: a cancelled worker must never be revived
 # ---------------------------------------------------------------------------
 
 
@@ -840,7 +842,7 @@ class TestSpentWorkerGuard:
     async def test_cancelled_worker_is_not_revived_through_a_closed_store(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """V-3/C13: task.cancel() -- drain_worker swallows CancelledError
+        """task.cancel() -- drain_worker swallows CancelledError
         and returns cleanly (task.cancelled() is False, documenting the
         swallow), worker.store_closed is True, no drain_worker_died ERROR,
         and start_drain(worker) creates NO new task (the guard is live and
@@ -875,7 +877,7 @@ class TestSpentWorkerGuard:
         assert graph.closed is True
         assert worker.store_closed is True
         assert sid not in reg.active_sessions(), (
-            "C13: the cancellation handler must deregister, or this worker "
+            "the cancellation handler must deregister, or this worker "
             "is wedged (found by get_or_create, refused by start_drain, "
             "forever)"
         )
@@ -928,8 +930,8 @@ class TestPoisonLineIsolation:
 
 class TestNoDoubleCountOnReplay:
     async def test_no_double_count_on_replay(self) -> None:
-        """R2 (wrote flag, section 6.2 C6): force the isolation-path commit
-        to fail once (S4 shape). written_total after the replay equals the
+        """Force the isolation-path commit
+        to fail once. written_total after the replay equals the
         number of DISTINCT committed lines, never lines-plus-replayed."""
         reg = SessionRegistry()
         qm = reg.queue_manager
@@ -967,7 +969,7 @@ class TestNoDoubleCountOnReplay:
 
 class TestCloseTaskReferenced:
     async def test_close_task_is_referenced_until_it_completes(self) -> None:
-        """V-6: after a crash, registry._close_tasks holds the fire-and-
+        """After a crash, registry._close_tasks holds the fire-and-
         forget close task while it is pending, and is empty once it
         finishes -- without this, asyncio's WEAK reference to a running
         task would let it be garbage-collected mid-close, leaking the

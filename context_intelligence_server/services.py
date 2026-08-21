@@ -233,23 +233,21 @@ class HookStateService:
         blob_store: Any | None = None,
     ) -> None:
         self.config = HookConfig(raw_config or {})
-        # M6-lite (spec section 6.4): the PARAMETER above is typed as
-        # GraphStore | None (closes V3 -- a caller can no longer pass an
-        # arbitrary duck-typed object into the CONSTRUCTOR without the type
-        # checker verifying it against the Protocol). self.graph itself is
-        # explicitly kept as `Any` here (an explicit annotation, not an
-        # omission -- pyright otherwise infers GraphStore | GraphState from
-        # the two assignments below regardless, which is exactly the wider
-        # blast radius this descope avoids).
+        # The PARAMETER above is typed as GraphStore | None -- a caller can
+        # no longer pass an arbitrary duck-typed object into the
+        # CONSTRUCTOR without the type checker verifying it against the
+        # Protocol. self.graph itself is explicitly kept as `Any` here (an
+        # explicit annotation, not an omission -- pyright otherwise infers
+        # GraphStore | GraphState from the two assignments below
+        # regardless, which is exactly the wider blast radius this keeps
+        # contained).
         #
         # Measured (uv run pyright over tests/): fully typing self.graph as
         # GraphStore ripples into 100+ pre-existing test-file errors across
         # handlers/data_layer_2 and handlers/data_layer_3 -- tests that reach
         # into GraphState's private _nodes/_edges buffers directly for
-        # assertions -- far past the "19 duck-typed graph_store= call sites,
-        # <=1 line each" threshold the spec sets for landing the full M6.
-        # Descoped here; the deeper observability/boundary follow-up is
-        # tracked separately.
+        # assertions. Narrowing self.graph's type is left for a separate,
+        # dedicated follow-up.
         self.graph: Any
         if graph_store is not None:
             self.graph = graph_store

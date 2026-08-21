@@ -229,10 +229,10 @@ def test_smb_shim_tears_WITHOUT_the_gate_control(
     accident of the local filesystem) is what removes the tear next door in
     ``test_smb_split_write_no_longer_merges_records``.
 
-    The real-mount smoke test (``tests/smoke/``) confirms the ENVIRONMENTAL
-    premise -- that the OLD code tears on real Azure Files/SMB/NFS -- but
-    that needs a live mount this dev box does not have. THIS test needs no
-    mount at all: it proves the fix's LOGIC is what matters, not the
+    Confirming the ENVIRONMENTAL premise -- that the OLD code tears on
+    real Azure Files/SMB/NFS -- needs a live mount this dev box does not
+    have. THIS test needs no mount at all: it proves the fix's LOGIC is
+    what matters, not the
     filesystem, by injecting non-atomicity locally (``_SplitWriteOS``) and
     showing that WITHOUT serialization the exact same shim tears on plain
     ext4. Paired with T2 (gate present -> no tear), the two together are a
@@ -999,10 +999,10 @@ async def test_heal_torn_tails_survives_an_oserror_and_still_boots(
 def _seed_dir() -> Path | None:
     """Locate the captured dead-letter seeds.
 
-    They live in the WORKSPACE-root ``docs/`` (this repo's ``docs/`` is product
-    documentation only -- AGENTS.md:100-112), so they are intentionally NOT in
-    this repo. Walk upward from this file so the lookup survives any checkout
-    depth; return None when absent.
+    These are real production artifacts kept outside this repo (this
+    repo's ``docs/`` is product documentation only), so they are
+    intentionally NOT checked in here. Walk upward from this file so the
+    lookup survives any checkout depth; return None when absent.
     """
     for parent in Path(__file__).resolve().parents:
         candidate = parent / "docs" / "04-deadletter-artifacts" / "seeds"
@@ -1014,10 +1014,7 @@ def _seed_dir() -> Path | None:
 _SEEDS = _seed_dir()
 _requires_seeds = pytest.mark.skipif(
     _SEEDS is None,
-    reason=(
-        "captured dead-letter seeds not present "
-        "(expected <workspace>/docs/04-deadletter-artifacts/seeds/)"
-    ),
+    reason="captured dead-letter seeds not present",
 )
 
 

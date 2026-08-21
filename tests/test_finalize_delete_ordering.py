@@ -1,19 +1,18 @@
 """`_finalize_session` delete-ordering race.
 
-Covers, per the finalized spec chain (R1-R6
-+ T9 are AUTHORITATIVE):
+Covers:
 
-  T1 (a)/(A) headline    -- a late append landing in the finalize window is
+  T1 headline             -- a late append landing in the finalize window is
                             drained-then-deleted (retry succeeds on attempt 2)
-  T2 (a)/(B) give-up      -- a late append on EVERY delete attempt exhausts
+  T2 give-up              -- a late append on EVERY delete attempt exhausts
                             the bounded retry; the log is RETAINED and
                             recover()-reportable
-  T4 (b) Call B ordering  -- no double-delete; delete -> close -> deregister,
+  T4 ordering             -- no double-delete; delete -> close -> deregister,
                             deregister LAST, on the clean path
-  T5 (c) compaction non-interaction -- a late-append-during-finalize retry
+  T5 compaction non-interaction -- a late-append-during-finalize retry
                             composes cleanly with a PRIOR compaction on the
                             same key
-  T6 (d) regression       -- the common no-late-append finalize still
+  T6 regression           -- the common no-late-append finalize still
                             deletes cleanly (must be GREEN before and after)
   T7 regression/extraction -- a FIRST-pass tail flush failure returns before
                             CompletedSession is recorded (must be GREEN
@@ -22,7 +21,7 @@ Covers, per the finalized spec chain (R1-R6
   T8                       -- the retry loop terminates in at most
                             `_FINALIZE_DELETE_ATTEMPTS` DELETE attempts
                             regardless of a continuously-appending client
-  T9 (R4)                 -- the NEW permanent-retention residual: the
+  T9                       -- the permanent-retention residual: the
                             retry's own re-drain can itself suffer a tail
                             flush failure AFTER CompletedSession was already
                             recorded, `return`-ing early (never reaching
@@ -30,11 +29,11 @@ Covers, per the finalized spec chain (R1-R6
                             is the honest signal; `delete_drained` is never
                             called again for that key.
 
-Window-injection technique (spec section 5, deterministic, not
-timing-dependent): wrap `qm.delete_drained` with a spy that, BEFORE
-delegating to the real method, performs `await qm.append(sid, <late
-line>)`. That lands the append strictly inside the real window (after the
-final `read_batch`, before the in-lock `stat`) by construction.
+Window-injection technique (deterministic, not timing-dependent): wrap
+`qm.delete_drained` with a spy that, BEFORE delegating to the real
+method, performs `await qm.append(sid, <late line>)`. That lands the
+append strictly inside the real window (after the final `read_batch`,
+before the in-lock `stat`) by construction.
 
 T3 ("prove pick-up") is intentionally folded into this file's own idiom
 for "a fresh drainer resumes a retained log" -- the same pattern
@@ -141,7 +140,7 @@ def _delete_drained_injector(
     late_lines: list[bytes],
     inject_on: set[int],
 ) -> tuple[Callable[[str], Awaitable[bool]], dict[str, int]]:
-    """Wrap ``qm.delete_drained`` per the spec's window-injection technique.
+    """Wrap ``qm.delete_drained`` with the window-injection technique.
 
     On the given 1-based delete-call numbers, appends the NEXT late line
     BEFORE delegating to the real ``delete_drained`` -- landing the append
@@ -286,7 +285,7 @@ async def test_late_append_on_every_attempt_retains_and_is_recoverable(
 
 
 # ---------------------------------------------------------------------------
-# T4 -- (b) no double-delete + Call B ordering preserved on the clean path
+# T4 -- no double-delete + delete/close/deregister ordering preserved on the clean path
 # ---------------------------------------------------------------------------
 
 
@@ -330,7 +329,7 @@ async def test_no_double_delete_and_call_b_ordering_preserved() -> None:
         "exactly one delete_drained call on the clean path -- never a double-delete"
     )
     assert sequence == ["delete_drained", "graph.close", "_deregister"], (
-        "Call B ordering: delete -> close -> deregister, deregister LAST"
+        "ordering: delete -> close -> deregister, deregister LAST"
     )
 
 
@@ -526,7 +525,7 @@ async def test_retry_loop_terminates_under_continuous_append() -> None:
 
 
 # ---------------------------------------------------------------------------
-# T9 (R4): NEW permanent-retention residual. The retry's
+# T9: permanent-retention residual. The retry's
 # OWN re-drain can itself suffer a tail flush failure AFTER CompletedSession
 # was already recorded -- returning early, never reaching
 # _safe_close/_deregister. orphaned_sessions() is the honest signal;
@@ -593,10 +592,10 @@ async def test_permanent_retention_when_retrys_own_redrain_flush_fails(
 
 
 # ---------------------------------------------------------------------------
-# T3 (spec section 5, "prove pick-up") -- a fresh drainer over the SAME
+# T3 ("prove pick-up") -- a fresh drainer over the SAME
 # on-disk retained log dispatches the late event and drains fully. Uses the
 # same fake-graph respawn pattern another regression test uses for a similar
-# scenario uses (test_finalize_reruns_to_completion_after_a_transient_finalize_failure),
+# scenario (test_finalize_reruns_to_completion_after_a_transient_finalize_failure),
 # rather than the real get_or_create(recovered=True) path, which would need
 # a real Neo4j driver -- out of scope for this non-Neo4j file.
 # ---------------------------------------------------------------------------

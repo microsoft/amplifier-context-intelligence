@@ -379,7 +379,7 @@ async def test_foreign_overwrite_surfaces_conflict_on_status(tmp_path: Path) -> 
         response = await client.get("/status")
     body = response.json()
     assert body["writer_lease"]["conflict"] is True
-    # R2: the spool projection is DROPPED -- untouched, boot-verified shape.
+    # The spool projection is UNTOUCHED by this change -- boot-verified shape.
     assert set(body["spool"].keys()) == {
         "pending_sessions",
         "spool_bytes_total",
@@ -714,13 +714,10 @@ async def test_submit_fail_releases_gate(tmp_path: Path) -> None:
 async def test_shutdown_never_raises_with_busy_gate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Strengthened per the claim-guard test-correspondence-auditor finding:
-    the prior version's own comment conceded it \"exercises the ordinary
-    shutdown path\" and never forced the busy state -- so it would have
-    stayed green even if the `(OSError, WriterLeaseBusy)` swallow in
-    `release()` were narrowed to `OSError` only.
-
-    This version forces the REAL adverse state: a genuinely outstanding
+    """Forces the REAL adverse state rather than merely exercising the
+    ordinary shutdown path, so this test would fail if the
+    `(OSError, WriterLeaseBusy)` swallow in `release()` were ever narrowed
+    to `OSError` only: a genuinely outstanding
     future occupying the private single-slot lease-I/O executor (`_LEASE_IO`,
     max_workers=1), plus the one-slot in-flight gate flag `_io()` itself
     checks (`_io_inflight`) held True -- both real internal state, not
@@ -818,13 +815,12 @@ async def test_shutdown_never_raises_with_busy_gate(
 async def test_status_writer_lease_present_during_boot_zero_disk_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Strengthened per the claim-guard test-correspondence-auditor finding:
-    the prior version of this test never instrumented disk I/O, so it would
-    have stayed green even if `snapshot()`/the `/status` handler started
-    reading the lease file from disk on every request -- it only asserted
-    on the JSON body, never on the claimed zero-disk-reads property itself.
+    """Instruments disk I/O directly rather than only asserting on the JSON
+    body, so this test would fail if `snapshot()`/the `/status` handler
+    ever started reading the lease file from disk on every request --
+    the zero-disk-reads property is asserted on directly, not inferred.
 
-    This version patches `Path.read_text` -- the exact primitive
+    This test patches `Path.read_text` -- the exact primitive
     `WriterLease._read` uses (writer_lease.py:206) -- filtered by identity
     to THIS lease's own on-disk path, so it counts every read of
     `.writer.lease` regardless of whether it goes through `_read()` or a

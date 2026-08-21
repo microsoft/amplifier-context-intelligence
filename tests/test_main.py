@@ -241,7 +241,7 @@ async def test_drain_loop_processes_event(
 ) -> None:
     """A posted event is drained from the durable log by the sticky drainer.
 
-    Migrated off the vestigial in-memory worker.queue (Phase B2, Task 5): the
+    Migrated off the vestigial in-memory worker.queue: the
     durable drain loop reads from the on-disk QueueManager log, so success is
     observed by polling that log to empty rather than worker.queue.join().
     """
@@ -746,7 +746,7 @@ async def test_lifespan_creates_and_closes_driver(
 
 
 # ---------------------------------------------------------------------------
-# Lifespan crash-recovery + workers==1 guard tests (Phase B2)
+# Lifespan crash-recovery + workers==1 guard tests
 # ---------------------------------------------------------------------------
 
 
@@ -805,10 +805,11 @@ async def test_lifespan_recovers_and_respawns_drainers(
 async def test_lifespan_skips_recovery_for_empty_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """B3: a session whose ONLY line has an empty workspace no longer
-    strands forever. Pre-fix this was silently skipped (never dispatched,
-    permanently stuck -- exactly the merged-head failure mode, just
-    triggered by an empty field instead of torn JSON). `_head_is_resumable`
+    """A session whose ONLY line has an empty workspace no longer
+    strands forever. It could otherwise be silently skipped (never
+    dispatched, permanently stuck -- exactly the merged-head failure
+    mode, just triggered by an empty field instead of torn JSON).
+    `_head_is_resumable`
     treats "no workspace" uniformly regardless of cause, so the byte-0 then
     sentinel fallback applies here too: the session IS now dispatched, under
     the `_RECOVERY_FALLBACK_WORKSPACE` sentinel (never workspace='' -- that
@@ -848,7 +849,7 @@ async def test_lifespan_skips_recovery_for_empty_workspace(
             # Recovery is backgrounded -- await it before shutdown cancels it.
             await main_module.app.state.boot_task
 
-    # B3: dispatched under the sentinel fallback, never under workspace=''.
+    # Dispatched under the sentinel fallback, never under workspace=''.
     assert len(spawned) == 1
     dispatched_sid, dispatched_ws = spawned[0]
     assert dispatched_sid == sid
@@ -1052,7 +1053,7 @@ async def test_crash_recovery_topup_drains_deferred_tail_across_passes(
     exercise the LIVE-drainer bound -- that property (a recovered drainer
     exits when it runs dry, so the ceiling bounds live population too, not
     just per-pass dispatches) is tested honestly, without the commit-to-EOF
-    shortcut, in tests/test_boot_safety.py (B2)."""
+    shortcut, in tests/test_boot_safety.py."""
     qm = registry.queue_manager
     sids = sorted(f"sess-sweep-{i}" for i in range(4))
     for sid in sids:

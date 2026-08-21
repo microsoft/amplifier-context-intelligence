@@ -388,7 +388,7 @@ async def test_process_event_terminal_does_not_self_flush(
 
 
 async def test_process_event_terminal_does_not_self_flush_real_handlers() -> None:
-    """D-DUW (R4/T-c): de-vacuumed sibling of the
+    """De-vacuumed sibling of the
     test above. Wires the REAL ``setup_handlers(services)`` enricher set
     (including the real ``SessionHandler``) instead of ``_StubEnricher``,
     over an in-memory ``HookStateService``/``GraphState`` so no Neo4j is
@@ -397,10 +397,10 @@ async def test_process_event_terminal_does_not_self_flush_real_handlers() -> Non
     The test above tests the ``pipeline`` module's OWN body only --
     ``pipeline_handlers`` wires ``_StubEnricher`` instances, so the real
     ``SessionHandler`` never runs and it cannot see a handler that flushes.
-    It passed even while ``SessionHandler._handle_end`` called
-    ``self.services.graph.flush()`` directly (the D-DUW bug). THIS test is
-    the real fence: RED on the pre-D-DUW tree, GREEN after Change 1 (the
-    flush deleted).
+    It would pass even if ``SessionHandler._handle_end`` called
+    ``self.services.graph.flush()`` directly. THIS test is
+    the real fence against that: it fails if the handler ever
+    self-flushes.
 
     Non-vacuity control: assert the real ``SessionHandler`` actually ran
     (the session node carries ``status == "completed"``), so a mis-wired
@@ -466,7 +466,7 @@ async def test_process_event_default_handler_exception_propagates(
     mock_worker: MagicMock,
     default_handler: _StubDefaultHandler,
 ) -> None:
-    """Phase B2: a default-handler (step 4) error must PROPAGATE so the drainer
+    """A default-handler (step 4) error must PROPAGATE so the drainer
     can dead-letter the line instead of committing the offset past a
     never-persisted event (no silent loss)."""
     from context_intelligence_server.pipeline import PipelineHandlers, process_event
@@ -480,7 +480,6 @@ async def test_process_event_default_handler_exception_propagates(
         )
 
 
-# NOTE (Task 6): test_process_event_flush_exception_propagates was removed.
 # process_event no longer flushes at all — the drainer's gated _flush_barrier is
 # the sole write trigger, so flush-failure-propagation is now a drainer contract
 # covered by tests/test_registry.py::TestDurableDrainLoop
@@ -492,7 +491,7 @@ async def test_process_event_propagates_handler_error(
     mock_worker: MagicMock,
     pipeline_handlers: Any,
 ) -> None:
-    """Phase B2 (USER DECISION option a): a handler error in steps 2-6 must
+    """A handler error in steps 2-6 must
     PROPAGATE, not be swallowed — here ensure_session_node (step 2) raises and
     process_event must re-raise so the drainer routes the line to dead-letter
     rather than committing the offset past a never-persisted event."""

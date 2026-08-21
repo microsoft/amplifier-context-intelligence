@@ -332,7 +332,7 @@ class SessionRegistry:
             result = "error"
             error = str(exc)
             worker.error_count += 1
-            raise  # Phase B2: propagate so the drainer dead-letters this line
+            raise  # Propagate so the drainer dead-letters this line
         finally:
             ring_buffer.add(
                 EventRecord(
@@ -427,10 +427,11 @@ class SessionRegistry:
                     # drainer compacts its committed prefix BEFORE it takes
                     # that exit -- otherwise a recovered drainer that never
                     # sees a live POST leaks its full log forever (the most
-                    # operationally common shape of FINDING 1). This sits
-                    # OUTSIDE the D-1 recheck-to-_deregister window (that
-                    # window starts at the cheap pre-filter just below, not
-                    # here), so it does not touch D-1's safety argument.
+                    # operationally common way a log grows unbounded). This
+                    # sits OUTSIDE the recheck-to-_deregister window below
+                    # (that window starts at the cheap pre-filter just
+                    # below, not here), so it does not affect that window's
+                    # safety argument.
                     # `compact_pending` is cleared BEFORE the call -- a
                     # compaction that errors is not
                     # retried until the next commit re-arms it.
@@ -452,7 +453,7 @@ class SessionRegistry:
                     # bounds DISPATCHES. Cheap pre-filter first (skips the
                     # extra read_batch on the overwhelming majority of live
                     # sessions); the RE-READ after the await is the
-                    # load-bearing part (D-1): a POST landing during the
+                    # load-bearing part: a POST landing during the
                     # await's suspension sets live_event_seen=True via
                     # get_or_create BEFORE append, so re-testing the flag
                     # AFTER the recheck -- with no await between the re-read
@@ -513,7 +514,7 @@ class SessionRegistry:
                         extra={"session_id": session_id},
                     )
                     await self._safe_close(worker)
-                    self._deregister(session_id)  # C13/R-B: spent worker must
+                    self._deregister(session_id)  # A spent worker must
                     # be deregistered so get_or_create builds a FRESH one --
                     # else start_drain's store_closed guard refuses it forever.
                     return
@@ -565,7 +566,7 @@ class SessionRegistry:
                 # Terminal batch: commit only UP TO session:end. Leaving that
                 # record uncommitted is what makes "ended but not finalized"
                 # DURABLE -- any later drain (respawn or boot recover()) re-
-                # reads it and re-enters finalization. See spec section 3.
+                # reads it and re-enters finalization.
                 commit_to = batch.end_offset if terminal_at is None else terminal_at
                 await qm.commit(session_id, commit_to)
                 counted = len(batch.records) if terminal_at is None else safe_count
@@ -612,7 +613,7 @@ class SessionRegistry:
                     extra={"session_id": session_id},
                 )
                 await self._safe_close(worker)
-                self._deregister(session_id)  # C13/R-B: see above
+                self._deregister(session_id)  # See the note above.
                 return
 
     @staticmethod
@@ -636,10 +637,10 @@ class SessionRegistry:
 
         Every record is still DISPATCHED, so a
         session:end whose DISPATCH fails keeps going down the existing
-        retry -> _handle_exhausted_batch isolation path (spec section 3.A.4).
+        retry -> _handle_exhausted_batch isolation path.
 
         No byte position is computed here: offsets come from the queue
-        (Record.start) and are only ever handed back to it (spec section 1.3).
+        (Record.start) and are only ever handed back to it.
         """
         from context_intelligence_server.pipeline import (
             TERMINAL_EVENTS,
@@ -665,16 +666,17 @@ class SessionRegistry:
         Each record is dispatched + flushed individually under the write
         semaphore. A record that still fails (parse error, handler error, or
         repeated flush failure) is dead-lettered with its error AND its write
-        residue is discarded from the store buffer (COE blocker, decision #13);
-        good records flush normally. Every record advances the offset to its
-        own queue-produced end (commit), so the whole batch is accounted for.
+        residue is discarded from the store buffer, so a poisoned record
+        cannot contaminate the records that flush after it; good records
+        flush normally. Every record advances the offset to its own
+        queue-produced end (commit), so the whole batch is accounted for.
         No silent loss, no binary shrink, no cross-line contamination.
 
-        R2: ``wrote`` is set True only when this record's OWN flush actually
+        ``wrote`` is set True only when this record's OWN flush actually
         succeeded, and ``record_written`` is only ever called when it is --
-        the commit (which may itself fail and kill this coroutine, per Rule
-        2) always happens outside the try/except, so a replay after a crash
-        here can never double-count a record that was already counted.
+        the commit (which may itself fail and kill this coroutine) always
+        happens outside the try/except, so a replay after a crash here can
+        never double-count a record that was already counted.
         """
         qm = self.queue_manager
         session_id = worker.session_id
@@ -701,10 +703,9 @@ class SessionRegistry:
                     exc_info=exc,
                     extra={"session_id": session_id},
                 )
-                # COE blocker (decision #13): drop the failed record's residue
-                # so it cannot contaminate the NEXT record's flush. A
-                # successful flush clears the buffer itself; only the
-                # failure path needs this.
+                # Drop the failed record's residue so it cannot contaminate
+                # the NEXT record's flush. A successful flush clears the
+                # buffer itself; only the failure path needs this.
                 worker.services.graph.discard_buffer()
             await qm.commit(session_id, rec.end)  # queue-produced offset
             if wrote:
@@ -715,8 +716,8 @@ class SessionRegistry:
 
         Returns True when the log is drained (committed == the last complete
         line). Returns False when a tail flush FAILED -- nothing was committed
-        for that batch, and the caller must NOT finalize (panel finding #7:
-        no tail loss).
+        for that batch, and the caller must NOT finalize, so no tail record
+        is ever lost.
 
         Extracted VERBATIM from
         _finalize_session so the finalize delete-retry can re-drain a late
@@ -747,11 +748,11 @@ class SessionRegistry:
     async def _finalize_session(self, worker: SessionWorker, handlers: Any) -> None:
         """session:end seen: drain any tail records read-to-EOF, then record
         the CompletedSession, DELETE the drained logs, close the graph, and
-        deregister -- in that order (Call B). Panel finding #7: if a tail
+        deregister -- in that order. If a tail
         flush fails, do NOT finalize — return without recording/closing so
         the drainer retries (no tail loss).
 
-        Call B reorder (spec section 4): ``delete_drained`` runs BEFORE
+        ``delete_drained`` runs BEFORE
         ``_safe_close``/``_deregister``, and ``_deregister`` is the LAST
         statement before the final log line, with NO ``await`` after it.
         Throughout ``delete_drained`` and ``_safe_close`` the worker is
@@ -821,9 +822,9 @@ class SessionRegistry:
                 duration_seconds=ended_at - worker.started_at,
             )
         )
-        # Panel finding #5: reclaim disk — a fully drained, finalized session no
+        # Reclaim disk — a fully drained, finalized session no
         # longer needs its .log/.offset. Keep .dead.jsonl (retained dead-letter).
-        # MOVED UP (Call B): still registered here, so a concurrent
+        # Runs while still registered here, so a concurrent
         # get_or_create's start_drain no-ops against the still-live task.
         #
         # delete_drained's return value is LOAD-BEARING, not advisory.
@@ -832,7 +833,7 @@ class SessionRegistry:
         # drain-to-EOF above and the unlink. The log is retained (never lost),
         # but the late event is undrained. Re-drain it HERE, on this still-live
         # drainer over this still-open store, and retry the delete. The worker
-        # stays REGISTERED throughout (Call B), so a concurrent
+        # stays REGISTERED throughout, so a concurrent
         # get_or_create's start_drain still no-ops against this live task --
         # a second drainer over the same log remains structurally unreachable.
         for attempt in range(1, _FINALIZE_DELETE_ATTEMPTS + 1):
@@ -936,7 +937,7 @@ class SessionRegistry:
                     extra={"session_id": session_id},
                 )
             else:
-                # V-6: hold a strong reference until it finishes. asyncio only
+                # Hold a strong reference until it finishes. asyncio only
                 # keeps a WEAK reference to a running task; without this the
                 # close can be garbage-collected mid-execution and the driver
                 # leaks anyway -- defeating the point of closing it at all.
@@ -949,14 +950,14 @@ class SessionRegistry:
             # finalization). Draining through a closed store would
             # spuriously dead-letter good events.
             #
-            # NB (R-B): for this claim to hold, the spent worker MUST also be
+            # For this claim to hold, the spent worker MUST also be
             # deregistered by whoever closed it -- otherwise get_or_create
             # takes the else: branch, finds this same spent worker, and
             # start_drain refuses it forever (session wedged, no drainer
             # until next boot, visible as orphaned:true). The done-callback
             # (_on_drain_done) deregisters; the TWO CancelledError handlers
             # in drain_worker MUST call self._deregister(session_id) beside
-            # _safe_close (change C13) so the next get_or_create builds a
+            # _safe_close so the next get_or_create builds a
             # FRESH worker.
             return
         task = worker.task
@@ -1104,7 +1105,7 @@ class SessionRegistry:
         return list(self._workers.values())
 
     def has_worker(self, session_id: str) -> bool:
-        """The public read for boot-reclaim's Gate 1.
+        """The public read for boot-reclaim's ownership gate.
 
         Lets ``main._boot_reclaim`` check live ownership WITHOUT reaching
         into ``_workers`` and without paying O(n) per key over ``workers()``.

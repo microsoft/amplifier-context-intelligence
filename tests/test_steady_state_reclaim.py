@@ -1,7 +1,6 @@
 """Steady-state queue reclaim + dead-letter retention.
 
-Covers, per the finalized spec chain (base spec + v1.1 patch --
-latest wins on conflict):
+Covers:
 
   (b) an undrained tail is never prefix-reclaimed past the committed offset
   (c) compaction is crash-atomic: offset-before-log ordering, verified at
@@ -14,10 +13,10 @@ latest wins on conflict):
   (g) regression: reclaim-on-finalize is unchanged, and composes with a
       prior compaction
   (i) an `os.replace` failure during compaction RESTORES the offset --
-      a pure no-op, zero accounting drift (R3)
-  (j) a huge-tail session is skipped (not compacted, not stalled) (R4)
+      a pure no-op, zero accounting drift
+  (j) a huge-tail session is skipped (not compacted, not stalled)
   (k) dead-letter expiry actually deletes under SHIPPED DEFAULTS
-      (`reclaim_enabled` stays False) (precision 3)
+      (`reclaim_enabled` stays False)
 
 (a), (d), (h) are Neo4j-backed and live in
 ``tests/neo4j/test_steady_state_reclaim_neo4j.py``, extending the throughput
@@ -279,7 +278,7 @@ async def test_c_control_rejected_log_then_offset_order_loses_data(
 
 
 # ---------------------------------------------------------------------------
-# (i) os.replace failure restores the offset -- pure no-op, zero drift (R3)
+# (i) os.replace failure restores the offset -- pure no-op, zero drift
 # ---------------------------------------------------------------------------
 
 
@@ -350,8 +349,8 @@ async def test_i_double_replace_failure_logs_restore_failed_honestly(
     def _always_raise(src: Any, dst: Any) -> None:
         # Let the FIRST offset write through (step 5's rebase to "0" --
         # required to reach the log-replace step at all); fail the log
-        # replace (step 6) AND the subsequent restore-to-C write, so R3's
-        # own restore path is what fails this time.
+        # replace (step 6) AND the subsequent restore-to-C write, so the
+        # restore path itself is what fails this time.
         src_content = (
             Path(src).read_text(encoding="utf-8") if Path(src).exists() else ""
         )
@@ -374,7 +373,7 @@ async def test_i_double_replace_failure_logs_restore_failed_honestly(
 
 
 # ---------------------------------------------------------------------------
-# (j) a huge tail is skipped, never compacted, never stalls ingest (R4)
+# (j) a huge tail is skipped, never compacted, never stalls ingest
 # ---------------------------------------------------------------------------
 
 
@@ -487,7 +486,7 @@ async def test_e_retention_zero_disables_expiry(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# (k) dead-letter expiry works under SHIPPED DEFAULTS (precision 3)
+# (k) dead-letter expiry works under SHIPPED DEFAULTS
 # ---------------------------------------------------------------------------
 
 
@@ -529,7 +528,7 @@ async def test_k_dead_letter_expiry_enabled_false_still_dry_runs(
 
 
 # ---------------------------------------------------------------------------
-# (m) BOOT-vs-SWEEP dead-letter accounting (claim clm_afcf3748)
+# (m) BOOT-vs-SWEEP dead-letter accounting
 #
 # Zero tests previously touched record_purged or the boot (_boot_reconcile)
 # vs sweep (_crash_recovery_sweep_loop) expiry call sites -- yet main.py's

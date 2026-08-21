@@ -119,15 +119,15 @@ _RECOVERY_FALLBACK_WORKSPACE = "unknown-recovered"
 
 
 def _head_is_resumable(raw: bytes) -> bool:
-    """TOTAL predicate (M-1/R4): does ``raw`` parse to a dict with a workspace?
+    """Total predicate: does ``raw`` parse to a dict with a workspace?
 
     Shared by ``_recover_one_session`` (recovery dispatch, via
     ``_parse_workspace_and_creator``) and ``QueueManager.classify_session``
     (boot-safety reclaim, injected as a pure ``Callable[[bytes], bool]`` -- the queue
     must not learn the event schema). ONE definition, two consumers. NEVER
     RAISES: valid-but-non-dict JSON (``123``, ``null``, ``"str"``, ``[]``)
-    must not escape as an ``AttributeError`` from ``obj.get(...)`` -- the
-    exact Q-5 bug class, and this predicate is a boot-path total function.
+    must not escape as an ``AttributeError`` from ``obj.get(...)`` -- this
+    predicate is a total function on the entire boot path.
     """
     try:
         obj = json.loads(raw)
@@ -256,20 +256,20 @@ async def _crash_recovery_topup(respawn_limit: int | None) -> TopupResult:
     ``respawn_limit`` recovered sessions (all of them when ``None``).
 
     This is the shared body of the boot-time recovery and the periodic sweep
-    (now the ONLY recovery-dispatch body -- the former lifespan inline
-    loop was a duplicate and is deleted, M-6). It is SAFE to call repeatedly
-    on a live server because respawn is idempotent -- ``registry.get_or_create``
+    (the only recovery-dispatch body -- the former lifespan inline loop was
+    a duplicate and has been removed). It is SAFE to call repeatedly on a
+    live server because respawn is idempotent -- ``registry.get_or_create``
     returns the existing worker for a session that already has a live
     drainer (no duplicate drainer, no reset). And because ``recover()``
     reports only sessions that still have undrained data, a session drops
     out the moment it finishes, so the number of live RECOVERED drainers
-    stays <= ``respawn_limit`` per dispatch pass (see B2 for why LIVE
-    recovered drainers are ALSO bounded independently -- via the drain
-    loop's own dry-exit, not this ceiling -- since a drained-out-but-still-
-    registered drainer stays alive between passes).
+    stays <= ``respawn_limit`` per dispatch pass (live recovered drainers
+    are also bounded independently via the drain loop's own dry-exit, not
+    this ceiling -- since a drained-out-but-still-registered drainer stays
+    alive between passes).
 
-    B3: when the head line does not resolve a workspace, this now tries
-    the session's byte-0 line before giving up on it entirely -- the data
+    When the head line does not resolve a workspace, this now tries the
+    session's byte-0 line before giving up on it entirely -- the data
     behind an unparseable head is still recoverable (see
     ``_recover_one_session``'s docstring).
     """
@@ -420,10 +420,10 @@ async def _boot_reclaim() -> None:
     already-drained key, resume-with-fallback for a recoverable-but-
     unparseable-head key, and reset a bounded bad-offset key.
 
-    Iterates `*.log` STEMS only (R10) -- a log-less key (only a
+    Iterates `*.log` STEMS only -- a log-less key (only a
     `.dead.jsonl`) belongs to ``reclaim_orphans``, never classified here.
 
-    Gate 1 (ownership): skip any key with a LIVE registry worker, checked
+    Ownership gate: skip any key with a LIVE registry worker, checked
     FRESH on the event loop immediately before classifying -- the registry
     owns live sessions; this pass only ever touches unowned keys.
 
@@ -493,10 +493,9 @@ async def _boot_reclaim() -> None:
             reclaimed_bytes += c.size
         else:
             kept += 1
-    # v1.3 defect fix (claim-guard run_a5af6bd7, clm_aab3adbc REFUTED):
     # `reclaim_enabled` MUST reach `reclaim_orphans` itself -- it, not just
     # this function's own telemetry aggregation, gates the actual unlink.
-    # Before this fix, orphan `.offset`/`.offset.tmp` and stale
+    # Previously, orphan `.offset`/`.offset.tmp` and stale
     # `.torn-*.bin` quarantine sidecars were unlinked unconditionally every
     # boot, invisibly, even under the `reclaim_enabled=False` safety
     # default. `reclaim_orphans` now reports `reclaimed`/`reclaimed_bytes`
@@ -696,7 +695,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         yield
     finally:
-        # M-14/R8: every background task lives on app.state so this
+        # Every background task lives on app.state so this
         # `finally` can reach it even if `_boot_reconcile` crashed before
         # creating the sweep task (hence the getattr guard). Ordering is
         # load-bearing: sweep stops before the one-shot reconcile (it can
@@ -713,7 +712,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             _boot_task.cancel()
             with suppress(asyncio.CancelledError):
                 await _boot_task
-        # The writer lease (R4) is released LAST among
+        # The writer lease is released LAST among
         # app-owned tasks, and its own heartbeat task is cancelled FIRST --
         # so no in-flight tick can regain the in-flight gate mid-shutdown.
         # release()/shutdown_lease_io() never raise (owner-gated release,
@@ -756,7 +755,7 @@ app.state.registry = registry
 idempotency_cache = EventIdempotencyCache()
 
 # Session-less events are keyed by a per-workspace sentinel stem so that events
-# from distinct workspaces never collide in one durable log (decision #10).
+# from distinct workspaces never collide in one durable log.
 _NO_SESSION_PREFIX = "_no_session__"
 
 
@@ -823,7 +822,7 @@ def _assert_admin_not_exempt() -> None:
 
 
 def _assert_neo4j_clients_explicit(settings: Settings) -> None:
-    """Startup assertion (doc 11 gap #12): the deployed profile MUST declare the
+    """Startup assertion: the deployed profile MUST declare the
     structured neo4j.admin / neo4j.cypher_query clients explicitly.
 
     When settings.neo4j_require_explicit_clients is True, refuse to boot if the
@@ -1175,9 +1174,9 @@ async def get_status(request: Request) -> dict[str, Any]:
     # block, at every boot phase -- pure in-memory (writer_lease.snapshot()
     # never touches disk or calls get_settings()), so this never violates
     # the zero-disk-during-boot contract. Deliberately NOT projected into
-    # `spool` (R2): that dict is spool_stats()'s live cache OBJECT
-    # returned BY REFERENCE, and mutating it would poison a claim-guard-
-    # verified surface.
+    # `spool`: that dict is spool_stats()'s live cache OBJECT
+    # returned BY REFERENCE, and mutating it would corrupt a shared,
+    # already-verified surface.
     response["writer_lease"] = writer_lease.snapshot()
     if boot_state.phase in ("ready", "failed"):
         # Byte-for-byte today's code, unreachable while actively booting.
@@ -1297,7 +1296,7 @@ async def post_events(
         )
         return EventResponse(status="duplicate", session_id=session_id or None)
     # Empty session_id maps to a per-workspace sentinel stem so session-less
-    # events from distinct workspaces never collide in one log (decision #10).
+    # events from distinct workspaces never collide in one log.
     worker_key = session_id or (_NO_SESSION_PREFIX + _workspace_slug(request.workspace))
     # Spawn (or reuse) the sticky drainer keyed by worker_key.
     registry.get_or_create(worker_key, request.workspace, created_by=contributor_id)

@@ -18,10 +18,10 @@ from context_intelligence_server.graph_store import GraphStore, QueryableStore
 class MinimalGraphStore:
     """Conforming implementation of GraphStore with all required members.
 
-    Spec section 6.3 (M5b/M5c): the Protocol grew a settable ``workspace``
-    and a ``created_by`` getter/setter -- both required for a real
-    isinstance() conformance check to pass, so this fixture must carry them
-    too (a runtime_checkable Protocol only checks attribute PRESENCE).
+    The Protocol declares a settable ``workspace`` and a ``created_by``
+    getter/setter -- both required for a real isinstance() conformance
+    check to pass, so this fixture must carry them too (a
+    runtime_checkable Protocol only checks attribute PRESENCE).
     """
 
     @property
@@ -95,7 +95,7 @@ class MissingUpsertNode:
 class MinimalQueryableStore:
     """Conforming implementation of QueryableStore with all required members.
 
-    Spec section 6.3 (M5b/M5c): see MinimalGraphStore's docstring.
+    See MinimalGraphStore's docstring.
     """
 
     @property

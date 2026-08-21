@@ -240,10 +240,10 @@ class TestDuwHeadlineLiveDefect:
 class TestDuwGuardIsolator:
     """Calls SessionHandler directly (no process_event/touch_session).
 
-    Per R4: GREEN today (the handler's own flush clears the
-    buffer so the second end's get_node falls through to Neo4j), RED with
-    Change 1 alone (no self-flush AND no label-seed -- the buffer entry left
-    behind by the first end() sheds the type), GREEN with BOTH.
+    The handler's own flush clears the buffer so the second end's
+    get_node falls through to Neo4j; without BOTH the self-flush AND the
+    label-seed, the buffer entry left behind by the first end() sheds the
+    type.
     """
 
     async def test_e_isolator_direct_handler_no_intervening_flush(
@@ -293,11 +293,9 @@ class TestDuwGuardIsolator:
 
 
 # ---------------------------------------------------------------------------
-# T-a (semaphore fence, corrected per R2) -- no flush occurs outside
+# T-a (semaphore fence) -- no flush occurs outside
 # write_semaphore, EXCLUDING the teardown close() flush.
 # ---------------------------------------------------------------------------
-#
-# CG-1 adverse-state test.
 
 
 @pytest.mark.timeout(60)
@@ -320,7 +318,7 @@ async def test_a_no_flush_outside_write_semaphore(
     real_flush = worker.services.graph.flush
 
     async def _spy_flush() -> None:
-        # R2: stop recording once the worker's store has been
+        # Stop recording once the worker's store has been
         # marked closed -- the teardown close()->flush() is a last-resort
         # net, un-gated by construction, and is NOT what this fence is
         # about (an un-gated flush DURING live drain is the bug).
