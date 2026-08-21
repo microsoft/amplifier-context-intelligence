@@ -65,7 +65,7 @@ ring_buffer: EventRingBuffer = EventRingBuffer()
 # BootState
 # ---------------------------------------------------------------------------
 
-# Authoritative phase enum (v1.3.1 C2). `sweep`/`topup` are MOMENTARY step
+# Authoritative phase enum. `sweep`/`topup` are MOMENTARY step
 # labels only -- `_crash_recovery_sweep_loop` runs forever once started, so
 # step 7 of `_boot_reconcile` unconditionally sets phase="ready" AFTER
 # starting it; a non-returning loop must never leave phase stuck at "sweep".

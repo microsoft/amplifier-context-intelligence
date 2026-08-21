@@ -89,9 +89,9 @@ async def test_t1_append_failure_leaves_key_unburned_retry_honoured(
     """The headline silent-loss bug, reproduced and then required-fixed.
 
     Monkeypatch ``registry.queue_manager.append`` to raise ``OSError`` on
-    call 1 and record on call 2. POST #1 with key K must raise (D-1 -- no
+    call 1 and record on call 2. POST #1 with key K must raise -- no
     HTTP response is observable for this failure through the
-    test client). POST #2 with the SAME key K must be honoured: 202
+    test client. POST #2 with the SAME key K must be honoured: 202
     "queued", and the event actually appended -- not answered "duplicate"
     for a still-nonexistent event (the pre-fix bug).
     """
@@ -116,7 +116,7 @@ async def test_t1_append_failure_leaves_key_unburned_retry_honoured(
     # and the test client's ASGITransport uses raise_app_exceptions=True
     # (the httpx default) -- so the OSError propagates OUT of
     # `client.post(...)` itself. There is no response object to assert a
-    # status code against (D-1).
+    # status code against.
     with pytest.raises(OSError):
         await client.post("/events", json=payload)
 
@@ -231,10 +231,10 @@ async def test_t3_concurrent_same_key_double_post_both_append(
     own ``seen()`` check, then release; gather both.
 
     Both must return 202 "queued", both must append (len == 2), and
-    NEITHER may be answered "duplicate" -- this pins C6/R-1 (the accepted
+    NEITHER may be answered "duplicate" -- this pins the accepted
     tradeoff: two same-key POSTs that overlap inside the check->store
     window both append; the duplicate converges downstream via idempotent
-    MERGE). P4: this is realizable ONLY because ``append`` is
+    MERGE. This is realizable ONLY because ``append`` is
     monkeypatched, bypassing the real per-key admission lock that would
     otherwise serialize two same-key POSTs and remove the interleave --
     do not "fix" this test toward the real queue manager.
@@ -402,16 +402,14 @@ class TestEventIdempotencyCacheSeenStore:
 
 
 def test_t7_no_stale_check_and_store_references() -> None:
-    """C7: check_and_store is removed and must have no remaining CALL SITES
+    """check_and_store is removed and must have no remaining CALL SITES
     or DEFINITIONS anywhere in the repo (product code, tests, scripts).
 
-    Spec ambiguity note: the spec's own VERBATIM docstring text for the
-    new ``seen()`` method explains the rename by name-dropping the old
-    method in prose (e.g. "the former ``check_and_store``, byte for byte");
-    that same docstring text is C7/S5's own authoritative code hunk, so a
-    bare substring scan for "check_and_store" would flag the spec's own
-    required docstring as a violation of its own success criterion.
-    Resolved by scoping this check to the CALL/DEF form
+    Note: the new ``seen()`` method's own docstring explains the rename
+    by name-dropping the old method in prose (e.g. "the former
+    ``check_and_store``, byte for byte"), so a bare substring scan for
+    "check_and_store" would flag that docstring itself as a violation of
+    this very check. Resolved by scoping this check to the CALL/DEF form
     ``check_and_store(`` (the name immediately followed by an open paren)
     -- which is what "no remaining references" substantively guards against
     (dead code, live call sites) -- rather than banning the bare identifier

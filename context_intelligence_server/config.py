@@ -949,8 +949,8 @@ class Settings(BaseSettings):
     # OFTEN a rewrite happens; this bounds how LONG one rewrite holds
     # guard.file_lock (blocking POST /events for that key) -- independent
     # quantities, since the copy cost is O(tail), not O(prefix). A
-    # fallen-behind drainer (this issue's originating incident shape) can
-    # have C >= min_prefix_bytes AND a multi-GB tail; without this cap that
+    # fallen-behind drainer can have a committed prefix above
+    # min_prefix_bytes AND a multi-GB uncommitted tail; without this cap that
     # copies gigabytes under the lock. Same magnitude as
     # reclaim_redrain_max_bytes (house precedent for \"a bounded amount of
     # queue-path I/O we are willing to pay\"). <=0 means no cap (explicit
@@ -966,8 +966,7 @@ class Settings(BaseSettings):
     # exists; mtime older than the window), and the log-less rule is a
     # STRUCTURAL PROOF (not a heuristic) that no boot mechanism can ever
     # consult the file being expired. Gating this on reclaim_enabled would
-    # mean FINDING 2 (dead-letters accumulate forever) is never actually
-    # closed under shipped defaults.
+    # let dead-letters accumulate forever under shipped defaults.
     dead_letter_expiry_enabled: bool = True
 
     # How long a log-less `.dead.jsonl` survives before being expired.

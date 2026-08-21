@@ -16,12 +16,11 @@ from context_intelligence_server.services import HookStateService
 class FakeGraph:
     """Minimal async graph store that records which nodes get upserted.
 
-    Conforms fully to the ``GraphStore`` Protocol (spec section 6.4's
-    measured M6-lite gate: the ``graph_store`` constructor parameter is
-    typed as ``GraphStore | None``, so a fake passed to it must structurally
-    satisfy the Protocol even though this test only exercises get_node/
-    upsert_node). The extra members are no-ops -- this test's behavior is
-    unchanged.
+    Conforms fully to the ``GraphStore`` Protocol: the ``graph_store``
+    constructor parameter is typed as ``GraphStore | None``, so a fake
+    passed to it must structurally satisfy the Protocol even though this
+    test only exercises get_node/upsert_node. The extra members are
+    no-ops -- this test's behavior is unchanged.
     """
 
     def __init__(self, nodes: dict[str, dict[str, Any]]) -> None:

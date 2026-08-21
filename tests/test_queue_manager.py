@@ -1,4 +1,4 @@
-"""Tests for the on-disk durable queue manager (Phase B1)."""
+"""Tests for the on-disk durable queue manager."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def test_constructor_creates_queues_dir(tmp_path):
 
 
 def test_batch_holds_its_fields():
-    """MECHANICAL (spec section 7.4 item 4, INPUT 3): ``Batch`` no longer
+    """``Batch`` no longer
     takes ``lines=`` -- it takes ``records: list[Record]``, and ``lines`` is
     now a DERIVED property. This assertion pins the derived property."""
     batch = Batch(
@@ -38,7 +38,7 @@ def test_batch_holds_its_fields():
 
 
 # ---------------------------------------------------------------------------
-# Record / Batch.records (spec section 7.1, INPUT 3) -- the queue produces
+# Record / Batch.records -- the queue produces
 # offsets, the registry only ever hands them back via ``commit``. These tests
 # pin that ``read_batch`` keeps the offsets it already computes (rather than
 # discarding them) and that ``lines`` can never disagree with ``records``.

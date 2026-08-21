@@ -23,7 +23,7 @@ Durability note:
     Appends use a plain durable ``write()``. This gives PROCESS-crash
     durability (the bytes are handed to the OS page cache and survive a
     process crash). POWER-LOSS durability via ``fsync`` is deliberately
-    deferred to Phase B3 (fsync group-commit).
+    deferred to a future fsync group-commit.
 
 session_id contract:
     Every public method validates ``session_id`` and raises ``ValueError`` if
@@ -179,7 +179,7 @@ class Classification:
 
     key: str
     verdict: Verdict
-    reason: str  # one token from the closed §6 vocabulary; "" for plain RESUMABLE
+    reason: str  # one token from a closed vocabulary; "" for plain RESUMABLE
     size: int
     dead_empty: bool
     fallback_source: str | None = None
@@ -527,7 +527,8 @@ class QueueManager:
         server-side EOF whereas seek-then-write would race on a stale
         position and OVERWRITE data.
 
-        No ``fsync``: power-loss durability stays deferred to Phase B3.
+        No ``fsync``: power-loss durability stays deferred to a future
+        fsync group-commit.
         """
         with guard.file_lock:
             flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
@@ -716,7 +717,7 @@ class QueueManager:
         Writes the offset to a temp file and uses ``os.replace`` for an atomic
         rename, so a reader never observes a torn or partial offset file. No
         ``fsync`` is issued here: this gives process-crash durability, while
-        power-loss durability is deferred to Phase B3 (fsync group-commit).
+        power-loss durability is deferred to a future fsync group-commit.
         """
         self._validate_session_id(session_id)
         final = self._offset_path(session_id)
@@ -737,8 +738,8 @@ class QueueManager:
         record also carries a ``ts`` (epoch seconds) and the ``error`` string.
 
         This is the dead-letter PRIMITIVE only. The poison-isolation POLICY
-        (deciding WHEN to dead-letter a line) is Phase B2. The main ``.log`` and
-        ``.offset`` files are untouched.
+        (deciding WHEN to dead-letter a line) lives in the caller. The main
+        ``.log`` and ``.offset`` files are untouched.
 
         Guarded by the SAME per-key ``_KeyGuard`` as ``append``: an
         unguarded write here is exactly as dangerous as an
@@ -819,7 +820,7 @@ class QueueManager:
 
         def _delete(guard: _KeyGuard) -> bool:
             # Under guard.file_lock: this can never run while a write thread
-            # for this key owns the fd (§6.1). Acquired by THIS thread, not
+            # for this key owns the fd. Acquired by THIS thread, not
             # the coroutine -- same discipline as _write_record.
             with guard.file_lock:
                 try:
@@ -857,7 +858,7 @@ class QueueManager:
             async with guard.admission:
                 ok = await _await_uninterrupted(asyncio.to_thread(_delete, guard))
                 # Still holding admission: apply the three-part removal
-                # condition (v2.1 §2.2). waiters == 1 is THIS call itself;
+                # condition. waiters == 1 is THIS call itself;
                 # anything higher means another coroutine holds the guard
                 # and removal must be skipped.
                 if ok and guard.waiters == 1 and self._guards.get(session_id) is guard:
@@ -885,7 +886,7 @@ class QueueManager:
         ``max_tail_bytes <= 0`` means no cap (explicit opt-out). Above 0, a
         tail larger than this is SKIPPED (not compacted) -- the threshold
         bounds how long ``guard.file_lock`` is held for one rewrite, not how
-        often a rewrite happens (that is ``min_prefix_bytes``'s job, R4).
+        often a rewrite happens (that is ``min_prefix_bytes``'s job).
 
         Same acquisition order as ``append``/``dead_letter``/
         ``delete_drained``/``reclaim``: ``_guard`` -> ``admission`` ->
@@ -1172,7 +1173,7 @@ class QueueManager:
             try:
                 size = log_path.stat().st_size
             except FileNotFoundError:
-                # R10/ALSO-b: a classify-time race (unlinked between the
+                # A classify-time race (unlinked between the
                 # `*.log` glob and this call) -- benign, not corruption.
                 return Classification(key, Verdict.UNREADABLE, "log_vanished", 0, True)
             except OSError:
@@ -1225,7 +1226,7 @@ class QueueManager:
             if head_raw.endswith(b"\n") and head_is_resumable(head_raw[:-1]):
                 return Classification(key, Verdict.RESUMABLE, "", size, dead_empty)
 
-            # B3: the head is unparseable/torn/lacks a workspace -- resume
+            # The head is unparseable/torn/lacks a workspace -- resume
             # with a FALLBACK workspace instead of deleting.
             # Step 10: byte 0 of the SAME file.
             try:
@@ -1267,8 +1268,7 @@ class QueueManager:
             # Step 12/13: bounding decides DELETE vs KEEP -- DELETE only when
             # the probe window provably covered the WHOLE file.
             if size <= _SCAN_CHUNK_BYTES:
-                # v1.3 defect fix (claim-guard run_a5af6bd7, clm_9116061c
-                # REFUTED): `main._recover_one_session` is MORE LENIENT than
+                # `main._recover_one_session` is MORE LENIENT than
                 # this classifier was -- it unconditionally sentinel-
                 # dispatches whenever byte 0 is a COMPLETE (newline-
                 # terminated) line, regardless of JSON parseability, because
@@ -1308,14 +1308,14 @@ class QueueManager:
         mid-unlink still leaves a record of the intent.
 
         Re-verifies, INSIDE the guarded body, immediately before applying
-        (B1 makes the server concurrent with this
+        (the server is concurrent with this
         pass, so a live event or a live drain can invalidate a classify-time
         snapshot before this runs):
-          1. Gate 1 (ownership) -- ``is_owned()`` is still False.
+          1. Ownership -- ``is_owned()`` is still False.
           2. Size DRIFT -- the `.log`'s live size still matches ``c.size``
              (NOT ``size > committed``: on the RESET_OFFSET path the
              `.offset` is corrupt by definition, so `committed` is
-             uncomputable -- C-a).
+             uncomputable).
           3. For RESET_OFFSET only: `.dead.jsonl` is STILL empty.
         Any failure -> apply NOTHING, log `boot_reclaim_skipped_changed`,
         return False (re-classified next boot).
@@ -1344,7 +1344,7 @@ class QueueManager:
 
         def _apply(guard: _KeyGuard) -> bool:
             with guard.file_lock:
-                # Gate 1 (ownership), re-checked FRESH inside the guarded
+                # Ownership, re-checked FRESH inside the guarded
                 # body -- the registry owns live sessions; a session that acquired a
                 # live worker after classify-time must never be reclaimed.
                 if is_owned():
@@ -1478,17 +1478,16 @@ class QueueManager:
         exist here in the first place -- the age check is defensive
         symmetry, not load-bearing.
 
-        ``enabled`` (v1.3 defect fix, claim-guard run_a5af6bd7,
-        clm_aab3adbc REFUTED): mirrors the per-key ``reclaim`` path's own
+        ``enabled`` mirrors the per-key ``reclaim`` path's own
         ``reclaim_enabled`` gate -- when False, EVERY candidate is only
         classified and LOGGED as a would-delete (``action=dry_run``); NO
         path is unlinked. When True, the candidate is unlinked for real,
-        logged (``action=delete``), and counted. Before this fix,
-        ``reclaim_orphans`` ignored ``reclaim_enabled`` entirely and
-        unlinked unconditionally -- an invisible delete every boot even
-        under the safety default (``reclaim_enabled=False``). A real
-        deletion must never be invisible: ``reclaimed``/``reclaimed_bytes``
-        only ever reflect actual unlinks, never dry-run candidates.
+        logged (``action=delete``), and counted. ``reclaim_orphans`` must
+        never ignore ``reclaim_enabled`` and unlink unconditionally -- that
+        would be an invisible delete every boot even under the safety
+        default (``reclaim_enabled=False``). A real deletion must never be
+        invisible: ``reclaimed``/``reclaimed_bytes`` only ever reflect
+        actual unlinks, never dry-run candidates.
 
         MUST NOT RAISE (mirrors ``heal_torn_tails``'s directory-scan guard).
         """
@@ -1991,8 +1990,8 @@ class QueueManager:
     ) -> dict[str, int]:
         r"""Expire LOG-LESS dead-letter files older than ``retention_seconds``.
 
-        FINDING 2 -- ``.dead.jsonl``
-        is never auto-reclaimed by any other path. A key is expired iff:
+        A log-less ``.dead.jsonl`` is never auto-reclaimed by any other
+        path. A key is expired iff:
 
           (a) ``<key>.log`` does NOT exist, AND
           (b) ``now - mtime(<key>.dead.jsonl) > retention_seconds``

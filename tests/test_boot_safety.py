@@ -1,27 +1,24 @@
 """Boot-safety hardening tests.
 
-Every test in this file was written and observed RED against the
-pre-fix tree before the corresponding production change landed (see the
-session's RED-first evidence log). No real Neo4j is used anywhere in this
-file.
+No real Neo4j is used anywhere in this file.
 
-Covers, per the final (v1.3) spec:
+Covers:
   - classify_session's decision table
   - log-then-delete ordering + the closed reason vocabulary
   - the anti-over-deletion guarantee (resumable data survives reclaim)
-  - B3: an unparseable head resumes with a fallback workspace, never deletes
-  - B1: /status is LEAN and ZERO-DISK-READ during boot (gated
+  - an unparseable head resumes with a fallback workspace, never deletes
+  - /status is LEAN and ZERO-DISK-READ during boot (gated
     on boot-is-OVER, not boot-succeeded)
   - the reconcile background task is exception-safe
-  - the four G-1..G-4 crash-loop guards (+ G-5)
-  - Gate 1 (live-session ownership) safety
-  - B2: the honest recovered-drainer bound + forward progress
+  - the crash-loop guards that bound repeated boot failures
+  - live-session ownership safety during boot reconciliation
+  - the honest recovered-drainer bound + forward progress
   - sidecar retention (a boot never destroys its own quarantine)
-  - D-1: the dry-exit's after-await re-read (the strand-after-await fix)
-  - D-4: RESET_OFFSET's dead-empty precondition + the in-lock re-check race
-  - R10: no phantom reclaim over dead-file-only keys
-  - R11: reclaim_enabled=False is a genuine dry run
-  - R8: shutdown cancels every background task before closing the drivers
+  - the dry-exit's after-await re-read (the strand-after-await fix)
+  - RESET_OFFSET's dead-empty precondition + the in-lock re-check race
+  - no phantom reclaim over dead-file-only keys
+  - reclaim_enabled=False is a genuine dry run
+  - shutdown cancels every background task before closing the drivers
 """
 
 from __future__ import annotations
@@ -132,7 +129,7 @@ def _make_worker(
 
 
 # ---------------------------------------------------------------------------
-# §11.1 -- classify_session decision-table (table-driven; side-effect-free)
+# classify_session decision-table (table-driven; side-effect-free)
 # ---------------------------------------------------------------------------
 
 
@@ -149,7 +146,7 @@ async def test_classify_resumable_head_parses(tmp_path: Path) -> None:
 async def test_classify_orphan_offset_is_reclaim_orphans_job_not_classify(
     tmp_path: Path,
 ) -> None:
-    """R10/ALSO-b: classify iterates *.log stems only; a .log that vanished
+    """classify iterates *.log stems only; a .log that vanished
     between glob and classify (or was never there) is a benign race."""
     qm = await _qm(tmp_path)
     c = await qm.classify_session("ghost", _head_is_resumable)
@@ -249,7 +246,7 @@ async def test_classify_mid_line_offset_resumes(tmp_path: Path) -> None:
 async def test_classify_merged_head_resumes_with_fallback_workspace_byte0(
     tmp_path: Path,
 ) -> None:
-    """B3: a merged/truncated FIRST uncommitted line no longer deletes -- it
+    """A merged/truncated FIRST uncommitted line no longer deletes -- it
     resumes with the workspace read from byte 0 of the same file."""
     good_head = _line(workspace="/real-ws")
     merged = (
@@ -267,17 +264,15 @@ async def test_classify_merged_head_resumes_with_fallback_workspace_byte0(
 async def test_classify_garbage_line_resumes_via_sentinel_not_deleted(
     tmp_path: Path,
 ) -> None:
-    """v1.3 defect (claim-guard run_a5af6bd7, clm_9116061c -- REFUTED,
-    now fixed): a single-line non-JSON garbage `.log` (newline-terminated,
+    """A single-line non-JSON garbage `.log` (newline-terminated,
     <1MiB, no `.offset`/`.dead.jsonl` siblings) must NOT be classified
     UNRESUMABLE/DELETE. `main._recover_one_session` is MORE LENIENT than
-    the old classify predicate -- it unconditionally sentinel-dispatches
+    the classify predicate -- it unconditionally sentinel-dispatches
     whenever byte 0 is a COMPLETE (newline-terminated) line, regardless of
     JSON parseability, because the drainer dead-letters the unparseable
     head and drains everything behind it. classify_session must never
     judge DELETE for a `.log` `_recover_one_session` would actually
-    dispatch. (Superseded the old `test_classify_no_parseable_line_small_
-    deletes`, which asserted the buggy over-delete behaviour.)"""
+    dispatch."""
     garbage = b"not json at all\n"
     _seed_log(tmp_path, "k11", garbage)
     _seed_offset(tmp_path, "k11", "0")
@@ -293,7 +288,7 @@ async def test_classify_garbage_line_resumes_via_sentinel_not_deleted(
 async def test_boot_reclaim_survives_garbage_log_and_real_drain_dead_letters_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Full-stack RED test for the same defect (clm_9116061c): with
+    """Full-stack test for the same defect: with
     reclaim_enabled=True, a single-line non-JSON garbage `.log` (no
     siblings) must survive the REAL `_boot_reclaim` pass -- not merely
     classify_session in isolation. A subsequent REAL drain (registry.
@@ -338,7 +333,7 @@ async def test_boot_reclaim_survives_garbage_log_and_real_drain_dead_letters_it(
 async def test_classify_unclassifiable_large_file_kept_not_deleted(
     tmp_path: Path,
 ) -> None:
-    """§6 bound: DELETE only when the probe window covered the WHOLE file.
+    """DELETE only when the probe window covered the WHOLE file.
     A large file whose first MiB has no parseable line is KEPT, not deleted."""
     garbage = b"not json at all\n" * 200_000  # > 1 MiB, no parseable line anywhere
     _seed_log(tmp_path, "k12", garbage)
@@ -368,7 +363,7 @@ async def test_classify_unreadable_offset_is_kept_never_deleted(
 
 
 # ---------------------------------------------------------------------------
-# §11.2 -- log-then-delete: audit line BEFORE unlink, all closed-set files gone
+# log-then-delete: audit line BEFORE unlink, all closed-set files gone
 # ---------------------------------------------------------------------------
 
 
@@ -426,7 +421,7 @@ async def test_reclaim_logs_before_failing_unlink(
 
 
 # ---------------------------------------------------------------------------
-# §11.3 -- the anti-over-deletion test: resumable data survives reclaim
+# the anti-over-deletion test: resumable data survives reclaim
 # ---------------------------------------------------------------------------
 
 
@@ -446,7 +441,7 @@ async def test_resumable_and_mid_line_offset_survive_reclaim(tmp_path: Path) -> 
 
 
 # ---------------------------------------------------------------------------
-# §11.5 (amended v1.3) -- /status is LEAN + ZERO-DISK during boot
+# /status is LEAN + ZERO-DISK during boot
 # ---------------------------------------------------------------------------
 
 
@@ -479,7 +474,7 @@ async def test_status_lean_during_boot_zero_disk_reads(
     assert data["metrics"] is None
     assert data["spool"] is None
     assert data["status_detail"] == {"reason": "booting"}
-    # The direct assertion of §2.3's unreachability argument: neither
+    # Direct assertion that neither
     # derive_all_stats' caller nor spool_stats is ever invoked while booting.
     assert called["pipeline_metrics"] is False
     assert called["spool_stats"] is False
@@ -528,7 +523,7 @@ def test_boot_state_default_phase_is_recovering_never_ready() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §11.6 -- _boot_reconcile is exception-safe (the boot done-callback analogue)
+# _boot_reconcile is exception-safe (the boot done-callback analogue)
 # ---------------------------------------------------------------------------
 
 
@@ -582,7 +577,7 @@ async def test_boot_reconcile_success_reaches_ready(
 
 
 # ---------------------------------------------------------------------------
-# §11.7 -- crash-loop guards (G-1..G-4) -- the four crash triggers
+# crash-loop guards (test_g1..test_g4) -- the four crash triggers
 # ---------------------------------------------------------------------------
 
 
@@ -678,7 +673,7 @@ async def test_all_four_crash_triggers_reach_ready_with_reclaim_disabled(
 
 
 # ---------------------------------------------------------------------------
-# §11.8 -- Gate 1 (live-session ownership) safety
+# live-session ownership safety during boot reclaim
 # ---------------------------------------------------------------------------
 
 
@@ -723,7 +718,7 @@ async def test_key_reclaimed_after_worker_removed_drains_from_zero(
 
 
 # ---------------------------------------------------------------------------
-# §11.9 (B2, honest bound) -- recovered-only population + forward progress
+# the honest recovered-drainer bound -- recovered-only population + forward progress
 # ---------------------------------------------------------------------------
 
 
@@ -786,7 +781,7 @@ async def test_recovered_drainer_population_bounded_and_makes_progress(
 
 
 # ---------------------------------------------------------------------------
-# §11.10 -- sidecar retention: a boot never destroys its own quarantine
+# sidecar retention: a boot never destroys its own quarantine
 # ---------------------------------------------------------------------------
 
 
@@ -828,8 +823,7 @@ async def test_reclaim_orphans_removes_orphan_offset_and_tmp(tmp_path: Path) -> 
 async def test_reclaim_orphans_respects_reclaim_enabled_false_dry_run(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """v1.3 defect (claim-guard run_a5af6bd7, clm_aab3adbc -- REFUTED,
-    now fixed): with `reclaim_enabled=False` ("dry run, delete nothing"),
+    """With `reclaim_enabled=False` ("dry run, delete nothing"),
     `reclaim_orphans` must NOT unlink an orphan `.offset` or a stale
     `.torn-*.bin` quarantine sidecar -- it must only classify + LOG the
     would-delete (action=dry_run), same as the per-key `reclaim` path.
@@ -920,7 +914,7 @@ async def test_boot_reclaim_orphan_offset_survives_with_reclaim_disabled(
 
 
 # ---------------------------------------------------------------------------
-# §11.13 (amended, D-1) -- the dry-exit + the strand-after-await fix
+# the dry-exit + the strand-after-await fix
 # ---------------------------------------------------------------------------
 
 
@@ -990,7 +984,7 @@ async def test_dry_exit_negative_control_recovered_that_drained_still_exits(
 
 
 async def test_d1_no_strand_after_recheck_await(tmp_path: Path) -> None:
-    """D-1 (the load-bearing blocker): a POST landing DURING the recheck's
+    """A POST landing DURING the recheck's
     await must NOT strand the drainer's client -- the flag is re-read AFTER
     the await, so the exit aborts and the loop continues draining."""
     qm = QueueManager(queues_dir=tmp_path)
@@ -1031,7 +1025,7 @@ async def test_d1_no_strand_after_recheck_await(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# §11.15 extended (D-4) -- reset-offset threshold + dead-empty + in-lock race
+# reset-offset threshold + dead-empty + in-lock race
 # ---------------------------------------------------------------------------
 
 
@@ -1055,7 +1049,7 @@ async def test_reset_offset_applies_and_drains_from_zero(tmp_path: Path) -> None
 async def test_reset_offset_refused_when_dead_letters_appear_after_classify(
     tmp_path: Path,
 ) -> None:
-    """D-4: the .dead.jsonl-empty precondition is re-checked
+    """The .dead.jsonl-empty precondition is re-checked
     INSIDE the guarded body, immediately before applying -- a live drain
     dirtying the dead file between classify and reclaim must not let a
     reset apply and re-dead-letter the poison line."""
@@ -1079,7 +1073,7 @@ async def test_reset_offset_refused_when_dead_letters_appear_after_classify(
 
 
 async def test_reclaim_size_drift_refuses_to_delete(tmp_path: Path) -> None:
-    """§11.16 -- the delete window is closed: a live append growing the
+    """The delete window is closed: a live append growing the
     `.log` between classify and reclaim must refuse the delete."""
     _seed_log(tmp_path, "grows", b"")  # empty_log -> delete
     qm = await _qm(tmp_path)
@@ -1107,7 +1101,7 @@ async def test_reclaim_gate1_refuses_when_key_becomes_owned(tmp_path: Path) -> N
 
 
 # ---------------------------------------------------------------------------
-# §11.17 (R10) -- no phantom reclaim over a dead-file-only key
+# no phantom reclaim over a dead-file-only key
 # ---------------------------------------------------------------------------
 
 
@@ -1131,7 +1125,7 @@ async def test_no_phantom_reclaim_for_dead_only_key(
 
 
 # ---------------------------------------------------------------------------
-# §11.18 (R11) -- reclaim_enabled=False is a genuine dry run
+# reclaim_enabled=False is a genuine dry run
 # ---------------------------------------------------------------------------
 
 
@@ -1177,7 +1171,7 @@ async def test_reclaim_enabled_true_deletes_what_dry_run_named(
 
 
 # ---------------------------------------------------------------------------
-# §11.19 (amended, R8) -- shutdown cancels every task before closing drivers
+# shutdown cancels every task before closing drivers
 # ---------------------------------------------------------------------------
 
 
@@ -1221,8 +1215,8 @@ async def test_shutdown_cancels_sweep_and_boot_tasks_before_closing_drivers(
 async def test_merged_head_session_resumes_and_drains_behind_the_poison_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The worst finding: a session whose FIRST uncommitted line is
-    the merged/truncated line. B3: classified fallback_workspace (not
+    """The worst case: a session whose FIRST uncommitted line is
+    the merged/truncated line. It classifies as fallback_workspace (not
     deleted), kept on disk, and on the SECOND `_boot_reconcile` pass it is
     STILL there and STILL classifies the same way -- the permanent per-boot
     stall is gone because the session is never stuck: it is
@@ -1262,7 +1256,7 @@ def test_d8_config_defaults_are_coupled() -> None:
 
 
 def test_head_is_resumable_is_total_never_raises() -> None:
-    """R4: valid-but-non-dict JSON must not escape as AttributeError."""
+    """Valid-but-non-dict JSON must not escape as AttributeError."""
     for raw in (b"123", b"null", b'"str"', b"[]", b"{}", b"not json", b""):
         result = _head_is_resumable(raw)
         assert isinstance(result, bool)

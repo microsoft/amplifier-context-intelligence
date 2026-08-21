@@ -1,17 +1,18 @@
 """Neo4j-backed coverage: (a), (d), (h).
 
-Extends ``test_throughput_bench.py``'s shape: real
+Uses real
 ``QueueManager``, real ``SessionRegistry``/``SessionWorker``/``drain_worker``,
 real ``Neo4jGraphStore``, against the isolated throwaway Neo4j container.
 
   (a) an open, drained-idle, NO-TERMINAL session's committed prefix IS
       reclaimed -- backlog stays 0, all events remain queryable in the
-      graph, and the return value is the RECLAIMED PREFIX (R1), not 0.
+      graph, and the return value is the RECLAIMED PREFIX, not 0.
   (d) a live drainer + concurrent ingest during repeated compaction never
       drops, reorders, or double-processes events.
   (h) a BOOT-RECOVERED (``live_event_seen=False``) no-terminal session IS
-      compacted BEFORE it takes the dry-exit (R2) -- the most
-      operationally common real-world shape of FINDING 1.
+      compacted BEFORE it takes the dry-exit -- the most
+      operationally common real-world way a log would otherwise grow
+      unbounded.
 
 Run explicitly:
     cd amplifier-context-intelligence
@@ -227,15 +228,14 @@ async def test_d_concurrent_ingest_during_repeated_compaction_no_loss(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Count-conservation (unchanged) PLUS an INDEPENDENT order check.
+    """Count-conservation PLUS an INDEPENDENT order check.
 
-    clm_37b8c6d9 (test-correspondence audit, run_a83f5707): the prior version
-    of this test only checked ``graph_count == n_total + 1`` and its own
-    comment admitted ordering was "inferred from count conservation, never
-    independently checked" -- a real reorder bug (e.g. a compaction race that
-    shuffled bytes) would leave the count identical and this test GREEN.
+    Checking ``graph_count == n_total + 1`` alone leaves ordering
+    "inferred from count conservation, never independently checked" -- a
+    real reorder bug (e.g. a compaction race that shuffled bytes) would
+    leave the count identical and go undetected.
 
-    Fix: every event carries an out-of-band ascending sequence marker
+    Every event carries an out-of-band ascending sequence marker
     (``_seq_event``'s ``tool_input``) that is INDEPENDENT of storage/queue
     byte layout. A spy wraps the REAL ``Neo4jGraphStore.upsert_node`` (still
     calling through to the real implementation -- this is observation, not a
@@ -303,12 +303,12 @@ async def test_d_concurrent_ingest_during_repeated_compaction_no_loss(
     deads = await qm.read_dead_letters(sid)
     assert len(deads) == 0
 
-    # LOAD-BEARING (clm_37b8c6d9 fix): order is checked INDEPENDENTLY of the
+    # Order is checked INDEPENDENTLY of the
     # count -- every ToolCall upsert for this session must have landed in
     # the graph in EXACT ascending sequence order. A reorder introduced
     # anywhere between append and the graph write (queue read, compaction
-    # race, batch dispatch) flips this RED even though the count above stays
-    # correct.
+    # race, batch dispatch) fails this assertion even though the count
+    # above stays correct.
     assert len(observed_order) == n_total
     assert observed_order == list(range(n_total)), (
         "events were delivered to the graph OUT OF ORDER under concurrent "
@@ -322,7 +322,7 @@ async def test_d_concurrent_ingest_during_repeated_compaction_no_loss(
 
 
 # ---------------------------------------------------------------------------
-# (h) boot-recovered, no-terminal session compacts BEFORE the dry-exit (R2)
+# (h) boot-recovered, no-terminal session compacts BEFORE the dry-exit
 # ---------------------------------------------------------------------------
 
 
@@ -333,27 +333,25 @@ async def test_h_boot_recovered_session_compacts_before_dry_exit(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """HEADLINE fix (clm_2631a2cb, test-correspondence audit run_a83f5707).
-
-    The prior version hand-constructed ``SessionWorker(live_event_seen=False)``
-    directly and NEVER called ``registry.get_or_create(..., recovered=True)``
-    -- the actual production entry point ``_recover_one_session`` uses
-    (``main.py:205``: ``get_or_create(sid, workspace, created_by=created_by,
-    recovered=recovered)``), from BOTH the boot-time crash-recovery topup and
-    the periodic sweep's re-dispatch of a still-undrained recovered session.
-    A regression in ``get_or_create``'s ``recovered`` wiring (e.g.
+    """Drives the REAL production entry point ``registry.get_or_create(...,
+    recovered=True)`` end to end -- the same call ``_recover_one_session``
+    uses, from BOTH the boot-time crash-recovery topup and the periodic
+    sweep's re-dispatch of a still-undrained recovered session. A
+    regression in ``get_or_create``'s ``recovered`` wiring (e.g.
     ``live_event_seen`` defaulting True regardless of the flag, so a
     boot-recovered worker never dry-exits, or a broken new-worker
-    construction path) would NOT have been caught by the old test, since it
-    never exercised ``get_or_create`` at all.
+    construction path) must be caught here, since hand-constructing a
+    ``SessionWorker`` directly would never exercise ``get_or_create`` at
+    all.
 
-    This version drives the REAL entry point end to end: ``get_or_create``
+    ``get_or_create``
     builds a brand-new ``SessionWorker`` from settings (its own store/
-    blob-store construction path, also newly exercised), and asserts the log
-    is compacted BEFORE the drainer's dry-exit -- exactly what R2's
-    Trigger-I-before-dry-exit ordering guarantees. If Trigger I were placed
-    AFTER the dry-exit (or never fired for this path), the drainer would
-    reach ``recovered_drainer_exited`` with the log still full-size.
+    blob-store construction path, also exercised here), and this test
+    asserts the log is compacted BEFORE the drainer's dry-exit -- exactly
+    what Trigger I's before-dry-exit ordering guarantees. If Trigger I
+    were placed AFTER the dry-exit (or never fired for this path), the
+    drainer would reach ``recovered_drainer_exited`` with the log still
+    full-size.
     """
     import context_intelligence_server.config as cfg_module
     import context_intelligence_server.registry as reg_module
@@ -407,7 +405,7 @@ async def test_h_boot_recovered_session_compacts_before_dry_exit(
         "expected the dry-exit log line -- the worker never reached it"
     )
 
-    # R2's whole point, now proven through the REAL entry point: the log is
+    # Proven through the REAL entry point: the log is
     # 0 bytes (or missing) AT EXIT, not full-size -- Trigger I ran BEFORE
     # the dry-exit, not after (and not never).
     assert not log_path.exists() or log_path.stat().st_size == 0

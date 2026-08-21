@@ -501,7 +501,7 @@ class TestDeadLetterWarning:
 
         # A malformed line makes _parse_line raise inside _handle_exhausted_batch,
         # triggering the dead-letter path.
-        # Spec section 7.4 item 5 (MECHANICAL, INPUT 3): the per-record
+        # The per-record
         # loop is now ``for rec in batch.records:`` -- a bare
         # ``poison.lines``/``poison.start_offset`` mock has no ``.records``,
         # so ``list(MagicMock().records) == []`` and the body never executes.
@@ -963,10 +963,10 @@ class TestDurableSessionEnd:
         cs = reg._completed[0]
         assert cs.session_id == sid
         assert cs.workspace == "/ws"
-        # Spec section 7.4 item 1: session:end is re-dispatched once by
-        # the durable finalize re-read (Call A commits UP TO session:end,
-        # so _finalize_session re-reads and re-dispatches it) -- 2 events
-        # appended, but session:end is dispatched twice (spec section 3 A.4).
+        # session:end is re-dispatched once by
+        # the durable finalize re-read (the terminal batch commits UP TO
+        # session:end, so _finalize_session re-reads and re-dispatches it)
+        # -- 2 events appended, but session:end is dispatched twice.
         assert cs.events_processed == 3
         assert cs.error_count == 0
         assert cs.ended_at > 0.0
