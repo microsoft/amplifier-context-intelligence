@@ -76,21 +76,27 @@ def test_settings_has_durable_queue_defaults():
 # ---------------------------------------------------------------------------
 
 
-def test_crash_recovery_respawn_limit_defaults_to_unbounded():
-    """Default MUST preserve today's behaviour exactly: unbounded (None)."""
+def test_crash_recovery_respawn_limit_defaults_to_8():
+    """Default changes from unbounded (None) to a finite 8.
+
+    An unbounded default was never actually protective (no sweep task was
+    ever started -- see the sweep-interval test below), so this makes the
+    ceiling finite by default: an operator is now protected out of the box
+    instead of only when they remember to opt in."""
     from context_intelligence_server.config import Settings
 
     s = Settings()
-    assert s.crash_recovery_respawn_limit is None
+    assert s.crash_recovery_respawn_limit == 8
 
 
-def test_crash_recovery_sweep_interval_defaults_to_300():
-    """A finite ceiling drains its deferred tail via a periodic sweep; the
-    default interval must be a sane positive value so a finite cap is safe
-    out of the box (not silently stranded)."""
+def test_crash_recovery_sweep_interval_defaults_to_60():
+    """Default changes from 300 to 60, coupled to the respawn-limit
+    default change above. A finite ceiling with no sweep task can never
+    drain a deferred tail; 60s makes throughput drain-bound rather than
+    timer-bound for a large recovered backlog."""
     from context_intelligence_server.config import Settings
 
-    assert Settings().crash_recovery_sweep_interval_seconds == 300
+    assert Settings().crash_recovery_sweep_interval_seconds == 60
 
 
 def test_crash_recovery_sweep_interval_accepts_zero_and_positive():
@@ -435,7 +441,7 @@ def test_neo4j_flush_chunk_bytes_default():
 class TestValidateApiKeys:
     """T8-T12 / T22: _validate_api_keys enforces the NESTED shape, fail-closed.
 
-    The NESTED form (design D4) maps a 64-char SHA-256 hex digest to a metadata
+    The NESTED form maps a 64-char SHA-256 hex digest to a metadata
     dict carrying at least ``id``::
 
         api_keys:

@@ -27,7 +27,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # NOTE: ToolCallHandler stub injection is performed in conftest.py so it
 # fires before any test module loads, regardless of pytest collection order.
@@ -153,8 +152,8 @@ def test_setup_handlers_returns_pipeline_handlers() -> None:
 
 
 def test_setup_handlers_has_default_handler_with_services() -> None:
-    from context_intelligence_server.pipeline import setup_handlers
     from context_intelligence_server.handlers.data_layer_1.default import DefaultHandler
+    from context_intelligence_server.pipeline import setup_handlers
     from context_intelligence_server.services import HookStateService
 
     services = HookStateService(workspace="test")
@@ -185,17 +184,17 @@ def test_setup_handlers_enricher_count() -> None:
 def test_setup_handlers_enricher_order() -> None:
     """Enrichers must be [SessionHandler, OrchestratorRunHandler, IterationHandler,
     ContentBlockHandler, ToolCallHandler] in that dispatch order."""
-    from context_intelligence_server.pipeline import setup_handlers
-    from context_intelligence_server.handlers.data_layer_2.session import SessionHandler
-    from context_intelligence_server.handlers.data_layer_2.orchestrator_run import (
-        OrchestratorRunHandler,
+    from context_intelligence_server.handlers.data_layer_2.content_block import (
+        ContentBlockHandler,
     )
     from context_intelligence_server.handlers.data_layer_2.iteration import (
         IterationHandler,
     )
-    from context_intelligence_server.handlers.data_layer_2.content_block import (
-        ContentBlockHandler,
+    from context_intelligence_server.handlers.data_layer_2.orchestrator_run import (
+        OrchestratorRunHandler,
     )
+    from context_intelligence_server.handlers.data_layer_2.session import SessionHandler
+    from context_intelligence_server.pipeline import setup_handlers
     from context_intelligence_server.services import HookStateService
 
     services = HookStateService(workspace="test")
@@ -210,12 +209,8 @@ def test_setup_handlers_enricher_order() -> None:
 def test_setup_handlers_l3_enricher_order() -> None:
     """Layer 3 enrichers must be appended after all Layer 2 enrichers in correct order:
     [DelegationHandler, SkillLoadHandler, RecipeRunHandler, RecipeStepHandler]."""
-    from context_intelligence_server.pipeline import setup_handlers
     from context_intelligence_server.handlers.data_layer_3.delegation import (
         DelegationHandler,
-    )
-    from context_intelligence_server.handlers.data_layer_3.skill_load import (
-        SkillLoadHandler,
     )
     from context_intelligence_server.handlers.data_layer_3.recipe_run import (
         RecipeRunHandler,
@@ -223,6 +218,10 @@ def test_setup_handlers_l3_enricher_order() -> None:
     from context_intelligence_server.handlers.data_layer_3.recipe_step import (
         RecipeStepHandler,
     )
+    from context_intelligence_server.handlers.data_layer_3.skill_load import (
+        SkillLoadHandler,
+    )
+    from context_intelligence_server.pipeline import setup_handlers
     from context_intelligence_server.services import HookStateService
 
     services = HookStateService(workspace="test")
@@ -386,6 +385,61 @@ async def test_process_event_terminal_does_not_self_flush(
     data = {"session_id": "sess-123"}
     await process_event(mock_worker, "session:end", data, pipeline_handlers)
     mock_worker.services.graph.flush.assert_not_called()
+
+
+async def test_process_event_terminal_does_not_self_flush_real_handlers() -> None:
+    """D-DUW (R4/T-c): de-vacuumed sibling of the
+    test above. Wires the REAL ``setup_handlers(services)`` enricher set
+    (including the real ``SessionHandler``) instead of ``_StubEnricher``,
+    over an in-memory ``HookStateService``/``GraphState`` so no Neo4j is
+    needed.
+
+    The test above tests the ``pipeline`` module's OWN body only --
+    ``pipeline_handlers`` wires ``_StubEnricher`` instances, so the real
+    ``SessionHandler`` never runs and it cannot see a handler that flushes.
+    It passed even while ``SessionHandler._handle_end`` called
+    ``self.services.graph.flush()`` directly (the D-DUW bug). THIS test is
+    the real fence: RED on the pre-D-DUW tree, GREEN after Change 1 (the
+    flush deleted).
+
+    Non-vacuity control: assert the real ``SessionHandler`` actually ran
+    (the session node carries ``status == "completed"``), so a mis-wired
+    fixture cannot pass by simply not dispatching.
+    """
+    from context_intelligence_server.pipeline import process_event, setup_handlers
+    from context_intelligence_server.registry import SessionWorker
+    from context_intelligence_server.services import HookStateService
+
+    services = HookStateService(workspace="test-real-handlers")
+    handlers = setup_handlers(services)
+    worker = SessionWorker(
+        session_id="sess-real-1", workspace="test-real-handlers", services=services
+    )
+
+    real_flush = services.graph.flush
+    flush_calls: list[None] = []
+
+    async def _counting_flush() -> None:
+        flush_calls.append(None)
+        await real_flush()
+
+    services.graph.flush = _counting_flush  # type: ignore[method-assign]
+
+    data = {"session_id": "sess-real-1", "timestamp": "2026-01-01T00:00:00Z"}
+    await process_event(worker, "session:end", data, handlers)
+
+    assert flush_calls == [], (
+        f"SessionHandler._handle_end (via the REAL setup_handlers enrichers) "
+        f"called graph.flush directly {len(flush_calls)} time(s) -- "
+        f"process_event must not self-flush; the drainer's gated "
+        f"_flush_barrier is the sole trigger"
+    )
+
+    # Non-vacuity: the real SessionHandler actually ran and wrote the node.
+    node = await services.graph.get_node("sess-real-1")
+    assert node is not None and node.get("status") == "completed", (
+        f"real SessionHandler did not run (mis-wired fixture?): {node}"
+    )
 
 
 async def test_process_event_non_terminal_does_not_self_flush(

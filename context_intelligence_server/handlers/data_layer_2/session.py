@@ -316,7 +316,11 @@ class SessionHandler:
         parent_id = _parent_of(data)
 
         end_node_data: dict[str, Any] = {
-            "labels": ["Session", "SST_EVENT"],
+            # D-DUW: seed with the labels just read (session.py:313-314) so the
+            # buffered entry can never SHED a persisted terminal type. The removed
+            # handler flush used to clear the buffer here; a same-batch read after
+            # session:end now reads this entry instead of falling through to Neo4j.
+            "labels": ["Session", "SST_EVENT", *labels],
             "ended_at": timestamp,
             "status": "completed",
             "session_id": session_id,
@@ -357,10 +361,6 @@ class SessionHandler:
                 remove_labels=transition.remove,
                 add_labels=transition.add,
             )
-
-        # Terminal event: flush directly. There is no hot path after session:end;
-        # all buffered data must reach the backing store before the process exits.
-        await self.services.graph.flush()
 
     async def _create_mount_plan(
         self, session_id: str, data_layer_1_fork_node_id: str

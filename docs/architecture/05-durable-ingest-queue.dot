@@ -24,7 +24,7 @@ digraph durable_ingest_queue {
     ]
 
     // ============================================================
-    // PHASE 1 \u2014 HTTP Layer (synchronous, returns fast)
+    // PHASE 1 -- HTTP Layer (synchronous, returns fast)
     // ============================================================
     subgraph cluster_http {
         graph [
@@ -43,12 +43,12 @@ digraph durable_ingest_queue {
         ]
 
         BearerMiddleware [
-            label     = "BearerTokenMiddleware\n(ASGI middleware \u2014 see diagram 06 for full auth flow)\nverifies bearer token; stamps contributor_id into scope[\"state\"]\nexempt paths bypass auth (/status, /version, etc.)"
+            label     = "BearerTokenMiddleware\n(ASGI middleware -- see diagram 06 for full auth flow)\nverifies bearer token; stamps contributor_id into scope[\"state\"]\nexempt paths bypass auth (/status, /version, etc.)"
             fillcolor = "#B2EBF2"
         ]
 
         Auth401Exit [
-            label     = "HTTP 401 / 403\nauth_event=auth_denied\n(or resolver_unexpected_exception \u2192 401)"
+            label     = "HTTP 401 / 403\nauth_event=auth_denied\n(or resolver_unexpected_exception -> 401)"
             shape     = oval
             fillcolor = "#FFCCBC"
         ]
@@ -60,7 +60,7 @@ digraph durable_ingest_queue {
         ]
 
         ValidateTimestamp [
-            label     = "_validate_data_timestamp(data)\ndata[\"timestamp\"] must be present +\nnon-empty string + valid ISO-8601\n(fail loud at boundary \u2014 never silently dead-letter)"
+            label     = "_validate_data_timestamp(data)\ndata[\"timestamp\"] must be present +\nnon-empty string + valid ISO-8601\n(fail loud at boundary -- never silently dead-letter)"
             fillcolor = "#F5F5F5"
         ]
 
@@ -71,7 +71,7 @@ digraph durable_ingest_queue {
         ]
 
         IdempotencyHit [
-            label     = "Idempotency hit?\n(idempotency_key seen before)"
+            label     = "idempotency_cache.seen(key)?\n(key is recorded ONLY after a durable append,\nso a hit proves the event is on disk)"
             shape     = diamond
             fillcolor = "#FFF9C4"
             style     = filled
@@ -99,7 +99,20 @@ digraph durable_ingest_queue {
         ]
 
         QueueAppend [
-            label     = "QueueManager.append(worker_key, stamped_body)\nbody[\"created_by\"] = contributor_id (write-once, prevents spoofing)\nPERSIST-FIRST: append line to <key>.log\n(zero-silent-loss window)"
+            label     = "QueueManager.append(worker_key, stamped_body)\nbody[\"created_by\"] = contributor_id (write-once, prevents spoofing)\nPERSIST-FIRST: append line to <key>.log\nSINGLE-WRITER, ATOMIC FRAMING: per-key file lock held by the\nWRITING THREAD (not the coroutine) for the whole record \--\ncancellation cannot release it mid-write\nPARTIAL WRITE \-> truncated away + OSError raised to the caller\n(never left as a torn/merged line)"
+            fillcolor = "#C8E6C9"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.5
+        ]
+
+        AppendFailed [
+            label     = "append failed\npartial bytes DISCARDED, error surfaced\n(no idempotency key stored \-> a client retry\nis honoured, not falsely refused)"
+            shape     = oval
+            fillcolor = "#FFCCBC"
+        ]
+
+        IdempotencyStore [
+            label     = "idempotency_cache.store(key)\nAFTER the durable append succeeds \-- ordering is\nload-bearing: storing first would answer a retry\n\\\"duplicate\\\" for an event that is nowhere on disk"
             fillcolor = "#C8E6C9"
             fontname  = "Helvetica-Bold"
             penwidth  = 2.5
@@ -118,11 +131,11 @@ digraph durable_ingest_queue {
     }
 
     // ============================================================
-    // PHASE 2 \u2014 Per-session drainer (single sticky async task)
+    // PHASE 2 -- Per-session drainer (single sticky async task)
     // ============================================================
     subgraph cluster_drainer {
         graph [
-            label     = "Per-session drainer (registry.drain_worker)\n\u2014 single sticky async task per worker_key"
+            label     = "Per-session drainer (registry.drain_worker)\n-- single sticky async task per worker_key"
             style     = "filled"
             color     = "#2E7D32"
             fillcolor = "#F1F8E9"
@@ -136,12 +149,12 @@ digraph durable_ingest_queue {
         ]
 
         ProcessBatch [
-            label     = "process batch \u2192 build graph writes\n(handlers/enrichers \u2014 see diagram 01)"
+            label     = "process batch -> build graph writes\n(handlers/enrichers -- see diagram 01)"
             fillcolor = "#F5F5F5"
         ]
 
         FlushBarrier [
-            label     = "_flush_barrier()\nasync with write_semaphore (cap=write_concurrency)\ngraph.flush() \u2192 Neo4j"
+            label     = "_flush_barrier()\nasync with write_semaphore (cap=write_concurrency)\ngraph.flush() -> Neo4j"
             fillcolor = "#C8E6C9"
             fontname  = "Helvetica-Bold"
             penwidth  = 2.5
@@ -177,8 +190,15 @@ digraph durable_ingest_queue {
         ]
 
         DeadLetterOut [
-            label     = "\u2192 <key>.dead.jsonl"
+            label     = "POISON -> DEAD-LETTER -> CONTINUE\nthe unparseable/poison line goes to <key>.dead.jsonl\nand the offset advances PAST it -- draining resumes\nat the next line; one bad record never halts the drain"
             fillcolor = "#F5F5F5"
+        ]
+
+        DrainSupervisor [
+            label     = "drain-task done-callback (the ONE supervision point)\ntask died with an exception?\n-> log 'drain_worker_died' at ERROR (session id + traceback)\n-> deregister the session, then close its store\nso the session is RECOVERABLE, never a silent orphan"
+            fillcolor = "#FFE0B2"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.0
         ]
     }
 
@@ -221,11 +241,40 @@ digraph durable_ingest_queue {
     }
 
     // ============================================================
+    // SELF-SHRINKING STORAGE
+    // the queue is a TRANSIENT BUFFER, not an archive
+    // ============================================================
+    subgraph cluster_shrink {
+        graph [
+            label     = "Self-shrinking storage\n(the queue is a TRANSIENT BUFFER, not an archive)"
+            style     = "filled"
+            color     = "#00838F"
+            fillcolor = "#E0F7FA"
+            fontname  = "Helvetica"
+            fontsize  = 10
+        ]
+
+        Compaction [
+            label     = "compact_committed_prefix()  (queue_compact_enabled, default ON)\nCONTINUOUS reclaim of a LIVE session's already-committed\nprefix [0, C) -- not just at session end. The .log then holds\nthe UNDRAINED TAIL, not the whole session history.\nfrequency bounded by queue_compact_min_prefix_bytes\ncost/lock-hold bounded by queue_compact_max_tail_bytes\nrebase .offset to 0 FIRST, then swap the tail in\n(every crash window degrades to a bounded re-drive, never a loss)"
+            fillcolor = "#80DEEA"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.0
+        ]
+
+        DeadLetterExpiry [
+            label     = "expire_dead_letters()  (dead_letter_expiry_enabled, default ON)\nLOG-LESS ONLY: no <key>.log exists (a structural proof that no\nboot mechanism can ever consult the file being expired)\nAND mtime older than dead_letter_retention_seconds (30d default)\nruns at boot (phase=expire) and on every sweep tick"
+            fillcolor = "#80DEEA"
+        ]
+
+        Compaction -> DeadLetterExpiry [style = invis]
+    }
+
+    // ============================================================
     // CRASH RECOVERY (startup, main.py lifespan)
     // ============================================================
     subgraph cluster_recovery {
         graph [
-            label     = "Crash recovery (startup, main.py lifespan)"
+            label     = "Phased boot reconciliation (main.py lifespan -> _boot_reconcile)\nspawned as a supervised BACKGROUND task, NOT awaited --\n/status and /version answer from the FIRST phase"
             style     = "filled"
             color     = "#6A1B9A"
             fillcolor = "#F3E5F5"
@@ -233,19 +282,58 @@ digraph durable_ingest_queue {
             fontsize  = 10
         ]
 
-        ReconcileDead [
-            label     = "recovery_reconcile_dead()\n(advance past already-dead-lettered pending lines\n\u2014 closes the dead_letter\u2192commit crash window)"
+        PhaseRecovering [
+            label     = "phase = recovering\nboot_state.begin()\n(the DEFAULT phase from module import --\nnever 'ready' until proven)"
             fillcolor = "#E1BEE7"
         ]
 
-        SeedCounts [
-            label     = "recovery_seed_counts()\nseed accepted/written from disk\nso residual==0 at startup"
+        PhaseHeal [
+            label     = "phase = heal\nheal_torn_tails()\nquarantine any torn tail left by a hard kill"
             fillcolor = "#E1BEE7"
         ]
 
-        RecoverSpawn [
-            label     = "recover()\nrespawn a drainer per session\nwith unprocessed lines"
+        PhaseReclaim [
+            label     = "phase = reclaim\nCLASSIFY every pre-existing key:\nresumable | drained | unresumable | reset_offset\nDRY-RUN BY DEFAULT (reclaim_enabled=False):\nclassify + audit-log always; UNLINK only when enabled\nbounded re-drain instead of delete below\nreclaim_redrain_max_bytes"
             fillcolor = "#E1BEE7"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.0
+        ]
+
+        PhaseExpire [
+            label     = "phase = expire\nexpire_dead_letters()\n(log-less + past dead_letter_retention_seconds)"
+            fillcolor = "#E1BEE7"
+        ]
+
+        PhaseReconcile [
+            label     = "phase = reconcile\nrecovery_reconcile_dead()\n(advance past already-dead-lettered pending lines\n-- closes the dead_letter->commit crash window)"
+            fillcolor = "#E1BEE7"
+        ]
+
+        PhaseSeed [
+            label     = "phase = seed\nrecovery_seed_counts()\nseed accepted/written from disk\nso residual==0 at startup"
+            fillcolor = "#E1BEE7"
+        ]
+
+        PhaseTopup [
+            label     = "phase = topup\nrespawn a drainer per recovered session,\nCAPPED at crash_recovery_respawn_limit\ndeferred tail: untouched on disk, still recoverable"
+            fillcolor = "#E1BEE7"
+        ]
+
+        PhaseSweep [
+            label     = "phase = sweep\nstart the periodic top-up loop\n(crash_recovery_sweep_interval_seconds)\nadvances the deferred tail at a BOUNDED rate"
+            fillcolor = "#E1BEE7"
+        ]
+
+        PhaseReady [
+            label     = "phase = ready\nboot over: /status fills in metrics + spool,\nPOST /queues/gc/apply is admitted"
+            shape     = oval
+            fillcolor = "#C8E6C9"
+        ]
+
+        PhaseFailed [
+            label     = "phase = failed\nANY step raised -> failed_step + error recorded,\nloud traceback logged, and THE SERVER KEEPS SERVING\n(/status stays HTTP 200 / status:ok at every phase --\nthe boot phase is informational, never a liveness signal)"
+            shape     = oval
+            fillcolor = "#FFCCBC"
         ]
 
         WorkersGuard [
@@ -254,8 +342,16 @@ digraph durable_ingest_queue {
             style     = filled
         ]
 
-        ReconcileDead -> SeedCounts -> RecoverSpawn
-        RecoverSpawn   -> WorkersGuard [style = dotted, color = "#AAAAAA", arrowhead = none]
+        PhaseRecovering -> PhaseHeal -> PhaseReclaim -> PhaseExpire -> PhaseReconcile
+        PhaseReconcile  -> PhaseSeed -> PhaseTopup -> PhaseSweep -> PhaseReady
+        PhaseReclaim -> PhaseFailed [
+            label     = "any phase raises"
+            style     = dashed
+            color     = "#C62828"
+            fontcolor = "#C62828"
+            constraint = false
+        ]
+        PhaseTopup   -> WorkersGuard [style = dotted, color = "#AAAAAA", arrowhead = none]
     }
 
     // ============================================================
@@ -277,17 +373,31 @@ digraph durable_ingest_queue {
         ]
 
         StatusEndpoint [
-            label     = "GET /status .metrics\n(unauthenticated, aggregate-only)"
+            label     = "GET /status  (unauthenticated, aggregate-only)\nALWAYS present:  .boot {phase, failed_step, error, counters}\n                 .writer_lease {mode, acquired, conflict, ...}\nWHILE BOOTING:   .metrics = null AND .spool = null\n                 .status_detail = {reason: \"booting\"}\n                 (ZERO disk reads on this request path)\nONCE phase is ready|failed:\n                 .metrics + .spool populated"
             fillcolor = "#B3E5FC"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.0
         ]
 
         QueuesEndpoint [
-            label     = "routers/queues.py (authenticated: Bearer)\nGET /queues/dead-letter\nPOST .../{worker_key}/replay\nPOST .../{worker_key}/purge"
+            label     = "routers/queues.py (authenticated: Bearer)\nGET  /queues/dead-letter                      (read)\nPOST .../{worker_key}/replay                  (write)\nPOST .../{worker_key}/purge                   (write)\nGET  /queues/gc        PREVIEW  (read)  -- stat/read ONLY,\n       deletes NOTHING, and is UNGATED during boot\nPOST /queues/gc/apply  APPLY    (write) -- 409 until boot is\n       ready|failed; bounded by gc_max_delete_per_pass;\n       body {max_delete} may only LOWER that ceiling;\n       every item RE-VERIFIED under its per-key lock\n       immediately before deletion"
             fillcolor = "#B3E5FC"
+        ]
+
+        WriterLease [
+            label     = "WriterLease -- DETECTOR, NOT A MUTEX\n(writer_lease_mode, DEFAULT 'detect' -- NEVER refuses to boot)\nheartbeats <queues>/.writer.lease every\nwriter_lease_heartbeat_seconds (5s); stale after\nheartbeat x writer_lease_staleness_multiplier (15s)\nLATCHES a foreign writer -> visible within ONE heartbeat.\nDetects the rolling-deploy overlap that corrupts the append\nlog; it does NOT make concurrent appends safe.\n'enforce' additionally refuses a fresh foreign lease at boot."
+            fillcolor = "#FFE0B2"
+            fontname  = "Helvetica-Bold"
+            penwidth  = 2.0
         ]
 
         PipelineMetrics -> StatusEndpoint
         PipelineMetrics -> QueuesEndpoint [style = invis]
+        WriterLease -> StatusEndpoint [
+            label     = ".writer_lease\n(pure in-memory,\nevery phase)"
+            color     = "#E65100"
+            fontcolor = "#E65100"
+        ]
     }
 
     // ============================================================
@@ -304,7 +414,9 @@ digraph durable_ingest_queue {
     IdempotencyHit  -> WorkerKey         [label = "no"]
     WorkerKey       -> GetOrCreate
     GetOrCreate     -> QueueAppend
-    QueueAppend     -> RecordAccepted
+    QueueAppend     -> AppendFailed      [label = "OSError\n(partial discarded)"]
+    QueueAppend     -> IdempotencyStore  [label = "durably appended"]
+    IdempotencyStore -> RecordAccepted
     RecordAccepted  -> Http202
 
     // ============================================================
@@ -320,19 +432,28 @@ digraph durable_ingest_queue {
     MaxAttempts     -> HandleExhausted [label = "yes"]
     WriteRetry      -> FlushBarrier    [label = "retry", constraint = false]
     HandleExhausted -> DeadLetterOut
-    DeadLetterOut   -> ReadBatch       [label = "resume", constraint = false]
+    DeadLetterOut   -> ReadBatch       [label = "continue past\nthe poison line", constraint = false]
 
-    // Recovery spawns drainer(s) at startup
-    RecoverSpawn    -> ReadBatch [
+    // Supervision: the drain task's done-callback observes ANY death.
+    ReadBatch       -> DrainSupervisor [
+        style      = dotted
+        color      = "#EF6C00"
+        fontcolor  = "#EF6C00"
+        label      = "drain task raised\n(done-callback)"
+        constraint = false
+    ]
+
+    // The boot topup spawns drainer(s) at startup
+    PhaseTopup      -> ReadBatch [
         style      = dashed
         color      = "#6A1B9A"
         fontcolor  = "#6A1B9A"
-        label      = "spawns drainer\nper session"
+        label      = "spawns drainer\nper recovered session\n(capped)"
         constraint = false
     ]
 
     // ============================================================
-    // DURABLE FILE edges (dashed \u2014 annotate the side-effects)
+    // DURABLE FILE edges (dashed -- annotate the side-effects)
     // ============================================================
     QueueAppend      -> FileLog    [
         style      = dashed
@@ -346,6 +467,31 @@ digraph durable_ingest_queue {
         color      = "#795548"
         fontcolor  = "#795548"
         label      = "commit\n(atomic)"
+        constraint = false
+    ]
+
+    // Commit is what makes the prefix reclaimable: the committed offset is the
+    // single value the durability design already trusts.
+    CommitAndRecord  -> Compaction [
+        style      = dashed
+        color      = "#00838F"
+        fontcolor  = "#00838F"
+        label      = "committed offset C\ntriggers reclaim"
+        constraint = false
+    ]
+    Compaction       -> FileLog [
+        style      = dashed
+        color      = "#00838F"
+        fontcolor  = "#00838F"
+        label      = "rewrite: drop [0, C),\nkeep the undrained tail\n(.offset rebased to 0 first)"
+        constraint = false
+    ]
+    DeadLetterExpiry -> FileDeadLetter [
+        style      = dashed
+        color      = "#00838F"
+        fontcolor  = "#00838F"
+        label      = "expire\n(log-less + aged out)"
+        arrowhead  = odot
         constraint = false
     ]
     HandleExhausted  -> FileDeadLetter [
@@ -381,6 +527,42 @@ digraph durable_ingest_queue {
         color      = "#0277BD"
         fontcolor  = "#0277BD"
         label      = "replay\n(re-append)"
+        constraint = false
+    ]
+
+    // GC: PREVIEW only ever READS. Deletion is reachable ONLY from apply.
+    QueuesEndpoint   -> FileOffset [
+        style      = dashed
+        color      = "#0277BD"
+        fontcolor  = "#0277BD"
+        label      = "GET /queues/gc\nscans (stat + offset READ only,\nno path to an unlink)"
+        arrowhead  = open
+        constraint = false
+    ]
+    QueuesEndpoint   -> FileLog [
+        style      = bold
+        color      = "#C62828"
+        fontcolor  = "#C62828"
+        label      = "POST /queues/gc/apply ONLY:\ndelete a FULLY-DRAINED log\n(committed == size, re-verified\nunder the per-key lock)"
+        arrowhead  = odot
+        constraint = false
+    ]
+    QueuesEndpoint   -> FileDeadLetter [
+        style      = bold
+        color      = "#C62828"
+        fontcolor  = "#C62828"
+        label      = "POST /queues/gc/apply ONLY:\ndelete an EXPIRED LOG-LESS\ndead-letter"
+        arrowhead  = odot
+        constraint = false
+    ]
+
+    // The writer lease guards the DIRECTORY the append log lives in.
+    WriterLease      -> FileLog [
+        style      = dotted
+        color      = "#E65100"
+        fontcolor  = "#E65100"
+        label      = "watches <queues_path>/.writer.lease\nfor a SECOND writer on this directory"
+        arrowhead  = none
         constraint = false
     ]
 
@@ -429,7 +611,22 @@ digraph durable_ingest_queue {
             shape     = oval
             fillcolor = "#FFCCBC"
         ]
+        LegShrink [
+            label     = "self-shrinking storage\n(compaction / expiry)"
+            fillcolor = "#80DEEA"
+        ]
+        LegDetect [
+            label     = "supervision / detection\n(not prevention)"
+            fillcolor = "#FFE0B2"
+        ]
+        LegDelete [
+            label     = "deletion edge\n(reachable ONLY from\nPOST /queues/gc/apply)"
+            shape     = plaintext
+            style     = ""
+            fontcolor = "#C62828"
+        ]
 
         LegGreen -> LegAuth -> LegDiamond -> LegFile -> LegOval -> LegError [style = invis]
+        LegError -> LegShrink -> LegDetect -> LegDelete [style = invis]
     }
 }

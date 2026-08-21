@@ -12,6 +12,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from context_intelligence_server.graph_store import GraphStore
 from context_intelligence_server.handlers.data_layer_2.state import DataLayer2State
 from context_intelligence_server.handlers.data_layer_3.state import DataLayer3State
 
@@ -225,13 +226,31 @@ class HookStateService:
     def __init__(
         self,
         workspace: str = "default",
-        graph_store: Any | None = None,
+        graph_store: GraphStore | None = None,
         *,
         created_by: str | None = None,
         raw_config: dict[str, Any] | None = None,
         blob_store: Any | None = None,
     ) -> None:
         self.config = HookConfig(raw_config or {})
+        # M6-lite (spec section 6.4): the PARAMETER above is typed as
+        # GraphStore | None (closes V3 -- a caller can no longer pass an
+        # arbitrary duck-typed object into the CONSTRUCTOR without the type
+        # checker verifying it against the Protocol). self.graph itself is
+        # explicitly kept as `Any` here (an explicit annotation, not an
+        # omission -- pyright otherwise infers GraphStore | GraphState from
+        # the two assignments below regardless, which is exactly the wider
+        # blast radius this descope avoids).
+        #
+        # Measured (uv run pyright over tests/): fully typing self.graph as
+        # GraphStore ripples into 100+ pre-existing test-file errors across
+        # handlers/data_layer_2 and handlers/data_layer_3 -- tests that reach
+        # into GraphState's private _nodes/_edges buffers directly for
+        # assertions -- far past the "19 duck-typed graph_store= call sites,
+        # <=1 line each" threshold the spec sets for landing the full M6.
+        # Descoped here; the deeper observability/boundary follow-up is
+        # tracked separately.
+        self.graph: Any
         if graph_store is not None:
             self.graph = graph_store
         else:

@@ -51,3 +51,13 @@ class CypherRequest(BaseModel):
     query: str
     params: dict[str, Any] = Field(default_factory=dict)
     workspace: str | None = None
+
+
+class GcApplyRequest(BaseModel):
+    """Body for POST /queues/gc/apply. Every field is optional.
+
+    A bodyless POST must succeed (R6) -- the router accepts
+    ``body: GcApplyRequest | None = None``, never a required body.
+    """
+
+    max_delete: int | None = Field(default=None, ge=1)

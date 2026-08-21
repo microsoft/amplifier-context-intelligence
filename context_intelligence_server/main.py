@@ -10,7 +10,9 @@ import sys
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +50,12 @@ from context_intelligence_server.registry import SessionRegistry
 from context_intelligence_server.routers.admin import router as admin_router
 from context_intelligence_server.routers.queues import router as queues_router
 from context_intelligence_server.routers.version import router as version_router
-from context_intelligence_server.status import build_status_response
+from context_intelligence_server.status import boot_state, build_status_response
+from context_intelligence_server.writer_lease import (
+    WriterLeaseConflict,
+    shutdown_lease_io,
+    writer_lease,
+)
 
 _settings = get_settings()
 
@@ -102,10 +109,64 @@ def get_entra_identity_store() -> IdentityStore | None:
     return _entra_identity_store
 
 
+# The last-resort workspace for a recovered session
+# whose head line does NOT resolve a workspace even after the byte-0
+# fallback. Dispatching under this sentinel is strictly better than deleting
+# the file outright: a drainer spawns, its own dead-letter-and-advance
+# isolates the unparseable line, and every event BEHIND it still reaches the
+# graph. See ``_head_is_resumable`` / ``_parse_workspace_and_creator`` below.
+_RECOVERY_FALLBACK_WORKSPACE = "unknown-recovered"
+
+
+def _head_is_resumable(raw: bytes) -> bool:
+    """TOTAL predicate (M-1/R4): does ``raw`` parse to a dict with a workspace?
+
+    Shared by ``_recover_one_session`` (recovery dispatch, via
+    ``_parse_workspace_and_creator``) and ``QueueManager.classify_session``
+    (boot-safety reclaim, injected as a pure ``Callable[[bytes], bool]`` -- the queue
+    must not learn the event schema). ONE definition, two consumers. NEVER
+    RAISES: valid-but-non-dict JSON (``123``, ``null``, ``"str"``, ``[]``)
+    must not escape as an ``AttributeError`` from ``obj.get(...)`` -- the
+    exact Q-5 bug class, and this predicate is a boot-path total function.
+    """
+    try:
+        obj = json.loads(raw)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(obj, dict):
+        return False
+    try:
+        return bool(obj.get("workspace", ""))
+    except (AttributeError, TypeError):
+        return False
+
+
+def _parse_workspace_and_creator(raw: str | bytes) -> tuple[str, str | None] | None:
+    """Return ``(workspace, created_by)`` iff ``raw`` parses to a dict with a
+    non-empty workspace, else ``None``. Total -- never raises."""
+    try:
+        obj = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    try:
+        workspace = obj.get("workspace", "")
+        created_by = obj.get("created_by")
+    except (AttributeError, TypeError):
+        return None
+    if not workspace:
+        return None
+    return workspace, created_by
+
+
 def _recover_one_session(
     sid: str,
     first_line: str | bytes,
     get_or_create: Any,
+    first_log_line: bytes | None = None,
+    *,
+    recovered: bool = True,
 ) -> bool:
     """Parse the first queued line for *sid* and respawn a drainer when valid.
 
@@ -113,67 +174,172 @@ def _recover_one_session(
     real parsing/dispatch logic rather than reimplementing it inline.
 
     The queue-read step is handled by the caller (the lifespan loop or the test)
-    so this function is pure — no I/O, fully synchronous.
+    so this function is pure -- no I/O, fully synchronous.
 
     Args:
         sid:            Session id being recovered.
         first_line:     The first raw log line (bytes from QueueManager or str
                         from tests).  ``json.loads`` accepts both.
-        get_or_create:  The registry callable — ``registry.get_or_create`` in
+        get_or_create:  The registry callable -- ``registry.get_or_create`` in
                         production or a spy in tests.
+        first_log_line: (optional) the session's BYTE-0 line, read by
+                        the caller via ``QueueManager.read_first_line`` --
+                        used ONLY when ``first_line`` fails to resolve a
+                        workspace. Omitting it (the default) preserves the
+                        original behaviour exactly: a bad/torn head line is
+                        skipped with no fallback attempted.
+        recovered:      Passed straight through to ``get_or_create``
+                        so a dispatched-from-recovery worker is exit-eligible
+                        once its backlog drains. Defaults to True because
+                        every real caller of this function IS the recovery
+                        path.
 
     Returns:
-        True  – drainer was (re)spawned via *get_or_create*.
-        False – session skipped (empty/torn workspace, or malformed JSON line).
+        True  -- drainer was (re)spawned via *get_or_create*.
+        False -- session skipped (empty/torn workspace, or malformed JSON
+                 line, with no fallback available or all fallbacks exhausted).
     """
-    try:
-        obj = json.loads(first_line)
-        workspace: str = obj.get("workspace", "")
-        created_by: str | None = obj.get("created_by")
-    except (ValueError, KeyError):
-        workspace = ""
-        created_by = None
-    if not workspace:
-        logger.warning(
-            "recovery_skipped session=%s: torn or empty workspace in first line",
+    parsed = _parse_workspace_and_creator(first_line)
+    if parsed is not None:
+        workspace, created_by = parsed
+        get_or_create(sid, workspace, created_by=created_by, recovered=recovered)
+        return True
+
+    if first_log_line is not None:
+        byte0_parsed = _parse_workspace_and_creator(first_log_line)
+        if byte0_parsed is not None:
+            workspace, created_by = byte0_parsed
+            logger.warning("recovery_fallback_workspace session=%s source=byte0", sid)
+            get_or_create(sid, workspace, created_by=created_by, recovered=recovered)
+            return True
+        # Sentinel: the LAST resort (a structural
+        # graph-identity cost, not a cosmetic one). Dispatch anyway: the
+        # drainer dead-letters the unparseable head and drains everything
+        # behind it, strictly better than destroying that data outright.
+        logger.warning("recovery_fallback_workspace session=%s source=sentinel", sid)
+        get_or_create(
             sid,
+            _RECOVERY_FALLBACK_WORKSPACE,
+            created_by=None,
+            recovered=recovered,
         )
-        return False
-    get_or_create(sid, workspace, created_by=created_by)
-    return True
+        return True
+
+    logger.warning(
+        "recovery_skipped session=%s: torn or empty workspace in first line",
+        sid,
+    )
+    return False
 
 
-async def _crash_recovery_topup(respawn_limit: int | None) -> int:
+@dataclass
+class TopupResult:
+    """Result of one ``_crash_recovery_topup`` pass (M-2).
+
+    ``dispatched``: sessions DISPATCHED to get_or_create this pass (an upper
+    bound on newly-spawned drainers -- get_or_create is idempotent).
+    ``recovered``: the total size of ``recover()``'s report THIS pass, before
+    any ceiling slicing -- lets the boot path report ``deferred`` to
+    ``/status`` without a second ``recover()`` scan (~2.5 GiB on the real
+    corpus).
+    ``deferred``: ``recovered`` minus how many were actually processed this
+    pass (0 when the ceiling is ``None``, i.e. unbounded).
+    """
+
+    dispatched: int
+    recovered: int
+    deferred: int
+
+
+async def _crash_recovery_topup(respawn_limit: int | None) -> TopupResult:
     """One bounded crash-recovery pass: respawn drainers for up to
     ``respawn_limit`` recovered sessions (all of them when ``None``).
 
-    This is the shared body of the boot-time recovery and the periodic sweep.
-    It is SAFE to call repeatedly on a live server because respawn is
-    idempotent -- ``registry.get_or_create`` returns the existing worker for a
-    session that already has a live drainer (no duplicate drainer, no reset).
-    And because ``recover()`` reports only sessions that still have undrained
-    data, a session drops out the moment it finishes, so the number of live
-    RECOVERED drainers stays <= ``respawn_limit`` while the deferred tail
-    advances in deterministic sorted order as head sessions drain.
+    This is the shared body of the boot-time recovery and the periodic sweep
+    (now the ONLY recovery-dispatch body -- the former lifespan inline
+    loop was a duplicate and is deleted, M-6). It is SAFE to call repeatedly
+    on a live server because respawn is idempotent -- ``registry.get_or_create``
+    returns the existing worker for a session that already has a live
+    drainer (no duplicate drainer, no reset). And because ``recover()``
+    reports only sessions that still have undrained data, a session drops
+    out the moment it finishes, so the number of live RECOVERED drainers
+    stays <= ``respawn_limit`` per dispatch pass (see B2 for why LIVE
+    recovered drainers are ALSO bounded independently -- via the drain
+    loop's own dry-exit, not this ceiling -- since a drained-out-but-still-
+    registered drainer stays alive between passes).
 
-    Returns the number of sessions DISPATCHED to get_or_create on this pass --
-    an upper bound on newly-spawned drainers, since get_or_create is a no-op
-    for a session that already has a live drainer (see NOTE in the loop).
+    B3: when the head line does not resolve a workspace, this now tries
+    the session's byte-0 line before giving up on it entirely -- the data
+    behind an unparseable head is still recoverable (see
+    ``_recover_one_session``'s docstring).
     """
     recovered = await registry.queue_manager.recover()
     to_process = recovered if respawn_limit is None else recovered[:respawn_limit]
-    respawned = 0
+    deferred_count = (
+        0 if respawn_limit is None else max(0, len(recovered) - respawn_limit)
+    )
+    dispatched = 0
     for sid in to_process:
-        batch = await registry.queue_manager.read_batch(sid, max_items=1)
+        try:
+            # Guarded HERE, at the boot/sweep call site -- NOT
+            # inside read_batch itself, which is also the LIVE drainer's hot
+            # path and must stay loud on a real read failure. Only the
+            # recovery-dispatch loop needs to degrade past one bad key.
+            batch = await registry.queue_manager.read_batch(sid, max_items=1)
+        except (OSError, ValueError):
+            # Cheap tightening: attach the traceback (was
+            # message-only) so a repeating read failure yields a traceback.
+            logger.exception("crash_recovery_topup_read_failed session=%s", sid)
+            continue
         if not batch.lines:
+            # recover() reported this session as having a
+            # complete unprocessed line, but read_batch found none --
+            # recover()/read_batch disagreement (e.g. a concurrent
+            # compaction/drain advanced the offset between the two calls).
+            # Not a loss -- the session is simply no longer recoverable by
+            # the time this pass reached it -- but a silent `continue` here
+            # was indistinguishable from "recover() was simply wrong".
+            logger.warning(
+                "recovery_skipped_empty_batch session=%s reason=empty_batch",
+                sid,
+            )
             continue
         # NOTE: _recover_one_session returns True whenever it dispatched to
         # get_or_create, whether or not a drainer already existed (get_or_create
         # is idempotent). So this count is "sessions dispatched this pass", an
         # upper bound on newly-spawned drainers -- fine for an INFO log.
-        if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
-            respawned += 1
-    return respawned
+        dispatched_ok = _recover_one_session(
+            sid, batch.lines[0], registry.get_or_create
+        )
+        if not dispatched_ok:
+            first_log_line = await registry.queue_manager.read_first_line(sid)
+            dispatched_ok = _recover_one_session(
+                sid,
+                batch.lines[0],
+                registry.get_or_create,
+                first_log_line=first_log_line,
+            )
+        if dispatched_ok:
+            dispatched += 1
+    if deferred_count:
+        # Loud on purpose (WARNING, not INFO): a deferred backlog must never
+        # be a silent, un-discoverable fact -- that silence is exactly what
+        # let the 38 GB spool go unnoticed for two days in the incident this
+        # guards against. Names the exact counts and the setting to raise.
+        logger.warning(
+            "lifespan_startup: crash-recovery respawn cap reached "
+            "(crash_recovery_respawn_limit=%d): %d/%d respawned this pass, "
+            "%d session(s) deferred to a later pass (untouched on disk, "
+            "still fully recoverable). Raise crash_recovery_respawn_limit "
+            "to respawn more per pass.",
+            respawn_limit,
+            dispatched,
+            len(to_process),
+            deferred_count,
+        )
+    return TopupResult(
+        dispatched=dispatched, recovered=len(recovered), deferred=deferred_count
+    )
 
 
 async def _crash_recovery_sweep_loop(interval: int, respawn_limit: int) -> None:
@@ -181,27 +347,259 @@ async def _crash_recovery_sweep_loop(interval: int, respawn_limit: int) -> None:
     finite ``crash_recovery_respawn_limit`` cannot permanently strand the
     deferred backlog (the tail only advances as head sessions finish draining).
 
-    Started by ``lifespan`` ONLY when a finite ceiling is configured and the
-    interval is > 0; with the default unbounded ceiling there is no deferred
-    tail and this loop never runs. A single failed tick must never kill the
-    loop, so the body is guarded (CancelledError propagates for clean
-    shutdown; everything else is logged and the loop continues).
+    Started (from ``_boot_reconcile``, after the topup) whenever a
+    finite ceiling is configured and the interval is > 0. A single failed
+    tick must never kill the loop, so the body is guarded (CancelledError
+    propagates for clean shutdown; everything else is logged and the loop
+    continues).
     """
     while True:
         try:
             await asyncio.sleep(interval)
-            respawned = await _crash_recovery_topup(respawn_limit)
-            if respawned:
+            result = await _crash_recovery_topup(respawn_limit)
+            if result.dispatched:
                 logger.info(
                     "crash_recovery_sweep: dispatched %d recovered session(s) "
                     "(ceiling=%d) -- draining deferred backlog",
-                    respawned,
+                    result.dispatched,
                     respawn_limit,
                 )
+            # Sweep-tick dead-letter
+            # expiry. Unlike the boot phase, counters are LIVE here, so the
+            # expired records MUST be reported via record_purged -- they
+            # were counted into `accepted` at ingest but never `written`;
+            # dropping them from disk without dropping them from `accepted`
+            # would latch the residual at +n forever.
+            expire_result = await registry.queue_manager.expire_dead_letters(
+                time.time(),
+                _settings.dead_letter_retention_seconds,
+                _settings.dead_letter_expiry_enabled,
+            )
+            if expire_result["expired_records"]:
+                registry.record_purged(expire_result["expired_records"])
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 - a sweep tick must never kill the loop
-            logger.warning("crash_recovery_sweep: tick failed, will retry: %s", exc)
+        except Exception as exc:
+            # Cheap tightening: attach the traceback (was
+            # message-only) so a repeating sweep-tick failure yields one.
+            logger.warning(
+                "crash_recovery_sweep: tick failed, will retry: %s",
+                exc,
+                exc_info=True,
+            )
+
+
+async def _writer_lease_boot() -> None:
+    """The ONLY writer-lease call on the synchronous boot path. Guarded so
+    that exactly ONE exception type -- the
+    intended `enforce`-mode refusal -- can escape.
+
+    The heartbeat task is created whenever ``writer_lease_mode != "off"``,
+    INCLUDING after a failed acquire -- that IS the re-arm mechanism a
+    transient fault depends on. ``mark_unarmed`` also fills
+    ``writer_lease.mode`` if ``acquire()`` failed before setting it, so
+    ``/status`` never shows ``mode: null`` while a lease task is running.
+    """
+    try:
+        await writer_lease.acquire(_settings, lambda: registry.queues_dir_path)
+    except WriterLeaseConflict:
+        raise  # the ONE intended abort (enforce mode only)
+    except Exception as exc:  # noqa: BLE001 - a detector must never crash-loop the server
+        logger.error(
+            "writer_lease: boot acquire failed -- the writer-lease detector "
+            "is NOT ARMED for this process: %r",
+            exc,
+        )
+        writer_lease.mark_unarmed(repr(exc), _settings.writer_lease_mode)
+    if _settings.writer_lease_mode != "off":
+        app.state.lease_task = asyncio.create_task(writer_lease.heartbeat_loop())
+
+
+async def _boot_reclaim() -> None:
+    """The reclaim pass -- log-then-delete every un-resumable /
+    already-drained key, resume-with-fallback for a recoverable-but-
+    unparseable-head key, and reset a bounded bad-offset key.
+
+    Iterates `*.log` STEMS only (R10) -- a log-less key (only a
+    `.dead.jsonl`) belongs to ``reclaim_orphans``, never classified here.
+
+    Gate 1 (ownership): skip any key with a LIVE registry worker, checked
+    FRESH on the event loop immediately before classifying -- the registry
+    owns live sessions; this pass only ever touches unowned keys.
+
+    Runs classify UNCONDITIONALLY; ``reclaim``/``reclaim_orphans`` (the
+    actual unlink/reset) run ONLY when ``reclaim_enabled`` -- the
+    documented dry-run-first deploy sequence.
+    """
+    qm = registry.queue_manager
+    # Use the MODULE-LEVEL `_settings` (same object `_boot_reconcile` and
+    # every test's `monkeypatch.setattr(main_module._settings, ...)` reads),
+    # not a fresh `get_settings()` call -- if anything upstream ever clears
+    # the settings lru_cache, a fresh call could return a DIFFERENT object
+    # than the one already bound to `_settings`, silently detaching this
+    # function from a test's (or an operator's live-reload's) mutation.
+    settings = _settings
+    boot_state.reclaim_enabled = settings.reclaim_enabled
+    # Iterate the QueueManager's OWN directory (qm.queues_dir), not a
+    # path recomputed from settings.queues_path -- registry.queue_manager may
+    # be pointed at a directory that differs from the live Settings
+    # singleton's queues_path (tests do this routinely), and this must never
+    # silently scan the wrong directory.
+    keys = sorted(p.stem for p in qm.queues_dir.glob("*.log"))
+    reclaimed = 0
+    reclaimed_bytes = 0
+    kept = 0
+    failed = 0
+    for key in keys:
+        if registry.has_worker(key):
+            kept += 1
+            continue
+        try:
+            c = await qm.classify_session(key, _head_is_resumable)
+        except (OSError, ValueError) as exc:  # pragma: no cover -- defence in depth
+            logger.error("boot_reclaim_classify_failed session=%s error=%s", key, exc)
+            failed += 1
+            continue
+        if c.verdict.value == "resumable":
+            kept += 1
+            if c.reason == "fallback_workspace":
+                if c.fallback_source == "byte0":
+                    boot_state.fallback_workspace_byte0 += 1
+                elif c.fallback_source == "sentinel":
+                    boot_state.fallback_workspace_sentinel += 1
+            continue
+        if c.verdict.value == "unreadable":
+            failed += 1
+            logger.warning("boot_reclaim_kept reason=%s session=%s", c.reason, key)
+            continue
+        if c.verdict.value == "keep":
+            kept += 1
+            logger.warning("boot_reclaim_kept reason=%s session=%s", c.reason, key)
+            continue
+        # verdict in (unresumable, drained, reset_offset): actionable.
+        if not settings.reclaim_enabled:
+            logger.warning(
+                "boot_reclaimed reason=%s path=%s session=%s bytes=%d action=dry_run",
+                c.reason,
+                Path(settings.queues_path) / f"{key}.log",
+                key,
+                c.size,
+            )
+            kept += 1
+            continue
+        ok = await qm.reclaim(c, partial(registry.has_worker, key))
+        if ok:
+            reclaimed += 1
+            reclaimed_bytes += c.size
+        else:
+            kept += 1
+    # v1.3 defect fix (claim-guard run_a5af6bd7, clm_aab3adbc REFUTED):
+    # `reclaim_enabled` MUST reach `reclaim_orphans` itself -- it, not just
+    # this function's own telemetry aggregation, gates the actual unlink.
+    # Before this fix, orphan `.offset`/`.offset.tmp` and stale
+    # `.torn-*.bin` quarantine sidecars were unlinked unconditionally every
+    # boot, invisibly, even under the `reclaim_enabled=False` safety
+    # default. `reclaim_orphans` now reports `reclaimed`/`reclaimed_bytes`
+    # that ALREADY reflect only real unlinks (0 when disabled), so no
+    # further gating is needed here.
+    orphan_result = await qm.reclaim_orphans(_start_time, settings.reclaim_enabled)
+    reclaimed += orphan_result["reclaimed"]
+    reclaimed_bytes += orphan_result["reclaimed_bytes"]
+    failed += orphan_result["failed"]
+    boot_state.reclaimed += reclaimed
+    boot_state.reclaimed_bytes += reclaimed_bytes
+    boot_state.kept += kept
+    boot_state.failed += failed
+    logger.info(
+        "boot_reclaim_summary reclaimed=%d bytes=%d kept=%d failed=%d mode=%s",
+        reclaimed,
+        reclaimed_bytes,
+        kept,
+        failed,
+        "live" if settings.reclaim_enabled else "dry_run",
+    )
+
+
+async def _boot_reconcile() -> None:
+    """The backgrounded, EXCEPTION-SAFE boot-recovery body.
+
+    Runs heal -> reclaim -> reconcile -> seed -> bounded topup -> (start the
+    sweep, then set phase=ready). Spawned as a task from ``lifespan``
+    immediately after the migration-health guard, NOT awaited -- the server
+    serves its first request while this still runs. On ANY exception:
+    ``boot_state.fail()`` + a loud traceback; the server KEEPS SERVING.
+    """
+    boot_state.begin()
+    try:
+        boot_state.phase = "heal"
+        _heal_result = await registry.queue_manager.heal_torn_tails()
+        logger.info("lifespan_startup: heal_torn_tails result=%s", _heal_result)
+
+        boot_state.phase = "reclaim"
+        await _boot_reclaim()
+
+        boot_state.phase = "expire"
+        # Boot-phase dead-letter expiry
+        # runs BEFORE recovery_reconcile_dead / recovery_seed_counts. Uses
+        # dead_letter_expiry_enabled (a SEPARATE flag from reclaim_enabled)
+        # -- NOT reclaim_enabled. Deliberately does
+        # NOT call registry.record_purged: this runs before
+        # recovery_seed_counts, so expired lines are simply never counted
+        # into accepted_seed in the first place (recovery_seed_counts
+        # derives `dead` from disk). Calling record_purged here would
+        # subtract records that were never added, driving the residual
+        # negative.
+        await registry.queue_manager.expire_dead_letters(
+            time.time(),
+            _settings.dead_letter_retention_seconds,
+            _settings.dead_letter_expiry_enabled,
+        )
+
+        boot_state.phase = "reconcile"
+        await registry.queue_manager.recovery_reconcile_dead()
+
+        boot_state.phase = "seed"
+        (
+            _accepted_seed,
+            _written_seed,
+        ) = await registry.queue_manager.recovery_seed_counts()
+        registry.seed_counters(_accepted_seed, _written_seed)
+
+        boot_state.phase = "topup"
+        respawn_limit = _settings.crash_recovery_respawn_limit
+        result = await _crash_recovery_topup(respawn_limit)
+        boot_state.resumed += result.dispatched
+        boot_state.deferred += result.deferred
+        logger.info(
+            "lifespan_startup: crash recovery respawned %d/%d drainers",
+            result.dispatched,
+            result.recovered,
+        )
+
+        boot_state.phase = "sweep"
+        _sweep_interval = _settings.crash_recovery_sweep_interval_seconds
+        if respawn_limit is not None and _sweep_interval > 0:
+            app.state.sweep_task = asyncio.create_task(
+                _crash_recovery_sweep_loop(_sweep_interval, respawn_limit)
+            )
+            logger.info(
+                "crash_recovery_sweep: enabled (interval=%ds, ceiling=%d) -- "
+                "deferred backlog will drain progressively, not just on restart",
+                _sweep_interval,
+                respawn_limit,
+            )
+        # C2 (v1.3.1): starting a non-returning sweep loop must NOT leave
+        # phase stuck at "sweep" -- unconditionally finish here, AFTER the
+        # (forever-running) loop is started.
+        boot_state.finish()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # a boot hook must never crash-loop the server
+        failed_step = boot_state.phase
+        boot_state.fail(failed_step, exc)
+        logger.exception(
+            "boot_reconcile_failed phase=failed failed_step=%s", failed_step
+        )
 
 
 @asynccontextmanager
@@ -275,99 +673,61 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "(un-migrated). Cold start refuses to boot to avoid duplicating "
             "them on write. Run: context-intelligence-server doctor --fix"
         )
-    # Crash recovery (decisions #5/#6): on startup, respawn one drainer per
-    # session that still has an undrained, complete line. The workspace is
-    # parsed from that session's FIRST log line so the respawned worker is
-    # bound to the same workspace it was originally created with.
-    #
-    # Conservation-counter recovery runs FIRST, and its two steps are
-    # order-load-bearing: reconcile MUST precede seed. recovery_reconcile_dead
-    # advances committed offsets past already-dead pending lines so the
-    # dead-letter counts are settled; only then does recovery_seed_counts read
-    # disk to reconstruct the accepted/written baseline. Seeding before
-    # reconciling would leave a residual==1 false DEGRADED. Both run before the
-    # respawn loop so the respawned drainers start from a conserved baseline.
-    await registry.queue_manager.recovery_reconcile_dead()
-    _accepted_seed, _written_seed = await registry.queue_manager.recovery_seed_counts()
-    registry.seed_counters(_accepted_seed, _written_seed)
-    recovered = await registry.queue_manager.recover()
-    # Bound how many drainers this boot respawns (incident: an unbounded
-    # backlog respawned 94/94 drainers before the server could serve a
-    # single request, driving a ~4 minute boot and 43.9 GB RSS that tripped
-    # the OOM killer -- which then never let the backlog shrink because
-    # every restart repeated the same unbounded respawn). None (the default)
-    # preserves today's behaviour exactly: every recovered session is
-    # processed on this boot, unbounded. `recovered` is already sorted
-    # (QueueManager.recover()), so which sessions are processed this boot
-    # vs. deferred is deterministic across restarts of the same backlog.
-    #
-    # Deferred sessions are NOT touched in any way here -- no read, no
-    # write, no drainer -- so they remain exactly as durable and
-    # recoverable as they were before this boot: a later boot's recover()
-    # call reports them again, and a new event for that session arriving
-    # via POST /events spawns its drainer immediately via get_or_create(),
-    # independent of this startup loop.
-    respawn_limit = _settings.crash_recovery_respawn_limit
-    if respawn_limit is not None and len(recovered) > respawn_limit:
-        to_process = recovered[:respawn_limit]
-        deferred_count = len(recovered) - respawn_limit
-    else:
-        to_process = recovered
-        deferred_count = 0
-    respawned = 0
-    for sid in to_process:
-        batch = await registry.queue_manager.read_batch(sid, max_items=1)
-        if not batch.lines:
-            continue
-        if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
-            respawned += 1
-    if deferred_count:
-        # Loud on purpose (WARNING, not INFO): a deferred backlog must never
-        # be a silent, un-discoverable fact -- that silence is exactly what
-        # let the 38 GB spool go unnoticed for two days in the incident this
-        # guards against. Names the exact counts and the setting to raise.
-        logger.warning(
-            "lifespan_startup: crash-recovery respawn cap reached "
-            "(crash_recovery_respawn_limit=%d): %d/%d respawned this boot, "
-            "%d session(s) deferred to a later boot (untouched on disk, "
-            "still fully recoverable). Raise crash_recovery_respawn_limit "
-            "to respawn more per boot.",
-            respawn_limit,
-            respawned,
-            len(to_process),
-            deferred_count,
-        )
-    logger.info(
-        "lifespan_startup: crash recovery respawned %d/%d drainers",
-        respawned,
-        len(recovered),
-    )
-    # Periodic deferred-backlog sweep: only meaningful under a FINITE ceiling
-    # (a deferred tail can exist). With the default unbounded ceiling
-    # (respawn_limit is None) there is no deferred tail, so NO background task
-    # is started -- existing deployments are completely unaffected. When a
-    # finite ceiling IS set, this drains the deferred tail over time instead of
-    # stranding it until a restart or a new event (see _crash_recovery_sweep_loop
-    # and config.crash_recovery_sweep_interval_seconds).
-    _sweep_task: asyncio.Task[None] | None = None
-    _sweep_interval = _settings.crash_recovery_sweep_interval_seconds
-    if respawn_limit is not None and _sweep_interval > 0:
-        _sweep_task = asyncio.create_task(
-            _crash_recovery_sweep_loop(_sweep_interval, respawn_limit)
-        )
-        logger.info(
-            "crash_recovery_sweep: enabled (interval=%ds, ceiling=%d) -- "
-            "deferred backlog will drain progressively, not just on restart",
-            _sweep_interval,
-            respawn_limit,
-        )
+    # The writer-lease detector acquires the queue-directory
+    # lease BEFORE any boot-recovery pass runs. `_boot_reconcile` mutates
+    # the shared directory destructively (heal truncates, reclaim unlinks),
+    # so a fresh-foreign-lease refusal (enforce mode) must gate those passes
+    # rather than race them. Awaited synchronously here -- NOT part of
+    # `_boot_reconcile` -- because that task's own exception-safety would
+    # silently downgrade "refuse to boot" into "log a line and boot anyway".
+    await _writer_lease_boot()
+    # Boot-safety hardening: every SHARE-READING recovery
+    # pass -- heal, reclaim, reconcile-dead, seed-counts, the crash-recovery
+    # topup, and the periodic sweep -- moves OFF the critical path to first
+    # request. `yield` moves up to immediately after the migration-health
+    # guard above (M-8); `_boot_reconcile` runs those passes as a single
+    # supervised background task, spawned but NOT awaited, so `/status` and
+    # `/version` answer while it is still running. The Neo4j schema guard
+    # above stays synchronous and fail-loud on purpose (O(1), no share I/O,
+    # a deliberate cold-start refusal on an un-migrated graph) -- the
+    # boot-recovery pass does not touch it.
+    boot_state.begin()
+    app.state.boot_task = asyncio.create_task(_boot_reconcile())
     try:
         yield
     finally:
+        # M-14/R8: every background task lives on app.state so this
+        # `finally` can reach it even if `_boot_reconcile` crashed before
+        # creating the sweep task (hence the getattr guard). Ordering is
+        # load-bearing: sweep stops before the one-shot reconcile (it can
+        # re-enter its work), and EVERY task stops before the drivers
+        # close -- a reconcile mid-Neo4j-write must never find a closed
+        # driver.
+        _sweep_task = getattr(app.state, "sweep_task", None)
         if _sweep_task is not None:
             _sweep_task.cancel()
             with suppress(asyncio.CancelledError):
                 await _sweep_task
+        _boot_task = getattr(app.state, "boot_task", None)
+        if _boot_task is not None:
+            _boot_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await _boot_task
+        # The writer lease (R4) is released LAST among
+        # app-owned tasks, and its own heartbeat task is cancelled FIRST --
+        # so no in-flight tick can regain the in-flight gate mid-shutdown.
+        # release()/shutdown_lease_io() never raise (owner-gated release,
+        # OSError + WriterLeaseBusy swallowed inside release()) -- shutdown
+        # never raises, though a healthy-but-still-in-flight op can leave
+        # the lease on disk even on a clean exit (an honest
+        # limit bounded by the staleness window, same as after a SIGKILL).
+        _lease_task = getattr(app.state, "lease_task", None)
+        if _lease_task is not None:
+            _lease_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await _lease_task
+        await writer_lease.release()
+        shutdown_lease_io()
         logger.info("lifespan_shutdown: closing Neo4j drivers")
         await app.state.neo4j_driver.close()
         await app.state.neo4j_query_driver.close()
@@ -803,18 +1163,51 @@ async def get_status(request: Request) -> dict[str, Any]:
     )
     response["neo4j_url"] = _settings.resolve_neo4j_admin().url
     response["neo4j_browser_url"] = _settings.neo4j_browser_url
-    # Additive, aggregate-only conservation metrics (D3). /status is
-    # unauthenticated, so this block must NOT carry the per-key table or the
-    # dead-letter listing — both are authenticated-only.
-    response["metrics"] = await registry.pipeline_metrics()
-    # Additive, aggregate-only spool footprint (incident: a 38 GB / 583-file
-    # durable spool grew completely unnoticed -- the only symptom was a graph
-    # that had silently stopped updating). Same /status contract as `metrics`
-    # above: two aggregate integers only, no session ids, no workspace names,
-    # no per-key table. Cheap by construction (stat-only, short-TTL cached) --
-    # see QueueManager.spool_stats() for why this is safe on every poll even
-    # with a huge spool.
-    response["spool"] = await registry.queue_manager.spool_stats()
+    # M-16: the boot-progress block is
+    # ALWAYS present. Gate on boot IS OVER (ready or failed), not boot
+    # SUCCEEDED -- `failed` is a terminal phase and the server keeps
+    # ingesting new events, so gating on `ready` alone would permanently
+    # null the spool-byte alarm for the rest of the process's life on any
+    # reconcile failure, reintroducing the exact "38 GB spool grew with
+    # zero signal" incident through a new door.
+    response["boot"] = boot_state.snapshot()
+    # The writer-lease detector is an ALWAYS-present top-level
+    # block, at every boot phase -- pure in-memory (writer_lease.snapshot()
+    # never touches disk or calls get_settings()), so this never violates
+    # the zero-disk-during-boot contract. Deliberately NOT projected into
+    # `spool` (R2): that dict is spool_stats()'s live cache OBJECT
+    # returned BY REFERENCE, and mutating it would poison a claim-guard-
+    # verified surface.
+    response["writer_lease"] = writer_lease.snapshot()
+    if boot_state.phase in ("ready", "failed"):
+        # Byte-for-byte today's code, unreachable while actively booting.
+        # Additive, aggregate-only conservation metrics. /status is
+        # unauthenticated, so this block must NOT carry the per-key table or
+        # the dead-letter listing — both are authenticated-only.
+        response["metrics"] = await registry.pipeline_metrics()
+        # Additive, aggregate-only spool footprint (incident: a 38 GB /
+        # 583-file durable spool grew completely unnoticed -- the only
+        # symptom was a graph that had silently stopped updating). Same
+        # /status contract as `metrics` above: two aggregate integers only,
+        # no session ids, no workspace names, no per-key table. Cheap by
+        # construction (stat-only, short-TTL cached) -- see
+        # QueueManager.spool_stats() for why this is safe on every poll even
+        # with a huge spool.
+        response["spool"] = await registry.queue_manager.spool_stats()
+    else:
+        # While actively booting (heal/reclaim/reconcile/seed/topup/
+        # sweep-not-yet-ready), `/status` is LEAN by construction -- it
+        # performs ZERO disk reads on this request path (neither
+        # `pipeline_metrics`/`derive_all_stats` nor `spool_stats` is called
+        # at all; `build_status_response` above reads only in-memory
+        # registry state). Less data during boot is the accepted trade
+        # (user directive): richer boot-time status is deferred to a future
+        # maintenance mode. `metrics`/`spool` stay PRESENT and `null` rather
+        # than absent, so an absent key is never confused with a version
+        # skew.
+        response["metrics"] = None
+        response["spool"] = None
+        response["status_detail"] = {"reason": "booting"}
     # T5 (E): surface auth mode and admin-API capability so operators can
     # confirm admin is enabled without tailing startup logs.  /status is
     # unauthenticated — only config-level boolean flags are exposed here
@@ -868,7 +1261,7 @@ async def _check_driver_connected(app_instance: FastAPI, attr_name: str) -> bool
     try:
         await driver.verify_connectivity()
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001 -- status must never 500
         return False
 
 
@@ -889,17 +1282,20 @@ async def post_events(
     # Validate data.timestamp at the ingest boundary (fail loud, not silent dead-letter).
     # Real Amplifier clients always supply this field; 400 only hits malformed payloads.
     _validate_data_timestamp(request.data)
-    # Idempotency-cache check + replay stay BEFORE the durable append so a
-    # duplicate is rejected without persisting a second log line.
-    if request.idempotency_key and not replay:
-        is_new = idempotency_cache.check_and_store(request.idempotency_key)
-        if not is_new:
-            logger.info(
-                "event_duplicate_skipped: event=%s session_id=%s",
-                request.event,
-                session_id,
-            )
-            return EventResponse(status="duplicate", session_id=session_id or None)
+    # Idempotency. The CHECK stays BEFORE the durable append -- a genuine
+    # duplicate must not persist a second log line. The STORE moved to AFTER a
+    # successful append, so a key is never burned for an event that is not on
+    # disk; a failed append leaves the key unburned and the client's retry is
+    # honoured. ``dedup_key`` is None on the replay path, which (as before)
+    # neither checks NOR stores.
+    dedup_key = request.idempotency_key if not replay else None
+    if dedup_key and idempotency_cache.seen(dedup_key):
+        logger.info(
+            "event_duplicate_skipped: event=%s session_id=%s",
+            request.event,
+            session_id,
+        )
+        return EventResponse(status="duplicate", session_id=session_id or None)
     # Empty session_id maps to a per-workspace sentinel stem so session-less
     # events from distinct workspaces never collide in one log (decision #10).
     worker_key = session_id or (_NO_SESSION_PREFIX + _workspace_slug(request.workspace))
@@ -915,6 +1311,10 @@ async def post_events(
     body_obj["created_by"] = contributor_id  # overwrite, never setdefault
     body = json.dumps(body_obj, separators=(",", ":")).encode()
     await registry.queue_manager.append(worker_key, body)
+    # The bytes are on disk: NOW the key may be burned. No try/except is
+    # needed anywhere -- "release on failure" is simply not reaching this line.
+    if dedup_key:
+        idempotency_cache.store(dedup_key)
     registry.record_accepted()  # count the durably-accepted event
     return EventResponse(status="queued", session_id=session_id or None)
 
@@ -955,7 +1355,7 @@ async def post_cypher(body: CypherRequest, request: Request) -> Response:
                 rows.append(dict(record))
         serialized = json.dumps({"results": rows}, default=str)
         return Response(content=serialized, media_type="application/json")
-    except Exception as exc:  # catch all Neo4j and serialization errors
+    except Exception as exc:  # noqa: BLE001 -- catch all Neo4j and serialization errors
         raise HTTPException(status_code=500, detail=str(exc))
 
 

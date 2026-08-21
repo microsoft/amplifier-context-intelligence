@@ -10,16 +10,14 @@ os.environ.setdefault(
     "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ALLOW_UNAUTHENTICATED", "true"
 )
 
-from collections.abc import AsyncGenerator, Generator  # noqa: E402
-from typing import Any  # noqa: E402
+from collections.abc import AsyncGenerator, Generator
+from typing import Any, Self
 
-import httpx  # noqa: E402
-import pytest  # noqa: E402
+import httpx
+import pytest
 
-
-from context_intelligence_server.main import app, registry  # noqa: E402
-from context_intelligence_server.services import HookStateService  # noqa: E402
-
+from context_intelligence_server.main import app, registry
+from context_intelligence_server.services import HookStateService
 
 # ---------------------------------------------------------------------------
 # Shared Neo4j mock helpers (used by POST /cypher tests)
@@ -64,7 +62,7 @@ class MockNeo4jSession:
             raise self._exc
         return MockNeo4jResult(self._rows)
 
-    async def __aenter__(self) -> "MockNeo4jSession":
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, *args: object) -> None:
@@ -101,6 +99,7 @@ def anyio_backend() -> str:
 @pytest.fixture(autouse=True)
 def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
     from unittest.mock import patch
+
     from context_intelligence_server.config import Neo4jClientConfig
     from context_intelligence_server.config import Settings as _Settings
 
@@ -122,6 +121,13 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
         neo4j_flush_chunk_rows: int = _real.neo4j_flush_chunk_rows
         neo4j_flush_chunk_bytes: int = _real.neo4j_flush_chunk_bytes
         neo4j_lock_timeout: float = _real.neo4j_lock_timeout
+        # drain_worker's Trigger H/I read these directly off get_settings()
+        # (config.py's lru_cache'd accessor) -- this proxy stands in for it
+        # inside registry.py, so it must carry the same fields real Settings
+        # does, at the same shipped defaults.
+        queue_compact_enabled: bool = _real.queue_compact_enabled
+        queue_compact_min_prefix_bytes: int = _real.queue_compact_min_prefix_bytes
+        queue_compact_max_tail_bytes: int = _real.queue_compact_max_tail_bytes
 
         # Neo4j two-client split (doc 12): SessionRegistry.get_or_create() calls
         # settings.resolve_neo4j_admin() directly, so this proxy (which stands
@@ -151,6 +157,80 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
 
 
 @pytest.fixture(autouse=True)
+def reset_boot_state() -> Generator[None, None, None]:
+    """Reset the module-level ``BootState`` singleton around each test.
+
+    ``/status`` is phase-gated: ``metrics``/``spool`` are populated only
+    once ``boot_state.phase`` reaches ``"ready"`` (or ``"failed"``) --
+    otherwise it serves the lean, zero-disk boot response. The overwhelming
+    majority of existing tests exercise ordinary ``/status`` behaviour, NOT
+    boot itself, and never invoke the real ``lifespan()`` (the plain
+    ``client``/``auth_client`` fixtures wrap the ASGI app directly, without
+    running its lifespan protocol) -- so without a reset, ``boot_state``
+    would default to its module-import value (``"recovering"``) for the
+    entire test session, permanently nulling ``metrics``/``spool`` for every
+    test that doesn't explicitly drive a real boot.
+
+    Default here to ``"ready"`` -- exactly what a real, running server is
+    for the overwhelming majority of its lifetime -- so pre-existing tests
+    keep seeing the populated shape they always have. Tests that need to
+    exercise a SPECIFIC boot phase (the boot-safety suite) set
+    ``boot_state.phase`` (and any other field) explicitly; mutated IN PLACE
+    on the same singleton object ``main.py`` imported, so both modules'
+    references see the change.
+    """
+    from context_intelligence_server.status import boot_state as _boot_state
+
+    def _reset() -> None:
+        _boot_state.phase = "ready"
+        _boot_state.started_at = 0.0
+        _boot_state.completed_at = None
+        _boot_state.reclaimed = 0
+        _boot_state.reclaimed_bytes = 0
+        _boot_state.kept = 0
+        _boot_state.failed = 0
+        _boot_state.resumed = 0
+        _boot_state.deferred = 0
+        _boot_state.error = None
+        _boot_state.failed_step = None
+        _boot_state.fallback_workspace_byte0 = 0
+        _boot_state.fallback_workspace_sentinel = 0
+        _boot_state.reclaim_enabled = False
+
+    _reset()
+    yield
+    _reset()
+
+
+@pytest.fixture(autouse=True)
+def _restore_lease_io() -> Generator[None, None, None]:
+    """The private `_LEASE_IO` executor in ``writer_lease`` is process-wide
+    (module-level, by design). A test that drives the real `lifespan()` to a
+    normal, non-raising completion calls `shutdown_lease_io()` in its
+    `finally`, which permanently shuts that shared executor down for every
+    later test in the same pytest process. Detect that (submitting after
+    shutdown raises `RuntimeError`, a documented `ThreadPoolExecutor`
+    contract) and transparently recreate it -- this is test-isolation
+    plumbing only; production shuts the executor down exactly once, at real
+    process exit.
+
+    Defined here (rather than only in the module that first needed it) so it
+    guards every test module regardless of collection/run order.
+    """
+    yield
+    import concurrent.futures
+
+    from context_intelligence_server import writer_lease as wl_module
+
+    try:
+        wl_module._LEASE_IO.submit(lambda: None).result(timeout=1.0)
+    except RuntimeError:
+        wl_module._LEASE_IO = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="writer-lease-io"
+        )
+
+
+@pytest.fixture(autouse=True)
 def reset_registry() -> Generator[None, None, None]:
     """Ensure each test starts with a clean session registry."""
     registry._workers.clear()
@@ -161,7 +241,7 @@ def reset_registry() -> Generator[None, None, None]:
     registry._queue_manager = None
     registry._write_semaphore = None
     # Zero the live pipeline-conservation counters on the shared singleton so
-    # each test starts from a clean conservation baseline (D2).
+    # each test starts from a clean conservation baseline.
     registry._accepted_total = 0
     registry._written_total = 0
     registry._replayed_total = 0
@@ -192,10 +272,10 @@ async def auth_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncGenerator[httpx.AsyncClient, None]:
     """Client routed through asgi_app (auth middleware applied) with a test API key set."""
-    import hashlib  # noqa: PLC0415
+    import hashlib
 
-    from context_intelligence_server.auth import StaticKeyResolver  # noqa: PLC0415
-    from context_intelligence_server.main import asgi_app  # noqa: PLC0415
+    from context_intelligence_server.auth import StaticKeyResolver
+    from context_intelligence_server.main import asgi_app
 
     # Build a StaticKeyResolver that maps sha256("test-secret") → "owner" so existing
     # integration tests that send `Authorization: Bearer test-secret` continue to work.
