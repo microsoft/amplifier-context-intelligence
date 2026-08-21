@@ -62,9 +62,8 @@ async def _neo4j_labels(services: Any, node_id: str) -> list[str]:
 async def _neo4j_props(services: Any, node_id: str) -> dict[str, Any]:
     """Return properties from Neo4j directly (bypasses buffer).
 
-    D-DUW (R3): used by TestHandleEndSingleTerminalAfterFlush
-    to assert the end-handler's OWN writes (ended_at/status) genuinely landed,
-    so the de-vacuumed flush isn't merely re-checking the earlier start/fork
+    Used to assert the end-handler's own writes (ended_at/status) genuinely
+    landed, so the assertion isn't merely re-checking the earlier start/fork
     flush's data.
     """
     rows = await services.graph.execute_query(
@@ -284,10 +283,9 @@ class TestHandleEndSingleTerminalAfterFlush:
                 "timestamp": "2026-01-01T10:05:00Z",
             },
         )
-        # D-DUW (R3): _handle_end no longer flushes
-        # itself. The drainer flushes after the batch (registry.py:505); do
-        # the same here so this test's own read sees the persisted result,
-        # exactly as production does via the gated _flush_barrier.
+        # _handle_end does not flush itself; the drainer flushes after the
+        # batch. Flush here so this test's read sees the persisted result,
+        # as production does via the gated _flush_barrier.
         await neo4j_services.graph.flush()
 
         # Read final labels directly from Neo4j (bypasses any buffer).
@@ -307,9 +305,9 @@ class TestHandleEndSingleTerminalAfterFlush:
             f"Expected exactly one terminal label SubSession; got {terminals} in {final_labels}"
         )
 
-        # D-DUW (R3): the flush above must actually depend on the
-        # end-handler's OWN writes having landed -- assert ended_at/status
-        # so this test isn't merely re-checking the earlier start+flush.
+        # The assertions below must depend on the end-handler's own writes
+        # having landed -- check ended_at/status so this isn't merely
+        # re-checking the earlier start+flush.
         final_props = await _neo4j_props(neo4j_services, child_id)
         assert final_props.get("status") == "completed", (
             f"end-handler's status write missing from Neo4j: {final_props}"
@@ -351,9 +349,8 @@ class TestHandleEndSingleTerminalAfterFlush:
                 "timestamp": "2026-01-01T10:05:00Z",
             },
         )
-        # D-DUW (R3): _handle_end no longer flushes
-        # itself. The drainer flushes after the batch (registry.py:505); do
-        # the same here so this test's own read sees the persisted result.
+        # _handle_end does not flush itself; the drainer flushes after the
+        # batch. Flush here so this test's read sees the persisted result.
         await neo4j_services.graph.flush()
 
         final_labels = await _neo4j_labels(neo4j_services, child_id)

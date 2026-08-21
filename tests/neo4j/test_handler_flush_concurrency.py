@@ -1,26 +1,10 @@
-"""D-DUW Neo4j-backed coverage: un-semaphored
-``graph.flush()`` in ``SessionHandler._handle_end``.
+"""Neo4j-backed tests for single-terminal-label behaviour on session:end.
 
-Change 1: delete the 3-line terminal flush at the end of ``_handle_end``
-(``session.py:361-363``) -- every byte it forced out is already flushed by
-the drainer's unconditional, semaphore-gated ``_flush_barrier``.
+Covers that _handle_end does not flush on its own, that no flush ever runs
+outside the drainer's write_semaphore, and that terminal data is durably
+flushed before the queue log is deleted.
 
-Change 2: seed the buffered end-node's labels with the type labels that were
-just READ (``end_node_data["labels"] = ["Session", "SST_EVENT", *labels]``)
-so the buffer can never SHED a persisted terminal type once the handler no
-longer clears the buffer via its own flush.
-
-BOTH changes are REQUIRED (headline correction): the
-dual-terminal-label defect (a same-batch ``session:end`` followed by another
-lifecycle event for the same session yields BOTH a real terminal label AND
-``IncompleteSession``) is measurably LIVE on the current tree, caused by
-``pipeline.process_event``'s step 6 (``touch_session``) RE-POPULATING the
-node buffer with a type-less entry after ANY flush (the handler's own, or a
-test-driven one) empties it. Neither change alone fixes it.
-
-Run explicitly:
-    cd amplifier-context-intelligence
-    uv run pytest tests/neo4j/test_handler_flush_concurrency.py -q -s -m neo4j
+    uv run pytest tests/neo4j/test_handler_flush_concurrency.py -q -m neo4j
 """
 
 from __future__ import annotations
@@ -42,19 +26,13 @@ from context_intelligence_server.services import HookStateService
 
 pytestmark = pytest.mark.neo4j
 
-_WS = "duw-neo4j"
+_WS = "handler-flush"
 _TS = "2026-01-01T10:00:00+00:00"
 _TS2 = "2026-01-01T10:05:00+00:00"
 _TS3 = "2026-01-01T10:10:00+00:00"
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 async def _neo4j_labels(services: Any, node_id: str) -> list[str]:
-    """Return labels from Neo4j directly (bypasses buffer)."""
     rows = await services.graph.execute_query(
         "MATCH (n) WHERE n.node_id = $id AND n.workspace = $workspace "
         "RETURN labels(n) AS lbls",
@@ -64,26 +42,10 @@ async def _neo4j_labels(services: Any, node_id: str) -> list[str]:
     return list(rows[0]["lbls"]) if rows else []
 
 
-async def _neo4j_props(services: Any, node_id: str) -> dict[str, Any]:
-    """Return properties from Neo4j directly (bypasses buffer)."""
-    rows = await services.graph.execute_query(
-        "MATCH (n) WHERE n.node_id = $id AND n.workspace = $workspace "
-        "RETURN properties(n) AS props",
-        {"id": node_id, "workspace": services.graph.workspace},
-        workspace="*",
-    )
-    return dict(rows[0]["props"]) if rows else {}
-
-
 async def _neo4j_labels_and_props_via_container(
     container: dict[str, Any], workspace: str, node_id: str
 ) -> tuple[list[str], dict[str, Any]]:
-    """Query Neo4j via a FRESH driver connection to the container.
-
-    Used post-finalization, when the worker's own store/driver has already
-    been closed by ``_safe_close`` -- reusing the closed store's driver
-    raises ``DriverError: Driver closed``.
-    """
+    # Fresh driver: after finalize, the worker's own store/driver is closed.
     driver = AsyncGraphDatabase.driver(
         container["bolt_url"], auth=(container["user"], container["password"])
     )
@@ -149,164 +111,72 @@ async def _schema(neo4j_container: dict[str, Any]) -> None:
         await driver.close()
 
 
-# ---------------------------------------------------------------------------
-# T-e (headline, LIVE-defect) -- via the REAL pipeline process_event
-# ---------------------------------------------------------------------------
-#
-# CG-4 (R5): "Change 1 + Change 2 together ELIMINATE a
-# dual-terminal-label defect that is live on the current tree." This is the
-# adverse-state test for that claim.
-
-
-class TestDuwHeadlineLiveDefect:
-    """Drives the full pipeline (process_event, including touch_session step
-    6) for a same-batch session:end -> session:end pair, no intervening
-    flush. This is what actually happens inside one drain-loop dispatch of
-    ``_process_batch`` across two records for the same session.
-
-    MUST measure: RED on the current (unmodified) tree, RED with Change 1
-    alone, RED with Change 2 alone, GREEN only with BOTH.
-    """
-
-    async def test_e_same_batch_end_then_end_yields_single_terminal_label(
+class TestSingleTerminalLabel:
+    async def test_same_batch_end_then_end_via_pipeline(
         self, neo4j_services: Any
     ) -> None:
+        # Two session:end for the same session in one batch (no flush between)
+        # must still leave exactly one terminal label.
         services = neo4j_services
         handlers = setup_handlers(services)
-        worker = SessionWorker(
-            session_id="duw-e-worker", workspace=_WS, services=services
-        )
-        parent_id = "duw-e-parent"
-        child_id = "duw-e-child"
+        worker = SessionWorker(session_id="worker", workspace=_WS, services=services)
+        child_id = "child"
 
-        # session:start(child, parent=P) -- sets SubSession.
         await process_event(
             worker,
             "session:start",
-            {
-                "session_id": child_id,
-                "parent_id": parent_id,
-                "timestamp": _TS,
-            },
+            {"session_id": child_id, "parent_id": "parent", "timestamp": _TS},
             handlers,
         )
-
-        # flush -- as the drainer does between batches.
         await services.graph.flush()
 
         lbls_after_start = await _neo4j_labels(services, child_id)
-        assert "SubSession" in lbls_after_start, (
-            f"precondition: SubSession expected after start+flush; got {lbls_after_start}"
-        )
+        assert "SubSession" in lbls_after_start, lbls_after_start
 
-        # session:end(child) -- first terminal event, SAME BATCH as the next.
         await process_event(
-            worker,
-            "session:end",
-            {"session_id": child_id, "timestamp": _TS2},
-            handlers,
+            worker, "session:end", {"session_id": child_id, "timestamp": _TS2}, handlers
         )
-
-        # session:end(child) -- SECOND, later timestamp, NO intervening
-        # flush before it (this is the same-batch condition: within one
-        # _process_batch dispatch, no flush happens between records).
         await process_event(
-            worker,
-            "session:end",
-            {"session_id": child_id, "timestamp": _TS3},
-            handlers,
+            worker, "session:end", {"session_id": child_id, "timestamp": _TS3}, handlers
         )
-
-        # Now flush (as the drainer's _flush_barrier eventually does) and
-        # read the REAL persisted result.
         await services.graph.flush()
 
-        final_labels = await _neo4j_labels(services, child_id)
-        terminals = _terminals(final_labels)
+        terminals = _terminals(await _neo4j_labels(services, child_id))
+        assert terminals == ["SubSession"], terminals
 
-        assert terminals == ["SubSession"], (
-            f"dual-terminal-label defect: expected exactly one terminal label "
-            f"SubSession, got {terminals} in {final_labels}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# T-e-isolator -- direct handler call, isolates whether Change 2 is
-# load-bearing (bypasses touch_session entirely: proves the guard, not the
-# live pipeline defect).
-# ---------------------------------------------------------------------------
-
-
-class TestDuwGuardIsolator:
-    """Calls SessionHandler directly (no process_event/touch_session).
-
-    The handler's own flush clears the buffer so the second end's
-    get_node falls through to Neo4j; without BOTH the self-flush AND the
-    label-seed, the buffer entry left behind by the first end() sheds the
-    type.
-    """
-
-    async def test_e_isolator_direct_handler_no_intervening_flush(
+    async def test_same_batch_end_then_end_direct_handler(
         self, neo4j_services: Any
     ) -> None:
+        # Same property via a direct handler call (no pipeline touch_session):
+        # isolates the label-seed guard in _handle_end.
         services = neo4j_services
         handler = SessionHandler(services)
-        parent_id = "duw-e-iso-parent"
-        child_id = "duw-e-iso-child"
+        child_id = "iso-child"
 
         await handler(
             "session:start",
-            {
-                "session_id": child_id,
-                "parent_id": parent_id,
-                "timestamp": _TS,
-            },
+            {"session_id": child_id, "parent_id": "iso-parent", "timestamp": _TS},
         )
         await services.graph.flush()
 
         lbls_after_start = await _neo4j_labels(services, child_id)
-        assert "SubSession" in lbls_after_start, (
-            f"precondition: SubSession expected after start+flush; got {lbls_after_start}"
-        )
+        assert "SubSession" in lbls_after_start, lbls_after_start
 
-        # First session:end -- direct handler call, no touch_session.
-        await handler(
-            "session:end",
-            {"session_id": child_id, "timestamp": _TS2},
-        )
-
-        # Second session:end -- same batch, NO intervening flush.
-        await handler(
-            "session:end",
-            {"session_id": child_id, "timestamp": _TS3},
-        )
-
+        await handler("session:end", {"session_id": child_id, "timestamp": _TS2})
+        await handler("session:end", {"session_id": child_id, "timestamp": _TS3})
         await services.graph.flush()
 
-        final_labels = await _neo4j_labels(services, child_id)
-        terminals = _terminals(final_labels)
-
-        assert terminals == ["SubSession"], (
-            f"guard not load-bearing: expected exactly one terminal label "
-            f"SubSession, got {terminals} in {final_labels}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# T-a (semaphore fence) -- no flush occurs outside
-# write_semaphore, EXCLUDING the teardown close() flush.
-# ---------------------------------------------------------------------------
+        terminals = _terminals(await _neo4j_labels(services, child_id))
+        assert terminals == ["SubSession"], terminals
 
 
 @pytest.mark.timeout(60)
-async def test_a_no_flush_outside_write_semaphore(
+async def test_no_flush_outside_write_semaphore(
     neo4j_container: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    queues_dir = tmp_path / "queues"
-    reg = _build_registry(queues_dir, write_concurrency=1)
+    reg = _build_registry(tmp_path / "queues", write_concurrency=1)
     qm = reg.queue_manager
-
-    sid = "duw-a-fence"
+    sid = "fence"
     await qm.append(
         sid, _line("session:end", _WS, {"session_id": sid, "timestamp": _TS})
     )
@@ -318,10 +188,8 @@ async def test_a_no_flush_outside_write_semaphore(
     real_flush = worker.services.graph.flush
 
     async def _spy_flush() -> None:
-        # Stop recording once the worker's store has been
-        # marked closed -- the teardown close()->flush() is a last-resort
-        # net, un-gated by construction, and is NOT what this fence is
-        # about (an un-gated flush DURING live drain is the bug).
+        # The teardown close()->flush() is un-gated by construction; only the
+        # flushes during live drain must hold the semaphore.
         if not worker.store_closed:
             observations.append(reg.write_semaphore.locked())
         await real_flush()
@@ -332,50 +200,31 @@ async def test_a_no_flush_outside_write_semaphore(
     assert worker.task is not None
     await asyncio.wait_for(worker.task, timeout=30.0)
 
-    assert len(observations) >= 1, (
-        "non-vacuity: the spy recorded no flush at all -- the test never "
-        "reached a flush, so it cannot honestly prove anything"
-    )
-    assert all(observations), (
-        f"a flush occurred with write_semaphore NOT locked (un-gated flush "
-        f"outside the drainer's barrier): {observations}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# T-d (durability regression) -- terminal graph data is still durably
-# flushed by the drainer under the semaphore, and the log is only deleted
-# AFTER that flush succeeded. Must pass BOTH before and after Change 1.
-# ---------------------------------------------------------------------------
-#
-# CG-2 adverse-state test.
+    assert observations, "no flush was recorded, so the test proves nothing"
+    assert all(observations), f"a flush ran with the semaphore unlocked: {observations}"
 
 
 @pytest.mark.timeout(60)
-async def test_d_terminal_data_durably_flushed_before_log_deleted(
+async def test_terminal_data_durably_flushed_before_log_deleted(
     neo4j_container: dict[str, Any], tmp_path: Path
 ) -> None:
-    queues_dir = tmp_path / "queues"
-    reg = _build_registry(queues_dir, write_concurrency=8)
+    reg = _build_registry(tmp_path / "queues", write_concurrency=8)
     qm = reg.queue_manager
-
-    sid = "duw-d-durability"
-    parent_id = "duw-d-parent"
+    sid = "durability"
     await qm.append(
         sid,
         _line(
             "session:start",
             _WS,
-            {"session_id": sid, "parent_id": parent_id, "timestamp": _TS},
+            {"session_id": sid, "parent_id": "parent", "timestamp": _TS},
         ),
     )
     await qm.append(
-        sid,
-        _line("session:end", _WS, {"session_id": sid, "timestamp": _TS2}),
+        sid, _line("session:end", _WS, {"session_id": sid, "timestamp": _TS2})
     )
 
-    log_path = queues_dir / f"{sid}.log"
-    offset_path = queues_dir / f"{sid}.offset"
+    log_path = tmp_path / "queues" / f"{sid}.log"
+    offset_path = tmp_path / "queues" / f"{sid}.offset"
     assert log_path.stat().st_size > 0
 
     worker = _build_worker(neo4j_container, sid)
@@ -384,30 +233,19 @@ async def test_d_terminal_data_durably_flushed_before_log_deleted(
     assert worker.task is not None
     await asyncio.wait_for(worker.task, timeout=30.0)
 
-    # The queue log + offset were deleted -- proof finalize completed, which
-    # only happens after delete_drained succeeds, which only happens after
-    # the tail was drained-and-flushed (registry.py _finalize_session).
-    assert not log_path.exists(), "log was not deleted -- finalize did not complete"
-    assert not offset_path.exists(), (
-        "offset was not deleted -- finalize did not complete"
-    )
+    # log + offset gone => finalize completed, which only deletes after the
+    # tail was drained and flushed.
+    assert not log_path.exists(), "log not deleted: finalize did not complete"
+    assert not offset_path.exists(), "offset not deleted: finalize did not complete"
 
-    # And the graph data genuinely reached the store: ended_at/status/label.
-    # NOTE: the worker's own store/driver is already CLOSED by _safe_close at
-    # this point (finalize completed) -- query via a fresh driver connection.
     final_labels, props = await _neo4j_labels_and_props_via_container(
         neo4j_container, _WS, sid
     )
+    assert "SubSession" in final_labels, final_labels
+    assert props.get("status") == "completed", props
 
-    assert "SubSession" in final_labels, (
-        f"terminal label missing from Neo4j after drain: {final_labels}"
-    )
-    assert props.get("status") == "completed", f"status missing/wrong: {props}"
-    # ended_at comes back as a neo4j.time.DateTime (raw session.run, no
-    # _normalize_temporal) -- convert via .to_native() before comparing,
-    # mirroring neo4j_store._normalize_temporal's own getattr pattern.
+    # ended_at returns as neo4j.time.DateTime from a raw session.run.
     ended_at = props.get("ended_at")
     _to_native = getattr(ended_at, "to_native", None)
     ended_at_native: Any = _to_native() if callable(_to_native) else ended_at
-    expected_ended_at = datetime.fromisoformat(_TS2)
-    assert ended_at_native == expected_ended_at, f"ended_at missing/wrong: {props}"
+    assert ended_at_native == datetime.fromisoformat(_TS2), props
