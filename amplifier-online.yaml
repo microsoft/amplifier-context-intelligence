@@ -47,7 +47,10 @@ services:
     # blobs, and logs. Survives restarts/revision swaps. Single-instance enforced.
     volume:
       mount_path: /data
-      size_gib: 100      # Premium minimum is 100 GiB (billed on provisioned size)
+      size_gib: 1024     # Standing size 1 TiB — data grows; live quota was raised to
+                         # 1 TiB out-of-band, so declare it here to keep manifest == actual
+                         # (a re-apply then grows/holds, never shrinks below live usage).
+                         # (Premium minimum is 100 GiB; billed on provisioned size.)
       tier: premium      # Premium_LRS SSD share. Standard Azure Files (SMB) per-op
                          # latency caps the write-heavy queue/blob throughput and
                          # builds a standing write backlog under pressure.

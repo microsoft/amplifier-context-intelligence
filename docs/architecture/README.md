@@ -33,7 +33,7 @@ resolver and exempt-path set are wired at boot time.
 | 02 | [02-handler-architecture.dot](./02-handler-architecture.dot) | Handler class-level architecture |
 | 03 | [03-graph-model.dot](./03-graph-model.dot) | Neo4j property-graph schema |
 | 04 | [04-default-handler-flow.dot](./04-default-handler-flow.dot) | DefaultHandler internal decision flow |
-| 05 | [05-durable-ingest-queue.dot](./05-durable-ingest-queue.dot) | Durable ingest queue + drain loop (incl. auth middleware entry) |
+| 05 | [05-durable-ingest-queue.dot](./05-durable-ingest-queue.dot) | Durable ingest queue + drain loop — atomic per-key append, supervised drainers, phased boot, continuous prefix reclaim + dead-letter expiry, the `/queues/gc` preview/apply pair, and the writer-lease detector (incl. auth middleware entry) |
 | 06 | [06-auth-flow.dot](./06-auth-flow.dot) | **Per-request auth flow** — BearerTokenMiddleware → resolver dispatch → `/admin/*` branch or `post_events` |
 | 07 | [07-auth-startup.dot](./07-auth-startup.dot) | **Auth boot wiring** — mode selection, JWKS prefetch, fail-closed gate, exempt-path selection |
 | 08 | [08-identity-map-management.dot](./08-identity-map-management.dot) | **Runtime identity-map management** — admin API, `require_admin` gate, `IdentityStore` write-then-swap, live `flat_dict`, no-redeploy proof |
@@ -209,14 +209,63 @@ Requests enter via `BearerTokenMiddleware` (auth gate — see diagram 06) and ar
 with `401`/`403` before reaching the route handler if credentials are missing or invalid.
 `POST /events` then validates `data.timestamp` (→ 400 on failure), stamps `created_by`
 from the verified contributor id, persists the event to a durable per-session append-log,
-and returns `202` immediately (persist-then-202); an async single drainer per session
-processes batches and flushes them to Neo4j under a global write semaphore, retrying
-transient/deadlock failures and isolating poison events to a dead-letter file. Durable files
-per session are `<worker_key>.log` (append-only raw events — `created_by`-stamped),
-`<worker_key>.offset` (last committed byte position), and `<worker_key>.dead.jsonl` (poison
-records). On startup the server replays unprocessed log lines and re-seeds counters from
-disk (crash recovery). Live conservation metrics surface on `/status`, and authenticated
-`/queues/dead-letter` endpoints support inspect, replay, and purge.
+and returns `202` immediately (persist-then-202). Durable files per session are
+`<worker_key>.log` (append-only raw events — `created_by`-stamped), `<worker_key>.offset`
+(last committed byte position), and `<worker_key>.dead.jsonl` (poison records).
+
+**The append is atomic and single-writer-serialised.** Each worker key has its own file
+lock, held by the *writing thread* for the duration of the write — not by the awaiting
+coroutine — so cancellation cannot release it mid-record. One record therefore lands as one
+contiguous, newline-terminated byte range or not at all: a write that fails part-way is
+discarded (the partial bytes truncated away) and the failure raised to the caller, never
+left on disk as a torn or merged line that a later append could fuse with. The idempotency
+key is recorded **only after** that durable append returns successfully — burning the key
+first would answer a client's retry "duplicate" for an event that is nowhere on disk, with
+no recovery path.
+
+**Drainers are supervised.** An async single drainer per session reads batches, dispatches
+them through the per-event spine, and flushes to Neo4j under one global write semaphore
+(including the terminal `session:end` flush, which goes through the same barrier as every
+other write — the semaphore is the single Neo4j-write boundary, with no bypass). Transient
+and deadlock failures retry at the same offset; a poison line that survives
+`max_delivery_attempts` is written to that key's dead-letter file and the offset advanced
+past it, so draining continues rather than halting on one bad record. A drain task that
+dies is not silent: a done-callback logs `drain_worker_died` at `ERROR` with the session id
+and traceback, then deregisters the session and closes its store, so the session can be
+recovered instead of lingering as an invisible orphan.
+
+**Boot is phased, fast, and never crash-looping.** `/status` and `/version` answer from the
+very first phase: every share-reading recovery pass runs as a single supervised background
+task rather than on the critical path to first request. The phases are `recovering → heal →
+reclaim → expire → reconcile → seed → topup → sweep → ready`, terminating at `failed` if any
+step raises — and `failed` keeps serving, since a boot hook must never restart-loop the
+process it is reconciling for. The `reclaim` phase classifies pre-existing on-disk queue data
+(resume vs. delete vs. bounded re-drain of a bad offset); classification is **dry-run by
+default** (`reclaim_enabled` ships `false`), emitting the same audit line it would when live
+while unlinking nothing, so an irreversible delete path's first contact with real data is
+never an actual delete. Respawn of recovered drainers is capped per pass, with a periodic
+sweep advancing the deferred tail — reclaiming already-drained data at a bounded rate rather
+than all at once.
+
+**Storage shrinks itself, and is reclaimable over the API.** A live session's
+already-committed prefix is rewritten away continuously (compaction), so a `.log` tracks the
+undrained tail rather than the whole session history — bounded in frequency by a minimum
+committed-prefix threshold and in per-rewrite cost by a maximum tail size, so one rewrite
+cannot hold a key's lock against `POST /events` for an unbounded time. Dead-letter files with
+no `.log` beside them expire on an mtime-based retention window. For the remainder,
+`GET /queues/gc` previews fully-drained logs and expired log-less dead-letters (read
+capability, stat/read only, answers during boot) and `POST /queues/gc/apply` deletes exactly
+those, each re-verified under its per-key lock immediately before deletion (write capability,
+`409` until boot reaches `ready`/`failed`, bounded per pass).
+
+Observability follows the same split. `/status` carries the always-present `boot` block (phase
+plus reclaim/resume counters) and `writer_lease` block (the queue-directory writer-lease
+**detector** — it makes a two-writer overlap during a rolling deploy *visible* within a
+heartbeat; it is not a mutex and does not make concurrent appends safe). While the server is
+still booting, `/status` performs zero disk reads on that request path: `metrics` and `spool`
+are present but `null`, with `status_detail.reason == "booting"`, and both populate once boot
+is over. Authenticated `/queues/dead-letter` endpoints still support inspect, replay, and
+purge.
 
 ---
 

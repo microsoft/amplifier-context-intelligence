@@ -43,11 +43,11 @@ from typing import Any
 import pytest
 from neo4j import AsyncGraphDatabase
 
-from context_intelligence_server.status import build_status_response
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
 from context_intelligence_server.queue_manager import QueueManager
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.status import build_status_response
 
 pytestmark = pytest.mark.neo4j
 
@@ -266,14 +266,21 @@ async def test_finalization_orphan_surfaces_on_status(
         "not plain logger.error without exc_info"
     )
 
-    # 5. Committed offset frozen at the pre-terminal boundary, NOT at tail_end.
-    #    The drain committed the first batch (lines 1-100) but _finalize_session
-    #    returned early without committing the tail (lines 101-200).
+    # 5. Committed offset frozen AT the terminal (session:end) record's own
+    #    start -- spec section 7.4 item 2 (Call A, spec section 3): the
+    #    drain now commits UP TO session:end, not past it, so an unfinalized
+    #    session is durably re-derivable (any later drain re-reads
+    #    session:end as the first line of its next batch). terminal_start is
+    #    a QUEUE-PRODUCED value (records[-1].start) -- the test does not
+    #    compute it either, matching the "queue produces offsets" rule.
+    terminal_start = first_100.records[-1].start
     post_drain_batch = await qm.read_batch(sid, 1)
     committed_offset = post_drain_batch.start_offset
-    assert committed_offset == boundary, (
-        f"Committed offset {committed_offset} must equal boundary {boundary} "
-        "(drain committed first batch, OOM froze the tail)"
+    assert committed_offset == terminal_start, (
+        f"Committed offset {committed_offset} must equal terminal_start "
+        f"{terminal_start} (drain committed first batch UP TO session:end, "
+        "OOM froze the tail -- the offset is parked ON the terminal record "
+        "so an unfinalized session is durably re-derivable)"
     )
     assert committed_offset != tail_end, (
         f"Committed offset {committed_offset} must NOT equal tail_end {tail_end} "

@@ -342,7 +342,7 @@ class Settings(BaseSettings):
         """Normalize empty string to None so that api_key: '' in config disables auth."""
         return None if v == "" else v
 
-    # Per-contributor API keys (NESTED form, design D4): the keystore is keyed by
+    # Per-contributor API keys (NESTED form): the keystore is keyed by
     # the SHA-256 hex digest of the raw token (64 lowercase hex chars), and each
     # value is a metadata dict carrying at least ``id`` (the contributor id). The
     # nested shape leaves room to add ``role`` / ``label`` later without a breaking
@@ -842,11 +842,19 @@ class Settings(BaseSettings):
     # setting, and /status's spool block (pending_sessions, spool_bytes_total)
     # makes the backlog observable continuously, not just at boot.
     #
-    # None (the default) preserves TODAY'S BEHAVIOUR EXACTLY: unbounded,
-    # every recovered session is respawned on this boot, matching every
-    # existing deployment -- this PR is a no-op unless an operator opts in
-    # by setting a finite ceiling.
-    crash_recovery_respawn_limit: int | None = None
+    # The default CHANGES from None
+    # (unbounded) to a finite ceiling of 8. An unbounded default made this a
+    # no-op in practice -- and worse, with the ceiling unbounded no sweep
+    # task was EVER started (see crash_recovery_sweep_interval_seconds
+    # below), so a recovered drainer that runs dry with no terminal record
+    # (the common shape of a legacy/crashed backlog) never freed its slot
+    # and was never replaced: there was no real protection against the OOM
+    # this field exists to prevent. 8 is a pessimistic, single-line-
+    # overridable default: an operator who can safely respawn more may raise
+    # it; one who cannot is now protected OUT OF THE BOX. 0 remains a valid
+    # explicit opt-out (never respawn automatically at boot; the deferred
+    # tail then drains only via a new event or the periodic sweep).
+    crash_recovery_respawn_limit: int | None = 8
 
     @field_validator("crash_recovery_respawn_limit")
     @classmethod
@@ -871,13 +879,17 @@ class Settings(BaseSettings):
     # number of live recovered drainers stays <= the ceiling while the deferred
     # tail advances in deterministic sorted order as head sessions drain.
     #
-    # Default 300s applies ONLY when a finite ceiling is set; with the default
-    # crash_recovery_respawn_limit=None (unbounded) there is no deferred tail
-    # and NO sweep task is ever started -- so every existing deployment is
-    # completely unaffected. Set to 0 to DISABLE the sweep even under a finite
-    # ceiling (the deferred tail then drains only on restart or a new event --
-    # an explicit, documented choice, not a silent surprise).
-    crash_recovery_sweep_interval_seconds: int = 300
+    # Default CHANGES from 300s to 60s, coupled to the respawn-limit
+    # default change above -- change them together or neither. With the OLD
+    # defaults (limit=None) this sweep NEVER ran in production, so 300 was
+    # never exercised at scale. Making the ceiling finite promotes the sweep
+    # from "occasional top-up" to the PRIMARY mechanism draining a large
+    # (e.g. 2539-session) recovered backlog: at 300s the tail advances far
+    # too slowly to matter; 60s makes throughput drain-bound rather than
+    # timer-bound. Set to 0 to DISABLE the sweep even under a finite ceiling
+    # (the deferred tail then drains only on restart or a new event -- an
+    # explicit, documented choice, not a silent surprise).
+    crash_recovery_sweep_interval_seconds: int = 60
 
     @field_validator("crash_recovery_sweep_interval_seconds")
     @classmethod
@@ -889,6 +901,236 @@ class Settings(BaseSettings):
                 f"integer (0 disables the sweep), got {v}"
             )
         return v
+
+    # A bad `.offset` (unparseable, negative,
+    # or past-EOF) below this many bytes is RESET (re-drained from byte 0 --
+    # bounded, and idempotent by construction, so re-driving costs nothing)
+    # rather than deleted outright. At/above the threshold the `.log` is
+    # deleted too (the boot cost a bounded re-drain would otherwise remove is
+    # precisely what this reset threshold exists to bound). ~2x the corpus's observed ~29 MB
+    # mean file size, so the common corrupt-offset case re-drains rather than
+    # being destroyed. 0 means "always delete" (pre-v1.1 behaviour), available
+    # but not the default.
+    reclaim_redrain_max_bytes: int = 64 * 1024 * 1024
+
+    # The reclaim pass's DELETE/RESET_OFFSET actions
+    # ship DISABLED by default. classify_session is side-effect-free, so with
+    # this False, boot still classifies every key and emits the SAME audit
+    # line it would if enabled (action=dry_run), but reclaim/reclaim_orphans
+    # never run -- nothing is unlinked. The documented first-deploy sequence
+    # is: boot once with this False, read the boot_reclaim_histogram in the
+    # logs, reconcile it against expectations, THEN opt in. An irreversible
+    # delete path must never have its first contact with real production
+    # data be a live unlink.
+    reclaim_enabled: bool = False
+
+    # The queue is a TRANSIENT
+    # BUFFER, not an archive -- an open, actively-draining session's
+    # already-committed PREFIX is reclaimed continuously (not just at
+    # session:end). Ships True (contra reclaim_enabled's dry-run-first
+    # default): the decision input is the committed offset, the single
+    # value the durability design already trusts, and delete_drained --
+    # already shipped, always on -- deletes the ENTIRE file on exactly this
+    # same evidence. Compaction removes a strict SUBSET of what an
+    # always-on path already removes. False is a config-change-plus-restart
+    # kill switch (get_settings() is lru_cache'd), not a live toggle.
+    queue_compact_enabled: bool = True
+
+    # Bounds compaction FREQUENCY on a continuously-hot session: below this
+    # many committed bytes, Trigger H skips the rewrite --
+    # the idle branch (Trigger I) closes the gap for free the moment the
+    # session goes idle (threshold-free there; the tail is ~0 by
+    # construction). ~18,000 events at the bench's measured ~467 bytes/event;
+    # at the real production peak (~16 ev/s) a single
+    # continuously-hot session triggers this at most once per ~19 minutes.
+    queue_compact_min_prefix_bytes: int = 8 * 1024 * 1024
+
+    # Bounds compaction COST: the threshold above bounds how
+    # OFTEN a rewrite happens; this bounds how LONG one rewrite holds
+    # guard.file_lock (blocking POST /events for that key) -- independent
+    # quantities, since the copy cost is O(tail), not O(prefix). A
+    # fallen-behind drainer (this issue's originating incident shape) can
+    # have C >= min_prefix_bytes AND a multi-GB tail; without this cap that
+    # copies gigabytes under the lock. Same magnitude as
+    # reclaim_redrain_max_bytes (house precedent for \"a bounded amount of
+    # queue-path I/O we are willing to pay\"). <=0 means no cap (explicit
+    # opt-out). Self-healing: as the drainer catches up the tail shrinks
+    # below this and compaction resumes automatically.
+    queue_compact_max_tail_bytes: int = 64 * 1024 * 1024
+
+    # A SEPARATE flag from
+    # reclaim_enabled, defaulting True. reclaim_enabled's caution exists for
+    # a HEURISTIC classification over corrupt/legacy files whose
+    # graph-presence is unproven -- dead-letter expiry is not that
+    # population: the predicate is two plain filesystem facts (no `.log`
+    # exists; mtime older than the window), and the log-less rule is a
+    # STRUCTURAL PROOF (not a heuristic) that no boot mechanism can ever
+    # consult the file being expired. Gating this on reclaim_enabled would
+    # mean FINDING 2 (dead-letters accumulate forever) is never actually
+    # closed under shipped defaults.
+    dead_letter_expiry_enabled: bool = True
+
+    # How long a log-less `.dead.jsonl` survives before being expired.
+    # Long enough that an operator who notices a dead-letter via
+    # `GET /queues/dead-letter` or `/status`'s dead count has time to purge or
+    # replay it; short enough that the file cannot accumulate indefinitely.
+    # <=0 disables expiry outright (an explicit opt-out, not a silent one).
+    dead_letter_retention_seconds: float = 30 * 86400.0
+
+    # How long a fully-drained (``committed ==
+    # size``) queue log must sit untouched before the operator GC endpoint
+    # (GET/POST /queues/gc) will offer it as safe to delete. 2 days is the
+    # value the manual Aug-2026 reclaim used against the live share -- it
+    # selected 1139 logs / 52.5 GiB with zero live sessions in the set. It is
+    # a CONSERVATISM knob for a bulk sweep, not a data-safety invariant: the
+    # safety invariant is `committed == size`, which `delete_drained`
+    # re-verifies under the file lock, and which `delete_drained` already
+    # acts on with NO age gate at every session finalize.
+    gc_queue_ttl_seconds: float = 2 * 86400.0
+
+    # Hard ceiling on GC apply OUTCOMES (deleted + skipped + failed) per
+    # pass -- not merely deletions. Bounds how long one request holds per-key
+    # locks and how much a single mistaken call can remove. A request body
+    # may only LOWER this, never raise it. 1000 clears the observed
+    # 1139-file backlog in two passes while keeping any single pass
+    # reviewable.
+    gc_max_delete_per_pass: int = 1000
+
+    @field_validator("gc_queue_ttl_seconds")
+    @classmethod
+    def _validate_gc_queue_ttl_seconds(cls, v: float) -> float:
+        """Fail loud on a negative TTL; 0 (delete as soon as drained) is valid."""
+        if v < 0:
+            raise ValueError(
+                f"gc_queue_ttl_seconds must be a non-negative number, got {v}"
+            )
+        return v
+
+    @field_validator("gc_max_delete_per_pass")
+    @classmethod
+    def _validate_gc_max_delete_per_pass(cls, v: int) -> int:
+        """Fail loud on <1 -- 0/negative must NEVER read as 'unbounded'."""
+        if v < 1:
+            raise ValueError(f"gc_max_delete_per_pass must be >= 1, got {v}")
+        return v
+
+    @field_validator(
+        "queue_compact_min_prefix_bytes",
+        "queue_compact_max_tail_bytes",
+    )
+    @classmethod
+    def _validate_queue_compact_bytes(cls, v: int) -> int:
+        """Fail loud on a negative value; 0 is a valid explicit opt-out."""
+        if v < 0:
+            raise ValueError(
+                "queue_compact_min_prefix_bytes/queue_compact_max_tail_bytes "
+                f"must be a non-negative integer, got {v}"
+            )
+        return v
+
+    @field_validator("dead_letter_retention_seconds")
+    @classmethod
+    def _validate_dead_letter_retention_seconds(cls, v: float) -> float:
+        """Fail loud on a negative retention; 0 (disabled) is valid."""
+        if v < 0:
+            raise ValueError(
+                "dead_letter_retention_seconds must be a non-negative number "
+                f"(0 disables expiry), got {v}"
+            )
+        return v
+
+    # -------------------------------------------------------------------------
+    # Writer lease
+    # -------------------------------------------------------------------------
+    # The writer-lease detector detects (and, opt-in, refuses) a second
+    # process writing the same
+    # queue directory -- the single-process assumption the per-key
+    # _KeyGuard depends on, enforced within a container but NOT across a
+    # rolling/blue-green revision swap sharing the same mount.
+    #
+    # `detect` (the DEFAULT) acquires the lease best-effort, heartbeats it,
+    # and LATCHES + SURFACES a conflict on /status within one heartbeat, but
+    # NEVER refuses to boot. Shipping the refusal on by default would
+    # deadlock a rolling deploy: the new revision can never become healthy
+    # while the old one is still actively renewing its own lease. `enforce`
+    # additionally REFUSES a fresh foreign lease at boot -- gated behind
+    # the deployed-mount smoke test that measures real cross-host clock
+    # skew + write-visibility latency before this is safe to flip on.
+    # `off` disables the detector entirely.
+    writer_lease_mode: Literal["off", "detect", "enforce"] = "detect"
+    # Renew + re-read interval. The acceptance criterion ("conflict visible
+    # within one heartbeat") is what fixes this at 5s: well inside a typical
+    # 15-30s revision-overlap window, at negligible write cost (~250 bytes
+    # every 5s).
+    writer_lease_heartbeat_seconds: float = 5.0
+    # Staleness window = heartbeat_seconds * this multiplier (15.0s at
+    # defaults). Must survive two consecutive missed ticks (one GC pause +
+    # one SMB latency spike) without a false "stale" verdict -- the same
+    # class of transient-skew reasoning as registry._RESIDUAL_DEGRADED_GRACE.
+    writer_lease_staleness_multiplier: float = 3.0
+    # Post-write settle delay before the acquire's confirming re-read, to
+    # exceed the write -> other-reader visibility latency on Azure Files SMB.
+    writer_lease_confirm_delay_seconds: float = 1.0
+    # Hard bound on the ENTIRE acquire (and, per-tick, the entire renew) --
+    # both reads, the write, and the confirm sleep. Without this, a hung
+    # mount would block `lifespan` before its `yield` forever; with it,
+    # `lifespan` always reaches `yield` and a stalled heartbeat tick always
+    # returns within this many seconds.
+    writer_lease_acquire_timeout_seconds: float = 5.0
+    # One-boot operator escape hatch: force-acquire over a FRESH foreign
+    # lease instead of refusing (enforce mode) or merely latching (detect
+    # mode). Logs a WARNING on every boot while set, and is surfaced on
+    # /status, so leaving it on by accident is never silent.
+    writer_lease_force_acquire: bool = False
+
+    @field_validator("writer_lease_heartbeat_seconds")
+    @classmethod
+    def _validate_writer_lease_heartbeat_seconds(cls, v: float) -> float:
+        """Fail loud on a non-positive heartbeat interval."""
+        if v <= 0:
+            raise ValueError(f"writer_lease_heartbeat_seconds must be > 0, got {v}")
+        return v
+
+    @field_validator("writer_lease_staleness_multiplier")
+    @classmethod
+    def _validate_writer_lease_staleness_multiplier(cls, v: float) -> float:
+        """Fail loud below 2.0x: one missed heartbeat tick would yield a
+        FALSE stale verdict -- a second writer boots on top of a live one."""
+        if v < 2.0:
+            raise ValueError(
+                "writer_lease_staleness_multiplier must be >= 2.0 (below 2, "
+                f"one missed heartbeat tick yields a false stale verdict), got {v}"
+            )
+        return v
+
+    @field_validator("writer_lease_confirm_delay_seconds")
+    @classmethod
+    def _validate_writer_lease_confirm_delay_seconds(cls, v: float) -> float:
+        """Fail loud on a negative confirm delay."""
+        if v < 0:
+            raise ValueError(
+                f"writer_lease_confirm_delay_seconds must be >= 0, got {v}"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_writer_lease_timeout_exceeds_confirm_delay(self) -> "Settings":
+        """Cross-field guard: a timeout at or below the confirm delay makes
+        EVERY acquire time out, permanently disarming the detector while
+        reporting only a benign-looking `error` -- a silent-disarm trap that
+        must fail at config load, not in production."""
+        if (
+            self.writer_lease_acquire_timeout_seconds
+            <= self.writer_lease_confirm_delay_seconds
+        ):
+            raise ValueError(
+                "writer_lease_acquire_timeout_seconds must exceed "
+                "writer_lease_confirm_delay_seconds (otherwise every acquire "
+                f"times out): got acquire_timeout="
+                f"{self.writer_lease_acquire_timeout_seconds}, confirm_delay="
+                f"{self.writer_lease_confirm_delay_seconds}"
+            )
+        return self
 
     # -------------------------------------------------------------------------
     # Logging

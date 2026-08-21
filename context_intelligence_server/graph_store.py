@@ -58,7 +58,31 @@ class GraphStore(Protocol):
 
     @property
     def workspace(self) -> str:
-        """Workspace this store is bound to (set at construction, read-only)."""
+        """Workspace this store is bound to.
+
+        Settable: HookStateService binds it immediately after construction
+        (services.py). Reads never return None -- an unset workspace resolves
+        to "default".
+        """
+        ...
+
+    @workspace.setter
+    def workspace(self, value: str) -> None: ...
+
+    @property
+    def created_by(self) -> str | None:
+        """Authenticated contributor id for write-once provenance (None when unset)."""
+        ...
+
+    @created_by.setter
+    def created_by(self, value: str | None) -> None: ...
+
+    def discard_buffer(self) -> None:
+        """Drop all buffered writes without persisting them (guarantee #13).
+
+        MUST NOT perform I/O and MUST NOT raise. In-memory implementations with
+        no backing store may treat this as a no-op.
+        """
         ...
 
     async def upsert_node(self, node_id: str, data: dict[str, Any]) -> None:

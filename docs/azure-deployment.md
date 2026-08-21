@@ -503,7 +503,9 @@ services:
 
     volume:                   # persistent /data (identity store, queues, blobs, logs)
       mount_path: /data
-      size_gib: 16
+      size_gib: 1024          # 1 TiB standing size — must match the live share quota
+      tier: premium           # Premium_LRS SSD; Standard SMB per-op latency caps the
+                              # write-heavy queue/blob throughput (premium min is 100 GiB)
 
     env:
       # Force Entra auth (server DEFAULTS to static — must override)
@@ -758,26 +760,73 @@ guarantee is structural, not "be careful":
 - **Neo4j data** lives on the VM's **persistent managed data disk**, entirely
   outside the manifest (see Neo4j safety, above). Untouched by any server redeploy.
 
+### `/data/queues` is self-shrinking — and reclaimable over the API
+
+The durable ingest queue is a **transient buffer, not an archive**. A live
+session's already-committed prefix is reclaimed continuously (compaction), so a
+`.log` holds the undrained tail rather than the whole session history; a
+fully-drained log is removed at session finalize; and a dead-letter file with no
+`.log` beside it expires on an mtime-based retention window. Steady-state
+`/data/queues` growth therefore tracks **undrained** data, not total ingest.
+
+For anything those leave behind, reclaim it **through the API — this is the
+supported path on Container Apps**:
+
+```bash
+TOKEN=$(az account get-access-token --resource "api://<client_id>" --query accessToken -o tsv)
+BASE="https://<your-server-fqdn-or-apim-gateway>"
+
+# Preview: deletes nothing, read capability, answers even while the server is booting.
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/queues/gc"
+
+# Apply: write capability, bounded per pass, each item re-verified before deletion.
+curl -s -X POST -H "Authorization: Bearer $TOKEN" "$BASE/queues/gc/apply"
+```
+
+This runs entirely server-side: **no container exec, no disk access, and no
+`az storage` commands against the share.** It only ever offers fully-drained
+logs and expired log-less dead-letters — undrained data is structurally excluded
+and reported in the response's `excluded` counts. `POST /queues/gc/apply`
+returns **409 while the server is still booting** (preview stays available);
+retry once `/status` reports the boot phase as `ready` or `failed`. Full
+runbook, scopes, and the safety invariant:
+[operational-hardening.md](operational-hardening.md) §8.
+
 ### The ONLY things that can lose `/data` — avoid during a version bump
 
 | Destructive action | Why it loses data |
 |--------------------|-------------------|
 | Remove/rename the `volume:` block | New revision has no `/data` mount → writes to ephemeral FS |
 | Change `mount_path` | App reads an empty path; share persists but is "gone" from the server's view |
-| Change `size_gib` **or** add/change `tier` | Resize/tier change can **re-provision a new, empty share — no data migration** |
+| **Shrink** `size_gib`, or change `tier` | Shrink/tier change can **re-provision a new, empty share — no data migration** |
 | `amplifier-online destroy` | Tears down per-project resources including the share |
 | Delete/re-provision the Azure Files share or storage account out-of-band | Removes the backing store |
 
-`size_gib: 16` is safe to leave unchanged — leaving it is the safe path. **Treat
-any `size_gib`/`tier` edit as potentially destructive.** A version bump changes
-**only the image tag**.
+**Treat any `size_gib`/`tier` edit as potentially destructive — but distinguish
+two cases, because they are not the same risk:**
+
+- **Reconciling a GROW against an already-raised live quota is safe, and is what
+  the shipped manifest does.** The live share quota was raised out-of-band to
+  1 TiB; the manifest declares `size_gib: 1024` so that manifest and actual
+  agree. A re-apply then grows-or-holds — it never drops below live usage, and
+  no re-provision occurs. Leaving the manifest *behind* the live quota is the
+  worse option: the drift is invisible until something reconciles it downward.
+- **A SHRINK, or any `tier` change, is the destructive case.** Either can
+  re-provision a new, empty share with no data migration. Do not do it as part
+  of a version bump.
+
+A version bump should change **only the image tag**. If the volume block differs
+from what is live, reconcile it deliberately and on its own — not bundled with a
+release.
 
 ### Protect-the-durable-data checklist (before a version bump)
 
 ```
 [ ] Manifest diff shows ONLY the image tag change (v6.6.6 → v6.7.0).
-    volume block byte-identical: mount_path: /data, size_gib: 16
-    (no size_gib change, no tier added, no mount_path change).
+    volume block byte-identical: mount_path: /data, size_gib: 1024, tier: premium
+    (no size_gib change, no tier change, no mount_path change).
+    If size_gib/tier DOES differ from live: only a GROW to match an
+    already-raised live quota is safe. A shrink or tier change: STOP.
 [ ] `amplifier-online up --dry-run` reports ONLY the image/revision change —
     NO volume, share, or storage change. If it mentions volume/storage → STOP.
 [ ] (Extra safety) Snapshot the Azure Files share first:

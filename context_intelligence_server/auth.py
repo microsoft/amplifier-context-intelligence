@@ -266,7 +266,7 @@ class EntraResolver:
         # per-kid dedup lock or global refresh cap is built for the pilot.
         try:
             jwks_client.fetch_data()
-        except Exception as exc:  # noqa: BLE001 — any failure is fatal here
+        except Exception as exc:
             raise RuntimeError(
                 f"EntraResolver: JWKS prefetch failed for tenant "
                 f"{tenant_id!r} — server cannot start without a reachable "
@@ -327,7 +327,7 @@ class EntraResolver:
                 missing/invalid ``oid`` (user branch), or no resolvable identity
                 (service branch).
             AuthError(403): Valid user token with unmapped ``oid``, or valid
-                service token with no qualifying App Role [D7].
+                service token with no qualifying App Role.
         """
         # ---- SHARED VALIDATION (both paths) — UNCHANGED from V1 ----
         try:
@@ -444,7 +444,7 @@ class EntraResolver:
             else []
         )
 
-        # --- Authorization = ROLE ALONE [D7].  Admit iff a qualifying configured
+        # --- Authorization = ROLE ALONE.  Admit iff a qualifying configured
         #     role is present.  Empty name disables that role (config.py:504-513).
         authorized = (
             (self._service_data_role and self._service_data_role in roles)
@@ -743,7 +743,7 @@ class BearerTokenMiddleware:
             )
             await _send_error(send, exc.status_code, exc.reason)
             return
-        except Exception:
+        except Exception:  # noqa: BLE001 -- defense-in-depth catch-all
             # Defense-in-depth catch-all: any unexpected exception from the
             # resolver (e.g. a transient library bug) must not propagate as a
             # 500 — respond fail-closed (401) and log loudly for operators.

@@ -62,6 +62,91 @@ ring_buffer: EventRingBuffer = EventRingBuffer()
 
 
 # ---------------------------------------------------------------------------
+# BootState
+# ---------------------------------------------------------------------------
+
+# Authoritative phase enum (v1.3.1 C2). `sweep`/`topup` are MOMENTARY step
+# labels only -- `_crash_recovery_sweep_loop` runs forever once started, so
+# step 7 of `_boot_reconcile` unconditionally sets phase="ready" AFTER
+# starting it; a non-returning loop must never leave phase stuck at "sweep".
+_BOOT_PHASES = (
+    "recovering",
+    "heal",
+    "reclaim",
+    "expire",  # dead-letter expiry, before reconcile
+    "reconcile",
+    "seed",
+    "topup",
+    "sweep",
+    "ready",
+    "failed",
+)
+
+
+@dataclasses.dataclass
+class BootState:
+    """Boot-safety progress, surfaced (additively) on /status.
+
+    A module-level singleton, mirroring the existing ``ring_buffer`` pattern
+    above. Every mutation happens on the event loop inside ``_boot_reconcile``
+    between awaits -- plain ints, no lock needed (do not add one).
+
+    ``phase`` DEFAULTS to ``"recovering"`` -- NEVER ``"ready"`` -- because the
+    zero-disk-during-boot guarantee (the lean /status response) depends on
+    this being true from the moment the module is imported, before
+    ``lifespan`` has run at all (e.g. under a bare ASGI test client that
+    never awaits the real lifespan).
+
+    ``status`` on /status stays ``"ok"`` and HTTP 200 at EVERY phase,
+    including ``"failed"`` -- the boot phase is INFORMATIONAL, never a
+    liveness signal. Flipping the probe on a failed reconcile would
+    reintroduce the exact probe-kills-boot restart loop this design removes.
+    """
+
+    phase: str = "recovering"
+    started_at: float = 0.0
+    completed_at: float | None = None
+    reclaimed: int = 0
+    reclaimed_bytes: int = 0
+    kept: int = 0
+    failed: int = 0
+    resumed: int = 0
+    deferred: int = 0
+    error: str | None = None
+    failed_step: str | None = None
+    fallback_workspace_byte0: int = 0
+    fallback_workspace_sentinel: int = 0
+    reclaim_enabled: bool = False
+
+    def begin(self) -> None:
+        """Mark the start of boot reconciliation (called once, at boot)."""
+        self.phase = "recovering"
+        self.started_at = time.time()
+        self.completed_at = None
+        self.error = None
+        self.failed_step = None
+
+    def finish(self) -> None:
+        """Mark boot reconciliation as complete: phase -> "ready"."""
+        self.phase = "ready"
+        self.completed_at = time.time()
+
+    def fail(self, step: str, exc: BaseException) -> None:
+        """Mark boot reconciliation as FAILED. The server keeps serving."""
+        self.phase = "failed"
+        self.completed_at = time.time()
+        self.failed_step = step
+        self.error = f"{type(exc).__name__}: {exc}"
+
+    def snapshot(self) -> dict[str, Any]:
+        """Read-only view for /status. Plain dict, no I/O."""
+        return dataclasses.asdict(self)
+
+
+boot_state: BootState = BootState()
+
+
+# ---------------------------------------------------------------------------
 # error_count_last_hour
 # ---------------------------------------------------------------------------
 

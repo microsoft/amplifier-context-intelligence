@@ -82,19 +82,22 @@ local runs. Scope is intentionally narrow — do this and nothing else.
 context_intelligence_server/      # FastAPI ingestion server
 ├── main.py                       # App factory, routes, lifespan
 ├── config.py                     # Settings (YAML + env vars via Pydantic)
-├── queue_manager.py              # Durable per-session append-log (persist-then-202)
-├── registry.py                   # Per-session drainers (drain_worker, write semaphore, retry/dead-letter)
+├── queue_manager.py              # Durable per-session append-log (persist-then-202); per-key _KeyGuard file lock (atomic single-writer append), compaction, dead-letter expiry, GC candidate scan
+├── registry.py                   # Per-session drainers (drain_worker, write semaphore, retry/dead-letter, drain-task done-callback supervision)
 ├── pipeline.py                   # Per-event dispatch spine (invoked by the drainer)
 ├── neo4j_store.py                # Managed-transaction Neo4j writes
 ├── blob_store.py                 # Async disk blob storage
+├── idempotency.py                # Request dedupe (seen/store split — a key is stored only AFTER a durable append)
+├── writer_lease.py               # Queue-directory writer-lease DETECTOR (heartbeat + staleness; detect/enforce/off; surfaces on /status.writer_lease)
 ├── handlers/                     # Event handlers (data_layer_1/2/3)
 │   ├── data_layer_1/             # Session/tool-call handlers
 │   ├── data_layer_2/             # Graph enrichment handlers
 │   └── data_layer_3/             # High-level insight handlers
-├── routers/                      # API routers (queues.py = dead-letter inspect/replay/purge; admin.py = /admin/* identity-map CRUD)
+├── routers/                      # API routers (queues.py = dead-letter inspect/replay/purge + operator GC: GET /queues/gc preview, POST /queues/gc/apply; admin.py = /admin/* identity-map CRUD; version.py)
 ├── auth.py                       # Bearer-token auth middleware (StaticKeyResolver / EntraResolver via PrincipalResolver; BearerTokenMiddleware; admin-key recognition)
+├── authz.py                      # Per-route capability gates (require_read / require_write)
 ├── identity_store.py             # Durable JSON identity map (write-file-then-swap, fail-closed load, live flat_dict)
-├── status.py                     # Status/version plumbing (EventRingBuffer, build_status_response, SERVER_VERSION, ring_buffer)
+├── status.py                     # Status/version plumbing (EventRingBuffer, build_status_response, SERVER_VERSION, ring_buffer, BootState/boot_state — the boot-phase singleton behind /status.boot)
 └── models.py                     # Pydantic request/response models
 
 docs/                             # ⚠️ PRODUCT DOCUMENTATION ONLY
@@ -432,6 +435,11 @@ with admin"). Runtime runbook: `docs/identity-management.md`.
 ## Key Concepts
 
 - **Event pipeline** — `POST /events` persists the raw event to a durable per-session append-log (`queue_manager.py`) and returns `202` immediately (persist-then-202). A single drainer per session (`registry.py`) processes batches and flushes them to Neo4j under a global write semaphore, with transient/deadlock retry, dead-letter isolation of poison events, and crash recovery (replay + counter re-seed) on startup. Each handler invoked by the per-event dispatch spine is a Python class in `handlers/data_layer_*/`.
+- **Append framing** — appends to one worker key are serialized by a per-key file lock (`_KeyGuard.file_lock`, held by the writing *thread*, not the coroutine), so a record lands as one contiguous newline-terminated line or not at all; a partial write is discarded and the error raised. The idempotency key is stored **only after** the durable append succeeds (`idempotency.py`: `seen()` / `store()` are separate) so a failed write plus a client retry is honoured, not falsely refused.
+- **Drain supervision** — a drain task's done-callback (`registry.py`) is the single supervision point: a task that dies logs `drain_worker_died` at ERROR with the session id + traceback, deregisters the session, and closes its store. A poison line is dead-lettered and the offset advanced past it, so draining continues.
+- **Boot phases** — boot recovery runs as a supervised background task (`main._boot_reconcile`), so `/status` and `/version` answer from the first phase. `status.BootState` (module singleton `boot_state`) tracks `recovering → heal → reclaim → expire → reconcile → seed → topup → sweep → ready`, or terminates at `failed` — and `failed` keeps serving. The phase is surfaced additively on `/status.boot`; while booting, `/status` does zero disk reads and reports `metrics`/`spool` as `null` with `status_detail.reason == "booting"`.
+- **Self-shrinking queue storage** — a live session's committed prefix is reclaimed continuously (compaction), and log-less dead-letters expire on an mtime window. `GET /queues/gc` (read, preview, never deletes, works during boot) and `POST /queues/gc/apply` (write, 409 until boot is `ready`/`failed`, bounded, per-item re-verified under the key lock) are the operator-facing reclaim path.
+- **Writer lease** — `writer_lease.py` detects a second process writing the same queue directory (the rolling-deploy overlap that voids the single-writer append guarantee) and surfaces it on `/status.writer_lease` within a heartbeat. It is a **detector, not a mutex**; default mode `detect` never refuses to boot.
 - **Graph model** — session sub-labels: `RootSession`, `SubSession`, `ForkedSession`, `IncompleteSession` (health marker; not a terminal). Full schema with all node and edge types: see `docs/architecture/03-graph-model.dot` and `docs/architecture/README.md`.
 - **Blob storage** — Large event payloads are written to disk and referenced by URI to avoid graph bloat.
 - **Configuration** — Pydantic Settings reads from `server-config.yaml` first, then environment variables. See `config.py`.
