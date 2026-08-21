@@ -325,7 +325,7 @@ digraph durable_ingest_queue {
         ]
 
         PhaseReady [
-            label     = "phase = ready\nboot over: /status fills in metrics + spool,\nPOST /queues/gc/apply is admitted"
+            label     = "phase = ready\nboot over: /status fills in metrics + spool"
             shape     = oval
             fillcolor = "#C8E6C9"
         ]
@@ -380,7 +380,7 @@ digraph durable_ingest_queue {
         ]
 
         QueuesEndpoint [
-            label     = "routers/queues.py (authenticated: Bearer)\nGET  /queues/dead-letter                      (read)\nPOST .../{worker_key}/replay                  (write)\nPOST .../{worker_key}/purge                   (write)\nGET  /queues/gc        PREVIEW  (read)  -- stat/read ONLY,\n       deletes NOTHING, and is UNGATED during boot\nPOST /queues/gc/apply  APPLY    (write) -- 409 until boot is\n       ready|failed; bounded by gc_max_delete_per_pass;\n       body {max_delete} may only LOWER that ceiling;\n       every item RE-VERIFIED under its per-key lock\n       immediately before deletion"
+            label     = "routers/queues.py (authenticated: Bearer)\nGET  /queues/dead-letter                      (read)\nPOST .../{worker_key}/replay                  (write)\nPOST .../{worker_key}/purge                   (write)"
             fillcolor = "#B3E5FC"
         ]
 
@@ -530,32 +530,6 @@ digraph durable_ingest_queue {
         constraint = false
     ]
 
-    // GC: PREVIEW only ever READS. Deletion is reachable ONLY from apply.
-    QueuesEndpoint   -> FileOffset [
-        style      = dashed
-        color      = "#0277BD"
-        fontcolor  = "#0277BD"
-        label      = "GET /queues/gc\nscans (stat + offset READ only,\nno path to an unlink)"
-        arrowhead  = open
-        constraint = false
-    ]
-    QueuesEndpoint   -> FileLog [
-        style      = bold
-        color      = "#C62828"
-        fontcolor  = "#C62828"
-        label      = "POST /queues/gc/apply ONLY:\ndelete a FULLY-DRAINED log\n(committed == size, re-verified\nunder the per-key lock)"
-        arrowhead  = odot
-        constraint = false
-    ]
-    QueuesEndpoint   -> FileDeadLetter [
-        style      = bold
-        color      = "#C62828"
-        fontcolor  = "#C62828"
-        label      = "POST /queues/gc/apply ONLY:\ndelete an EXPIRED LOG-LESS\ndead-letter"
-        arrowhead  = odot
-        constraint = false
-    ]
-
     // The writer lease guards the DIRECTORY the append log lives in.
     WriterLease      -> FileLog [
         style      = dotted
@@ -619,14 +593,7 @@ digraph durable_ingest_queue {
             label     = "supervision / detection\n(not prevention)"
             fillcolor = "#FFE0B2"
         ]
-        LegDelete [
-            label     = "deletion edge\n(reachable ONLY from\nPOST /queues/gc/apply)"
-            shape     = plaintext
-            style     = ""
-            fontcolor = "#C62828"
-        ]
-
         LegGreen -> LegAuth -> LegDiamond -> LegFile -> LegOval -> LegError [style = invis]
-        LegError -> LegShrink -> LegDetect -> LegDelete [style = invis]
+        LegError -> LegShrink -> LegDetect [style = invis]
     }
 }

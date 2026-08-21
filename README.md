@@ -21,7 +21,8 @@ Amplifier CLI sessions
 | - Atomic single-writer append (per-key   |
 |   file lock) + supervised drain workers  |
 | - Self-shrinking queue storage           |
-|   (compaction + operator GC endpoint)    |
+|   (continuous compaction + dead-letter   |
+|    retention)                            |
 +------------------------------------------+
 ```
 
@@ -42,9 +43,8 @@ past it instead of halting.
 Queue storage shrinks itself. A live session's already-committed prefix is reclaimed
 continuously (compaction) rather than only when the session ends, so a `.log` tracks the
 undrained tail rather than the whole session history; dead-letter files that no longer have a
-`.log` beside them expire on an mtime-based retention window. For anything those leave behind,
-`GET /queues/gc` previews and `POST /queues/gc/apply` deletes fully-drained logs and expired
-log-less dead-letters — entirely server-side, no disk access required.
+`.log` beside them expire on an mtime-based retention window. Both run automatically as part of
+normal operation and need no operator action.
 
 ---
 
@@ -340,8 +340,6 @@ Full runtime onboarding/offboarding runbook and the `/admin/*` API:
 | `GET` | `/queues/dead-letter` | List dead-letter queues — `worker_key`, `item_count`, `last_error`, `last_ts` (requires `Authorization: Bearer`) |
 | `POST` | `/queues/dead-letter/{worker_key}/replay` | Re-enqueue a worker's dead-letter records then purge; returns count re-enqueued (requires `Authorization: Bearer`) |
 | `POST` | `/queues/dead-letter/{worker_key}/purge` | Permanently delete a worker's dead-letter records; returns count purged (requires `Authorization: Bearer`) |
-| `GET` | `/queues/gc` | **Preview** safe-to-delete queue storage: fully-drained `.log` files and expired log-less dead-letters, with per-item path, bytes, age, reason, plus `totals` and aggregate `excluded` counts. **Deletes nothing** — stat/read only. Requires the **read** capability, and is **available during boot** (deliberately ungated, since a full spool during a slow boot is exactly when it is most wanted) |
-| `POST` | `/queues/gc/apply` | **Apply** the deletion for exactly those previewed candidates, each re-verified under its per-key lock immediately before deletion. Requires the **write** capability. Returns **409 while the server is still booting** (allowed once the boot phase is `ready` or `failed`); preview stays available meanwhile. Bounded per pass by `gc_max_delete_per_pass`; an optional body `{"max_delete": N}` may only **lower** that ceiling, never raise it. A body-less POST is valid |
 | `PUT`/`DELETE`/`GET` | `/admin/identities[/{oid}]` | Runtime entra identity-map CRUD (`auth_mode=entra`) — admin authority required. See [docs/identity-management.md](docs/identity-management.md) |
 | `PUT`/`DELETE`/`GET` | `/admin/keys[/{sha256hash}]` | Runtime static API-key map CRUD (`auth_mode=static`) — admin authority required. See [docs/identity-management.md](docs/identity-management.md) |
 
@@ -429,8 +427,6 @@ Values are resolved with this priority (highest first):
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_QUEUE_COMPACT_MAX_TAIL_BYTES` | `queue_compact_max_tail_bytes` | `67108864` (64 MiB) | Bounds compaction **cost**: a key whose undrained tail exceeds this is skipped, since the copy cost — and therefore how long the per-key lock is held against `POST /events` for that key — is proportional to the tail, not the prefix. Self-healing: as the drainer catches up, compaction resumes automatically. `<= 0` means no cap. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_DEAD_LETTER_EXPIRY_ENABLED` | `dead_letter_expiry_enabled` | `true` | Expire dead-letter files that have **no `.log` beside them** once they age past the retention window below. Deliberately independent of `reclaim_enabled`: the predicate here is two plain filesystem facts, not a heuristic classification. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_DEAD_LETTER_RETENTION_SECONDS` | `dead_letter_retention_seconds` | `2592000.0` (30 days) | How long a log-less `.dead.jsonl` survives (by mtime) before expiry — long enough to notice it via `GET /queues/dead-letter` and purge or replay it, short enough that it cannot accumulate forever. `<= 0` disables expiry outright; negative is a hard startup error. |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_GC_QUEUE_TTL_SECONDS` | `gc_queue_ttl_seconds` | `172800.0` (2 days) | How long a fully-drained (`committed == size`) `.log` must sit untouched before `GET/POST /queues/gc` will offer it. A **conservatism knob for a bulk sweep, not the safety invariant** — the invariant is `committed == size`, re-verified under the per-key lock at delete time. `0` (offer as soon as drained) is valid; negative is a hard startup error. |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_GC_MAX_DELETE_PER_PASS` | `gc_max_delete_per_pass` | `1000` | Hard ceiling on GC **outcomes** (deleted + skipped + failed) per `POST /queues/gc/apply` call — bounds how long one request holds per-key locks and how much a single mistaken call can remove. A request body may only lower it. Values below `1` are a hard startup error (`0` must never read as "unbounded"). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_WRITER_LEASE_MODE` | `writer_lease_mode` | `detect` | Writer-lease detector for the queue directory. `detect` (default) acquires the lease best-effort, heartbeats it, and latches + surfaces a conflict on `/status.writer_lease` — but **never refuses to boot**. `enforce` additionally refuses to boot against a fresh foreign lease. `off` disables the detector. See [docs/operational-hardening.md](docs/operational-hardening.md) — **leave this at `detect`**; `enforce` is present but not yet cleared for use. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_WRITER_LEASE_HEARTBEAT_SECONDS` | `writer_lease_heartbeat_seconds` | `5.0` | Lease renew + re-read interval. Sets the detection latency: a conflict becomes visible on `/status` within one heartbeat. Must be `> 0`. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_WRITER_LEASE_STALENESS_MULTIPLIER` | `writer_lease_staleness_multiplier` | `3.0` | Staleness window = heartbeat x this (15.0s at defaults). Must survive two consecutive missed ticks without a false "stale" verdict, so values **below `2.0` are a hard startup error**. |
@@ -475,8 +471,8 @@ to the graph.
 committed, its bytes have reached the graph and the queue no longer needs them: the
 already-committed prefix of a *live, still-open* session's `.log` is reclaimed
 continuously (compaction), so the file tracks the undrained tail rather than the
-whole session history. A fully-drained log is removed at session finalize, or later
-via the operator GC endpoint. Dead-letter files are likewise bounded: a
+whole session history. A fully-drained log is removed at session finalize.
+Dead-letter files are likewise bounded: a
 `.dead.jsonl` with no `.log` beside it expires once it ages past
 `dead_letter_retention_seconds`. Read the queue directory as "what has not reached
 the graph yet", never as "everything this server ever ingested" — the graph and the

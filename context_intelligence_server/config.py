@@ -977,43 +977,6 @@ class Settings(BaseSettings):
     # <=0 disables expiry outright (an explicit opt-out, not a silent one).
     dead_letter_retention_seconds: float = 30 * 86400.0
 
-    # How long a fully-drained (``committed ==
-    # size``) queue log must sit untouched before the operator GC endpoint
-    # (GET/POST /queues/gc) will offer it as safe to delete. 2 days is the
-    # value the manual Aug-2026 reclaim used against the live share -- it
-    # selected 1139 logs / 52.5 GiB with zero live sessions in the set. It is
-    # a CONSERVATISM knob for a bulk sweep, not a data-safety invariant: the
-    # safety invariant is `committed == size`, which `delete_drained`
-    # re-verifies under the file lock, and which `delete_drained` already
-    # acts on with NO age gate at every session finalize.
-    gc_queue_ttl_seconds: float = 2 * 86400.0
-
-    # Hard ceiling on GC apply OUTCOMES (deleted + skipped + failed) per
-    # pass -- not merely deletions. Bounds how long one request holds per-key
-    # locks and how much a single mistaken call can remove. A request body
-    # may only LOWER this, never raise it. 1000 clears the observed
-    # 1139-file backlog in two passes while keeping any single pass
-    # reviewable.
-    gc_max_delete_per_pass: int = 1000
-
-    @field_validator("gc_queue_ttl_seconds")
-    @classmethod
-    def _validate_gc_queue_ttl_seconds(cls, v: float) -> float:
-        """Fail loud on a negative TTL; 0 (delete as soon as drained) is valid."""
-        if v < 0:
-            raise ValueError(
-                f"gc_queue_ttl_seconds must be a non-negative number, got {v}"
-            )
-        return v
-
-    @field_validator("gc_max_delete_per_pass")
-    @classmethod
-    def _validate_gc_max_delete_per_pass(cls, v: int) -> int:
-        """Fail loud on <1 -- 0/negative must NEVER read as 'unbounded'."""
-        if v < 1:
-            raise ValueError(f"gc_max_delete_per_pass must be >= 1, got {v}")
-        return v
-
     @field_validator(
         "queue_compact_min_prefix_bytes",
         "queue_compact_max_tail_bytes",

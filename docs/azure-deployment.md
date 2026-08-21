@@ -751,7 +751,7 @@ guarantee is structural, not "be careful":
 - **Neo4j data** lives on the VM's **persistent managed data disk**, entirely
   outside the manifest (see Neo4j safety, above). Untouched by any server redeploy.
 
-### `/data/queues` is self-shrinking — and reclaimable over the API
+### `/data/queues` is self-shrinking
 
 The durable ingest queue is a **transient buffer, not an archive**. A live
 session's already-committed prefix is reclaimed continuously (compaction), so a
@@ -760,28 +760,9 @@ fully-drained log is removed at session finalize; and a dead-letter file with no
 `.log` beside it expires on an mtime-based retention window. Steady-state
 `/data/queues` growth therefore tracks **undrained** data, not total ingest.
 
-For anything those leave behind, reclaim it **through the API — this is the
-supported path on Container Apps**:
-
-```bash
-TOKEN=$(az account get-access-token --resource "api://<client_id>" --query accessToken -o tsv)
-BASE="https://<your-server-fqdn-or-apim-gateway>"
-
-# Preview: deletes nothing, read capability, answers even while the server is booting.
-curl -s -H "Authorization: Bearer $TOKEN" "$BASE/queues/gc"
-
-# Apply: write capability, bounded per pass, each item re-verified before deletion.
-curl -s -X POST -H "Authorization: Bearer $TOKEN" "$BASE/queues/gc/apply"
-```
-
-This runs entirely server-side: **no container exec, no disk access, and no
-`az storage` commands against the share.** It only ever offers fully-drained
-logs and expired log-less dead-letters — undrained data is structurally excluded
-and reported in the response's `excluded` counts. `POST /queues/gc/apply`
-returns **409 while the server is still booting** (preview stays available);
-retry once `/status` reports the boot phase as `ready` or `failed`. Full
-runbook, scopes, and the safety invariant:
-[operational-hardening.md](operational-hardening.md) §8.
+These mechanisms run automatically and require no operator action. Reclamation
+of already-drained backlog, if ever needed, is an out-of-band maintenance
+operation run inside the container.
 
 ### The ONLY things that can lose `/data` — avoid during a version bump
 

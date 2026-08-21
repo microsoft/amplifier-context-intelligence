@@ -33,7 +33,7 @@ resolver and exempt-path set are wired at boot time.
 | 02 | [02-handler-architecture.dot](./02-handler-architecture.dot) | Handler class-level architecture |
 | 03 | [03-graph-model.dot](./03-graph-model.dot) | Neo4j property-graph schema |
 | 04 | [04-default-handler-flow.dot](./04-default-handler-flow.dot) | DefaultHandler internal decision flow |
-| 05 | [05-durable-ingest-queue.dot](./05-durable-ingest-queue.dot) | Durable ingest queue + drain loop — atomic per-key append, supervised drainers, phased boot, continuous prefix reclaim + dead-letter expiry, the `/queues/gc` preview/apply pair, and the writer-lease detector (incl. auth middleware entry) |
+| 05 | [05-durable-ingest-queue.dot](./05-durable-ingest-queue.dot) | Durable ingest queue + drain loop — atomic per-key append, supervised drainers, phased boot, continuous prefix reclaim + dead-letter expiry, and the writer-lease detector (incl. auth middleware entry) |
 | 06 | [06-auth-flow.dot](./06-auth-flow.dot) | **Per-request auth flow** — BearerTokenMiddleware → resolver dispatch → `/admin/*` branch or `post_events` |
 | 07 | [07-auth-startup.dot](./07-auth-startup.dot) | **Auth boot wiring** — mode selection, JWKS prefetch, fail-closed gate, exempt-path selection |
 | 08 | [08-identity-map-management.dot](./08-identity-map-management.dot) | **Runtime identity-map management** — admin API, `require_admin` gate, `IdentityStore` write-then-swap, live `flat_dict`, no-redeploy proof |
@@ -247,16 +247,13 @@ never an actual delete. Respawn of recovered drainers is capped per pass, with a
 sweep advancing the deferred tail — reclaiming already-drained data at a bounded rate rather
 than all at once.
 
-**Storage shrinks itself, and is reclaimable over the API.** A live session's
+**Storage shrinks itself.** A live session's
 already-committed prefix is rewritten away continuously (compaction), so a `.log` tracks the
 undrained tail rather than the whole session history — bounded in frequency by a minimum
 committed-prefix threshold and in per-rewrite cost by a maximum tail size, so one rewrite
 cannot hold a key's lock against `POST /events` for an unbounded time. Dead-letter files with
-no `.log` beside them expire on an mtime-based retention window. For the remainder,
-`GET /queues/gc` previews fully-drained logs and expired log-less dead-letters (read
-capability, stat/read only, answers during boot) and `POST /queues/gc/apply` deletes exactly
-those, each re-verified under its per-key lock immediately before deletion (write capability,
-`409` until boot reaches `ready`/`failed`, bounded per pass).
+no `.log` beside them expire on an mtime-based retention window. Both run automatically as
+part of normal operation and require no operator action.
 
 Observability follows the same split. `/status` carries the always-present `boot` block (phase
 plus reclaim/resume counters) and `writer_lease` block (the queue-directory writer-lease

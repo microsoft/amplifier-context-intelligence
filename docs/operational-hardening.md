@@ -248,9 +248,6 @@ mechanisms bound it:
 - **Dead-letter expiry** removes a `.dead.jsonl` that has no `.log` beside it
   once it ages past `dead_letter_retention_seconds` (30 days by default), so
   poison records cannot accumulate indefinitely.
-- **`GET /queues/gc`** is the read-only inventory of what is *safe* to remove —
-  fully-drained logs and expired log-less dead-letters, with paths, bytes, ages
-  and reasons. See §8.
 
 None of that bounds **undrained** data: a stalled drainer's tail is exactly the
 data nothing may touch, and it grows for as long as the stall lasts. Boot cost
@@ -262,26 +259,16 @@ top-up sweep (`crash_recovery_sweep_interval_seconds`, default 60s). Boot no
 longer crash-loops on an oversized spool: a reconciliation failure sets the boot
 phase to `failed` and the server keeps serving.
 
-**Reclaiming space — start here, not with `mv`.** The supported path needs no
-disk access and never touches undrained data:
-
-```bash
-# 1. Preview. Deletes nothing; available even while the server is booting.
-curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8000/queues/gc \
-  | python3 -c "import json,sys; r=json.load(sys.stdin); print(r['totals']); print(r['excluded'])"
-
-# 2. Review the candidate list, then apply (bounded per pass).
-curl -s -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8000/queues/gc/apply \
-  | python3 -c "import json,sys; print(json.load(sys.stdin)['applied'])"
-```
-
-Full runbook, scopes, and safety invariant: §8.
+**Reclaiming space.** In normal operation there is nothing to reclaim by hand:
+compaction and dead-letter expiry above run continuously and need no operator
+action. If an already-drained backlog ever does need manual reclamation, that is
+an out-of-band admin/maintenance operation performed inside the container — there
+is no API for it.
 
 ### Last resort — archive the whole queue directory
 
 Only if the server cannot be made healthy any other way. Boot no longer
-crash-loops on spool size, so this is rarely the right tool; prefer the GC
-endpoint above, which cannot remove undrained data.
+crash-loops on spool size, so this is rarely the right tool.
 
 ```bash
 DATA_DIR="$HOME/amplifier-context-intelligence-server-data-store"
@@ -322,12 +309,12 @@ Check these directly.
 > raised, and `failed_step` + `error` name which. `/status` stays HTTP `200`
 > with `status: "ok"` at every phase, deliberately: the boot phase must never
 > flip a liveness probe and restart the boot it is reporting on. `conflict:
-> true` on the lease block is §9.
+> true` on the lease block is §8.
 
 | Symptom | Command | What bad looks like |
 |---------|---------|---------------------|
 | Still booting (check before anything below) | `curl -s http://localhost:8000/status \| python3 -c "import json,sys; r=json.load(sys.stdin); print(r['boot']['phase'], r.get('status_detail'))"` | anything other than `ready` — `metrics`/`spool` are `null` until then; `failed` names a step in `boot.failed_step` |
-| Two writers on one queue directory | `curl -s http://localhost:8000/status \| python3 -c "import json,sys; print(json.load(sys.stdin)['writer_lease'])"` | `conflict: true` — see §9 |
+| Two writers on one queue directory | `curl -s http://localhost:8000/status \| python3 -c "import json,sys; print(json.load(sys.stdin)['writer_lease'])"` | `conflict: true` — see §8 |
 | Graph stopped updating | `curl -s http://localhost:8000/status \| python3 -c "import json,sys;[print(s['session_id'],s['last_successful_flush'],s['events_processed']) for s in json.load(sys.stdin)['sessions']]"` | `last_successful_flush` (unix seconds) hours old while `events_processed` keeps climbing |
 | Backlog / loss accounting (**boot must be `ready`/`failed`**) | `curl -s http://localhost:8000/status \| python3 -c "import json,sys; print(json.load(sys.stdin)['metrics'])"` | `in_queue_total` climbing and not falling; `degraded: true`; non-zero `dead_letter_total`. `None` printed → still booting, not broken |
 | Spool footprint from the server itself (**boot must be `ready`/`failed`**) | `curl -s http://localhost:8000/status \| python3 -c "import json,sys; print(json.load(sys.stdin)['spool'])"` | `spool_bytes_total` climbing and not falling. `None` printed → still booting |
@@ -364,8 +351,7 @@ runs out of memory. It guarantees the failure is **bounded and attributable**:
 | `StartLimitIntervalSec` / `StartLimitBurst` | An infinite restart loop burning CPU for days | The underlying failure — the unit stops in `failed` state and **stays down** until you fix it |
 | `write_concurrency: 4` | A backlog drain thundering Neo4j's transaction-memory ceiling | A backlog from forming in the first place |
 | Compaction + dead-letter expiry (on by default) | A *drained* session's bytes and orphaned poison records living on disk forever; a `.log` growing to the size of the whole session | **Undrained** data growing — a stalled drainer's tail is exactly what must not be touched; compaction shrinks nothing there |
-| `GET`/`POST /queues/gc` (§8) | Needing disk / shell access to reclaim drained queue storage; a bulk sweep removing something still in use (each item is re-verified under its per-key lock at delete time, and one pass is bounded) | An oversized spool caused by a *stall* — GC only ever offers what has already reached the graph |
-| Writer-lease detector (§9) | A rolling deploy silently running two writers on one queue directory with **no signal at all** | The corruption itself — it is a detector with a staleness tolerance, not a mutex. It makes the overlap visible, not safe |
+| Writer-lease detector (§8) | A rolling deploy silently running two writers on one queue directory with **no signal at all** | The corruption itself — it is a detector with a staleness tolerance, not a mutex. It makes the overlap visible, not safe |
 
 The point of every one of them is the same: convert a silent, unbounded,
 self-perpetuating failure into a loud, bounded, one-shot one that shows up in
@@ -380,99 +366,7 @@ restarts.**
 
 ---
 
-## 8. Operator GC — reclaiming drained queue storage
-
-Two endpoints let an operator inventory and reclaim queue storage **entirely
-server-side**. No disk access, no shell into the container, no storage-account
-tooling — which matters most exactly where you have none of those.
-
-| Endpoint | Capability | Deletes? | During boot |
-|----------|-----------|----------|-------------|
-| `GET /queues/gc` | **read** | never — stat/read only | **available** (deliberately ungated) |
-| `POST /queues/gc/apply` | **write** | yes, bounded | **409** until boot reaches `ready` or `failed` |
-
-### Preview → review → apply
-
-```bash
-TOKEN=...   # a credential with the read capability (write, for apply)
-BASE=http://localhost:8000
-
-# 1. PREVIEW — deletes nothing.
-curl -s -H "Authorization: Bearer $TOKEN" "$BASE/queues/gc" > /tmp/gc.json
-
-# Totals, and why things were EXCLUDED (the interesting half).
-python3 - <<'PY' < /tmp/gc.json
-import json,sys
-r = json.load(sys.stdin)
-print("scanned keys:", r["scanned_keys"])
-print("totals:", r["totals"])
-print("excluded:", r["excluded"])
-for c in r["candidates"][:10]:
-    print(f'  {c["class"]:11} {c["bytes"]:>12,}B  age={c["age_seconds"]:.0f}s  {c["reason"]:12} {c["path"]}')
-PY
-
-# 2. APPLY — same candidate set, each re-verified before deletion.
-curl -s -X POST -H "Authorization: Bearer $TOKEN" "$BASE/queues/gc/apply" \
-  | python3 -c "import json,sys; print(json.load(sys.stdin)['applied'])"
-
-# Smaller first pass? A body may only LOWER the configured ceiling.
-curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"max_delete": 25}' "$BASE/queues/gc/apply"
-```
-
-`applied` reports `deleted` / `skipped` / `failed`, the `max_delete` actually in
-force, `bounded_by_max_delete` (true when the pass hit its ceiling — just run it
-again), and `bytes_reclaimed_estimate`. That last field is **labelled an estimate
-honestly**: it sums scan-time sizes, not bytes observed unlinked.
-
-### What it offers, and what it will never offer
-
-A **queue log** is offered only when *all* of these hold: an `.offset` exists,
-`committed == size` (fully drained, no undrained tail), the file has no torn
-tail, it has been untouched longer than `gc_queue_ttl_seconds`, and no live
-drainer owns the key. A **dead-letter** is offered only when there is **no
-`.log`** for that key at all and it has aged past
-`dead_letter_retention_seconds`.
-
-Everything else is refused and counted, aggregate-only, in `excluded` —
-`live_worker`, `undrained_tail`, `no_offset`, `torn_tail`, `too_young`,
-`log_present`, `unreadable`. That block is the answer to "why didn't it reclaim
-anything?", and it is always present and zero-filled, so its shape never varies.
-
-### The safety invariant
-
-> **`committed == size` is the invariant. The age gate is conservatism, not
-> safety.**
-
-`apply` does not trust the preview. Each item is re-checked immediately before
-deletion, under that key's own file lock, by the same primitive the server
-already uses at session finalize — so a log that grew between scan and apply
-(an uncommitted append landed) is refused and reported `skipped` with reason
-`changed`, and a dead-letter whose `.log` reappeared (e.g. a replay) is reported
-`log_present`. Live-worker ownership is likewise re-checked at apply time.
-
-`gc_queue_ttl_seconds` (2 days by default) exists so a *bulk* sweep is
-reviewable, not because a drained log becomes safe only with age — the server
-already deletes fully-drained logs with no age gate at every session finalize.
-Lowering it does not weaken the invariant; it only widens the candidate set.
-
-`gc_max_delete_per_pass` (default 1000) bounds **outcomes**, not just deletions:
-deleted + skipped + failed. It bounds how long one request holds per-key locks
-and how much one mistaken call can remove. A request body may only lower it.
-
-### Why apply is refused during boot
-
-`POST /queues/gc/apply` returns **409** until the boot phase reaches `ready` or
-`failed`, because the boot reconciliation passes walk the same directory and
-seed the conservation counters; deleting underneath them can land before a key
-has been accounted for. `failed` counts as "boot is over" deliberately — the
-server keeps serving after a failed reconcile, and gating on `ready` alone would
-lock GC out for the rest of the process's life. Preview stays available
-throughout; retry apply once boot completes.
-
----
-
-## 9. Writer-lease conflicts during a rolling deploy
+## 8. Writer-lease conflicts during a rolling deploy
 
 The durable append log is correct because **exactly one process writes the queue
 directory**, with per-key locking inside that process. A rolling or blue/green
