@@ -121,9 +121,9 @@ class SessionLabelStateMachine:
             # Bare session: session:start/fork was permanently lost.  Rather than
             # fabricating a real terminal (Sub/Root), mark it explicitly so it
             # stays outside the clean terminal space and surfaces as a health signal.
-            # IncompleteSession IS a confirmed (if incomplete) terminal outcome — the
-            # node is no longer an orphaned stub, it is a diagnosed data-loss case —
-            # so StubSession is cleared here too.
+            # IncompleteSession is a confirmed (if incomplete) terminal outcome —
+            # a diagnosed data-loss case, not an unresolved stub — so
+            # StubSession is cleared here too.
             #
             # NOTE: if a real start/fork ever arrives AFTER this end (out-of-order,
             # vanishingly rare), _handle_start/_handle_fork will classify normally
@@ -316,21 +316,21 @@ class SessionHandler:
         parent_id = _parent_of(data)
 
         end_node_data: dict[str, Any] = {
-            # D-DUW: seed with the labels just read (session.py:313-314) so the
-            # buffered entry can never SHED a persisted terminal type. The removed
-            # handler flush used to clear the buffer here; a same-batch read after
-            # session:end now reads this entry instead of falling through to Neo4j.
+            # Seed with the labels just read so this upsert's buffer entry cannot
+            # SHED a persisted terminal type: a later same-batch read of this
+            # session then sees the type carried here, rather than a bare
+            # ["Session", "SST_EVENT"] entry that would look like an unclassified
+            # stub and trigger spurious stub-recovery.
             "labels": ["Session", "SST_EVENT", *labels],
             "ended_at": timestamp,
             "status": "completed",
             "session_id": session_id,
         }
-        # Persist parent_id when the end payload carries one.  _handle_start and
-        # _handle_fork already write parent_id, but a session that reaches
-        # session:end WITHOUT a captured start/fork previously never had
-        # parent_id recorded at all — leaving `parent_id IS NULL` ambiguous
-        # between "genuinely no parent" and "parent never recorded". Only write
-        # when present in the payload; never fabricate a value when absent.
+        # Persist parent_id when the end payload carries one. A session that
+        # reaches session:end without a captured start/fork would otherwise
+        # have no parent_id at all, leaving `parent_id IS NULL` ambiguous
+        # between "no parent" and "not recorded". Only write when present;
+        # never fabricate a value when absent.
         if parent_id:
             end_node_data["parent_id"] = parent_id
 

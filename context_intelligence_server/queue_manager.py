@@ -20,10 +20,8 @@ Disk layout (one set of files per session, keyed by ``session_id``):
   ``orphan_compact_tmp``.
 
 Durability note:
-    Appends use a plain durable ``write()``. This gives PROCESS-crash
-    durability (the bytes are handed to the OS page cache and survive a
-    process crash). POWER-LOSS durability via ``fsync`` is deliberately
-    deferred to a future fsync group-commit.
+    Appends use a plain ``write()`` (no ``fsync``): bytes reach the OS page
+    cache and survive a process crash, but not a power loss.
 
 session_id contract:
     Every public method validates ``session_id`` and raises ``ValueError`` if
@@ -527,8 +525,8 @@ class QueueManager:
         server-side EOF whereas seek-then-write would race on a stale
         position and OVERWRITE data.
 
-        No ``fsync``: power-loss durability stays deferred to a future
-        fsync group-commit.
+        No ``fsync`` is issued: appends survive a process crash but not a
+        power loss.
         """
         with guard.file_lock:
             flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
@@ -716,8 +714,8 @@ class QueueManager:
 
         Writes the offset to a temp file and uses ``os.replace`` for an atomic
         rename, so a reader never observes a torn or partial offset file. No
-        ``fsync`` is issued here: this gives process-crash durability, while
-        power-loss durability is deferred to a future fsync group-commit.
+        ``fsync`` is issued: the offset survives a process crash but not a
+        power loss.
         """
         self._validate_session_id(session_id)
         final = self._offset_path(session_id)
