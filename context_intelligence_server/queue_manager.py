@@ -185,32 +185,6 @@ class Classification:
     fallback_source: str | None = None
 
 
-@dataclass(frozen=True)
-class GcCandidate:
-    """One operator-GC garbage-collection candidate. Produced with NO side effects.
-
-    ``kind`` is ``"queue_log"`` or ``"dead_letter"``. ``reason`` is one token
-    from the closed set {fully_drained, empty_log, logless_dead_letter} for a
-    SAFE candidate. ``bytes`` is what deleting this candidate reclaims: for a
-    queue log the ``.log`` plus its ``.offset`` (both are unlinked together by
-    ``delete_drained``); for a dead-letter the ``.dead.jsonl``.
-
-    ``size`` / ``committed`` are the values AT SCAN TIME. They are report
-    fields only -- the delete path NEVER trusts them: ``delete_drained``
-    re-reads both inside ``guard.file_lock`` before unlinking (:823-843).
-    """
-
-    key: str
-    kind: str  # "queue_log" | "dead_letter"
-    path: str
-    bytes: int
-    age_seconds: float
-    reason: str
-    size: int = 0
-    committed: int = 0
-    records: int = 0  # dead_letter only
-
-
 # A bad-offset log at/below this many
 # bytes is RESET (re-drained from byte 0) rather than deleted outright.
 # Read from Settings so it stays a single, operator-overridable config knob
@@ -1982,9 +1956,7 @@ class QueueManager:
 
         return await asyncio.to_thread(_scan)
 
-    async def purge_dead_letters(
-        self, worker_key: str, require_logless: bool = False
-    ) -> int:
+    async def purge_dead_letters(self, worker_key: str) -> int:
         """Delete the dead-letter file for ``worker_key`` and return the count.
 
         Counts the dead-letter records via ``_count_dead``, then unlinks the
@@ -1997,31 +1969,12 @@ class QueueManager:
         Guarded by the key's ``_KeyGuard``: an unlink racing a
         ``dead_letter`` append from the drainer is the same class of hazard
         ``delete_drained`` guards against for the ``.log`` file.
-
-        ``require_logless``: when True, re-check INSIDE
-        ``guard.file_lock`` that ``<worker_key>.log`` does NOT exist, and
-        REFUSE (return -1, unlink nothing) if it does. Converts "never purge
-        a dead-letter for a key with a live `.log`" from an argued invariant
-        (the caller's own scan-time check) into a mechanical one enforced at
-        the same point ``delete_drained`` enforces its own in-lock refusal.
-        Default False -- the two existing callers
-        (``routers/queues.py``'s purge route, ``expire_dead_letters``) are
-        UNCHANGED: both already establish log-absence via their own means
-        (an explicit route param / the log-less scan predicate) before
-        calling this, so this refusal would be redundant, never load-bearing,
-        for them.
         """
         self._validate_session_id(worker_key)
         path = self._dead_path(worker_key)
-        log_path = self._log_path(worker_key)
 
         def _purge() -> int:
             with guard.file_lock:
-                if require_logless and log_path.exists():
-                    logger.warning(
-                        "gc_purge_refused key=%s reason=log_present", worker_key
-                    )
-                    return -1
                 count = self._count_dead(worker_key)
                 try:
                     path.unlink()
@@ -2147,164 +2100,6 @@ class QueueManager:
             "expired_bytes": expired_bytes,
             "failed": failed,
         }
-
-    async def scan_gc_candidates(
-        self,
-        now: float,
-        queue_ttl_seconds: float,
-        dead_letter_retention_seconds: float,
-        is_owned: Callable[[str], bool],
-    ) -> tuple[list[GcCandidate], dict[str, int], int]:
-        """READ-ONLY scan for the operator GC preview. Returns (safe_candidates, excluded_counts, scanned_keys).
-
-        Side-effect-free: stat() and offset reads ONLY -- never writes,
-        truncates, or unlinks. This is what makes PREVIEW structurally
-        incapable of deleting.
-
-        MUST NOT RAISE (mirrors ``reclaim_orphans`` / ``expire_dead_letters``):
-        a directory-level failure returns ``([], {"unreadable": 1}, 0)``; a
-        per-key failure increments ``excluded["unreadable"]`` and skips just
-        that key.
-
-        SAFE-TO-DELETE, queue log (``kind="queue_log"``) -- ALL of:
-          1. ``<key>.offset`` EXISTS. Load-bearing, not cosmetic:
-             ``_read_committed_offset`` returns 0 for a MISSING file, so
-             without this check a 0-byte log with no offset reads as
-             "committed == size" and looks drained.
-          2. ``committed == size``      (fully drained -- no undrained tail)
-          3. ``complete_end == size``   (no torn tail; STRICTER than
-                                         ``classify_session``'s ``>=``,
-                                         deliberately)
-          4. ``now - mtime(.log) > queue_ttl_seconds`` (strict ``>``, R5)
-          5. ``not is_owned(key)``      (no live drainer -- registry.has_worker)
-        Reason is "fully_drained" when size > 0, "empty_log" when size == 0.
-
-        SAFE-TO-DELETE, dead-letter (``kind="dead_letter"``) -- BOTH of:
-          1. ``<key>.log`` does NOT exist -- the STRUCTURAL log-less rule
-             ``expire_dead_letters`` uses verbatim.
-          2. ``now - mtime(.dead.jsonl) > dead_letter_retention_seconds``
-             (strict ``>``, R5)
-
-        EXCLUSION TOKENS (closed set, aggregate-counted):
-          live_worker | undrained_tail | no_offset | torn_tail | too_young
-          | log_present | unreadable
-
-        NEVER ENUMERATED AT ALL (not this pass's population, by design):
-          ``*.offset.tmp``, ``*.log.torn-*.bin``, ``*.log.compact.tmp`` --
-          these remain ``reclaim_orphans``'s territory.
-
-        ``is_owned`` is a plain, already-resolved ``Callable[[str], bool]``
-        (e.g. ``frozenset(registry.active_sessions()).__contains__``) --
-        invoked from the worker thread as a pure ``set.__contains__`` lookup,
-        never touching the event loop.
-        """
-
-        def _scan() -> tuple[list[GcCandidate], dict[str, int], int]:
-            excluded = {
-                "live_worker": 0,
-                "undrained_tail": 0,
-                "no_offset": 0,
-                "torn_tail": 0,
-                "too_young": 0,
-                "log_present": 0,
-                "unreadable": 0,
-            }
-            try:
-                log_paths = sorted(self._dir.glob("*.log"))
-                dead_paths = sorted(self._dir.glob("*.dead.jsonl"))
-            except OSError:
-                logger.exception("gc_scan_dir_failed dir=%s", self._dir)
-                return [], {"unreadable": 1}, 0
-
-            keys: set[str] = set()
-            for p in log_paths:
-                keys.add(p.stem)
-            for p in dead_paths:
-                keys.add(p.name[: -len(".dead.jsonl")])
-
-            candidates: list[GcCandidate] = []
-
-            for key in sorted(keys):
-                log_path = self._log_path(key)
-                has_log = log_path.exists()
-
-                if has_log:
-                    try:
-                        offset_path = self._offset_path(key)
-                        if not offset_path.exists():
-                            excluded["no_offset"] += 1
-                        else:
-                            size = log_path.stat().st_size
-                            committed = self._read_committed_offset(key)
-                            if committed != size:
-                                excluded["undrained_tail"] += 1
-                            else:
-                                complete_end = self._complete_data_end(key)
-                                if complete_end != size:
-                                    excluded["torn_tail"] += 1
-                                else:
-                                    mtime = log_path.stat().st_mtime
-                                    age = now - mtime
-                                    if not (age > queue_ttl_seconds):
-                                        excluded["too_young"] += 1
-                                    elif is_owned(key):
-                                        excluded["live_worker"] += 1
-                                    else:
-                                        offset_bytes = offset_path.stat().st_size
-                                        reason = (
-                                            "fully_drained" if size > 0 else "empty_log"
-                                        )
-                                        candidates.append(
-                                            GcCandidate(
-                                                key=key,
-                                                kind="queue_log",
-                                                path=str(log_path),
-                                                bytes=size + offset_bytes,
-                                                age_seconds=age,
-                                                reason=reason,
-                                                size=size,
-                                                committed=committed,
-                                            )
-                                        )
-                    except OSError:
-                        excluded["unreadable"] += 1
-                        logger.exception(
-                            "gc_scan_key_failed session=%s class=queue_log", key
-                        )
-
-                dead_path = self._dead_path(key)
-                if dead_path.exists():
-                    try:
-                        if log_path.exists():
-                            excluded["log_present"] += 1
-                        else:
-                            mtime = dead_path.stat().st_mtime
-                            age = now - mtime
-                            if not (age > dead_letter_retention_seconds):
-                                excluded["too_young"] += 1
-                            else:
-                                size = dead_path.stat().st_size
-                                records = self._count_dead(key)
-                                candidates.append(
-                                    GcCandidate(
-                                        key=key,
-                                        kind="dead_letter",
-                                        path=str(dead_path),
-                                        bytes=size,
-                                        age_seconds=age,
-                                        reason="logless_dead_letter",
-                                        records=records,
-                                    )
-                                )
-                    except OSError:
-                        excluded["unreadable"] += 1
-                        logger.exception(
-                            "gc_scan_key_failed session=%s class=dead_letter", key
-                        )
-
-            return candidates, excluded, len(keys)
-
-        return await asyncio.to_thread(_scan)
 
     async def recovery_seed_counts(self) -> tuple[int, int]:
         """Seed the conservation counters so residual == 0 by construction.
