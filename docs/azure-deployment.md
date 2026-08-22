@@ -760,9 +760,9 @@ fully-drained log is removed at session finalize; and a dead-letter file with no
 `.log` beside it expires on an mtime-based retention window. Steady-state
 `/data/queues` growth therefore tracks **undrained** data, not total ingest.
 
-These mechanisms run automatically and require no operator action. Reclamation
-of already-drained backlog, if ever needed, is an out-of-band maintenance
-operation run inside the container.
+These mechanisms run automatically and require no operator action — including
+reclamation of a fully-drained log, which happens at boot regardless of
+`reclaim_enabled`.
 
 ### The ONLY things that can lose `/data` — avoid during a version bump
 
