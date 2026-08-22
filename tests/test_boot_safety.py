@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from neo4j.exceptions import ServiceUnavailable
 
 import context_intelligence_server.main as main_module
 from context_intelligence_server.config import Settings
@@ -544,6 +545,7 @@ async def test_boot_reconcile_survives_a_failing_step_and_names_it(
 async def test_boot_reconcile_success_reaches_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    main_module.app.state.schema_ready = True  # schema is out of scope here
     monkeypatch.setattr(
         main_module.registry.queue_manager,
         "heal_torn_tails",
@@ -649,6 +651,7 @@ async def test_all_four_crash_triggers_reach_ready_with_reclaim_disabled(
     _seed_dead(tmp_path, "bad-payload", json.dumps({"payload": 123}) + "\n")
     _seed_log(tmp_path, "bad-payload", _line())
 
+    main_module.app.state.schema_ready = True  # schema is out of scope here
     monkeypatch.setattr(
         main_module.registry, "_queue_manager", QueueManager(queues_dir=tmp_path)
     )
@@ -1306,6 +1309,157 @@ async def test_shutdown_cancels_sweep_and_boot_tasks_before_closing_drivers(
     assert sweep_task.done()
     assert boot_task.done()
     assert mock_driver.close.await_count == 2
+
+
+# ---------------------------------------------------------------------------
+# schema-init must never crash-loop the server
+# ---------------------------------------------------------------------------
+
+
+async def test_lifespan_survives_schema_init_neo4j_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED before the fix: a connectivity failure during schema init must
+    not propagate out of lifespan -- the server still reaches yield (serves
+    /status), schema_ready stays False, and no drainers are started."""
+    mock_driver = MagicMock()
+    mock_driver.close = AsyncMock()
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
+    monkeypatch.setattr(
+        main_module._settings, "crash_recovery_sweep_interval_seconds", 60
+    )
+    schema_mock = AsyncMock(side_effect=ServiceUnavailable("simulated: unreachable"))
+    topup_mock = AsyncMock()
+
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch("context_intelligence_server.main.ensure_neo4j_schema", new=schema_mock),
+        patch(
+            "context_intelligence_server.main._crash_recovery_topup", new=topup_mock
+        ),
+    ):
+        async with lifespan(main_module.app):  # must reach yield without raising
+            await main_module.app.state.boot_task
+            assert main_module.app.state.schema_ready is False
+            assert boot_state.phase not in ("failed", "ready")
+
+    assert schema_mock.await_count >= 1
+    topup_mock.assert_not_called()
+
+
+async def test_boot_reconcile_proceeds_past_schema_once_neo4j_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once schema init succeeds, the background reconcile proceeds past
+    the schema phase and starts drainers via the normal topup phase."""
+    mock_driver = MagicMock()
+    mock_driver.close = AsyncMock()
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
+    monkeypatch.setattr(
+        main_module._settings, "crash_recovery_sweep_interval_seconds", 60
+    )
+    topup_mock = AsyncMock(return_value=main_module.TopupResult(1, 1, 0))
+
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        patch(
+            "context_intelligence_server.main._crash_recovery_topup", new=topup_mock
+        ),
+    ):
+        async with lifespan(main_module.app):
+            await main_module.app.state.boot_task
+            assert main_module.app.state.schema_ready is True
+            assert boot_state.phase == "ready"
+
+    topup_mock.assert_awaited_once()
+
+
+async def test_lifespan_survives_schema_data_conflict_records_boot_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reachable graph, genuinely un-migrated (untagged>0): still refuses to
+    start drainers, but via boot_state.fail (visible on /status) -- never an
+    unguarded raise out of lifespan."""
+    mock_driver = MagicMock()
+    mock_driver.close = AsyncMock()
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
+    monkeypatch.setattr(
+        main_module._settings, "crash_recovery_sweep_interval_seconds", 60
+    )
+    topup_mock = AsyncMock()
+
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        patch(
+            "context_intelligence_server.main.count_untagged_nodes",
+            new=AsyncMock(return_value=3),
+        ),
+        patch(
+            "context_intelligence_server.main._crash_recovery_topup", new=topup_mock
+        ),
+    ):
+        async with lifespan(main_module.app):  # must reach yield without raising
+            await main_module.app.state.boot_task
+            assert main_module.app.state.schema_ready is False
+            assert boot_state.phase == "failed"
+            assert boot_state.failed_step == "schema"
+
+    topup_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# a hung boot phase must not leave /status.spool/metrics null forever
+# ---------------------------------------------------------------------------
+
+
+async def test_hung_boot_phase_times_out_and_populates_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A phase that hangs beyond boot_phase_timeout_seconds must not leave
+    /status stuck with spool=null forever -- it ends the boot as a visible
+    failed phase (failed_step named) instead."""
+    monkeypatch.setattr(main_module._settings, "boot_phase_timeout_seconds", 0.05)
+    main_module.app.state.schema_ready = True  # skip schema phase for this test
+
+    async def _hang(*a: Any, **kw: Any) -> Any:
+        await asyncio.sleep(2)
+
+    monkeypatch.setattr(main_module.registry.queue_manager, "heal_torn_tails", _hang)
+
+    await main_module._boot_reconcile()
+
+    assert boot_state.phase == "failed"
+    assert boot_state.failed_step == "heal"
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=main_module.app), base_url="http://test"
+    ) as c:
+        response = await c.get("/status")
+    data = response.json()
+    assert data["spool"] is not None
+    assert data["metrics"] is not None
+
+
+def test_boot_phase_timeout_seconds_default_and_validator() -> None:
+    from context_intelligence_server.config import Settings
+
+    assert Settings().boot_phase_timeout_seconds == 300.0
+    assert Settings(boot_phase_timeout_seconds=0).boot_phase_timeout_seconds == 0
+    assert Settings(boot_phase_timeout_seconds=-1).boot_phase_timeout_seconds == -1
 
 
 # ---------------------------------------------------------------------------

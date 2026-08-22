@@ -10,6 +10,7 @@ No real Neo4j is used anywhere in this file.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -382,11 +383,13 @@ async def test_clean_finalize_still_deletes_and_tears_down(
 
 
 # ---------------------------------------------------------------------------
-# A first-pass tail flush failure returns before CompletedSession is recorded
+# A first-pass tail flush failure returns before CompletedSession is
+# recorded, and tears down (close+deregister) exactly like the death path
+# instead of leaving a registered zombie worker.
 # ---------------------------------------------------------------------------
 
 
-async def test_first_pass_tail_flush_failure_returns_before_completed_session(
+async def test_first_pass_tail_flush_failure_deregisters_and_closes(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     reg = SessionRegistry()
@@ -414,11 +417,14 @@ async def test_first_pass_tail_flush_failure_returns_before_completed_session(
     assert len(reg.completed_sessions()) == 0, (
         "CompletedSession must NOT be recorded when the FIRST pass's tail flush fails"
     )
-    assert sid in reg.active_sessions(), (
-        "worker must remain registered so a respawn retries"
+    assert sid not in reg.active_sessions(), (
+        "must not remain a registered zombie -- deregistered like the death path"
     )
-    assert worker.store_closed is False
-    assert qm._log_path(sid).exists(), "the tail must remain uncommitted on disk"
+    assert worker.store_closed is True, (
+        "graph store must be closed, like the death path"
+    )
+    assert graph.closed is True
+    assert qm._log_path(sid).exists(), "nothing was committed -- log fully retained"
 
 
 # ---------------------------------------------------------------------------
@@ -458,14 +464,14 @@ async def test_retry_loop_terminates_under_continuous_append() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Permanent retention: the retry's own re-drain can itself suffer a tail
-# flush failure after CompletedSession was already recorded, returning early
-# and never reaching _safe_close/_deregister. orphaned_sessions() is the
-# honest signal.
+# The retry's own re-drain can itself suffer a tail flush failure after
+# CompletedSession was already recorded (the delete_retry_exhausted orphan).
+# It must tear down (safe_close + deregister) exactly like the death path,
+# instead of leaving a registered zombie worker.
 # ---------------------------------------------------------------------------
 
 
-async def test_permanent_retention_when_retrys_own_redrain_flush_fails(
+async def test_delete_retry_exhausted_orphan_deregisters_and_closes(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     reg = SessionRegistry()
@@ -503,24 +509,120 @@ async def test_permanent_retention_when_retrys_own_redrain_flush_fails(
     assert len(reg.completed_sessions()) == 1, (
         "CompletedSession was already recorded BEFORE the retry loop began"
     )
-    assert sid in reg.active_sessions(), (
-        "the early return never reaches _deregister -- permanently registered"
+    assert sid not in reg.active_sessions(), (
+        "must not remain a registered zombie -- deregistered like the death path"
     )
-    assert worker.store_closed is False, (
-        "the early return never reaches _safe_close either"
+    assert worker.store_closed is True, (
+        "graph store must be closed, like the death path"
     )
     assert any(
         r.levelno == logging.ERROR and "finalize_tail_flush_failed" in r.getMessage()
         for r in caplog.records
     )
+    assert any(
+        r.levelno == logging.ERROR and "delete_retry_exhausted" in r.getMessage()
+        for r in caplog.records
+    ), "the existing ERROR must still be logged"
     orphans = reg.orphaned_sessions()
-    assert any(w.session_id == sid for w in orphans), (
-        "orphaned_sessions() is the honest signal for this permanent-"
-        "retention residual -- registered, task done, never re-entered"
+    assert not any(w.session_id == sid for w in orphans), (
+        "deregistered -- no longer an orphaned/zombie residual"
     )
     assert qm._log_path(sid).exists(), (
-        "the late event's log is RETAINED -- never lost, never re-attempted"
+        "the late event's log is RETAINED -- never lost"
     )
+
+
+async def test_delete_retry_exhausted_orphan_is_recovered_by_fresh_worker() -> None:
+    """After the delete_retry_exhausted teardown, a fresh worker for the
+    same session_id drains the still-undrained late event to completion --
+    no loss. (session:end already committed in the first pass, so this late
+    event isn't itself terminal -- the fresh worker just idles once fully
+    drained; cancelled here like a normal shutdown, mirroring
+    ``test_retained_log_is_picked_up_by_a_fresh_drainer``'s own give-up
+    recovery check below.)"""
+    reg = SessionRegistry()
+    qm = reg.queue_manager
+    sid = "d5-t9b-delete-retry-exhausted-recovery"
+    graph = _AccumGraph(fail_on_call=2)  # fails once, then always succeeds
+    worker = _make_worker(sid, graph)
+    reg._register_for_test(worker)
+
+    late_line = _line("late:event", "/ws", {"session_id": sid})
+    original_delete = qm.delete_drained
+    wrapper, _calls = _delete_drained_injector(qm, [late_line], inject_on={1})
+    qm.delete_drained = wrapper  # type: ignore[method-assign]
+
+    with patch(
+        "context_intelligence_server.registry.process_event",
+        side_effect=_accumulate,
+    ):
+        await qm.append(sid, _line("tool:pre", "/ws", {"session_id": sid}))
+        await qm.append(sid, _line("session:end", "/ws", {"session_id": sid}))
+        task = asyncio.create_task(reg._finalize_session(worker, handlers=object()))
+        worker.task = task
+        await task
+        assert sid not in reg.active_sessions()  # precondition: torn down
+
+        # Restore the REAL delete_drained -- the injector's job (landing the
+        # late append in the original finalize's window) is done.
+        qm.delete_drained = original_delete  # type: ignore[method-assign]
+
+        worker2 = _make_worker(sid, graph)  # SAME fake graph -- dedup proof
+        reg._register_for_test(worker2)
+        reg.start_drain(worker2)
+        assert worker2.task is not None
+        for _ in range(500):
+            await asyncio.sleep(0.01)
+            if qm._read_committed_offset(sid) >= qm._complete_data_end(sid):
+                break
+        worker2.task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker2.task
+
+    assert "late:event" in graph.flushed, (
+        "the retained late event must be dispatched by the fresh worker"
+    )
+    assert qm._read_committed_offset(sid) == qm._complete_data_end(sid), (
+        "log ends fully drained -- committed advances to complete_data_end, "
+        "proving real pick-up, not merely asserted"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The FIRST orphan return (tail_flush_failed) is recoverable: a fresh worker
+# picks the retained log back up and drains it (including session:end,
+# never committed by the failed pass) to full completion.
+# ---------------------------------------------------------------------------
+
+
+async def test_first_orphan_retained_log_is_recovered_by_fresh_worker() -> None:
+    """After the first-orphan teardown, a brand-new worker for the same
+    session_id drains the retained log to completion -- no loss."""
+    reg = SessionRegistry()
+    qm = reg.queue_manager
+    sid = "d5-t11-first-orphan-recovery"
+    graph = _AccumGraph(fail_on_call=1)  # fails once, then always succeeds
+    worker = _make_worker(sid, graph)
+    reg._register_for_test(worker)
+
+    with patch(
+        "context_intelligence_server.registry.process_event",
+        side_effect=_accumulate,
+    ):
+        await qm.append(sid, _line("session:end", "/ws", {"session_id": sid}))
+        await reg._finalize_session(worker, handlers=object())
+        assert sid not in reg.active_sessions()  # precondition: torn down
+
+        worker2 = _make_worker(sid, graph)  # SAME fake graph -- dedup proof
+        reg._register_for_test(worker2)
+        reg.start_drain(worker2)
+        assert worker2.task is not None
+        await asyncio.wait_for(worker2.task, timeout=5.0)
+
+    assert len(reg.completed_sessions()) == 1
+    assert graph.flushed == {"session:end"}
+    assert not qm._log_path(sid).exists(), "delete_drained must have run this time"
+    assert sid not in reg.active_sessions()
 
 
 # ---------------------------------------------------------------------------

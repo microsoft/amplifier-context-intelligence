@@ -262,7 +262,7 @@ digraph durable_ingest_queue {
         ]
 
         DeadLetterExpiry [
-            label     = "expire_dead_letters()  (dead_letter_expiry_enabled, default ON)\nLOG-LESS ONLY: no <key>.log exists (a structural proof that no\nboot mechanism can ever consult the file being expired)\nAND mtime older than dead_letter_retention_seconds (30d default)\nruns at boot (phase=expire) and on every sweep tick"
+            label     = "expire_dead_letters()  (dead_letter_expiry_enabled, opt-in, default OFF)\nLOG-LESS ONLY: no <key>.log exists (a structural proof that no\nboot mechanism can ever consult the file being expired)\nAND mtime older than dead_letter_retention_seconds (30d default)\nruns at boot (phase=expire) and on every sweep tick"
             fillcolor = "#80DEEA"
         ]
 
