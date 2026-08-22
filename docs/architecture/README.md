@@ -33,7 +33,7 @@ resolver and exempt-path set are wired at boot time.
 | 02 | [02-handler-architecture.dot](./02-handler-architecture.dot) | Handler class-level architecture |
 | 03 | [03-graph-model.dot](./03-graph-model.dot) | Neo4j property-graph schema |
 | 04 | [04-default-handler-flow.dot](./04-default-handler-flow.dot) | DefaultHandler internal decision flow |
-| 05 | [05-durable-ingest-queue.dot](./05-durable-ingest-queue.dot) | Durable ingest queue + drain loop — atomic per-key append, supervised drainers, phased boot, continuous prefix reclaim + dead-letter expiry, and the writer-lease detector (incl. auth middleware entry) |
+| 05 | [05-durable-ingest-queue.dot](./05-durable-ingest-queue.dot) | Durable ingest queue + drain loop — atomic per-key append, supervised drainers, phased boot, continuous prefix reclaim + dead-letter expiry, and the single-writer lease guard (incl. auth middleware entry) |
 | 06 | [06-auth-flow.dot](./06-auth-flow.dot) | **Per-request auth flow** — BearerTokenMiddleware → resolver dispatch → `/admin/*` branch or `post_events` |
 | 07 | [07-auth-startup.dot](./07-auth-startup.dot) | **Auth boot wiring** — mode selection, JWKS prefetch, fail-closed gate, exempt-path selection |
 | 08 | [08-identity-map-management.dot](./08-identity-map-management.dot) | **Runtime identity-map management** — admin API, `require_admin` gate, `IdentityStore` write-then-swap, live `flat_dict`, no-redeploy proof |
@@ -250,15 +250,15 @@ than all at once.
 **Storage shrinks itself.** A live session's
 already-committed prefix is rewritten away continuously (compaction), so a `.log` tracks the
 undrained tail rather than the whole session history — bounded in frequency by a minimum
-committed-prefix threshold and in per-rewrite cost by a maximum tail size, so one rewrite
-cannot hold a key's lock against `POST /events` for an unbounded time. Dead-letter files with
-no `.log` beside them expire on an mtime-based retention window. Both run automatically as
+committed-prefix threshold; there is no cap on the rewrite itself. A fully-drained log is
+reclaimed automatically at boot regardless of `reclaim_enabled`. Dead-letter files with
+no `.log` beside them expire on an mtime-based retention window. All three run automatically as
 part of normal operation and require no operator action.
 
 Observability follows the same split. `/status` carries the always-present `boot` block (phase
-plus reclaim/resume counters) and `writer_lease` block (the queue-directory writer-lease
-**detector** — it makes a two-writer overlap during a rolling deploy *visible* within a
-heartbeat; it is not a mutex and does not make concurrent appends safe). While the server is
+plus reclaim/resume counters) and `writer_lease` block (the queue-directory single-writer
+**lease guard** — a backstop against an accidental second writer, not a rolling-deploy
+coordinator; default mode `enforce` refuses to boot against a live foreign lease). While the server is
 still booting, `/status` performs zero disk reads on that request path: `metrics` and `spool`
 are present but `null`, with `status_detail.reason == "booting"`, and both populate once boot
 is over. Authenticated `/queues/dead-letter` endpoints still support inspect, replay, and

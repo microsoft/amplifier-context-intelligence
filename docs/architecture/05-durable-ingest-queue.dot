@@ -293,7 +293,7 @@ digraph durable_ingest_queue {
         ]
 
         PhaseReclaim [
-            label     = "phase = reclaim\nCLASSIFY every pre-existing key:\nresumable | drained | unresumable | reset_offset\nDRY-RUN BY DEFAULT (reclaim_enabled=False):\nclassify + audit-log always; UNLINK only when enabled\nbounded re-drain instead of delete below\nreclaim_redrain_max_bytes"
+            label     = "phase = reclaim\nCLASSIFY every pre-existing key:\nresumable | drained | unresumable | reset_offset\ndrained -> reclaimed automatically, always\nunresumable/reset_offset -> gated on reclaim_enabled\n(default False = dry-run: classify + audit-log only)\nunparseable offset -> always re-drain from byte 0, any size\nnegative/past-EOF offset -> re-drain below reclaim_redrain_max_bytes,\nelse delete"
             fillcolor = "#E1BEE7"
             fontname  = "Helvetica-Bold"
             penwidth  = 2.0
@@ -385,7 +385,7 @@ digraph durable_ingest_queue {
         ]
 
         WriterLease [
-            label     = "WriterLease -- DETECTOR, NOT A MUTEX\n(writer_lease_mode, DEFAULT 'detect' -- NEVER refuses to boot)\nheartbeats <queues>/.writer.lease every\nwriter_lease_heartbeat_seconds (5s); stale after\nheartbeat x writer_lease_staleness_multiplier (15s)\nLATCHES a foreign writer -> visible within ONE heartbeat.\nDetects the rolling-deploy overlap that corrupts the append\nlog; it does NOT make concurrent appends safe.\n'enforce' additionally refuses a fresh foreign lease at boot."
+            label     = "WriterLease -- SINGLE-WRITER LEASE GUARD\n(writer_lease_mode, DEFAULT 'enforce')\nbackstop against an accidental second writer, NOT a\nrolling-deploy coordinator (deployment is single-replica).\nheartbeats <queues>/.writer.lease every\nwriter_lease_heartbeat_seconds (5s); stale after\nheartbeat x writer_lease_staleness_multiplier (15s)\n'enforce': REFUSES to boot against a LIVE foreign lease;\nreleases lease on clean shutdown; takes over a STALE\nforeign lease automatically.\n'detect': latches + surfaces a conflict on /status only,\nnever refuses to boot."
             fillcolor = "#FFE0B2"
             fontname  = "Helvetica-Bold"
             penwidth  = 2.0
@@ -535,7 +535,7 @@ digraph durable_ingest_queue {
         style      = dotted
         color      = "#E65100"
         fontcolor  = "#E65100"
-        label      = "watches <queues_path>/.writer.lease\nfor a SECOND writer on this directory"
+        label      = "guards <queues_path>/.writer.lease\nagainst a SECOND writer on this directory"
         arrowhead  = none
         constraint = false
     ]

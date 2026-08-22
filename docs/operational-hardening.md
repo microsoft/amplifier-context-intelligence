@@ -351,7 +351,7 @@ runs out of memory. It guarantees the failure is **bounded and attributable**:
 | `StartLimitIntervalSec` / `StartLimitBurst` | An infinite restart loop burning CPU for days | The underlying failure — the unit stops in `failed` state and **stays down** until you fix it |
 | `write_concurrency: 4` | A backlog drain thundering Neo4j's transaction-memory ceiling | A backlog from forming in the first place |
 | Compaction + dead-letter expiry (on by default) | A *drained* session's bytes and orphaned poison records living on disk forever; a `.log` growing to the size of the whole session | **Undrained** data growing — a stalled drainer's tail is exactly what must not be touched; compaction shrinks nothing there |
-| Writer-lease detector (§8) | A rolling deploy silently running two writers on one queue directory with **no signal at all** | The corruption itself — it is a detector with a staleness tolerance, not a mutex. It makes the overlap visible, not safe |
+| Writer-lease guard (§8) | A second process (accidental/misconfigured, not a rolling deploy — deployment is single-replica) silently writing the same queue directory | Nothing left to prevent by default: `enforce` refuses to boot against a live foreign lease. A stale lease (holder gone) is taken over automatically after the staleness window |
 
 The point of every one of them is the same: convert a silent, unbounded,
 self-perpetuating failure into a loud, bounded, one-shot one that shows up in
@@ -366,26 +366,26 @@ restarts.**
 
 ---
 
-## 8. Writer-lease conflicts during a rolling deploy
+## 8. Writer-lease guard
 
-The durable append log is correct because **exactly one process writes the queue
-directory**, with per-key locking inside that process. A rolling or blue/green
-revision swap can briefly run the old and new revisions against the **same**
-mounted `/data`, and for that overlap the guarantee is void — torn or merged
-append lines can reappear with no signal whatsoever. That silence is what the
-writer lease removes.
+The durable append log is correct because **exactly one process writes the
+queue directory** (deployment is single-replica), with per-key locking inside
+that process serializing every record to one contiguous, newline-terminated
+line or not at all. The writer lease is a backstop against an accidental
+second writer — a stray or misconfigured process pointed at the same `/data`
+— not a rolling-deploy coordinator.
 
-**It is a detector, not a mutex.** Say this plainly to anyone reading
-`/status`: it does not make concurrent writes safe. It makes the overlap
-**visible** within one heartbeat. It has a staleness tolerance (heartbeat x
-multiplier — 15s at defaults), so two processes *can* both believe they hold the
-lease inside that window, and writes already in flight during an overlap are
-surfaced, not prevented.
+**The default mode is `enforce`.** It refuses to boot against a **live**
+foreign lease, so the second-writer overlap is prevented outright rather than
+merely reported. It releases the lease on clean shutdown, so a restart
+reacquires immediately, and it takes over a **stale** foreign lease
+automatically once the holder's heartbeat ages past the staleness window
+(heartbeat x multiplier — 15s at defaults) — an unclean exit recovers on its
+own after that window instead of crash-looping.
 
-**The default mode is `detect`, and it never refuses to boot.** It acquires the
-lease best-effort, heartbeats it, and latches the conflict onto `/status`.
-Refusing by default would deadlock a rolling deploy outright: the incoming
-revision could never become healthy while the outgoing one is still renewing.
+`detect` acquires the lease best-effort, heartbeats it, and only latches +
+surfaces a conflict on `/status.writer_lease` — it never refuses to boot.
+`off` disables the guard entirely.
 
 ```bash
 curl -s http://localhost:8000/status \
@@ -394,35 +394,29 @@ curl -s http://localhost:8000/status \
 
 | Field | Read it as |
 |-------|-----------|
-| `mode` | `detect` (default) / `enforce` / `off` |
+| `mode` | `enforce` (default) / `detect` / `off` |
 | `acquired` | whether this process currently believes it holds the lease |
-| `conflict` | **the alarm.** `true` = a foreign writer was observed |
+| `conflict` | **the alarm.** `true` = a foreign writer was observed (under `enforce` this means boot was refused; under `detect` it is observe-only) |
 | `conflict_source` | `boot` / `reacquire` / `runtime` — when it was seen (`runtime` = the lease was taken from a running process) |
 | `observed_owner`, `observed_at` | who, and when |
 | `took_over_stale`, `superseded_owner`, `superseded_age_seconds` | a *stale* lease was superseded — normal after an unclean exit, not a conflict |
-| `error` | the detector is **not armed** for this process (share fault, hung mount). Evidence of nothing — never a conflict |
+| `error` | the guard is **not armed** for this process (share fault, hung mount). Evidence of nothing — never a conflict |
 | `force_acquire` | the one-boot escape hatch is still set. Unset it |
-| `heartbeat_seconds`, `staleness_seconds`, `lease_age_seconds` | detection latency and tolerance |
+| `heartbeat_seconds`, `staleness_seconds`, `lease_age_seconds` | heartbeat interval and staleness tolerance |
 
 The matching log lines are `writer_lease_conflict` (ERROR) and, on a stale
 takeover, a `writer_lease` WARNING naming the superseded owner and its age.
 
-**On a conflict:** confirm you are not running two revisions/processes against
-one queue directory (see the single-instance invariant in `AGENTS.md`), and get
-down to one writer. A conflict latches — it stays visible after the overlap ends
-— so treat it as "this happened", and correlate `observed_at` with your deploy
+**On a conflict:** confirm you are not running two processes against one
+queue directory (see the single-instance invariant in `AGENTS.md`), and get
+down to one writer. A conflict latches — it stays visible after the overlap
+ends — so treat it as "this happened", and correlate `observed_at` with your
 timeline rather than assuming it is still happening.
 
-> **Do not enable `enforce`.** The mode exists and works — it additionally
-> refuses to boot against a fresh foreign lease — but turning it on requires a
-> deployed-mount smoke test that measures real cross-host clock skew and
-> write-visibility latency on the actual shared mount, and **that test has not
-> been run**. Until it has, `enforce` risks refusing a legitimate boot on
-> timing alone. Leave `writer_lease_mode: detect`.
->
-> `writer_lease_force_acquire` is likewise a **one-boot** escape hatch for when
-> you are certain the previous writer is gone. It logs a `WARNING` on every boot
-> while set and shows on `/status`; unset it immediately afterwards.
+> `writer_lease_force_acquire` is a **one-boot** escape hatch for when you are
+> certain the previous writer is gone but its lease hasn't gone stale yet. It
+> logs a `WARNING` on every boot while set and shows on `/status`; unset it
+> immediately afterwards.
 
 ---
 
