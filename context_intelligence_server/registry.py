@@ -610,14 +610,17 @@ class SessionRegistry:
         qm = self.queue_manager
         session_id = worker.session_id
         if not await self._drain_to_eof(worker, handlers):
-            # Orphan: still registered, task about to finish. Recoverable --
-            # a respawn or boot recover() re-enters _finalize_session.
+            # Tear down now -- a registered-but-dead worker is a zombie no
+            # new event would restart. A fresh worker re-drains from the
+            # still-committed offset (log retained, nothing lost).
             logger.warning(
                 "finalize_orphan session=%s reason=tail_flush_failed "
                 "recoverable=respawn",
                 session_id,
                 extra={"session_id": session_id},
             )
+            await self._safe_close(worker)
+            self._deregister(session_id)
             return
 
         ended_at = time.time()
@@ -654,14 +657,16 @@ class SessionRegistry:
                 )
                 break
             if not await self._drain_to_eof(worker, handlers):
-                # Permanent orphan: this session can never re-enter
-                # _finalize_session, so nothing will retry it on its own.
+                # Tear down now, same as the first orphan path -- else this
+                # session can never re-enter _finalize_session on its own.
                 logger.error(
                     "finalize_orphan session=%s reason=delete_retry_exhausted "
                     "permanent=true",
                     session_id,
                     extra={"session_id": session_id},
                 )
+                await self._safe_close(worker)
+                self._deregister(session_id)
                 return  # late-tail flush failed: same semantics as the first pass
         await self._safe_close(worker)
         self._deregister(session_id)  # the LAST act -- no await after this

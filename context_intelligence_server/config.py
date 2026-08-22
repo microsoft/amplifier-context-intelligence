@@ -11,6 +11,7 @@ Values are resolved in this priority order (highest first):
 
 import hashlib
 import logging
+import math
 import os
 import re
 from functools import lru_cache
@@ -696,7 +697,9 @@ class Settings(BaseSettings):
     # Separate flag from reclaim_enabled: the log-less + stale-mtime predicate
     # is a structural proof (not a heuristic), so gating this on
     # reclaim_enabled would let dead-letters accumulate forever by default.
-    dead_letter_expiry_enabled: bool = True
+    # Ships False: a dead-letter may be the only surviving copy of an
+    # un-recovered event -- never auto-delete it without an explicit opt-in.
+    dead_letter_expiry_enabled: bool = False
 
     # How long a log-less `.dead.jsonl` survives before being expired.
     # Long enough that an operator who notices a dead-letter via
@@ -724,6 +727,21 @@ class Settings(BaseSettings):
                 "dead_letter_retention_seconds must be a non-negative number "
                 f"(0 disables expiry), got {v}"
             )
+        return v
+
+    # Hard ceiling per _boot_reconcile phase (heal/reclaim/expire/reconcile/
+    # seed/topup). A phase that hangs (e.g. a blocking stat/read on a
+    # degraded mount) would otherwise leave boot phase stuck pre-ready
+    # forever, latching /status's spool/metrics at null. <=0 disables the
+    # per-phase timeout (unbounded wait, pre-existing behavior).
+    boot_phase_timeout_seconds: float = 300.0
+
+    @field_validator("boot_phase_timeout_seconds")
+    @classmethod
+    def _validate_boot_phase_timeout_seconds(cls, v: float) -> float:
+        """Fail loud on non-finite input; <=0 is the documented opt-out."""
+        if not math.isfinite(v):
+            raise ValueError(f"boot_phase_timeout_seconds must be finite, got {v}")
         return v
 
     # -------------------------------------------------------------------------

@@ -276,23 +276,86 @@ async def _crash_recovery_topup(respawn_limit: int | None) -> TopupResult:
     )
 
 
+async def _ensure_schema_ready() -> None:
+    """Attempt Neo4j schema init once; a no-op once already ready.
+
+    Sets ``app.state.schema_ready`` on success. A connectivity failure
+    (Neo4j unreachable) is logged and swallowed here -- schema stays
+    not-ready, retried later (boot's sweep phase) instead of crash-looping
+    the server. Raises ``RuntimeError`` only for a genuine data conflict
+    (graph reachable but un-migrated) -- the one refusal this still
+    preserves, now recorded via ``boot_state.fail()`` by the caller instead
+    of aborting ASGI startup.
+    """
+    if getattr(app.state, "schema_ready", False):
+        return
+    try:
+        await ensure_neo4j_schema(app.state.neo4j_driver, fail_on_data_conflict=True)
+    except RuntimeError:
+        raise  # genuine data conflict: fatal, let the caller record it
+    except Exception as exc:  # noqa: BLE001 - Neo4j unreachable, not fatal
+        logger.warning(
+            "schema_init_unreachable: Neo4j not reachable, will retry: %s", exc
+        )
+        return
+    # Catches nodes lacking the :Node label (the other un-migrated shape the
+    # constraint above can't see). A probe failure is logged at DEBUG, not
+    # treated as confirmed-bad -- the flush path's self-heal still covers it.
+    try:
+        untagged = await count_untagged_nodes(app.state.neo4j_driver)
+    except Exception as exc:  # noqa: BLE001 - connectivity probe, not a confirmed bad state
+        logger.debug(
+            "schema_init: untagged-node probe skipped (graph unreachable?): %s", exc
+        )
+        untagged = 0
+    if untagged:
+        raise RuntimeError(
+            f"Neo4j graph has {untagged} node(s) lacking the :Node label "
+            "(un-migrated). Cold start refuses to boot to avoid duplicating "
+            "them on write. Run: context-intelligence-server doctor --fix"
+        )
+    app.state.schema_ready = True
+    logger.info("lifespan_startup: Neo4j schema initialized")
+
+
 async def _crash_recovery_sweep_loop(interval: int, respawn_limit: int) -> None:
     """Periodically top the recovered-drainer pool back up to the ceiling so
     a finite ``crash_recovery_respawn_limit`` cannot permanently strand the
-    deferred backlog. A single failed tick is logged and retried;
-    ``CancelledError`` propagates for clean shutdown.
+    deferred backlog. Also the retry mechanism for a schema that wasn't
+    ready at boot: each tick retries schema init first, and only tops up
+    (and marks boot ready) once it succeeds. A single failed tick is logged
+    and retried; ``CancelledError`` propagates for clean shutdown.
     """
     while True:
         try:
             await asyncio.sleep(interval)
-            result = await _crash_recovery_topup(respawn_limit)
-            if result.dispatched:
-                logger.info(
-                    "crash_recovery_sweep: dispatched %d recovered session(s) "
-                    "(ceiling=%d) -- draining deferred backlog",
-                    result.dispatched,
-                    respawn_limit,
-                )
+            if not app.state.schema_ready:
+                try:
+                    await _ensure_schema_ready()
+                except Exception as exc:  # noqa: BLE001 - retried next tick
+                    logger.warning(
+                        "crash_recovery_sweep: schema still not ready, will retry: %s",
+                        exc,
+                    )
+                else:
+                    if app.state.schema_ready:
+                        logger.info(
+                            "crash_recovery_sweep: schema now ready -- "
+                            "draining deferred backlog"
+                        )
+            # Drainer start stays gated on schema; disk-only work below
+            # (expire) does not and must run every tick regardless.
+            if app.state.schema_ready:
+                result = await _crash_recovery_topup(respawn_limit)
+                if result.dispatched:
+                    logger.info(
+                        "crash_recovery_sweep: dispatched %d recovered session(s) "
+                        "(ceiling=%d) -- draining deferred backlog",
+                        result.dispatched,
+                        respawn_limit,
+                    )
+                if boot_state.phase == "awaiting_schema":
+                    boot_state.finish()
             # Live counters here (unlike boot) must record_purged expired
             # records, or the accepted/written residual latches at +n.
             expire_result = await registry.queue_manager.expire_dead_letters(
@@ -420,52 +483,91 @@ async def _boot_reclaim() -> None:
     )
 
 
+async def _phase_run(coro: Any) -> Any:
+    """Run one boot-phase awaited call under ``boot_phase_timeout_seconds``.
+
+    A hung mount-touching call (a blocking stat/read on a degraded mount)
+    would otherwise leave ``boot_state.phase`` stuck pre-ready forever,
+    latching /status's spool/metrics at null. On timeout this raises
+    ``TimeoutError`` -- left to propagate to ``_boot_reconcile``'s own
+    except-Exception handler, which records it via ``boot_state.fail()``
+    exactly like any other phase failure. ``<= 0`` disables the timeout
+    (unbounded wait, pre-existing behavior).
+    """
+    timeout = _settings.boot_phase_timeout_seconds
+    if timeout is not None and timeout > 0:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    return await coro
+
+
 async def _boot_reconcile() -> None:
     """The backgrounded, exception-safe boot-recovery body.
 
-    Runs heal -> reclaim -> expire -> reconcile -> seed -> topup -> sweep,
-    then phase=ready. Spawned from ``lifespan``, not awaited, so the server
-    serves its first request while this still runs. Any exception is
+    Runs schema -> heal -> reclaim -> expire -> reconcile -> seed -> topup ->
+    sweep, then phase=ready. Spawned from ``lifespan``, not awaited, so the
+    server serves its first request while this still runs. Any exception is
     recorded via ``boot_state.fail()``; the server keeps serving.
+
+    ``schema`` is the one phase gating something real: drainer start
+    (``topup``) requires ``app.state.schema_ready``, since the Session/:Node
+    uniqueness constraints must be active before any flush() MERGE. The
+    disk-only phases (heal/reclaim/expire/reconcile/seed) need no schema and
+    run regardless. A schema left not-ready (Neo4j unreachable) is retried
+    by the periodic sweep, not by blocking this pass.
     """
     boot_state.begin()
+    # Defensive: a direct call (bypassing lifespan's own init) must not
+    # AttributeError on the topup-phase read below.
+    app.state.schema_ready = getattr(app.state, "schema_ready", False)
     try:
+        boot_state.phase = "schema"
+        await _ensure_schema_ready()
+
         boot_state.phase = "heal"
-        _heal_result = await registry.queue_manager.heal_torn_tails()
+        _heal_result = await _phase_run(registry.queue_manager.heal_torn_tails())
         logger.info("lifespan_startup: heal_torn_tails result=%s", _heal_result)
 
         boot_state.phase = "reclaim"
-        await _boot_reclaim()
+        await _phase_run(_boot_reclaim())
 
         boot_state.phase = "expire"
         # Runs before recovery_seed_counts, so expired lines are simply never
         # counted into accepted_seed -- record_purged must not be called here.
-        await registry.queue_manager.expire_dead_letters(
-            time.time(),
-            _settings.dead_letter_retention_seconds,
-            _settings.dead_letter_expiry_enabled,
+        await _phase_run(
+            registry.queue_manager.expire_dead_letters(
+                time.time(),
+                _settings.dead_letter_retention_seconds,
+                _settings.dead_letter_expiry_enabled,
+            )
         )
 
         boot_state.phase = "reconcile"
-        await registry.queue_manager.recovery_reconcile_dead()
+        await _phase_run(registry.queue_manager.recovery_reconcile_dead())
 
         boot_state.phase = "seed"
         (
             _accepted_seed,
             _written_seed,
-        ) = await registry.queue_manager.recovery_seed_counts()
+        ) = await _phase_run(registry.queue_manager.recovery_seed_counts())
         registry.seed_counters(_accepted_seed, _written_seed)
 
         boot_state.phase = "topup"
         respawn_limit = _settings.crash_recovery_respawn_limit
-        result = await _crash_recovery_topup(respawn_limit)
-        boot_state.resumed += result.dispatched
-        boot_state.deferred += result.deferred
-        logger.info(
-            "lifespan_startup: crash recovery respawned %d/%d drainers",
-            result.dispatched,
-            result.recovered,
-        )
+        if app.state.schema_ready:
+            result = await _phase_run(_crash_recovery_topup(respawn_limit))
+            boot_state.resumed += result.dispatched
+            boot_state.deferred += result.deferred
+            logger.info(
+                "lifespan_startup: crash recovery respawned %d/%d drainers",
+                result.dispatched,
+                result.recovered,
+            )
+        else:
+            logger.warning(
+                "crash_recovery_topup_skipped phase=topup reason=schema_not_ready "
+                "-- drainers deferred until Neo4j schema init succeeds "
+                "(retried by the periodic sweep)"
+            )
 
         boot_state.phase = "sweep"
         _sweep_interval = _settings.crash_recovery_sweep_interval_seconds
@@ -479,9 +581,15 @@ async def _boot_reconcile() -> None:
                 _sweep_interval,
                 respawn_limit,
             )
-        # Finish unconditionally here (after starting the loop), so a
-        # forever-running sweep never leaves phase stuck at "sweep".
-        boot_state.finish()
+        if app.state.schema_ready:
+            # Finish unconditionally here (after starting the loop), so a
+            # forever-running sweep never leaves phase stuck at "sweep".
+            boot_state.finish()
+        else:
+            # Schema never came up this pass -- stay visibly NOT ready
+            # (never silently reported as "ready") until the sweep loop
+            # above retries schema + topup and marks it ready itself.
+            boot_state.phase = "awaiting_schema"
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # a boot hook must never crash-loop the server
@@ -514,30 +622,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Stash the resolved query access_mode so /cypher opens READ sessions without
     # re-resolving settings on every request.
     app.state.neo4j_query_access_mode = _query.access_mode
-    # Initialize schema before serving, so the Session uniqueness constraint
-    # is active before any concurrent flush() MERGE can race it.
-    logger.info(
-        "lifespan_startup: initializing Neo4j schema (indexes + uniqueness constraints)"
-    )
-    # Cold start fails loud on an un-migrated graph (nothing written yet, so
-    # no data lost); the flush path instead self-heals and never raises.
-    await ensure_neo4j_schema(app.state.neo4j_driver, fail_on_data_conflict=True)
-    logger.info("lifespan_startup: Neo4j schema initialized")
-    # Catches nodes lacking the :Node label (the other un-migrated shape the
-    # constraint above can't see). A probe failure is logged at DEBUG, not
-    # treated as confirmed-bad -- the flush path's self-heal still covers it.
-    try:
-        untagged = await count_untagged_nodes(app.state.neo4j_driver)
-    except Exception as exc:  # noqa: BLE001 - connectivity probe, not a confirmed bad state
-        _LOG_MSG = "startup migration-health probe skipped (graph unreachable?): %s"
-        logger.debug(_LOG_MSG, exc)
-        untagged = 0
-    if untagged:
-        raise RuntimeError(
-            f"Neo4j graph has {untagged} node(s) lacking the :Node label "
-            "(un-migrated). Cold start refuses to boot to avoid duplicating "
-            "them on write. Run: context-intelligence-server doctor --fix"
-        )
+    # Schema init (indexes + the Session/:Node uniqueness constraints) no
+    # longer runs synchronously here -- a Neo4j connectivity failure must
+    # never raise out of lifespan (ASGI startup abort -> crash-loop). It now
+    # runs as _boot_reconcile's first phase ("schema"), backgrounded like
+    # the rest of boot recovery; app.state.schema_ready gates drainer start
+    # (_crash_recovery_topup) until it succeeds.
+    app.state.schema_ready = False
     # Acquires the lease before any boot-recovery pass mutates the shared
     # directory; awaited synchronously so an enforce-mode refusal can't be
     # silently downgraded by _boot_reconcile's own exception-safety.

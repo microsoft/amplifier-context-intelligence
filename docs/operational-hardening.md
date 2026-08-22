@@ -260,10 +260,12 @@ longer crash-loops on an oversized spool: a reconciliation failure sets the boot
 phase to `failed` and the server keeps serving.
 
 **Reclaiming space.** In normal operation there is nothing to reclaim by hand:
-compaction and dead-letter expiry above run continuously and need no operator
-action. If an already-drained backlog ever does need manual reclamation, that is
-an out-of-band admin/maintenance operation performed inside the container — there
-is no API for it.
+compaction runs continuously and needs no operator action. Dead-letter expiry
+is opt-in (`dead_letter_expiry_enabled`, default off — a dead-letter may be the
+only surviving copy of an un-recovered event) and, once enabled, likewise runs
+continuously. If an already-drained backlog ever does need manual reclamation,
+that is an out-of-band admin/maintenance operation performed inside the
+container — there is no API for it.
 
 ### Last resort — archive the whole queue directory
 
@@ -350,7 +352,7 @@ runs out of memory. It guarantees the failure is **bounded and attributable**:
 | `MemoryMax` / `MemoryHigh` | The server taking the host down with it; an unattributable kernel OOM kill | The server being killed — it just gets killed **in its own cgroup**, with `memory.events` naming it |
 | `StartLimitIntervalSec` / `StartLimitBurst` | An infinite restart loop burning CPU for days | The underlying failure — the unit stops in `failed` state and **stays down** until you fix it |
 | `write_concurrency: 4` | A backlog drain thundering Neo4j's transaction-memory ceiling | A backlog from forming in the first place |
-| Compaction + dead-letter expiry (on by default) | A *drained* session's bytes and orphaned poison records living on disk forever; a `.log` growing to the size of the whole session | **Undrained** data growing — a stalled drainer's tail is exactly what must not be touched; compaction shrinks nothing there |
+| Compaction (on by default) + dead-letter expiry (opt-in, default off) | A *drained* session's bytes and orphaned poison records living on disk forever; a `.log` growing to the size of the whole session | **Undrained** data growing — a stalled drainer's tail is exactly what must not be touched; compaction shrinks nothing there |
 | Writer-lease guard (§8) | A second process (accidental/misconfigured, not a rolling deploy — deployment is single-replica) silently writing the same queue directory | Nothing left to prevent by default: `enforce` refuses to boot against a live foreign lease. A stale lease (holder gone) is taken over automatically after the staleness window |
 
 The point of every one of them is the same: convert a silent, unbounded,

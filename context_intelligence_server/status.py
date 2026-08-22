@@ -67,8 +67,12 @@ ring_buffer: EventRingBuffer = EventRingBuffer()
 
 # `sweep`/`topup` are momentary step labels only -- the sweep loop runs
 # forever once started, so `_boot_reconcile` sets phase="ready" right after.
+# `schema` is the new first phase (Neo4j schema init); `awaiting_schema` is
+# the terminal-but-not-ready state when Neo4j stayed unreachable this pass --
+# the periodic sweep retries schema + topup and marks "ready" once it lands.
 _BOOT_PHASES = (
     "recovering",
+    "schema",
     "heal",
     "reclaim",
     "expire",  # dead-letter expiry, before reconcile
@@ -76,6 +80,7 @@ _BOOT_PHASES = (
     "seed",
     "topup",
     "sweep",
+    "awaiting_schema",
     "ready",
     "failed",
 )

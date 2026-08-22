@@ -460,19 +460,20 @@ async def test_e_retention_zero_disables_expiry(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_k_expiry_runs_under_shipped_defaults_reclaim_enabled_false(
+async def test_k_expiry_is_opt_in_disabled_under_shipped_defaults(
     tmp_path: Path,
 ) -> None:
-    """No overrides at all: `reclaim_enabled` stays False (the shipped
-    default), yet dead-letter expiry must be a REAL delete -- it is gated on
-    the SEPARATE `dead_letter_expiry_enabled` flag, which ships True."""
+    """No overrides at all: `dead_letter_expiry_enabled` ships False -- an
+    un-recovered dead-letter's last surviving copy must never be silently
+    deleted out of the box. Explicit opt-in still deletes (mechanism
+    unchanged, only the default flipped)."""
     settings = Settings()
     assert settings.reclaim_enabled is False
-    assert settings.dead_letter_expiry_enabled is True
+    assert settings.dead_letter_expiry_enabled is False
 
     qm = QueueManager(queues_dir=tmp_path)
     now = time.time()
-    old_path = _seed_dead(tmp_path, "shipped-default-expire", _dead_record("p"))
+    old_path = _seed_dead(tmp_path, "shipped-default-no-expire", _dead_record("p"))
     old_mtime = now - settings.dead_letter_retention_seconds - 3600
     os.utime(old_path, (old_mtime, old_mtime))
 
@@ -480,6 +481,13 @@ async def test_k_expiry_runs_under_shipped_defaults_reclaim_enabled_false(
         now, settings.dead_letter_retention_seconds, settings.dead_letter_expiry_enabled
     )
 
+    assert old_path.exists(), "shipped default must never auto-delete the last copy"
+    assert result["expired_keys"] == 0  # dry-run only, no override
+
+    # Opt-in (enabled=True) still deletes -- the mechanism itself is untouched.
+    result = await qm.expire_dead_letters(
+        now, settings.dead_letter_retention_seconds, enabled=True
+    )
     assert not old_path.exists()
     assert result["expired_keys"] == 1
 

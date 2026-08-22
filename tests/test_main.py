@@ -1169,19 +1169,17 @@ async def test_lifespan_no_sweep_when_interval_zero(
 # ---------------------------------------------------------------------------
 
 
-async def test_lifespan_calls_ensure_schema_with_fail_on_data_conflict() -> None:
-    """Cold start must call ensure_neo4j_schema with fail_on_data_conflict=True
+async def test_ensure_schema_ready_calls_schema_init_with_fail_on_data_conflict() -> (
+    None
+):
+    """Schema init (now _boot_reconcile's first phase, not synchronous
+    lifespan) must call ensure_neo4j_schema with fail_on_data_conflict=True
     -- boot refuses to proceed on a genuine :Node constraint data conflict
-    (duplicate legacy nodes), mirroring run_repair's contract. Safe at cold
-    start (nothing flushed yet); the flush path keeps the opposite default."""
-    mock_driver = _patched_lifespan_deps()
+    (duplicate legacy nodes), mirroring run_repair's contract."""
+    main_module.app.state.schema_ready = False
+    main_module.app.state.neo4j_driver = MagicMock()
     mock_ensure_schema = AsyncMock(return_value=True)
     with (
-        patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
         patch(
             "context_intelligence_server.main.ensure_neo4j_schema",
             new=mock_ensure_schema,
@@ -1191,30 +1189,27 @@ async def test_lifespan_calls_ensure_schema_with_fail_on_data_conflict() -> None
             new=AsyncMock(return_value=0),
         ),
     ):
-        async with lifespan(main_module.app):
-            pass
+        await main_module._ensure_schema_ready()
 
     mock_ensure_schema.assert_awaited_once()
     assert mock_ensure_schema.await_args is not None
     _args, kwargs = mock_ensure_schema.await_args
     assert kwargs.get("fail_on_data_conflict") is True, (
-        "lifespan must opt into fail_on_data_conflict=True -- cold start "
+        "schema init must opt into fail_on_data_conflict=True -- boot "
         "fails loud on a genuine data conflict (that contract now applies "
         "at boot too, not just to run_repair / `doctor --fix`)."
     )
+    assert main_module.app.state.schema_ready is True
 
 
-async def test_lifespan_raises_on_ensure_schema_data_conflict() -> None:
+async def test_ensure_schema_ready_raises_on_data_conflict() -> None:
     """When ensure_neo4j_schema itself raises (a genuine :Node constraint
-    data conflict under fail_on_data_conflict=True), lifespan must propagate
-    the RuntimeError -- boot refuses to start."""
-    mock_driver = _patched_lifespan_deps()
+    data conflict under fail_on_data_conflict=True), _ensure_schema_ready
+    propagates the RuntimeError -- caught by _boot_reconcile's own
+    exception-safe wrapper (boot_state.fail), never an ASGI-startup abort."""
+    main_module.app.state.schema_ready = False
+    main_module.app.state.neo4j_driver = MagicMock()
     with (
-        patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
         patch(
             "context_intelligence_server.main.ensure_neo4j_schema",
             new=AsyncMock(
@@ -1225,21 +1220,18 @@ async def test_lifespan_raises_on_ensure_schema_data_conflict() -> None:
         ),
         pytest.raises(RuntimeError, match="doctor --fix"),
     ):
-        async with lifespan(main_module.app):
-            pass
+        await main_module._ensure_schema_ready()
+
+    assert main_module.app.state.schema_ready is False
 
 
-async def test_lifespan_raises_on_untagged_nodes() -> None:
-    """On an un-migrated graph (untagged :Node count > 0), startup MUST
-    raise a RuntimeError naming `doctor --fix` -- boot refuses to start
-    rather than silently risking write-path duplication."""
-    mock_driver = _patched_lifespan_deps()
+async def test_ensure_schema_ready_raises_on_untagged_nodes() -> None:
+    """On an un-migrated graph (untagged :Node count > 0), schema init MUST
+    raise a RuntimeError naming `doctor --fix` -- boot refuses to mark
+    schema ready rather than silently risking write-path duplication."""
+    main_module.app.state.schema_ready = False
+    main_module.app.state.neo4j_driver = MagicMock()
     with (
-        patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
         patch(
             "context_intelligence_server.main.ensure_neo4j_schema",
             new=AsyncMock(return_value=True),
@@ -1250,25 +1242,20 @@ async def test_lifespan_raises_on_untagged_nodes() -> None:
         ),
         pytest.raises(RuntimeError, match="doctor --fix") as exc_info,
     ):
-        async with lifespan(main_module.app):
-            pass
+        await main_module._ensure_schema_ready()
 
     assert "42" in str(exc_info.value), (
         f"Expected the untagged count in the error message, got: {exc_info.value}"
     )
+    assert main_module.app.state.schema_ready is False
 
 
-async def test_lifespan_does_not_raise_on_clean_graph() -> None:
+async def test_ensure_schema_ready_does_not_raise_on_clean_graph() -> None:
     """On a fully-migrated graph (untagged count == 0, no constraint
-    conflict), startup does NOT raise -- the fail-loud guards are silent
-    when there is nothing to report."""
-    mock_driver = _patched_lifespan_deps()
+    conflict), schema init does NOT raise and marks schema_ready True."""
+    main_module.app.state.schema_ready = False
+    main_module.app.state.neo4j_driver = MagicMock()
     with (
-        patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
         patch(
             "context_intelligence_server.main.ensure_neo4j_schema",
             new=AsyncMock(return_value=True),
@@ -1278,10 +1265,10 @@ async def test_lifespan_does_not_raise_on_clean_graph() -> None:
             new=AsyncMock(return_value=0),
         ) as mock_count,
     ):
-        async with lifespan(main_module.app):
-            pass
+        await main_module._ensure_schema_ready()
 
     mock_count.assert_awaited_once()
+    assert main_module.app.state.schema_ready is True
 
 
 async def test_lifespan_does_not_raise_when_health_check_itself_fails(

@@ -274,9 +274,10 @@ class TestG4FinalizeOrphan:
             ],
             session_id=sid,
         ), [r.getMessage() for r in caplog.records]
-        # No behavior change: still registered, store not closed (respawn will retry).
-        assert sid in reg.active_sessions()
-        assert graph.closed is False
+        # Tears down like the death path: deregistered + store closed, so a
+        # fresh worker (not a zombie) is what a respawn actually gets.
+        assert sid not in reg.active_sessions()
+        assert graph.closed is True
 
     async def test_g4b_delete_retry_exhausted_permanent_orphan_logs_error(
         self, caplog: pytest.LogCaptureFixture
@@ -308,8 +309,10 @@ class TestG4FinalizeOrphan:
             ],
             session_id=sid,
         ), [r.getMessage() for r in caplog.records]
-        assert sid in reg.active_sessions(), "permanent orphan stays registered"
-        assert graph.closed is False
+        assert sid not in reg.active_sessions(), (
+            "tears down like the death path -- no longer a registered zombie"
+        )
+        assert graph.closed is True
 
 
 # ---------------------------------------------------------------------------
