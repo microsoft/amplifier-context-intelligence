@@ -293,7 +293,6 @@ async def test_finalize_retry_does_not_race_compaction_on_the_same_key() -> None
     class _CompactAlwaysSettings:
         queue_compact_enabled = True
         queue_compact_min_prefix_bytes = 0
-        queue_compact_max_tail_bytes = 64 * 1024 * 1024
 
     late_line = _line("late:event", "/ws", {"session_id": sid})
     wrapper, calls = _delete_drained_injector(qm, [late_line], inject_on={1})

@@ -174,7 +174,7 @@ async def test_drained_idle_no_terminal_session_prefix_reclaimed(
     assert await _graph_event_count(neo4j_container, sid) == n
 
     # A manual invocation on the now-fully-compacted log reclaims nothing.
-    assert await qm.compact_committed_prefix(sid, 0, 0) == 0
+    assert await qm.compact_committed_prefix(sid, 0) == 0
 
     worker.task.cancel()
     try:
@@ -204,7 +204,6 @@ async def test_concurrent_ingest_during_repeated_compaction_no_loss(
     class _S:
         queue_compact_enabled = True
         queue_compact_min_prefix_bytes = 4096  # fires repeatedly mid-stream
-        queue_compact_max_tail_bytes = 64 * 1024 * 1024
         stale_session_timeout = 3600.0
 
     monkeypatch.setattr(cfg_module, "get_settings", lambda: _S())
@@ -286,7 +285,6 @@ async def test_boot_recovered_session_compacts_before_dry_exit(
     settings.blob_path = str(tmp_path / "blobs")
     settings.queue_compact_enabled = True
     settings.queue_compact_min_prefix_bytes = 0
-    settings.queue_compact_max_tail_bytes = 64 * 1024 * 1024
     settings.stale_session_timeout = 3600.0
 
     monkeypatch.setattr(cfg_module, "get_settings", lambda: settings)

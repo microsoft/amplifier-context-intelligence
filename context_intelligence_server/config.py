@@ -693,12 +693,6 @@ class Settings(BaseSettings):
     # gap for free once the session goes idle).
     queue_compact_min_prefix_bytes: int = 8 * 1024 * 1024
 
-    # Bounds compaction cost: how long one rewrite holds guard.file_lock
-    # (blocking POST /events for that key), since copy cost is O(tail) not
-    # O(prefix). <=0 means no cap. Self-healing: as the drainer catches up
-    # the tail shrinks below this and compaction resumes automatically.
-    queue_compact_max_tail_bytes: int = 64 * 1024 * 1024
-
     # Separate flag from reclaim_enabled: the log-less + stale-mtime predicate
     # is a structural proof (not a heuristic), so gating this on
     # reclaim_enabled would let dead-letters accumulate forever by default.
@@ -711,17 +705,13 @@ class Settings(BaseSettings):
     # <=0 disables expiry outright (an explicit opt-out, not a silent one).
     dead_letter_retention_seconds: float = 30 * 86400.0
 
-    @field_validator(
-        "queue_compact_min_prefix_bytes",
-        "queue_compact_max_tail_bytes",
-    )
+    @field_validator("queue_compact_min_prefix_bytes")
     @classmethod
     def _validate_queue_compact_bytes(cls, v: int) -> int:
         """Fail loud on a negative value; 0 is a valid explicit opt-out."""
         if v < 0:
             raise ValueError(
-                "queue_compact_min_prefix_bytes/queue_compact_max_tail_bytes "
-                f"must be a non-negative integer, got {v}"
+                f"queue_compact_min_prefix_bytes must be a non-negative integer, got {v}"
             )
         return v
 
@@ -739,14 +729,9 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # Writer lease
     # -------------------------------------------------------------------------
-    # Detects (and, opt-in, refuses) a second process writing the same queue
-    # directory -- the single-process assumption per-key _KeyGuard depends on.
-    #
-    # `detect` (default) acquires best-effort, heartbeats, and surfaces a
-    # conflict on /status within one heartbeat, but never refuses to boot
-    # (refusing by default would deadlock a rolling deploy). `enforce`
-    # additionally refuses a fresh foreign lease at boot. `off` disables it.
-    writer_lease_mode: Literal["off", "detect", "enforce"] = "detect"
+    # Refuses boot against a live foreign lease (takes over a stale one);
+    # `detect` only observes+heartbeats without ever refusing; `off` disables it.
+    writer_lease_mode: Literal["off", "detect", "enforce"] = "enforce"
     # Renew + re-read interval; fixed at 5s for "conflict visible within one
     # heartbeat" well inside a typical revision-overlap window.
     writer_lease_heartbeat_seconds: float = 5.0

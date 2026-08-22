@@ -6,8 +6,11 @@ cache means the event is on disk.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import OrderedDict
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 
 class EventIdempotencyCache:
@@ -68,3 +71,27 @@ class EventIdempotencyCache:
     def _trim(self) -> None:
         while len(self._seen) > self._max_entries:
             self._seen.popitem(last=False)
+
+
+class KeyedAsyncLocks:
+    """Per-key asyncio.Lock registry; a key's lock is dropped once idle."""
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._waiters: dict[str, int] = {}
+
+    @asynccontextmanager
+    async def acquire(self, key: str) -> AsyncIterator[None]:
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        self._waiters[key] = self._waiters.get(key, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            self._waiters[key] -= 1
+            if self._waiters[key] <= 0:
+                self._waiters.pop(key, None)
+                # Only drop the lock if nothing else grabbed a reference to
+                # it in the meantime (it is not currently locked/awaited).
+                if not lock.locked():
+                    self._locks.pop(key, None)

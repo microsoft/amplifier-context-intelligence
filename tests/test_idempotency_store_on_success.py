@@ -158,22 +158,133 @@ async def test_t2_genuine_duplicate_still_duplicate_no_double_append(
     assert len(appended) == 1
 
 
-# ---------------------------------------------------------------------------
-# Concurrent same-key double-POST: both append
-# ---------------------------------------------------------------------------
+# Two concurrent same-key POSTs are serialized by the per-key lock: exactly
+# one durable append, the other answered "duplicate".
 
 
-async def test_t3_concurrent_same_key_double_post_both_append(
+async def test_t3_concurrent_same_key_lock_serializes_exactly_one_append(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Hold POST #1 inside a patched ``append`` until POST #2 has passed its
-    own ``seen()`` check, then release; gather both. Both must return 202
-    "queued" and append (len == 2); neither may be answered "duplicate" --
-    two same-key POSTs overlapping inside the check->store window both
-    append, converging downstream via idempotent MERGE. Realizable only
-    because ``append`` is monkeypatched, bypassing the real per-key
-    admission lock; do not "fix" this test toward the real queue manager."""
+    """Two concurrent POSTs with the SAME idempotency_key must be serialized
+    by the per-key lock spanning seen()->append->store(): exactly ONE line
+    is durably appended; the other response is "duplicate". Before the fix,
+    both concurrent requests observed seen() == False and BOTH durably
+    appended (2 lines) -- this is the regression test for that defect."""
+    monkeypatch.setattr(
+        main_module.registry, "get_or_create", lambda *a, **k: MagicMock()
+    )
+    appended: list[tuple[str, bytes]] = []
+    first_entered_append = asyncio.Event()
+    call_count = 0
+
+    async def _fake_append(worker_key: str, raw: bytes) -> None:
+        nonlocal call_count
+        call_count += 1
+        first_entered_append.set()
+        # Bounded window for a genuinely concurrent second arrival to try
+        # to race in. Pre-fix (no lock spanning the sequence), the second
+        # arrival's own seen() check runs unlocked during this window and
+        # also reaches append -- the bug (both append). Post-fix, the
+        # second arrival cannot even reach its own seen() check until this
+        # request releases the per-key lock (after store()), so it never
+        # calls append at all -- this sleep simply elapses unobserved.
+        await asyncio.sleep(0.3)
+        appended.append((worker_key, raw))
+
+    monkeypatch.setattr(main_module.registry.queue_manager, "append", _fake_append)
+
+    payload = _payload("sess-d7-t3", "aci-event-v1:d7-t3-key")
+
+    async def _second() -> httpx.Response:
+        # Fire only once the first request is genuinely mid-append, so the
+        # two requests provably overlap in time.
+        await asyncio.wait_for(first_entered_append.wait(), timeout=5)
+        return await client.post("/events", json=payload)
+
+    r1, r2 = await asyncio.wait_for(
+        asyncio.gather(client.post("/events", json=payload), _second()),
+        timeout=10,
+    )
+
+    assert r1.status_code == 202
+    assert r2.status_code == 202
+    statuses = {r1.json()["status"], r2.json()["status"]}
+    assert statuses == {"queued", "duplicate"}, (
+        f"exactly one concurrent same-key POST may be honoured as new and "
+        f"the other must be a duplicate; got {statuses}"
+    )
+    assert len(appended) == 1, (
+        f"expected exactly one durable append under the per-key lock, got "
+        f"{len(appended)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lock is released even when append raises -- no deadlock, next waiter with
+# the same key is honoured once it acquires the (now-free) lock.
+# ---------------------------------------------------------------------------
+
+
+async def test_t3b_lock_released_after_append_failure_next_waiter_honoured(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A per-key lock held across a FAILING append must still be released
+    (never leaked/deadlocked): a second, concurrently-waiting request with
+    the same key acquires the lock once free, finds seen() still False (the
+    first request's key was never burned), and is durably honoured."""
+    monkeypatch.setattr(
+        main_module.registry, "get_or_create", lambda *a, **k: MagicMock()
+    )
+    appended: list[tuple[str, bytes]] = []
+    first_attempted = asyncio.Event()
+    call_count = 0
+
+    async def _fake_append(worker_key: str, raw: bytes) -> None:
+        nonlocal call_count
+        call_count += 1
+        first_attempted.set()
+        if call_count == 1:
+            await asyncio.sleep(0.1)  # genuine checkpoint before failing
+            raise OSError("simulated durable-write failure")
+        appended.append((worker_key, raw))
+
+    monkeypatch.setattr(main_module.registry.queue_manager, "append", _fake_append)
+
+    payload = _payload("sess-d7-t3b", "aci-event-v1:d7-t3b-key")
+
+    async def _first() -> None:
+        with pytest.raises(OSError):
+            await client.post("/events", json=payload)
+
+    async def _second() -> httpx.Response:
+        await asyncio.wait_for(first_attempted.wait(), timeout=5)
+        return await client.post("/events", json=payload)
+
+    _, second_response = await asyncio.wait_for(
+        asyncio.gather(_first(), _second()), timeout=10
+    )
+
+    assert second_response.status_code == 202
+    assert second_response.json()["status"] == "queued"
+    assert call_count == 2
+    assert len(appended) == 1
+
+
+# ---------------------------------------------------------------------------
+# No idempotency_key: no lock is taken, concurrent no-key requests unaffected
+# ---------------------------------------------------------------------------
+
+
+async def test_t3c_no_dedup_key_concurrent_requests_unaffected_by_lock(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requests carrying no idempotency_key take NO lock: two concurrent
+    no-key POSTs still both durably append, exactly as before the fix. This
+    reuses the classic mutual-release pattern -- if a lock were mistakenly
+    applied to the no-key path, this would deadlock and time out."""
     monkeypatch.setattr(
         main_module.registry, "get_or_create", lambda *a, **k: MagicMock()
     )
@@ -185,18 +296,18 @@ async def test_t3_concurrent_same_key_double_post_both_append(
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            # Hold the first arrival open until the second arrival has
-            # reached (and passed) its own seen() check and called append.
             await asyncio.wait_for(release.wait(), timeout=5)
         else:
-            # The second arrival has now passed its check (it is executing
-            # this very call) -- release the first so both complete.
             release.set()
         appended.append((worker_key, raw))
 
     monkeypatch.setattr(main_module.registry.queue_manager, "append", _fake_append)
 
-    payload = _payload("sess-d7-t3", "aci-event-v1:d7-t3-key")
+    payload = {
+        "event": "tool_use",
+        "workspace": "/ws",
+        "data": {"session_id": "sess-d7-t3c", "timestamp": _TIMESTAMP},
+    }
 
     r1, r2 = await asyncio.wait_for(
         asyncio.gather(
@@ -208,10 +319,7 @@ async def test_t3_concurrent_same_key_double_post_both_append(
 
     assert r1.status_code == 202
     assert r2.status_code == 202
-    statuses = {r1.json()["status"], r2.json()["status"]}
-    assert statuses == {"queued"}, (
-        f"neither concurrent POST may be answered duplicate; got {statuses}"
-    )
+    assert {r1.json()["status"], r2.json()["status"]} == {"queued"}
     assert len(appended) == 2
 
 

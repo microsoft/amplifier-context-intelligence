@@ -321,11 +321,7 @@ class SessionRegistry:
                         worker.compact_pending = False
                         settings = get_settings()
                         if settings.queue_compact_enabled:
-                            await qm.compact_committed_prefix(
-                                session_id,
-                                0,
-                                settings.queue_compact_max_tail_bytes,
-                            )
+                            await qm.compact_committed_prefix(session_id, 0)
                     # Dry-exit for a recovered drainer with no terminal record: re-read
                     # after the await closes the race with a live POST arriving mid-check.
                     if not worker.live_event_seen:
@@ -411,7 +407,15 @@ class SessionRegistry:
                         )
                     if attempts >= self._max_delivery_attempts:
                         # Budget spent: isolate the batch line-by-line and dead-letter.
-                        await self._handle_exhausted_batch(worker, batch, handlers)
+                        terminal_seen = await self._handle_exhausted_batch(
+                            worker, batch, handlers
+                        )
+                        if terminal_seen:
+                            # Mirror the normal terminal branch below: the
+                            # session:end record was left uncommitted, so
+                            # finalize instead of resuming the drain loop.
+                            await self._finalize_session(worker, handlers)
+                            return
                         attempts = 0
                         continue
                     # Not yet exhausted: back off before re-reading the same
@@ -440,9 +444,7 @@ class SessionRegistry:
                     settings = get_settings()
                     if settings.queue_compact_enabled:
                         await qm.compact_committed_prefix(
-                            session_id,
-                            settings.queue_compact_min_prefix_bytes,
-                            settings.queue_compact_max_tail_bytes,
+                            session_id, settings.queue_compact_min_prefix_bytes
                         )
 
                 if terminal_at is not None:
@@ -496,13 +498,27 @@ class SessionRegistry:
 
     async def _handle_exhausted_batch(
         self, worker: SessionWorker, batch: Batch, handlers: Any
-    ) -> None:
+    ) -> bool:
         """Reprocess a poison batch one line at a time (linear isolation).
 
         Each record is dispatched and flushed individually. A record that
         fails is dead-lettered and its buffer residue discarded so it can't
-        contaminate later records. Every record advances the offset to its
-        own queue-produced end, so the whole batch is fully accounted for.
+        contaminate later records. Every non-terminal record advances the
+        offset to its own queue-produced end, so it is fully accounted for.
+
+        A record that successfully parses as a terminal ``session:end``
+        record is NOT dispatched or committed here -- isolation stops
+        immediately and returns True, leaving that record (and anything
+        after it) uncommitted, mirroring the normal drain loop's terminal
+        semantics (see ``drain_worker``/``_process_batch``). The caller must
+        then call ``_finalize_session`` instead of resuming the drain loop,
+        exactly like the non-exhausted terminal path: ``_finalize_session``'s
+        own ``_drain_to_eof`` re-reads and re-dispatches the terminal record.
+        A record whose bytes fail to parse is NOT terminal -- it is
+        dead-lettered and committed past like any other poison line.
+
+        Returns False when the whole batch is isolated without ever
+        reaching a terminal record (unchanged behavior: no finalization).
         """
         qm = self.queue_manager
         session_id = worker.session_id
@@ -510,9 +526,29 @@ class SessionRegistry:
         # discard so the first isolated record flushes from a clean buffer.
         worker.services.graph.discard_buffer()
         for rec in batch.records:
-            wrote = False
             try:
                 event, _ws, data = self._parse_line(rec.raw)
+            except Exception as exc:
+                # Unparseable: can't be a terminal record -- poison as before.
+                await qm.dead_letter(session_id, rec.raw, str(exc))  # no re-framing
+                logger.warning(
+                    "dead_letter session=%s error=%s",
+                    session_id,
+                    exc,
+                    exc_info=exc,
+                    extra={"session_id": session_id},
+                )
+                worker.services.graph.discard_buffer()
+                await qm.commit(session_id, rec.end)  # queue-produced offset
+                continue
+
+            from context_intelligence_server.pipeline import TERMINAL_EVENTS
+
+            if event in TERMINAL_EVENTS:
+                return True
+
+            wrote = False
+            try:
                 await self._process_one(worker, event, data, handlers)
                 await self._flush_barrier(worker)
                 wrote = True
@@ -532,6 +568,7 @@ class SessionRegistry:
             await qm.commit(session_id, rec.end)  # queue-produced offset
             if wrote:
                 self.record_written(1)
+        return False
 
     async def _drain_to_eof(self, worker: SessionWorker, handlers: Any) -> bool:
         """Drain every remaining record for this session up to EOF.

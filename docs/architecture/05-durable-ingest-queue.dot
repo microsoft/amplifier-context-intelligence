@@ -255,7 +255,7 @@ digraph durable_ingest_queue {
         ]
 
         Compaction [
-            label     = "compact_committed_prefix()  (queue_compact_enabled, default ON)\nCONTINUOUS reclaim of a LIVE session's already-committed\nprefix [0, C) -- not just at session end. The .log then holds\nthe UNDRAINED TAIL, not the whole session history.\nfrequency bounded by queue_compact_min_prefix_bytes\ncost/lock-hold bounded by queue_compact_max_tail_bytes\nrebase .offset to 0 FIRST, then swap the tail in\n(every crash window degrades to a bounded re-drive, never a loss)"
+            label     = "compact_committed_prefix()  (queue_compact_enabled, default ON)\nCONTINUOUS reclaim of a LIVE session's already-committed\nprefix [0, C) -- not just at session end. The .log then holds\nthe UNDRAINED TAIL, not the whole session history.\nfrequency bounded by queue_compact_min_prefix_bytes\nreclaims regardless of tail size\nrebase .offset to 0 FIRST, then swap the tail in\n(every crash window degrades to a bounded re-drive, never a loss)"
             fillcolor = "#80DEEA"
             fontname  = "Helvetica-Bold"
             penwidth  = 2.0

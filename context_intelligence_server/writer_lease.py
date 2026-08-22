@@ -4,15 +4,16 @@ Durable append-log framing is correct only while exactly one process writes
 the queue directory (per-key serialization is in-process, ``queue_manager.py``).
 A rolling/blue-green overlap on a shared mount can silently violate that.
 
-``detect`` (default): best-effort acquire + heartbeat, latches a conflict on
-``/status``, never refuses to boot. ``enforce`` (opt-in): also refuses boot
-against a fresh foreign lease. ``off``: disabled.
+``enforce`` (default): refuses boot against a LIVE foreign lease, takes over a
+STALE one. ``detect`` (opt-in): best-effort acquire + heartbeat, latches a
+conflict on ``/status``, never refuses to boot. ``off``: disabled.
 
-Honest limits: ~15s staleness tolerance, not a mutex; a share fault degrades
-to "not armed" rather than crash-looping; never constructs the queue
-directory (pure path read); all I/O runs on a private single-thread executor
-so a hung mount leaks at most one thread; shutdown never raises but is not
-guaranteed to release (the staleness window is the backstop).
+Honest limits: staleness tolerance is heartbeat * multiplier, not a mutex; a
+share fault degrades to "not armed" rather than crash-looping; never
+constructs the queue directory (pure path read); all I/O runs on a private
+single-thread executor so a hung mount leaks at most one thread; clean
+shutdown releases (bounded, best-effort) -- the staleness window is the
+backstop only when release itself fails or is skipped (e.g. a crash).
 """
 
 from __future__ import annotations
@@ -526,11 +527,16 @@ class WriterLease:
 
     async def release(self) -> None:
         """Owner-gated, best-effort release. A failed release is not a
-        failed shutdown -- the next boot just waits out the staleness window."""
+        failed shutdown -- the next boot just waits out the staleness window.
+        Bounded by the acquire timeout so a hung mount can never block
+        shutdown."""
         if self.mode is None or self.mode == "off" or self._path is None:
             return
+        timeout = self._acquire_timeout if self._acquire_timeout is not None else 5.0
         try:
-            await self._io(self._unlink_if_owned)
+            await asyncio.wait_for(self._io(self._unlink_if_owned), timeout=timeout)
+        except TimeoutError:
+            logger.warning("writer_lease: release timed out after %.1fs", timeout)
         except (OSError, WriterLeaseBusy) as exc:
             logger.warning("writer_lease: release failed (best-effort): %s", exc)
 

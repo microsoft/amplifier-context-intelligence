@@ -166,19 +166,39 @@ async def test_classify_unparseable_offset_with_dead_letters_kept(
     assert c.reason == "bad_offset_with_dead"
 
 
-async def test_classify_unparseable_offset_large_deletes(tmp_path: Path) -> None:
+async def test_classify_unparseable_offset_large_still_resets(tmp_path: Path) -> None:
+    """An unparseable .offset must never delete an intact .log, regardless
+    of size -- only genuinely bad parsed values (negative/past-eof) stay
+    size-gated (see test_classify_offset_past_eof_large_still_deletes)."""
     big = _line() * 3
     _seed_log(tmp_path, "k4", big)
     _seed_offset(tmp_path, "k4", "not-a-number")
+    qm = await _qm(tmp_path)
+    settings = Settings(reclaim_redrain_max_bytes=1)  # would have forced "large"
+    with patch(
+        "context_intelligence_server.queue_manager.get_settings",
+        return_value=settings,
+    ):
+        c = await qm.classify_session("k4", _head_is_resumable)
+    assert c.verdict is Verdict.RESET_OFFSET
+    assert c.reason == "unparseable_offset"
+
+
+async def test_classify_offset_past_eof_large_still_deletes(tmp_path: Path) -> None:
+    """Unlike an unparseable offset, a parsed-but-past-EOF offset stays
+    size-gated -- genuinely bad content, not an unreadable sidecar."""
+    big = _line() * 3
+    _seed_log(tmp_path, "k4b", big)
+    _seed_offset(tmp_path, "k4b", str(len(big) + 1000))
     qm = await _qm(tmp_path)
     settings = Settings(reclaim_redrain_max_bytes=1)  # force "large"
     with patch(
         "context_intelligence_server.queue_manager.get_settings",
         return_value=settings,
     ):
-        c = await qm.classify_session("k4", _head_is_resumable)
+        c = await qm.classify_session("k4b", _head_is_resumable)
     assert c.verdict is Verdict.UNRESUMABLE
-    assert c.reason == "unparseable_offset"
+    assert c.reason == "offset_past_eof"
 
 
 async def test_classify_negative_offset(tmp_path: Path) -> None:
@@ -1122,6 +1142,133 @@ async def test_reclaim_enabled_true_deletes_what_dry_run_named(
     monkeypatch.setattr(main_module._settings, "reclaim_enabled", True)
     await main_module._boot_reclaim()
     assert not (tmp_path / "target.log").exists()  # enabled: deleted for real
+
+
+# ---------------------------------------------------------------------------
+# DRAINED is auto-reclaimed at boot regardless of reclaim_enabled; the risky
+# verdicts (UNRESUMABLE, RESET_OFFSET) stay gated behind it.
+# ---------------------------------------------------------------------------
+
+
+async def test_boot_reclaim_auto_reclaims_drained_log_under_shipped_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fully-drained log (committed == complete_end == size) is the same
+    evidence delete_drained already acts on unconditionally -- it must be
+    reclaimed at boot even under shipped defaults (reclaim_enabled=False)."""
+    qm = QueueManager(queues_dir=tmp_path)
+    line = _line()
+    await qm.append("drained-key", line)
+    await qm.commit("drained-key", len(line))
+
+    monkeypatch.setattr(main_module.registry, "_queue_manager", qm)
+    monkeypatch.setattr(main_module._settings, "reclaim_enabled", False)
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
+    boot_state.reclaimed = 0
+    boot_state.kept = 0
+
+    await main_module._boot_reclaim()
+
+    assert not (tmp_path / "drained-key.log").exists()
+    assert not (tmp_path / "drained-key.offset").exists()
+    assert boot_state.reclaimed >= 1
+
+
+async def test_boot_reclaim_risky_verdicts_stay_gated_under_shipped_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """UNRESUMABLE and RESET_OFFSET must still be dry-run-only under
+    reclaim_enabled=False -- only DRAINED gets the auto-reclaim carve-out."""
+    big = _line() * 3
+    _seed_log(tmp_path, "unresumable-key", big)
+    # offset_past_eof (not unparseable_offset): genuinely bad parsed value,
+    # so it stays size-gated -- unaffected by the unparseable-offset fix.
+    _seed_offset(tmp_path, "unresumable-key", str(len(big) + 1000))
+
+    line = _line()
+    _seed_log(tmp_path, "reset-key", line * 2)
+    _seed_offset(tmp_path, "reset-key", "garbage")  # small -> RESET_OFFSET
+
+    qm = QueueManager(queues_dir=tmp_path)
+    monkeypatch.setattr(main_module.registry, "_queue_manager", qm)
+    monkeypatch.setattr(main_module._settings, "reclaim_enabled", False)
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
+
+    # Between reset-key's size (108) and unresumable-key's size (162): the
+    # former stays a bounded RESET_OFFSET, the latter tips into UNRESUMABLE.
+    # Patched directly on queue_manager's own get_settings, like
+    # test_classify_offset_past_eof_large_still_deletes does -- immune to any
+    # other test's get_settings.cache_clear() changing the shared singleton.
+    threshold_settings = Settings(reclaim_redrain_max_bytes=150)
+    with patch(
+        "context_intelligence_server.queue_manager.get_settings",
+        return_value=threshold_settings,
+    ):
+        # Confirm the verdicts are what this test claims before asserting.
+        c_unresumable = await qm.classify_session(
+            "unresumable-key", _head_is_resumable
+        )
+        assert c_unresumable.verdict is Verdict.UNRESUMABLE
+        c_reset = await qm.classify_session("reset-key", _head_is_resumable)
+        assert c_reset.verdict is Verdict.RESET_OFFSET
+
+        await main_module._boot_reclaim()
+
+    assert (tmp_path / "unresumable-key.log").exists()
+    assert (tmp_path / "reset-key.log").exists()
+    assert (tmp_path / "reset-key.offset").exists()
+
+
+async def test_boot_reclaim_large_unparseable_offset_never_deletes_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A large intact .log with an unparseable .offset must survive a REAL
+    boot reclaim (reclaim_enabled=True) -- only the .offset resets, so the
+    session re-drains from byte 0 instead of losing its data."""
+    big = _line() * 3
+    _seed_log(tmp_path, "big-unparseable", big)
+    _seed_offset(tmp_path, "big-unparseable", "not-a-number")
+
+    qm = QueueManager(queues_dir=tmp_path)
+    monkeypatch.setattr(main_module.registry, "_queue_manager", qm)
+    monkeypatch.setattr(main_module._settings, "reclaim_enabled", True)
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
+
+    threshold_settings = Settings(reclaim_redrain_max_bytes=1)  # old "large" cliff
+    with patch(
+        "context_intelligence_server.queue_manager.get_settings",
+        return_value=threshold_settings,
+    ):
+        await main_module._boot_reclaim()
+
+    assert (tmp_path / "big-unparseable.log").exists()
+    assert not (tmp_path / "big-unparseable.offset").exists()
+    batch = await qm.read_batch("big-unparseable", max_items=10)
+    assert len(batch.records) == 3  # re-drains from byte 0
+
+
+async def test_boot_reclaim_drained_log_with_live_worker_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The has_worker guard runs BEFORE classify -- a live worker's log is
+    never touched by boot reclaim, DRAINED or not."""
+    qm = QueueManager(queues_dir=tmp_path)
+    line = _line()
+    await qm.append("live-drained-key", line)
+    await qm.commit("live-drained-key", len(line))
+
+    reg = SessionRegistry()
+    reg._queue_manager = qm
+    worker = _make_worker("live-drained-key", live_event_seen=True)
+    reg._register_for_test(worker)
+
+    monkeypatch.setattr(main_module, "registry", reg)
+    monkeypatch.setattr(main_module._settings, "reclaim_enabled", False)
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
+
+    await main_module._boot_reclaim()
+
+    assert (tmp_path / "live-drained-key.log").exists()
 
 
 # ---------------------------------------------------------------------------
