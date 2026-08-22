@@ -1,50 +1,18 @@
 """Writer-lease DETECTOR -- not a mutex.
 
-The durable append-log framing's entire correctness argument is that
-appends to one worker key are
-serialized by an in-process, per-key ``_KeyGuard`` (``queue_manager.py``).
-That argument holds only while EXACTLY ONE process writes the queue
-directory. A rolling / blue-green revision swap can run old+new against the
-same shared ``/data`` mount, and during that overlap that guarantee is
-silently void --
-torn/merged append lines can reappear with ZERO signal.
+Durable append-log framing is correct only while exactly one process writes
+the queue directory (per-key serialization is in-process, ``queue_manager.py``).
+A rolling/blue-green overlap on a shared mount can silently violate that.
 
-**This module is a DETECTOR, not a mutex.** It does not make multi-writer
-append safe (that is Tier-3, out of scope). It:
+``detect`` (default): best-effort acquire + heartbeat, latches a conflict on
+``/status``, never refuses to boot. ``enforce`` (opt-in): also refuses boot
+against a fresh foreign lease. ``off``: disabled.
 
-1. In ``detect`` (the shipped DEFAULT): acquires the lease best-effort,
-   heartbeats it, and LATCHES + SURFACES a conflict on ``/status`` within one
-   heartbeat -- but NEVER refuses to boot. Shipping the refusal on by default
-   would deadlock a rolling deploy (the new revision can never become
-   healthy while the old one is still actively renewing its lease).
-2. In ``enforce`` (opt-in, gated behind the deployed-mount smoke test):
-   additionally REFUSES to boot against a fresh foreign lease.
-3. In ``off``: does nothing at all.
-
-Honest limits:
-
-- It is a detector with a ~15s staleness tolerance, not a mutex. Two writers
-  CAN both believe they hold the lease for up to that window, and writes
-  already in flight during an overlap are made VISIBLE, not SAFE.
-- A share fault (SMB remount, etc.) or a hung mount can NEVER crash-loop or
-  hang the server -- every fallible step degrades to "detector not armed for
-  this process" (``error`` on ``/status``) and boot/heartbeat continues.
-- This detector constructs NOTHING. The queue directory is resolved as a
-  PURE PATH READ (``SessionRegistry.queues_dir_path``) -- it never triggers
-  ``QueueManager`` construction, because doing so off-loop can race the
-  boot-recovery pass's own on-loop construction and reproduce the same
-  torn/merged-line append corruption through a second door. It also never
-  creates the queue directory; on a first-ever cold boot the directory may
-  not exist yet, and the detector is simply unarmed for one heartbeat until
-  boot recovery creates it.
-- All lease I/O runs on a PRIVATE, single-thread executor with a one-slot
-  in-flight gate, so a stalled/hung mount can leak at most one thread and
-  zero queued items -- and can never starve the append/commit path or
-  ``spool_stats``, which run on the shared default executor.
-- Shutdown never raises -- but that is not the same guarantee as "release
-  always succeeds": a shutdown racing a HEALTHY
-  in-flight op can leave the lease on disk even on a clean exit; the 15s
-  staleness window is the backstop, exactly as after a SIGKILL.
+Honest limits: ~15s staleness tolerance, not a mutex; a share fault degrades
+to "not armed" rather than crash-looping; never constructs the queue
+directory (pure path read); all I/O runs on a private single-thread executor
+so a hung mount leaks at most one thread; shutdown never raises but is not
+guaranteed to release (the staleness window is the backstop).
 """
 
 from __future__ import annotations
@@ -88,10 +56,8 @@ LEASE_FILENAME = ".writer.lease"
 LEASE_TMP_FILENAME = ".writer.lease.tmp"
 _LEASE_VERSION = 1
 
-# Private, single-thread executor: ALL lease I/O runs here, never on the
-# shared default `asyncio.to_thread` pool the append/commit path and
-# `spool_stats` also use. A hung mount can leak at most ONE
-# thread here, ever -- never a growing queue behind it.
+# Private, single-thread executor: all lease I/O runs here, never on the
+# shared default pool the append/commit path and `spool_stats` also use.
 _LEASE_IO = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="writer-lease-io"
 )
@@ -206,11 +172,7 @@ class WriterLease:
         try:
             text = self._path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            # This swallow lives INSIDE `_read` -- a
-            # missing lease means "free directory", NOT a share fault. A
-            # write-side ENOENT (dir missing) is a DIFFERENT FileNotFoundError
-            # that reaches the outer OSError policy instead (it never calls
-            # `_read`), so the two are never confused.
+            # A missing lease means "free directory", not a share fault.
             return None
         try:
             data = json.loads(text.strip())
@@ -225,9 +187,8 @@ class WriterLease:
                 lease_version=int(data.get("lease_version", -1)),
             )
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            # A torn/malformed lease is treated as fresh-and-foreign, at the
-            # same strength as a genuine live peer -- never an
-            # unconditional refusal; the mode ladder alone decides.
+            # Torn/malformed lease is treated as fresh-and-foreign, same
+            # strength as a genuine live peer.
             return LeaseRecord(
                 owner="",
                 host="",
@@ -316,11 +277,8 @@ class WriterLease:
         fault -- OSError, a hung mount, a busy gate -- is absorbed and
         surfaced via `error`/`conflict`, never raised.
         """
-        # --- I/O-FREE PRELUDE: attribute reads only, no syscall, no await.
-        # `_dir_source` is FIRST: a bare-parameter
-        # assignment that cannot raise, so even a prelude death at a later
-        # settings-read statement leaves the re-arm path a real source
-        # rather than an AttributeError on every subsequent tick.
+        # I/O-free prelude: attribute reads only. `_dir_source` assigned
+        # first so a later prelude failure still leaves a real re-arm source.
         self._dir_source = dir_source
         self.mode = settings.writer_lease_mode
         self.heartbeat_seconds = settings.writer_lease_heartbeat_seconds
@@ -332,9 +290,7 @@ class WriterLease:
         self._acquire_timeout = settings.writer_lease_acquire_timeout_seconds
 
         if self.force_acquire:
-            # Log on EVERY boot while set, regardless of whether
-            # a foreign lease existed -- an operator who forgot to unset it
-            # must never get silence.
+            # Log on every boot while set so it's never silently forgotten.
             logger.warning(
                 "writer_lease: FORCE_ACQUIRE IS ENABLED -- the boot refusal is "
                 "disabled for this process. Unset "
@@ -349,10 +305,9 @@ class WriterLease:
         await self._acquire_once(refuse=refuse, source="boot")
 
     async def _acquire_once(self, *, refuse: bool, source: str) -> None:
-        """One bounded acquire attempt. NEVER raises except
-        `WriterLeaseConflict` when `refuse=True` (boot's `enforce` path
-        only -- `tick()`'s re-arm always passes `refuse=False`, so the
-        refusal limb is structurally unreachable from the heartbeat loop)."""
+        """One bounded acquire attempt. Never raises except
+        `WriterLeaseConflict` when `refuse=True` (boot's `enforce` path only;
+        `tick()`'s re-arm always passes `refuse=False`)."""
         assert self._acquire_timeout is not None
         try:
             await asyncio.wait_for(
@@ -386,8 +341,7 @@ class WriterLease:
         assert self.staleness_seconds is not None
         assert self._confirm_delay is not None
 
-        # R1: a PURE PATH READ, on the loop, zero syscalls. This detector
-        # constructs nothing -- see SessionRegistry.queues_dir_path.
+        # Pure path read, zero syscalls -- this detector constructs nothing.
         self._dir = self._dir_source()
         self._path = self._dir / LEASE_FILENAME
 
@@ -397,13 +351,6 @@ class WriterLease:
             if age < self.staleness_seconds:
                 # Fresh (or unreadable, or future-dated) foreign lease.
                 if refuse:
-                    # The single most important refusal event
-                    # previously had NO logger call at all -- only the
-                    # exception message, visible only to whatever catches
-                    # WriterLeaseConflict (the boot path, which re-raises it
-                    # straight out of lifespan). ERROR here makes the refusal
-                    # itself observable in the log stream independent of how
-                    # the caller handles the exception.
                     msg = self._refusal_message(rec, age)
                     logger.error("writer_lease_refused_boot %s", msg)
                     raise WriterLeaseConflict(msg)
@@ -435,9 +382,6 @@ class WriterLease:
         rec2 = await self._io(self._read)
         if rec2 is None or rec2.owner != self.owner:
             if refuse:
-                # The second enforce-mode refusal site -- same
-                # gap as the fresh-foreign-lease raise above (no logger call
-                # at all previously).
                 msg = f"lost the acquire race to owner={rec2.owner if rec2 else None}"
                 logger.error("writer_lease_refused_boot %s", msg)
                 raise WriterLeaseConflict(msg)
@@ -491,14 +435,11 @@ class WriterLease:
 
         if not self.acquired:
             if self.ever_acquired:
-                # Held-then-lost: keep READING so observed_owner/observed_at
-                # stay current, but NEVER write again -- renewing would
-                # ping-pong the lease with the peer.
+                # Held-then-lost: keep reading, but never write again --
+                # renewing would ping-pong the lease with the peer.
                 await self._observe_only()
                 return
-            # Never-acquired: we hold nothing to protect, so a latched
-            # conflict must not bar us from trying -- one attempt per
-            # heartbeat, never a refusal.
+            # Never-acquired: nothing to protect, so try again this tick.
             await self._acquire_once(refuse=False, source="reacquire")
             return
 
@@ -553,13 +494,10 @@ class WriterLease:
             self.observed_at = _now()
 
     async def heartbeat_loop(self) -> None:
-        """Sleep -> tick -> forever, supervised. Mirrors
-        `_crash_recovery_sweep_loop` (main.py) line-for-line in shape.
+        """Sleep -> tick -> forever, supervised.
 
-        The interval is read ONCE, before the loop -- an unset value (a
-        prelude that never ran, e.g. `acquire()` never called at all) is a
-        LOUD, single-shot return rather than `sleep(None)` -> TypeError ->
-        an uncapped busy-loop."""
+        Interval is read once before the loop; an unset value (prelude never
+        ran) is a loud single-shot return rather than an uncapped busy-loop."""
         interval = self.heartbeat_seconds
         if not interval or interval <= 0:
             logger.error(
@@ -576,9 +514,6 @@ class WriterLease:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # Cheap tightening: attach the traceback (was
-                # message-only) so a repeating tick failure yields a
-                # traceback instead of just the exception's str().
                 logger.warning(
                     "writer_lease_heartbeat: tick failed, will retry: %s",
                     exc,
@@ -590,11 +525,8 @@ class WriterLease:
     # -----------------------------------------------------------------
 
     async def release(self) -> None:
-        """Owner-gated, best-effort release. Swallows
-        `OSError` and `WriterLeaseBusy` -- a failed release is not a failed
-        shutdown, it just means the next boot waits out the staleness
-        window (this guarantees "shutdown never
-        raises", NOT "release always succeeds")."""
+        """Owner-gated, best-effort release. A failed release is not a
+        failed shutdown -- the next boot just waits out the staleness window."""
         if self.mode is None or self.mode == "off" or self._path is None:
             return
         try:
@@ -603,9 +535,8 @@ class WriterLease:
             logger.warning("writer_lease: release failed (best-effort): %s", exc)
 
     def mark_unarmed(self, error_repr: str, mode: str | None = None) -> None:
-        """Called by `main._writer_lease_boot`'s backstop `except Exception`
-        when something outside `acquire()`'s own fault policy escaped (a
-        mis-shaped settings object, etc). `conflict` is left UNTOUCHED."""
+        """Called when a fault escapes `acquire()`'s own fault policy.
+        `conflict` is left untouched."""
         self.acquired = False
         self.error = error_repr
         if self.mode is None and mode is not None:
@@ -616,8 +547,7 @@ class WriterLease:
     # -----------------------------------------------------------------
 
     def snapshot(self) -> dict[str, Any]:
-        """Pure in-memory dict build -- no I/O, no `await`, no
-        `get_settings()` -- so it structurally cannot raise on the
+        """Pure in-memory dict build -- no I/O, so it cannot raise on the
         unauthenticated health path."""
         last_renewed = self.last_renewed
         lease_age = None if last_renewed is None else max(0.0, _now() - last_renewed)
@@ -641,8 +571,6 @@ class WriterLease:
         }
 
 
-# Module singleton. NO I/O at import (uuid4 + os.getpid() + gethostname() +
-# time.time() only) -- mirrors status.boot_state's own reasoning: a bare
-# ASGI test client that never runs the real lifespan must still get a
-# coherent, non-lying /status.
+# Module singleton. No I/O at import, so a bare ASGI test client that never
+# runs the real lifespan still gets a coherent, non-lying /status.
 writer_lease: WriterLease = WriterLease()

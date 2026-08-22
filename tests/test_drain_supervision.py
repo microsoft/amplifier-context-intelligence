@@ -3,20 +3,11 @@
 Verifies that an unexpected exception raised inside ``drain_worker`` is
 never silent: ``add_done_callback``/``_on_drain_done`` ensures it is
 logged, the store is closed, and the worker is deregistered so a fresh
-one can be created -- rather than leaving a dead, still-registered
-worker behind with nothing to revive it.
+one can be created. No real Neo4j is used anywhere in this file.
 
-Harness -- reuse only what is already proven: a real ``SessionRegistry``, a
-real ``tmp_path``-backed ``QueueManager`` (via ``reg.queue_manager``),
-``reg._register_for_test(worker)``, and the same fault-injection style as
-``tests/test_large_event_tail_drop.py`` (``AsyncMock``/a thin
-async wrapper with ``side_effect``-like semantics on the specific ``qm``
-method). No real Neo4j is used anywhere in this file.
-
-Determinism rule: no wall-clock sleeps as synchronisation. Every wait here
-is either (a) a bounded poll on an observable condition (queue state, task
-state) or (b) an ``asyncio.Event`` the injected fake sets right before
-blocking, so the test can ``await`` it deterministically.
+Determinism rule: no wall-clock sleeps as synchronisation -- every wait is
+either a bounded poll on an observable condition, or an ``asyncio.Event``
+the injected fake sets right before blocking.
 """
 
 from __future__ import annotations
@@ -275,7 +266,7 @@ class TestInjectionMatrix:
     async def test_read_batch_failure_is_supervised_and_respawns(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """S1 registry.py:329 -- qm.read_batch raises OSError(EIO) once."""
+        """qm.read_batch raises OSError(EIO) once."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-s1-read-batch"
@@ -322,9 +313,9 @@ class TestInjectionMatrix:
     async def test_commit_failure_is_supervised_and_respawns(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """S2 registry.py:406 -- qm.commit raises OSError(ESTALE) once.
-        Plus: no duplicate node in fake.flushed after the replay (flushed is
-        a set), and written_total counts the line exactly once."""
+        """qm.commit raises OSError(ESTALE) once. No duplicate node in
+        fake.flushed after the replay (flushed is a set), and written_total
+        counts the line exactly once."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-s2-commit"
@@ -366,10 +357,9 @@ class TestInjectionMatrix:
     async def test_dead_letter_failure_no_longer_kills_the_drainer(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """S3 -- qm.dead_letter raises OSError(EIO) once, in registry.py's
-        dead-letter except-clause. THE EXACT CASE B INJECTION for this
-        suite. The poison line ends up in read_dead_letters and tail-1/
-        tail-2 are persisted after respawn."""
+        """qm.dead_letter raises OSError(EIO) once, in the dead-letter
+        except-clause. The poison line ends up in read_dead_letters and
+        tail-1/tail-2 are persisted after respawn."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-s3-dead-letter"
@@ -416,9 +406,8 @@ class TestInjectionMatrix:
     async def test_isolation_commit_failure_is_supervised_and_respawns(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """S4 registry.py:484 -- qm.commit raises TimeoutError once on the
-        FIRST isolation-path commit call. No line is dead-lettered twice,
-        none is lost."""
+        """qm.commit raises TimeoutError once on the first isolation-path
+        commit call. No line is dead-lettered twice, none is lost."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-s4-isolation-commit"
@@ -464,11 +453,10 @@ class TestInjectionMatrix:
     async def test_finalize_tail_read_failure_refinalizes_after_respawn(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """qm.read_batch raises OSError(ESTALE) once,
-        on its SECOND call (the first call reads the main terminal batch;
-        the second is _finalize_session's own tail read). The terminal
-        batch was already committed up to session:end durably, so
-        finalize re-runs after respawn to full completion (assert (d))."""
+        """qm.read_batch raises OSError(ESTALE) once, on _finalize_session's
+        own tail read (its second call). The terminal batch was already
+        committed up to session:end, so finalize re-runs after respawn to
+        full completion (assert (d))."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-s5-finalize-read"
@@ -515,10 +503,9 @@ class TestInjectionMatrix:
     async def test_finalize_tail_commit_failure_refinalizes_after_respawn(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """qm.commit raises OSError(ENOSPC) once, on
-        its SECOND call (the first commit is the terminal batch's
-        up-to-session:end commit; the second is _finalize_session's own
-        tail commit)."""
+        """qm.commit raises OSError(ENOSPC) once, on _finalize_session's own
+        tail commit (its second call, after the terminal batch's own
+        up-to-session:end commit succeeds)."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-s6-finalize-commit"
@@ -562,10 +549,9 @@ class TestInjectionMatrix:
     async def test_delete_drained_failure_is_supervised_without_second_drainer(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """S7 (now the last I/O in finalize) -- qm.delete_drained raises
-        PermissionError once. CompletedSession WAS recorded (it is appended
-        before delete_drained runs, unchanged position); the callback
-        deregisters + closes; (e) no second drainer."""
+        """qm.delete_drained raises PermissionError once. CompletedSession
+        was already recorded (appended before delete_drained runs); the
+        callback deregisters + closes; no second drainer."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-s7-delete-drained"
@@ -605,9 +591,8 @@ class TestInjectionMatrix:
     async def test_prologue_exception_is_supervised(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """S8 registry.py:320-321 -- setup_handlers raises before the while
-        loop even starts. A later get_or_create-equivalent still builds a
-        working worker."""
+        """setup_handlers raises before the while loop even starts. A later
+        get_or_create-equivalent still builds a working worker."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-s8-prologue"
@@ -645,11 +630,8 @@ class TestInjectionMatrix:
         assert graph.flushed == {"e1"}
 
     async def test_flush_failure_uses_real_neo4j_exception_types(self) -> None:
-        """Not a crash scenario -- proves the PRE-EXISTING inner retry path
-        tolerates REAL neo4j driver exception types, not
-        just a bare Exception. This is a regression guard for an unchanged
-        code path: the inner retry path itself is untouched by this suite's
-        fixes."""
+        """Not a crash scenario -- proves the inner retry path tolerates
+        real neo4j driver exception types, not just a bare Exception."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-flush-real-exceptions"
@@ -680,7 +662,7 @@ class TestInjectionMatrix:
 
 
 # ---------------------------------------------------------------------------
-# 7.3 -- Mechanism-specific tests
+# Mechanism-specific tests
 # ---------------------------------------------------------------------------
 
 
@@ -720,9 +702,8 @@ class TestMechanismSpecific:
         assert event == "session:end"
 
     async def test_recover_reports_a_terminal_but_unfinalized_session(self) -> None:
-        """Free win: recover() reports a session frozen at its terminal
-        line as recoverable (committed < complete_data_end), so boot
-        recovery finalizes it with NO new code."""
+        """recover() reports a session frozen at its terminal line as
+        recoverable (committed < complete_data_end)."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-recover-terminal-unfinalized"
@@ -749,10 +730,9 @@ class TestMechanismSpecific:
     async def test_finalize_reruns_to_completion_after_a_transient_finalize_failure(
         self,
     ) -> None:
-        """Full end-to-end version of S5: after a transient finalize-tail
-        read failure and a respawn, the session is FULLY finalized --
-        CompletedSession recorded, delete_drained ran (log file gone),
-        every line persisted exactly once."""
+        """After a transient finalize-tail read failure and a respawn, the
+        session is fully finalized -- CompletedSession recorded,
+        delete_drained ran, every line persisted exactly once."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-finalize-full-completion"
@@ -785,9 +765,8 @@ class TestMechanismSpecific:
         assert not qm._offset_path(sid).exists()
 
     async def test_no_second_drainer_during_the_finalize_window(self) -> None:
-        """Park qm.delete_drained on an asyncio.Event; while
-        parked, call get_or_create -- must be a no-op (no new task, worker.task
-        unchanged). Release; finalization completes cleanly."""
+        """While qm.delete_drained is parked, get_or_create must be a no-op
+        (no new task, worker.task unchanged); finalization then completes."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-no-second-drainer"
@@ -842,12 +821,10 @@ class TestSpentWorkerGuard:
     async def test_cancelled_worker_is_not_revived_through_a_closed_store(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """task.cancel() -- drain_worker swallows CancelledError
-        and returns cleanly (task.cancelled() is False, documenting the
-        swallow), worker.store_closed is True, no drain_worker_died ERROR,
-        and start_drain(worker) creates NO new task (the guard is live and
-        the worker was deregistered so it does not stay wedged, but the
-        SAME worker object must never be revived once its store is closed)."""
+        """task.cancel() -- drain_worker swallows CancelledError and returns
+        cleanly, worker.store_closed is True, no drain_worker_died ERROR,
+        and start_drain(worker) creates no new task: the same worker object
+        must never be revived once its store is closed."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-cancelled-not-revived"
@@ -896,9 +873,9 @@ class TestPoisonLineIsolation:
     async def test_poison_line_is_dead_lettered_and_advances_without_dying(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Rule 1: a merged/unparseable line is dead-lettered via the
-        EXISTING isolation path, the offset advances past it, the task
-        stays ALIVE, and no drain_worker_died fires."""
+        """A merged/unparseable line is dead-lettered via the isolation
+        path, the offset advances past it, the task stays alive, and no
+        drain_worker_died fires."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-poison-isolated"
@@ -930,9 +907,8 @@ class TestPoisonLineIsolation:
 
 class TestNoDoubleCountOnReplay:
     async def test_no_double_count_on_replay(self) -> None:
-        """Force the isolation-path commit
-        to fail once. written_total after the replay equals the
-        number of DISTINCT committed lines, never lines-plus-replayed."""
+        """Force the isolation-path commit to fail once. written_total after
+        the replay equals the number of distinct committed lines."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-no-double-count"
@@ -969,11 +945,9 @@ class TestNoDoubleCountOnReplay:
 
 class TestCloseTaskReferenced:
     async def test_close_task_is_referenced_until_it_completes(self) -> None:
-        """After a crash, registry._close_tasks holds the fire-and-
-        forget close task while it is pending, and is empty once it
-        finishes -- without this, asyncio's WEAK reference to a running
-        task would let it be garbage-collected mid-close, leaking the
-        driver anyway."""
+        """registry._close_tasks holds the fire-and-forget close task while
+        it is pending, and is empty once it finishes -- without this,
+        asyncio's weak reference could let it be garbage-collected mid-close."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-close-task-referenced"
@@ -1021,12 +995,10 @@ class TestCloseTaskReferenced:
 
 class TestTerminalBatchFlushExhaustion:
     async def test_terminal_batch_flush_exhaustion_loses_finalization(self) -> None:
-        """V-4, characterization (KNOWN LIMITATION, pre-existing, see spec
-        section 3.A.3 / section 8): force the terminal batch itself through
-        _handle_exhausted_batch (flush ALWAYS fails). The committed offset
-        ends up PAST session:end, no CompletedSession is recorded, and
-        recover() does NOT report the session -- pinning the residual so a
-        future fix has a RED test waiting."""
+        """Known limitation: force the terminal batch itself through
+        _handle_exhausted_batch (flush always fails). The committed offset
+        ends up past session:end, no CompletedSession is recorded, and
+        recover() does not report the session."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d1-terminal-exhaustion"

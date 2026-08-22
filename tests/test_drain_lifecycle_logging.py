@@ -1,36 +1,10 @@
-"""Logging-completeness tests.
+"""Logging-completeness tests: each test asserts that a specific
+drain/session-lifecycle event emits exactly one structured log line (right
+level, `session=`/`reason=` tokens, session id promoted via `extra`). No
+test here asserts on behavior, metrics, or /status -- other files own that.
 
-SCOPE IS STRICTLY LOGGING. Every test in this file asserts that a specific
-drain/session-lifecycle event -- previously invisible in the log stream --
-now emits exactly one clear structured log line (right level, `session=`/
-`reason=` key=value tokens matching the dominant convention in
-registry.py/queue_manager.py, and the session id promoted via
-`extra={"session_id": ...}` so `JsonFormatter` surfaces it as a top-level
-field). No test in this file asserts on behavior, metrics, or /status --
-other test files already own that; this file only proves a line was ADDED,
-never that anything downstream changed.
-
-RED-first: every test here was observed RED (the expected record simply
-absent -- current code reaches the same return/raise/continue silently)
-against the pre-fix tree. See the session's RED-first evidence log for the
-captured output.
-
-Gap map:
-  G1  -- drain_worker CANCELLED (two sites: inner dispatch/flush, outer loop)
-  G2  -- remove() cancelling a still-live drain task
-  G3  -- start_drain() respawning an already-registered worker
-  G4  -- _finalize_session leaving an orphaned (still-registered, task-done)
-         worker (two sites: first-pass tail-flush-fail, permanent give-up)
-  G5  -- QueueManager.dead_letter()'s own write failing (re-raises unchanged)
-  G6  -- reclaim_orphans()'s two swallowed mtime-stat OSErrors
-  G7  -- writer_lease enforce-mode boot refusal (two raise sites)
-  G8  -- crash-recovery topup: recover() reports a session but read_batch
-         finds nothing (recover()/read_batch disagreement)
-
-Harness: reuses the proven fakes/helpers from
-tests/test_drain_supervision.py (`_FlakyGraph`, `_make_worker`,
-`_accumulate`, `_start_supervised`, `_pump`, `_cancel_and_await`) rather than
-re-deriving them. No real Neo4j is used anywhere in this file.
+Harness: reuses the fakes/helpers from tests/test_drain_supervision.py.
+No real Neo4j is used anywhere in this file.
 """
 
 from __future__ import annotations
@@ -89,7 +63,7 @@ def _has(
 
 
 # ---------------------------------------------------------------------------
-# G1 -- drain_worker CANCELLED (two distinct sites)
+# drain_worker CANCELLED (two distinct sites)
 # ---------------------------------------------------------------------------
 
 
@@ -178,7 +152,7 @@ class TestG1DrainWorkerCancelled:
 
 
 # ---------------------------------------------------------------------------
-# G2 -- remove() cancelling a still-live drain task
+# remove() cancelling a still-live drain task
 # ---------------------------------------------------------------------------
 
 
@@ -217,7 +191,7 @@ class TestG2Remove:
 
 
 # ---------------------------------------------------------------------------
-# G3 -- start_drain() respawning an already-registered worker
+# start_drain() respawning an already-registered worker
 # ---------------------------------------------------------------------------
 
 
@@ -225,11 +199,9 @@ class TestG3Respawn:
     async def test_g3_start_drain_respawn_logs_info(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """A worker whose PREVIOUS task is done (cancelled, not crashed) is
-        genuinely distinct from a brand-new worker (task=None) -- start_drain
-        builds a fresh task either way, but only the RESPAWN case (task was
-        not None) should log. The brand-new-spawn case already logs
-        ``drainer_spawned`` at the get_or_create call site (untouched)."""
+        """A worker whose previous task is done (cancelled, not crashed) is
+        respawned: only this case should log ``drainer_respawned``, not the
+        brand-new-spawn ``drainer_spawned``."""
         reg = SessionRegistry()
         sid = "d3-g3-respawn"
         graph = _FlakyGraph()
@@ -269,7 +241,7 @@ class TestG3Respawn:
 
 
 # ---------------------------------------------------------------------------
-# G4 -- _finalize_session leaving an orphaned worker (two sites)
+# _finalize_session leaving an orphaned worker (two sites)
 # ---------------------------------------------------------------------------
 
 
@@ -309,9 +281,8 @@ class TestG4FinalizeOrphan:
     async def test_g4b_delete_retry_exhausted_permanent_orphan_logs_error(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """delete_drained refuses every attempt AND the late-tail re-drain
-        (inside the retry loop, before the LAST attempt) also fails -> the
-        PERMANENT-retention orphan (never re-enters _finalize_session)."""
+        """delete_drained refuses every attempt and the late-tail re-drain
+        also fails -> the permanent-retention orphan."""
         reg = SessionRegistry()
         qm = reg.queue_manager
         sid = "d3-g4-permanent"
@@ -342,7 +313,7 @@ class TestG4FinalizeOrphan:
 
 
 # ---------------------------------------------------------------------------
-# G5 -- QueueManager.dead_letter()'s own write failing
+# QueueManager.dead_letter()'s own write failing
 # ---------------------------------------------------------------------------
 
 
@@ -378,7 +349,7 @@ class TestG5DeadLetterWriteFailure:
 
 
 # ---------------------------------------------------------------------------
-# G6 -- reclaim_orphans()'s two swallowed mtime-stat OSErrors
+# reclaim_orphans()'s two swallowed mtime-stat OSErrors
 # ---------------------------------------------------------------------------
 
 
@@ -469,7 +440,7 @@ class TestG6ReclaimOrphansMtimeStatFailure:
 
 
 # ---------------------------------------------------------------------------
-# G7 -- writer_lease enforce-mode boot refusal (two raise sites)
+# writer_lease enforce-mode boot refusal (two raise sites)
 # ---------------------------------------------------------------------------
 
 
@@ -541,7 +512,7 @@ class TestG7WriterLeaseRefusalLogged:
 
 
 # ---------------------------------------------------------------------------
-# G8 -- crash-recovery topup: recover()/read_batch disagreement
+# Crash-recovery topup: recover()/read_batch disagreement
 # ---------------------------------------------------------------------------
 
 

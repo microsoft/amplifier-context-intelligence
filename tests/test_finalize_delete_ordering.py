@@ -1,49 +1,9 @@
-"""`_finalize_session` delete-ordering race.
+"""`_finalize_session` delete-ordering race: a late append landing in the
+finalize window must be drained then deleted, or, if every attempt sees a
+late append, the bounded retry gives up and the log is retained.
 
-Covers:
-
-  T1 headline             -- a late append landing in the finalize window is
-                            drained-then-deleted (retry succeeds on attempt 2)
-  T2 give-up              -- a late append on EVERY delete attempt exhausts
-                            the bounded retry; the log is RETAINED and
-                            recover()-reportable
-  T4 ordering             -- no double-delete; delete -> close -> deregister,
-                            deregister LAST, on the clean path
-  T5 compaction non-interaction -- a late-append-during-finalize retry
-                            composes cleanly with a PRIOR compaction on the
-                            same key
-  T6 regression           -- the common no-late-append finalize still
-                            deletes cleanly (must be GREEN before and after)
-  T7 regression/extraction -- a FIRST-pass tail flush failure returns before
-                            CompletedSession is recorded (must be GREEN
-                            before and after -- pre-existing, unchanged
-                            behaviour merely extracted into `_drain_to_eof`)
-  T8                       -- the retry loop terminates in at most
-                            `_FINALIZE_DELETE_ATTEMPTS` DELETE attempts
-                            regardless of a continuously-appending client
-  T9                       -- the permanent-retention residual: the
-                            retry's own re-drain can itself suffer a tail
-                            flush failure AFTER CompletedSession was already
-                            recorded, `return`-ing early (never reaching
-                            _safe_close/_deregister). `orphaned_sessions()`
-                            is the honest signal; `delete_drained` is never
-                            called again for that key.
-
-Window-injection technique (deterministic, not timing-dependent): wrap
-`qm.delete_drained` with a spy that, BEFORE delegating to the real
-method, performs `await qm.append(sid, <late line>)`. That lands the
-append strictly inside the real window (after the final `read_batch`,
-before the in-lock `stat`) by construction.
-
-T3 ("prove pick-up") is intentionally folded into this file's own idiom
-for "a fresh drainer resumes a retained log" -- the same pattern
-`test_finalize_reruns_to_completion_after_a_transient_finalize_failure`
-already uses (a second `SessionWorker` over the same on-disk queue, driven
-through the real `start_drain`/`drain_worker`), rather than the real
-`get_or_create(..., recovered=True)` (which would require a real Neo4j
-driver -- out of scope for this non-Neo4j file). See
-`test_retained_log_is_picked_up_by_a_fresh_drainer` below.
-
+Uses a deterministic window-injection technique: wrap `qm.delete_drained`
+with a spy that appends a late line before delegating to the real method.
 No real Neo4j is used anywhere in this file.
 """
 
@@ -66,9 +26,7 @@ pytestmark = pytest.mark.integration
 
 
 # ---------------------------------------------------------------------------
-# Wire format + fakes (mirrors tests/test_drain_supervision.py's
-# style; duplicated rather than imported across test modules, matching this
-# repo's existing convention -- see tests/test_steady_state_reclaim.py)
+# Wire format + fakes (mirrors tests/test_drain_supervision.py's style)
 # ---------------------------------------------------------------------------
 
 
@@ -80,16 +38,10 @@ def _line(event: str, workspace: str, data: dict) -> bytes:
 
 
 class _AccumGraph:
-    """A minimal, faithful accumulating-buffer graph fake (not a hollow mock).
-
-    Writes accumulate in ``buffer`` until ``flush()`` succeeds, at which
-    point they move into ``flushed`` -- a SET, modeling a real store's
-    idempotent id-keyed MERGE (replaying the same event after a re-drain
-    must never show up twice). ``fail_on_call``, if given, makes the Nth
-    NON-EMPTY ``flush()`` call raise (1-based); every other call succeeds.
-    Empty-buffer flushes are never counted (mirrors GraphStore Protocol
-    guarantee #5 -- the empty-buffer early return).
-    """
+    """Accumulating-buffer graph fake. Writes accumulate in ``buffer`` until
+    ``flush()`` moves them into ``flushed`` (a SET, so a replayed event never
+    shows up twice). ``fail_on_call``, if given, makes the Nth non-empty
+    ``flush()`` call raise (1-based)."""
 
     def __init__(self, *, fail_on_call: int | None = None) -> None:
         self.workspace = "/ws"
@@ -140,17 +92,9 @@ def _delete_drained_injector(
     late_lines: list[bytes],
     inject_on: set[int],
 ) -> tuple[Callable[[str], Awaitable[bool]], dict[str, int]]:
-    """Wrap ``qm.delete_drained`` with the window-injection technique.
-
-    On the given 1-based delete-call numbers, appends the NEXT late line
-    BEFORE delegating to the real ``delete_drained`` -- landing the append
-    strictly inside the real window (after the final ``read_batch``, before
-    the in-lock ``stat``) by construction, not by timing.
-
-    Returns ``(wrapper, calls)`` where ``calls["count"]`` is the number of
-    times ``delete_drained`` was actually invoked (assign the wrapper to
-    ``qm.delete_drained`` and inspect ``calls`` afterwards).
-    """
+    """Wrap ``qm.delete_drained`` so, on the given 1-based call numbers, it
+    appends the next late line before delegating to the real method. Returns
+    ``(wrapper, calls)`` where ``calls["count"]`` tracks invocations."""
     original = qm.delete_drained
     calls = {"count": 0}
     injected = {"count": 0}
@@ -183,16 +127,13 @@ def _start_supervised(
 
 
 # ---------------------------------------------------------------------------
-# T1 -- (a)/(A) headline: a late append is drained, THEN deleted
+# A late append is drained, then deleted
 # ---------------------------------------------------------------------------
 
 
 async def test_late_append_in_finalize_window_is_drained_then_deleted(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """This test run IS the non-vacuity control: pre-fix, delete_drained is
-    called exactly ONCE, returns False, the log is still on disk, and the
-    late event is NEVER dispatched (the return value is discarded)."""
     reg = SessionRegistry()
     qm = reg.queue_manager
     sid = "d5-t1-late-append"
@@ -233,7 +174,7 @@ async def test_late_append_in_finalize_window_is_drained_then_deleted(
 
 
 # ---------------------------------------------------------------------------
-# T2 -- (a)/(B) give-up: a late append on EVERY attempt exhausts the retry
+# A late append on every attempt exhausts the retry
 # ---------------------------------------------------------------------------
 
 
@@ -285,7 +226,7 @@ async def test_late_append_on_every_attempt_retains_and_is_recoverable(
 
 
 # ---------------------------------------------------------------------------
-# T4 -- no double-delete + delete/close/deregister ordering preserved on the clean path
+# No double-delete + delete/close/deregister ordering preserved on the clean path
 # ---------------------------------------------------------------------------
 
 
@@ -334,17 +275,14 @@ async def test_no_double_delete_and_call_b_ordering_preserved() -> None:
 
 
 # ---------------------------------------------------------------------------
-# T5 -- (c) no race with a PRIOR compaction on the same key
+# No race with a prior compaction on the same key
 # ---------------------------------------------------------------------------
 
 
 async def test_finalize_retry_does_not_race_compaction_on_the_same_key() -> None:
-    """Drives the REAL drain_worker loop with compaction enabled and
-    min_prefix=0 (so Trigger H compacts the earlier, non-terminal batch),
-    THEN a late append lands inside the finalize window. The compaction
-    path's own analysis says these cannot interact -- finalize never
-    compacts, exactly one drain task exists per session -- this proves it
-    holds with the retry loop composed in."""
+    """Drives the real drain_worker loop with compaction enabled, then a
+    late append lands inside the finalize window: the retry must still
+    retain-then-succeed after a prior compaction ran on the same key."""
     reg = SessionRegistry()
     qm = reg.queue_manager
     sid = "d5-t5-no-compaction-race"
@@ -398,14 +336,13 @@ async def test_finalize_retry_does_not_race_compaction_on_the_same_key() -> None
 
 
 # ---------------------------------------------------------------------------
-# T6 -- (d) regression: the common no-late-append finalize still deletes
+# Regression: the common no-late-append finalize still deletes
 # ---------------------------------------------------------------------------
 
 
 async def test_clean_finalize_still_deletes_and_tears_down(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Must be GREEN before AND after the change."""
     reg = SessionRegistry()
     qm = reg.queue_manager
     sid = "d5-t6-clean-finalize"
@@ -446,16 +383,13 @@ async def test_clean_finalize_still_deletes_and_tears_down(
 
 
 # ---------------------------------------------------------------------------
-# T7 -- regression/extraction: a FIRST-pass tail flush failure returns
-# before CompletedSession is recorded (pre-existing behaviour, unchanged;
-# guards the _drain_to_eof extraction against changing existing semantics)
+# A first-pass tail flush failure returns before CompletedSession is recorded
 # ---------------------------------------------------------------------------
 
 
 async def test_first_pass_tail_flush_failure_returns_before_completed_session(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Must be GREEN before AND after the change."""
     reg = SessionRegistry()
     qm = reg.queue_manager
     sid = "d5-t7-tail-flush-failure"
@@ -489,8 +423,8 @@ async def test_first_pass_tail_flush_failure_returns_before_completed_session(
 
 
 # ---------------------------------------------------------------------------
-# T8: the retry loop terminates in at most _FINALIZE_DELETE_ATTEMPTS
-# DELETE attempts, regardless of a continuously-appending client
+# The retry loop terminates in at most _FINALIZE_DELETE_ATTEMPTS DELETE
+# attempts, regardless of a continuously-appending client
 # ---------------------------------------------------------------------------
 
 
@@ -525,11 +459,10 @@ async def test_retry_loop_terminates_under_continuous_append() -> None:
 
 
 # ---------------------------------------------------------------------------
-# T9: permanent-retention residual. The retry's
-# OWN re-drain can itself suffer a tail flush failure AFTER CompletedSession
-# was already recorded -- returning early, never reaching
-# _safe_close/_deregister. orphaned_sessions() is the honest signal;
-# delete_drained is never called again for this key.
+# Permanent retention: the retry's own re-drain can itself suffer a tail
+# flush failure after CompletedSession was already recorded, returning early
+# and never reaching _safe_close/_deregister. orphaned_sessions() is the
+# honest signal.
 # ---------------------------------------------------------------------------
 
 
@@ -592,12 +525,8 @@ async def test_permanent_retention_when_retrys_own_redrain_flush_fails(
 
 
 # ---------------------------------------------------------------------------
-# T3 ("prove pick-up") -- a fresh drainer over the SAME
-# on-disk retained log dispatches the late event and drains fully. Uses the
-# same fake-graph respawn pattern another regression test uses for a similar
-# scenario (test_finalize_reruns_to_completion_after_a_transient_finalize_failure),
-# rather than the real get_or_create(recovered=True) path, which would need
-# a real Neo4j driver -- out of scope for this non-Neo4j file.
+# A fresh drainer over the same on-disk retained log dispatches the late
+# event and drains fully.
 # ---------------------------------------------------------------------------
 
 
@@ -623,7 +552,7 @@ async def test_retained_log_is_picked_up_by_a_fresh_drainer() -> None:
         await qm.append(sid, _line("session:end", "/ws", {"session_id": sid}))
         await reg._finalize_session(worker, handlers=object())
 
-        # T2's give-up end-state: log retained with late:event:2 undrained.
+        # Give-up end-state: log retained with late:event:2 undrained.
         assert calls["count"] == 3
         assert qm._log_path(sid).exists()
         assert "late:event:2" not in graph.flushed

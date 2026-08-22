@@ -1,26 +1,11 @@
-"""Writer-lease DETECTOR tests.
+"""Writer-lease detector tests. No real Neo4j is used anywhere in this file.
 
-RED-first: every test in this file was observed RED against the pre-fix
-tree (``context_intelligence_server.writer_lease`` did not exist at all, so
-every test here failed to even collect) before the corresponding production
-change landed -- see the session's RED-first evidence log for the captured
-output. No real Neo4j is used anywhere in this file.
-
-The writer-lease detector is a DETECTOR, not a mutex. It:
-  - acquires a `.writer.lease` sibling artifact BEFORE any boot-recovery
-    pass runs;
-  - in the default `detect` mode: latches + surfaces a conflict, but NEVER
-    refuses boot (the deploy-deadlock fix);
-  - in `enforce` mode: additionally REFUSES a fresh foreign lease at boot
-    (gated behind the deployed-mount smoke gate, not exercised here);
-  - constructs NO `QueueManager` anywhere (the merged-line-corruption
-    reintroduction guard: the single most load-bearing test in this file is
-    ``test_r1_*``);
-  - never crash-loops or hangs the server on a share fault / hung mount;
-  - bounds all lease I/O to a private single-thread executor so a stalled
-    detector can never starve the append/commit path;
-  - never permanently disarms after a transient fault;
-  - never raises out of shutdown, even under a busy gate.
+The detector is a DETECTOR, not a mutex: it acquires a `.writer.lease`
+sibling before boot recovery runs; `detect` mode latches + surfaces
+conflicts without ever refusing boot; `enforce` mode additionally refuses a
+fresh foreign lease. It never constructs a QueueManager, never crash-loops
+on a share fault or hung mount, and bounds lease I/O to a private executor
+so a stalled detector can never starve the append/commit path.
 """
 
 from __future__ import annotations
@@ -171,9 +156,8 @@ async def test_clean_boot_acquires(tmp_path: Path) -> None:
 
 
 async def test_detect_never_refuses_fresh_foreign_lease(tmp_path: Path) -> None:
-    """RED against an enforce-style unconditional raise: pre-v1.1 semantics
-    alone would raise WriterLeaseConflict here and deadlock every
-    rolling deploy (the deploy-deadlock fix)."""
+    """An unconditional raise here would deadlock every rolling deploy --
+    `detect` mode must acquire over a fresh foreign lease instead."""
     peer = WriterLease()
     await peer.acquire(_settings(), lambda: tmp_path)
 
@@ -466,10 +450,9 @@ async def test_acquire_race_exactly_one_wins(tmp_path: Path) -> None:
 async def test_r1_no_queue_manager_constructed_by_d6(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The single most load-bearing test in this file: the detector's acquire/tick/
-    release path must NEVER trigger QueueManager construction, or a
-    concurrent construction race can reproduce the same torn/merged-line
-    append corruption."""
+    """The detector's acquire/tick/release path must never trigger
+    QueueManager construction, or a concurrent construction race can
+    reproduce torn/merged-line append corruption."""
     queues_dir = tmp_path / "queues"
     queues_dir.mkdir()
     main_module.registry._queue_manager = None
@@ -714,19 +697,10 @@ async def test_submit_fail_releases_gate(tmp_path: Path) -> None:
 async def test_shutdown_never_raises_with_busy_gate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Forces the REAL adverse state rather than merely exercising the
-    ordinary shutdown path, so this test would fail if the
-    `(OSError, WriterLeaseBusy)` swallow in `release()` were ever narrowed
-    to `OSError` only: a genuinely outstanding
-    future occupying the private single-slot lease-I/O executor (`_LEASE_IO`,
-    max_workers=1), plus the one-slot in-flight gate flag `_io()` itself
-    checks (`_io_inflight`) held True -- both real internal state, not
-    mocked -- at the exact moment lifespan's `finally` cancels `lease_task`
-    and then calls `writer_lease.release()`. `release()`'s own
-    `_io(self._unlink_if_owned)` call must see the gate closed, raise
-    `WriterLeaseBusy` INTERNALLY, and `release()` must swallow it. It must
-    go RED if that swallow were narrowed to `OSError` only.
-    """
+    """Forces a genuinely busy lease-I/O gate (real outstanding future on the
+    single-worker executor, `_io_inflight` held True) at the exact moment
+    shutdown calls `release()`, so `release()` must swallow the resulting
+    `WriterLeaseBusy` rather than let it escape."""
     from context_intelligence_server import writer_lease as wl_module
 
     queues_dir = tmp_path / "queues"
@@ -815,21 +789,10 @@ async def test_shutdown_never_raises_with_busy_gate(
 async def test_status_writer_lease_present_during_boot_zero_disk_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Instruments disk I/O directly rather than only asserting on the JSON
-    body, so this test would fail if `snapshot()`/the `/status` handler
-    ever started reading the lease file from disk on every request --
-    the zero-disk-reads property is asserted on directly, not inferred.
-
-    This test patches `Path.read_text` -- the exact primitive
-    `WriterLease._read` uses (writer_lease.py:206) -- filtered by identity
-    to THIS lease's own on-disk path, so it counts every read of
-    `.writer.lease` regardless of whether it goes through `_read()` or a
-    hypothetical direct read. It then drives a REAL `/status` GET while
-    `boot_state.phase` is actively booting and asserts the count is exactly
-    zero. It must go RED if `snapshot()` (or the `/status` handler's
-    actively-booting branch) were changed to read the lease file from disk
-    on the request path.
-    """
+    """Instruments disk I/O directly (patches `Path.read_text`, filtered to
+    this lease's own path) rather than only asserting on the JSON body, so a
+    regression that reads the lease file from disk on every request is caught
+    even if `/status`'s JSON output looks unchanged."""
     lease = main_module.writer_lease
     await lease.acquire(_settings(), lambda: tmp_path)
 
