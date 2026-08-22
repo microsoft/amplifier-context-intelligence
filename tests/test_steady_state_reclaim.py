@@ -95,7 +95,7 @@ async def test_b_undrained_tail_never_reclaimed_past_committed_c_less_than_tail(
     e = log_path.stat().st_size
     assert c < e - c  # this sub-case: C < E-C
 
-    reclaimed = await qm.compact_committed_prefix(sid, 0, 0)
+    reclaimed = await qm.compact_committed_prefix(sid, 0)
     assert reclaimed == c
 
     assert log_path.stat().st_size == e - c
@@ -123,7 +123,7 @@ async def test_b_undrained_tail_never_reclaimed_past_committed_c_greater_than_ta
     e = log_path.stat().st_size
     assert c > e - c  # this sub-case: C > E-C
 
-    reclaimed = await qm.compact_committed_prefix(sid, 0, 0)
+    reclaimed = await qm.compact_committed_prefix(sid, 0)
     assert reclaimed == c
     assert log_path.stat().st_size == e - c
     assert qm._read_committed_offset(sid) == 0
@@ -179,7 +179,7 @@ async def test_c_mid_copy_oserror_is_a_pure_noop(
         queue_manager_module.QueueManager, "_write_all", staticmethod(_raise)
     )
 
-    reclaimed = await qm.compact_committed_prefix(sid, 0, 0)  # must not raise
+    reclaimed = await qm.compact_committed_prefix(sid, 0)  # must not raise
 
     assert reclaimed == 0
     assert log_path.read_bytes() == log_before
@@ -290,7 +290,7 @@ async def test_i_replace_failure_restores_offset_zero_accounting_drift(
     )
 
     with caplog.at_level(logging.ERROR):
-        reclaimed = await qm.compact_committed_prefix(sid, 0, 0)  # must not raise
+        reclaimed = await qm.compact_committed_prefix(sid, 0)  # must not raise
 
     assert reclaimed == 0
     # Offset restored to C -- a pure no-op, not a re-drive.
@@ -339,7 +339,7 @@ async def test_i_double_replace_failure_logs_restore_failed_honestly(
     monkeypatch.setattr(queue_manager_module.os, "replace", _always_raise, raising=True)
 
     with caplog.at_level(logging.ERROR):
-        reclaimed = await qm.compact_committed_prefix(sid, 0, 0)  # must not raise
+        reclaimed = await qm.compact_committed_prefix(sid, 0)  # must not raise
 
     assert reclaimed == 0
     assert any(
@@ -350,12 +350,12 @@ async def test_i_double_replace_failure_logs_restore_failed_honestly(
 
 
 # ---------------------------------------------------------------------------
-# (j) a huge tail is skipped, never compacted, never stalls ingest
+# (j) a large tail no longer blocks reclaiming the committed prefix
 # ---------------------------------------------------------------------------
 
 
-async def test_j_huge_tail_is_skipped_not_compacted_not_stalled(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+async def test_j_large_tail_does_not_block_prefix_reclaim(
+    tmp_path: Path,
 ) -> None:
     qm = QueueManager(queues_dir=tmp_path)
     sid = "s-huge-tail"
@@ -365,26 +365,19 @@ async def test_j_huge_tail_is_skipped_not_compacted_not_stalled(
     batch = await qm.read_batch(sid, max_items=2)  # C = 20 bytes
     await qm.commit(sid, batch.end_offset)
     log_path = tmp_path / f"{sid}.log"
-    before = log_path.read_bytes()
     assert batch.end_offset == 20
 
-    # Tail is 180 bytes; cap it at 50 -- well above min_prefix_bytes (10).
-    with caplog.at_level(logging.DEBUG):
-        reclaimed = await qm.compact_committed_prefix(
-            sid, min_prefix_bytes=10, max_tail_bytes=50
-        )
+    # Tail is 180 bytes -- well above min_prefix_bytes (10) and above what
+    # used to be a tail cap. The prefix must still be reclaimed.
+    reclaimed = await qm.compact_committed_prefix(sid, min_prefix_bytes=10)
 
-    assert reclaimed == 0
-    assert log_path.read_bytes() == before
-    assert any(
-        "compact_skipped" in r.getMessage() and "tail_too_large" in r.getMessage()
-        for r in caplog.records
-    )
+    assert reclaimed == 20
+    assert log_path.stat().st_size == 180
+    assert qm._read_committed_offset(sid) == 0
 
-    # A concurrent append for the same key must complete promptly -- the
-    # skip must never hold any lock or otherwise stall ingest.
+    # A concurrent append for the same key must complete promptly.
     await asyncio.wait_for(qm.append(sid, _fixed(999)), timeout=2.0)
-    assert log_path.stat().st_size == len(before) + 10
+    assert log_path.stat().st_size == 190
 
 
 # ---------------------------------------------------------------------------
@@ -784,7 +777,7 @@ async def test_g_compaction_then_finalize_compose_correctly(
     assert await _log_collapsed()
 
     # A manual call on top finds nothing left -- idempotent (I7).
-    reclaimed = await qm.compact_committed_prefix(sid, 0, 0)
+    reclaimed = await qm.compact_committed_prefix(sid, 0)
     assert reclaimed == 0
     assert not log_path.exists() or log_path.stat().st_size == 0
 

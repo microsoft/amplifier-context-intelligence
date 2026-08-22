@@ -5,8 +5,12 @@ from __future__ import annotations
 import time
 
 import pytest
-
-from context_intelligence_server.queue_manager import Batch, QueueManager, Record
+from context_intelligence_server.queue_manager import (
+    Batch,
+    QueueManager,
+    Record,
+    Verdict,
+)
 
 
 @pytest.fixture
@@ -229,6 +233,82 @@ async def test_commit_is_atomic_no_temp_leftover(qm, tmp_path):
     qdir = tmp_path / "queues"
     assert (qdir / "s1.offset").read_text("utf-8") == "2"
     assert list(qdir.glob("*.tmp")) == []
+
+
+# _read_committed_offset accepts the bare-int form and the legacy JSON offset
+# document; commit() still writes bare int. A present-but-unusable offset must
+# raise, never silently return 0 (0 would force a full re-drain).
+
+
+async def test_read_committed_offset_accepts_legacy_json_cursor(qm):
+    """A legacy JSON cursor document parses to its integer "offset" field."""
+    qm._offset_path("s1").write_text(
+        '{"v":1,"offset":12345,"cursor":{"dl2":{"a":1},"dl3":{}}}',
+        encoding="utf-8",
+    )
+    assert qm._read_committed_offset("s1") == 12345
+
+
+async def test_read_committed_offset_accepts_bare_int_unchanged(qm):
+    """Bare-int offsets (the current write format) still parse exactly."""
+    qm._offset_path("s1").write_text("980582046", encoding="utf-8")
+    assert qm._read_committed_offset("s1") == 980582046
+
+
+async def test_read_committed_offset_missing_file_is_zero(qm):
+    assert qm._read_committed_offset("never-written") == 0
+
+
+async def test_read_committed_offset_empty_file_is_zero(qm):
+    qm._offset_path("s1").write_text("", encoding="utf-8")
+    assert qm._read_committed_offset("s1") == 0
+
+
+async def test_read_committed_offset_legacy_json_without_usable_offset_raises(qm):
+    """A JSON object present but with no usable integer "offset" must raise
+    ValueError -- the same as any other unparseable offset -- rather than
+    silently returning 0 (which would trigger a full re-drain)."""
+    qm._offset_path("s1").write_text('{"v":1,"cursor":{}}', encoding="utf-8")
+    with pytest.raises(ValueError):
+        qm._read_committed_offset("s1")
+
+
+async def test_read_committed_offset_garbage_still_raises(qm):
+    """Genuinely unparseable text (not JSON, not an int) still raises."""
+    qm._offset_path("s1").write_text("not-a-number", encoding="utf-8")
+    with pytest.raises(ValueError):
+        qm._read_committed_offset("s1")
+
+
+async def test_read_batch_drains_session_with_legacy_json_offset(qm):
+    """A session with a legacy JSON-cursor .offset drains via the normal
+    read path (read_batch) with no ValueError -- the fix must reach the
+    hot path, not just the private helper."""
+    await qm.append("s1", b"a")
+    await qm.append("s1", b"b")
+    qm._offset_path("s1").write_text('{"v":1,"offset":2,"cursor":{}}', encoding="utf-8")
+
+    batch = await qm.read_batch("s1", max_items=10)
+
+    assert batch.start_offset == 2
+    assert batch.lines == [b"b"]
+
+
+async def test_classify_session_with_legacy_json_offset_is_not_corrupt(qm):
+    """A session with a legacy JSON-cursor .offset must not be classified
+    as an unreadable/corrupt offset -- it should classify the same as an
+    equivalent bare-int offset (drained, in this fully-committed case)."""
+    await qm.append("s1", b"a\n" * 0 + b"a")  # single record "a"
+    line = b"a\n"
+    qm._offset_path("s1").write_text(
+        f'{{"v":1,"offset":{len(line)},"cursor":{{}}}}', encoding="utf-8"
+    )
+
+    classification = await qm.classify_session(
+        "s1", head_is_resumable=lambda _raw: True
+    )
+
+    assert classification.verdict == Verdict.DRAINED
 
 
 async def test_active_sessions_excludes_fully_committed(qm):

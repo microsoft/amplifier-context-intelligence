@@ -20,10 +20,9 @@ from pathlib import Path
 from typing import Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import context_intelligence_server.main as main_module
 import httpx
 import pytest
-
-import context_intelligence_server.main as main_module
 from context_intelligence_server.config import Settings
 from context_intelligence_server.main import lifespan
 from context_intelligence_server.queue_manager import QueueManager
@@ -269,6 +268,31 @@ async def test_acquire_over_stale_lease_takes_over_and_latches(
     assert record["owner"] == lease.owner
 
 
+async def test_enforce_takes_over_stale_lease_without_refusing(
+    tmp_path: Path,
+) -> None:
+    """A single-replica restart after an unclean exit must not crash-loop:
+    `enforce` takes over a STALE foreign lease instead of refusing."""
+    peer = WriterLease()
+    await peer.acquire(_settings(), lambda: tmp_path)
+    stale_record = _read_lease(tmp_path)
+    stale_record["heartbeat"] = time.time() - 3600
+    (tmp_path / ".writer.lease").write_text(
+        json.dumps(stale_record) + "\n", encoding="utf-8"
+    )
+
+    lease = WriterLease()
+    await lease.acquire(_settings(writer_lease_mode="enforce"), lambda: tmp_path)
+
+    assert lease.acquired is True
+    assert lease.took_over_stale is True
+    assert lease.conflict is False
+    assert lease.superseded_owner == peer.owner
+
+    record = _read_lease(tmp_path)
+    assert record["owner"] == lease.owner
+
+
 async def test_took_over_stale_surfaces_on_status(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -408,6 +432,22 @@ async def test_release_never_destroys_a_foreign_lease(tmp_path: Path) -> None:
     await lease.release()
     assert (tmp_path / ".writer.lease").exists()
     assert _read_lease(tmp_path)["owner"] == peer.owner
+
+
+async def test_release_never_raises_when_lease_file_missing(tmp_path: Path) -> None:
+    lease = WriterLease()
+    await lease.acquire(_settings(), lambda: tmp_path)
+    (tmp_path / ".writer.lease").unlink()
+
+    await lease.release()  # must not raise FileNotFoundError
+
+
+async def test_release_never_raises_when_dir_missing(tmp_path: Path) -> None:
+    missing_dir = tmp_path / "gone"
+    lease = WriterLease()
+    await lease.acquire(_settings(), lambda: missing_dir)  # dir absent -> unarmed
+
+    await lease.release()  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -866,7 +906,7 @@ async def test_status_writer_lease_never_500s_when_unacquired() -> None:
 
 def test_writer_lease_config_defaults() -> None:
     s = Settings()
-    assert s.writer_lease_mode == "detect"
+    assert s.writer_lease_mode == "enforce"
     assert s.writer_lease_heartbeat_seconds == 5.0
     assert s.writer_lease_staleness_multiplier == 3.0
     assert s.writer_lease_confirm_delay_seconds == 1.0

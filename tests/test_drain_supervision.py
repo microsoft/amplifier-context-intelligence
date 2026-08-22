@@ -994,14 +994,63 @@ class TestCloseTaskReferenced:
 
 
 class TestTerminalBatchFlushExhaustion:
-    async def test_terminal_batch_flush_exhaustion_loses_finalization(self) -> None:
-        """Known limitation: force the terminal batch itself through
-        _handle_exhausted_batch (flush always fails). The committed offset
-        ends up past session:end, no CompletedSession is recorded, and
-        recover() does not report the session."""
+    async def test_terminal_batch_flush_exhaustion_still_finalizes(self) -> None:
+        """A batch that exhausts the retry budget AND contains session:end
+        must still finalize the session -- a CompletedSession is recorded and
+        delete_drained runs -- instead of committing past session:end with no
+        finalization, which would leak the fully-drained log forever
+        (recover()'s strict `<` excludes it once the offset reaches EOF).
+
+        The 2-record batch (tool:pre, session:end) dispatches into one
+        buffer of size 2, which the default ``_FlakyGraph.fail_when``
+        rejects -- forcing every batch-level attempt to fail until the
+        retry budget is spent and ``_handle_exhausted_batch`` isolates it
+        line by line. Isolation flushes ``tool:pre`` alone (buffer size 1,
+        succeeds) and, on reaching ``session:end``, must leave it
+        uncommitted rather than dispatching/committing past it --
+        ``_finalize_session``'s own ``_drain_to_eof`` re-dispatch (the same
+        re-dispatch the NORMAL non-exhausted terminal path already relies
+        on) then completes it.
+        """
         reg = SessionRegistry()
         qm = reg.queue_manager
-        sid = "d1-terminal-exhaustion"
+        sid = "d1-terminal-exhaustion-finalizes"
+        graph = _FlakyGraph()  # default fail_when: len(buf) > 1
+        worker = _make_worker(sid, graph)
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            side_effect=_accumulate,
+        ):
+            await qm.append(sid, _line("tool:pre", "/ws", {"session_id": sid}))
+            await qm.append(sid, _line("session:end", "/ws", {"session_id": sid}))
+            task = _start_supervised(reg, worker)
+            await asyncio.wait_for(task, timeout=5.0)
+
+        assert len(reg.completed_sessions()) == 1
+        assert graph.flushed == {"tool:pre", "session:end"}
+        assert not qm._log_path(sid).exists(), "delete_drained must have run"
+        assert not qm._offset_path(sid).exists()
+        recoverable = await qm.recover()
+        assert sid not in recoverable
+        dead = await qm.read_dead_letters(sid)
+        assert dead == [], (
+            "session:end must never be dead-lettered by isolation -- it is "
+            "left uncommitted for _finalize_session to re-dispatch"
+        )
+
+    async def test_exhausted_batch_without_terminal_isolates_without_finalizing(
+        self,
+    ) -> None:
+        """Unchanged behavior: a poison batch that exhausts the retry
+        budget but contains NO session:end record must dead-letter every
+        record and NOT finalize the session -- guards against the fix
+        over-triggering finalization for a batch that never reaches a
+        terminal record."""
+        reg = SessionRegistry()
+        qm = reg.queue_manager
+        sid = "d1-exhausted-no-terminal"
         graph = _FlakyGraph(fail_when=lambda buf: True)  # flush ALWAYS fails
         worker = _make_worker(sid, graph)
         reg._register_for_test(worker)
@@ -1010,18 +1059,40 @@ class TestTerminalBatchFlushExhaustion:
             "context_intelligence_server.registry.process_event",
             side_effect=_accumulate,
         ):
-            await qm.append(sid, _line("session:end", "/ws", {"session_id": sid}))
+            await qm.append(sid, _line("tool:pre", "/ws", {"session_id": sid}))
+            await qm.append(sid, _line("tool:post", "/ws", {"session_id": sid}))
             task = _start_supervised(reg, worker)
             await _drain_until_idle(reg, qm, worker, sid)
-            if not task.done():
-                await _cancel_and_await(task)
+            assert not task.done(), "no terminal record: the drainer stays alive"
+            await _cancel_and_await(task)
 
-        # Committed PAST session:end (the whole, only, line): EOF.
-        assert (await qm.read_batch(sid, 10)).lines == []
-        assert reg.completed_sessions() == []
-        recoverable = await qm.recover()
-        assert sid not in recoverable
         dead = await qm.read_dead_letters(sid)
-        assert len(dead) == 1, (
-            "session:end itself is dead-lettered (flush never succeeds)"
-        )
+        assert len(dead) == 2
+        assert reg.completed_sessions() == []
+
+    async def test_poison_line_before_terminal_is_dead_lettered_and_session_finalizes(
+        self,
+    ) -> None:
+        """An unparseable (poison) line sitting before session:end in the
+        same exhausted batch is still dead-lettered by isolation, and the
+        session still finalizes once the terminal record is reached."""
+        reg = SessionRegistry()
+        qm = reg.queue_manager
+        sid = "d1-poison-before-terminal-finalizes"
+        graph = _FlakyGraph()  # default fail_when: len(buf) > 1
+        worker = _make_worker(sid, graph)
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            side_effect=_accumulate,
+        ):
+            await qm.append(sid, b"{ this is not valid json")
+            await qm.append(sid, _line("session:end", "/ws", {"session_id": sid}))
+            task = _start_supervised(reg, worker)
+            await asyncio.wait_for(task, timeout=5.0)
+
+        assert len(reg.completed_sessions()) == 1
+        dead = await qm.read_dead_letters(sid)
+        assert len(dead) == 1
+        assert not qm._log_path(sid).exists(), "delete_drained must have run"

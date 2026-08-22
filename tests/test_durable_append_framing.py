@@ -514,7 +514,9 @@ async def test_partial_write_failure_discards_the_record(
         calls["n"] += 1
         if calls["n"] == 1:
             return real_write(fd, bytes(data)[:8])
-        raise OSError("simulated append failure")
+        if calls["n"] == 2:
+            raise OSError("simulated append failure")
+        return real_write(fd, bytes(data))  # rollback's newline write succeeds
 
     monkeypatch.setattr(qm_module.os, "write", _flaky_write)
 
@@ -522,18 +524,20 @@ async def test_partial_write_failure_discards_the_record(
     with pytest.raises(OSError):
         await qm.append(key, record)
 
-    # File is byte-identical to its pre-append state (empty) -- ftruncate discard.
-    assert qm._log_path(key).read_bytes() == b""
+    # Fragment is newline-terminated, never truncated -- the queue never
+    # removes bytes it already wrote.
+    assert qm._log_path(key).read_bytes() == record[:8] + b"\n"
 
     monkeypatch.setattr(qm_module.os, "write", real_write)
     good = _event_bytes("will-succeed")
     await qm.append(key, good)
     batch = await qm.read_batch(key, max_items=10)
-    assert batch.lines == [good]
-    assert _parses(batch.lines[0])
+    assert batch.lines == [record[:8], good]
+    assert not _parses(batch.lines[0]), "malformed fragment must not parse"
+    assert _parses(batch.lines[1])
 
 
-async def test_partial_write_failure_logs_when_truncate_also_fails(
+async def test_partial_write_failure_logs_when_newline_terminate_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     qm = QueueManager(tmp_path)
@@ -545,15 +549,9 @@ async def test_partial_write_failure_logs_when_truncate_also_fails(
         calls["n"] += 1
         if calls["n"] == 1:
             return real_write(fd, bytes(data)[:8])
-        if calls["n"] == 2:
-            raise OSError("simulated append failure")
-        return real_write(fd, bytes(data))  # fallback newline write succeeds
-
-    def _flaky_truncate(fd: int, length: int) -> None:
-        raise OSError("simulated truncate failure")
+        raise OSError("simulated write failure")
 
     monkeypatch.setattr(qm_module.os, "write", _flaky_write)
-    monkeypatch.setattr(qm_module.os, "ftruncate", _flaky_truncate)
 
     record = _event_bytes("will-fail-hard")
     with (
@@ -565,16 +563,116 @@ async def test_partial_write_failure_logs_when_truncate_also_fails(
         await qm.append(key, record)
 
     errors = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
-    assert any("append_partial_truncate_failed" in m for m in errors), (
-        "truncate failure must be logged at ERROR"
-    )
-    assert not any("append_partial_terminate_failed" in m for m in errors), (
-        "the fallback newline write succeeded -- no second failure expected"
+    assert any("append_partial_terminate_failed" in m for m in errors), (
+        "newline-terminate failure must be logged at ERROR"
     )
 
-    # fallback newline succeeded; the drainer dead-letters this line next pass
-    # since append() already raised to the caller
-    assert qm._log_path(key).read_bytes() == record[:8] + b"\n"
+    # torn tail left untouched -- never truncated; heal_torn_tails removes it at boot
+    assert qm._log_path(key).read_bytes() == record[:8]
+
+
+# _discard_partial never truncates: a peer writer's committed line and this
+# writer's own prior records survive a rollback.
+
+
+async def test_discard_partial_never_destroys_a_peer_process_committed_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two independent processes append to the same file (writer-lease is
+    detect-only -- see _write_record's own docstring, no cross-process lock).
+    While this writer's partial write is rolled back, a peer process
+    completes and closes its own fully-formed, already-acknowledged record.
+    _discard_partial must never remove those bytes.
+    """
+    qm = QueueManager(tmp_path)
+    key = "race-key"
+    path = qm._log_path(key)
+    path.write_bytes(b'{"payload":"PRIOR-COMMITTED"}\n')
+
+    peer_can_go = threading.Event()
+    peer_done = threading.Event()
+    real_write = os.write
+
+    def _flaky_write(fd: int, data: Any) -> int:
+        buf = bytes(data)
+        real_write(fd, buf[: len(buf) // 2])
+        peer_can_go.set()
+        assert peer_done.wait(_HANDSHAKE_TIMEOUT_S)
+        raise OSError("simulated mid-record failure")
+
+    def _peer_append() -> None:
+        assert peer_can_go.wait(_HANDSHAKE_TIMEOUT_S)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        fd = os.open(path, flags, 0o644)
+        try:
+            real_write(fd, b'{"payload":"PEER-COMMITTED"}\n')
+        finally:
+            os.close(fd)
+        peer_done.set()
+
+    peer = threading.Thread(target=_peer_append)
+    peer.start()
+
+    monkeypatch.setattr(qm_module.os, "write", _flaky_write)
+    record = _event_bytes("mine", filler=5000)
+    with pytest.raises(OSError):
+        await qm.append(key, record)
+    monkeypatch.setattr(qm_module.os, "write", real_write)
+
+    peer.join(_HANDSHAKE_TIMEOUT_S)
+    assert not peer.is_alive()
+
+    final = path.read_bytes()
+    assert b"PEER-COMMITTED" in final, (
+        "a peer's already-acknowledged line must never be destroyed"
+    )
+    assert b"PRIOR-COMMITTED" in final, (
+        "pre-existing committed data must never be destroyed"
+    )
+
+
+async def test_discard_partial_single_writer_preserves_prior_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Single-writer case: a partial write rolled back leaves prior COMPLETE
+    records intact and the fragment newline-terminated (not merged into the
+    next record); a subsequent drain dead-letters the fragment rather than
+    crashing.
+    """
+    qm = QueueManager(tmp_path)
+    key = "single-writer-key"
+    prior = _event_bytes("prior-committed")
+    await qm.append(key, prior)
+
+    real_write = os.write
+    calls = {"n": 0}
+
+    def _flaky_write(fd: int, data: Any) -> int:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_write(fd, bytes(data)[:8])
+        if calls["n"] == 2:
+            raise OSError("simulated append failure")
+        return real_write(fd, bytes(data))  # rollback's newline write succeeds
+
+    monkeypatch.setattr(qm_module.os, "write", _flaky_write)
+    record = _event_bytes("torn-fragment")
+    with pytest.raises(OSError):
+        await qm.append(key, record)
+    monkeypatch.setattr(qm_module.os, "write", real_write)
+
+    good = _event_bytes("after-recovery")
+    await qm.append(key, good)
+
+    batch = await qm.read_batch(key, max_items=10)
+    assert batch.lines == [prior, record[:8], good], (
+        "no committed record lost; fragment isolated on its own line"
+    )
+    assert _parses(batch.lines[0])
+    assert not _parses(batch.lines[1]), (
+        "malformed fragment is dead-lettered, not crashed on"
+    )
+    assert _parses(batch.lines[2])
 
 
 # ---------------------------------------------------------------------------

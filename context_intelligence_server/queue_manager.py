@@ -242,12 +242,23 @@ class QueueManager:
         return self._dir / f"{session_id}.log.compact.tmp"
 
     def _read_committed_offset(self, session_id: str) -> int:
+        """Committed byte offset; reads bare-int and legacy JSON offset files."""
         try:
             text = self._offset_path(session_id).read_text("utf-8")
         except FileNotFoundError:
             return 0
         text = text.strip()
-        return int(text) if text else 0
+        if not text:
+            return 0
+        if text[0] == "{":
+            try:
+                cursor = json.loads(text)
+                return int(cursor["offset"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                raise ValueError(
+                    f"unparseable legacy offset document for session {session_id!r}"
+                ) from None
+        return int(text)
 
     @staticmethod
     def _last_complete_end(path: Path) -> int:
@@ -382,25 +393,7 @@ class QueueManager:
 
     @staticmethod
     def _discard_partial(fd: int, start: int, path: Path) -> None:
-        """Undo a record whose write failed part-way. Never fails silently.
-
-        Preferred: ``ftruncate`` the partial bytes away, returning the file to a
-        clean line boundary. Fallback if truncate fails: newline-terminate the
-        fragment so the next record cannot merge into it (the failed write
-        already raised to the caller, so the event was unacknowledged; the
-        malformed line is dead-lettered on next drain). Final backstop if both
-        fail: a torn tail with no newline, which readers ignore and
-        ``heal_torn_tails`` removes at next boot. Failures are logged at ERROR.
-        """
-        try:
-            os.ftruncate(fd, start)
-            return
-        except OSError:
-            logger.exception(
-                "append_partial_truncate_failed path=%s start=%d",
-                path,
-                start,
-            )
+        """Newline-terminate a partial write; never truncates -- queue bytes are never removed."""
         try:
             QueueManager._write_all(fd, b"\n")
         except OSError:
@@ -698,15 +691,16 @@ class QueueManager:
         return ok
 
     async def compact_committed_prefix(
-        self, session_id: str, min_prefix_bytes: int = 0, max_tail_bytes: int = 0
+        self, session_id: str, min_prefix_bytes: int = 0
     ) -> int:
         """Rewrite ``<session_id>.log`` to keep only its undrained tail.
 
         Reclaims the committed prefix ``[0, C)`` while the session stays live
         (unlike ``delete_drained``, which removes the whole file at finalize).
         Returns the reclaimed prefix byte count ``C``; ``0`` means nothing was
-        done (no prefix, tail over ``max_tail_bytes``, or failure).
-        ``max_tail_bytes <= 0`` disables the cap. Never raises.
+        done (no prefix, or failure). Reclaims regardless of tail size -- a
+        large tail only costs more lock-hold time, never a skipped reclaim.
+        Never raises.
 
         Crash ordering: rebase ``.offset`` to 0 first (atomic tmp + replace),
         then replace the ``.log`` with the verified tail; if that fails, restore
@@ -730,21 +724,11 @@ class QueueManager:
                 except OSError:
                     return 0
 
-                # Step 2: bail (return 0) unless
-                # C >= min_prefix_bytes and 0 < C <= E and the tail fits
-                # under max_tail_bytes (<=0 means no cap).
+                # Step 2: bail (return 0) unless C >= min_prefix_bytes and
+                # 0 < C <= E. Reclaimed regardless of tail size.
                 if not (c >= min_prefix_bytes and 0 < c <= e):
                     return 0
                 tail = e - c
-                if max_tail_bytes > 0 and tail > max_tail_bytes:
-                    logger.debug(
-                        "compact_skipped session=%s reason=tail_too_large "
-                        "tail=%d limit=%d",
-                        session_id,
-                        tail,
-                        max_tail_bytes,
-                    )
-                    return 0
 
                 # Step 3: copy [C, E) into a fresh tmp. O_TRUNC so a stray
                 # tmp from a previous attempt is never appended to.
@@ -958,7 +942,10 @@ class QueueManager:
                 return False
 
         def _bad_offset(reason: str, size: int, dead_empty: bool) -> Classification:
-            if size <= threshold:
+            # unparseable_offset: the .log bytes are unexamined here, so an
+            # unreadable sidecar alone must never delete them -- size-gate
+            # only the reasons where the parsed value itself is bad.
+            if size <= threshold or reason == "unparseable_offset":
                 if dead_empty:
                     return Classification(
                         key, Verdict.RESET_OFFSET, reason, size, dead_empty

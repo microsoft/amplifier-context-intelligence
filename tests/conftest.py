@@ -124,7 +124,6 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
         # Mirrors real Settings fields drain_worker reads via get_settings().
         queue_compact_enabled: bool = _real.queue_compact_enabled
         queue_compact_min_prefix_bytes: int = _real.queue_compact_min_prefix_bytes
-        queue_compact_max_tail_bytes: int = _real.queue_compact_max_tail_bytes
 
         # Neo4j two-client split (doc 12): SessionRegistry.get_or_create() calls
         # settings.resolve_neo4j_admin() directly, so this proxy (which stands

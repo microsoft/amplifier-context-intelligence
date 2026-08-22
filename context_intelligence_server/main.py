@@ -9,7 +9,7 @@ import re
 import sys
 import time
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
@@ -34,7 +34,10 @@ from context_intelligence_server.authz import (  # noqa: F401 — re-exported fo
 )
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import Neo4jClientConfig, Settings, get_settings
-from context_intelligence_server.idempotency import EventIdempotencyCache
+from context_intelligence_server.idempotency import (
+    EventIdempotencyCache,
+    KeyedAsyncLocks,
+)
 from context_intelligence_server.identity_store import IdentityStore
 from context_intelligence_server.logging_config import setup_logging
 from context_intelligence_server.models import (
@@ -377,7 +380,11 @@ async def _boot_reclaim() -> None:
             logger.warning("boot_reclaim_kept reason=%s session=%s", c.reason, key)
             continue
         # verdict in (unresumable, drained, reset_offset): actionable.
-        if not settings.reclaim_enabled:
+        # drained is the same evidence delete_drained already acts on
+        # unconditionally at session finalize -- safe to auto-reclaim
+        # regardless of reclaim_enabled. unresumable/reset_offset stay
+        # gated: they can act on a log whose offset was merely unreadable.
+        if c.verdict.value != "drained" and not settings.reclaim_enabled:
             logger.warning(
                 "boot_reclaimed reason=%s path=%s session=%s bytes=%d action=dry_run",
                 c.reason,
@@ -588,6 +595,9 @@ registry = SessionRegistry()
 # importing the module-level name (avoids a circular import).
 app.state.registry = registry
 idempotency_cache = EventIdempotencyCache()
+# Serializes the seen()->append->store() sequence per idempotency_key so
+# concurrent same-key requests cannot both durably append (see post_events).
+_idempotency_locks = KeyedAsyncLocks()
 
 # Session-less events are keyed by a per-workspace sentinel stem so that events
 # from distinct workspaces never collide in one durable log.
@@ -1002,35 +1012,39 @@ async def post_events(
     # Validate data.timestamp at the ingest boundary (fail loud, not silent dead-letter).
     # Real Amplifier clients always supply this field; 400 only hits malformed payloads.
     _validate_data_timestamp(request.data)
-    # Check before the durable append (a duplicate must not persist a second
-    # line); store after a successful append, so a failed append leaves the
-    # key unburned and the client's retry is honoured.
+    # Serialize seen->append->store per key so concurrent same-key requests
+    # cannot both append; store only after a successful append.
     dedup_key = request.idempotency_key if not replay else None
-    if dedup_key and idempotency_cache.seen(dedup_key):
-        logger.info(
-            "event_duplicate_skipped: event=%s session_id=%s",
-            request.event,
-            session_id,
+    lock_ctx = _idempotency_locks.acquire(dedup_key) if dedup_key else nullcontext()
+    async with lock_ctx:
+        if dedup_key and idempotency_cache.seen(dedup_key):
+            logger.info(
+                "event_duplicate_skipped: event=%s session_id=%s",
+                request.event,
+                session_id,
+            )
+            return EventResponse(status="duplicate", session_id=session_id or None)
+        # Empty session_id maps to a per-workspace sentinel stem so session-less
+        # events from distinct workspaces never collide in one log.
+        worker_key = session_id or (
+            _NO_SESSION_PREFIX + _workspace_slug(request.workspace)
         )
-        return EventResponse(status="duplicate", session_id=session_id or None)
-    # Empty session_id maps to a per-workspace sentinel stem so session-less
-    # events from distinct workspaces never collide in one log.
-    worker_key = session_id or (_NO_SESSION_PREFIX + _workspace_slug(request.workspace))
-    # Spawn (or reuse) the sticky drainer keyed by worker_key.
-    registry.get_or_create(worker_key, request.workspace, created_by=contributor_id)
-    # Re-parse raw bytes (not the pydantic model) so client extra fields
-    # survive; stamp created_by server-side, overwriting any spoofed value.
-    body = await http_request.body()
-    body_obj = json.loads(body)
-    body_obj["created_by"] = contributor_id  # overwrite, never setdefault
-    body = json.dumps(body_obj, separators=(",", ":")).encode()
-    await registry.queue_manager.append(worker_key, body)
-    # Bytes are on disk: the key may be burned now (a failed append simply
-    # never reaches this line).
-    if dedup_key:
-        idempotency_cache.store(dedup_key)
-    registry.record_accepted()  # count the durably-accepted event
-    return EventResponse(status="queued", session_id=session_id or None)
+        # Spawn (or reuse) the sticky drainer keyed by worker_key.
+        registry.get_or_create(worker_key, request.workspace, created_by=contributor_id)
+        # Re-parse raw bytes (not the pydantic model) so client extra fields
+        # survive; stamp created_by server-side, overwriting any spoofed value.
+        body = await http_request.body()
+        body_obj = json.loads(body)
+        body_obj["created_by"] = contributor_id  # overwrite, never setdefault
+        body = json.dumps(body_obj, separators=(",", ":")).encode()
+        await registry.queue_manager.append(worker_key, body)
+        # Bytes are on disk: the key may be burned now (a failed append
+        # simply never reaches this line -- the lock is still released,
+        # via the `async with`, WITHOUT storing).
+        if dedup_key:
+            idempotency_cache.store(dedup_key)
+        registry.record_accepted()  # count the durably-accepted event
+        return EventResponse(status="queued", session_id=session_id or None)
 
 
 @app.get("/blobs/{session_id}", dependencies=[Depends(require_read)])

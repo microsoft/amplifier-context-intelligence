@@ -243,8 +243,8 @@ mechanisms bound it:
 - **Compaction** reclaims a *live* session's already-committed prefix
   continuously, not just at session end (`queue_compact_enabled`, on by default).
   A `.log` therefore tracks the undrained tail, not the whole session history.
-  Frequency is bounded by `queue_compact_min_prefix_bytes` and per-rewrite cost
-  by `queue_compact_max_tail_bytes`.
+  Frequency is bounded by `queue_compact_min_prefix_bytes`; it reclaims
+  regardless of tail size.
 - **Dead-letter expiry** removes a `.dead.jsonl` that has no `.log` beside it
   once it ages past `dead_letter_retention_seconds` (30 days by default), so
   poison records cannot accumulate indefinitely.
