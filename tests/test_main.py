@@ -241,9 +241,7 @@ async def test_drain_loop_processes_event(
 ) -> None:
     """A posted event is drained from the durable log by the sticky drainer.
 
-    Migrated off the vestigial in-memory worker.queue: the
-    durable drain loop reads from the on-disk QueueManager log, so success is
-    observed by polling that log to empty rather than worker.queue.join().
+    Success is observed by polling the on-disk QueueManager log to empty.
     """
     from context_intelligence_server.neo4j_store import Neo4jGraphStore
 
@@ -793,10 +791,7 @@ async def test_lifespan_recovers_and_respawns_drainers(
         ),
     ):
         async with lifespan(main_module.app):
-            # Recovery is now BACKGROUNDED (main_module.app.state.boot_task).
-            # Await it here, INSIDE the lifespan block, before it would be
-            # cancelled by lifespan's own shutdown -- exactly what a real
-            # health-probe poll loop does by waiting for boot.phase=="ready".
+            # Recovery is backgrounded -- await it before shutdown cancels it.
             await main_module.app.state.boot_task
 
     assert (sid, "/recovered-ws") in spawned
@@ -805,16 +800,8 @@ async def test_lifespan_recovers_and_respawns_drainers(
 async def test_lifespan_skips_recovery_for_empty_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A session whose ONLY line has an empty workspace no longer
-    strands forever. It could otherwise be silently skipped (never
-    dispatched, permanently stuck -- exactly the merged-head failure
-    mode, just triggered by an empty field instead of torn JSON).
-    `_head_is_resumable`
-    treats "no workspace" uniformly regardless of cause, so the byte-0 then
-    sentinel fallback applies here too: the session IS now dispatched, under
-    the `_RECOVERY_FALLBACK_WORKSPACE` sentinel (never workspace='' -- that
-    invariant is still upheld; it dispatches under a different, non-empty
-    workspace instead of not dispatching at all)."""
+    """A session whose only line has an empty workspace is dispatched under
+    the `_RECOVERY_FALLBACK_WORKSPACE` sentinel, never under workspace=''."""
     sid = "sess-empty-ws"
     qm = registry.queue_manager
     body = json.dumps(
@@ -876,14 +863,9 @@ async def _seed_recoverable_session(qm: Any, sid: str, workspace: str) -> None:
 async def test_lifespan_default_respawns_all_recovered_sessions_unbounded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An explicit unbounded ceiling (crash_recovery_respawn_limit=None) MUST
-    preserve the pre-fix unbounded behaviour exactly: every recovered session
-    is respawned on this boot, no matter how many there are.
-
-    The fix changed the DEFAULT to a finite 8 (see test_config.py), so this test
-    now sets None explicitly rather than asserting it's the default -- the
-    behaviour under an unbounded ceiling (still a supported, valid setting)
-    is what this test guards, not the default value itself."""
+    """An explicit unbounded ceiling (crash_recovery_respawn_limit=None)
+    respawns every recovered session on this boot, no matter how many
+    there are."""
     qm = registry.queue_manager
     sids = [f"sess-unbounded-{i}" for i in range(10)]
     for sid in sids:
@@ -1046,14 +1028,10 @@ async def test_lifespan_respawn_cap_zero_defers_everything(
 async def test_crash_recovery_topup_drains_deferred_tail_across_passes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The deferred tail is not stranded: with ceiling=2, pass 1 dispatches the
-    2 head sessions; once those finish draining (drop out of recover()), pass 2
-    dispatches the previously-deferred 2. This tests DISPATCH counting only
-    (sessions manually committed to EOF to simulate completion); it does NOT
-    exercise the LIVE-drainer bound -- that property (a recovered drainer
-    exits when it runs dry, so the ceiling bounds live population too, not
-    just per-pass dispatches) is tested honestly, without the commit-to-EOF
-    shortcut, in tests/test_boot_safety.py."""
+    """With ceiling=2: pass 1 dispatches the 2 head sessions; once those
+    finish draining, pass 2 dispatches the previously-deferred 2. Tests
+    dispatch counting only -- see tests/test_boot_safety.py for the
+    live-drainer bound."""
     qm = registry.queue_manager
     sids = sorted(f"sess-sweep-{i}" for i in range(4))
     for sid in sids:
@@ -1109,8 +1087,7 @@ async def test_lifespan_enables_sweep_under_finite_limit(
     ):
         async with lifespan(main_module.app):
             # Recovery (incl. sweep-task creation) is backgrounded --
-            # await it before shutdown cancels the boot task (and, in turn,
-            # the sweep task it starts).
+            # await it before shutdown cancels it.
             await main_module.app.state.boot_task
 
     assert any(

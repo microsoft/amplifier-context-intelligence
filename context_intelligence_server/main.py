@@ -77,14 +77,8 @@ def build_neo4j_driver(config: Neo4jClientConfig) -> Any:
     return AsyncGraphDatabase.driver(config.url, auth=config.auth)
 
 
-# ---------------------------------------------------------------------------
-# Module-level live identity-map stores (T3)
-#
-# Set by create_asgi_app() so the future /admin router can mutate the active
-# store without needing to carry a reference through the middleware chain.
-# Exactly ONE of these is non-None at any time — whichever mode is active.
-# The other is always reset to None so accessors return an unambiguous result.
-# ---------------------------------------------------------------------------
+# Module-level live identity-map stores. Exactly one is non-None at a time --
+# the other is reset to None so accessors return an unambiguous result.
 _api_key_store: IdentityStore | None = None
 _entra_identity_store: IdentityStore | None = None
 
@@ -109,25 +103,17 @@ def get_entra_identity_store() -> IdentityStore | None:
     return _entra_identity_store
 
 
-# The last-resort workspace for a recovered session
-# whose head line does NOT resolve a workspace even after the byte-0
-# fallback. Dispatching under this sentinel is strictly better than deleting
-# the file outright: a drainer spawns, its own dead-letter-and-advance
-# isolates the unparseable line, and every event BEHIND it still reaches the
-# graph. See ``_head_is_resumable`` / ``_parse_workspace_and_creator`` below.
+# Last-resort workspace sentinel when no head line resolves a workspace.
+# Dispatching under it still isolates the bad line and drains the rest.
 _RECOVERY_FALLBACK_WORKSPACE = "unknown-recovered"
 
 
 def _head_is_resumable(raw: bytes) -> bool:
     """Total predicate: does ``raw`` parse to a dict with a workspace?
 
-    Shared by ``_recover_one_session`` (recovery dispatch, via
-    ``_parse_workspace_and_creator``) and ``QueueManager.classify_session``
-    (boot-safety reclaim, injected as a pure ``Callable[[bytes], bool]`` -- the queue
-    must not learn the event schema). ONE definition, two consumers. NEVER
-    RAISES: valid-but-non-dict JSON (``123``, ``null``, ``"str"``, ``[]``)
-    must not escape as an ``AttributeError`` from ``obj.get(...)`` -- this
-    predicate is a total function on the entire boot path.
+    Shared by ``_recover_one_session`` and ``QueueManager.classify_session``
+    (injected as a pure callable so the queue never learns the event schema).
+    Never raises -- valid-but-non-dict JSON must not escape as an AttributeError.
     """
     try:
         obj = json.loads(raw)
@@ -170,34 +156,10 @@ def _recover_one_session(
 ) -> bool:
     """Parse the first queued line for *sid* and respawn a drainer when valid.
 
-    Extracted from the lifespan startup recovery loop so tests can exercise the
-    real parsing/dispatch logic rather than reimplementing it inline.
-
-    The queue-read step is handled by the caller (the lifespan loop or the test)
-    so this function is pure -- no I/O, fully synchronous.
-
-    Args:
-        sid:            Session id being recovered.
-        first_line:     The first raw log line (bytes from QueueManager or str
-                        from tests).  ``json.loads`` accepts both.
-        get_or_create:  The registry callable -- ``registry.get_or_create`` in
-                        production or a spy in tests.
-        first_log_line: (optional) the session's BYTE-0 line, read by
-                        the caller via ``QueueManager.read_first_line`` --
-                        used ONLY when ``first_line`` fails to resolve a
-                        workspace. Omitting it (the default) preserves the
-                        original behaviour exactly: a bad/torn head line is
-                        skipped with no fallback attempted.
-        recovered:      Passed straight through to ``get_or_create``
-                        so a dispatched-from-recovery worker is exit-eligible
-                        once its backlog drains. Defaults to True because
-                        every real caller of this function IS the recovery
-                        path.
-
-    Returns:
-        True  -- drainer was (re)spawned via *get_or_create*.
-        False -- session skipped (empty/torn workspace, or malformed JSON
-                 line, with no fallback available or all fallbacks exhausted).
+    Falls back to ``first_log_line`` (byte-0) when ``first_line`` doesn't
+    resolve a workspace, then to the ``_RECOVERY_FALLBACK_WORKSPACE``
+    sentinel -- so an unparseable head never blocks recovery of the data
+    behind it. Returns True if a drainer was (re)spawned, False if skipped.
     """
     parsed = _parse_workspace_and_creator(first_line)
     if parsed is not None:
@@ -212,10 +174,8 @@ def _recover_one_session(
             logger.warning("recovery_fallback_workspace session=%s source=byte0", sid)
             get_or_create(sid, workspace, created_by=created_by, recovered=recovered)
             return True
-        # Sentinel: the LAST resort (a structural
-        # graph-identity cost, not a cosmetic one). Dispatch anyway: the
-        # drainer dead-letters the unparseable head and drains everything
-        # behind it, strictly better than destroying that data outright.
+        # Last resort: dispatch under the sentinel anyway -- the drainer
+        # dead-letters the unparseable head and drains everything behind it.
         logger.warning("recovery_fallback_workspace session=%s source=sentinel", sid)
         get_or_create(
             sid,
@@ -234,16 +194,12 @@ def _recover_one_session(
 
 @dataclass
 class TopupResult:
-    """Result of one ``_crash_recovery_topup`` pass (M-2).
+    """Result of one ``_crash_recovery_topup`` pass.
 
-    ``dispatched``: sessions DISPATCHED to get_or_create this pass (an upper
-    bound on newly-spawned drainers -- get_or_create is idempotent).
-    ``recovered``: the total size of ``recover()``'s report THIS pass, before
-    any ceiling slicing -- lets the boot path report ``deferred`` to
-    ``/status`` without a second ``recover()`` scan (~2.5 GiB on the real
-    corpus).
-    ``deferred``: ``recovered`` minus how many were actually processed this
-    pass (0 when the ceiling is ``None``, i.e. unbounded).
+    ``dispatched``: sessions dispatched this pass (idempotent, so an upper
+    bound on newly-spawned drainers). ``recovered``: total size of this
+    pass's ``recover()`` report, before ceiling slicing. ``deferred``:
+    ``recovered`` minus how many were processed (0 when unbounded).
     """
 
     dispatched: int
@@ -255,23 +211,11 @@ async def _crash_recovery_topup(respawn_limit: int | None) -> TopupResult:
     """One bounded crash-recovery pass: respawn drainers for up to
     ``respawn_limit`` recovered sessions (all of them when ``None``).
 
-    This is the shared body of the boot-time recovery and the periodic sweep
-    (the only recovery-dispatch body -- the former lifespan inline loop was
-    a duplicate and has been removed). It is SAFE to call repeatedly on a
-    live server because respawn is idempotent -- ``registry.get_or_create``
-    returns the existing worker for a session that already has a live
-    drainer (no duplicate drainer, no reset). And because ``recover()``
-    reports only sessions that still have undrained data, a session drops
-    out the moment it finishes, so the number of live RECOVERED drainers
-    stays <= ``respawn_limit`` per dispatch pass (live recovered drainers
-    are also bounded independently via the drain loop's own dry-exit, not
-    this ceiling -- since a drained-out-but-still-registered drainer stays
-    alive between passes).
-
-    When the head line does not resolve a workspace, this now tries the
-    session's byte-0 line before giving up on it entirely -- the data
-    behind an unparseable head is still recoverable (see
-    ``_recover_one_session``'s docstring).
+    Shared by the boot-time recovery and the periodic sweep. Safe to call
+    repeatedly -- ``get_or_create`` is idempotent, and ``recover()`` only
+    reports sessions with undrained data, so live recovered drainers stay
+    bounded as the deferred tail advances. Falls back to the session's
+    byte-0 line when the head doesn't resolve a workspace.
     """
     recovered = await registry.queue_manager.recover()
     to_process = recovered if respawn_limit is None else recovered[:respawn_limit]
@@ -281,33 +225,22 @@ async def _crash_recovery_topup(respawn_limit: int | None) -> TopupResult:
     dispatched = 0
     for sid in to_process:
         try:
-            # Guarded HERE, at the boot/sweep call site -- NOT
-            # inside read_batch itself, which is also the LIVE drainer's hot
-            # path and must stay loud on a real read failure. Only the
-            # recovery-dispatch loop needs to degrade past one bad key.
+            # Guarded here (not inside read_batch, which must stay loud for
+            # the live drainer's hot path) so one bad key can't halt the pass.
             batch = await registry.queue_manager.read_batch(sid, max_items=1)
         except (OSError, ValueError):
-            # Cheap tightening: attach the traceback (was
-            # message-only) so a repeating read failure yields a traceback.
             logger.exception("crash_recovery_topup_read_failed session=%s", sid)
             continue
         if not batch.lines:
-            # recover() reported this session as having a
-            # complete unprocessed line, but read_batch found none --
-            # recover()/read_batch disagreement (e.g. a concurrent
-            # compaction/drain advanced the offset between the two calls).
-            # Not a loss -- the session is simply no longer recoverable by
-            # the time this pass reached it -- but a silent `continue` here
-            # was indistinguishable from "recover() was simply wrong".
+            # recover()/read_batch disagreement (e.g. a concurrent compaction
+            # advanced the offset) -- not a loss, just no longer recoverable.
             logger.warning(
                 "recovery_skipped_empty_batch session=%s reason=empty_batch",
                 sid,
             )
             continue
-        # NOTE: _recover_one_session returns True whenever it dispatched to
-        # get_or_create, whether or not a drainer already existed (get_or_create
-        # is idempotent). So this count is "sessions dispatched this pass", an
-        # upper bound on newly-spawned drainers -- fine for an INFO log.
+        # An upper bound on newly-spawned drainers: get_or_create is
+        # idempotent, so "dispatched" may include already-live workers.
         dispatched_ok = _recover_one_session(
             sid, batch.lines[0], registry.get_or_create
         )
@@ -322,10 +255,8 @@ async def _crash_recovery_topup(respawn_limit: int | None) -> TopupResult:
         if dispatched_ok:
             dispatched += 1
     if deferred_count:
-        # Loud on purpose (WARNING, not INFO): a deferred backlog must never
-        # be a silent, un-discoverable fact -- that silence is exactly what
-        # let the 38 GB spool go unnoticed for two days in the incident this
-        # guards against. Names the exact counts and the setting to raise.
+        # WARNING (not INFO): a deferred backlog must never be silently
+        # undiscoverable. Names the exact counts and the setting to raise.
         logger.warning(
             "lifespan_startup: crash-recovery respawn cap reached "
             "(crash_recovery_respawn_limit=%d): %d/%d respawned this pass, "
@@ -343,15 +274,10 @@ async def _crash_recovery_topup(respawn_limit: int | None) -> TopupResult:
 
 
 async def _crash_recovery_sweep_loop(interval: int, respawn_limit: int) -> None:
-    """Periodically top the recovered-drainer pool back up to the ceiling so a
-    finite ``crash_recovery_respawn_limit`` cannot permanently strand the
-    deferred backlog (the tail only advances as head sessions finish draining).
-
-    Started (from ``_boot_reconcile``, after the topup) whenever a
-    finite ceiling is configured and the interval is > 0. A single failed
-    tick must never kill the loop, so the body is guarded (CancelledError
-    propagates for clean shutdown; everything else is logged and the loop
-    continues).
+    """Periodically top the recovered-drainer pool back up to the ceiling so
+    a finite ``crash_recovery_respawn_limit`` cannot permanently strand the
+    deferred backlog. A single failed tick is logged and retried;
+    ``CancelledError`` propagates for clean shutdown.
     """
     while True:
         try:
@@ -364,12 +290,8 @@ async def _crash_recovery_sweep_loop(interval: int, respawn_limit: int) -> None:
                     result.dispatched,
                     respawn_limit,
                 )
-            # Sweep-tick dead-letter
-            # expiry. Unlike the boot phase, counters are LIVE here, so the
-            # expired records MUST be reported via record_purged -- they
-            # were counted into `accepted` at ingest but never `written`;
-            # dropping them from disk without dropping them from `accepted`
-            # would latch the residual at +n forever.
+            # Live counters here (unlike boot) must record_purged expired
+            # records, or the accepted/written residual latches at +n.
             expire_result = await registry.queue_manager.expire_dead_letters(
                 time.time(),
                 _settings.dead_letter_retention_seconds,
@@ -380,8 +302,6 @@ async def _crash_recovery_sweep_loop(interval: int, respawn_limit: int) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # Cheap tightening: attach the traceback (was
-            # message-only) so a repeating sweep-tick failure yields one.
             logger.warning(
                 "crash_recovery_sweep: tick failed, will retry: %s",
                 exc,
@@ -390,15 +310,12 @@ async def _crash_recovery_sweep_loop(interval: int, respawn_limit: int) -> None:
 
 
 async def _writer_lease_boot() -> None:
-    """The ONLY writer-lease call on the synchronous boot path. Guarded so
-    that exactly ONE exception type -- the
-    intended `enforce`-mode refusal -- can escape.
+    """The only writer-lease call on the synchronous boot path.
 
-    The heartbeat task is created whenever ``writer_lease_mode != "off"``,
-    INCLUDING after a failed acquire -- that IS the re-arm mechanism a
-    transient fault depends on. ``mark_unarmed`` also fills
-    ``writer_lease.mode`` if ``acquire()`` failed before setting it, so
-    ``/status`` never shows ``mode: null`` while a lease task is running.
+    Only ``WriterLeaseConflict`` (the intended enforce-mode refusal) is
+    allowed to escape. The heartbeat task starts whenever
+    ``writer_lease_mode != "off"``, even after a failed acquire -- that is
+    the re-arm mechanism a transient fault depends on.
     """
     try:
         await writer_lease.acquire(_settings, lambda: registry.queues_dir_path)
@@ -416,35 +333,18 @@ async def _writer_lease_boot() -> None:
 
 
 async def _boot_reclaim() -> None:
-    """The reclaim pass -- log-then-delete every un-resumable /
-    already-drained key, resume-with-fallback for a recoverable-but-
-    unparseable-head key, and reset a bounded bad-offset key.
-
-    Iterates `*.log` STEMS only -- a log-less key (only a
-    `.dead.jsonl`) belongs to ``reclaim_orphans``, never classified here.
-
-    Ownership gate: skip any key with a LIVE registry worker, checked
-    FRESH on the event loop immediately before classifying -- the registry
-    owns live sessions; this pass only ever touches unowned keys.
-
-    Runs classify UNCONDITIONALLY; ``reclaim``/``reclaim_orphans`` (the
-    actual unlink/reset) run ONLY when ``reclaim_enabled`` -- the
-    documented dry-run-first deploy sequence.
+    """Log-then-delete every un-resumable/already-drained key, resume with
+    fallback for a recoverable-but-unparseable head, and reset a bounded
+    bad-offset key. Skips any key with a live registry worker. Classify
+    always runs; the actual unlink/reset only runs when ``reclaim_enabled``.
     """
     qm = registry.queue_manager
-    # Use the MODULE-LEVEL `_settings` (same object `_boot_reconcile` and
-    # every test's `monkeypatch.setattr(main_module._settings, ...)` reads),
-    # not a fresh `get_settings()` call -- if anything upstream ever clears
-    # the settings lru_cache, a fresh call could return a DIFFERENT object
-    # than the one already bound to `_settings`, silently detaching this
-    # function from a test's (or an operator's live-reload's) mutation.
+    # Module-level `_settings`, not a fresh get_settings() -- keeps this in
+    # sync with test monkeypatches bound to the same object.
     settings = _settings
     boot_state.reclaim_enabled = settings.reclaim_enabled
-    # Iterate the QueueManager's OWN directory (qm.queues_dir), not a
-    # path recomputed from settings.queues_path -- registry.queue_manager may
-    # be pointed at a directory that differs from the live Settings
-    # singleton's queues_path (tests do this routinely), and this must never
-    # silently scan the wrong directory.
+    # Iterate the QueueManager's own directory, not settings.queues_path --
+    # the two can differ (tests do this routinely).
     keys = sorted(p.stem for p in qm.queues_dir.glob("*.log"))
     reclaimed = 0
     reclaimed_bytes = 0
@@ -493,14 +393,8 @@ async def _boot_reclaim() -> None:
             reclaimed_bytes += c.size
         else:
             kept += 1
-    # `reclaim_enabled` MUST reach `reclaim_orphans` itself -- it, not just
-    # this function's own telemetry aggregation, gates the actual unlink.
-    # Previously, orphan `.offset`/`.offset.tmp` and stale
-    # `.torn-*.bin` quarantine sidecars were unlinked unconditionally every
-    # boot, invisibly, even under the `reclaim_enabled=False` safety
-    # default. `reclaim_orphans` now reports `reclaimed`/`reclaimed_bytes`
-    # that ALREADY reflect only real unlinks (0 when disabled), so no
-    # further gating is needed here.
+    # reclaim_orphans itself gates on reclaim_enabled and reports only real
+    # unlinks (0 when disabled) -- no further gating needed here.
     orphan_result = await qm.reclaim_orphans(_start_time, settings.reclaim_enabled)
     reclaimed += orphan_result["reclaimed"]
     reclaimed_bytes += orphan_result["reclaimed_bytes"]
@@ -520,13 +414,12 @@ async def _boot_reclaim() -> None:
 
 
 async def _boot_reconcile() -> None:
-    """The backgrounded, EXCEPTION-SAFE boot-recovery body.
+    """The backgrounded, exception-safe boot-recovery body.
 
-    Runs heal -> reclaim -> reconcile -> seed -> bounded topup -> (start the
-    sweep, then set phase=ready). Spawned as a task from ``lifespan``
-    immediately after the migration-health guard, NOT awaited -- the server
-    serves its first request while this still runs. On ANY exception:
-    ``boot_state.fail()`` + a loud traceback; the server KEEPS SERVING.
+    Runs heal -> reclaim -> expire -> reconcile -> seed -> topup -> sweep,
+    then phase=ready. Spawned from ``lifespan``, not awaited, so the server
+    serves its first request while this still runs. Any exception is
+    recorded via ``boot_state.fail()``; the server keeps serving.
     """
     boot_state.begin()
     try:
@@ -538,16 +431,8 @@ async def _boot_reconcile() -> None:
         await _boot_reclaim()
 
         boot_state.phase = "expire"
-        # Boot-phase dead-letter expiry
-        # runs BEFORE recovery_reconcile_dead / recovery_seed_counts. Uses
-        # dead_letter_expiry_enabled (a SEPARATE flag from reclaim_enabled)
-        # -- NOT reclaim_enabled. Deliberately does
-        # NOT call registry.record_purged: this runs before
-        # recovery_seed_counts, so expired lines are simply never counted
-        # into accepted_seed in the first place (recovery_seed_counts
-        # derives `dead` from disk). Calling record_purged here would
-        # subtract records that were never added, driving the residual
-        # negative.
+        # Runs before recovery_seed_counts, so expired lines are simply never
+        # counted into accepted_seed -- record_purged must not be called here.
         await registry.queue_manager.expire_dead_letters(
             time.time(),
             _settings.dead_letter_retention_seconds,
@@ -587,9 +472,8 @@ async def _boot_reconcile() -> None:
                 _sweep_interval,
                 respawn_limit,
             )
-        # C2 (v1.3.1): starting a non-returning sweep loop must NOT leave
-        # phase stuck at "sweep" -- unconditionally finish here, AFTER the
-        # (forever-running) loop is started.
+        # Finish unconditionally here (after starting the loop), so a
+        # forever-running sweep never leaves phase stuck at "sweep".
         boot_state.finish()
     except asyncio.CancelledError:
         raise
@@ -613,10 +497,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         _query.url,
         _query.access_mode,
     )
-    # Admin (read/write): schema init + all mutation paths. Keep the existing
-    # app.state.neo4j_driver NAME so nothing that reads it silently breaks.
-    # build_neo4j_driver() is the SAME helper doctor.run_doctor() uses, so the
-    # server and the doctor CLI can never construct this connection differently.
+    # Admin (read/write): schema init + all mutation paths. Shares
+    # build_neo4j_driver() with doctor.run_doctor() so the two never diverge.
     app.state.neo4j_driver = build_neo4j_driver(_admin)
     # Cypher-query (read-intent): /cypher + dashboard reads.
     app.state.neo4j_query_driver = AsyncGraphDatabase.driver(
@@ -625,41 +507,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Stash the resolved query access_mode so /cypher opens READ sessions without
     # re-resolving settings on every request.
     app.state.neo4j_query_access_mode = _query.access_mode
-    # Initialize schema (indexes + uniqueness constraints) BEFORE the server starts
-    # accepting requests.  This ensures the Session uniqueness constraint is active
-    # before any concurrent flush() transactions execute MERGE, which prevents the
-    # duplicate-Session-node race condition observed under concurrent upload load.
+    # Initialize schema before serving, so the Session uniqueness constraint
+    # is active before any concurrent flush() MERGE can race it.
     logger.info(
         "lifespan_startup: initializing Neo4j schema (indexes + uniqueness constraints)"
     )
-    # Cold start FAILS LOUD on schema/data corruption that requires
-    # `doctor --fix` -- an un-migrated graph (duplicate legacy nodes OR
-    # nodes lacking the universal :Node label). Nothing has been written yet
-    # at cold start, so refusing to boot loses no data: this is the safest
-    # possible moment to surface an impossible state as an un-missable
-    # signal rather than a log line someone greps for later. Contrast with
-    # the flush path (Neo4jGraphStore._ensure_schema), which must keep
-    # self-healing and never raise (Salil's blocker -- raising there would
-    # dead-letter real in-flight activity records). fail_on_data_conflict=True
-    # here mirrors run_repair's contract: a :Node constraint data conflict
-    # raises a RuntimeError naming `doctor --fix` instead of being logged
-    # and swallowed.
+    # Cold start fails loud on an un-migrated graph (nothing written yet, so
+    # no data lost); the flush path instead self-heals and never raises.
     await ensure_neo4j_schema(app.state.neo4j_driver, fail_on_data_conflict=True)
     logger.info("lifespan_startup: Neo4j schema initialized")
-    # Fail-loud migration-health guard: duplicate nodes are already caught
-    # above by the :Node constraint (fail_on_data_conflict=True); this catches
-    # the OTHER un-migrated shape the constraint can't see on its own --
-    # nodes that simply lack the :Node label altogether, which violate no
-    # constraint and so raise nothing by themselves. O(1) via the counts
-    # store (see count_untagged_nodes) -- this must never regress into the
-    # AllNodesScan stall PR #67 removed from the write path.
-    #
-    # A connectivity/probe failure here is NOT the same as "confirmed
-    # un-migrated" -- it means graph state could not be determined, not that
-    # it was determined to be bad -- so it is logged at DEBUG and swallowed
-    # rather than treated as a corruption finding; the flush path's
-    # self-heal still covers a genuinely dirty graph once it becomes
-    # reachable.
+    # Catches nodes lacking the :Node label (the other un-migrated shape the
+    # constraint above can't see). A probe failure is logged at DEBUG, not
+    # treated as confirmed-bad -- the flush path's self-heal still covers it.
     try:
         untagged = await count_untagged_nodes(app.state.neo4j_driver)
     except Exception as exc:  # noqa: BLE001 - connectivity probe, not a confirmed bad state
@@ -672,36 +531,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "(un-migrated). Cold start refuses to boot to avoid duplicating "
             "them on write. Run: context-intelligence-server doctor --fix"
         )
-    # The writer-lease detector acquires the queue-directory
-    # lease BEFORE any boot-recovery pass runs. `_boot_reconcile` mutates
-    # the shared directory destructively (heal truncates, reclaim unlinks),
-    # so a fresh-foreign-lease refusal (enforce mode) must gate those passes
-    # rather than race them. Awaited synchronously here -- NOT part of
-    # `_boot_reconcile` -- because that task's own exception-safety would
-    # silently downgrade "refuse to boot" into "log a line and boot anyway".
+    # Acquires the lease before any boot-recovery pass mutates the shared
+    # directory; awaited synchronously so an enforce-mode refusal can't be
+    # silently downgraded by _boot_reconcile's own exception-safety.
     await _writer_lease_boot()
-    # Boot-safety hardening: every SHARE-READING recovery
-    # pass -- heal, reclaim, reconcile-dead, seed-counts, the crash-recovery
-    # topup, and the periodic sweep -- moves OFF the critical path to first
-    # request. `yield` moves up to immediately after the migration-health
-    # guard above (M-8); `_boot_reconcile` runs those passes as a single
-    # supervised background task, spawned but NOT awaited, so `/status` and
-    # `/version` answer while it is still running. The Neo4j schema guard
-    # above stays synchronous and fail-loud on purpose (O(1), no share I/O,
-    # a deliberate cold-start refusal on an un-migrated graph) -- the
-    # boot-recovery pass does not touch it.
+    # Every share-reading recovery pass moves off the critical path to first
+    # request: spawned as a background task, not awaited, so /status and
+    # /version answer while it still runs.
     boot_state.begin()
     app.state.boot_task = asyncio.create_task(_boot_reconcile())
     try:
         yield
     finally:
-        # Every background task lives on app.state so this
-        # `finally` can reach it even if `_boot_reconcile` crashed before
-        # creating the sweep task (hence the getattr guard). Ordering is
-        # load-bearing: sweep stops before the one-shot reconcile (it can
-        # re-enter its work), and EVERY task stops before the drivers
-        # close -- a reconcile mid-Neo4j-write must never find a closed
-        # driver.
+        # Ordering is load-bearing: sweep stops before reconcile (it can
+        # re-enter its work), and every task stops before the drivers close.
         _sweep_task = getattr(app.state, "sweep_task", None)
         if _sweep_task is not None:
             _sweep_task.cancel()
@@ -712,14 +555,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             _boot_task.cancel()
             with suppress(asyncio.CancelledError):
                 await _boot_task
-        # The writer lease is released LAST among
-        # app-owned tasks, and its own heartbeat task is cancelled FIRST --
-        # so no in-flight tick can regain the in-flight gate mid-shutdown.
-        # release()/shutdown_lease_io() never raise (owner-gated release,
-        # OSError + WriterLeaseBusy swallowed inside release()) -- shutdown
-        # never raises, though a healthy-but-still-in-flight op can leave
-        # the lease on disk even on a clean exit (an honest
-        # limit bounded by the staleness window, same as after a SIGKILL).
+        # Released last; its heartbeat is cancelled first so no in-flight
+        # tick can regain the gate mid-shutdown. release() never raises.
         _lease_task = getattr(app.state, "lease_task", None)
         if _lease_task is not None:
             _lease_task.cancel()
@@ -736,9 +573,8 @@ app = FastAPI(
     title="Context Intelligence Server",
     version=__version__,
     lifespan=lifespan,
-    # Headless server: no browser-facing UI. The OpenAPI contract + Swagger UI
-    # are the developer surface and are always registered; ReDoc is a redundant
-    # second doc UI and is intentionally left off (docs_url=None equivalent).
+    # Headless server: Swagger UI is the dev surface; ReDoc is a redundant
+    # second doc UI, intentionally left off.
     docs_url="/docs",
     redoc_url=None,
     openapi_url="/openapi.json",
@@ -748,9 +584,8 @@ app.include_router(version_router)
 app.include_router(queues_router)
 _start_time = time.time()
 registry = SessionRegistry()
-# Expose the registry singleton on app.state so routers can read it via
-# request.app.state.registry instead of importing the module-level name
-# (avoids a circular import between main and the routers package).
+# Expose the registry singleton on app.state so routers can read it without
+# importing the module-level name (avoids a circular import).
 app.state.registry = registry
 idempotency_cache = EventIdempotencyCache()
 
@@ -766,13 +601,9 @@ def _workspace_slug(workspace: str) -> str:
 
 
 def _validate_data_timestamp(data: dict[str, Any]) -> None:
-    """Raise HTTPException(400) if data['timestamp'] is missing, empty, or not ISO-8601.
-
-    This is the ingest boundary check (Option A). Real Amplifier clients always
-    supply data.timestamp (verified: 224,530 events on disk, 0 missing). This
-    guard rejects only malformed/hand-rolled payloads with a clear 400, instead
-    of accepting them silently and dead-lettering them later when the graph
-    drainer calls make_node_id() on an empty string.
+    """Raise HTTPException(400) if data['timestamp'] is missing, empty, or
+    not ISO-8601. This is the ingest boundary check -- reject malformed
+    payloads with a clear 400 instead of dead-lettering them later.
     """
     value = data.get("timestamp")
     if value is None or not isinstance(value, str) or not value.strip():
@@ -790,15 +621,11 @@ def _validate_data_timestamp(data: dict[str, Any]) -> None:
 
 
 def _assert_admin_not_exempt() -> None:
-    """Startup assertion (TB-07): /admin/* must NEVER be in any exempt set.
+    """/admin/* must never be in any exempt set.
 
-    Called by ``create_asgi_app`` before constructing the middleware.
     Raises ``RuntimeError`` if any ``/admin`` path or prefix appears in
-    ``_EXEMPT_PATHS`` or ``_EXEMPT_PREFIXES``, because that would make the
-    admin API accessible without authentication.
-
-    This is a defence-in-depth structural check: it is impossible to
-    accidentally ship an unauthenticated admin surface.
+    ``_EXEMPT_PATHS`` or ``_EXEMPT_PREFIXES`` -- a defence-in-depth check
+    against accidentally shipping an unauthenticated admin surface.
     """
     import context_intelligence_server.auth as _auth_module
 
@@ -822,14 +649,10 @@ def _assert_admin_not_exempt() -> None:
 
 
 def _assert_neo4j_clients_explicit(settings: Settings) -> None:
-    """Startup assertion: the deployed profile MUST declare the
-    structured neo4j.admin / neo4j.cypher_query clients explicitly.
-
-    When settings.neo4j_require_explicit_clients is True, refuse to boot if the
-    server silently fell back to the legacy flat neo4j_* fields (settings.neo4j is
-    None). Back-compat fallback is allowed ONLY when the flag is False (dev / test /
-    transition). This makes a silent partial-config fallback impossible in the
-    deployed profile.
+    """The deployed profile must declare structured neo4j.admin /
+    neo4j.cypher_query clients explicitly. When
+    ``neo4j_require_explicit_clients`` is True, refuse to boot on a silent
+    fallback to legacy flat neo4j_* fields.
     """
     if settings.neo4j_require_explicit_clients and settings.neo4j is None:
         raise RuntimeError(
@@ -849,70 +672,43 @@ def create_asgi_app(
 ) -> BearerTokenMiddleware:
     """Return the ASGI app wrapped with auth middleware.
 
-    This is the single strategy-selection point.  *settings* defaults to
-    the module-level ``_settings`` (the cached production config).  Pass an
-    explicit :class:`~context_intelligence_server.config.Settings` instance
-    from tests to exercise specific configurations without touching the live
-    cached settings.
+    *settings* defaults to the module-level ``_settings``; tests pass an
+    explicit instance to exercise a config without touching the live cache.
+    *_jwks_client* injects a JWKS client for ``auth_mode="entra"`` tests only.
 
-    *_jwks_client* is an injectable JWKS client used **only** when
-    ``auth_mode="entra"`` — intended for tests that need to construct an
-    :class:`~context_intelligence_server.auth.EntraResolver` without making
-    real network calls.  Production deployments leave it as ``None``; the
-    resolver builds a real ``PyJWKClient`` internally.
-
-    Startup behavior on an EMPTY store:
-        An empty keystore (static) or empty identity map (entra) NO LONGER
-        raises — it is a supported bootstrap state. The server BOOTS
-        fail-CLOSED and logs a loud startup WARNING; every request 401/403s
-        until the store is populated at runtime via the /admin API. Wide-open
-        pass-through is reachable ONLY via the explicit
-        ``settings.allow_unauthenticated=True`` opt-out combined with no
-        credentials configured, which additionally logs a "WIDE OPEN" warning.
-
-    Raises:
-        RuntimeError: (TB-07) When any ``/admin`` path or prefix appears in an
-            auth-exempt set.  The admin API surface must never be unguarded.
+    An empty keystore/identity map is a supported bootstrap state: the
+    server boots fail-closed and every request 401/403s until populated via
+    the /admin API, unless ``allow_unauthenticated=True`` with no
+    credentials configured (wide-open, logged loudly).
     """
     global _api_key_store, _entra_identity_store
 
-    # TB-07 structural assertion: /admin must not be in any exempt set.
-    # This runs before any middleware construction so the failure is loud and
-    # immediate — no request ever reaches an unauthenticated /admin endpoint.
+    # Structural assertion: runs before middleware construction so the
+    # failure is loud and immediate.
     _assert_admin_not_exempt()
 
     s = settings if settings is not None else _settings
     _assert_neo4j_clients_explicit(s)
 
-    # Reset both stores; the active mode sets exactly one of them below.
-    # app.state.* mirrors the module-level globals so the /admin router can
-    # access the live stores via request.app.state without importing from main
-    # (which would create a circular import).
+    # Reset both stores; the active mode sets exactly one below. app.state.*
+    # mirrors the globals so /admin can read them without importing main.
     _api_key_store = None
     _entra_identity_store = None
     app.state.api_key_store = None
     app.state.entra_identity_store = None
 
-    # T5: store auth/admin config on app.state so the require_admin dependency
-    # can read it without importing from main (avoids circular import) and so
-    # test-specific settings (passed via create_asgi_app(settings=...)) take
-    # effect without relying on the module-level cached get_settings().
+    # Store auth/admin config on app.state so dependencies can read it
+    # without importing main, and test-specific settings take effect.
     app.state.auth_mode = s.auth_mode
     app.state.admin_api_key_configured = s.resolve_admin_api_key_digest() is not None
     app.state.entra_admin_role = s.entra_admin_role
-    # M2: service capability role names for require_write / require_read deps.
+    # Service-capability role names for require_write / require_read.
     app.state.service_data_role = s.service_data_role
     app.state.reader_role = s.reader_role
 
-    # Compute the admin-key digest for the middleware (static mode only).
-    # The middleware checks the bearer token's sha256 against this digest BEFORE
-    # calling the resolver, so the admin key can authenticate even though it is
-    # not in the data keystore (ROB F1).
-    #
-    # Storage-at-rest is resolved by Settings: the RECOMMENDED admin_api_key_sha256
-    # (digest at rest) is used verbatim; the legacy raw admin_api_key (DEPRECATED,
-    # plaintext at rest) is hashed by the resolver.  Surface the deprecation and
-    # precedence as one-time startup warnings so operators can migrate.
+    # Admin-key digest for the middleware (static mode only): checked against
+    # the bearer token's sha256 before the resolver, so the admin key
+    # authenticates even though it isn't in the data keystore.
     admin_api_key_digest: str | None = s.resolve_admin_api_key_digest()
     if s.admin_api_key is not None and s.admin_api_key_sha256 is not None:
         logger.warning(
@@ -934,9 +730,8 @@ def create_asgi_app(
         entra_store = IdentityStore(Path(s.entra_identities_store_path))
         entra_store.load()
         if not entra_store.path.exists():
-            # First boot: seed in-process map from config.  Converts the flat
-            # {oid -> contributor_id} from build_identity_map() to the rich
-            # {oid -> {"id": contributor_id}} format that IdentityStore expects.
+            # First boot: seed from config, converting flat {oid: contributor_id}
+            # to the rich {oid: {"id": contributor_id}} format IdentityStore expects.
             config_map = s.build_identity_map()
             if config_map:
                 rich_seed = {oid: {"id": cid} for oid, cid in config_map.items()}
@@ -944,11 +739,8 @@ def create_asgi_app(
         _entra_identity_store = entra_store
         app.state.entra_identity_store = entra_store
 
-        # Bootstrap visibility: announce an EMPTY identity map loudly at startup.
-        # This is a SUPPORTED state, not an error — the server is up and serving.
-        # Delegated (human) tokens will 403 until an IdentityAdmin role-holder
-        # binds the first oid via PUT /admin/identities/{oid}. Without this line
-        # an empty map would be silent and look like a misconfiguration.
+        # Supported bootstrap state, not an error -- without this the empty
+        # map would be silent and look like a misconfiguration.
         if not entra_store.flat_dict:
             logger.warning(
                 "entra identity map is EMPTY at startup (0 bound oids) — server "
@@ -959,12 +751,9 @@ def create_asgi_app(
                 s.entra_identities_store_path,
             )
 
-        # B4: boot disjointness invariant — each oid must belong to exactly one
-        # identity source.  Building the service map here (not inline in the
-        # EntraResolver call) lets us check the overlap BEFORE construction so
-        # the server fails loudly at startup rather than silently misbehaving.
-        # This is cheap hygiene: B1 already keeps app tokens off the human map
-        # at request time; this prevents a same-oid-in-both misconfiguration.
+        # Disjointness invariant: each oid belongs to exactly one identity
+        # source. Built here (not inline in EntraResolver) so the overlap can
+        # be checked before construction, failing loud at startup.
         _service_id_map = s.build_service_identity_map()
         _entra_oids = set(entra_store.flat_dict.keys())
         _service_oids = set(_service_id_map.keys())
@@ -977,30 +766,28 @@ def create_asgi_app(
                 f"the overlap before restarting."
             )
 
-        # EntraResolver raises RuntimeError at construction if the JWKS
-        # prefetch fails (eager fail-closed guard from §8b / crusty gate).
-        # Pass entra_store.flat_dict (the LIVE dict) so the resolver sees
-        # any put()/delete() made by /admin immediately, no restart required.
+        # EntraResolver raises at construction if the JWKS prefetch fails
+        # (fail-closed). Pass the live flat_dict so /admin mutations are
+        # visible immediately, no restart required.
         resolver: StaticKeyResolver | EntraResolver = EntraResolver(
-            s.azure_client_id,  # type: ignore[arg-type]  — validated non-None by config
-            s.azure_tenant_id,  # type: ignore[arg-type]  — validated non-None by config
-            entra_store.flat_dict,  # live reference — mutations visible immediately
-            service_identity_map=_service_id_map,  # B4: pre-built, disjointness verified
-            service_data_role=s.service_data_role,  # M2: role gate
-            reader_role=s.reader_role,  # M2: role gate
-            entra_admin_role=s.entra_admin_role,  # M2: role gate
+            s.azure_client_id,  # type: ignore[arg-type] -- validated non-None by config
+            s.azure_tenant_id,  # type: ignore[arg-type] -- validated non-None by config
+            entra_store.flat_dict,  # live reference -- mutations visible immediately
+            service_identity_map=_service_id_map,  # pre-built, disjointness verified
+            service_data_role=s.service_data_role,  # role gate
+            reader_role=s.reader_role,  # role gate
+            entra_admin_role=s.entra_admin_role,  # role gate
             jwks_client=_jwks_client,
         )
-        # Entra mode does not use admin_api_key_digest (admin via roles claim).
+        # Entra mode: admin is via roles claim, not admin_api_key_digest.
         admin_api_key_digest = None
     else:
         # Build and load the API-key store.
         key_store = IdentityStore(Path(s.api_keys_store_path))
         key_store.load()
         if not key_store.path.exists():
-            # First boot: seed from config.  Converts the flat
-            # {sha256_hex -> contributor_id} from build_keystore() to the
-            # rich {sha256_hex -> {"id": contributor_id}} format.
+            # First boot: seed from config, converting flat {sha256: contributor_id}
+            # to the rich {sha256: {"id": contributor_id}} format.
             config_ks = s.build_keystore()
             if config_ks:
                 rich_seed = {digest: {"id": cid} for digest, cid in config_ks.items()}
@@ -1008,9 +795,8 @@ def create_asgi_app(
         _api_key_store = key_store
         app.state.api_key_store = key_store
 
-        # Bootstrap visibility: announce an EMPTY keystore loudly at startup.
-        # This is a SUPPORTED state (fail-CLOSED, not fail-open) — the server
-        # is up and serving, but every request 401s until keys are onboarded.
+        # Supported bootstrap state (fail-closed, not fail-open): server is
+        # up but every request 401s until keys are onboarded.
         if not key_store.flat_dict:
             if s.resolve_admin_api_key_digest() is not None:
                 logger.warning(
@@ -1037,10 +823,8 @@ def create_asgi_app(
         # put()/delete() made by /admin immediately, no restart required.
         resolver = StaticKeyResolver(key_store.flat_dict)
 
-    # Wide-open warning: fires ONLY on the explicit allow_unauthenticated
-    # opt-out combined with no credentials configured. An empty keystore/map
-    # ALONE no longer triggers this (and no longer refuses to start) — it now
-    # boots fail-closed instead (see the empty-map/keystore warnings above).
+    # Fires only on the explicit allow_unauthenticated opt-out combined with
+    # no credentials configured; an empty store alone boots fail-closed instead.
     if s.allow_unauthenticated and not resolver.auth_enabled:
         logger.warning(
             "allow_unauthenticated=True AND no credentials configured — the "
@@ -1050,7 +834,7 @@ def create_asgi_app(
             "(entra) and unset allow_unauthenticated to enforce authentication."
         )
 
-    # Log admin capability status for operator visibility (E: status surfacing).
+    # Log admin capability status for operator visibility.
     if s.auth_mode == "static":
         _admin_status = (
             "enabled"
@@ -1069,11 +853,8 @@ def create_asgi_app(
         _admin_status,
     )
 
-    # T6: store the admin-key digest on app.state so the /admin router handlers
-    # can read it without importing from main (no circular import) and so that
-    # test-specific settings are honoured.  In entra mode admin_api_key_digest
-    # has already been set to None above (line ~385); in static mode it is the
-    # sha256 of admin_api_key (or None when admin_api_key is not configured).
+    # Store the admin-key digest on app.state so the /admin router can read
+    # it without importing main; None in entra mode, sha256 in static mode.
     app.state.admin_api_key_digest = admin_api_key_digest
 
     return BearerTokenMiddleware(
@@ -1086,40 +867,16 @@ def create_asgi_app(
 
 
 # Module-level ASGI app used by Gunicorn: context_intelligence_server.main:asgi_app
-# The raw `app` is kept for internal use and testing against un-authed routes.
-#
-# LAZY construction (PEP 562 module __getattr__), NOT built at import time.
-#
-# create_asgi_app() enforces the auth guard: it raises RuntimeError when no
-# authentication is configured at all (see its docstring / _assert_* helpers).
-# That guard is correct and must NOT be weakened. The problem was *timing*:
-# this module used to call create_asgi_app() unconditionally at import time,
-# which meant the console-script entry point (`context-intelligence-server`)
-# imports `main` to reach `main()`, so even `--help`/`--version` constructed
-# the whole ASGI app and hit the guard. An operator with a broken/absent
-# config couldn't ask the binary what version it was -- exactly when they
-# most need to.
-#
-# `_asgi_app` is the cache; `get_asgi_app()` builds-and-caches on first call;
-# `__getattr__` makes `context_intelligence_server.main.asgi_app` /
-# `from context_intelligence_server.main import asgi_app` keep working for
-# anything that reads the module attribute directly (gunicorn's `load()`,
-# tests) -- construction (and therefore the auth guard) now happens on first
-# access instead of at import time. Actually serving (`run()` -> `_App.load()`
-# -> `get_asgi_app()`) still triggers it, so an unconfigured server still
-# fails loud exactly as before -- only bare import / --help / --version are
-# spared.
+# Lazily constructed (PEP 562 __getattr__) so bare import / --help / --version
+# don't trigger create_asgi_app()'s auth guard; get_asgi_app() builds-and-caches.
 _asgi_app: BearerTokenMiddleware | None = None
 
 
 def get_asgi_app() -> BearerTokenMiddleware:
     """Return the module-level ASGI app, constructing it on first call.
 
-    This is the single lazy-construction point. Internal code (``_App.load()``
-    below) MUST call this function rather than referencing a bare ``asgi_app``
-    global -- a bare name reference is a normal global-variable lookup and
-    would NOT go through ``__getattr__``, so it would raise ``NameError``
-    once the unconditional module-level assignment is removed.
+    Internal code must call this rather than referencing a bare ``asgi_app``
+    global -- that lookup would not go through ``__getattr__``.
     """
     global _asgi_app
     if _asgi_app is None:
@@ -1139,13 +896,8 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-# ---------------------------------------------------------------------------
-# M2 — service capability dependencies (moved to authz.py to avoid circular import)
-#
-# require_write, require_read, _is_write_capable are imported from
-# context_intelligence_server.authz at the top of this file (re-exported here
-# so tests and existing imports from main still work).
-# ---------------------------------------------------------------------------
+# require_write, require_read, _is_write_capable live in authz.py (avoids a
+# circular import) and are re-exported here for existing imports from main.
 
 
 @app.get("/status")
@@ -1154,63 +906,34 @@ async def get_status(request: Request) -> dict[str, Any]:
     response["neo4j_connected"] = await _check_driver_connected(
         request.app, "neo4j_driver"
     )
-    # Additive (Concern B, council review): surface the query (read-intent)
-    # driver's connectivity too, so a misconfigured cypher_query client shows
-    # up here instead of on the first /cypher call.
+    # Surface the query (read-intent) driver's connectivity too, so a
+    # misconfigured cypher_query client shows up here, not on first /cypher.
     response["neo4j_query_connected"] = await _check_driver_connected(
         request.app, "neo4j_query_driver"
     )
     response["neo4j_url"] = _settings.resolve_neo4j_admin().url
     response["neo4j_browser_url"] = _settings.neo4j_browser_url
-    # M-16: the boot-progress block is
-    # ALWAYS present. Gate on boot IS OVER (ready or failed), not boot
-    # SUCCEEDED -- `failed` is a terminal phase and the server keeps
-    # ingesting new events, so gating on `ready` alone would permanently
-    # null the spool-byte alarm for the rest of the process's life on any
-    # reconcile failure, reintroducing the exact "38 GB spool grew with
-    # zero signal" incident through a new door.
+    # Gated on boot being OVER (ready or failed), not SUCCEEDED -- gating on
+    # `ready` alone would permanently null the spool alarm after any reconcile failure.
     response["boot"] = boot_state.snapshot()
-    # The writer-lease detector is an ALWAYS-present top-level
-    # block, at every boot phase -- pure in-memory (writer_lease.snapshot()
-    # never touches disk or calls get_settings()), so this never violates
-    # the zero-disk-during-boot contract. Deliberately NOT projected into
-    # `spool`: that dict is spool_stats()'s live cache OBJECT
-    # returned BY REFERENCE, and mutating it would corrupt a shared,
-    # already-verified surface.
+    # Pure in-memory (never touches disk), so this is safe at every boot
+    # phase. Kept out of `spool`, which is a live cache dict returned by reference.
     response["writer_lease"] = writer_lease.snapshot()
     if boot_state.phase in ("ready", "failed"):
-        # Byte-for-byte today's code, unreachable while actively booting.
-        # Additive, aggregate-only conservation metrics. /status is
-        # unauthenticated, so this block must NOT carry the per-key table or
-        # the dead-letter listing — both are authenticated-only.
+        # /status is unauthenticated: only aggregate-only conservation
+        # metrics, no per-key table or dead-letter listing.
         response["metrics"] = await registry.pipeline_metrics()
-        # Additive, aggregate-only spool footprint (incident: a 38 GB /
-        # 583-file durable spool grew completely unnoticed -- the only
-        # symptom was a graph that had silently stopped updating). Same
-        # /status contract as `metrics` above: two aggregate integers only,
-        # no session ids, no workspace names, no per-key table. Cheap by
-        # construction (stat-only, short-TTL cached) -- see
-        # QueueManager.spool_stats() for why this is safe on every poll even
-        # with a huge spool.
+        # Same contract: aggregate integers only, cheap (stat-only,
+        # short-TTL cached) even with a huge spool.
         response["spool"] = await registry.queue_manager.spool_stats()
     else:
-        # While actively booting (heal/reclaim/reconcile/seed/topup/
-        # sweep-not-yet-ready), `/status` is LEAN by construction -- it
-        # performs ZERO disk reads on this request path (neither
-        # `pipeline_metrics`/`derive_all_stats` nor `spool_stats` is called
-        # at all; `build_status_response` above reads only in-memory
-        # registry state). Less data during boot is the accepted trade
-        # (user directive): richer boot-time status is deferred to a future
-        # maintenance mode. `metrics`/`spool` stay PRESENT and `null` rather
-        # than absent, so an absent key is never confused with a version
-        # skew.
+        # While booting, /status performs zero disk reads. metrics/spool stay
+        # present but null, so an absent key is never confused with a version skew.
         response["metrics"] = None
         response["spool"] = None
         response["status_detail"] = {"reason": "booting"}
-    # T5 (E): surface auth mode and admin-API capability so operators can
-    # confirm admin is enabled without tailing startup logs.  /status is
-    # unauthenticated — only config-level boolean flags are exposed here
-    # (no credential values, no key hashes, no token details).
+    # Surface auth mode/admin capability so operators can confirm admin is
+    # enabled without tailing logs -- boolean flags only, no credentials.
     _auth_mode = getattr(request.app.state, "auth_mode", _settings.auth_mode)
     _admin_key_set = getattr(
         request.app.state,
@@ -1225,10 +948,8 @@ async def get_status(request: Request) -> dict[str, Any]:
         "admin_api_enabled": (
             _admin_key_set if _auth_mode == "static" else bool(_entra_admin_role)
         ),
-        # Surface the role names (not secrets) so operators can confirm which
-        # roles are configured without exposing credential values.  Additive:
-        # existing fields (mode, admin_api_enabled, entra_admin_role) are
-        # unchanged; reader_role and service_data_role are new in M2.
+        # Surface role names (not secrets) so operators can confirm what's
+        # configured without exposing credential values.
         **(
             {
                 "entra_admin_role": _entra_admin_role,
@@ -1281,12 +1002,9 @@ async def post_events(
     # Validate data.timestamp at the ingest boundary (fail loud, not silent dead-letter).
     # Real Amplifier clients always supply this field; 400 only hits malformed payloads.
     _validate_data_timestamp(request.data)
-    # Idempotency. The CHECK stays BEFORE the durable append -- a genuine
-    # duplicate must not persist a second log line. The STORE moved to AFTER a
-    # successful append, so a key is never burned for an event that is not on
-    # disk; a failed append leaves the key unburned and the client's retry is
-    # honoured. ``dedup_key`` is None on the replay path, which (as before)
-    # neither checks NOR stores.
+    # Check before the durable append (a duplicate must not persist a second
+    # line); store after a successful append, so a failed append leaves the
+    # key unburned and the client's retry is honoured.
     dedup_key = request.idempotency_key if not replay else None
     if dedup_key and idempotency_cache.seen(dedup_key):
         logger.info(
@@ -1300,18 +1018,15 @@ async def post_events(
     worker_key = session_id or (_NO_SESSION_PREFIX + _workspace_slug(request.workspace))
     # Spawn (or reuse) the sticky drainer keyed by worker_key.
     registry.get_or_create(worker_key, request.workspace, created_by=contributor_id)
-    # Re-parse the raw validated body bytes, stamp created_by (server-assigned,
-    # unconditional overwrite — kills any client-supplied spoofed value), then
-    # re-serialize compact JSON before persisting to the durable queue.
-    # IMPORTANT: re-parse raw bytes (not the pydantic model) so client extra
-    # fields are preserved. body() is cached by Starlette after the first read.
+    # Re-parse raw bytes (not the pydantic model) so client extra fields
+    # survive; stamp created_by server-side, overwriting any spoofed value.
     body = await http_request.body()
     body_obj = json.loads(body)
     body_obj["created_by"] = contributor_id  # overwrite, never setdefault
     body = json.dumps(body_obj, separators=(",", ":")).encode()
     await registry.queue_manager.append(worker_key, body)
-    # The bytes are on disk: NOW the key may be burned. No try/except is
-    # needed anywhere -- "release on failure" is simply not reaching this line.
+    # Bytes are on disk: the key may be burned now (a failed append simply
+    # never reaches this line).
     if dedup_key:
         idempotency_cache.store(dedup_key)
     registry.record_accepted()  # count the durably-accepted event
@@ -1361,16 +1076,12 @@ async def post_cypher(body: CypherRequest, request: Request) -> Response:
 def main(argv: list[str] | None = None) -> None:
     """CLI entrypoint.
 
-    INVARIANT: no subcommand (or the explicit ``serve`` subcommand) starts the
-    ingestion server. This MUST hold because the systemd unit (and the
-    macOS launchd agent) invoke the bare console script
-    ``context-intelligence-server`` with NO arguments -- that call dispatches
-    to ``serve`` unchanged.
+    No subcommand (or the explicit ``serve``) starts the ingestion server --
+    the systemd unit and macOS launchd agent invoke the bare console script
+    with no arguments, dispatching to ``serve``.
 
-    ``doctor [--fix]`` diagnoses (and, with ``--fix``, repairs) Neo4j graph
-    health -- the two O(graph-size) migration scans (dedup + :Node backfill)
-    that used to run unconditionally at cold start now live ONLY here, never
-    on server boot. See ``context_intelligence_server.doctor``.
+    ``doctor [--fix]`` diagnoses (and repairs) Neo4j graph health; see
+    ``context_intelligence_server.doctor``.
     """
     parser = argparse.ArgumentParser(prog="context-intelligence-server")
     subparsers = parser.add_subparsers(dest="command")
@@ -1394,9 +1105,7 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     # Deferred import: doctor.py imports build_neo4j_driver back from this
-    # module, so importing it at module load time (rather than here, inside
-    # main()) would be a circular import at import time. By the time main()
-    # runs, this module has already finished executing top-to-bottom.
+    # module, so a top-level import here would be circular.
     from context_intelligence_server import doctor as _doctor
 
     sys.exit(asyncio.run(_doctor.run_doctor(fix=args.fix)))
@@ -1447,9 +1156,8 @@ def run() -> None:
     """Start the server using gunicorn + uvicorn worker for graceful SIGTERM shutdown."""
     from gunicorn.app.base import BaseApplication
 
-    # Read WEB_CONCURRENCY and fail loud if it would run != 1 worker. The same
-    # value is fed into gunicorn below so the guard and the live config are one
-    # source of truth (they can never diverge).
+    # Fail loud if WEB_CONCURRENCY would run != 1 worker; the same value
+    # feeds gunicorn below so the guard and config can never diverge.
     workers = _validate_single_worker()
 
     class _App(BaseApplication):
@@ -1465,9 +1173,8 @@ def run() -> None:
                 self.cfg.set(key, value)
 
         def load(self) -> Any:
-            # get_asgi_app() (not the bare `asgi_app` global) -- this is
-            # where lazy construction actually happens for a real serve,
-            # and where the auth guard still fires if unconfigured.
+            # get_asgi_app(), not the bare `asgi_app` global -- this is where
+            # lazy construction happens and the auth guard still fires.
             return get_asgi_app()
 
     _App().run()

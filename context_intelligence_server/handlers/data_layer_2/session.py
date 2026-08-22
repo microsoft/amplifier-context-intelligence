@@ -71,15 +71,9 @@ class SessionLabelStateMachine:
     def classify(
         self, current_type: str | None, event: str, has_parent: bool
     ) -> LabelTransition:
-        # NOTE on "StubSession" removal below: StubSession is a plain observability
-        # marker (added by services.ensure_session_node when a node is created from
-        # a reference — delegation, fork/start parent — before its own lifecycle
-        # events arrive).  It is not part of the RootSession/SubSession/ForkedSession
-        # terminal lattice.  Every branch below that assigns a REAL terminal label
-        # (including IncompleteSession, a confirmed-if-incomplete terminal) also
-        # clears StubSession, so genuine late enrichment removes the marker.  Removing
-        # a label that isn't present is a silent no-op (see GraphState.set_labels /
-        # Neo4jGraphStore.set_labels), so it is always safe to include in `remove`.
+        # StubSession is a plain observability marker, not part of the
+        # terminal lattice; every branch assigning a real terminal label
+        # also clears it (removing an absent label is a no-op).
         if event == "start":
             if current_type in ("ForkedSession", "SubSession"):
                 return LabelTransition()
@@ -118,17 +112,8 @@ class SessionLabelStateMachine:
         if event == "end":
             if current_type is not None:
                 return LabelTransition()
-            # Bare session: session:start/fork was permanently lost.  Rather than
-            # fabricating a real terminal (Sub/Root), mark it explicitly so it
-            # stays outside the clean terminal space and surfaces as a health signal.
-            # IncompleteSession is a confirmed (if incomplete) terminal outcome —
-            # a diagnosed data-loss case, not an unresolved stub — so
-            # StubSession is cleared here too.
-            #
-            # NOTE: if a real start/fork ever arrives AFTER this end (out-of-order,
-            # vanishingly rare), _handle_start/_handle_fork will classify normally
-            # and add the real terminal.  IncompleteSession may then coexist as an
-            # audit trail — that is acceptable; no special stripping is needed.
+            # Bare session: start/fork was permanently lost. Mark
+            # IncompleteSession rather than fabricating a real terminal.
             return LabelTransition(
                 add=["IncompleteSession", "SST_EVENT"], remove=["StubSession"]
             )
@@ -184,9 +169,8 @@ class SessionHandler:
         _warn_if_dual_terminal(labels, session_id)
         current_type = _current_type(labels)
 
-        # Always enrich started_at and session identity. "Session" MUST be in
-        # labels so neo4j_store routes this to MERGE (n:Session {...}), the same
-        # bucket as ensure_session_node.
+        # "Session" MUST be in labels so neo4j_store routes this to MERGE,
+        # the same bucket as ensure_session_node.
         await self.services.graph.upsert_node(
             session_id,
             {
@@ -203,7 +187,6 @@ class SessionHandler:
             session_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
         )
 
-        # Label decision is owned by the state machine.
         transition = self._label_machine.classify(
             current_type, "start", bool(parent_id)
         )
@@ -214,9 +197,8 @@ class SessionHandler:
                 add_labels=transition.add,
             )
 
-        # Edge rule: a session becoming a SubSession under a parent gets a
-        # HAS_SUBSESSION edge. Covers both Root->Sub and bare->Sub. Root (no
-        # parent) and the terminal no-ops create no edge.
+        # A session becoming a SubSession under a parent gets a
+        # HAS_SUBSESSION edge; Root (no parent) creates no edge.
         if "SubSession" in transition.add and parent_id:
             await self.services.ensure_session_node(parent_id, {})
             await self.services.graph.upsert_edge(
@@ -249,8 +231,8 @@ class SessionHandler:
         _warn_if_dual_terminal(labels, session_id)
         current_type = _current_type(labels)
 
-        # Always enrich. "Session" MUST be in labels for the same MERGE-bucket
-        # reason as _handle_start.
+        # "Session" MUST be in labels for the same MERGE-bucket reason as
+        # _handle_start.
         await self.services.graph.upsert_node(
             session_id,
             {
@@ -276,11 +258,8 @@ class SessionHandler:
                 add_labels=transition.add,
             )
 
-        # Edge rule: a session becoming a ForkedSession under a parent gets a
-        # FORKED edge. If this was a reclassification of an already-typed
-        # Root/Sub node, drop the stale parent edge FIRST. Keyed on current_type
-        # (not transition.remove) to mirror the legacy code exactly. The terminal
-        # ForkedSession no-op has empty transition.add, so creates no edge.
+        # A session becoming a ForkedSession gets a FORKED edge; a
+        # reclassified Root/Sub node drops its stale parent edge first.
         if "ForkedSession" in transition.add and parent_id:
             if current_type in ("RootSession", "SubSession"):
                 self.services.graph.remove_edge(parent_id, session_id)
@@ -301,36 +280,22 @@ class SessionHandler:
     async def _handle_end(
         self, session_id: str, timestamp: str, data: dict[str, Any]
     ) -> None:
-        # Read the session's current labels BEFORE writing the end-event upsert.
-        # After a flush (the drainer flushes between event batches) the node
-        # buffer is empty, so get_node falls through to Neo4j and returns the
-        # real persisted type label (SubSession / ForkedSession).  If we upsert
-        # first, that upsert creates a fresh buffer entry holding only
-        # ["Session", "SST_EVENT"], which SHADOWS the persisted type on the
-        # buffer-first get_node read -> _current_type reads None -> stub-recovery
-        # spuriously adds RootSession (a dual terminal label).  Reading first
-        # mirrors _handle_start and _handle_fork, which both read before writing.
+        # Read labels BEFORE the end-event upsert -- upserting first would
+        # shadow the persisted type label and spuriously trigger stub-recovery.
         existing = await self.services.graph.get_node(session_id)
         labels: list[str] = existing.get("labels", []) if existing else []
         _warn_if_dual_terminal(labels, session_id)
         parent_id = _parent_of(data)
 
         end_node_data: dict[str, Any] = {
-            # Seed with the labels just read so this upsert's buffer entry cannot
-            # SHED a persisted terminal type: a later same-batch read of this
-            # session then sees the type carried here, rather than a bare
-            # ["Session", "SST_EVENT"] entry that would look like an unclassified
-            # stub and trigger spurious stub-recovery.
+            # Seed with labels just read so this entry can't shed a
+            # persisted terminal type and trigger spurious stub-recovery.
             "labels": ["Session", "SST_EVENT", *labels],
             "ended_at": timestamp,
             "status": "completed",
             "session_id": session_id,
         }
-        # Persist parent_id when the end payload carries one. A session that
-        # reaches session:end without a captured start/fork would otherwise
-        # have no parent_id at all, leaving `parent_id IS NULL` ambiguous
-        # between "no parent" and "not recorded". Only write when present;
-        # never fabricate a value when absent.
+        # Only write parent_id when present; never fabricate a value.
         if parent_id:
             end_node_data["parent_id"] = parent_id
 
@@ -342,10 +307,8 @@ class SessionHandler:
             session_id, data_layer_1_node_id, {"type": "SOURCED_FROM"}
         )
 
-        # Stub recovery: if session:start was permanently missed (bare Session),
-        # mark the session as IncompleteSession instead of fabricating a real
-        # terminal label (Sub/Root).  This keeps the guess out of the clean
-        # Root/Sub/Forked terminal space and surfaces a health signal.
+        # Stub recovery: if start was permanently missed, mark
+        # IncompleteSession rather than fabricating a real terminal label.
         transition = self._label_machine.classify(
             _current_type(labels), "end", bool(parent_id)
         )
@@ -378,7 +341,6 @@ class SessionHandler:
             {"type": "HAS_PART", "sst_semantic": "CONTAINS"},
         )
         # SOURCED_FROM bridge: MountPlan -> data_layer_1 session:fork event
-        # The session:fork event contains data.raw (blob) with the full mount plan config
         await self.services.graph.upsert_edge(
             mount_plan_id,
             data_layer_1_fork_node_id,

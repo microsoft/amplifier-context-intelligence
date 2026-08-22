@@ -1,43 +1,9 @@
 """Idempotency key burned before the durable append.
 
-Verified against the working tree with the durable append-log framing,
-drain supervision, boot-safety, writer-lease, steady-state reclaim, and
-finalize-delete-ordering fixes already implemented.
-
-Bug (pre-fix): ``EventIdempotencyCache.check_and_store`` burns the key
-BEFORE the durable append (``main.py:1269`` -> ``:1291``). If anything in
-that window raises (``get_or_create``, the body round-trip, or
-``queue_manager.append`` itself), the key is permanently burned for an
-event that has ZERO bytes on disk. A client retry with the same key is then
-answered HTTP 202 ``{"status": "duplicate"}`` -- a success code -- for an
-event no recovery path (boot recovery, finalize re-drain,
-compaction) can ever resurrect, because it never reached the log.
-
-Fix (store-on-success): split the cache into ``seen(key)``
-(read-only duplicate check, called BEFORE the append) and ``store(key)``
-(record the key, called ONLY after ``queue_manager.append`` returns
-normally). No try/except, no new state, no new response code -- "release on
-failure" is simply not reaching the store line.
-
-Test map (with a correction applied to T1/T1b):
-
-    T1  -- append fails -> key not burned -> retry honoured, becomes durable
-    T1b -- the cache itself is untouched by a failed append
-    T2  -- genuine duplicate still "duplicate"; polarity tripwire
-    T3  -- concurrent same-key double-POST: both append (R-1, accepted)
-    T4  -- reservation leak: N/A by construction (documented, not skipped)
-    T5  -- replay path unaffected (regression)
-    T6  -- EventIdempotencyCache.seen/store unit behaviour
-    T7  -- no stale check_and_store references anywhere in the repo
-
-tests/conftest.py's ``client`` fixture uses
-``httpx.ASGITransport(app=app)`` with the httpx default
-``raise_app_exceptions=True``, and ``main.py`` registers NO custom exception
-handler. An unhandled exception raised inside ``post_events`` therefore
-PROPAGATES OUT of ``await client.post(...)`` itself -- there is no response
-object, so a bare "assert response.status_code == 5xx" is unachievable
-through this test client. T1/T1b wrap POST #1 in ``pytest.raises(OSError)``
-accordingly.
+The idempotency cache must not burn a key until ``queue_manager.append``
+returns successfully: ``seen(key)`` (read-only duplicate check) runs before
+the append; ``store(key)`` runs only after it succeeds. A failed append must
+never poison a retry with a false "duplicate".
 """
 
 from __future__ import annotations
@@ -78,7 +44,7 @@ def _payload(session_id: str, idempotency_key: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# T1 -- append fails => key not burned => retry honoured, becomes durable
+# Append fails => key not burned => retry honoured, becomes durable
 # ---------------------------------------------------------------------------
 
 
@@ -86,15 +52,8 @@ async def test_t1_append_failure_leaves_key_unburned_retry_honoured(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The headline silent-loss bug, reproduced and then required-fixed.
-
-    Monkeypatch ``registry.queue_manager.append`` to raise ``OSError`` on
-    call 1 and record on call 2. POST #1 with key K must raise -- no
-    HTTP response is observable for this failure through the
-    test client. POST #2 with the SAME key K must be honoured: 202
-    "queued", and the event actually appended -- not answered "duplicate"
-    for a still-nonexistent event (the pre-fix bug).
-    """
+    """POST #1 (append raises) must not burn the key; POST #2 with the same
+    key must be honoured (202 "queued", actually appended), not "duplicate"."""
     monkeypatch.setattr(
         main_module.registry, "get_or_create", lambda *a, **k: MagicMock()
     )
@@ -123,10 +82,7 @@ async def test_t1_append_failure_leaves_key_unburned_retry_honoured(
     assert call_count == 1
     assert appended == []
 
-    # POST #2: same key. Pre-fix (current code): idempotency_cache already
-    # burned the key during POST #1 (check_and_store ran before append), so
-    # this returns 202 "duplicate" with nothing appended -- the bug,
-    # reproduced. Post-fix: the key was never stored because append never
+    # POST #2: same key. The key was never stored because append never
     # returned successfully, so the retry is honoured and becomes durable.
     second = await client.post("/events", json=payload)
     assert second.status_code == 202
@@ -165,15 +121,12 @@ async def test_t1b_cache_untouched_by_failed_append(
     with pytest.raises(OSError):
         await client.post("/events", json=payload)
 
-    # Pre-fix: idempotency_cache.check_and_store already stored the key
-    # before append was ever reached, so a post-fix-shaped ``.seen(key)``
-    # check does not even exist yet on current code (AttributeError -- RED
-    # by absence). Post-fix: seen(key) must be False -- nothing was stored.
+    # seen(key) must be False -- nothing was stored.
     assert main_module.idempotency_cache.seen(key) is False
 
 
 # ---------------------------------------------------------------------------
-# T2 -- genuine duplicate still "duplicate"; polarity tripwire
+# Genuine duplicate still "duplicate"
 # ---------------------------------------------------------------------------
 
 
@@ -182,20 +135,7 @@ async def test_t2_genuine_duplicate_still_duplicate_no_double_append(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Two sequential POSTs, append always succeeds -> first "queued",
-    second "duplicate", exactly one durable line.
-
-    This assertion passes both before and after the fix under CORRECT
-    polarity -- it mirrors tests/test_main.py:91 by design (T2:
-    "passes today"). Its value as a RED signal is against a DELIBERATELY
-    inverted implementation of the fix (the ``seen()``/``store()`` split's
-    documented polarity trap -- ``check_and_store`` returned True for NEW;
-    ``seen`` returns True for DUPLICATE, so a mechanical
-    ``if not is_new:`` -> ``if not idempotency_cache.seen(...):`` rename
-    inverts the guard and answers the FIRST POST "duplicate"). See the
-    weaken/revert RED evidence captured during implementation (this test
-    unmodified, main.py's guard temporarily inverted, reverted) for the
-    live demonstration of this exact trap.
-    """
+    second "duplicate", exactly one durable line."""
     monkeypatch.setattr(
         main_module.registry, "get_or_create", lambda *a, **k: MagicMock()
     )
@@ -219,7 +159,7 @@ async def test_t2_genuine_duplicate_still_duplicate_no_double_append(
 
 
 # ---------------------------------------------------------------------------
-# T3 -- concurrent same-key double-POST: both append (R-1, accepted)
+# Concurrent same-key double-POST: both append
 # ---------------------------------------------------------------------------
 
 
@@ -228,27 +168,12 @@ async def test_t3_concurrent_same_key_double_post_both_append(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Hold POST #1 inside a patched ``append`` until POST #2 has passed its
-    own ``seen()`` check, then release; gather both.
-
-    Both must return 202 "queued", both must append (len == 2), and
-    NEITHER may be answered "duplicate" -- this pins the accepted
-    tradeoff: two same-key POSTs that overlap inside the check->store
-    window both append; the duplicate converges downstream via idempotent
-    MERGE. This is realizable ONLY because ``append`` is
-    monkeypatched, bypassing the real per-key admission lock that would
-    otherwise serialize two same-key POSTs and remove the interleave --
-    do not "fix" this test toward the real queue manager.
-
-    Pre-fix (current code): POST #1's ``check_and_store`` runs to
-    completion -- store included -- entirely BEFORE append is ever called
-    (no await between check and store in the old synchronous method), so by
-    the time POST #2 reaches its check the key is already burned. POST #2
-    returns "duplicate" immediately without ever calling append, and
-    ``release`` (only set by the second ``append`` call) is never set --
-    POST #1 hangs forever inside ``append``. Bounded via
-    ``asyncio.wait_for`` so this shows up as a clean RED (timeout), not an
-    unbounded hang.
-    """
+    own ``seen()`` check, then release; gather both. Both must return 202
+    "queued" and append (len == 2); neither may be answered "duplicate" --
+    two same-key POSTs overlapping inside the check->store window both
+    append, converging downstream via idempotent MERGE. Realizable only
+    because ``append`` is monkeypatched, bypassing the real per-key
+    admission lock; do not "fix" this test toward the real queue manager."""
     monkeypatch.setattr(
         main_module.registry, "get_or_create", lambda *a, **k: MagicMock()
     )
@@ -291,26 +216,19 @@ async def test_t3_concurrent_same_key_double_post_both_append(
 
 
 # ---------------------------------------------------------------------------
-# T4 -- reservation leak: N/A by construction (documented, not skipped)
+# Reservation leak: not applicable by construction
 # ---------------------------------------------------------------------------
 
 
 def test_t4_reservation_leak_not_applicable_by_construction() -> None:
-    """T4 (acceptance (d)): N/A by construction.
-
-    The chosen design (store-on-success) creates no
-    reservation state -- there is nothing analogous to
-    ``check_and_reserve``, so there is no reservation that can leak and no
-    key that can be permanently blocked by a lost ``release``. The adjacent
-    real property IS covered elsewhere: T1b proves a failed attempt leaves
-    zero cache state, and T1 proves the next attempt is a fresh, unblocked
-    one. Recorded here as an honest N/A -- not a skipped requirement.
-    """
+    """The store-on-success design has no reservation state analogous to
+    ``check_and_reserve``, so there is no reservation that can leak or a key
+    that can be permanently blocked by a lost ``release``."""
     assert True  # documentation-only; see docstring
 
 
 # ---------------------------------------------------------------------------
-# T5 -- replay path unaffected (regression)
+# Replay path unaffected (regression)
 # ---------------------------------------------------------------------------
 
 
@@ -319,10 +237,8 @@ async def test_t5_replay_never_stores_key_non_replay_still_honoured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``?replay=true`` twice with key K -> both "queued", 2 appends; then a
-    NON-replay POST with K -> "queued" (not "duplicate"), proving replay
-    never stored K. (tests/test_main.py:126 covers the single-replay case
-    and must pass UNMODIFIED alongside this file -- verified separately.)
-    """
+    non-replay POST with K -> "queued" (not "duplicate"), proving replay
+    never stored K."""
     monkeypatch.setattr(
         main_module.registry, "get_or_create", lambda *a, **k: MagicMock()
     )
@@ -350,13 +266,12 @@ async def test_t5_replay_never_stores_key_non_replay_still_honoured(
 
 
 # ---------------------------------------------------------------------------
-# T6 -- EventIdempotencyCache.seen/store unit behaviour
+# EventIdempotencyCache.seen/store unit behaviour
 # ---------------------------------------------------------------------------
 
 
 class TestEventIdempotencyCacheSeenStore:
-    """Direct unit coverage of the new seen()/store() split. New surface --
-    RED by absence on current (pre-fix) code."""
+    """Direct unit coverage of the seen()/store() split."""
 
     def test_seen_false_then_store_then_seen_true(self) -> None:
         cache = EventIdempotencyCache()
@@ -397,25 +312,15 @@ class TestEventIdempotencyCacheSeenStore:
 
 
 # ---------------------------------------------------------------------------
-# T7 -- no stale check_and_store references anywhere in the repo
+# No stale check_and_store references anywhere in the repo
 # ---------------------------------------------------------------------------
 
 
 def test_t7_no_stale_check_and_store_references() -> None:
-    """check_and_store is removed and must have no remaining CALL SITES
-    or DEFINITIONS anywhere in the repo (product code, tests, scripts).
-
-    Note: the new ``seen()`` method's own docstring explains the rename
-    by name-dropping the old method in prose (e.g. "the former
-    ``check_and_store``, byte for byte"), so a bare substring scan for
-    "check_and_store" would flag that docstring itself as a violation of
-    this very check. Resolved by scoping this check to the CALL/DEF form
-    ``check_and_store(`` (the name immediately followed by an open paren)
-    -- which is what "no remaining references" substantively guards against
-    (dead code, live call sites) -- rather than banning the bare identifier
-    in explanatory prose. This file itself is excluded from the scan (it
-    discusses the removal in prose without that call-form).
-    """
+    """``check_and_store`` must have no remaining call/def sites anywhere in
+    the repo. Scoped to the ``check_and_store(`` call/def form (not the bare
+    identifier) so explanatory prose mentioning the old name doesn't trip
+    the scan; this file is excluded from the scan for the same reason."""
     repo_root = Path(__file__).resolve().parents[1]
     this_file = Path(__file__).resolve()
     target = "check_and_store("

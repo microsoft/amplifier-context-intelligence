@@ -1,56 +1,15 @@
-"""On-disk durable queue manager for the event-write pipeline.
+"""On-disk durable queue for the event-write pipeline.
 
-Disk layout (one set of files per session, keyed by ``session_id``):
+Per session ``<id>``: ``.log`` (append-only, ``\\n``-terminated records),
+``.offset`` (committed byte position, missing == 0), ``.dead.jsonl`` (dead
+letters), ``.log.compact.tmp`` (transient compaction copy).
 
-- ``<session_id>.log`` -- append-only, newline-terminated, opaque ``bytes``.
-  Each line is one enqueued record. The log is REWRITTEN only via
-  ``compact_committed_prefix``: the committed prefix is
-  dropped and the log rebased to hold just its undrained tail. This is
-  ALWAYS an atomic tmp + ``os.replace`` -- the log is never rewritten IN
-  PLACE, and no path ever seeks-and-overwrites live bytes.
-- ``<session_id>.offset`` -- a single integer: the byte position in the log
-  that has been durably processed (committed). A missing offset file means 0.
-- ``<session_id>.dead.jsonl`` -- append-only dead-letter records for batches
-  that could not be processed after exhausting retries. Expired
-  once log-less and older than ``dead_letter_retention_seconds``.
-- ``<session_id>.log.compact.tmp`` -- transient tmp used ONLY by
-  ``compact_committed_prefix``'s tail copy. Inert to every other reader,
-  classifier and recovery pass (matches no other glob); a stray left by a
-  crash mid-compaction is reaped by ``reclaim_orphans`` as
-  ``orphan_compact_tmp``.
-
-Durability note:
-    Appends use a plain ``write()`` (no ``fsync``): bytes reach the OS page
-    cache and survive a process crash, but not a power loss.
-
-session_id contract:
-    Every public method validates ``session_id`` and raises ``ValueError`` if
-    it is empty or contains a path separator (``/`` or ``\\``) or a null byte.
-    The ``session_id`` is used raw as the filename stem, so it must be a safe,
-    single path component.
-
-Framing invariant:
-    One event == one contiguous byte range in the ``.log``, terminated by
-    exactly one ``\\n``, for any payload size, under any concurrency, under
-    cancellation, on any filesystem -- AS LONG AS EXACTLY ONE PROCESS WRITES
-    THE QUEUE DIRECTORY. That precondition is not enforced by this module
-    (see ``main.py``'s single-worker startup guard); a violation is a
-    cross-process race no in-process lock can see.
-
-    A second, narrower precondition this invariant depends on (v2.1 P1):
-    a record's bytes contain no raw ``0x0A`` except the terminator this
-    module appends. That is true today because every caller serializes with
-    ``json.dumps(..., ensure_ascii=True)`` (the default) -- see
-    ``main.py``'s event-ingest handler and this module's own
-    ``dead_letter``. A future caller that violates P1 must revisit this
-    module's torn-tail reasoning (queue_manager tests assert P1 on real
-    record bytes).
-
-    Correctness here does NOT depend on filesystem write atomicity
-    (``O_APPEND`` is kept as defence in depth, not relied upon): each key's
-    ``_KeyGuard.file_lock`` is a ``threading.Lock`` acquired and released by
-    the worker thread that performs the write, so no event-loop event --
-    cancellation included -- can release it mid-write.
+Framing (one event == one ``\\n``-terminated byte range) holds only while a
+single process writes the directory; each key's ``file_lock`` (a
+``threading.Lock`` held on the writing thread) serialises its writes. Records
+must contain no raw ``0x0A`` except the terminator. ``session_id`` is the raw
+filename stem and is rejected if empty or containing a separator or null byte.
+Appends are not ``fsync``ed: crash-durable, not power-loss-durable.
 """
 
 from __future__ import annotations
@@ -159,20 +118,12 @@ class Verdict(str, Enum):
 
 @dataclass(frozen=True)
 class Classification:
-    """One `classify_session` verdict. Produced with NO side effects.
+    """One side-effect-free ``classify_session`` verdict.
 
-    ``size`` is the `.log` `st_size` AT CLASSIFY TIME (0 when the log is
-    missing/vanished) -- ``reclaim`` re-`stat()`s inside its guarded body and
-    refuses to apply if the live size has drifted (the real check is size
-    DRIFT, not ``size > committed``, because a RESET_OFFSET's `.offset` is
-    corrupt by definition and cannot be read to produce a `committed` to
-    compare against).
-
-    ``dead_empty`` is whether `.dead.jsonl` was absent/0-byte at classify
-    time. ``fallback_source`` is ``"byte0"`` or
-    ``"sentinel"`` ONLY when ``reason == "fallback_workspace"``, else
-    ``None`` -- kept separate from ``reason`` so the two
-    fallback populations are counted distinctly on `/status`.
+    ``size`` is the ``.log`` ``st_size`` at classify time; ``reclaim`` re-stats
+    inside its guarded body and refuses to apply if the size has drifted.
+    ``dead_empty`` records whether ``.dead.jsonl`` was empty. ``fallback_source``
+    is set only when ``reason == "fallback_workspace"``.
     """
 
     key: str
@@ -193,35 +144,15 @@ def _reclaim_redrain_max_bytes() -> int:
 
 @dataclass
 class _KeyGuard:
-    """Everything that serializes access to ONE worker key's files.
+    """Serializes access to one worker key's files.
 
-    Two locks and one counter, three DIFFERENT jobs -- do not collapse them:
-
-    ``file_lock`` is the CORRECTNESS lock for the BYTES. It is acquired and
-    released by the WORKER THREAD that performs the write, in a ``finally``
-    in that same thread. No event-loop event can release it. This is what
-    makes the framing invariant true under cancellation: a ``CancelledError``
-    unwinds coroutine frames on the event-loop thread, and none of those
-    frames hold this lock.
-
-    ``admission`` is a RESOURCE lock, not a correctness lock. It caps the
-    number of worker threads this process will dispatch for one key at 1, so
-    a burst on the busiest key cannot occupy the whole default executor
-    (which ``read_batch``/``commit``/``spool_stats`` also share). If it were
-    removed, the file would still never tear -- writes would just queue as
-    blocked threads instead of as parked coroutines.
-
-    ``waiters`` is the CORRECTNESS counter for the OBJECT'S LIFETIME. IT IS
-    LOAD-BEARING -- ``delete_drained`` branches on it (v2.1 G1). It is the
-    exact number of coroutines that currently hold a reference to this guard,
-    including any parked on ``admission``. Removing a guard while a coroutine
-    still references it lets that coroutine write under THIS ``file_lock``
-    while a newcomer writes the SAME file under a fresh one -- two disjoint
-    locks on one file, which reproduces the torn/merged-line corruption. It is
-    incremented and decremented ONLY by ``_guard``, only on the event-loop
-    thread, and never across an ``await`` boundary; on a single event loop it
-    is therefore exact, not a heuristic. It doubles as the non-vacuous
-    contention assertion in T2.
+    ``file_lock`` (``threading.Lock``): correctness lock for the bytes, held on
+    the writing thread so no coroutine cancellation can release it mid-write.
+    ``admission`` (``Semaphore(1)``): caps dispatched threads per key so one
+    key cannot occupy the shared executor; not a correctness lock.
+    ``waiters``: exact count of coroutines referencing this guard.
+    ``delete_drained`` refuses to drop the guard while any remain, else two
+    coroutines could lock the same file under different guards and tear it.
     """
 
     admission: asyncio.Lock
@@ -230,20 +161,13 @@ class _KeyGuard:
 
 
 async def _await_uninterrupted(coro: Coroutine[Any, Any, _T]) -> _T:
-    """Await ``coro`` to completion even if THIS coroutine is cancelled.
+    """Await ``coro`` to completion even if this coroutine is cancelled.
 
-    ``asyncio.to_thread`` cannot interrupt the OS thread it dispatched. If we
-    returned as soon as a ``CancelledError`` arrived, ``append`` would return
-    while its bytes were still in flight -- the caller would be told nothing
-    definite, and the admission gate would open for the next writer.
-
-    So: absorb cancellations, keep waiting, and re-raise the cancellation
-    once the write has definitively succeeded or failed.
-
-    NOTE ON RISK: this helper is resource hygiene and caller honesty. It is
-    NOT what makes the framing invariant true -- ``_KeyGuard.file_lock`` is.
-    If this helper were removed entirely, throughput and accounting would
-    degrade; the file still would not tear.
+    ``asyncio.to_thread`` cannot interrupt the OS thread it dispatched, so a
+    cancellation is absorbed and re-raised only once the write has definitively
+    succeeded or failed -- otherwise ``append`` would return with bytes still in
+    flight. This is resource hygiene, not the framing guarantee (that is
+    ``_KeyGuard.file_lock``).
     """
     task = asyncio.ensure_future(coro)
     cancelled: asyncio.CancelledError | None = None
@@ -420,22 +344,13 @@ class QueueManager:
 
     @contextlib.contextmanager
     def _guard(self, worker_key: str) -> Iterator[_KeyGuard]:
-        """Get-or-create this key's guard AND register this coroutine as a holder.
+        """Get-or-create this key's guard and register this coroutine as a holder.
 
-        Get-or-create and the ``waiters`` increment are fused into ONE
-        synchronous step with NO ``await`` between them, so an UNCOUNTED
-        reference is not merely forbidden -- it is unwritable. The
-        ``finally`` makes the decrement unforgettable. This is a race
-        DELETED, not a race guarded against.
-
-        CORRECTNESS-ORDERING REQUIREMENT (not a convenience): the increment
-        MUST happen before the caller's first ``await``. Adding any yield
-        point between the ``self._guards`` lookup and ``waiters += 1``
-        reintroduces this race. Both statements are synchronous; keep them
-        that way.
-
-        Every guarded operation -- append, dead_letter, delete_drained,
-        purge_dead_letters -- uses this. There are no exceptions.
+        The lookup and the ``waiters`` increment are one synchronous step with
+        no ``await`` between them, so an uncounted reference is impossible; the
+        ``finally`` decrements. Keep both statements synchronous -- a yield
+        point between them reintroduces the race. Every guarded operation uses
+        this.
         """
         guard = self._guards.get(worker_key)
         if guard is None:
@@ -467,30 +382,15 @@ class QueueManager:
 
     @staticmethod
     def _discard_partial(fd: int, start: int, path: Path) -> None:
-        """Undo a record whose write failed part-way. NEVER fails silently.
+        """Undo a record whose write failed part-way. Never fails silently.
 
-        Preferred: ``ftruncate`` the partial bytes away entirely -- the file
-        returns to a clean line boundary and NOTHING downstream ever sees the
-        failed record.
-
-        Fallback, only if the truncate itself fails: terminate the fragment
-        with a newline via the same short-write-safe loop, so at minimum the
-        NEXT record cannot merge into it. Each failure is LOGGED at ERROR --
-        this is the failure path of a corruption fix; a silent suppress here
-        is the exact anti-pattern this whole issue is about.
-
-        NOTE on the fallback: the newline-terminated ``<partial>\\n`` is a
-        SYNTACTICALLY COMPLETE line, not a torn tail -- ``read_batch`` accepts
-        it and ``heal_torn_tails`` will NOT quarantine it. That is safe: the
-        write that produced it already raised ``OSError`` out to append()'s
-        caller, so the event was never acknowledged; on the next drain the
-        malformed JSON fails ``_parse_line`` and is correctly DEAD-LETTERED
-        (offset advanced past it). Reached only on a compound OS failure
-        (ftruncate fails AND the subsequent write succeeds).
-
-        Final backstop if BOTH the truncate and the newline write fail: a
-        genuine torn TAIL (no trailing newline), which every reader ignores
-        and ``heal_torn_tails`` removes at next boot.
+        Preferred: ``ftruncate`` the partial bytes away, returning the file to a
+        clean line boundary. Fallback if truncate fails: newline-terminate the
+        fragment so the next record cannot merge into it (the failed write
+        already raised to the caller, so the event was unacknowledged; the
+        malformed line is dead-lettered on next drain). Final backstop if both
+        fail: a torn tail with no newline, which readers ignore and
+        ``heal_torn_tails`` removes at next boot. Failures are logged at ERROR.
         """
         try:
             os.ftruncate(fd, start)
@@ -512,21 +412,13 @@ class QueueManager:
             )
 
     def _write_record(self, guard: _KeyGuard, path: Path, line: bytes) -> None:
-        """Append ONE newline-terminated record as a contiguous byte range.
+        """Append one newline-terminated record as a contiguous byte range.
 
-        RUNS IN A WORKER THREAD. Acquires ``guard.file_lock`` ITSELF -- the
-        caller must NOT hold it, and must not try to release it. That is the
-        whole point: the lock's lifetime is the thread's write, not the
-        coroutine's await.
-
-        ``O_APPEND`` is KEPT. The guard is what removes the RELIANCE on its
-        atomicity; ``O_APPEND`` stays as defence in depth, because if a
-        second writer ever appears it still positions every op at
-        server-side EOF whereas seek-then-write would race on a stale
-        position and OVERWRITE data.
-
-        No ``fsync`` is issued: appends survive a process crash but not a
-        power loss.
+        Runs in a worker thread and acquires ``guard.file_lock`` itself, so the
+        lock's lifetime is the thread's write, not the coroutine's await; the
+        caller must not hold it. ``O_APPEND`` is kept as defence in depth (it
+        positions every op at server-side EOF), but correctness rests on the
+        guard, not on its atomicity. Not ``fsync``ed.
         """
         with guard.file_lock:
             flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
@@ -545,18 +437,11 @@ class QueueManager:
     def _heal_one(path: Path) -> tuple[int, bool]:
         """Heal one torn tail. Returns ``(bytes_discarded, healed)``.
 
-        ORDERING IS LOAD-BEARING: copy the torn bytes to a quarantine
-        sidecar, VERIFY the quarantine is byte-complete, THEN truncate --
-        never the reverse, and never a truncate after a copy that raised or
-        came up short. A partial or failed quarantine means the file is LEFT
-        EXACTLY AS IT WAS: the torn tail stays, every reader already skips
-        it, and the next boot retries. Truncating on an incomplete
-        quarantine would destroy the only remaining copy of those bytes --
-        strictly worse than leaving a tail that harms nobody.
-
-        Raises ``OSError`` on ANY failure (quarantine write, verification
-        mismatch, or truncate) -- the caller (``heal_torn_tails``) catches it
-        per file so one bad file cannot fail the whole pass.
+        Ordering is load-bearing: copy the torn bytes to a quarantine sidecar,
+        verify it is byte-complete, then truncate -- never the reverse. A
+        partial or failed quarantine leaves the file untouched (readers already
+        skip the tail; next boot retries). Raises ``OSError`` on any failure;
+        the caller catches it per file.
         """
         end = QueueManager._last_complete_end(path)
         size = path.stat().st_size
@@ -593,30 +478,15 @@ class QueueManager:
         return torn_bytes, True
 
     async def heal_torn_tails(self) -> dict[str, int]:
-        """ONE-TIME, BOUNDED startup pass: truncate every queue file back to
-        its last complete line, quarantining the removed bytes.
+        """One-time startup pass: truncate every queue file back to its last
+        complete line, quarantining the removed bytes.
 
-        Runs ONCE per boot, BEFORE ``recovery_reconcile_dead``, BEFORE
-        ``recovery_seed_counts``, BEFORE ``recover()`` respawns any drainer --
-        so no reader and no writer is live while it runs. It is the ONLY
-        place a queue file is ever shortened.
-
-        For each ``*.log`` and ``*.dead.jsonl``, INDEPENDENTLY and
-        FAULT-ISOLATED (v2.1 G3): a per-file failure is logged at ERROR and
-        the file is skipped -- healing continues for the rest. THIS METHOD
-        MUST NOT RAISE. Its caller is a lifespan hook, and a raise there is a
-        restart loop on the very share being healed. Even the directory scan
-        itself is guarded the same way, so an unreadable queue directory
-        degrades to "healed nothing" rather than a boot loop.
-
-        ``size == 0``, or a file with no newline at all (``end == 0``), are
-        handled by the same arithmetic -- a 0-byte file is never touched
-        (``0 > 0`` is false), and a newline-free file truncates to empty
-        (correct: it contains no complete record). There is NO end-relative
-        seek anywhere in this pass.
-
-        Returns ``{"files_healed": n, "bytes_discarded": b, "files_failed":
-        f}`` for the boot log. BOOT PROCEEDS EITHER WAY.
+        Runs once per boot before any reader/writer is live, and is the only
+        place a queue file is shortened. Each ``*.log``/``*.dead.jsonl`` is
+        healed independently; a per-file failure is logged and skipped. Must
+        not raise (the caller is a lifespan hook; a raise would restart-loop on
+        the share being healed). Returns
+        ``{"files_healed", "bytes_discarded", "files_failed"}``.
         """
 
         def _heal_all() -> dict[str, int]:
@@ -730,19 +600,11 @@ class QueueManager:
     async def dead_letter(self, session_id: str, raw: bytes, error: str) -> None:
         """Append one dead-letter record for an unprocessable batch line.
 
-        The original line is stored under ``payload`` as a UTF-8 string when it
-        decodes cleanly; otherwise the raw bytes are stored base64-encoded under
-        ``payload_b64`` (so non-UTF-8 payloads are never silently dropped). Each
-        record also carries a ``ts`` (epoch seconds) and the ``error`` string.
-
-        This is the dead-letter PRIMITIVE only. The poison-isolation POLICY
-        (deciding WHEN to dead-letter a line) lives in the caller. The main
-        ``.log`` and ``.offset`` files are untouched.
-
-        Guarded by the SAME per-key ``_KeyGuard`` as ``append``: an
-        unguarded write here is exactly as dangerous as an
-        unguarded ``.log`` write, and is the trigger named for the b87417ef
-        "fourth state".
+        Stores the line under ``payload`` (UTF-8) or ``payload_b64`` (raw
+        bytes), plus ``ts`` and ``error``. Primitive only -- the caller decides
+        when to dead-letter. Guarded by the same per-key ``_KeyGuard`` as
+        ``append`` (an unguarded write here is as dangerous as an unguarded
+        ``.log`` write); the ``.log``/``.offset`` files are untouched.
         """
         self._validate_session_id(session_id)
         payload = raw[:-1] if raw.endswith(b"\n") else raw
@@ -770,47 +632,19 @@ class QueueManager:
                     raise
 
     async def delete_drained(self, session_id: str) -> bool:
-        """Remove the drained .log and .offset for a fully-finalized session.
+        """Remove the drained ``.log``/``.offset`` for a finalized session.
 
-        GUARDED and CONDITIONAL. Returns True if the files were removed (or
-        were already both absent).
+        Returns True if removed (or already both absent). Takes
+        ``guard.file_lock`` before unlinking, so it can never race an in-flight
+        append. Refuses (returns False) if the log still has uncommitted bytes;
+        the caller re-drains and retries a bounded number of times, and
+        ``recover()`` picks up any give-up. A missing ``.log`` still unlinks a
+        stale ``.offset`` (else a recreated log reads past its own end). Keeps
+        ``.dead.jsonl``. Idempotent.
 
-        Guarded: an unlink racing an in-flight append is how an event gets
-        "appended successfully, then vanishes forever" -- worse than a
-        dead-letter, because nothing detects the loss. The thread body takes
-        ``guard.file_lock`` before unlinking, so it can never run while a
-        write thread owns the fd.
-
-        Conditional: even perfectly serialized, a naive caller could drain to
-        EOF, THEN delete -- an append that arrives in between would be lost
-        with no trace. The guard cannot fix that ordering by itself, so this
-        method REFUSES to delete a log with uncommitted bytes and logs it.
-        The caller (``_finalize_session``,
-        registry.py) now RE-DRAINS on a False return and retries the delete,
-        up to a bounded number of attempts, on this still-live drainer over
-        this still-open store -- shrinking (not eliminating) the window. On
-        give-up the session's retained files are found by ``recover()``
-        (typically within the <=60s crash-recovery sweep, or the next POST
-        for this session -- not merely "at next boot") and drained normally.
-        Trade: a retained file (visible in spool_stats.pending_sessions)
-        instead of a silent loss.
-
-        A missing ``.log`` still unlinks a stale ``.offset``:
-        leaving one behind would make a later-recreated log (the
-        finalize-retry window above)
-        start reading past its own end -- a silent, clean-looking loss.
-
-        The .dead.jsonl is still intentionally KEPT. Idempotent as before.
-
-        Guard removal (v2.1 G1): after the unlink, the entry is removed from
-        the guard map ONLY if ``waiters == 1`` (this call is the only
-        coroutine referencing the guard) AND the identity check passes.
-        Otherwise another coroutine is holding a reference -- e.g. parked on
-        ``admission`` -- and removing the entry would let it later write
-        under a stale ``file_lock`` while a newcomer creates a fresh one:
-        two disjoint locks on one file, the exact merged-line defect this
-        whole change removes. Skipping removal in that case is safe and
-        correct: the surviving coroutine simply reuses the same guard.
+        The guard-map entry is dropped only when ``waiters == 1`` and identity
+        matches; otherwise a still-referencing coroutine could later lock a
+        fresh guard over the same file and tear it.
         """
         self._validate_session_id(session_id)
         log = self._log_path(session_id)
@@ -866,43 +700,18 @@ class QueueManager:
     async def compact_committed_prefix(
         self, session_id: str, min_prefix_bytes: int = 0, max_tail_bytes: int = 0
     ) -> int:
-        """Rewrite ``<session_id>.log`` to hold only its undrained TAIL.
+        """Rewrite ``<session_id>.log`` to keep only its undrained tail.
 
-        The queue is a
-        transient buffer, not an archive -- a still-OPEN session that has
-        fully drained data must not keep the whole history on disk. This
-        reclaims the already-committed PREFIX (bytes ``[0, C)``) while the
-        session stays live, unlike ``delete_drained`` (which only ever
-        removes the WHOLE file, and only at finalize).
+        Reclaims the committed prefix ``[0, C)`` while the session stays live
+        (unlike ``delete_drained``, which removes the whole file at finalize).
+        Returns the reclaimed prefix byte count ``C``; ``0`` means nothing was
+        done (no prefix, tail over ``max_tail_bytes``, or failure).
+        ``max_tail_bytes <= 0`` disables the cap. Never raises.
 
-        Returns the number of bytes reclaimed FROM THE FRONT of the log --
-        i.e. ``C``, the committed prefix -- NOT the tail kept. ``0`` means
-        nothing was reclaimed (nothing to do, the tail was too large, or the
-        attempt failed). NEVER RAISES: the entire body is guarded so an
-        ``OSError`` here can never kill a healthy drain loop.
-
-        ``max_tail_bytes <= 0`` means no cap (explicit opt-out). Above 0, a
-        tail larger than this is SKIPPED (not compacted) -- the threshold
-        bounds how long ``guard.file_lock`` is held for one rewrite, not how
-        often a rewrite happens (that is ``min_prefix_bytes``'s job).
-
-        Same acquisition order as ``append``/``dead_letter``/
-        ``delete_drained``/``reclaim``: ``_guard`` -> ``admission`` ->
-        ``asyncio.to_thread`` -> ``guard.file_lock``. Guard-map removal is
-        NOT performed here (contrast ``delete_drained``): the ``.log`` still
-        exists and the session is live, so the guard must survive.
-
-        Crash/failure ordering:
-          1. Rebase ``.offset`` to ``0`` FIRST (tmp + ``os.replace`` --
-             identical primitive to ``commit``). This is the point of no
-             return: every crash window from here degrades to a bounded
-             RE-DRIVE, never a loss.
-          2. THEN ``os.replace`` the verified tail tmp over the ``.log``.
-          3. If step 2 raises, RESTORE ``.offset := C`` (R3) -- a pure
-             no-op, not an in-process re-drive (which would double-count
-             ``written`` and drive the residual negative). If the restore
-             itself also fails, log the honest ``redrive_expected=true``
-             fallback rather than claim success.
+        Crash ordering: rebase ``.offset`` to 0 first (atomic tmp + replace),
+        then replace the ``.log`` with the verified tail; if that fails, restore
+        ``.offset := C``. Every window degrades to a bounded re-drive, not a
+        loss. The guard is kept (the log still exists and the session is live).
         """
         self._validate_session_id(session_id)
         log = self._log_path(session_id)
@@ -1126,20 +935,12 @@ class QueueManager:
         key: str,
         head_is_resumable: Callable[[bytes], bool],
     ) -> Classification:
-        """Boot-safety classifier.
+        """Boot-safety classifier. Side-effect-free (reads only).
 
-        Side-effect-free: reads only (never writes, truncates, or unlinks).
-        Bounded I/O: `stat()` + the backward last-complete-end scan (already
-        implemented) + one head `readline()` + (rarely) a byte-0 `readline()`
-        + a bounded forward scan of at most `_SCAN_CHUNK_BYTES` -- never a
-        whole-log read. MUST NOT RAISE: any OSError/ValueError this method
-        cannot attribute to a specific, closed-set reason becomes
-        ``Verdict.UNREADABLE`` -- its caller is a boot hook, and a raise
-        there is a restart loop on the very share being read.
-
-        ``key`` is a `.log` STEM: a log-less key (e.g. one with
-        only a `.dead.jsonl`) is never passed here -- that population is
-        ``reclaim_orphans``'s to own.
+        Bounded I/O: never a whole-log read. Must not raise -- an
+        unattributable OSError/ValueError becomes ``Verdict.UNREADABLE`` (the
+        caller is a boot hook; a raise would restart-loop on the share). ``key``
+        is a ``.log`` stem; log-less keys are ``reclaim_orphans``'s to own.
         """
         self._validate_session_id(key)
         log_path = self._log_path(key)
@@ -1299,32 +1100,15 @@ class QueueManager:
         c: Classification,
         is_owned: Callable[[], bool],
     ) -> bool:
-        """Apply a `classify_session` verdict: log-then-delete, or reset.
+        """Apply a ``classify_session`` verdict: log-then-delete, or reset.
 
-        Log-then-delete, IN THAT ORDER -- load-bearing: the
-        `boot_reclaimed` audit line is emitted BEFORE any unlink, so a crash
-        mid-unlink still leaves a record of the intent.
-
-        Re-verifies, INSIDE the guarded body, immediately before applying
-        (the server is concurrent with this
-        pass, so a live event or a live drain can invalidate a classify-time
-        snapshot before this runs):
-          1. Ownership -- ``is_owned()`` is still False.
-          2. Size DRIFT -- the `.log`'s live size still matches ``c.size``
-             (NOT ``size > committed``: on the RESET_OFFSET path the
-             `.offset` is corrupt by definition, so `committed` is
-             uncomputable).
-          3. For RESET_OFFSET only: `.dead.jsonl` is STILL empty.
-        Any failure -> apply NOTHING, log `boot_reclaim_skipped_changed`,
-        return False (re-classified next boot).
-
-        MUST NOT RAISE: an OSError is logged as `boot_reclaim_failed` and
-        returns False; the caller's pass continues to the next key.
-
-        Only ``Verdict.UNRESUMABLE``/``Verdict.DRAINED`` (delete) and
-        ``Verdict.RESET_OFFSET`` (reset) are actionable here; any other
-        verdict is a caller error (nothing to reclaim) and returns False
-        without touching disk.
+        Emits the ``boot_reclaimed`` audit line BEFORE any unlink, so a crash
+        mid-unlink still records the intent. Re-verifies inside the guarded body
+        (the server runs concurrently with this pass): ownership still False,
+        live ``.log`` size still matches ``c.size``, and for RESET_OFFSET the
+        ``.dead.jsonl`` still empty; any drift applies nothing and returns
+        False. Actionable only for UNRESUMABLE/DRAINED (delete) and
+        RESET_OFFSET (reset). Must not raise.
         """
         self._validate_session_id(c.key)
         if c.verdict not in (
@@ -1458,36 +1242,15 @@ class QueueManager:
     async def reclaim_orphans(
         self, before_ts: float, enabled: bool = True
     ) -> dict[str, int]:
-        r"""One directory pass over log-less artifacts. `stat()`-only.
+        r"""One ``stat()``-only directory pass over log-less artifacts.
 
-        Classifies `<key>.offset` / `<key>.offset.tmp` with NO `<key>.log`
-        (`orphan_offset` / `orphan_offset_tmp`), `*.torn-*.bin` sidecars
-        OLDER than ``before_ts`` (`torn_sidecar`) -- sidecars created by
-        THIS boot's ``heal_torn_tails`` are kept, so a single boot never
-        both quarantines bytes and destroys the quarantine -- and
-        ``*.log.compact.tmp`` stragglers OLDER than
-        ``before_ts`` (`orphan_compact_tmp`). UNLIKE the ``.offset``
-        classes, a compact tmp is NOT gated on `<key>.log` being absent --
-        a crash mid-compaction leaves the tmp beside a very much still-live
-        ``.log``, so requiring a log-less key would never reap it. Age
-        (``before_ts``) alone is the gate, same as ``torn_sidecar``: this
-        pass runs before any drainer exists (phase ``reclaim``, before
-        ``topup``), so a tmp from THIS boot's own compaction can never
-        exist here in the first place -- the age check is defensive
-        symmetry, not load-bearing.
-
-        ``enabled`` mirrors the per-key ``reclaim`` path's own
-        ``reclaim_enabled`` gate -- when False, EVERY candidate is only
-        classified and LOGGED as a would-delete (``action=dry_run``); NO
-        path is unlinked. When True, the candidate is unlinked for real,
-        logged (``action=delete``), and counted. ``reclaim_orphans`` must
-        never ignore ``reclaim_enabled`` and unlink unconditionally -- that
-        would be an invisible delete every boot even under the safety
-        default (``reclaim_enabled=False``). A real deletion must never be
-        invisible: ``reclaimed``/``reclaimed_bytes`` only ever reflect
-        actual unlinks, never dry-run candidates.
-
-        MUST NOT RAISE (mirrors ``heal_torn_tails``'s directory-scan guard).
+        Classifies and (when ``enabled``) unlinks: ``.offset``/``.offset.tmp``
+        with no ``.log``; ``*.torn-*.bin`` sidecars older than ``before_ts``
+        (this boot's own are kept); and ``*.log.compact.tmp`` older than
+        ``before_ts`` (age-gated, not log-less-gated, since a compaction tmp
+        sits beside a live log). With ``enabled`` False every candidate is only
+        logged as a dry-run. ``reclaimed``/``reclaimed_bytes`` count real
+        unlinks only. Must not raise.
         """
 
         def _scan() -> dict[str, int]:
@@ -1739,20 +1502,10 @@ class QueueManager:
     async def derive_all_stats(self) -> dict[str, Any]:
         """Derive live queue stats purely from disk, with a short TTL cache.
 
-        Returns an aggregate of per-worker ``in_queue`` (complete, uncommitted
-        log lines) and ``dead`` (dead-letter records), plus ``in_queue_total``
-        and ``dead_total``. No counters are stored: every value is derived from
-        the files on disk.
-
-        ``in_queue`` is computed with a TAIL READ -- seek to the committed
-        offset and read only committed->EOF, then count newlines up to the last
-        ``\\n`` (a torn trailing line has no newline and is not counted). The
-        whole-file is never read. Results are cached for ``_stats_cache_ttl``
-        seconds (monotonic clock) because ``/status`` polls every ~3s; the tail
-        read plus the cache keep that path cheap under load.
-
-        ``oldest_unflushed_age`` is deferred to C2 and is intentionally NOT
-        computed or returned here.
+        Aggregates per-worker ``in_queue`` (complete uncommitted lines) and
+        ``dead`` (dead-letter records). ``in_queue`` is a tail read from the
+        committed offset to EOF (the whole file is never read); results are
+        cached for ``_stats_cache_ttl`` seconds since ``/status`` polls often.
         """
         now = time.monotonic()
         if (
@@ -1806,69 +1559,16 @@ class QueueManager:
     async def spool_stats(self) -> dict[str, int]:
         """Cheap, aggregate-only spool footprint for the unauthenticated /status.
 
-        Incident context: a durable spool silently grew to 38 GB across 583
-        files (largest single file 4.9 GB) with ZERO signal anywhere that it
-        was happening -- the only symptom was a graph that had stopped
-        updating. This method exists so that number is always one field away.
+        Returns two integers: ``pending_sessions`` (keys whose committed offset
+        is below the ``.log`` size) and ``spool_bytes_total`` (bytes across all
+        queue files). Sized via ``stat()`` per file -- O(file count), never
+        O(bytes) -- and cached for ``_spool_cache_ttl`` seconds. No identifiers
+        are returned or derivable.
 
-        Returns exactly two aggregate integers:
-
-        - ``pending_sessions``: count of worker keys with a ``.log`` file
-          whose committed offset is strictly less than the file's size, i.e.
-          there is unconsumed data (mirrors ``active_sessions()``'s
-          definition, but via ``stat()`` instead of a full scan-and-compare
-          pass, so it is safe to call on every /status hit).
-        - ``spool_bytes_total``: total bytes on disk across EVERY file in the
-          queue directory (``.log`` + ``.offset`` + ``.dead.jsonl``) -- the
-          same number an operator would get from ``du`` on the spool
-          directory, without shelling out.
-
-        CHEAP BY CONSTRUCTION for the byte-total: this walks the directory
-        and calls ``stat()`` on each entry to size ``spool_bytes_total`` --
-        O(file count), NEVER O(file bytes). This is deliberately how a
-        38 GB spool can be SIZED on every /status poll without walking
-        38 GB of content.
-
-        HONEST CAVEAT (D-3'): ``pending_sessions``/``corrupt_offsets``
-        are NOT zero-cost -- computing them opens ONE ``.offset`` file per
-        ``.log`` via ``_read_committed_offset`` (below). That is still
-        O(files) opens of ~16 bytes each, never O(file CONTENT bytes) --
-        unlike ``derive_all_stats()``, which tail-reads each log's undrained
-        remainder to count pending lines -- but it is not the zero-``open()``
-        claim an earlier revision of this docstring made. This keeps
-        the method whole (does not split it) because it stays off the
-        boot-window request path entirely (``/status`` is phase-gated, see
-        ``main.get_status``); the honest bound is recorded here instead.
-        On top of that, results are cached for ``_spool_cache_ttl`` seconds
-        (monotonic clock) so a deployment with a very large number of spool
-        files (thousands of sessions) still does not pay a full directory
-        scan on every request.
-
-        Per the /status aggregate-only contract: NO session ids, NO
-        workspace names, and NO per-key table are returned or computable from
-        this result -- two integers only.
-
-        HEALTH-ENDPOINT SAFE: /status is the unauthenticated health probe (the
-        ACA liveness surface). This method therefore MUST NOT be able to raise
-        out to the /status handler -- an uncaught exception there becomes a 500,
-        a failed health probe, and a container restart loop. Two degradation
-        rules make that impossible:
-
-        - A directory-level failure (the queue dir missing/unavailable -- e.g.
-          an Azure Files SMB remount -- or any transient OS error while
-          scanning) returns the degraded sentinel ``{-1, -1}`` instead of
-          raising. Unlike every sibling reader, which uses ``glob()`` (empty on
-          a missing dir), this scan uses ``iterdir()`` (raises on a missing
-          dir), so the guard is mandatory, not cosmetic. The sentinel is NOT
-          cached, so the very next poll re-scans and recovers the real numbers
-          the moment the filesystem is healthy again.
-        - A per-file failure (a raced delete, or a corrupt/unreadable
-          ``.offset``) skips just that entry rather than failing the whole
-          aggregate.
-
-        A ``-1`` in either field is the operator-visible "spool footprint
-        temporarily unavailable" signal -- distinct from a real ``0`` -- and
-        never leaks any identifier.
+        Must not raise (/status is the unauthenticated health probe): a
+        directory-level failure returns the uncached sentinel ``{-1, -1}`` and a
+        per-file failure skips that entry. ``-1`` means "temporarily
+        unavailable", distinct from a real ``0``.
         """
         now = time.monotonic()
         if (
@@ -1986,42 +1686,16 @@ class QueueManager:
     async def expire_dead_letters(
         self, now: float, retention_seconds: float, enabled: bool
     ) -> dict[str, int]:
-        r"""Expire LOG-LESS dead-letter files older than ``retention_seconds``.
+        r"""Expire log-less dead-letter files older than ``retention_seconds``.
 
-        A log-less ``.dead.jsonl`` is never auto-reclaimed by any other
-        path. A key is expired iff:
-
-          (a) ``<key>.log`` does NOT exist, AND
-          (b) ``now - mtime(<key>.dead.jsonl) > retention_seconds``
-
-        The log-less condition is a STRUCTURAL PROOF, not a heuristic: both
-        boot mechanisms that consult ``.dead.jsonl``
-        (``classify_session``'s ``_dead_empty()`` gate and
-        ``recovery_reconcile_dead``) are only ever reachable for a key that
-        STILL HAS a ``.log`` -- so a log-less dead file can never be one
-        either depends on.
-
-        Whole-file mtime (not per-line ``ts``) is used because ``dead_letter``
-        only ever APPENDS -- mtime is the newest record's timestamp, so a
-        file whose mtime is older than the window has EVERY line older than
-        the window. A session that dead-letters one new line per hour never
-        expires -- that is a property (an actively-failing session must stay
-        visible), not a gap.
-
-        ``retention_seconds <= 0`` disables expiry outright (returns zeros,
-        no scan). ``enabled=False`` runs the FULL classification and emits
-        the SAME audit line with ``action=dry_run``, but unlinks nothing --
-        mirroring ``reclaim_orphans``'s contract: a real deletion must never
-        be invisible, so ``expired_keys``/``expired_records``/
-        ``expired_bytes`` only ever reflect ACTUAL unlinks, never dry-run
-        candidates.
-
-        Deletion routes exclusively through ``purge_dead_letters`` (never a
-        direct filesystem call), per that method's own contract.
-
-        MUST NOT RAISE (mirrors ``reclaim_orphans``'s directory-scan guard):
-        this runs on the boot path and the periodic sweep tick, neither of
-        which may crash-loop the server on a bad scan.
+        Expired iff ``<key>.log`` is absent AND
+        ``now - mtime(<key>.dead.jsonl) > retention_seconds``. Whole-file mtime
+        is safe because ``dead_letter`` only appends, so an old mtime means
+        every line is old (an actively-failing session stays visible by
+        design). ``retention_seconds <= 0`` disables expiry. With ``enabled``
+        False every candidate is only logged as a dry-run; the counts reflect
+        real unlinks only. Deletes route through ``purge_dead_letters``. Must
+        not raise.
         """
         zeros = {
             "expired_keys": 0,
@@ -2099,35 +1773,15 @@ class QueueManager:
         }
 
     async def recovery_seed_counts(self) -> tuple[int, int]:
-        """Seed the conservation counters so residual == 0 by construction.
+        """Seed the conservation counters from disk so residual == 0.
 
-        Returns ``(accepted_seed, written_seed)`` to re-initialise the
-        accepted/written conservation counters after a crash. Derived purely
-        from disk so the invariant ``accepted == written + in_queue + dead``
-        holds with a zero residual the instant the counters are seeded.
-
-        Per worker key, from disk:
-
-        - ``C`` = complete lines below the committed offset
-        - ``P`` = complete lines between the committed offset and the end of
-          complete data (== ``in_queue``)
-        - ``D`` = dead-letter records
-
-        Formula::
-
-            written_seed  = max(0, C - D)
-            accepted_seed = written_seed + P + D
-
-        The ``max(0, ...)`` clamp is load-bearing. In a crash/replay window a
-        dead-but-pending line (dead-lettered, but whose commit has not yet
-        advanced past it) makes ``C - D`` go negative. The naive formula
-        ``accepted = C + P`` / ``written = C - D`` yields a negative written
-        count -- residual ``-1``, a false DEGRADED. Clamping written to zero
-        and counting the line in BOTH ``P`` and ``D`` absorbs it into
-        ``accepted_seed`` so the residual stays exactly zero.
-
-        Ordering is load-bearing: this MUST run AFTER ``recovery_reconcile_dead``
-        in the lifespan so the dead-letter counts it reads are already settled.
+        Returns ``(accepted_seed, written_seed)`` re-derived from disk so
+        ``accepted == written + in_queue + dead`` holds immediately. Per key,
+        with C=committed lines, P=pending lines, D=dead records:
+        ``written_seed = max(0, C - D)``, ``accepted_seed = written_seed + P +
+        D``. The clamp absorbs a dead-but-not-yet-committed line that would
+        otherwise drive written negative (a false DEGRADED). Must run after
+        ``recovery_reconcile_dead`` so the dead counts are settled.
         """
 
         def _seed() -> tuple[int, int]:
@@ -2210,26 +1864,13 @@ class QueueManager:
     async def recovery_reconcile_dead(self) -> int:
         """Advance committed offsets past leading already-dead pending lines.
 
-        Closes the dead_letter->commit crash window. When the process
-        crashes after a poison line was dead-lettered but before the commit
-        advanced past it, the line remains pending in the ``.log``. A naively
-        respawned drainer would re-read it, re-dead-letter it, and permanently
-        corrupt the dead count. This pass steps the committed offset over each
-        LEADING pending line whose raw bytes already appear in the dead-letter
-        file, stopping at the first non-dead pending line.
-
-        Per worker key with a ``.log`` and a non-empty dead-payload set, walk
-        from the committed offset toward the end of complete data: for each
-        leading line whose raw bytes are in the dead-payload set, advance past
-        it (``skipped += 1``); stop at the first non-dead pending line. If the
-        offset advanced, persist it atomically (tmp + ``os.replace``, mirroring
-        ``commit``). Returns the total number of lines skipped across all keys.
-
-        Covers both the crash window (dead_letter then crash before commit) and
-        the replay window (re-append then crash before purge).
-
-        Ordering is load-bearing: this MUST run ONCE at startup, BEFORE
-        ``recovery_seed_counts`` and BEFORE drainers respawn.
+        Closes the dead-letter->commit crash window: a line dead-lettered but
+        not yet committed past would otherwise be re-read and re-dead-lettered
+        by a respawned drainer. Per key, steps the committed offset over each
+        leading pending line whose bytes are already in the dead-letter file,
+        stopping at the first non-dead line, and persists it atomically.
+        Returns the total lines skipped. Must run once at startup, before
+        ``recovery_seed_counts`` and before drainers respawn.
         """
 
         def _reconcile() -> int:

@@ -1,44 +1,8 @@
-"""Tier-1 fix test matrix for the durable append-log framing fix.
-
-WRITE-SIDE FRAMING CORRUPTION -- THE FIX
------------------------------------------
-The durable per-session append-log used to depend on an UNSTATED filesystem
-guarantee (POSIX ``O_APPEND`` write atomicity) that Azure Files/SMB does not
-provide. ``QueueManager.append`` now serializes every write to one worker
-key's files through a ``_KeyGuard`` whose ``file_lock`` (a ``threading.Lock``)
-is acquired and released BY THE WORKER THREAD that performs the write --
-never by an event-loop event, cancellation included. Correctness no longer
-depends on any filesystem write-atomicity guarantee; ``O_APPEND`` is kept
-only as defence in depth.
-
-THIS FILE PINS
---------------
-- ``test_control_local_o_append_is_atomic`` (T1) -- BASELINE. Passes on a
-  local filesystem where ``O_APPEND`` happens to be atomic. Its passing is
-  NOT evidence the code is correct -- ``test_smb_split_write_no_longer_
-  merges_records`` (T2) is what proves the code itself supplies the
-  guarantee, independent of the filesystem.
-- T2-T18 exercise the guard, the write
-  mechanism, cancellation, the torn-tail heal, dead-letter framing, and the
-  v2.1 G1 fix (guard-removal-races-a-parked-appender) directly.
-- ``test_captured_corrupt_seed_*`` -- the REAL production artifact fed to
-  the REAL ``_parse_line``, isolating the defect to FRAMING, not payload
-  size.
-
-THE SMB MODEL
--------------
-``_SplitWriteOS`` patches ``queue_manager.os.write`` (the actual write
-primitive used by ``_write_record``/``_write_all``) to split any write
-larger than ``_SMB_OP_BYTES`` into multiple SHORT writes and return a short
-count for each -- exactly what an SMB client does with a single logical
-``write()`` call, and exactly what ``_write_all``'s loop exists to handle.
-Real bytes are written via the real ``os.write`` to the real fd; only the
-CHUNKING and SHORT-COUNT-RETURN behaviour is injected.
-
-NO PRODUCT CODE IS MODIFIED BY THIS FILE (except the one-time, reverted
-RED/GREEN demonstration of T17 against the pre-v2.1 removal condition,
-which is applied and restored via a separate script -- see the
-implementation report).
+"""Durable append-log framing: QueueManager serializes every write to a
+session's files through a per-key ``_KeyGuard``, so concurrent or
+split (SMB-style short) writes can never merge or tear a record.
+``_SplitWriteOS`` models a non-atomic filesystem by splitting each
+``os.write`` into multiple short writes against the real fd.
 """
 
 from __future__ import annotations
@@ -63,25 +27,17 @@ pytestmark = pytest.mark.integration
 SESSION = "71afde0c-f061-4f4c-b124-9323f9d5b110"
 WORKSPACE = "-Users-samule-repo-team-pulse-structure"
 
-# Bounded wait for every cross-thread handshake in this file. The tests are
-# gated on threading.Event objects (deterministic), never on a bare sleep; the
-# timeout exists only so a broken handshake FAILS LOUD instead of hanging.
+# Bounded wait for cross-thread handshakes (never a bare sleep); exists so a
+# broken handshake fails loud instead of hanging.
 _HANDSHAKE_TIMEOUT_S = 10.0
 
-# Models one SMB write op. Real value is negotiated (commonly ~1 MiB), but the
-# only property under test is "one logical write == MORE THAN ONE storage op",
-# so a small value keeps the test fast while reproducing the same signature.
+# Models one SMB write op; a small value keeps tests fast while still
+# forcing multiple storage ops per logical write.
 _SMB_OP_BYTES = 64 * 1024
 
 
 def _event_bytes(event: str, *, filler: int = 0) -> bytes:
-    """One event line exactly as POST /events persists it (main.py:913-917).
-
-    Compact separators + a ``data`` blob, matching the real wire format. The
-    ``filler`` pads ``data.payload`` to make a genuinely large record.
-    ``ensure_ascii`` defaults to True (json.dumps), which is precondition P1
-    No raw ``0x0A`` ever appears in the serialized bytes.
-    """
+    """One event line, JSON-encoded; `filler` pads the payload to make a large record."""
     obj: dict[str, Any] = {
         "event": event,
         "workspace": WORKSPACE,
@@ -92,10 +48,10 @@ def _event_bytes(event: str, *, filler: int = 0) -> bytes:
 
 
 def _parses(raw: bytes) -> bool:
-    """True iff the REAL drain-side parser accepts this line."""
+    """True iff the real drain-side parser accepts this line."""
     try:
         SessionRegistry._parse_line(raw)
-    except Exception:  # noqa: BLE001 - mirrors registry.py:472's own broad catch
+    except Exception:  # noqa: BLE001 - mirrors the real parser's own broad catch
         return False
     return True
 
@@ -103,14 +59,7 @@ def _parses(raw: bytes) -> bool:
 async def _poll_until(
     pred: Any, timeout: float = _HANDSHAKE_TIMEOUT_S, interval: float = 0.005
 ) -> None:
-    """Poll an in-process predicate until true, or fail loud on timeout.
-
-    Used for cross-task synchronization points that are not gated on a
-    dedicated event (e.g. "has this OTHER already-scheduled coroutine's
-    synchronous prologue run yet"). Deterministic in effect: only the WALL
-    TIME is a bound, not a correctness dependency -- the predicate itself
-    (an in-process counter) is exact.
-    """
+    """Poll a predicate until true, or fail loud on timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if pred():
@@ -120,20 +69,9 @@ async def _poll_until(
 
 
 class _SplitWriteOS:
-    """Patches ``os.write`` to split any large write into SHORT writes.
-
-    Models Azure Files/SMB: one logical ``os.write(fd, data)`` call becomes
-    N separate real ``os.write`` calls of at most ``chunk`` bytes each, with
-    NO atomicity spanning them -- so another writer's bytes can land in
-    between (if nothing else serializes them). Each chunk is written via the
-    REAL ``os.write`` against the REAL fd; the ONLY thing this shim changes
-    is the GRANULARITY and the SHORT RETURN COUNT, which is exactly the
-    guarantee SMB withholds and ext4 provides -- and exactly what
-    ``_write_all``'s loop exists to handle.
-
-    ``on_chunk(fd, index, chunk, total_len)`` fires AFTER each real chunk has
-    landed on disk, for deterministic test handshakes. ``index`` is 0 for the
-    first op on a given fd.
+    """Splits each os.write call into multiple short writes against the
+    real fd, modelling a non-atomic filesystem (e.g. SMB). ``on_chunk``
+    fires after each chunk lands, for deterministic test handshakes.
     """
 
     def __init__(
@@ -158,19 +96,14 @@ class _SplitWriteOS:
 
 
 # ---------------------------------------------------------------------------
-# T1: CONTROL -- baseline, real filesystem, no shim
+# CONTROL -- baseline, real filesystem, no shim
 # ---------------------------------------------------------------------------
 
 
 async def test_control_local_o_append_is_atomic(tmp_path: Path) -> None:
-    """Real QueueManager, many concurrent large+small appends, NO shim.
-
-    BASELINE ONLY. This is the ``dyad`` case: on a local filesystem
-    ``O_APPEND`` happens to be atomic, so every line reads back individually
-    parseable even without the guard doing any work. Passing here is NOT
-    evidence the CODE is correct -- ``test_smb_split_write_no_longer_
-    merges_records`` (T2) is what proves the guard supplies the guarantee,
-    independent of the filesystem's own atomicity.
+    """BASELINE: on a local filesystem O_APPEND happens to be atomic, so
+    every line parses even without the guard doing any work. Passing alone
+    is not proof the guard works -- see test_smb_split_write_no_longer_merges_records.
     """
     qm = QueueManager(tmp_path)
 
@@ -193,20 +126,12 @@ async def test_control_local_o_append_is_atomic(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# NON-VACUITY CONTROL: the shim tears WITHOUT the gate -- proves T2 is not
-# vacuous, and proves the guard (not luck) is what fixes it, all locally.
+# CONTROL: the shim tears without the gate -- isolates the guard from luck
 # ---------------------------------------------------------------------------
 
 
 def _raw_write_no_lock(path: Path, line: bytes) -> None:
-    """The OLD, pre-v2.1 unguarded write: open O_APPEND, write, close.
-
-    No ``_KeyGuard``, no ``admission`` lock, no ``file_lock`` -- this is
-    exactly the write ``_write_record``/``_write_all`` perform, MINUS the
-    ``with guard.file_lock:`` that serializes them. It loops on short writes
-    the same way ``_write_all`` does, so it is subject to the
-    ``_SplitWriteOS`` shim exactly like the real (fixed) code path is.
-    """
+    """Unguarded append: open O_APPEND, write, close -- no serialization."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
     fd = os.open(path, flags, 0o644)
     try:
@@ -224,34 +149,10 @@ def _raw_write_no_lock(path: Path, line: bytes) -> None:
 def test_smb_shim_tears_WITHOUT_the_gate_control(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """NON-VACUITY CONTROL for T2 -- proves the shim actually tears when
-    nothing serializes it, and therefore that the ``_KeyGuard`` gate (not an
-    accident of the local filesystem) is what removes the tear next door in
-    ``test_smb_split_write_no_longer_merges_records``.
-
-    Confirming the ENVIRONMENTAL premise -- that the OLD code tears on
-    real Azure Files/SMB/NFS -- needs a live mount this dev box does not
-    have. THIS test needs no mount at all: it proves the fix's LOGIC is
-    what matters, not the
-    filesystem, by injecting non-atomicity locally (``_SplitWriteOS``) and
-    showing that WITHOUT serialization the exact same shim tears on plain
-    ext4. Paired with T2 (gate present -> no tear), the two together are a
-    self-proving local pair: the shim faithfully models non-atomic append
-    (this test) AND the guard is what prevents corruption (T2) -- no real
-    SMB/NFS mount is required for either half of that proof.
-
-    Bypasses ``QueueManager.append`` and its ``_KeyGuard`` entirely: two
-    threads perform the OLD pre-v2.1 write (``_raw_write_no_lock`` --
-    ``open(O_APPEND)`` / loop of raw ``os.write`` / ``close``, going through
-    the shimmed ``os.write`` exactly as the real code does) against the SAME
-    ``.log`` file, with no admission lock and no file_lock. A deterministic
-    ``threading.Event`` handshake -- never a sleep -- parks the large writer
-    after its FIRST sub-op (``idx == 0``, split by the shim because it
-    exceeds ``_SMB_OP_BYTES``) and releases it only after the small
-    writer's COMPLETE record has landed, forcing exactly the interleave
-    ``[large-chunk-0][small-whole][large-rest]`` -- one physical line
-    containing fragments of two records with no separating newline between
-    them.
+    """CONTROL: without the guard's serialization, two threads writing to
+    the same file via the split-write shim interleave and produce a line
+    that fails to parse -- proving the shim actually models non-atomic
+    append (and that the guard, not luck, is what fixes it next door).
     """
     real_write = os.write
     large_first_op = threading.Event()
@@ -314,22 +215,16 @@ def test_smb_shim_tears_WITHOUT_the_gate_control(
 
 
 # ---------------------------------------------------------------------------
-# T2: the inverted repro -- headline criterion
+# the inverted repro: concurrent write under contention
 # ---------------------------------------------------------------------------
 
 
 async def test_smb_split_write_no_longer_merges_records(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The framing invariant holds under a genuinely contending appender.
-
-    Parks a large (multi-op) write mid-record via the SMB shim; while it is
-    parked, a second appender for the SAME key is dispatched and PROVABLY
-    contends (``guard.admission.locked()`` and ``guard.waiters == 2`` --
-    the non-vacuous contention assertion). Releasing the large write lets
-    it complete BEFORE the small one starts (admission is a single slot),
-    so the log ends up byte-exact ``large + b"\\n" + small + b"\\n"`` and
-    both lines parse.
+    """Framing holds under genuine contention: parks a large write mid-record
+    via the shim while a second appender for the same key waits on the
+    guard; both lines land whole, in order, and parse cleanly.
     """
     qm = QueueManager(tmp_path)
     real_write = os.write
@@ -379,7 +274,7 @@ async def test_smb_split_write_no_longer_merges_records(
 
 
 # ---------------------------------------------------------------------------
-# T3: concurrent appends over both key shapes, all parse (+ P1 precondition)
+# concurrent appends over both key shapes, all parse
 # ---------------------------------------------------------------------------
 
 
@@ -396,8 +291,7 @@ async def test_concurrent_appends_under_smb_shim_all_parse(
     for i in range(24):
         records.append(_event_bytes(f"tool:call:{i}"))
 
-    # Precondition P1: no raw newline anywhere except
-    # the terminator this module appends.
+    # precondition: no raw newline anywhere except the trailing terminator
     for r in records:
         stored = r if r.endswith(b"\n") else r + b"\n"
         assert b"\n" not in stored[:-1], f"P1 violated by record: {r[:80]!r}"
@@ -412,7 +306,7 @@ async def test_concurrent_appends_under_smb_shim_all_parse(
 
 
 # ---------------------------------------------------------------------------
-# T4: cancellation cannot reintroduce the tear
+# cancellation cannot reintroduce the tear
 # ---------------------------------------------------------------------------
 
 
@@ -429,10 +323,8 @@ async def test_cancel_mid_write_never_releases_the_file_lock(
 
     record_a = _event_bytes("llm:request:A", filler=300 * 1024)
     record_b = _event_bytes("tool:call:B")
-    # The exact bytes _write_all actually sees (append() adds the trailing
-    # newline) -- used below to identify which record a given SHORT chunk
-    # belongs to. A's first chunk is a PREFIX of line_a (it's split); B's
-    # single chunk equals line_b exactly.
+    # exact on-disk bytes (append() adds the trailing newline), used below to
+    # identify which record a given short chunk belongs to
     line_a = record_a if record_a.endswith(b"\n") else record_a + b"\n"
     line_b = record_b if record_b.endswith(b"\n") else record_b + b"\n"
     real_write = os.write
@@ -463,8 +355,7 @@ async def test_cancel_mid_write_never_releases_the_file_lock(
 
     task_a.cancel()
 
-    # (b) Dispatch B now -- it must not reach os.write while A's thread
-    # holds file_lock.
+    # dispatch B now -- it must not reach os.write while A's thread holds file_lock
     task_b = asyncio.ensure_future(qm.append(key, record_b))
     await asyncio.sleep(0.05)
     assert guard.file_lock.locked(), (
@@ -481,8 +372,7 @@ async def test_cancel_mid_write_never_releases_the_file_lock(
         try:
             await task_a
         except asyncio.CancelledError:
-            # (d) A's bytes must already be on disk at the moment the
-            # cancellation is observed here.
+            # A's bytes must already be on disk at the moment cancellation is observed here
             current = (tmp_path / f"{key}.log").read_bytes()
             a_landed_before_cancel_observed = current.startswith(record_a + b"\n")
             raise
@@ -508,7 +398,7 @@ async def test_cancel_mid_write_never_releases_the_file_lock(
 
 
 # ---------------------------------------------------------------------------
-# T5: distinct keys append concurrently -- per-key parallelism preserved
+# distinct keys append concurrently -- per-key parallelism preserved
 # ---------------------------------------------------------------------------
 
 
@@ -549,7 +439,7 @@ async def test_distinct_keys_append_concurrently(
 
 
 # ---------------------------------------------------------------------------
-# T6/T7: heal_torn_tails truncates and quarantines
+# heal_torn_tails truncates and quarantines
 # ---------------------------------------------------------------------------
 
 
@@ -608,7 +498,7 @@ async def test_heal_torn_tails_on_empty_and_newline_free_files(tmp_path: Path) -
 
 
 # ---------------------------------------------------------------------------
-# T8/T9: partial write failure discards the record; failure is loud
+# partial write failure discards the record; failure is loud
 # ---------------------------------------------------------------------------
 
 
@@ -682,17 +572,13 @@ async def test_partial_write_failure_logs_when_truncate_also_fails(
         "the fallback newline write succeeded -- no second failure expected"
     )
 
-    # The fallback newline landed: the file now holds the partial 8-byte
-    # fragment terminated by a newline. This is a SYNTACTICALLY COMPLETE line
-    # (not a torn tail): read_batch accepts it and heal_torn_tails does NOT
-    # quarantine it. That is safe -- the append already raised OSError to the
-    # caller (event never acknowledged), so on the next drain the malformed
-    # JSON fails _parse_line and is correctly dead-lettered (offset advanced).
+    # fallback newline succeeded; the drainer dead-letters this line next pass
+    # since append() already raised to the caller
     assert qm._log_path(key).read_bytes() == record[:8] + b"\n"
 
 
 # ---------------------------------------------------------------------------
-# T10/T11: delete_drained cannot race append; retains on uncommitted bytes
+# delete_drained cannot race append; retains on uncommitted bytes
 # ---------------------------------------------------------------------------
 
 
@@ -728,11 +614,8 @@ async def test_delete_drained_cannot_race_an_in_flight_append(
     await task_append
     ok = await delete_task
 
-    # Nothing was ever committed for this record, so delete_drained MUST
-    # retain it -- never a silent disappearance -- and the record is fully
-    # present, never partial: the guard's admission serialization meant
-    # delete's thread could not even begin until append's thread released
-    # file_lock.
+    # nothing committed yet, so delete_drained must retain the record fully
+    # -- admission serialization blocks delete until append releases file_lock
     assert ok is False
     assert qm._log_path(key).exists()
     batch = await qm.read_batch(key, max_items=10)
@@ -767,7 +650,7 @@ async def test_delete_drained_retains_a_log_with_uncommitted_bytes(
 
 
 # ---------------------------------------------------------------------------
-# T12: guard map is bounded and ABA-proof
+# guard map is bounded and ABA-proof
 # ---------------------------------------------------------------------------
 
 
@@ -786,11 +669,8 @@ async def test_guard_map_is_released_on_delete_drained_and_identity_checked(
         assert await qm.delete_drained(k) is True
     assert qm._guards == {}
 
-    # Direct ABA probe: while delete_drained(K)'s thread is mid-flight
-    # (having captured guard G_orig via its own _guard() call and about to
-    # unlink), swap the map entry for a foreign object. The removal's
-    # identity check must then fail, and the foreign entry must survive
-    # untouched.
+    # ABA probe: swap the guard map entry for a foreign object while
+    # delete_drained is mid-flight; its identity check must refuse to remove it
     key = "aba-key"
     await qm.append(key, _event_bytes("ev"))
     batch = await qm.read_batch(key, max_items=10)
@@ -826,7 +706,7 @@ async def test_guard_map_is_released_on_delete_drained_and_identity_checked(
 
 
 # ---------------------------------------------------------------------------
-# T13/T14: dead-letter path is covered and un-crashable
+# dead-letter path is covered and un-crashable
 # ---------------------------------------------------------------------------
 
 
@@ -860,24 +740,16 @@ async def test_dead_letter_parsing_survives_a_malformed_line(tmp_path: Path) -> 
 
 
 # ---------------------------------------------------------------------------
-# T17: v2.1 G1 -- the reproduced counter-example, inverted
+# guard survives a delete racing a parked appender
 # ---------------------------------------------------------------------------
 
 
 async def test_guard_survives_a_delete_that_races_a_parked_appender(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """v2.1 G1 -- delete_drained racing a parked appender.
-
-    MUST BE RED against v2's \u00a72.2 removal condition (identity-only, no
-    ``waiters`` gate): without the gate, the map entry is deleted while
-    appender A is still parked holding a reference to it, so a subsequent
-    appender B gets a FRESH ``_KeyGuard`` with a DISJOINT ``file_lock`` --
-    the exact mechanism that reproduces the torn/merged-line append
-    corruption (``scratch/probe_guard_swap.py``). GREEN against v2.1's
-    ``waiters == 1``
-    gate: removal is skipped while A holds a reference, so B is served by
-    the SAME guard object A used.
+    """delete_drained racing a parked appender: the guard map entry must
+    survive while appender A still holds a reference, so a subsequent
+    appender B is served by the SAME guard rather than a disjoint one.
     """
     qm = QueueManager(tmp_path)
     key = "race-key"
@@ -936,7 +808,7 @@ async def test_guard_survives_a_delete_that_races_a_parked_appender(
 
 
 # ---------------------------------------------------------------------------
-# T18: heal_torn_tails cannot crash boot
+# heal_torn_tails cannot crash boot
 # ---------------------------------------------------------------------------
 
 
@@ -992,17 +864,13 @@ async def test_heal_torn_tails_survives_an_oserror_and_still_boots(
 
 
 # ---------------------------------------------------------------------------
-# T15 + the REAL captured production artifacts
+# captured production artifacts
 # ---------------------------------------------------------------------------
 
 
 def _seed_dir() -> Path | None:
-    """Locate the captured dead-letter seeds.
-
-    These are real production artifacts kept outside this repo (this
-    repo's ``docs/`` is product documentation only), so they are
-    intentionally NOT checked in here. Walk upward from this file so the
-    lookup survives any checkout depth; return None when absent.
+    """Locate captured dead-letter seed files (kept outside this repo);
+    walk upward so the lookup survives any checkout depth.
     """
     for parent in Path(__file__).resolve().parents:
         candidate = parent / "docs" / "04-deadletter-artifacts" / "seeds"
@@ -1022,11 +890,8 @@ _requires_seeds = pytest.mark.skipif(
 async def test_read_batch_over_a_pre_existing_merged_middle_line(
     tmp_path: Path,
 ) -> None:
-    """A pre-existing merged middle line still fails ``_parse_line`` (T15).
-
-    This fix does NOT claim to fix damage already on disk -- consuming a
-    malformed middle line (dead-letter it, commit past it) is the drainer's
-    job, not the framing fix's.
+    """A pre-existing merged middle line still fails _parse_line -- consuming
+    it (dead-letter, commit past it) is the drainer's job, not this fix's.
     """
     qm = QueueManager(tmp_path)
     key = "merged-middle-key"
@@ -1050,19 +915,13 @@ async def test_read_batch_over_a_pre_existing_merged_middle_line(
 
 @_requires_seeds
 def test_captured_corrupt_seed_is_rejected_by_the_real_parser() -> None:
-    """The REAL 1.0 MiB corrupt line from production fails ``_parse_line``.
-
-    Source: session 71afde0c's ``.dead.jsonl``, whose recorded error is
-    ``Expecting ',' delimiter: line 1 column 1050642 (char 1050641)``. This
-    asserts the real artifact still reproduces that exact rejection through the
-    real parser -- the dead-letter was not a one-off environment artifact.
+    """A real captured corrupt production line still fails _parse_line, at
+    the same offset and with the same error text as the original dead-letter.
     """
     assert _SEEDS is not None
     raw = (_SEEDS / "seed_corrupt_merged_line_1.0MiB.raw").read_bytes()
 
-    # Framing evidence: ONE physical line (no internal newline) that contains
-    # the start of TWO distinct event records -- record B begins immediately,
-    # with no separator, inside record A.
+    # one physical line containing two merged records, no separator between them
     assert raw.count(b"\n") == 0, "seed is a single physical line by construction"
     starts = [i for i in range(len(raw)) if raw.startswith(b'{"event":', i)]
     assert len(starts) == 2, f"expected two merged records, found {len(starts)}"
@@ -1075,12 +934,8 @@ def test_captured_corrupt_seed_is_rejected_by_the_real_parser() -> None:
     with pytest.raises(json.JSONDecodeError) as exc:
         SessionRegistry._parse_line(raw)
 
-    # The parser dies AT the merge boundary, give or take a couple of bytes:
-    # record A's truncated JSON is syntactically fine right up to where record
-    # B's bytes begin. Here A was torn INSIDE a quoted string, so B's leading
-    # ``{"`` is swallowed as string content and the parse only breaks on the
-    # very next token -- boundary+2. That two-byte offset is itself evidence of
-    # a mid-value tear rather than a record-boundary problem.
+    # parse fails near the merge boundary; here A tore inside a quoted string
+    # so B's leading bytes are swallowed, breaking a couple bytes later
     assert boundary <= exc.value.pos <= boundary + 8, (
         f"parse failed at {exc.value.pos}, merge boundary is {boundary}"
     )
@@ -1092,10 +947,8 @@ def test_captured_corrupt_seed_is_rejected_by_the_real_parser() -> None:
 
 @_requires_seeds
 def test_captured_valid_large_event_parses_cleanly() -> None:
-    """A REAL 1.04 MiB event parses fine -- isolating the defect to FRAMING.
-
-    Same session, same magnitude, ~43 KB LARGER than the corrupt seed. Size is
-    not what breaks ``_parse_line``; a torn write is.
+    """A real large event of similar size parses fine -- isolating the
+    defect to framing, not payload size.
     """
     assert _SEEDS is not None
     raw = (_SEEDS / "seed_valid_large_event_1.04MiB.json").read_bytes()

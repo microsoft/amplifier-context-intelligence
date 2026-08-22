@@ -22,9 +22,7 @@ def test_constructor_creates_queues_dir(tmp_path):
 
 
 def test_batch_holds_its_fields():
-    """``Batch`` no longer
-    takes ``lines=`` -- it takes ``records: list[Record]``, and ``lines`` is
-    now a DERIVED property. This assertion pins the derived property."""
+    """``batch.lines`` is derived from ``batch.records``."""
     batch = Batch(
         session_id="s1",
         records=[Record(b"a", 0, 2), Record(b"b", 2, 4)],
@@ -38,18 +36,14 @@ def test_batch_holds_its_fields():
 
 
 # ---------------------------------------------------------------------------
-# Record / Batch.records -- the queue produces
-# offsets, the registry only ever hands them back via ``commit``. These tests
-# pin that ``read_batch`` keeps the offsets it already computes (rather than
-# discarding them) and that ``lines`` can never disagree with ``records``.
+# Record / Batch.records: offsets are queue-produced and read-only for callers.
 # ---------------------------------------------------------------------------
 
 
 async def test_read_batch_records_carry_queue_produced_offsets(qm, tmp_path):
-    """A 3-line log: each record's start equals the previous record's end,
-    the first record's start equals the batch's own start_offset, the last
-    record's end equals the batch's own end_offset, and every record's raw
-    payload has no trailing newline."""
+    """Each record's start equals the previous record's end, the first/last
+    records bound the batch's start/end_offset, and no record's raw payload
+    has a trailing newline."""
     await qm.append("s1", b"one")
     await qm.append("s1", b"two")
     await qm.append("s1", b"three")
@@ -67,9 +61,7 @@ async def test_read_batch_records_carry_queue_produced_offsets(qm, tmp_path):
 
 
 async def test_batch_lines_is_derived_from_records(qm, tmp_path):
-    """``batch.lines`` is derived from ``batch.records`` -- the two views can
-    never disagree because ``lines`` is computed FROM ``records``, not
-    tracked independently."""
+    """``batch.lines`` always matches ``[r.raw for r in batch.records]``."""
     await qm.append("s1", b"alpha")
     await qm.append("s1", b"beta")
 
@@ -80,8 +72,7 @@ async def test_batch_lines_is_derived_from_records(qm, tmp_path):
 
 async def test_read_batch_records_survive_a_torn_trailing_line(qm, tmp_path):
     """A log ending in a partial (torn) line yields records only for the
-    complete lines that precede it; end_offset stops on the line boundary --
-    the pre-existing torn-tail invariant, unchanged by the Record seam."""
+    complete lines that precede it; end_offset stops on the line boundary."""
     log = tmp_path / "queues" / "s1.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_bytes(b"complete-one\ncomplete-two\ntorn-no-newline-yet")
@@ -94,9 +85,7 @@ async def test_read_batch_records_survive_a_torn_trailing_line(qm, tmp_path):
 
 async def test_committing_rec_end_advances_exactly_one_record(qm, tmp_path):
     """``commit(sid, records[0].end)`` then a fresh ``read_batch`` returns
-    records ``[1:]`` -- the exact round-trip the registry now depends on
-    (Record.end is a queue-produced, opaque cursor value, never computed by
-    the caller)."""
+    records ``[1:]``."""
     await qm.append("s1", b"first")
     await qm.append("s1", b"second")
     await qm.append("s1", b"third")

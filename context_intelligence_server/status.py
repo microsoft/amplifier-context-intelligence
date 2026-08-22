@@ -65,10 +65,8 @@ ring_buffer: EventRingBuffer = EventRingBuffer()
 # BootState
 # ---------------------------------------------------------------------------
 
-# Authoritative phase enum. `sweep`/`topup` are MOMENTARY step
-# labels only -- `_crash_recovery_sweep_loop` runs forever once started, so
-# step 7 of `_boot_reconcile` unconditionally sets phase="ready" AFTER
-# starting it; a non-returning loop must never leave phase stuck at "sweep".
+# `sweep`/`topup` are momentary step labels only -- the sweep loop runs
+# forever once started, so `_boot_reconcile` sets phase="ready" right after.
 _BOOT_PHASES = (
     "recovering",
     "heal",
@@ -87,20 +85,13 @@ _BOOT_PHASES = (
 class BootState:
     """Boot-safety progress, surfaced (additively) on /status.
 
-    A module-level singleton, mirroring the existing ``ring_buffer`` pattern
-    above. Every mutation happens on the event loop inside ``_boot_reconcile``
-    between awaits -- plain ints, no lock needed (do not add one).
+    Module-level singleton; all mutation happens on the event loop inside
+    ``_boot_reconcile`` between awaits, so plain ints need no lock.
 
-    ``phase`` DEFAULTS to ``"recovering"`` -- NEVER ``"ready"`` -- because the
-    zero-disk-during-boot guarantee (the lean /status response) depends on
-    this being true from the moment the module is imported, before
-    ``lifespan`` has run at all (e.g. under a bare ASGI test client that
-    never awaits the real lifespan).
-
-    ``status`` on /status stays ``"ok"`` and HTTP 200 at EVERY phase,
-    including ``"failed"`` -- the boot phase is INFORMATIONAL, never a
-    liveness signal. Flipping the probe on a failed reconcile would
-    reintroduce the exact probe-kills-boot restart loop this design removes.
+    ``phase`` defaults to ``"recovering"``, never ``"ready"``, so a bare ASGI
+    test client that never runs the real lifespan still gets a true value.
+    ``status`` stays ``"ok"``/200 at every phase including ``"failed"`` --
+    the boot phase is informational, never a liveness signal.
     """
 
     phase: str = "recovering"
@@ -170,26 +161,10 @@ def build_status_response(
 ) -> dict[str, Any]:
     """Build a status response dict from registry state and recent events.
 
-    Args:
-        registry: The active SessionRegistry.
-        start_time: Server start time as a Unix timestamp (from time.time()).
-
-    Returns:
-        A dict with keys: status, uptime_seconds, active_sessions, sessions,
-        recent_events, completed_sessions, error_count_last_hour, server_version,
-        orphaned_sessions.
-
-        Each entry in ``sessions`` includes the keys: session_id, workspace,
-        last_event, last_event_time, events_processed, orphaned,
-        last_successful_flush.
-
-        Note: ``orphaned_sessions`` is the count of ALL registered workers whose
-        drain task has completed (``task.done()``).  A worker filtered *out* of
-        the visible ``sessions`` list by ``status_inactive_timeout`` still
-        contributes to this count but will not appear with ``orphaned: True`` in
-        any per-session dict.  For a fresh OOM orphan this asymmetry is
-        irrelevant (OOM orphans are recent by definition); it can surface for
-        long-running orphans whose ``last_event_time`` ages past the timeout.
+    ``orphaned_sessions`` counts ALL workers whose drain task is done, even
+    ones filtered out of the visible ``sessions`` list by
+    ``status_inactive_timeout`` -- so the count and the per-session
+    ``orphaned`` flags can disagree for long-idle orphans.
     """
     settings = get_settings()
     now = time.time()

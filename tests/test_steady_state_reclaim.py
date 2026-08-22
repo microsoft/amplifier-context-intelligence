@@ -1,28 +1,10 @@
 """Steady-state queue reclaim + dead-letter retention.
 
-Covers:
-
-  (b) an undrained tail is never prefix-reclaimed past the committed offset
-  (c) compaction is crash-atomic: offset-before-log ordering, verified at
-      the mid-copy window and the "offset rebased, log not yet replaced"
-      window, plus a CONTROL proving the REJECTED log-then-offset order
-      loses data
-  (e) dead-letters older than retention are expired; newer ones (and any
-      key whose `.log` still exists) are kept
-  (f) neither compaction nor expiry can block /status
-  (g) regression: reclaim-on-finalize is unchanged, and composes with a
-      prior compaction
-  (i) an `os.replace` failure during compaction RESTORES the offset --
-      a pure no-op, zero accounting drift
-  (j) a huge-tail session is skipped (not compacted, not stalled)
-  (k) dead-letter expiry actually deletes under SHIPPED DEFAULTS
-      (`reclaim_enabled` stays False)
-
-(a), (d), (h) are Neo4j-backed and live in
-``tests/neo4j/test_steady_state_reclaim_neo4j.py``, extending the throughput
-bench shape.
-
-No real Neo4j is used anywhere in this file.
+Covers undrained-tail protection, crash-atomic compaction ordering,
+dead-letter retention/expiry, /status non-blocking during compaction,
+reclaim-on-finalize composing with compaction, and boot-vs-sweep expiry
+accounting. No real Neo4j is used anywhere in this file (see
+``tests/neo4j/test_steady_state_reclaim_neo4j.py`` for the Neo4j-backed cases).
 """
 
 from __future__ import annotations
@@ -207,10 +189,9 @@ async def test_c_mid_copy_oserror_is_a_pure_noop(
 async def test_c_window2_offset_rebased_before_log_replaced_bounded_redrive(
     tmp_path: Path,
 ) -> None:
-    """Simulates a hard process crash AFTER the offset was rebased to 0 but
-    BEFORE the log was replaced (the CHOSEN ordering's crash window). Any
-    reader resuming from this on-disk state must see a bounded RE-DRIVE
-    (the committed prefix duplicated) -- never a loss."""
+    """Simulates a crash after the offset was rebased to 0 but before the log
+    was replaced. A reader resuming from this on-disk state must see a
+    bounded re-drive (the committed prefix duplicated) -- never a loss."""
     qm = QueueManager(queues_dir=tmp_path)
     sid = "s-window2"
     events = [_fixed(i) for i in range(9)]
@@ -229,17 +210,16 @@ async def test_c_window2_offset_rebased_before_log_replaced_bounded_redrive(
 
     # Bounded re-drive: every original event is present -- zero loss.
     assert resumed_raw == events
-    # The duplicated set is exactly the previously-committed prefix.
+    # the duplicated set is exactly the already-committed prefix
     assert resumed_raw[:3] == events[:3]
 
 
 async def test_c_control_rejected_log_then_offset_order_loses_data(
     tmp_path: Path,
 ) -> None:
-    """CONTROL (not the shipped method): apply the REJECTED log-then-offset
-    ordering by hand and stop mid-window (log replaced, offset NOT yet
-    rewritten). Proves the rejected order silently drops undrained data --
-    this is why offset-before-log was chosen."""
+    """CONTROL: applies the alternative log-then-offset ordering by hand and
+    stops mid-window (log replaced, offset not yet rewritten), proving that
+    order silently drops undrained data -- why offset-before-log is used."""
     qm = QueueManager(queues_dir=tmp_path)
     sid = "s-rejected-order"
     events = [_fixed(i) for i in range(9)]
@@ -253,19 +233,18 @@ async def test_c_control_rejected_log_then_offset_order_loses_data(
     e = log_path.stat().st_size
     assert c <= e - c  # precondition for the table's "lands inside the tail" case
 
-    # REJECTED ORDER, applied by hand: replace the log with the tail FIRST.
+    # alternative order, applied by hand: replace the log with the tail first
     tail_bytes = log_path.read_bytes()[c:e]
     rejected_tmp = tmp_path / f"{sid}.log.rejected.tmp"
     rejected_tmp.write_bytes(tail_bytes)
     os.replace(rejected_tmp, log_path)
-    # CRASH HERE -- before the offset would have been rewritten to 0.
-    # The .offset file still says C (unchanged).
+    # crash here -- offset file still says C (unchanged)
 
     resumed = await qm.read_batch(sid, max_items=100)
     resumed_raw = [r.raw for r in resumed.records]
 
-    # SILENT LOSS: the drainer resumes at byte C inside the NEW (already
-    # shortened) file, skipping the first C bytes of real undrained data.
+    # silent loss: the drainer resumes at byte C inside the already-shortened
+    # file, skipping the first C bytes of real undrained data
     skipped_events = events[3:6]
     surviving_events = events[6:9]
     assert resumed_raw == surviving_events
@@ -347,10 +326,8 @@ async def test_i_double_replace_failure_logs_restore_failed_honestly(
     log_path = tmp_path / f"{sid}.log"
 
     def _always_raise(src: Any, dst: Any) -> None:
-        # Let the FIRST offset write through (step 5's rebase to "0" --
-        # required to reach the log-replace step at all); fail the log
-        # replace (step 6) AND the subsequent restore-to-C write, so the
-        # restore path itself is what fails this time.
+        # let the first offset rebase-to-0 write through, then fail both the
+        # log replace and the subsequent restore-to-C write
         src_content = (
             Path(src).read_text(encoding="utf-8") if Path(src).exists() else ""
         )
@@ -528,25 +505,9 @@ async def test_k_dead_letter_expiry_enabled_false_still_dry_runs(
 
 
 # ---------------------------------------------------------------------------
-# (m) BOOT-vs-SWEEP dead-letter accounting
-#
-# Zero tests previously touched record_purged or the boot (_boot_reconcile)
-# vs sweep (_crash_recovery_sweep_loop) expiry call sites -- yet main.py's
-# own comments warn: the BOOT expiry (main.py ~line 522-537) must NEVER call
-# record_purged (it runs BEFORE recovery_seed_counts, so expired lines are
-# simply never counted into accepted_seed in the first place -- calling
-# record_purged there would subtract records never added, driving the
-# residual negative); the SWEEP expiry (main.py ~line 354-366) MUST call it
-# (counters are already live there, so a purge that isn't reported back
-# would latch the residual at +n forever).
-#
-# Both tests drive the REAL main.py functions (`_boot_reconcile`,
-# `_crash_recovery_sweep_loop`) against `main_module.registry` -- the same
-# module-level singleton those functions close over -- not a reimplemented
-# stand-in. Each spies on `registry.record_purged` (still calling through to
-# the real implementation) so the assertion is direct and structural, not
-# inferred from counters alone (which the clamp in `record_purged` can mask
-# at a 0/0 baseline -- see docstring there).
+# (m) boot-vs-sweep dead-letter accounting: boot expiry runs before seed
+# counting and must never call record_purged (nothing was counted yet);
+# sweep expiry runs on live counters and must call it, or residual drifts.
 # ---------------------------------------------------------------------------
 
 

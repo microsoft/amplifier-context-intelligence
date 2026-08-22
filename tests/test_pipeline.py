@@ -388,24 +388,9 @@ async def test_process_event_terminal_does_not_self_flush(
 
 
 async def test_process_event_terminal_does_not_self_flush_real_handlers() -> None:
-    """De-vacuumed sibling of the
-    test above. Wires the REAL ``setup_handlers(services)`` enricher set
-    (including the real ``SessionHandler``) instead of ``_StubEnricher``,
-    over an in-memory ``HookStateService``/``GraphState`` so no Neo4j is
-    needed.
-
-    The test above tests the ``pipeline`` module's OWN body only --
-    ``pipeline_handlers`` wires ``_StubEnricher`` instances, so the real
-    ``SessionHandler`` never runs and it cannot see a handler that flushes.
-    It would pass even if ``SessionHandler._handle_end`` called
-    ``self.services.graph.flush()`` directly. THIS test is
-    the real fence against that: it fails if the handler ever
-    self-flushes.
-
-    Non-vacuity control: assert the real ``SessionHandler`` actually ran
-    (the session node carries ``status == "completed"``), so a mis-wired
-    fixture cannot pass by simply not dispatching.
-    """
+    """Wires the real ``setup_handlers(services)`` enrichers (not
+    ``_StubEnricher``) to verify ``SessionHandler`` never self-flushes;
+    also asserts the session node was actually written."""
     from context_intelligence_server.pipeline import process_event, setup_handlers
     from context_intelligence_server.registry import SessionWorker
     from context_intelligence_server.services import HookStateService
@@ -435,7 +420,7 @@ async def test_process_event_terminal_does_not_self_flush_real_handlers() -> Non
         f"_flush_barrier is the sole trigger"
     )
 
-    # Non-vacuity: the real SessionHandler actually ran and wrote the node.
+    # Confirm the real SessionHandler actually ran and wrote the node.
     node = await services.graph.get_node("sess-real-1")
     assert node is not None and node.get("status") == "completed", (
         f"real SessionHandler did not run (mis-wired fixture?): {node}"

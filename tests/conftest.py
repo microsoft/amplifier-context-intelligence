@@ -121,10 +121,7 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
         neo4j_flush_chunk_rows: int = _real.neo4j_flush_chunk_rows
         neo4j_flush_chunk_bytes: int = _real.neo4j_flush_chunk_bytes
         neo4j_lock_timeout: float = _real.neo4j_lock_timeout
-        # drain_worker's Trigger H/I read these directly off get_settings()
-        # (config.py's lru_cache'd accessor) -- this proxy stands in for it
-        # inside registry.py, so it must carry the same fields real Settings
-        # does, at the same shipped defaults.
+        # Mirrors real Settings fields drain_worker reads via get_settings().
         queue_compact_enabled: bool = _real.queue_compact_enabled
         queue_compact_min_prefix_bytes: int = _real.queue_compact_min_prefix_bytes
         queue_compact_max_tail_bytes: int = _real.queue_compact_max_tail_bytes
@@ -158,27 +155,9 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
 
 @pytest.fixture(autouse=True)
 def reset_boot_state() -> Generator[None, None, None]:
-    """Reset the module-level ``BootState`` singleton around each test.
-
-    ``/status`` is phase-gated: ``metrics``/``spool`` are populated only
-    once ``boot_state.phase`` reaches ``"ready"`` (or ``"failed"``) --
-    otherwise it serves the lean, zero-disk boot response. The overwhelming
-    majority of existing tests exercise ordinary ``/status`` behaviour, NOT
-    boot itself, and never invoke the real ``lifespan()`` (the plain
-    ``client``/``auth_client`` fixtures wrap the ASGI app directly, without
-    running its lifespan protocol) -- so without a reset, ``boot_state``
-    would default to its module-import value (``"recovering"``) for the
-    entire test session, permanently nulling ``metrics``/``spool`` for every
-    test that doesn't explicitly drive a real boot.
-
-    Default here to ``"ready"`` -- exactly what a real, running server is
-    for the overwhelming majority of its lifetime -- so pre-existing tests
-    keep seeing the populated shape they always have. Tests that need to
-    exercise a SPECIFIC boot phase (the boot-safety suite) set
-    ``boot_state.phase`` (and any other field) explicitly; mutated IN PLACE
-    on the same singleton object ``main.py`` imported, so both modules'
-    references see the change.
-    """
+    """Reset the module-level ``BootState`` singleton to ``"ready"`` around
+    each test, since ``/status``'s ``metrics``/``spool`` fields are
+    phase-gated and most tests never drive a real ``lifespan()`` boot."""
     from context_intelligence_server.status import boot_state as _boot_state
 
     def _reset() -> None:
@@ -204,19 +183,9 @@ def reset_boot_state() -> Generator[None, None, None]:
 
 @pytest.fixture(autouse=True)
 def _restore_lease_io() -> Generator[None, None, None]:
-    """The private `_LEASE_IO` executor in ``writer_lease`` is process-wide
-    (module-level, by design). A test that drives the real `lifespan()` to a
-    normal, non-raising completion calls `shutdown_lease_io()` in its
-    `finally`, which permanently shuts that shared executor down for every
-    later test in the same pytest process. Detect that (submitting after
-    shutdown raises `RuntimeError`, a documented `ThreadPoolExecutor`
-    contract) and transparently recreate it -- this is test-isolation
-    plumbing only; production shuts the executor down exactly once, at real
-    process exit.
-
-    Defined here (rather than only in the module that first needed it) so it
-    guards every test module regardless of collection/run order.
-    """
+    """Recreate the process-wide `_LEASE_IO` executor in ``writer_lease`` if
+    a prior test's real `lifespan()` shutdown already closed it, so later
+    tests aren't left without it."""
     yield
     import concurrent.futures
 

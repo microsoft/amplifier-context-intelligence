@@ -26,21 +26,15 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
-# Environment variable used to locate the YAML configuration file.
-# This variable is intentionally NOT covered by the AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_
-# prefix — it is read directly from the environment before the Settings class is
-# instantiated, so the prefix-based machinery cannot apply.
+# Read directly from the environment (not the AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_
+# prefix) before Settings is constructed.
 _CONFIG_FILE_ENV = "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE"
 _CONFIG_FILE_DEFAULT = "server-config.yaml"
 
 logger = logging.getLogger(__name__)
 
-# Config keys that USED to exist and were removed or renamed in the headless
-# refactor.  Pydantic's settings sources silently drop unknown keys, so an
-# operator upgrading a live deployment whose YAML still carries one of these
-# would get a SILENT behaviour change (e.g. a customized timeout reverting to
-# default, or a dashboard toggle becoming a no-op).  We warn loudly instead of
-# failing -- the server must still boot -- so the drop is never invisible.
+# Removed/renamed config keys. Pydantic silently drops unknown keys, so warn
+# loudly instead of failing -- the server must still boot.
 _REMOVED_CONFIG_KEYS: dict[str, str] = {
     "web_ui_enabled": (
         "removed -- the server is headless-only and has no web UI toggle; "
@@ -55,13 +49,10 @@ _REMOVED_CONFIG_KEYS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # GUID validation helpers (Entra identities)
 # ---------------------------------------------------------------------------
-# Anchored pattern for lowercase hex groups of 8-4-4-4-12.
-# re.fullmatch() anchors the match to the full string, so braces, urn:uuid:
-# prefixes, and trailing junk are all rejected without explicit anchors in the
-# pattern.
+# 8-4-4-4-12 lowercase hex, fullmatch()'d so braces/urn:uuid: prefixes/trailing
+# junk are rejected without explicit anchors.
 _GUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-# The all-zeros sentinel is explicitly rejected — a placeholder accidentally
-# left in config should never authorize anyone.
+# Placeholder sentinel; never a valid identity.
 _ALL_ZEROS_GUID = "00000000-0000-0000-0000-000000000000"
 
 
@@ -73,30 +64,16 @@ def _validate_identity_map(
 ) -> dict[str, dict[str, str]] | None:
     """Shared validator for GUID-keyed identity maps (entra_identities, service_identities).
 
-    Enforces the same rules for both fields so they stay in sync:
-
-    - ``None`` passes through (field is optional).
-    - An empty dict is rejected (fail-closed; omit or null-out to disable),
-      UNLESS ``allow_empty=True`` (entra_identities only), in which case an
-      empty dict is accepted and returned as ``{}`` so the server can boot on a
-      fresh /data volume and be populated at runtime via the /admin API.
-    - Every key must be a valid lowercase GUID in 8-4-4-4-12 form after
-      normalization (rejects braces, urn:uuid: prefixes, trailing junk).
-    - The all-zeros GUID is rejected (placeholder sentinel).
-    - Every value must carry a non-empty, non-whitespace ``id`` string.
-    - Keys are normalized to lowercase and returned as such.
-
-    ``field_name`` is included verbatim in error messages so operators can tell
-    which field failed at startup.
+    - ``None`` passes through (optional field).
+    - Empty dict is rejected unless ``allow_empty=True`` (entra_identities only).
+    - Keys must be valid lowercase GUIDs (8-4-4-4-12); all-zeros is rejected.
+    - Every value must carry a non-empty, non-whitespace ``id``.
+    - Keys are normalized to lowercase.
     """
     if v is None:
         return None
     if len(v) == 0:
         if allow_empty:
-            # entra_identities ONLY: an explicit empty map is permitted so the
-            # server boots on a fresh /data volume and is populated at runtime
-            # via PUT /admin/identities (bootstrap). service_identities does NOT
-            # pass allow_empty, so {} there remains a fail-closed startup error.
             return {}
         raise ValueError(
             f"{field_name} must contain at least one entry if specified; "
@@ -143,21 +120,8 @@ def _build_identity_map_from(
 def _default_identity_store_path(filename: str) -> str:
     """Return a host-install-writable default path for an identity-map store file.
 
-    These paths used to default to "/data/identity/<filename>" -- an Azure
-    Files volume path baked in for the container deployment. On a plain
-    (non-container) host install nothing mounts /data, so the
-    seed-on-first-boot write in IdentityStore.seed() silently failed with
-    PermissionError: the server kept running fail-closed on the in-memory
-    map, but nothing was ever persisted to disk, and any key added later via
-    the /admin API would vanish on restart.
-
-    Default to the invoking user's own writable data dir instead, using the
-    same ~/.local/share/ci-server/... layout already illustrated as the
-    host-install convention in YamlConfigSettingsSource's docstring above
-    (its blob_path / log_path example values). Container deployments are
-    unaffected: they set these paths explicitly via env/YAML (e.g.
-    amplifier-online.yaml sets entra_identities_store_path to the mounted
-    /data volume) -- this default only matters when nothing overrides it.
+    Defaults under the invoking user's own data dir rather than a container-only
+    /data mount. Container deployments override these paths explicitly.
     """
     return str(Path.home() / ".local" / "share" / "ci-server" / "identity" / filename)
 
@@ -165,23 +129,12 @@ def _default_identity_store_path(filename: str) -> str:
 class YamlConfigSettingsSource(PydanticBaseSettingsSource):
     """Load settings from a YAML configuration file.
 
-    The file path is resolved in this order:
+    Path resolution order: constructor ``yaml_file`` arg, then
+    ``AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE``, then
+    ``server-config.yaml`` in cwd (skipped if absent).
 
-    1. The ``yaml_file`` argument passed to the constructor (for tests / explicit use).
-    2. The ``AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE`` environment variable.
-    3. ``server-config.yaml`` in the current working directory (silently skipped if
-       it does not exist).
-
-    Keys in the YAML file correspond to the field names in :class:`Settings` without
-    the ``AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_`` prefix.  Unknown keys are ignored.
-
-    Example ``server-config.yaml``::
-
-        neo4j_url: neo4j://localhost:7687
-        neo4j_password: ""
-        blob_path: /home/user/.local/share/ci-server/blobs
-        log_path: /home/user/.local/share/ci-server/logs/server.jsonl
-    Environment variables always take precedence over values in the YAML file.
+    Keys match :class:`Settings` field names (no prefix); unknown keys are
+    ignored. Environment variables take precedence over YAML values.
     """
 
     def __init__(
@@ -229,18 +182,13 @@ class YamlConfigSettingsSource(PydanticBaseSettingsSource):
 
 
 class Neo4jClientConfig(BaseModel):
-    """One Neo4j logical client (admin OR cypher_query). Same shape for both.
-
-    Future RBAC fields (rbac_role, database, etc.) land in THIS object -- no
-    new top-level knobs later (doc 11 Structured config).
-    """
+    """One Neo4j logical client (admin OR cypher_query). Same shape for both."""
 
     url: str
     username: str = "neo4j"
     password: str = ""
-    # access_mode steers session routing/intent. "WRITE" for admin, "READ" for
-    # cypher_query. On a Community single instance over bolt:// this is a
-    # routing HINT, not server-side enforcement (doc 11 Honest caveat).
+    # "WRITE" for admin, "READ" for cypher_query. On a Community single
+    # instance over bolt:// this is a routing hint, not server-side enforcement.
     access_mode: Literal["READ", "WRITE"] = "WRITE"
 
     @property
@@ -256,9 +204,8 @@ class Neo4jClientConfig(BaseModel):
 class Neo4jConfig(BaseModel):
     """The structured `neo4j` block: two same-shaped clients.
 
-    When present, BOTH sub-clients are required (pydantic enforces this), so
-    the only fallback case the startup guard must detect is
-    `Settings.neo4j is None`.
+    Both sub-clients are required when present, so the startup guard's only
+    fallback case to detect is `Settings.neo4j is None`.
     """
 
     admin: Neo4jClientConfig
@@ -266,18 +213,10 @@ class Neo4jConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_access_modes(self) -> "Neo4jConfig":
-        """Enforce role/access_mode correctness -- fail loud, not silent.
+        """Enforce `admin.access_mode == "WRITE"` and `cypher_query.access_mode == "READ"`.
 
-        `Neo4jClientConfig.access_mode` defaults to "WRITE", so a `cypher_query`
-        block that is a copy-paste of `admin` (or simply omits `access_mode`)
-        would silently behave as a WRITE-capable "read" client -- defeating the
-        entire point of the two-client split. Reject that at construction time:
-
-        - `admin.access_mode` MUST be "WRITE" (the read/write client).
-        - `cypher_query.access_mode` MUST be "READ" (the read-intent client).
-
-        Both violations are reported together so the operator sees one clear
-        message naming exactly which client has the wrong access_mode.
+        Fails loud (both violations reported together) rather than letting a
+        copy-pasted `cypher_query` block silently behave as WRITE-capable.
         """
         errors: list[str] = []
         if self.admin.access_mode != "WRITE":
@@ -311,23 +250,12 @@ class Settings(BaseSettings):
     server_host: str = "0.0.0.0"
     server_port: int = 8000
 
-    # Gunicorn worker timeouts (run() in main.py). Both were hardcoded until
-    # the incident below made that a problem: a durable-spool boot whose
-    # crash-recovery work is legitimately O(backlog size) (see
-    # crash_recovery_respawn_limit above) can take minutes on a large
-    # backlog, and gunicorn's own worker-timeout watchdog cannot distinguish
-    # "still doing legitimate startup work" from "hung" -- it just SIGKILLs
-    # the worker either way, which then gets restarted by systemd and repeats
-    # the same slow boot forever. Defaults (30s / 10s) are UNCHANGED from the
-    # previous hardcoded values, so this PR is a no-op unless an operator
-    # opts in to raise them for a deployment that expects a slow/large-backlog
-    # boot.
+    # Gunicorn worker timeouts (run() in main.py). Crash-recovery boot work is
+    # O(backlog size) and can take minutes; raise these for a deployment that
+    # expects a slow/large-backlog boot.
     #
-    # gunicorn_worker_timeout: seconds gunicorn allows a worker to go silent
-    #   (no heartbeat) before killing it. See gunicorn's `timeout` setting.
-    # gunicorn_graceful_timeout: seconds gunicorn waits for a worker to finish
-    #   handling in-flight work after SIGTERM before force-killing it. See
-    #   gunicorn's `graceful_timeout` setting.
+    # gunicorn_worker_timeout: seconds a silent worker is allowed before kill.
+    # gunicorn_graceful_timeout: seconds to finish in-flight work after SIGTERM.
     gunicorn_worker_timeout: int = 30
     gunicorn_graceful_timeout: int = 10
 
@@ -362,23 +290,10 @@ class Settings(BaseSettings):
     ) -> dict[str, dict[str, str]] | None:
         """Fail-closed: raise unless every entry is ``<64-hex> -> {"id": <non-empty str>}``.
 
-        Rejects (by raising ``ValueError``):
-        - an explicitly empty dict (omit or null-out to disable authentication);
-        - a key that is not exactly 64 lowercase-hex characters after normalization
-          (whitespace characters are rejected because they are not valid hex digits);
-        - a value whose ``id`` is missing, empty, or whitespace-only.
-
-        Non-dict values are already rejected by pydantic's ``dict[str, dict[str, str]]``
-        coercion before this validator runs (``mode="after"``), so no extra
-        ``isinstance`` check is needed here.
-
-        Digest keys are normalized to lowercase before validation and returned as
-        lowercase so an UPPERCASE digest in a config file maps correctly to the
-        lowercase hexdigest produced by ``hashlib.sha256(...).hexdigest()``.
-
-        NOTE: Duplicate digest keys in YAML/dict collapse to last-wins at the YAML
-        parse level, before this validator sees the data.  Detection is not possible
-        here.
+        Rejects an empty dict, a key that isn't 64 lowercase-hex chars after
+        normalization, or a value with a missing/empty ``id``. Digest keys are
+        lowercased so an uppercase digest still maps to
+        ``hashlib.sha256(...).hexdigest()``.
         """
         if v is None:
             return None
@@ -432,35 +347,20 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # Entra authentication (auth_mode=entra)
     # -------------------------------------------------------------------------
-    # auth_mode selects which resolver is active: "static" = today's sha256
-    # keystore; "entra" = JWT validation via Entra / JWKS.  Exactly one mode
-    # is active at a time — no "both".  Choosing "entra" without the required
-    # supporting fields is a hard startup error (AC7 / §8b).
+    # "static" = sha256 keystore; "entra" = JWT validation via Entra/JWKS.
+    # Exactly one mode is active at a time.
     auth_mode: Literal["static", "entra"] = "static"
 
-    # allow_unauthenticated: the SOLE fail-open trigger in the whole server.
-    #
-    # An empty keystore / identity map alone NO LONGER fails open: the server
-    # BOOTS fail-CLOSED with zero credentials (a supported bootstrap state,
-    # announced by a loud startup WARNING) and every request 401/403s until the
-    # store is populated at runtime via the /admin API.
-    #
-    # The ONLY way to make the server pass EVERY request through unauthenticated
-    # is to set this flag to True AND leave credentials unconfigured
-    # (auth_enabled=False).  In that case the middleware fails open and
-    # create_asgi_app() emits a loud "WIDE OPEN" warning at startup.
-    #
-    # This flag exists ONLY for the test harness and local dev environments
-    # where auth is intentionally disabled.  Never set it in production.
-    # (In auth_mode=entra it has no effect: EntraResolver.auth_enabled is always
-    # True, so the fail-open branch can never fire regardless of this flag.)
+    # The sole fail-open trigger in the server. An empty keystore/identity map
+    # boots fail-closed (401/403 until populated via /admin). Setting this True
+    # with no credentials configured makes every request pass unauthenticated
+    # ("WIDE OPEN" warning at startup) -- test/dev only, never production. No
+    # effect in auth_mode=entra (EntraResolver.auth_enabled is always True).
     allow_unauthenticated: bool = False
 
-    # azure_client_id / azure_tenant_id: the App Registration coordinates.
-    # Both are required when auth_mode="entra".  Empty / whitespace-only
-    # strings are normalized to None so that a template placeholder in a YAML
-    # file (e.g. azure_client_id: "") behaves identically to omitting the field
-    # and triggers a clear startup error rather than a silent wrong-value lookup.
+    # App Registration coordinates; both required when auth_mode="entra".
+    # Empty/whitespace strings normalize to None so a blank YAML placeholder
+    # triggers a clear startup error instead of a silent wrong-value lookup.
     azure_client_id: str | None = None
     azure_tenant_id: str | None = None
 
@@ -474,21 +374,11 @@ class Settings(BaseSettings):
             return None
         return v
 
-    # entra_identities: the oid→contributor map — exact parity with api_keys.
-    #
-    # Shape: { "<oid-GUID>": {"id": "<contributor>"} }  (value = {id} only)
-    #
-    # Key  = the user's Azure AD object ID (oid), stored verbatim (public id);
-    #        not hashed — hashing buys nothing for a public id and hurts auditability.
-    # Value = {"id": "<contributor>"} matching the api_keys payload — same
-    #        contributor string space, same write-once provenance semantics.
-    #
-    # Many oids → one contributor works automatically: each oid is its own key
-    # with the same "id" value (e.g. two AD identities for the same person).
-    #
-    # NOTE: oid is a persistent personal identifier.  Do NOT commit real oid
-    # values to product repos — use env/secret injection or a git-ignored map
-    # (see §3 PII note in the auth plan).
+    # oid -> contributor map: { "<oid-GUID>": {"id": "<contributor>"} }.
+    # oid is stored verbatim (not hashed -- it's already a public id). Many
+    # oids may map to one contributor.
+    # NOTE: oid is a persistent personal identifier -- do not commit real
+    # values to product repos; use env/secret injection or a git-ignored map.
     entra_identities: dict[str, dict[str, str]] | None = None
 
     @field_validator("entra_identities", mode="after")
@@ -496,34 +386,15 @@ class Settings(BaseSettings):
     def _validate_entra_identities(
         cls, v: dict[str, dict[str, str]] | None
     ) -> dict[str, dict[str, str]] | None:
-        """Fail-closed: raise unless every entry is ``<GUID> -> {"id": <non-empty str>}``.
-
-        Delegates to the shared ``_validate_identity_map()`` helper which enforces
-        GUID key validation, the all-zeros sentinel rejection, non-empty ``id``
-        requirement, and key lowercasing.  See that function's docstring for the
-        full rule set.
-
-        This validator runs in ``mode="after"``, so pydantic has already coerced
-        the field as ``dict[str, dict[str, str]]`` before this function is called.
-        Non-dict values and non-string ``id`` values are caught by pydantic before
-        reaching this code.
-        """
+        """Fail-closed: raise unless every entry is ``<GUID> -> {"id": <non-empty str>}``."""
         return _validate_identity_map(v, "entra_identities", allow_empty=True)
 
     @model_validator(mode="after")
     def _validate_entra_config(self) -> "Settings":
-        """Cross-field startup validator for auth_mode='entra' (AC7).
+        """When auth_mode='entra', require azure_client_id and azure_tenant_id.
 
-        When auth_mode is 'entra' ALL of the following must be present and
-        non-None after normalization:
-        - azure_client_id
-        - azure_tenant_id
-
-        entra_identities is NOT required: an empty/omitted identity map is a
-        supported bootstrap state (populate at runtime via /admin/identities).
-
-        A single ValueError names every missing field so the operator sees one
-        clear startup message rather than cryptic downstream failures.
+        entra_identities is not required (empty/omitted is a supported
+        bootstrap state). Names every missing field in one ValueError.
         """
         if self.auth_mode == "entra":
             errors: list[str] = []
@@ -539,11 +410,6 @@ class Settings(BaseSettings):
                     "set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_TENANT_ID "
                     "or azure_tenant_id in the config file"
                 )
-            # NOTE: entra_identities is intentionally NOT required here.
-            # An empty/omitted map is a SUPPORTED bootstrap state: the server
-            # boots and operators onboard the first oid at runtime via the
-            # IdentityAdmin-gated /admin/identities API. main.create_asgi_app()
-            # logs a loud warning when the effective map is empty at startup.
             if errors:
                 raise ValueError(
                     "Entra auth misconfiguration (startup refused): "
@@ -554,32 +420,17 @@ class Settings(BaseSettings):
     def build_identity_map(self) -> dict[str, str]:
         """Return ``{oid_lower -> contributor_id}`` for all configured Entra identities.
 
-        Mirrors ``build_keystore()`` — returns a plain ``{key: contributor_id}``
-        dict that the EntraResolver can use for O(1) lookup after extracting the
+        Mirrors ``build_keystore()`` for O(1) lookup after extracting the
         ``oid`` claim from a validated JWT.
-
-        Keys are lowercased as a belt-and-suspenders guarantee: the field
-        validator already normalizes them, but the resolver also lowercases the
-        JWT ``oid`` claim before lookup, so both sides use the same casing.
         """
         return _build_identity_map_from(self.entra_identities)
 
     # -------------------------------------------------------------------------
     # M2 non-interactive auth: service / app-token identity path
     # -------------------------------------------------------------------------
-    # service_identities: the OID → contributor map for service principals /
-    # managed identities.  Same shape as entra_identities; lives in config
-    # only (no durable store — service identities don't need runtime mutation).
-    #
-    # Shape: { "<oid-GUID>": {"id": "<contributor>"} }
-    #
-    # Validation rules are identical to entra_identities (both delegate to the
-    # shared _validate_identity_map() helper) — GUID keys, non-empty id, no
-    # all-zeros sentinel.
-    #
-    # This field is OPTIONAL.  The service identity path never participates in
-    # the _validate_entra_config cross-field check, so auth_mode=entra boots
-    # with only client_id / tenant_id / entra_identities.
+    # OID -> contributor map for service principals / managed identities.
+    # Same shape and validation as entra_identities; config-only (no durable
+    # store). Optional; doesn't participate in _validate_entra_config.
     service_identities: dict[str, dict[str, str]] | None = None
 
     @field_validator("service_identities", mode="after")
@@ -587,31 +438,18 @@ class Settings(BaseSettings):
     def _validate_service_identities(
         cls, v: dict[str, dict[str, str]] | None
     ) -> dict[str, dict[str, str]] | None:
-        """Fail-closed: same GUID-map rules as entra_identities (shared helper).
-
-        Delegates to ``_validate_identity_map()``.  See that function's docstring
-        for the full rule set.
-        """
+        """Fail-closed: same GUID-map rules as entra_identities (shared helper)."""
         return _validate_identity_map(v, "service_identities")
 
     def build_service_identity_map(self) -> dict[str, str]:
-        """Return ``{oid_lower -> contributor_id}`` for all configured service identities.
-
-        Mirrors ``build_identity_map()`` — returns a plain ``{key: contributor_id}``
-        dict for O(1) lookup after extracting the ``oid`` claim from an app token.
-
-        Returns ``{}`` when ``service_identities`` is ``None`` or empty.
-        """
+        """Return ``{oid_lower -> contributor_id}`` for all configured service identities."""
         return _build_identity_map_from(self.service_identities)
 
     # -------------------------------------------------------------------------
     # Admin API key (static mode only — gates /admin/* map-mutation endpoints)
     # -------------------------------------------------------------------------
-    # admin_api_key is a separate credential from the data-auth api_keys.
-    # It is set via the YAML config file (same CONFIG_FILE that carries api_keys)
-    # and/or the env var below (env overrides YAML — standard pydantic-settings
-    # priority).  Empty string is normalised to None so that admin_api_key: ""
-    # in a YAML template behaves identically to omitting the field.
+    # Separate credential from the data-auth api_keys. Empty string normalizes
+    # to None so admin_api_key: "" behaves like omitting the field.
     admin_api_key: str | None = None
 
     @field_validator("admin_api_key", mode="before")
@@ -620,21 +458,10 @@ class Settings(BaseSettings):
         """Normalize empty string to None (mirrors _normalize_api_key)."""
         return None if v == "" else v  # type: ignore[return-value]
 
-    # admin_api_key_sha256 is the RECOMMENDED way to configure the admin key:
-    # store the SHA-256 hex digest of the admin token at rest, never the raw
-    # token — mirroring how the data-auth ``api_keys`` map stores digests, not
-    # tokens (see docs/managing-api-keys.md).  A leak of the config file then
-    # yields only a one-way digest, not a usable admin credential.
-    #
-    # The legacy raw ``admin_api_key`` above still works for back-compat (it is
-    # hashed at load time, exactly like the legacy singular ``api_key``), but is
-    # DEPRECATED because it stores the secret in plaintext at rest.  When both
-    # are set, ``admin_api_key_sha256`` wins and the raw field is ignored
-    # (surfaced as a startup warning in create_asgi_app).
-    #
-    # Set via YAML or the env var
-    # ``AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY_SHA256``.  Empty
-    # string normalises to None (mirrors admin_api_key).
+    # Recommended way to configure the admin key: store the SHA-256 hex digest
+    # at rest, never the raw token. The legacy raw ``admin_api_key`` still
+    # works (hashed at load time) but is deprecated; when both are set, this
+    # wins. Empty string normalizes to None.
     admin_api_key_sha256: str | None = None
 
     @field_validator("admin_api_key_sha256", mode="before")
@@ -691,16 +518,9 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # Entra admin role (entra mode only — gates /admin/* map-mutation endpoints)
     # -------------------------------------------------------------------------
-    # entra_admin_role is the Entra App Role name whose presence in a token's
-    # `roles` claim grants access to /admin/* endpoints.  The role is created
-    # in the App Registration (approles-patch.json).
-    #
-    # Empty string ("") means the admin API is DISABLED in entra mode (callers
-    # receive 503).  The default "IdentityAdmin" matches the App Registration
-    # role defined for the pilot.  Override via YAML or env var to rename.
-    #
-    # NOTE: the check ONLY reads the `roles` claim — NEVER `groups`.  A value
-    # in the `groups` claim must NOT grant admin access (TB-09 / design §6).
+    # Entra App Role name whose presence in a token's `roles` claim grants
+    # access to /admin/* endpoints. Empty string disables the admin API in
+    # entra mode (503). Checks ONLY the `roles` claim — never `groups`.
     entra_admin_role: str = "IdentityAdmin"
 
     @field_validator("entra_admin_role", mode="before")
@@ -711,18 +531,9 @@ class Settings(BaseSettings):
             return ""
         return str(v)
 
-    # M2 service role names
-    #
-    # service_data_role: the Entra App Role name whose presence in an app token's
-    # ``roles`` claim grants the standard Contributor-level data access.  This
-    # mirrors what a delegated user gets via entra_identities, but for service
-    # principals.  Empty string ('') disables the service data path entirely.
-    #
-    # reader_role: the Entra App Role name granting read-only access.  Empty string
-    # disables read-only app-token gating.  Default 'Reader' matches the App
-    # Registration role defined for the M2 service path.
-    #
-    # Both fields normalize None → '' (same pattern as entra_admin_role).
+    # Entra App Roles gating service/app-token access: service_data_role for
+    # standard Contributor-level data access, reader_role for read-only.
+    # Empty string disables the respective path.
     service_data_role: str = "Contributor"
     reader_role: str = "Reader"
 
@@ -737,15 +548,7 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # Durable identity-map store paths
     # -------------------------------------------------------------------------
-    # These paths control where the two JSON identity-map files live. Both are
-    # env/YAML overridable to allow non-default layouts in development,
-    # custom deployments, or containers -- e.g. amplifier-online.yaml sets
-    # entra_identities_store_path explicitly to the mounted Azure Files
-    # volume (/data/identity/entra-identities.json).
-    #
-    # The DEFAULT (see _default_identity_store_path()) is a host-writable
-    # per-user path, not /data/... -- see that helper's docstring for why.
-    #
+    # Where the two JSON identity-map files live; both env/YAML overridable.
     # api_keys_store_path:          SHA-256 digest → contributor map (static mode)
     # entra_identities_store_path:  OID → contributor map (entra mode)
     api_keys_store_path: str = _default_identity_store_path("api-keys.json")
@@ -761,18 +564,12 @@ class Settings(BaseSettings):
     neo4j_password: str = "password"
     neo4j_browser_url: str = "http://localhost:7474"
 
-    # Structured two-client config (doc 11). OPTIONAL for backward-compat: when
-    # absent, BOTH clients fall back to the legacy flat neo4j_* fields above.
-    # The real amplifier-online.yaml MUST set this explicitly (see
-    # neo4j_require_explicit_clients + the startup guard).
+    # Structured two-client config. Optional for backward-compat: when absent,
+    # both clients fall back to the legacy flat neo4j_* fields above.
     neo4j: Neo4jConfig | None = None
 
-    # Deployed-profile signal (gap #12). When True, the startup guard REFUSES to
-    # boot on the legacy fallback (i.e. neo4j is None) -- the deployed system must
-    # declare admin + cypher_query explicitly, even pointing at the same instance.
-    # Default False so existing deployments / server-config.yaml keep booting on
-    # the legacy fallback during the transition.
-    # Env: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_REQUIRE_EXPLICIT_CLIENTS=true
+    # When True, the startup guard refuses to boot on the legacy fallback
+    # (neo4j is None) -- admin + cypher_query must be declared explicitly.
     neo4j_require_explicit_clients: bool = False
 
     def resolve_neo4j_admin(self) -> Neo4jClientConfig:
@@ -806,47 +603,32 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # Durable ingest queue
     # -------------------------------------------------------------------------
-    # Conservative working defaults pending tuning (design Open Question 4).
     write_concurrency: int = 8  # global cap on concurrent Neo4j-write flushes
     max_delivery_attempts: int = 5  # flush retries for one batch before dead-letter
-    # Sub-transaction chunk bounds for _flush_body (issue #278).
-    # A chunk closes when EITHER bound trips first: cardinality or payload size.
+    # Sub-transaction chunk bounds for _flush_body. A chunk closes when EITHER
+    # bound trips first: cardinality or payload size.
     neo4j_flush_chunk_rows: int = (
         100  # max rows per sub-transaction (cardinality bound)
     )
     neo4j_flush_chunk_bytes: int = (
         4_194_304  # max serialized bytes per sub-tx (4 MiB payload bound)
     )
-    neo4j_lock_timeout: float = (
-        30.0  # per-transaction server-side timeout in seconds (Layer B)
-    )
-    # A conservative default matching max_transaction_retry_time=30s.  Prevents
-    # a blocked flush from parking indefinitely when db.lock.acquisition.timeout=0
-    # (Neo4j default) holds all write_semaphore permits and stalls the pipeline.
-    # Set to 0 to disable (no per-transaction timeout).
+    neo4j_lock_timeout: float = 30.0  # per-transaction server-side timeout in seconds
+    # Prevents a blocked flush from parking indefinitely when
+    # db.lock.acquisition.timeout=0 holds all write_semaphore permits and
+    # stalls the pipeline. 0 disables the per-transaction timeout.
 
-    # Crash-recovery respawn ceiling (incident: a 38 GB / 583-file durable
-    # spool made cold start respawn 94/94 drainers before the server could
-    # accept a single request; startup took ~4 minutes and RSS peaked at
-    # 43.9 GB, tripping the kernel OOM killer -- which systemd then restarted,
-    # repeating the same unbounded respawn and never letting the backlog
-    # shrink). This mirrors write_concurrency's role as a hard ceiling on a
-    # startup-time resource cost, but bounds the RESPAWN LOOP in
-    # lifespan() (main.py) rather than write-flush concurrency: at most this
-    # many sessions from the recovered backlog get a drainer respawned on
-    # THIS boot; the remainder are DEFERRED -- left completely untouched on
-    # disk (still durable, still recoverable on a later boot, or instantly
-    # via get_or_create() the moment a new event for that session arrives
-    # through POST /events). A deferred backlog is never silent: lifespan()
-    # logs a WARNING naming the exact respawned/deferred counts and this
-    # setting, and /status's spool block (pending_sessions, spool_bytes_total)
-    # makes the backlog observable continuously, not just at boot.
+    # Hard ceiling on drainers respawned from the recovered backlog on THIS
+    # boot (mirrors write_concurrency's role, but bounds the respawn loop in
+    # lifespan() rather than write-flush concurrency). The remainder are
+    # deferred, left untouched on disk (still durable; recoverable on a later
+    # boot, or instantly via get_or_create() on a new event). Never silent:
+    # lifespan() logs the respawned/deferred counts, and /status's spool
+    # block makes the backlog observable continuously.
     #
-    # The default CHANGES from None
-    # (unbounded) to a finite ceiling of 8. An unbounded default made this a
-    # no-op in practice -- and worse, with the ceiling unbounded no sweep
-    # task was EVER started (see crash_recovery_sweep_interval_seconds
-    # below), so a recovered drainer that runs dry with no terminal record
+    # None means unbounded; with an unbounded ceiling no sweep task starts
+    # (see crash_recovery_sweep_interval_seconds below), so a recovered drainer
+    # that runs dry with no terminal record
     # (the common shape of a legacy/crashed backlog) never freed its slot
     # and was never replaced: there was no real protection against the OOM
     # this field exists to prevent. 8 is a pessimistic, single-line-
@@ -867,28 +649,11 @@ class Settings(BaseSettings):
             )
         return v
 
-    # Crash-recovery deferred-backlog SWEEP interval (seconds). Only relevant
-    # when crash_recovery_respawn_limit is FINITE. Without this, a finite cap
-    # would drain the head of the backlog on boot and leave the deferred tail
-    # untouched until either a restart or a NEW event for that exact session
-    # arrives -- so a backlog of already-COMPLETED sessions (the incident's
-    # shape) would never drain at all, and a cap of 0 would strand EVERYTHING
-    # permanently. This sweep periodically re-runs recover() and tops the
-    # drainer pool back up to the ceiling: because respawn is idempotent
-    # (get_or_create) and recover() drops sessions the moment they finish, the
-    # number of live recovered drainers stays <= the ceiling while the deferred
-    # tail advances in deterministic sorted order as head sessions drain.
-    #
-    # Default CHANGES from 300s to 60s, coupled to the respawn-limit
-    # default change above -- change them together or neither. With the OLD
-    # defaults (limit=None) this sweep NEVER ran in production, so 300 was
-    # never exercised at scale. Making the ceiling finite promotes the sweep
-    # from "occasional top-up" to the PRIMARY mechanism draining a large
-    # (e.g. 2539-session) recovered backlog: at 300s the tail advances far
-    # too slowly to matter; 60s makes throughput drain-bound rather than
-    # timer-bound. Set to 0 to DISABLE the sweep even under a finite ceiling
-    # (the deferred tail then drains only on restart or a new event -- an
-    # explicit, documented choice, not a silent surprise).
+    # Deferred-backlog sweep interval (seconds); only relevant when
+    # crash_recovery_respawn_limit is finite. Periodically re-runs recover()
+    # and tops the drainer pool back up to the ceiling so the deferred tail
+    # keeps advancing instead of stalling until a restart or new event.
+    # 0 disables the sweep (deferred tail then drains only on restart/new event).
     crash_recovery_sweep_interval_seconds: int = 60
 
     @field_validator("crash_recovery_sweep_interval_seconds")
@@ -902,71 +667,41 @@ class Settings(BaseSettings):
             )
         return v
 
-    # A bad `.offset` (unparseable, negative,
-    # or past-EOF) below this many bytes is RESET (re-drained from byte 0 --
-    # bounded, and idempotent by construction, so re-driving costs nothing)
-    # rather than deleted outright. At/above the threshold the `.log` is
-    # deleted too (the boot cost a bounded re-drain would otherwise remove is
-    # precisely what this reset threshold exists to bound). ~2x the corpus's observed ~29 MB
-    # mean file size, so the common corrupt-offset case re-drains rather than
-    # being destroyed. 0 means "always delete" (pre-v1.1 behaviour), available
-    # but not the default.
+    # A bad `.offset` (unparseable, negative, or past-EOF) below this many
+    # bytes is reset (re-drained from byte 0, bounded and idempotent) rather
+    # than deleted outright; at/above the threshold the `.log` is deleted too.
+    # 0 means "always delete".
     reclaim_redrain_max_bytes: int = 64 * 1024 * 1024
 
-    # The reclaim pass's DELETE/RESET_OFFSET actions
-    # ship DISABLED by default. classify_session is side-effect-free, so with
-    # this False, boot still classifies every key and emits the SAME audit
-    # line it would if enabled (action=dry_run), but reclaim/reclaim_orphans
-    # never run -- nothing is unlinked. The documented first-deploy sequence
-    # is: boot once with this False, read the boot_reclaim_histogram in the
-    # logs, reconcile it against expectations, THEN opt in. An irreversible
-    # delete path must never have its first contact with real production
-    # data be a live unlink.
+    # Reclaim pass's DELETE/RESET_OFFSET actions ship disabled by default.
+    # With this False, boot still classifies every key and logs the same
+    # audit line (action=dry_run), but nothing is unlinked. First-deploy
+    # sequence: boot dry-run, review boot_reclaim_histogram, then opt in.
     reclaim_enabled: bool = False
 
-    # The queue is a TRANSIENT
-    # BUFFER, not an archive -- an open, actively-draining session's
-    # already-committed PREFIX is reclaimed continuously (not just at
-    # session:end). Ships True (contra reclaim_enabled's dry-run-first
-    # default): the decision input is the committed offset, the single
-    # value the durability design already trusts, and delete_drained --
-    # already shipped, always on -- deletes the ENTIRE file on exactly this
-    # same evidence. Compaction removes a strict SUBSET of what an
-    # always-on path already removes. False is a config-change-plus-restart
-    # kill switch (get_settings() is lru_cache'd), not a live toggle.
+    # The queue is a transient buffer, not an archive -- an open,
+    # actively-draining session's already-committed prefix is reclaimed
+    # continuously (not just at session:end). Ships True: the decision input
+    # is the committed offset, the single value the durability design already
+    # trusts, and delete_drained -- already shipped, always on -- deletes the
+    # entire file on exactly this same evidence. False is a
+    # config-change-plus-restart kill switch, not a live toggle.
     queue_compact_enabled: bool = True
 
-    # Bounds compaction FREQUENCY on a continuously-hot session: below this
-    # many committed bytes, Trigger H skips the rewrite --
-    # the idle branch (Trigger I) closes the gap for free the moment the
-    # session goes idle (threshold-free there; the tail is ~0 by
-    # construction). ~18,000 events at the bench's measured ~467 bytes/event;
-    # at the real production peak (~16 ev/s) a single
-    # continuously-hot session triggers this at most once per ~19 minutes.
+    # Bounds compaction frequency on a continuously-hot session: below this
+    # many committed bytes, the rewrite is skipped (the idle path closes the
+    # gap for free once the session goes idle).
     queue_compact_min_prefix_bytes: int = 8 * 1024 * 1024
 
-    # Bounds compaction COST: the threshold above bounds how
-    # OFTEN a rewrite happens; this bounds how LONG one rewrite holds
-    # guard.file_lock (blocking POST /events for that key) -- independent
-    # quantities, since the copy cost is O(tail), not O(prefix). A
-    # fallen-behind drainer can have a committed prefix above
-    # min_prefix_bytes AND a multi-GB uncommitted tail; without this cap that
-    # copies gigabytes under the lock. Same magnitude as
-    # reclaim_redrain_max_bytes (house precedent for \"a bounded amount of
-    # queue-path I/O we are willing to pay\"). <=0 means no cap (explicit
-    # opt-out). Self-healing: as the drainer catches up the tail shrinks
-    # below this and compaction resumes automatically.
+    # Bounds compaction cost: how long one rewrite holds guard.file_lock
+    # (blocking POST /events for that key), since copy cost is O(tail) not
+    # O(prefix). <=0 means no cap. Self-healing: as the drainer catches up
+    # the tail shrinks below this and compaction resumes automatically.
     queue_compact_max_tail_bytes: int = 64 * 1024 * 1024
 
-    # A SEPARATE flag from
-    # reclaim_enabled, defaulting True. reclaim_enabled's caution exists for
-    # a HEURISTIC classification over corrupt/legacy files whose
-    # graph-presence is unproven -- dead-letter expiry is not that
-    # population: the predicate is two plain filesystem facts (no `.log`
-    # exists; mtime older than the window), and the log-less rule is a
-    # STRUCTURAL PROOF (not a heuristic) that no boot mechanism can ever
-    # consult the file being expired. Gating this on reclaim_enabled would
-    # let dead-letters accumulate forever under shipped defaults.
+    # Separate flag from reclaim_enabled: the log-less + stale-mtime predicate
+    # is a structural proof (not a heuristic), so gating this on
+    # reclaim_enabled would let dead-letters accumulate forever by default.
     dead_letter_expiry_enabled: bool = True
 
     # How long a log-less `.dead.jsonl` survives before being expired.
@@ -1004,45 +739,28 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # Writer lease
     # -------------------------------------------------------------------------
-    # The writer-lease detector detects (and, opt-in, refuses) a second
-    # process writing the same
-    # queue directory -- the single-process assumption the per-key
-    # _KeyGuard depends on, enforced within a container but NOT across a
-    # rolling/blue-green revision swap sharing the same mount.
+    # Detects (and, opt-in, refuses) a second process writing the same queue
+    # directory -- the single-process assumption per-key _KeyGuard depends on.
     #
-    # `detect` (the DEFAULT) acquires the lease best-effort, heartbeats it,
-    # and LATCHES + SURFACES a conflict on /status within one heartbeat, but
-    # NEVER refuses to boot. Shipping the refusal on by default would
-    # deadlock a rolling deploy: the new revision can never become healthy
-    # while the old one is still actively renewing its own lease. `enforce`
-    # additionally REFUSES a fresh foreign lease at boot -- gated behind
-    # the deployed-mount smoke test that measures real cross-host clock
-    # skew + write-visibility latency before this is safe to flip on.
-    # `off` disables the detector entirely.
+    # `detect` (default) acquires best-effort, heartbeats, and surfaces a
+    # conflict on /status within one heartbeat, but never refuses to boot
+    # (refusing by default would deadlock a rolling deploy). `enforce`
+    # additionally refuses a fresh foreign lease at boot. `off` disables it.
     writer_lease_mode: Literal["off", "detect", "enforce"] = "detect"
-    # Renew + re-read interval. The acceptance criterion ("conflict visible
-    # within one heartbeat") is what fixes this at 5s: well inside a typical
-    # 15-30s revision-overlap window, at negligible write cost (~250 bytes
-    # every 5s).
+    # Renew + re-read interval; fixed at 5s for "conflict visible within one
+    # heartbeat" well inside a typical revision-overlap window.
     writer_lease_heartbeat_seconds: float = 5.0
-    # Staleness window = heartbeat_seconds * this multiplier (15.0s at
-    # defaults). Must survive two consecutive missed ticks (one GC pause +
-    # one SMB latency spike) without a false "stale" verdict -- the same
-    # class of transient-skew reasoning as registry._RESIDUAL_DEGRADED_GRACE.
+    # Staleness window = heartbeat_seconds * this multiplier. Must survive two
+    # consecutive missed ticks without a false "stale" verdict.
     writer_lease_staleness_multiplier: float = 3.0
     # Post-write settle delay before the acquire's confirming re-read, to
-    # exceed the write -> other-reader visibility latency on Azure Files SMB.
+    # exceed write -> other-reader visibility latency on the shared mount.
     writer_lease_confirm_delay_seconds: float = 1.0
-    # Hard bound on the ENTIRE acquire (and, per-tick, the entire renew) --
-    # both reads, the write, and the confirm sleep. Without this, a hung
-    # mount would block `lifespan` before its `yield` forever; with it,
-    # `lifespan` always reaches `yield` and a stalled heartbeat tick always
-    # returns within this many seconds.
+    # Hard bound on the entire acquire/renew (reads, write, confirm sleep) so
+    # a hung mount can never block `lifespan` before its `yield` forever.
     writer_lease_acquire_timeout_seconds: float = 5.0
-    # One-boot operator escape hatch: force-acquire over a FRESH foreign
-    # lease instead of refusing (enforce mode) or merely latching (detect
-    # mode). Logs a WARNING on every boot while set, and is surfaced on
-    # /status, so leaving it on by accident is never silent.
+    # One-boot operator escape hatch: force-acquire over a fresh foreign
+    # lease. Logs a warning every boot while set and is surfaced on /status.
     writer_lease_force_acquire: bool = False
 
     @field_validator("writer_lease_heartbeat_seconds")
@@ -1056,8 +774,7 @@ class Settings(BaseSettings):
     @field_validator("writer_lease_staleness_multiplier")
     @classmethod
     def _validate_writer_lease_staleness_multiplier(cls, v: float) -> float:
-        """Fail loud below 2.0x: one missed heartbeat tick would yield a
-        FALSE stale verdict -- a second writer boots on top of a live one."""
+        """Fail loud below 2.0x (one missed tick would yield a false stale verdict)."""
         if v < 2.0:
             raise ValueError(
                 "writer_lease_staleness_multiplier must be >= 2.0 (below 2, "
@@ -1077,10 +794,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_writer_lease_timeout_exceeds_confirm_delay(self) -> "Settings":
-        """Cross-field guard: a timeout at or below the confirm delay makes
-        EVERY acquire time out, permanently disarming the detector while
-        reporting only a benign-looking `error` -- a silent-disarm trap that
-        must fail at config load, not in production."""
+        """Cross-field guard: timeout <= confirm delay makes every acquire
+        time out, silently disarming the detector -- must fail at config load."""
         if (
             self.writer_lease_acquire_timeout_seconds
             <= self.writer_lease_confirm_delay_seconds

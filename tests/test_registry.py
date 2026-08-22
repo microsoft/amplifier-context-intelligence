@@ -501,10 +501,6 @@ class TestDeadLetterWarning:
 
         # A malformed line makes _parse_line raise inside _handle_exhausted_batch,
         # triggering the dead-letter path.
-        # The per-record
-        # loop is now ``for rec in batch.records:`` -- a bare
-        # ``poison.lines``/``poison.start_offset`` mock has no ``.records``,
-        # so ``list(MagicMock().records) == []`` and the body never executes.
         poison = MagicMock()
         poison.records = [Record(b"{ this is not valid json", 0, 25)]
 
@@ -963,10 +959,8 @@ class TestDurableSessionEnd:
         cs = reg._completed[0]
         assert cs.session_id == sid
         assert cs.workspace == "/ws"
-        # session:end is re-dispatched once by
-        # the durable finalize re-read (the terminal batch commits UP TO
-        # session:end, so _finalize_session re-reads and re-dispatches it)
-        # -- 2 events appended, but session:end is dispatched twice.
+        # session:end is dispatched twice: once live, once via the
+        # finalize re-read.
         assert cs.events_processed == 3
         assert cs.error_count == 0
         assert cs.ended_at > 0.0
@@ -1409,7 +1403,7 @@ class TestHandlerErrorClose:
 
 
 # ---------------------------------------------------------------------------
-# Task 5: live conservation counters on SessionRegistry. These feed the
+# Live conservation counters on SessionRegistry. These feed the
 # pipeline-conservation snapshot in /status so silently-dropped events become
 # observable (accepted vs written vs replayed, plus write retries).
 # ---------------------------------------------------------------------------
