@@ -731,7 +731,7 @@ async def test_delete_drained_retains_a_log_with_uncommitted_bytes(
     second = _event_bytes("second")
     await qm.append(key, first)
     batch = await qm.read_batch(key, max_items=10)
-    await qm.commit(key, batch.end_offset)  # commits only `first`
+    await qm.commit(key, batch.end_offset, None)  # commits only `first`
     await qm.append(key, second)  # uncommitted tail
 
     with caplog.at_level(
@@ -761,7 +761,7 @@ async def test_guard_map_is_released_on_delete_drained_and_identity_checked(
     for k in keys:
         await qm.append(k, _event_bytes("ev"))
         batch = await qm.read_batch(k, max_items=10)
-        await qm.commit(k, batch.end_offset)
+        await qm.commit(k, batch.end_offset, None)
     assert set(qm._guards.keys()) == set(keys)
 
     for k in keys:
@@ -773,7 +773,7 @@ async def test_guard_map_is_released_on_delete_drained_and_identity_checked(
     key = "aba-key"
     await qm.append(key, _event_bytes("ev"))
     batch = await qm.read_batch(key, max_items=10)
-    await qm.commit(key, batch.end_offset)
+    await qm.commit(key, batch.end_offset, None)
     g_orig = qm._guards[key]
 
     real_stat = Path.stat
@@ -856,7 +856,7 @@ async def test_guard_survives_a_delete_that_races_a_parked_appender(
     seed = _event_bytes("seed")
     await qm.append(key, seed)
     seed_batch = await qm.read_batch(key, max_items=10)
-    await qm.commit(key, seed_batch.end_offset)  # fully drained: size == committed
+    await qm.commit(key, seed_batch.end_offset, None)  # fully drained: size == committed
     guard = qm._guards[key]
 
     real_stat = Path.stat

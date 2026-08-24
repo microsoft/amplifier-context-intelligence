@@ -48,9 +48,9 @@ T11 = "2026-01-01T00:00:11.000000000+00:00"  # prompt:submit P3  (E15: R2→P3)
 
 # Computed node IDs matching the handlers' key conventions
 PROMPT_1_ID = f"{SESSION_ID}::prompt::{T1}"
-RUN_1_ID = f"{SESSION_ID}::orch_run::{T2}"
+RUN_1_ID = f"{SESSION_ID}::orch_run::{T2}::1"
 PROMPT_2_ID = f"{SESSION_ID}::prompt::{T8}"
-RUN_2_ID = f"{SESSION_ID}::orch_run::{T9}"
+RUN_2_ID = f"{SESSION_ID}::orch_run::{T9}::2"
 PROMPT_3_ID = f"{SESSION_ID}::prompt::{T11}"
 
 

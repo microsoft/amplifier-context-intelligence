@@ -710,3 +710,41 @@ class TestHookStateServiceCreatedBy:
         store = GraphState()
         svc = HookStateService(workspace="/ws", graph_store=store, created_by="carol")
         assert svc.graph.created_by == "carol"
+
+
+class TestDurableCursor:
+    def test_snapshot_restore_round_trips_cursor_state(self) -> None:
+        src = HookStateService(workspace="/ws")
+        src.data_layer_2.iteration_count = 7
+        src.data_layer_2.execution_start_ts = "2026-01-01T00:00:02+00:00"
+        src.data_layer_2.active_iteration_id = "sid::iteration::7"
+        src.data_layer_3.active_recipe_run_stack = ["run-1", "run-2"]
+
+        snapshot = src.snapshot_cursor()
+
+        # A fresh worker (empty in-process state) restores from the snapshot.
+        dst = HookStateService(workspace="/ws")
+        dst.restore_cursor(snapshot)
+        assert dst.data_layer_2.iteration_count == 7
+        assert dst.data_layer_2.execution_start_ts == "2026-01-01T00:00:02+00:00"
+        assert dst.data_layer_2.active_iteration_id == "sid::iteration::7"
+        assert dst.data_layer_3.active_recipe_run_stack == ["run-1", "run-2"]
+
+    def test_restore_none_is_a_noop(self) -> None:
+        svc = HookStateService(workspace="/ws")
+        svc.data_layer_2.iteration_count = 3
+        svc.restore_cursor(None)  # legacy .offset with no cursor
+        assert svc.data_layer_2.iteration_count == 3
+
+    def test_restore_drops_unknown_keys_and_keeps_defaults(self) -> None:
+        svc = HookStateService(workspace="/ws")
+        svc.restore_cursor({"dl2": {"iteration_count": 5, "gone_field": "x"}})
+        assert svc.data_layer_2.iteration_count == 5
+        assert not hasattr(svc.data_layer_2, "gone_field")
+        # A field absent from the record keeps its dataclass default.
+        assert svc.data_layer_2.execution_start_ts is None
+
+    def test_corrupt_record_never_raises(self) -> None:
+        svc = HookStateService(workspace="/ws")
+        svc.restore_cursor({"dl2": "not-a-dict", "dl3": 123})  # type: ignore[dict-item]
+        assert svc.data_layer_2.iteration_count == 0

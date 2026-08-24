@@ -66,7 +66,7 @@ class TestExecutionStartCreatesOrchestratorRun:
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        node_id = "s1::orch_run::2026-01-01T00:00:00Z"
+        node_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
         node = await services.graph.get_node(node_id)
         assert node is not None, f"execution:start must create node at '{node_id}'"
 
@@ -82,7 +82,7 @@ class TestExecutionStartCreatesOrchestratorRun:
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z")
+        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z::1")
         assert node is not None
         assert "OrchestratorRun" in node["labels"], (
             f"OrchestratorRun label missing. Got: {node['labels']}"
@@ -103,7 +103,7 @@ class TestExecutionStartCreatesOrchestratorRun:
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z")
+        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z::1")
         assert node is not None
         assert node.get("session_id") == "s1", (
             f"session_id property missing or wrong. Got: {node!r}"
@@ -124,7 +124,7 @@ class TestExecutionStartCreatesOrchestratorRun:
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z"
+        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
         edge = await services.graph.get_edge("s1", orch_run_id)
         assert edge is not None, (
             f"E01 HAS_EXECUTION edge from 's1' to '{orch_run_id}' must exist"
@@ -191,7 +191,7 @@ class TestExecutionEndUpsertsProperties:
                 "status": "completed",
             },
         )
-        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z")
+        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z::1")
         assert node is not None
         assert node.get("ended_at") == "2026-01-01T00:01:00Z", (
             f"ended_at must be set by execution:end. Got: {node!r}"
@@ -212,7 +212,7 @@ class TestExecutionEndUpsertsProperties:
                 "status": "completed",
             },
         )
-        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z")
+        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z::1")
         assert node is not None
         assert node.get("status") == "completed", (
             f"status must be set by execution:end. Got: {node!r}"
@@ -236,7 +236,7 @@ class TestExecutionEndUpsertsProperties:
                 "response": "final answer text",
             },
         )
-        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z")
+        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z::1")
         assert node is not None
         assert node.get("response") == "final answer text", (
             f"response must be set by execution:end. Got: {node!r}"
@@ -269,7 +269,7 @@ class TestOrchestratorCompleteUpsertsProperties:
                 "turn_count": 3,
             },
         )
-        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z")
+        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z::1")
         assert node is not None
         assert node.get("orchestrator_name") == "my-orchestrator", (
             f"orchestrator_name must be set by orchestrator:complete. Got: {node!r}"
@@ -366,7 +366,7 @@ class TestOrchestratorCompleteCursorLifecycle:
                 "turn_count": 1,
             },
         )
-        expected_run_id = "s1::orch_run::2026-01-01T00:00:00Z"
+        expected_run_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
         assert services.data_layer_2.last_completed_orch_run_id == expected_run_id, (
             f"last_completed_orch_run_id must be set to '{expected_run_id}'. "
             f"Got: {services.data_layer_2.last_completed_orch_run_id!r}"
@@ -420,7 +420,7 @@ class TestE14TriggersEdge:
                 "timestamp": "2026-01-01T00:01:00Z",
             },
         )
-        orch_run_id = "s1::orch_run::2026-01-01T00:01:00Z"
+        orch_run_id = "s1::orch_run::2026-01-01T00:01:00Z::1"
         prompt_id = "s1::prompt::2026-01-01T00:00:00Z"
         edge = await services.graph.get_edge(prompt_id, orch_run_id)
         assert edge is not None, (
@@ -509,7 +509,7 @@ class TestOrchestratorRunSourcedFrom:
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z"
+        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
         data_layer_1_node_id = make_node_id(
             "s1", "execution:start", "2026-01-01T00:00:00Z"
         )
@@ -539,7 +539,7 @@ class TestOrchestratorRunSourcedFrom:
                 "status": "completed",
             },
         )
-        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z"
+        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
         data_layer_1_node_id = make_node_id(
             "s1", "execution:end", "2026-01-01T00:01:00Z"
         )
@@ -570,7 +570,7 @@ class TestOrchestratorRunSourcedFrom:
                 "turn_count": 3,
             },
         )
-        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z"
+        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
         data_layer_1_node_id = make_node_id(
             "s1", "orchestrator:complete", "2026-01-01T00:02:00Z"
         )

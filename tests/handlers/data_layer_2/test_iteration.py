@@ -3,10 +3,15 @@
 Covers:
 - handled_events == frozenset({'provider:request', 'llm:request', 'llm:response'})
 - provider:request creates Iteration:SST_EVENT node keyed as
-  '{session_id}::iteration::{iteration_number}' with session_id, iteration_number,
-  and started_at; sets active_iteration_id cursor
+  '{session_id}::iteration::{iteration_number}' (no active orchestrator run) or
+  '{session_id}::orch_run::{execution_start_ts}::iteration::{iteration_number}'
+  (run-scoped when a run is active) with session_id,
+  iteration_number, and started_at; sets active_iteration_id cursor
 - E06: OrchestratorRun -[:HAS_PART {sst_semantic: 'CONTAINS'}]-> Iteration
-  created when execution_start_ts cursor is set; NOT created when None
+  created when execution_start_ts cursor is set (target is the run-scoped
+  iteration_id); NOT created when None
+- two iterations sharing the same iteration_number under DIFFERENT
+  orchestrator runs get DISTINCT node_ids (no cross-run collision)
 - llm:request enriches active Iteration with provider, model, message_count, has_system;
   noop when active_iteration_id is None
 - llm:response enriches active Iteration with usage_input, usage_output, usage_cache_write;
@@ -16,10 +21,14 @@ Covers:
 
 from __future__ import annotations
 
+import logging
+
 from context_intelligence_server.handlers.data_layer_2.iteration import IterationHandler
+from context_intelligence_server.handlers.data_layer_2.orchestrator_run import (
+    OrchestratorRunHandler,
+)
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.utils import make_node_id
-
 
 # ---------------------------------------------------------------------------
 # 1. TestIterationHandlerHandledEvents
@@ -172,10 +181,14 @@ class TestE06HasPartEdge:
     async def test_e06_has_part_edge_created_when_execution_start_ts_is_set(
         self, services: HookStateService
     ) -> None:
-        """E06 edge must be created when execution_start_ts cursor is set before provider:request."""
+        """E06 edge must be created when execution_start_ts cursor is set before provider:request.
+
+        The edge target is the run-scoped iteration_id, not the bare shape.
+        """
         handler = IterationHandler(services)
-        # Simulate that execution:start previously fired and set the cursor
+        # Simulate that execution:start previously fired and set both cursors.
         services.data_layer_2.execution_start_ts = "2026-01-01T00:00:00Z"
+        services.data_layer_2.active_orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
 
         await handler(
             "provider:request",
@@ -184,8 +197,8 @@ class TestE06HasPartEdge:
                 "timestamp": "2026-01-01T00:00:01Z",
             },
         )
-        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z"
-        iteration_id = "s1::iteration::1"
+        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
+        iteration_id = "s1::orch_run::2026-01-01T00:00:00Z::1::iteration::1"
         edge = await services.graph.get_edge(orch_run_id, iteration_id)
         assert edge is not None, (
             f"E06 HAS_PART edge from '{orch_run_id}' to '{iteration_id}' must exist "
@@ -196,6 +209,9 @@ class TestE06HasPartEdge:
         )
         assert edge.get("sst_semantic") == "CONTAINS", (
             f"E06 edge must have sst_semantic='CONTAINS'. Got: {edge.get('sst_semantic')}"
+        )
+        assert services.data_layer_2.active_iteration_id == iteration_id, (
+            "active_iteration_id cursor must be set to the run-scoped iteration_id"
         )
 
     async def test_e06_not_created_when_execution_start_ts_is_none(
@@ -217,6 +233,118 @@ class TestE06HasPartEdge:
         assert len(services.graph._edges) == 1, (
             f"Only SOURCED_FROM edge should exist when execution_start_ts is None. "
             f"Got {len(services.graph._edges)} edges: {list(services.graph._edges.keys())}"
+        )
+        # Falls back to the bare (pre-fix-shaped) id when no orchestrator run is active
+        assert services.data_layer_2.active_iteration_id == "s1::iteration::1"
+
+
+# ---------------------------------------------------------------------------
+# 3b. TestIterationRunScopingP21
+# ---------------------------------------------------------------------------
+
+
+class TestIterationRunScopingP21:
+    """Iteration node_id is run-scoped and does not collide across runs."""
+
+    async def test_same_iteration_number_under_different_runs_gets_distinct_node_ids(
+        self, services: HookStateService
+    ) -> None:
+        """Two iterations sharing iteration_number=1 under DIFFERENT orchestrator runs
+        must produce DISTINCT node_ids and both nodes must independently exist.
+
+        This reproduces the real-world collision: iteration_count is a per-session
+        (not per-run) counter, so after a drainer restart/replay recreates
+        DataLayer2State the counter can restart from zero and reproduce a prior
+        run's iteration_number under a NEW orchestrator run. Before run-scoping,
+        both runs' first iteration would MERGE onto the bare
+        's1::iteration::1' node_id. After the fix, each run's iteration_number=1 is
+        prefixed with its own orch_run_id and the two nodes stay distinct.
+        """
+        orch = OrchestratorRunHandler(services)
+        handler = IterationHandler(services)
+
+        # --- Run 1: a real execution:start mints the run + its tiebreaker (seq 1).
+        await orch(
+            "execution:start",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:01Z"},
+        )
+        run1_iteration_id = services.data_layer_2.active_iteration_id
+        await orch(
+            "orchestrator:complete",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:02Z"},
+        )
+
+        # --- Simulate a drainer restart: a fresh DataLayer2State restarts
+        # iteration_count from 0. The durable orch_run_seq is what a restored
+        # cursor carries; leave it as-is so a genuinely NEW run keeps advancing it.
+        services.data_layer_2.iteration_count = 0
+        # A SECOND run that shares run 1's identical timestamp (coarse clock /
+        # replayed execution:start) -- the exact collision the tiebreaker exists for.
+        await orch(
+            "execution:start",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:03Z"},
+        )
+        run2_iteration_id = services.data_layer_2.active_iteration_id
+
+        # Same timestamp, different seq -> distinct ids (tiebreaker load-bearing).
+        assert run1_iteration_id == "s1::orch_run::2026-01-01T00:00:00Z::1::iteration::1"
+        assert run2_iteration_id == "s1::orch_run::2026-01-01T00:00:00Z::2::iteration::1"
+        assert run1_iteration_id != run2_iteration_id, (
+            "Two runs sharing an identical execution_start_ts must still get "
+            "distinct Iteration ids (the run tiebreaker)."
+        )
+
+        node1 = await services.graph.get_node(run1_iteration_id)
+        node2 = await services.graph.get_node(run2_iteration_id)
+        assert node1 is not None, (
+            f"Run 1's Iteration node '{run1_iteration_id}' must exist"
+        )
+        assert node2 is not None, (
+            f"Run 2's Iteration node '{run2_iteration_id}' must exist"
+        )
+        assert node1.get("iteration_number") == 1
+        assert node2.get("iteration_number") == 1
+        assert node1.get("started_at") == "2026-01-01T00:00:01Z", (
+            "Run 1's Iteration node must retain its own started_at, not run 2's "
+            "(proves the two nodes were never merged together)"
+        )
+        assert node2.get("started_at") == "2026-01-01T00:00:03Z"
+
+        # --- Regression guard: exactly ONE distinct HAS_PART parent per Iteration.
+        run1_orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
+        run2_orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z::2"
+
+        def has_part_parents(iteration_id: str) -> list[str]:
+            """Distinct HAS_PART parent ids pointing at *iteration_id* in the fake graph."""
+            return [
+                src
+                for (src, dst), data in services.graph._edges.items()
+                if dst == iteration_id and data.get("type") == "HAS_PART"
+            ]
+
+        run1_parents = has_part_parents(run1_iteration_id)
+        run2_parents = has_part_parents(run2_iteration_id)
+
+        assert run1_parents == [run1_orch_run_id], (
+            f"Run 1's Iteration node '{run1_iteration_id}' must have exactly ONE "
+            f"HAS_PART parent (its own OrchestratorRun). Got: {run1_parents!r}"
+        )
+        assert run2_parents == [run2_orch_run_id], (
+            f"Run 2's Iteration node '{run2_iteration_id}' must have exactly ONE "
+            f"HAS_PART parent (its own OrchestratorRun). Got: {run2_parents!r}"
+        )
+        assert set(run1_parents).isdisjoint(run2_parents), (
+            "No Iteration node may be shared (MERGEd) across the two "
+            "OrchestratorRuns -- each run's iterations must be distinct nodes "
+            "with distinct, non-overlapping HAS_PART parents."
         )
 
 
@@ -596,4 +724,176 @@ class TestIterationSourcedFrom:
         )
         assert edge.get("type") == "SOURCED_FROM", (
             f"Edge type must be 'SOURCED_FROM'. Got: {edge.get('type')!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# iteration_scope completeness
+#
+# The Iteration node is upsert_node'd from THREE sites: provider:request,
+# llm:request, llm:response. Each site stamps the additive 'iteration_scope'
+# ('run' | 'unscoped') property independently, sourced from the SAME cursor
+# field (execution_start_ts) -- so a node can never be created/updated
+# without a scope value, regardless of which of the three sites happens to
+# be the one that actually writes it (e.g. a dead-lettered provider:request
+# whose active_iteration_id mutation nonetheless survives to a later
+# llm:request/llm:response).
+# ---------------------------------------------------------------------------
+
+
+class TestIterationScopeCompleteness:
+    """iteration_scope stamped at ALL THREE upsert_node call sites."""
+
+    async def test_provider_request_unscoped_with_no_execution_start(
+        self, services: HookStateService
+    ) -> None:
+        """provider:request with NO preceding execution:start ->
+        iteration_scope == 'unscoped'."""
+        assert services.data_layer_2.execution_start_ts is None
+        handler = IterationHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+        )
+        node = await services.graph.get_node("s1::iteration::1")
+        assert node is not None
+        assert node.get("iteration_scope") == "unscoped", (
+            f"Expected iteration_scope='unscoped'. Got: {node!r}"
+        )
+
+    async def test_provider_request_run_scoped_with_execution_start(
+        self, services: HookStateService
+    ) -> None:
+        """A normal (execution:start already seen) run stamps 'run'."""
+        services.data_layer_2.execution_start_ts = "2026-01-01T00:00:00Z"
+        services.data_layer_2.active_orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
+        handler = IterationHandler(services)
+        await handler(
+            "provider:request",
+            {"session_id": "s1", "timestamp": "2026-01-01T00:00:01Z"},
+        )
+        node_id = "s1::orch_run::2026-01-01T00:00:00Z::1::iteration::1"
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert node.get("iteration_scope") == "run", (
+            f"Expected iteration_scope='run'. Got: {node!r}"
+        )
+
+    async def test_unscoped_emitted_log_is_info_not_warning(
+        self, services: HookStateService, caplog
+    ) -> None:
+        """The log line for an unscoped iteration must be
+        INFO (or rate-limited), NEVER WARNING -- a loop-basic unscoped
+        session is a normal case, not an alert-worthy anomaly."""
+        handler = IterationHandler(services)
+        with caplog.at_level(
+            logging.INFO,
+            logger="context_intelligence_server.handlers.data_layer_2.iteration",
+        ):
+            await handler(
+                "provider:request",
+                {"session_id": "s1", "timestamp": "2026-01-01T00:00:00Z"},
+            )
+        unscoped_records = [
+            r for r in caplog.records if "unscoped_iteration_emitted" in r.message
+        ]
+        assert unscoped_records, (
+            "expected an 'unscoped_iteration_emitted' log record to be emitted"
+        )
+        assert all(r.levelno == logging.INFO for r in unscoped_records), (
+            "unscoped_iteration_emitted must log at INFO, got levels: "
+            f"{[r.levelname for r in unscoped_records]}"
+        )
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records), (
+            "no WARNING (or higher) should be emitted for a normal unscoped iteration"
+        )
+
+    async def test_llm_request_stamps_unscoped_independent_of_provider_request(
+        self, services: HookStateService
+    ) -> None:
+        """llm:request must stamp iteration_scope
+        on its OWN upsert_node call, even when the node was never created by
+        provider:request (e.g. a dead-lettered provider:request whose
+        active_iteration_id cursor mutation nonetheless survives). Simulated
+        here by setting the cursor directly, bypassing provider:request."""
+        services.data_layer_2.active_iteration_id = "s1::iteration::99"
+        handler = IterationHandler(services)
+        await handler(
+            "llm:request",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "provider": "anthropic",
+                "model": "claude",
+            },
+        )
+        node = await services.graph.get_node("s1::iteration::99")
+        assert node is not None
+        assert node.get("iteration_scope") == "unscoped", (
+            f"llm:request must stamp iteration_scope='unscoped'. Got: {node!r}"
+        )
+
+    async def test_llm_request_stamps_run_scope_when_execution_start_ts_set(
+        self, services: HookStateService
+    ) -> None:
+        services.data_layer_2.execution_start_ts = "2026-01-01T00:00:00Z"
+        services.data_layer_2.active_orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
+        node_id = "s1::orch_run::2026-01-01T00:00:00Z::1::iteration::1"
+        services.data_layer_2.active_iteration_id = node_id
+        handler = IterationHandler(services)
+        await handler(
+            "llm:request",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "provider": "anthropic",
+                "model": "claude",
+            },
+        )
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert node.get("iteration_scope") == "run", (
+            f"llm:request must stamp iteration_scope='run'. Got: {node!r}"
+        )
+
+    async def test_llm_response_stamps_unscoped_independent_of_provider_request(
+        self, services: HookStateService
+    ) -> None:
+        """Same completeness gap as llm:request, for the third site."""
+        services.data_layer_2.active_iteration_id = "s1::iteration::99"
+        handler = IterationHandler(services)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+        node = await services.graph.get_node("s1::iteration::99")
+        assert node is not None
+        assert node.get("iteration_scope") == "unscoped", (
+            f"llm:response must stamp iteration_scope='unscoped'. Got: {node!r}"
+        )
+
+    async def test_llm_response_stamps_run_scope_when_execution_start_ts_set(
+        self, services: HookStateService
+    ) -> None:
+        services.data_layer_2.execution_start_ts = "2026-01-01T00:00:00Z"
+        services.data_layer_2.active_orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
+        node_id = "s1::orch_run::2026-01-01T00:00:00Z::1::iteration::1"
+        services.data_layer_2.active_iteration_id = node_id
+        handler = IterationHandler(services)
+        await handler(
+            "llm:response",
+            {
+                "session_id": "s1",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+        node = await services.graph.get_node(node_id)
+        assert node is not None
+        assert node.get("iteration_scope") == "run", (
+            f"llm:response must stamp iteration_scope='run'. Got: {node!r}"
         )

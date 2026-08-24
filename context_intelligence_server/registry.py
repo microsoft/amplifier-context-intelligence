@@ -353,6 +353,18 @@ class SessionRegistry:
         poll_interval = min(flush_timeout, _DRAIN_POLL_INTERVAL)
         idle_elapsed = 0.0
         attempts = 0
+        # A (re)built worker starts with empty cross-handler counters. Restore the
+        # cursor the last commit persisted -- lazily, just before the FIRST real
+        # batch is processed -- so a rebuild resumes those counters instead of
+        # restarting from zero (which would remint node ids and duplicate them).
+        # Kept off the idle path so an idle worker never does this read.
+        cursor_restored = False
+        # Cursor state as it was BEFORE the first attempt on the current batch.
+        # A failed attempt leaves the cross-handler counters advanced; replaying
+        # the same batch from that advanced state mints fresh node ids and
+        # duplicates the Iteration. Restoring this snapshot before each retry
+        # makes the replay reproduce the SAME ids (idempotent MERGE).
+        pre_batch_cursor: dict[str, Any] | None = None
 
         while True:
             try:
@@ -401,6 +413,20 @@ class SessionRegistry:
                     continue
 
                 idle_elapsed = 0.0
+
+                # Restore the durable cursor once, before this worker's FIRST
+                # real batch is processed (and before the pre-attempt snapshot
+                # below, so that snapshot captures the restored state). A
+                # brand-new session has no committed cursor (read_cursor -> None
+                # -> no-op).
+                if not cursor_restored:
+                    worker.services.restore_cursor(await qm.read_cursor(session_id))
+                    cursor_restored = True
+
+                # Snapshot once, before the first attempt on this batch, so a
+                # retry can roll the counters back (see pre_batch_cursor above).
+                if attempts == 0:
+                    pre_batch_cursor = worker.services.snapshot_cursor()
 
                 # --- dispatch + durable write barrier, one error path ---
                 try:
@@ -462,8 +488,11 @@ class SessionRegistry:
                             return
                         attempts = 0
                         continue
-                    # Not yet exhausted: back off before re-reading the same
-                    # offset (idempotent MERGE makes the replay a no-op).
+                    # Not yet exhausted: roll the cross-handler counters back to
+                    # their pre-attempt state so the replay reproduces the same
+                    # node ids (idempotent MERGE) instead of duplicating them,
+                    # then back off before re-reading the same offset.
+                    worker.services.restore_cursor(pre_batch_cursor)
                     await asyncio.sleep(poll_interval)
                     continue
 
@@ -471,7 +500,9 @@ class SessionRegistry:
                 # Commit only up to session:end -- leaving it uncommitted makes
                 # "ended but not finalized" durable across a respawn/recover().
                 commit_to = batch.end_offset if terminal_at is None else terminal_at
-                await qm.commit(session_id, commit_to)
+                await qm.commit(
+                    session_id, commit_to, worker.services.snapshot_cursor()
+                )
                 counted = len(batch.records) if terminal_at is None else safe_count
                 self.record_written(counted)
                 logger.debug(
@@ -583,7 +614,9 @@ class SessionRegistry:
                     extra={"session_id": session_id},
                 )
                 worker.services.graph.discard_buffer()
-                await qm.commit(session_id, rec.end)  # queue-produced offset
+                await qm.commit(
+                    session_id, rec.end, worker.services.snapshot_cursor()
+                )  # queue-produced offset
                 continue
 
             from context_intelligence_server.pipeline import TERMINAL_EVENTS
@@ -609,7 +642,9 @@ class SessionRegistry:
                 # the NEXT record's flush. A successful flush clears the
                 # buffer itself; only the failure path needs this.
                 worker.services.graph.discard_buffer()
-            await qm.commit(session_id, rec.end)  # queue-produced offset
+            await qm.commit(
+                session_id, rec.end, worker.services.snapshot_cursor()
+            )  # queue-produced offset
             if wrote:
                 self.record_written(1)
         return False
@@ -632,7 +667,9 @@ class SessionRegistry:
             except Exception:
                 logger.exception("finalize_tail_flush_failed session=%s", session_id)
                 return False  # NOT finalized: keep worker alive, tail uncommitted
-            await qm.commit(session_id, tail.end_offset)
+            await qm.commit(
+                session_id, tail.end_offset, worker.services.snapshot_cursor()
+            )
             self.record_written(len(tail.records))
             logger.debug(
                 "batch_committed events=%d offset=%d",

@@ -89,7 +89,7 @@ async def test_b_undrained_tail_never_reclaimed_past_committed_c_less_than_tail(
 
     first_batch = await qm.read_batch(sid, max_items=40)
     assert len(first_batch.records) == 40
-    await qm.commit(sid, first_batch.end_offset)
+    await qm.commit(sid, first_batch.end_offset, None)
     c = first_batch.end_offset
     log_path = tmp_path / f"{sid}.log"
     e = log_path.stat().st_size
@@ -117,7 +117,7 @@ async def test_b_undrained_tail_never_reclaimed_past_committed_c_greater_than_ta
 
     first_batch = await qm.read_batch(sid, max_items=70)
     assert len(first_batch.records) == 70
-    await qm.commit(sid, first_batch.end_offset)
+    await qm.commit(sid, first_batch.end_offset, None)
     c = first_batch.end_offset
     log_path = tmp_path / f"{sid}.log"
     e = log_path.stat().st_size
@@ -139,7 +139,7 @@ async def test_b_below_min_prefix_bytes_is_a_noop(tmp_path: Path) -> None:
     for i in range(10):
         await qm.append(sid, _fixed(i))
     batch = await qm.read_batch(sid, max_items=5)
-    await qm.commit(sid, batch.end_offset)
+    await qm.commit(sid, batch.end_offset, None)
     log_path = tmp_path / f"{sid}.log"
     before = log_path.read_bytes()
 
@@ -164,13 +164,13 @@ async def test_c_mid_copy_oserror_is_a_pure_noop(
     for i in range(9):
         await qm.append(sid, _fixed(i))
     batch = await qm.read_batch(sid, max_items=3)
-    await qm.commit(sid, batch.end_offset)
+    await qm.commit(sid, batch.end_offset, None)
 
     log_path = tmp_path / f"{sid}.log"
     offset_path = tmp_path / f"{sid}.offset"
     log_before = log_path.read_bytes()
     offset_before = offset_path.read_text(encoding="utf-8")
-    assert offset_before.strip() == str(batch.end_offset)
+    assert offset_before.strip() == f'{{"v":1,"offset":{batch.end_offset},"cursor":null}}'
 
     def _raise(fd: int, data: bytes) -> None:
         raise OSError("simulated mid-copy failure")
@@ -198,7 +198,7 @@ async def test_c_window2_offset_rebased_before_log_replaced_bounded_redrive(
     for ev in events:
         await qm.append(sid, ev)
     batch = await qm.read_batch(sid, max_items=3)
-    await qm.commit(sid, batch.end_offset)  # committed = 3 events (30 bytes)
+    await qm.commit(sid, batch.end_offset, None)  # committed = 3 events (30 bytes)
 
     # Simulate the crash: offset already rebased to 0 (step 5 completed),
     # log NOT yet replaced (step 6 never ran).
@@ -226,7 +226,7 @@ async def test_c_control_rejected_log_then_offset_order_loses_data(
     for ev in events:
         await qm.append(sid, ev)
     batch = await qm.read_batch(sid, max_items=3)
-    await qm.commit(sid, batch.end_offset)  # committed = 30 bytes (C == 30)
+    await qm.commit(sid, batch.end_offset, None)  # committed = 30 bytes (C == 30)
 
     log_path = tmp_path / f"{sid}.log"
     c = qm._read_committed_offset(sid)
@@ -270,7 +270,7 @@ async def test_i_replace_failure_restores_offset_zero_accounting_drift(
     for ev in events:
         await qm.append(sid, ev)
     batch = await qm.read_batch(sid, max_items=3)
-    await qm.commit(sid, batch.end_offset)
+    await qm.commit(sid, batch.end_offset, None)
     c = batch.end_offset
 
     log_path = tmp_path / f"{sid}.log"
@@ -321,7 +321,7 @@ async def test_i_double_replace_failure_logs_restore_failed_honestly(
     for i in range(9):
         await qm.append(sid, _fixed(i))
     batch = await qm.read_batch(sid, max_items=3)
-    await qm.commit(sid, batch.end_offset)
+    await qm.commit(sid, batch.end_offset, None)
 
     log_path = tmp_path / f"{sid}.log"
 
@@ -363,7 +363,7 @@ async def test_j_large_tail_does_not_block_prefix_reclaim(
     for i in range(20):
         await qm.append(sid, _fixed(i))
     batch = await qm.read_batch(sid, max_items=2)  # C = 20 bytes
-    await qm.commit(sid, batch.end_offset)
+    await qm.commit(sid, batch.end_offset, None)
     log_path = tmp_path / f"{sid}.log"
     assert batch.end_offset == 20
 
@@ -637,7 +637,7 @@ async def test_f_status_not_blocked_by_an_in_progress_compaction(
     qm = main_module.registry.queue_manager
     sid = "s-status-lock"
     await qm.append(sid, _fixed(0))
-    await qm.commit(sid, 10)
+    await qm.commit(sid, 10, None)
 
     with qm._guard(sid) as guard:
         loop = asyncio.get_event_loop()

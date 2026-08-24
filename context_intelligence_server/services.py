@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import fnmatch
 import logging
+from dataclasses import asdict
 from datetime import datetime
 from typing import Any
 
@@ -241,6 +243,51 @@ class HookStateService:
         self.data_layer_3 = DataLayer3State()
 
     # ------------------------------------------------------------------
+    # Durable cursor (survives a worker rebuild)
+    # ------------------------------------------------------------------
+
+    def snapshot_cursor(self) -> dict[str, Any]:
+        """Return a JSON-safe snapshot of cross-handler cursor state.
+
+        Snapshots the whole ``data_layer_2``/``data_layer_3`` dataclasses via
+        ``asdict`` (every field is JSON-native) rather than a hand-picked
+        allowlist that would silently miss a newly added field.
+        """
+        return {
+            "dl2": asdict(self.data_layer_2),
+            "dl3": asdict(self.data_layer_3),
+        }
+
+    def restore_cursor(self, record: dict[str, Any] | None) -> None:
+        """Restore cross-handler cursor state from a persisted snapshot.
+
+        No-op on ``record is None`` (a brand-new session, or a legacy
+        ``.offset`` with no cursor). Otherwise only field NAMES present on the
+        current dataclass are assigned -- unknown/renamed keys are dropped and a
+        field absent from the record keeps its default, so the persisted format
+        tolerates dataclass evolution in both directions without a version bump.
+
+        Any failure is caught and logged, leaving the dataclasses at their
+        defaults: a corrupt or unexpected cursor must never crash boot.
+        """
+        if record is None:
+            return
+        try:
+            for key, target in (
+                ("dl2", self.data_layer_2),
+                ("dl3", self.data_layer_3),
+            ):
+                value = record.get(key)
+                if not isinstance(value, dict):
+                    continue
+                valid_fields = {f.name for f in dataclasses.fields(type(target))}
+                for field_name, field_value in value.items():
+                    if field_name in valid_fields:
+                        setattr(target, field_name, field_value)
+        except Exception:
+            logger.warning("cursor_restore_failed", exc_info=True)
+
+    # ------------------------------------------------------------------
     # Session node management
     # ------------------------------------------------------------------
 
@@ -259,10 +306,18 @@ class HookStateService:
         if existing is not None:
             # Upsert a stub so this worker's own flush uses MERGE (idempotent)
             # instead of racing a second worker into creating a duplicate node.
-            await self.graph.upsert_node(
-                session_id,
-                {"labels": ["Session"], "status": "running", "session_id": session_id},
-            )
+            stub_data: dict[str, Any] = {
+                "labels": ["Session"],
+                "status": "running",
+                "session_id": session_id,
+            }
+            # Populate-if-missing: backfill working_dir on a node created before
+            # working_dir was known (or by a bare reference). Only when the event
+            # supplies one AND the node still lacks it; the DB-level coalesce
+            # guarantees an already-set value is never clobbered.
+            if data.get("working_dir") and not existing.get("working_dir"):
+                stub_data["working_dir"] = data["working_dir"]
+            await self.graph.upsert_node(session_id, stub_data)
             self._seen_sessions.add(session_id)
             return
 
@@ -282,6 +337,10 @@ class HookStateService:
             node_data["started_at"] = _ts
         if "agent" in data:
             node_data["agent"] = data["agent"]
+        # Lift working_dir onto the Session node when the event carries one;
+        # absent/empty leaves it null for a later event to populate.
+        if data.get("working_dir"):
+            node_data["working_dir"] = data["working_dir"]
 
         await self.graph.upsert_node(session_id, node_data)
         self._seen_sessions.add(session_id)  # only cache after successful write

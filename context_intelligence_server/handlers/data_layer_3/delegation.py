@@ -52,12 +52,17 @@ def _discriminate_root_vs_unresolved(parent_session: dict[str, Any] | None) -> s
       -> "unresolved" (fails loud; monitored; never mistaken for a real answer)
 
     CRITICAL: branches on the TERMINAL label ONLY, never on
-    ``IncompleteSession``. Live graph data shows ``IncompleteSession``
-    co-labels a terminal label ~41% of the time (a session can reach
-    session:end with session:start/fork permanently missed, out of order --
-    see SessionHandler._handle_end). Treating ``IncompleteSession`` as a
-    discriminator would mis-flag hundreds of genuine root/forked sessions as
-    unresolved.
+    ``IncompleteSession``. Historically ``IncompleteSession`` co-labeled a
+    terminal label ~41% of the time (a session's session:end drained before
+    its session:start/fork, out of order -- see SessionHandler._handle_end).
+    As of the heal-forward fix, SessionLabelStateMachine.classify() now
+    strips ``IncompleteSession`` the moment a real start/fork is processed,
+    so co-occurrence is
+    no longer expected for newly-processed events -- only pending a one-off
+    backfill for historical nodes written before the fix. This function
+    still ignores ``IncompleteSession`` as a discriminator regardless: it was
+    never a reliable signal and using it would mis-flag genuine root/forked
+    sessions as unresolved.
     """
     labels: list[str] = (parent_session or {}).get("labels", [])
     if "RootSession" in labels:

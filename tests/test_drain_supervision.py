@@ -1096,3 +1096,102 @@ class TestTerminalBatchFlushExhaustion:
         dead = await qm.read_dead_letters(sid)
         assert len(dead) == 1
         assert not qm._log_path(sid).exists(), "delete_drained must have run"
+
+
+class TestRetryDoesNotDuplicateIteration:
+    """In-place retry rolls the cross-handler counter back to its pre-attempt
+    state, so a replayed batch reproduces the SAME node ids instead of
+    duplicating them."""
+
+    async def test_in_place_retry_yields_exactly_one_iteration(self) -> None:
+        reg = SessionRegistry()
+        qm = reg.queue_manager
+        sid = "d1-retry-dedup"
+        # Fail the first multi-record flush exactly once, then succeed (in-place
+        # retry, no respawn). flushed is a SET: a duplicate id shows as an extra
+        # member, and a non-rolled-back counter yields iter::3/iter::4 too.
+        flush_calls = {"n": 0}
+
+        def _fail_first_multi(buf: set[str]) -> bool:
+            if len(buf) > 1:
+                flush_calls["n"] += 1
+                return flush_calls["n"] == 1
+            return False
+
+        graph = _FlakyGraph(fail_when=_fail_first_multi)
+        worker = _make_worker(sid, graph)
+        reg._register_for_test(worker)
+
+        async def _advance_and_buffer(
+            w: SessionWorker, event: str, data: object, handlers: object
+        ) -> None:
+            # Mimic a real enricher: bump the iteration counter, then buffer the
+            # id it produces. Without the pre-retry rollback the counter keeps
+            # climbing across attempts and the replay emits a DIFFERENT id.
+            w.services.data_layer_2.iteration_count += 1
+            w.services.graph.buffer.add(
+                f"iter::{w.services.data_layer_2.iteration_count}"
+            )
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            side_effect=_advance_and_buffer,
+        ):
+            await qm.append(sid, _line("e1", "/ws", {"session_id": sid}))
+            await qm.append(sid, _line("e2", "/ws", {"session_id": sid}))
+            reg.start_drain(worker)
+            await _drain_until_idle(reg, qm, worker, sid)
+            await _cancel_and_await(worker.task)
+
+        # Two records => ids iter::1, iter::2 written exactly once each. A missing
+        # rollback would additionally leave iter::3/iter::4 from the failed attempt.
+        assert graph.flushed == {"iter::1", "iter::2"}
+        assert (await qm.read_batch(sid, 10)).lines == []
+
+
+class TestCursorRestoredOnWorkerRebuild:
+    """A rebuilt worker restores the durable cursor the last commit persisted,
+    so cross-handler counters resume instead of restarting from zero (which
+    would remint node ids and duplicate them)."""
+
+    async def test_orch_run_seq_is_restored_before_a_rebuilt_worker_processes(
+        self,
+    ) -> None:
+        reg = SessionRegistry()
+        qm = reg.queue_manager
+        sid = "d1-cursor-rebuild"
+
+        # A prior worker committed a cursor carrying orch_run_seq=5, leaving one
+        # event still undrained (offset 0) for the rebuilt worker to pick up.
+        await qm.append(sid, _line("e1", "/ws", {"session_id": sid}))
+        await qm.commit(sid, 0, {"dl2": {"orch_run_seq": 5}, "dl3": {}})
+        assert (await qm.read_cursor(sid))["dl2"]["orch_run_seq"] == 5
+
+        # A REBUILT worker: a brand-new SessionWorker whose DataLayer2State starts
+        # at orch_run_seq=0. drain_worker must restore the persisted cursor before
+        # processing, so the counter is 5 (not 0) by the time an event is handled
+        # -- without the restore the next run would remint the already-used seq.
+        graph = _FlakyGraph()
+        worker = _make_worker(sid, graph)
+        assert worker.services.data_layer_2.orch_run_seq == 0
+        reg._register_for_test(worker)
+
+        captured: dict[str, int] = {}
+
+        async def _capture(w: SessionWorker, event, data, handlers) -> None:
+            captured["seq_at_process"] = w.services.data_layer_2.orch_run_seq
+            w.services.graph.buffer.add("e1")
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            side_effect=_capture,
+        ):
+            reg.start_drain(worker)
+            await _drain_until_idle(reg, qm, worker, sid)
+            await _cancel_and_await(worker.task)
+
+        assert captured.get("seq_at_process") == 5, (
+            "drain_worker must restore the durable cursor (orch_run_seq=5) before "
+            "processing any event; a rebuilt worker that starts from 0 would "
+            "remint already-used run ids"
+        )
