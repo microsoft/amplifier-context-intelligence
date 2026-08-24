@@ -10,14 +10,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from context_intelligence_server.blob_store import AsyncDiskBlobStore
+from context_intelligence_server.blob_store import create_blob_store
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.neo4j_store import (
     Neo4jGraphStore,
     build_bounded_neo4j_driver,
 )
 from context_intelligence_server.pipeline import process_event, setup_handlers
-from context_intelligence_server.queue_manager import Batch, QueueManager
+from context_intelligence_server.queue_manager import (
+    Batch,
+    QueueManager,
+    create_queue_manager,
+)
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.status import EventRecord, ring_buffer
 
@@ -109,7 +113,7 @@ class SessionRegistry:
         """
         if self._queue_manager is None:
             settings = get_settings()
-            self._queue_manager = QueueManager(queues_dir=Path(settings.queues_path))
+            self._queue_manager = create_queue_manager(settings)
             self._write_semaphore = asyncio.Semaphore(settings.write_concurrency)
             self._max_delivery_attempts = settings.max_delivery_attempts
 
@@ -817,7 +821,7 @@ class SessionRegistry:
         """
         if session_id not in self._workers:
             settings = get_settings()
-            blob_store = AsyncDiskBlobStore(root=settings.blob_path)
+            blob_store = create_blob_store(settings)
             _admin = settings.resolve_neo4j_admin()
             neo4j_store = Neo4jGraphStore(
                 uri=_admin.url,

@@ -29,6 +29,15 @@ from context_intelligence_server.blob_processor import (
     _lift_raw_fields,
     process_event_data,
 )
+from context_intelligence_server.blob_store import BlobReference
+
+
+def _ref(uri: str) -> BlobReference:
+    """A BlobReference for a mocked write() return (only .uri is read here)."""
+    session_id, _, key = uri.removeprefix("ci-blob://").partition("/")
+    return BlobReference(
+        uri=uri, session_id=session_id, key=key, size=0, last_modified=0.0
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +64,7 @@ async def test_process_event_data_mutates_in_place() -> None:
     original_id = id(data)
 
     blob_store = AsyncMock()
-    blob_store.write = AsyncMock(return_value="ci-blob://sess/node__raw")
+    blob_store.write = AsyncMock(return_value=_ref("ci-blob://sess/node__raw"))
 
     await process_event_data(data, blob_store, "sess", "node")
 
@@ -74,7 +83,7 @@ async def test_process_event_data_returns_none() -> None:
     """process_event_data returns None."""
     data: dict[str, Any] = {"result": {"answer": 42}}
     blob_store = AsyncMock()
-    blob_store.write = AsyncMock(return_value="ci-blob://sess/node__result")
+    blob_store.write = AsyncMock(return_value=_ref("ci-blob://sess/node__result"))
 
     result = await process_event_data(data, blob_store, "sess", "node")
 
@@ -96,8 +105,8 @@ async def test_blob_ref_substitution_on_successful_write() -> None:
 
     # Use a function-based side_effect so the returned URI always matches
     # the actual key argument, regardless of BLOB_FIELDS frozenset iteration order.
-    async def _write(session_id: str, key: str, value: object) -> str:
-        return f"ci-blob://{session_id}/{key}"
+    async def _write(session_id: str, key: str, value: object) -> BlobReference:
+        return _ref(f"ci-blob://{session_id}/{key}")
 
     blob_store.write = AsyncMock(side_effect=_write)
 
@@ -134,7 +143,7 @@ async def test_absent_fields_are_skipped() -> None:
     """Fields in BLOB_FIELDS that are absent from data are not added."""
     data: dict[str, Any] = {"other_field": "untouched"}
     blob_store = AsyncMock()
-    blob_store.write = AsyncMock(return_value="ci-blob://sess/node__something")
+    blob_store.write = AsyncMock(return_value=_ref("ci-blob://sess/node__something"))
 
     await process_event_data(data, blob_store, "sess", "node")
 
@@ -158,7 +167,7 @@ async def test_none_fields_are_skipped() -> None:
         "messages": None,
     }
     blob_store = AsyncMock()
-    blob_store.write = AsyncMock(return_value="ci-blob://sess/node__x")
+    blob_store.write = AsyncMock(return_value=_ref("ci-blob://sess/node__x"))
 
     await process_event_data(data, blob_store, "sess", "node")
 

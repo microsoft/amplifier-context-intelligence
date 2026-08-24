@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from context_intelligence_server import registry as registry_module
-from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.queue_manager import FileSystemQueueManager, QueueManager
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
 
@@ -23,7 +23,7 @@ async def test_no_loss_after_crash_mid_drain() -> None:
         registry_module.get_settings()
     )  # queues_path patched to tmp_path by safe_settings
     sid = "crash-sess"
-    qm = QueueManager(queues_dir=Path(settings.queues_path))
+    qm = FileSystemQueueManager(queues_dir=Path(settings.queues_path))
 
     K = 5
     for i in range(K):
@@ -94,7 +94,7 @@ async def test_offset_never_advances_over_undurable_data() -> None:
     buffer-restore-on-failure (neo4j_store.py:686-696)."""
     settings = registry_module.get_settings()
     sid = "flush-fail-sess"
-    qm = QueueManager(queues_dir=Path(settings.queues_path))
+    qm = FileSystemQueueManager(queues_dir=Path(settings.queues_path))
     await qm.append(sid, _line("e0", "/ws", {"session_id": sid}))
 
     reg = SessionRegistry()

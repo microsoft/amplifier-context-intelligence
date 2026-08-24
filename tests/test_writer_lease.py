@@ -25,7 +25,7 @@ import httpx
 import pytest
 from context_intelligence_server.config import Settings
 from context_intelligence_server.main import lifespan
-from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.queue_manager import FileSystemQueueManager, QueueManager
 from context_intelligence_server.status import boot_state
 from context_intelligence_server.writer_lease import (
     WriterLease,
@@ -500,7 +500,7 @@ async def test_r1_no_queue_manager_constructed_by_d6(
     def _fail_init(self: object, queues_dir: Path) -> None:
         pytest.fail("QueueManager.__init__ must never be called by the detector")
 
-    monkeypatch.setattr(QueueManager, "__init__", _fail_init)
+    monkeypatch.setattr(FileSystemQueueManager, "__init__", _fail_init)
 
     lease = WriterLease()
     await lease.acquire(_settings(), lambda: main_module.registry.queues_dir_path)
@@ -535,14 +535,14 @@ async def test_r1_exactly_one_queue_manager_under_concurrent_construction(
     main_module.registry._queue_manager = None
 
     construct_count = 0
-    real_init = QueueManager.__init__
+    real_init = FileSystemQueueManager.__init__
 
-    def _counting_init(self: QueueManager, queues_dir: Path) -> None:
+    def _counting_init(self: FileSystemQueueManager, queues_dir: Path) -> None:
         nonlocal construct_count
         construct_count += 1
         real_init(self, queues_dir)
 
-    monkeypatch.setattr(QueueManager, "__init__", _counting_init)
+    monkeypatch.setattr(FileSystemQueueManager, "__init__", _counting_init)
 
     lease = WriterLease()
 
@@ -685,7 +685,7 @@ async def test_hung_mount_does_not_starve_shared_pool(tmp_path: Path) -> None:
     try:
         await asyncio.sleep(0.5)
 
-        qm = QueueManager(queues_dir=tmp_path / "shared-pool-check")
+        qm = FileSystemQueueManager(queues_dir=tmp_path / "shared-pool-check")
         start = time.monotonic()
         await asyncio.wait_for(qm.append("sid-1", b"hello"), timeout=1.0)
         elapsed = time.monotonic() - start
@@ -941,7 +941,7 @@ async def test_no_collision_with_existing_session_scans(tmp_path: Path) -> None:
     lease = WriterLease()
     await lease.acquire(_settings(), lambda: tmp_path)
 
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     (tmp_path / "sess-1.log").write_bytes(b'{"event":"x","workspace":"/w"}\n')
     (tmp_path / "sess-1.offset").write_text("0", encoding="utf-8")
 

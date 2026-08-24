@@ -34,7 +34,7 @@ from context_intelligence_server.neo4j_store import (
     Neo4jGraphStore,
     ensure_neo4j_schema,
 )
-from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.queue_manager import FileSystemQueueManager, QueueManager
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
 
@@ -96,7 +96,7 @@ async def test_replay_rewrites_through_real_drainer(
     # worker is pre-registered, so get_or_create never builds a settings-derived
     # store).
     reg = SessionRegistry()
-    reg._queue_manager = QueueManager(queues_dir=tmp_path / "queues")
+    reg._queue_manager = FileSystemQueueManager(queues_dir=tmp_path / "queues")
     reg._write_semaphore = asyncio.Semaphore(1)
     reg._max_delivery_attempts = 3
     qm = reg._queue_manager

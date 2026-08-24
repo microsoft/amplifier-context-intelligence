@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from context_intelligence_server.config import get_settings
+from context_intelligence_server.queue_manager.protocol import Batch, Record
 
 logger = logging.getLogger(__name__)
 
@@ -40,52 +41,6 @@ _T = TypeVar("_T")
 # and loading one into RAM just to count newlines is what drove ~44 GB RSS at
 # startup. 1 MiB balances syscall count against per-scan memory.
 _SCAN_CHUNK_BYTES = 1 << 20
-
-
-@dataclass(frozen=True)
-class Record:
-    """One log record and the byte range the QUEUE assigned it.
-
-    ``start``/``end`` are opaque cursor values PRODUCED BY THE QUEUE and only
-    ever handed back to it (``commit``). Callers MUST NOT compute them and
-    MUST NOT assume ``end - start == len(raw) + 1`` -- that relationship is
-    the queue's private framing invariant (module docstring), not a public
-    contract.
-    """
-
-    raw: bytes  # WITHOUT the terminator, exactly as ``lines`` is today
-    start: int
-    end: int
-
-
-@dataclass(frozen=True)
-class Batch:
-    """A contiguous batch of log records read from a session's append-only log.
-
-    Attributes:
-        session_id: The session the records belong to.
-        records: Queue-produced ``Record``s -- each carries its own opaque
-            ``start``/``end`` cursor. The queue produces these offsets; a
-            caller (the registry) only ever hands them back via ``commit``.
-        start_offset: Byte position in the log where this batch begins.
-        end_offset: Byte position in the log AFTER the last returned record.
-            This is the value passed to ``commit``. When no complete records
-            are available, ``end_offset == start_offset``.
-    """
-
-    session_id: str
-    records: list[Record]
-    start_offset: int
-    end_offset: int
-
-    @property
-    def lines(self) -> list[bytes]:
-        """Raw record payloads, terminator-stripped -- the pre-Record view.
-
-        Derived from ``records`` so the two can never disagree. Retained
-        because ~90 call sites across main.py and 12 test files read it.
-        """
-        return [r.raw for r in self.records]
 
 
 class Verdict(str, Enum):
@@ -188,8 +143,11 @@ async def _await_uninterrupted(coro: Coroutine[Any, Any, _T]) -> _T:
     return result
 
 
-class QueueManager:
-    """Manages per-session append-only queues on disk."""
+class FileSystemQueueManager:
+    """Manages per-session append-only queues on disk.
+
+    Implements :class:`~context_intelligence_server.queue_manager.protocol.QueueManager`.
+    """
 
     def __init__(self, queues_dir: Path):
         self._dir = Path(queues_dir)
@@ -395,7 +353,7 @@ class QueueManager:
     def _discard_partial(fd: int, start: int, path: Path) -> None:
         """Newline-terminate a partial write; never truncates -- queue bytes are never removed."""
         try:
-            QueueManager._write_all(fd, b"\n")
+            FileSystemQueueManager._write_all(fd, b"\n")
         except OSError:
             logger.exception(
                 "append_partial_terminate_failed path=%s start=%d "
@@ -436,7 +394,7 @@ class QueueManager:
         skip the tail; next boot retries). Raises ``OSError`` on any failure;
         the caller catches it per file.
         """
-        end = QueueManager._last_complete_end(path)
+        end = FileSystemQueueManager._last_complete_end(path)
         size = path.stat().st_size
         if size <= end:
             return 0, False
@@ -455,7 +413,7 @@ class QueueManager:
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
         fd = os.open(quarantine, flags, 0o644)
         try:
-            QueueManager._write_all(fd, data)
+            FileSystemQueueManager._write_all(fd, data)
         finally:
             os.close(fd)
 

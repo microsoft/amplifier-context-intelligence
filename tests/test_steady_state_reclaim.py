@@ -22,9 +22,9 @@ import httpx
 import pytest
 
 import context_intelligence_server.main as main_module
-import context_intelligence_server.queue_manager as queue_manager_module
+import context_intelligence_server.queue_manager.filesystem as queue_manager_module
 from context_intelligence_server.config import Settings
-from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.queue_manager import FileSystemQueueManager, QueueManager
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
 
@@ -81,7 +81,7 @@ async def test_b_undrained_tail_never_reclaimed_past_committed_c_less_than_tail(
 ) -> None:
     """C < E-C: commit 40 of 100 events, compact, and prove events 41..100
     survive in order, untouched, with committed rebased to 0."""
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     sid = "s-tail-c-lt-tail"
     events = [_fixed(i) for i in range(100)]
     for ev in events:
@@ -109,7 +109,7 @@ async def test_b_undrained_tail_never_reclaimed_past_committed_c_greater_than_ta
     tmp_path: Path,
 ) -> None:
     """C > E-C: commit 70 of 100 events -- the tail is now the SMALLER side."""
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     sid = "s-tail-c-gt-tail"
     events = [_fixed(i) for i in range(100)]
     for ev in events:
@@ -134,7 +134,7 @@ async def test_b_undrained_tail_never_reclaimed_past_committed_c_greater_than_ta
 
 async def test_b_below_min_prefix_bytes_is_a_noop(tmp_path: Path) -> None:
     """C below min_prefix_bytes bails without touching the file at all."""
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     sid = "s-below-threshold"
     for i in range(10):
         await qm.append(sid, _fixed(i))
@@ -159,7 +159,7 @@ async def test_c_mid_copy_oserror_is_a_pure_noop(
 ) -> None:
     """An OSError raised mid-copy (Precision 1) must not mutate anything and
     must not escape -- it is caught and the method returns 0."""
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     sid = "s-mid-copy-fault"
     for i in range(9):
         await qm.append(sid, _fixed(i))
@@ -176,7 +176,7 @@ async def test_c_mid_copy_oserror_is_a_pure_noop(
         raise OSError("simulated mid-copy failure")
 
     monkeypatch.setattr(
-        queue_manager_module.QueueManager, "_write_all", staticmethod(_raise)
+        queue_manager_module.FileSystemQueueManager, "_write_all", staticmethod(_raise)
     )
 
     reclaimed = await qm.compact_committed_prefix(sid, 0)  # must not raise
@@ -192,7 +192,7 @@ async def test_c_window2_offset_rebased_before_log_replaced_bounded_redrive(
     """Simulates a crash after the offset was rebased to 0 but before the log
     was replaced. A reader resuming from this on-disk state must see a
     bounded re-drive (the committed prefix duplicated) -- never a loss."""
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     sid = "s-window2"
     events = [_fixed(i) for i in range(9)]
     for ev in events:
@@ -220,7 +220,7 @@ async def test_c_control_rejected_log_then_offset_order_loses_data(
     """CONTROL: applies the alternative log-then-offset ordering by hand and
     stops mid-window (log replaced, offset not yet rewritten), proving that
     order silently drops undrained data -- why offset-before-log is used."""
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     sid = "s-rejected-order"
     events = [_fixed(i) for i in range(9)]
     for ev in events:
@@ -264,7 +264,7 @@ async def test_c_control_rejected_log_then_offset_order_loses_data(
 async def test_i_replace_failure_restores_offset_zero_accounting_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     sid = "s-replace-fails"
     events = [_fixed(i) for i in range(9)]
     for ev in events:
@@ -316,7 +316,7 @@ async def test_i_double_replace_failure_logs_restore_failed_honestly(
     """If the RESTORE itself also fails, the honest (documented) fallback is
     a logged `compact_restore_failed ... redrive_expected=true` -- never a
     silent success claim."""
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     sid = "s-double-fail"
     for i in range(9):
         await qm.append(sid, _fixed(i))
@@ -357,7 +357,7 @@ async def test_i_double_replace_failure_logs_restore_failed_honestly(
 async def test_j_large_tail_does_not_block_prefix_reclaim(
     tmp_path: Path,
 ) -> None:
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     sid = "s-huge-tail"
     # 20 events * 10 bytes = 200 bytes total.
     for i in range(20):
@@ -388,7 +388,7 @@ async def test_j_large_tail_does_not_block_prefix_reclaim(
 async def test_e_dead_letters_older_than_retention_expired_newer_kept(
     tmp_path: Path,
 ) -> None:
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     now = time.time()
     retention = 30 * 86400.0
 
@@ -420,7 +420,7 @@ async def test_e_dead_letters_older_than_retention_expired_newer_kept(
 async def test_e_dry_run_deletes_nothing_but_still_classifies(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     now = time.time()
     retention = 30 * 86400.0
     old_path = _seed_dead(tmp_path, "would-expire", _dead_record("p"))
@@ -439,7 +439,7 @@ async def test_e_dry_run_deletes_nothing_but_still_classifies(
 
 
 async def test_e_retention_zero_disables_expiry(tmp_path: Path) -> None:
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     now = time.time()
     old_path = _seed_dead(tmp_path, "ancient", _dead_record("p"))
     os.utime(old_path, (now - 10_000_000, now - 10_000_000))
@@ -471,7 +471,7 @@ async def test_k_expiry_is_opt_in_disabled_under_shipped_defaults(
     assert settings.reclaim_enabled is False
     assert settings.dead_letter_expiry_enabled is False
 
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     now = time.time()
     old_path = _seed_dead(tmp_path, "shipped-default-no-expire", _dead_record("p"))
     old_mtime = now - settings.dead_letter_retention_seconds - 3600
@@ -495,7 +495,7 @@ async def test_k_expiry_is_opt_in_disabled_under_shipped_defaults(
 async def test_k_dead_letter_expiry_enabled_false_still_dry_runs(
     tmp_path: Path,
 ) -> None:
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     now = time.time()
     old_path = _seed_dead(tmp_path, "would-expire-2", _dead_record("p"))
     os.utime(old_path, (now - (31 * 86400.0), now - (31 * 86400.0)))
@@ -516,7 +516,7 @@ async def test_m_boot_phase_expiry_never_calls_record_purged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        main_module.registry, "_queue_manager", QueueManager(queues_dir=tmp_path)
+        main_module.registry, "_queue_manager", FileSystemQueueManager(queues_dir=tmp_path)
     )
     main_module.registry._accepted_total = 0
     main_module.registry._written_total = 0
@@ -563,7 +563,7 @@ async def test_m_sweep_tick_expiry_applies_record_purged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        main_module.registry, "_queue_manager", QueueManager(queues_dir=tmp_path)
+        main_module.registry, "_queue_manager", FileSystemQueueManager(queues_dir=tmp_path)
     )
     main_module.registry._accepted_total = 0
     main_module.registry._written_total = 0
@@ -632,7 +632,7 @@ async def test_f_status_not_blocked_by_an_in_progress_compaction(
     background thread; /status must still return promptly -- it never
     acquires guard.file_lock for any key."""
     monkeypatch.setattr(
-        main_module.registry, "_queue_manager", QueueManager(queues_dir=tmp_path)
+        main_module.registry, "_queue_manager", FileSystemQueueManager(queues_dir=tmp_path)
     )
     qm = main_module.registry.queue_manager
     sid = "s-status-lock"
@@ -669,7 +669,7 @@ async def test_f_status_not_blocked_by_a_concurrent_dead_letter_expiry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        main_module.registry, "_queue_manager", QueueManager(queues_dir=tmp_path)
+        main_module.registry, "_queue_manager", FileSystemQueueManager(queues_dir=tmp_path)
     )
     qm = main_module.registry.queue_manager
     for i in range(50):
@@ -694,7 +694,7 @@ async def test_f_status_not_blocked_by_a_concurrent_dead_letter_expiry(
 @pytest.fixture
 async def reg_qm(tmp_path: Path):
     reg = SessionRegistry()
-    reg._queue_manager = QueueManager(queues_dir=tmp_path)
+    reg._queue_manager = FileSystemQueueManager(queues_dir=tmp_path)
     reg._write_semaphore = asyncio.Semaphore(8)
     reg._max_delivery_attempts = 3
     yield reg, reg._queue_manager

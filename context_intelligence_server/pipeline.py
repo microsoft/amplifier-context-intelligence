@@ -173,7 +173,16 @@ async def process_event(
             data.get("timestamp") if isinstance(data, dict) else None
         )
         if session_id and timestamp and worker.services.blob_store:
-            node_id = make_node_id(session_id, event, timestamp)
+            # The blob-key node_id MUST match handlers/data_layer_1/default.py's
+            # event_node_id (same session_id + event + timestamp + tool_call_id),
+            # otherwise two distinct same-millisecond events (e.g. parallel tool
+            # calls in the same batch) collide on an identical blob key and the
+            # second write silently overwrites the first, while the first Event
+            # node's $blob_ref still points at that URI (now holding the wrong
+            # payload). tool_call_id is present on ALL event types that carry it,
+            # not just tool:*, so it is safe to read unconditionally here.
+            disambiguator = data.get("tool_call_id") if isinstance(data, dict) else None
+            node_id = make_node_id(session_id, event, timestamp, disambiguator)
             await process_event_data(
                 data, worker.services.blob_store, session_id, node_id
             )

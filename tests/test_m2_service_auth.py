@@ -123,16 +123,18 @@ def _service_claims(roles: list[str], appid: str = FAKE_APPID) -> dict[str, Any]
 
 
 class _MockBlobStore:
-    """Mock for AsyncDiskBlobStore — returns empty list, never touches filesystem."""
+    """Mock BlobStore — empty list, never touches filesystem."""
 
-    def __init__(self, root: Any) -> None:
-        pass
-
-    async def list(self, session_id: str) -> list[str]:
-        return []
+    async def list(self, session_id: str) -> AsyncGenerator[Any, None]:
+        return
+        yield  # unreachable: makes list() an async generator
 
     async def read(self, uri: str) -> Any:
         raise FileNotFoundError(f"mock blob store: not found: {uri}")
+
+
+def _mock_blob_store_factory(settings: Any) -> _MockBlobStore:
+    return _MockBlobStore()
 
 
 class _MockNeo4jResult:
@@ -377,7 +379,7 @@ class TestM2CapabilityDeps:
         private_key, asgi = service_asgi
         token = _sign_jwt(private_key, _service_claims(roles=["Reader"]))
 
-        monkeypatch.setattr(main_module, "AsyncDiskBlobStore", _MockBlobStore)
+        monkeypatch.setattr(main_module, "create_blob_store", _mock_blob_store_factory)
 
         async with _make_client(asgi) as c:
             resp = await c.get(
@@ -456,7 +458,7 @@ class TestM2CapabilityDeps:
         private_key, asgi = service_asgi
         token = _sign_jwt(private_key, _service_claims(roles=["Contributor"]))
 
-        monkeypatch.setattr(main_module, "AsyncDiskBlobStore", _MockBlobStore)
+        monkeypatch.setattr(main_module, "create_blob_store", _mock_blob_store_factory)
 
         async with _make_client(asgi) as c:
             resp = await c.get(

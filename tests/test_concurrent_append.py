@@ -15,7 +15,7 @@ import json
 import os
 from pathlib import Path
 
-from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.queue_manager import FileSystemQueueManager, QueueManager
 
 _SMALL_SIZE = 64
 _LARGE_SIZE = 1_500_000  # > 1 MiB, mixed in with small records
@@ -79,7 +79,7 @@ async def test_concurrent_appends_many_sessions_no_tear_or_merge_or_loss(
     """>=8 sessions x >=50 records each, all interleaved concurrently, plus
     concurrent appends to the SAME session and several >1 MiB payloads
     mixed with small ones."""
-    qm = QueueManager(queues_dir=tmp_path / "queues")
+    qm = FileSystemQueueManager(queues_dir=tmp_path / "queues")
     num_sessions = 10
     records_per_session = 60
 
@@ -105,7 +105,7 @@ async def test_concurrent_appends_many_sessions_no_tear_or_merge_or_loss(
 
 async def test_concurrent_appends_single_session_hammered(tmp_path: Path) -> None:
     """Worst-case contention: many concurrent tasks writing ONE session's file."""
-    qm = QueueManager(queues_dir=tmp_path / "queues")
+    qm = FileSystemQueueManager(queues_dir=tmp_path / "queues")
     session_id = "hot-session"
     num_records = 300
 

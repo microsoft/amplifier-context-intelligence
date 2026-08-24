@@ -44,7 +44,7 @@ import pytest
 from neo4j import AsyncGraphDatabase
 
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
-from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.queue_manager import FileSystemQueueManager, QueueManager
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.status import build_status_response
@@ -145,7 +145,7 @@ async def test_finalization_orphan_surfaces_on_status(
     # guarantees this QueueManager and the registry's queue_manager point at
     # the same on-disk queue.
     queues_dir = tmp_path / "queues"
-    qm = QueueManager(queues_dir=queues_dir)
+    qm = FileSystemQueueManager(queues_dir=queues_dir)
 
     # -----------------------------------------------------------------------
     # Seed the durable queue in exact order (line counts are load-bearing).
