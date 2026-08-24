@@ -68,46 +68,36 @@ class SessionLabelStateMachine:
     ForkedSession > SubSession > RootSession in specificity (terminal ordering).
     """
 
+    @staticmethod
+    def _heal_forward(transition: LabelTransition) -> LabelTransition:
+        """Strip a stale IncompleteSession marker on a start/fork transition.
+
+        IncompleteSession is only correct at session:end on a bare session whose
+        start/fork was lost. Its co-occurrence with a start/fork is always the
+        out-of-order case -- a forked sub-session's session:end drained before
+        its session:start/fork, stamping the marker first. Removing an absent
+        label is a no-op, so applying this to every start/fork result is safe and
+        makes the invariant impossible to miss when a branch is added later.
+        """
+        if "IncompleteSession" in transition.remove:
+            return transition
+        return LabelTransition(
+            add=transition.add, remove=[*transition.remove, "IncompleteSession"]
+        )
+
     def classify(
         self, current_type: str | None, event: str, has_parent: bool
     ) -> LabelTransition:
         # StubSession is a plain observability marker, not part of the
         # terminal lattice; every branch assigning a real terminal label
-        # also clears it (removing an absent label is a no-op).
+        # also clears it (removing an absent label is a no-op). Start/fork
+        # results are passed through _heal_forward so a stale IncompleteSession
+        # marker is stripped on the transition (it is only correct at end).
         if event == "start":
-            if current_type in ("ForkedSession", "SubSession"):
-                return LabelTransition()
-            if current_type == "RootSession":
-                if has_parent:
-                    return LabelTransition(
-                        add=["SubSession", "SST_EVENT"],
-                        remove=["RootSession", "StubSession"],
-                    )
-                return LabelTransition()
-            # bare session (current_type is None)
-            if has_parent:
-                return LabelTransition(
-                    add=["Session", "SubSession", "SST_EVENT"],
-                    remove=["StubSession"],
-                )
-            return LabelTransition(
-                add=["RootSession", "Session", "SST_EVENT"],
-                remove=["StubSession"],
-            )
+            return self._heal_forward(self._classify_start(current_type, has_parent))
 
         if event == "fork":
-            if current_type == "ForkedSession":
-                return LabelTransition()
-            if current_type in ("RootSession", "SubSession"):
-                return LabelTransition(
-                    add=["ForkedSession", "SST_EVENT"],
-                    remove=[current_type, "StubSession"],
-                )
-            # bare session (current_type is None)
-            return LabelTransition(
-                add=["Session", "ForkedSession", "SST_EVENT"],
-                remove=["StubSession"],
-            )
+            return self._heal_forward(self._classify_fork(current_type, has_parent))
 
         if event == "end":
             if current_type is not None:
@@ -119,6 +109,43 @@ class SessionLabelStateMachine:
             )
 
         raise ValueError(f"classify() received unknown event: {event!r}")
+
+    @staticmethod
+    def _classify_start(current_type: str | None, has_parent: bool) -> LabelTransition:
+        if current_type in ("ForkedSession", "SubSession"):
+            return LabelTransition()
+        if current_type == "RootSession":
+            if has_parent:
+                return LabelTransition(
+                    add=["SubSession", "SST_EVENT"],
+                    remove=["RootSession", "StubSession"],
+                )
+            return LabelTransition()
+        # bare session (current_type is None)
+        if has_parent:
+            return LabelTransition(
+                add=["Session", "SubSession", "SST_EVENT"],
+                remove=["StubSession"],
+            )
+        return LabelTransition(
+            add=["RootSession", "Session", "SST_EVENT"],
+            remove=["StubSession"],
+        )
+
+    @staticmethod
+    def _classify_fork(current_type: str | None, has_parent: bool) -> LabelTransition:
+        if current_type == "ForkedSession":
+            return LabelTransition()
+        if current_type in ("RootSession", "SubSession"):
+            return LabelTransition(
+                add=["ForkedSession", "SST_EVENT"],
+                remove=[current_type, "StubSession"],
+            )
+        # bare session (current_type is None)
+        return LabelTransition(
+            add=["Session", "ForkedSession", "SST_EVENT"],
+            remove=["StubSession"],
+        )
 
 
 class SessionHandler:
