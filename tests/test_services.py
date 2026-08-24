@@ -748,3 +748,68 @@ class TestDurableCursor:
         svc = HookStateService(workspace="/ws")
         svc.restore_cursor({"dl2": "not-a-dict", "dl3": 123})  # type: ignore[dict-item]
         assert svc.data_layer_2.iteration_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #484: ensure_session_node must not drop `agent` on the existing-node
+# (Tier-2) branch. The `agent` value for a spawned sub-session arrives on the
+# parent's delegate:agent_spawned event ({"agent": ...}), while the child's own
+# session:start (no top-level agent) can create the node first. When the parent
+# event then hits the Tier-2 branch, `agent` must still be persisted (same
+# populate-if-missing rule already applied to working_dir).
+#
+# Two HookStateService instances share ONE GraphState to model the real
+# two-writer condition (each worker has its own cold _seen_sessions cache, so
+# the second writer genuinely reaches the graph-query Tier-2 branch rather than
+# short-circuiting on the Tier-1 warm-cache fast path).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestEnsureSessionNodeAgentField:
+    """#484 regression: the agent name survives the child-first ordering race."""
+
+    async def test_tier2_existing_node_persists_agent_from_later_event(self) -> None:
+        """Child creates the node WITHOUT agent; a later writer carrying
+        {"agent": ...} (the parent's delegate:agent_spawned) must persist it."""
+        graph = GraphState()
+        svc_child = HookStateService(graph_store=graph)
+        svc_parent = HookStateService(graph_store=graph)
+
+        # Child's session:start reaches ensure_session_node first — no top-level agent.
+        await svc_child.ensure_session_node(
+            "child-484", {"timestamp": "2026-01-01T00:00:00Z"}
+        )
+        node = await graph.get_node("child-484")
+        assert node is not None
+        # Precondition: the node exists but has no agent yet (reproduces the setup).
+        assert node.get("agent") is None
+
+        # Parent's delegate:agent_spawned arrives later, carrying the agent name.
+        # Second writer's cache is cold, so this reaches the Tier-2 existing branch.
+        await svc_parent.ensure_session_node(
+            "child-484", {"agent": "foundation:git-ops"}
+        )
+
+        node = await graph.get_node("child-484")
+        assert node is not None
+        assert node.get("agent") == "foundation:git-ops"
+
+    async def test_tier2_does_not_clobber_existing_agent(self) -> None:
+        """A later agent-less writer must NOT wipe an already-set agent."""
+        graph = GraphState()
+        svc_parent = HookStateService(graph_store=graph)
+        svc_child = HookStateService(graph_store=graph)
+
+        # Parent creates the node first, with the agent set.
+        await svc_parent.ensure_session_node(
+            "child-484b", {"agent": "foundation:git-ops"}
+        )
+        # Child's later agent-less call hits Tier-2 and must not clobber agent.
+        await svc_child.ensure_session_node(
+            "child-484b", {"timestamp": "2026-01-01T00:00:00Z"}
+        )
+
+        node = await graph.get_node("child-484b")
+        assert node is not None
+        assert node.get("agent") == "foundation:git-ops"

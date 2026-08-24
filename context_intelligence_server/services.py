@@ -317,6 +317,16 @@ class HookStateService:
             # guarantees an already-set value is never clobbered.
             if data.get("working_dir") and not existing.get("working_dir"):
                 stub_data["working_dir"] = data["working_dir"]
+            # Issue #484: same populate-if-missing rule for `agent`. The agent
+            # name for a spawned sub-session arrives ONLY on the parent's
+            # delegate:agent_spawned event; the child's own session:start (no
+            # top-level agent) can create the node first, so that later parent
+            # event routinely lands HERE. Without this, the parent's `agent` was
+            # silently dropped, leaving :Session.agent empty and breaking any
+            # `WHERE s.agent = ...` query. Only writes when the event supplies it
+            # AND the node still lacks it, so an already-set value is preserved.
+            if data.get("agent") and not existing.get("agent"):
+                stub_data["agent"] = data["agent"]
             await self.graph.upsert_node(session_id, stub_data)
             self._seen_sessions.add(session_id)
             return
