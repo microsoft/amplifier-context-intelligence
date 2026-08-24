@@ -13,6 +13,11 @@ from context_intelligence_server.config import get_settings
 # Resolved once at import time — never changes within a process lifetime.
 SERVER_VERSION: str = _pkg_version("context-intelligence-server")
 
+# Graph data-model version, distinct from the server release version above.
+# Bumped only when the node/edge schema changes; /status compares it against
+# the graph's stored :SchemaMeta.schema_version to surface drift.
+SCHEMA_VERSION: int = 1
+
 if TYPE_CHECKING:
     from context_intelligence_server.registry import SessionRegistry
 
@@ -113,6 +118,11 @@ class BootState:
     fallback_workspace_byte0: int = 0
     fallback_workspace_sentinel: int = 0
     reclaim_enabled: bool = False
+    # Why the graph-wide schema gate is currently closed, or None when open.
+    # Single global value: the un-migrated-data condition is graph-wide, not
+    # per-session. Set when boot detects/repairs un-migrated data, cleared once
+    # the gate re-opens; surfaced on /status so an operator can see the cause.
+    degraded_reason: str | None = None
 
     def begin(self) -> None:
         """Mark the start of boot reconciliation (called once, at boot)."""
@@ -133,6 +143,14 @@ class BootState:
         self.completed_at = time.time()
         self.failed_step = step
         self.error = f"{type(exc).__name__}: {exc}"
+
+    def degrade(self, reason: str) -> None:
+        """Record why the graph-wide schema gate is closed."""
+        self.degraded_reason = reason
+
+    def clear_degraded(self) -> None:
+        """Clear the reason once the schema gate re-opens."""
+        self.degraded_reason = None
 
     def snapshot(self) -> dict[str, Any]:
         """Read-only view for /status. Plain dict, no I/O."""

@@ -491,3 +491,31 @@ class TestBuildStatusResponseOrphanVisibility:
         sess = response["sessions"][0]
         assert "last_successful_flush" in sess
         assert sess["last_successful_flush"] == expected_flush
+
+
+class TestBootStateDegradedReason:
+    def test_degraded_reason_defaults_none_and_surfaces_on_snapshot(self) -> None:
+        from context_intelligence_server.status import BootState
+
+        bs = BootState()
+        snap = bs.snapshot()
+        assert "degraded_reason" in snap
+        assert snap["degraded_reason"] is None
+
+    def test_degrade_and_clear_round_trip(self) -> None:
+        from context_intelligence_server.status import BootState
+
+        bs = BootState()
+        bs.degrade("3 node(s) lacking the :Node label")
+        assert bs.snapshot()["degraded_reason"] == "3 node(s) lacking the :Node label"
+        bs.clear_degraded()
+        assert bs.snapshot()["degraded_reason"] is None
+
+    def test_no_parallel_schema_health_subsystem(self) -> None:
+        # degraded_reason lives on the existing BootState; no separate
+        # schema_health/schema_untagged fields were introduced.
+        from context_intelligence_server.status import BootState
+
+        fields = set(BootState().snapshot())
+        assert "schema_health" not in fields
+        assert "schema_untagged_nodes" not in fields
