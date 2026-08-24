@@ -23,7 +23,7 @@ from neo4j.exceptions import ServiceUnavailable
 import context_intelligence_server.main as main_module
 from context_intelligence_server.config import Settings
 from context_intelligence_server.main import _head_is_resumable, lifespan
-from context_intelligence_server.queue_manager import QueueManager, Verdict
+from context_intelligence_server.queue_manager import FileSystemQueueManager, QueueManager, Verdict
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.status import boot_state
@@ -45,7 +45,7 @@ def _line(workspace: str = "/ws", event: str = "tool_use", **data: Any) -> bytes
 
 
 async def _qm(tmp_path: Path) -> QueueManager:
-    return QueueManager(queues_dir=tmp_path)
+    return FileSystemQueueManager(queues_dir=tmp_path)
 
 
 def _seed_log(tmp_path: Path, key: str, content: bytes) -> Path:
@@ -177,7 +177,7 @@ async def test_classify_unparseable_offset_large_still_resets(tmp_path: Path) ->
     qm = await _qm(tmp_path)
     settings = Settings(reclaim_redrain_max_bytes=1)  # would have forced "large"
     with patch(
-        "context_intelligence_server.queue_manager.get_settings",
+        "context_intelligence_server.queue_manager.filesystem.get_settings",
         return_value=settings,
     ):
         c = await qm.classify_session("k4", _head_is_resumable)
@@ -194,7 +194,7 @@ async def test_classify_offset_past_eof_large_still_deletes(tmp_path: Path) -> N
     qm = await _qm(tmp_path)
     settings = Settings(reclaim_redrain_max_bytes=1)  # force "large"
     with patch(
-        "context_intelligence_server.queue_manager.get_settings",
+        "context_intelligence_server.queue_manager.filesystem.get_settings",
         return_value=settings,
     ):
         c = await qm.classify_session("k4b", _head_is_resumable)
@@ -294,7 +294,7 @@ async def test_boot_reclaim_survives_garbage_log_and_real_drain_dead_letters_it(
     garbage = b"not json at all\n"
     _seed_log(tmp_path, "garbage-key", garbage)
 
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     monkeypatch.setattr(main_module.registry, "_queue_manager", qm)
     monkeypatch.setattr(main_module._settings, "reclaim_enabled", True)
     monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
@@ -609,7 +609,7 @@ async def test_g4_topup_read_batch_guard_skips_corrupt_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        main_module.registry, "_queue_manager", QueueManager(queues_dir=tmp_path)
+        main_module.registry, "_queue_manager", FileSystemQueueManager(queues_dir=tmp_path)
     )
     qm = main_module.registry.queue_manager
     _seed_log(tmp_path, "bad", _line())
@@ -653,7 +653,7 @@ async def test_all_four_crash_triggers_reach_ready_with_reclaim_disabled(
 
     main_module.app.state.schema_ready = True  # schema is out of scope here
     monkeypatch.setattr(
-        main_module.registry, "_queue_manager", QueueManager(queues_dir=tmp_path)
+        main_module.registry, "_queue_manager", FileSystemQueueManager(queues_dir=tmp_path)
     )
     monkeypatch.setattr(main_module._settings, "reclaim_enabled", False)
     monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
@@ -678,7 +678,7 @@ async def test_gate1_live_worker_key_never_reclaimed(
     _seed_log(tmp_path, "owned", line)
     _seed_offset(tmp_path, "owned", str(len(line)))  # fully_drained shape
 
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     monkeypatch.setattr(main_module.registry, "_queue_manager", qm)
     monkeypatch.setattr(main_module._settings, "reclaim_enabled", True)
     monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
@@ -697,7 +697,7 @@ async def test_key_reclaimed_after_worker_removed_drains_from_zero(
     _seed_log(tmp_path, "was-owned", line)
     _seed_offset(tmp_path, "was-owned", str(len(line)))
 
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     monkeypatch.setattr(main_module.registry, "_queue_manager", qm)
     monkeypatch.setattr(main_module._settings, "reclaim_enabled", True)
     monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
@@ -724,7 +724,7 @@ async def test_recovered_drainer_population_bounded_and_makes_progress(
     bound, and cumulative distinct dispatches exceed the ceiling (forward progress)."""
     ceiling = 3
     n_sessions = 9
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     for i in range(n_sessions):
         await qm.append(f"sess-{i}", _line(session_id=f"sess-{i}"))
 
@@ -885,7 +885,7 @@ async def test_boot_reclaim_orphan_offset_survives_with_reclaim_disabled(
     `reclaim_orphans` itself, not just gate a telemetry counter."""
     (tmp_path / "orphan.offset").write_text("5", encoding="utf-8")
 
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     monkeypatch.setattr(main_module.registry, "_queue_manager", qm)
     monkeypatch.setattr(main_module._settings, "reclaim_enabled", False)
     monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
@@ -903,7 +903,7 @@ async def test_boot_reclaim_orphan_offset_survives_with_reclaim_disabled(
 async def test_dry_exit_fires_for_recovered_drainer_over_drained_log(
     tmp_path: Path,
 ) -> None:
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     reg = SessionRegistry()
     reg._queue_manager = qm
     line = _line()
@@ -922,7 +922,7 @@ async def test_dry_exit_fires_for_recovered_drainer_over_drained_log(
 async def test_dry_exit_negative_control_live_created_worker_never_exits(
     tmp_path: Path,
 ) -> None:
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     reg = SessionRegistry()
     reg._queue_manager = qm
     line = _line()
@@ -950,7 +950,7 @@ async def test_dry_exit_negative_control_recovered_that_drained_still_exits(
     """The RED test proving the field is NOT last_event_time in disguise:
     a recovered worker that DID process >=1 record must still exit once
     it runs dry (v1.2's rejected fix excluded exactly this population)."""
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     reg = SessionRegistry()
     reg._queue_manager = qm
     line = _line()
@@ -968,7 +968,7 @@ async def test_dry_exit_negative_control_recovered_that_drained_still_exits(
 async def test_d1_no_strand_after_recheck_await(tmp_path: Path) -> None:
     """A POST landing during the recheck's await must not strand the drainer's
     client -- the flag is re-read after the await, aborting the exit."""
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     reg = SessionRegistry()
     reg._queue_manager = qm
     worker = _make_worker("sess-race", live_event_seen=False)
@@ -1090,7 +1090,7 @@ async def test_no_phantom_reclaim_for_dead_only_key(
     """A correctly-finalized session retains only a .dead.jsonl; classify
     must never see this key at all (it iterates *.log stems only)."""
     _seed_dead(tmp_path, "finalized", "kept\n")
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     monkeypatch.setattr(main_module.registry, "_queue_manager", qm)
     monkeypatch.setattr(main_module._settings, "reclaim_enabled", True)
     monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
@@ -1113,7 +1113,7 @@ async def test_reclaim_disabled_classifies_but_deletes_nothing(
     line = _line()
     _seed_log(tmp_path, "would-resume", line)
 
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     monkeypatch.setattr(main_module.registry, "_queue_manager", qm)
     monkeypatch.setattr(main_module._settings, "reclaim_enabled", False)
     monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
@@ -1132,7 +1132,7 @@ async def test_reclaim_enabled_true_deletes_what_dry_run_named(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _seed_log(tmp_path, "target", b"")
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     monkeypatch.setattr(main_module.registry, "_queue_manager", qm)
     monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
 
@@ -1159,7 +1159,7 @@ async def test_boot_reclaim_auto_reclaims_drained_log_under_shipped_defaults(
     """A fully-drained log (committed == complete_end == size) is the same
     evidence delete_drained already acts on unconditionally -- it must be
     reclaimed at boot even under shipped defaults (reclaim_enabled=False)."""
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     line = _line()
     await qm.append("drained-key", line)
     await qm.commit("drained-key", len(line))
@@ -1192,7 +1192,7 @@ async def test_boot_reclaim_risky_verdicts_stay_gated_under_shipped_defaults(
     _seed_log(tmp_path, "reset-key", line * 2)
     _seed_offset(tmp_path, "reset-key", "garbage")  # small -> RESET_OFFSET
 
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     monkeypatch.setattr(main_module.registry, "_queue_manager", qm)
     monkeypatch.setattr(main_module._settings, "reclaim_enabled", False)
     monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
@@ -1204,7 +1204,7 @@ async def test_boot_reclaim_risky_verdicts_stay_gated_under_shipped_defaults(
     # other test's get_settings.cache_clear() changing the shared singleton.
     threshold_settings = Settings(reclaim_redrain_max_bytes=150)
     with patch(
-        "context_intelligence_server.queue_manager.get_settings",
+        "context_intelligence_server.queue_manager.filesystem.get_settings",
         return_value=threshold_settings,
     ):
         # Confirm the verdicts are what this test claims before asserting.
@@ -1232,14 +1232,14 @@ async def test_boot_reclaim_large_unparseable_offset_never_deletes_log(
     _seed_log(tmp_path, "big-unparseable", big)
     _seed_offset(tmp_path, "big-unparseable", "not-a-number")
 
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     monkeypatch.setattr(main_module.registry, "_queue_manager", qm)
     monkeypatch.setattr(main_module._settings, "reclaim_enabled", True)
     monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
 
     threshold_settings = Settings(reclaim_redrain_max_bytes=1)  # old "large" cliff
     with patch(
-        "context_intelligence_server.queue_manager.get_settings",
+        "context_intelligence_server.queue_manager.filesystem.get_settings",
         return_value=threshold_settings,
     ):
         await main_module._boot_reclaim()
@@ -1255,7 +1255,7 @@ async def test_boot_reclaim_drained_log_with_live_worker_is_skipped(
 ) -> None:
     """The has_worker guard runs BEFORE classify -- a live worker's log is
     never touched by boot reclaim, DRAINED or not."""
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     line = _line()
     await qm.append("live-drained-key", line)
     await qm.commit("live-drained-key", len(line))
@@ -1480,7 +1480,7 @@ async def test_merged_head_session_resumes_and_drains_behind_the_poison_line(
         tmp_path, "merged-head", str(len(good_head))
     )  # merged is first-uncommitted
 
-    qm = QueueManager(queues_dir=tmp_path)
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
     c1 = await qm.classify_session("merged-head", _head_is_resumable)
     assert c1.verdict is Verdict.RESUMABLE
     assert c1.reason == "fallback_workspace"

@@ -18,8 +18,9 @@ from typing import Any
 
 import pytest
 
-from context_intelligence_server import queue_manager as qm_module
-from context_intelligence_server.queue_manager import QueueManager, _KeyGuard
+from context_intelligence_server.queue_manager import filesystem as qm_module
+from context_intelligence_server.queue_manager import FileSystemQueueManager, QueueManager
+from context_intelligence_server.queue_manager.filesystem import _KeyGuard
 from context_intelligence_server.registry import SessionRegistry
 
 pytestmark = pytest.mark.integration
@@ -105,7 +106,7 @@ async def test_control_local_o_append_is_atomic(tmp_path: Path) -> None:
     every line parses even without the guard doing any work. Passing alone
     is not proof the guard works -- see test_smb_split_write_no_longer_merges_records.
     """
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
 
     records: list[bytes] = []
     for i in range(12):
@@ -226,7 +227,7 @@ async def test_smb_split_write_no_longer_merges_records(
     via the shim while a second appender for the same key waits on the
     guard; both lines land whole, in order, and parse cleanly.
     """
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     real_write = os.write
 
     large_first_op = threading.Event()
@@ -282,7 +283,7 @@ async def test_smb_split_write_no_longer_merges_records(
 async def test_concurrent_appends_under_smb_shim_all_parse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
 ) -> None:
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     monkeypatch.setattr(qm_module.os, "write", _SplitWriteOS(os.write))
 
     records: list[bytes] = []
@@ -313,7 +314,7 @@ async def test_concurrent_appends_under_smb_shim_all_parse(
 async def test_cancel_mid_write_never_releases_the_file_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     key = SESSION
 
     entered_write = threading.Event()
@@ -405,7 +406,7 @@ async def test_cancel_mid_write_never_releases_the_file_lock(
 async def test_distinct_keys_append_concurrently(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     key_a = "key-a"
     key_b = "key-b"
 
@@ -444,7 +445,7 @@ async def test_distinct_keys_append_concurrently(
 
 
 async def test_heal_torn_tails_truncates_and_quarantines(tmp_path: Path) -> None:
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     key = "torn-key"
     log_path = qm._log_path(key)
     good = b'{"event":"a"}\n'
@@ -471,7 +472,7 @@ async def test_heal_torn_tails_truncates_and_quarantines(tmp_path: Path) -> None
 
 
 async def test_heal_torn_tails_on_empty_and_newline_free_files(tmp_path: Path) -> None:
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     empty_key = "empty-key"
     nf_key = "newline-free-key"
     qm._log_path(empty_key).write_bytes(b"")
@@ -505,7 +506,7 @@ async def test_heal_torn_tails_on_empty_and_newline_free_files(tmp_path: Path) -
 async def test_partial_write_failure_discards_the_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     key = "fail-key"
     real_write = os.write
     calls = {"n": 0}
@@ -540,7 +541,7 @@ async def test_partial_write_failure_discards_the_record(
 async def test_partial_write_failure_logs_when_newline_terminate_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     key = "fail-key-2"
     real_write = os.write
     calls = {"n": 0}
@@ -584,7 +585,7 @@ async def test_discard_partial_never_destroys_a_peer_process_committed_line(
     completes and closes its own fully-formed, already-acknowledged record.
     _discard_partial must never remove those bytes.
     """
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     key = "race-key"
     path = qm._log_path(key)
     path.write_bytes(b'{"payload":"PRIOR-COMMITTED"}\n')
@@ -639,7 +640,7 @@ async def test_discard_partial_single_writer_preserves_prior_records(
     next record); a subsequent drain dead-letters the fragment rather than
     crashing.
     """
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     key = "single-writer-key"
     prior = _event_bytes("prior-committed")
     await qm.append(key, prior)
@@ -683,7 +684,7 @@ async def test_discard_partial_single_writer_preserves_prior_records(
 async def test_delete_drained_cannot_race_an_in_flight_append(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     key = "race-delete-key"
 
     entered = threading.Event()
@@ -724,7 +725,7 @@ async def test_delete_drained_cannot_race_an_in_flight_append(
 async def test_delete_drained_retains_a_log_with_uncommitted_bytes(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     key = "uncommitted-key"
     first = _event_bytes("first")
     second = _event_bytes("second")
@@ -755,7 +756,7 @@ async def test_delete_drained_retains_a_log_with_uncommitted_bytes(
 async def test_guard_map_is_released_on_delete_drained_and_identity_checked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     keys = [f"session-{i}" for i in range(5)]
     for k in keys:
         await qm.append(k, _event_bytes("ev"))
@@ -811,7 +812,7 @@ async def test_guard_map_is_released_on_delete_drained_and_identity_checked(
 async def test_dead_letter_record_is_framed_under_smb_shim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     key = "dl-key"
     monkeypatch.setattr(qm_module.os, "write", _SplitWriteOS(os.write))
     large_raw = _event_bytes("bad:record", filler=300 * 1024)
@@ -823,7 +824,7 @@ async def test_dead_letter_record_is_framed_under_smb_shim(
 
 
 async def test_dead_letter_parsing_survives_a_malformed_line(tmp_path: Path) -> None:
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     key = "dl-malformed-key"
     dead_path = qm._dead_path(key)
     good = json.dumps({"ts": 1.0, "error": "e", "payload": "ok"})
@@ -849,7 +850,7 @@ async def test_guard_survives_a_delete_that_races_a_parked_appender(
     survive while appender A still holds a reference, so a subsequent
     appender B is served by the SAME guard rather than a disjoint one.
     """
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     key = "race-key"
 
     seed = _event_bytes("seed")
@@ -913,7 +914,7 @@ async def test_guard_survives_a_delete_that_races_a_parked_appender(
 async def test_heal_torn_tails_survives_an_oserror_and_still_boots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     good = b'{"event":"ok"}\n'
     torn = b'{"event":"torn","data":"no-terminator-yet'
     for name in ("a", "b", "c"):
@@ -991,7 +992,7 @@ async def test_read_batch_over_a_pre_existing_merged_middle_line(
     """A pre-existing merged middle line still fails _parse_line -- consuming
     it (dead-letter, commit past it) is the drainer's job, not this fix's.
     """
-    qm = QueueManager(tmp_path)
+    qm = FileSystemQueueManager(tmp_path)
     key = "merged-middle-key"
     assert _SEEDS is not None
     merged = (_SEEDS / "seed_corrupt_merged_line_1.0MiB.raw").read_bytes()

@@ -20,7 +20,7 @@ from neo4j import AsyncGraphDatabase
 from context_intelligence_server.handlers.data_layer_2.session import SessionHandler
 from context_intelligence_server.neo4j_store import Neo4jGraphStore, ensure_neo4j_schema
 from context_intelligence_server.pipeline import process_event, setup_handlers
-from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.queue_manager import FileSystemQueueManager, QueueManager
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
 
@@ -83,7 +83,7 @@ def _line(event: str, workspace: str, data: dict[str, Any]) -> bytes:
 
 def _build_registry(queues_dir: Path, *, write_concurrency: int = 8) -> SessionRegistry:
     reg = SessionRegistry()
-    reg._queue_manager = QueueManager(queues_dir=queues_dir)
+    reg._queue_manager = FileSystemQueueManager(queues_dir=queues_dir)
     reg._write_semaphore = asyncio.Semaphore(write_concurrency)
     reg._max_delivery_attempts = 3
     return reg

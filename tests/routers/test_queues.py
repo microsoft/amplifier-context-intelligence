@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from context_intelligence_server.main import registry
-from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.queue_manager import FileSystemQueueManager, QueueManager
 
 
 def _point_registry_at(tmp_path: Path) -> QueueManager:
@@ -17,7 +17,7 @@ def _point_registry_at(tmp_path: Path) -> QueueManager:
 
     Returns the QueueManager so tests can seed dead-letter records directly.
     """
-    qm = QueueManager(queues_dir=tmp_path / "queues")
+    qm = FileSystemQueueManager(queues_dir=tmp_path / "queues")
     registry._queue_manager = qm
     registry._write_semaphore = asyncio.Semaphore(2)
     registry._max_delivery_attempts = 5

@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
-from context_intelligence_server.identity_store import IdentityStore
+from context_intelligence_server.identity_store import FileSystemIdentityStore
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +42,7 @@ def _bob_entry() -> dict[str, str]:
 class TestPutGetRoundtrip:
     def test_put_then_get_returns_value(self, tmp_path: Path) -> None:
         """put(key, value) → get(key) returns that value immediately."""
-        store = IdentityStore(path=tmp_path / "store.json")
+        store = FileSystemIdentityStore(path=tmp_path / "store.json")
         store.load()
 
         store.put(FAKE_HASH_A, _alice_entry())
@@ -53,25 +53,25 @@ class TestPutGetRoundtrip:
     def test_put_persists_to_file_and_loads_fresh(self, tmp_path: Path) -> None:
         """Round-trip: put → create new store → load → value is present."""
         store_path = tmp_path / "store.json"
-        store = IdentityStore(path=store_path)
+        store = FileSystemIdentityStore(path=store_path)
         store.load()
         store.put(FAKE_HASH_A, _alice_entry())
 
         # New store instance reads from disk
-        store2 = IdentityStore(path=store_path)
+        store2 = FileSystemIdentityStore(path=store_path)
         store2.load()
         assert store2.get(FAKE_HASH_A) == _alice_entry()
 
     def test_get_missing_key_returns_none(self, tmp_path: Path) -> None:
         """get() returns None for a key that was never put."""
-        store = IdentityStore(path=tmp_path / "store.json")
+        store = FileSystemIdentityStore(path=tmp_path / "store.json")
         store.load()
         assert store.get(FAKE_HASH_A) is None
 
     def test_delete_removes_key(self, tmp_path: Path) -> None:
         """delete(key) removes the entry from in-process dict AND file."""
         store_path = tmp_path / "store.json"
-        store = IdentityStore(path=store_path)
+        store = FileSystemIdentityStore(path=store_path)
         store.load()
         store.put(FAKE_HASH_A, _alice_entry())
         store.delete(FAKE_HASH_A)
@@ -79,13 +79,13 @@ class TestPutGetRoundtrip:
         assert store.get(FAKE_HASH_A) is None
 
         # Verify file is also updated
-        store2 = IdentityStore(path=store_path)
+        store2 = FileSystemIdentityStore(path=store_path)
         store2.load()
         assert store2.get(FAKE_HASH_A) is None
 
     def test_items_returns_all_entries(self, tmp_path: Path) -> None:
         """items() yields all key-value pairs currently in the store."""
-        store = IdentityStore(path=tmp_path / "store.json")
+        store = FileSystemIdentityStore(path=tmp_path / "store.json")
         store.load()
         store.put(FAKE_HASH_A, _alice_entry())
         store.put(FAKE_HASH_B, _bob_entry())
@@ -95,7 +95,7 @@ class TestPutGetRoundtrip:
 
     def test_upsert_overwrites_existing(self, tmp_path: Path) -> None:
         """put() on an existing key overwrites the value."""
-        store = IdentityStore(path=tmp_path / "store.json")
+        store = FileSystemIdentityStore(path=tmp_path / "store.json")
         store.load()
         store.put(FAKE_HASH_A, _alice_entry())
         store.put(FAKE_HASH_A, {"id": "alice-updated"})
@@ -105,12 +105,12 @@ class TestPutGetRoundtrip:
     def test_sequential_puts_all_persist(self, tmp_path: Path) -> None:
         """Multiple sequential puts all persist correctly (each write is the full map)."""
         store_path = tmp_path / "store.json"
-        store = IdentityStore(path=store_path)
+        store = FileSystemIdentityStore(path=store_path)
         store.load()
         store.put(FAKE_HASH_A, _alice_entry())
         store.put(FAKE_HASH_B, _bob_entry())
 
-        store2 = IdentityStore(path=store_path)
+        store2 = FileSystemIdentityStore(path=store_path)
         store2.load()
         assert store2.get(FAKE_HASH_A) == _alice_entry()
         assert store2.get(FAKE_HASH_B) == _bob_entry()
@@ -124,7 +124,7 @@ class TestPutGetRoundtrip:
 class TestLoadFailClosed:
     def test_missing_file_yields_empty_dict(self, tmp_path: Path) -> None:
         """Missing store file → load() yields empty dict (normal first boot), no raise."""
-        store = IdentityStore(path=tmp_path / "nonexistent.json")
+        store = FileSystemIdentityStore(path=tmp_path / "nonexistent.json")
         store.load()  # must not raise
         assert store.get(FAKE_HASH_A) is None
         assert list(store.items()) == []
@@ -136,7 +136,7 @@ class TestLoadFailClosed:
         store_path = tmp_path / "store.json"
         store_path.write_text("{{{{not valid json at all}}}}", encoding="utf-8")
 
-        store = IdentityStore(path=store_path)
+        store = FileSystemIdentityStore(path=store_path)
         with caplog.at_level(logging.ERROR):
             store.load()  # must NOT raise
 
@@ -156,7 +156,7 @@ class TestLoadFailClosed:
             json.dumps([{"id": "alice"}]), encoding="utf-8"
         )  # list, not dict
 
-        store = IdentityStore(path=store_path)
+        store = FileSystemIdentityStore(path=store_path)
         with caplog.at_level(logging.ERROR):
             store.load()  # must NOT raise
 
@@ -171,7 +171,7 @@ class TestLoadFailClosed:
         store_path = tmp_path / "store.json"
         store_path.write_bytes(b'{"aaa": {"id": "al')  # truncated mid-write
 
-        store = IdentityStore(path=store_path)
+        store = FileSystemIdentityStore(path=store_path)
         with caplog.at_level(logging.ERROR):
             store.load()  # must NOT raise
 
@@ -188,7 +188,7 @@ class TestLoadFailClosed:
 class TestWriteFileThenSwapMemory:
     def test_put_write_failure_leaves_dict_unchanged(self, tmp_path: Path) -> None:
         """If os.replace raises, the in-process dict is UNCHANGED (F2 contract)."""
-        store = IdentityStore(path=tmp_path / "store.json")
+        store = FileSystemIdentityStore(path=tmp_path / "store.json")
         store.load()
         # Establish an existing entry
         store.put(FAKE_HASH_A, _alice_entry())
@@ -208,7 +208,7 @@ class TestWriteFileThenSwapMemory:
 
     def test_delete_write_failure_leaves_dict_unchanged(self, tmp_path: Path) -> None:
         """If delete's file write fails, the in-process dict is UNCHANGED."""
-        store = IdentityStore(path=tmp_path / "store.json")
+        store = FileSystemIdentityStore(path=tmp_path / "store.json")
         store.load()
         store.put(FAKE_HASH_A, _alice_entry())
 
@@ -221,7 +221,7 @@ class TestWriteFileThenSwapMemory:
 
     def test_failed_write_leaves_no_torn_tempfile(self, tmp_path: Path) -> None:
         """A failed os.replace must clean up the tempfile — no orphaned .tmp files."""
-        store = IdentityStore(path=tmp_path / "store.json")
+        store = FileSystemIdentityStore(path=tmp_path / "store.json")
         store.load()
 
         with patch("os.replace", side_effect=OSError("simulated disk full")):
@@ -235,7 +235,7 @@ class TestWriteFileThenSwapMemory:
     def test_atomic_write_uses_tempfile_in_same_dir(self, tmp_path: Path) -> None:
         """Writes use a temp file in the same directory (then os.replace)."""
         store_path = tmp_path / "store.json"
-        store = IdentityStore(path=store_path)
+        store = FileSystemIdentityStore(path=store_path)
         store.load()
 
         replaced_from: list[str] = []
@@ -266,13 +266,13 @@ class TestFlatDictLiveReference:
 
     def test_flat_dict_empty_on_new_store(self, tmp_path: Path) -> None:
         """flat_dict is empty after load() with no file."""
-        store = IdentityStore(path=tmp_path / "store.json")
+        store = FileSystemIdentityStore(path=tmp_path / "store.json")
         store.load()
         assert store.flat_dict == {}
 
     def test_flat_dict_updated_after_put(self, tmp_path: Path) -> None:
         """flat_dict is updated immediately after put()."""
-        store = IdentityStore(path=tmp_path / "store.json")
+        store = FileSystemIdentityStore(path=tmp_path / "store.json")
         store.load()
         store.put(FAKE_HASH_A, {"id": "alice"})
 
@@ -280,7 +280,7 @@ class TestFlatDictLiveReference:
 
     def test_flat_dict_updated_after_delete(self, tmp_path: Path) -> None:
         """flat_dict removes key immediately after delete()."""
-        store = IdentityStore(path=tmp_path / "store.json")
+        store = FileSystemIdentityStore(path=tmp_path / "store.json")
         store.load()
         store.put(FAKE_HASH_A, {"id": "alice"})
         store.delete(FAKE_HASH_A)
@@ -290,7 +290,7 @@ class TestFlatDictLiveReference:
     def test_flat_dict_is_same_object_across_puts(self, tmp_path: Path) -> None:
         """flat_dict is the SAME dict object before and after put()
         (so a shared reference to flat_dict stays live)."""
-        store = IdentityStore(path=tmp_path / "store.json")
+        store = FileSystemIdentityStore(path=tmp_path / "store.json")
         store.load()
         flat_ref = store.flat_dict  # capture the reference
 
@@ -309,7 +309,7 @@ class TestFlatDictLiveReference:
             json.dumps({FAKE_HASH_A: {"id": "alice"}, FAKE_HASH_B: {"id": "bob"}}),
             encoding="utf-8",
         )
-        store = IdentityStore(path=store_path)
+        store = FileSystemIdentityStore(path=store_path)
         store.load()
 
         assert store.flat_dict[FAKE_HASH_A] == "alice"

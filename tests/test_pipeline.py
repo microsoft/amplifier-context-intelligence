@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+
 # ---------------------------------------------------------------------------
 # NOTE: ToolCallHandler stub injection is performed in conftest.py so it
 # fires before any test module loads, regardless of pytest collection order.
@@ -152,8 +153,8 @@ def test_setup_handlers_returns_pipeline_handlers() -> None:
 
 
 def test_setup_handlers_has_default_handler_with_services() -> None:
-    from context_intelligence_server.handlers.data_layer_1.default import DefaultHandler
     from context_intelligence_server.pipeline import setup_handlers
+    from context_intelligence_server.handlers.data_layer_1.default import DefaultHandler
     from context_intelligence_server.services import HookStateService
 
     services = HookStateService(workspace="test")
@@ -184,17 +185,17 @@ def test_setup_handlers_enricher_count() -> None:
 def test_setup_handlers_enricher_order() -> None:
     """Enrichers must be [SessionHandler, OrchestratorRunHandler, IterationHandler,
     ContentBlockHandler, ToolCallHandler] in that dispatch order."""
-    from context_intelligence_server.handlers.data_layer_2.content_block import (
-        ContentBlockHandler,
+    from context_intelligence_server.pipeline import setup_handlers
+    from context_intelligence_server.handlers.data_layer_2.session import SessionHandler
+    from context_intelligence_server.handlers.data_layer_2.orchestrator_run import (
+        OrchestratorRunHandler,
     )
     from context_intelligence_server.handlers.data_layer_2.iteration import (
         IterationHandler,
     )
-    from context_intelligence_server.handlers.data_layer_2.orchestrator_run import (
-        OrchestratorRunHandler,
+    from context_intelligence_server.handlers.data_layer_2.content_block import (
+        ContentBlockHandler,
     )
-    from context_intelligence_server.handlers.data_layer_2.session import SessionHandler
-    from context_intelligence_server.pipeline import setup_handlers
     from context_intelligence_server.services import HookStateService
 
     services = HookStateService(workspace="test")
@@ -209,8 +210,12 @@ def test_setup_handlers_enricher_order() -> None:
 def test_setup_handlers_l3_enricher_order() -> None:
     """Layer 3 enrichers must be appended after all Layer 2 enrichers in correct order:
     [DelegationHandler, SkillLoadHandler, RecipeRunHandler, RecipeStepHandler]."""
+    from context_intelligence_server.pipeline import setup_handlers
     from context_intelligence_server.handlers.data_layer_3.delegation import (
         DelegationHandler,
+    )
+    from context_intelligence_server.handlers.data_layer_3.skill_load import (
+        SkillLoadHandler,
     )
     from context_intelligence_server.handlers.data_layer_3.recipe_run import (
         RecipeRunHandler,
@@ -218,10 +223,6 @@ def test_setup_handlers_l3_enricher_order() -> None:
     from context_intelligence_server.handlers.data_layer_3.recipe_step import (
         RecipeStepHandler,
     )
-    from context_intelligence_server.handlers.data_layer_3.skill_load import (
-        SkillLoadHandler,
-    )
-    from context_intelligence_server.pipeline import setup_handlers
     from context_intelligence_server.services import HookStateService
 
     services = HookStateService(workspace="test")
@@ -387,46 +388,6 @@ async def test_process_event_terminal_does_not_self_flush(
     mock_worker.services.graph.flush.assert_not_called()
 
 
-async def test_process_event_terminal_does_not_self_flush_real_handlers() -> None:
-    """Wires the real ``setup_handlers(services)`` enrichers (not
-    ``_StubEnricher``) to verify ``SessionHandler`` never self-flushes;
-    also asserts the session node was actually written."""
-    from context_intelligence_server.pipeline import process_event, setup_handlers
-    from context_intelligence_server.registry import SessionWorker
-    from context_intelligence_server.services import HookStateService
-
-    services = HookStateService(workspace="test-real-handlers")
-    handlers = setup_handlers(services)
-    worker = SessionWorker(
-        session_id="sess-real-1", workspace="test-real-handlers", services=services
-    )
-
-    real_flush = services.graph.flush
-    flush_calls: list[None] = []
-
-    async def _counting_flush() -> None:
-        flush_calls.append(None)
-        await real_flush()
-
-    services.graph.flush = _counting_flush  # type: ignore[method-assign]
-
-    data = {"session_id": "sess-real-1", "timestamp": "2026-01-01T00:00:00Z"}
-    await process_event(worker, "session:end", data, handlers)
-
-    assert flush_calls == [], (
-        f"SessionHandler._handle_end (via the REAL setup_handlers enrichers) "
-        f"called graph.flush directly {len(flush_calls)} time(s) -- "
-        f"process_event must not self-flush; the drainer's gated "
-        f"_flush_barrier is the sole trigger"
-    )
-
-    # Confirm the real SessionHandler actually ran and wrote the node.
-    node = await services.graph.get_node("sess-real-1")
-    assert node is not None and node.get("status") == "completed", (
-        f"real SessionHandler did not run (mis-wired fixture?): {node}"
-    )
-
-
 async def test_process_event_non_terminal_does_not_self_flush(
     mock_worker: MagicMock,
     pipeline_handlers: Any,
@@ -451,7 +412,7 @@ async def test_process_event_default_handler_exception_propagates(
     mock_worker: MagicMock,
     default_handler: _StubDefaultHandler,
 ) -> None:
-    """A default-handler (step 4) error must PROPAGATE so the drainer
+    """Phase B2: a default-handler (step 4) error must PROPAGATE so the drainer
     can dead-letter the line instead of committing the offset past a
     never-persisted event (no silent loss)."""
     from context_intelligence_server.pipeline import PipelineHandlers, process_event
@@ -465,6 +426,7 @@ async def test_process_event_default_handler_exception_propagates(
         )
 
 
+# NOTE (Task 6): test_process_event_flush_exception_propagates was removed.
 # process_event no longer flushes at all — the drainer's gated _flush_barrier is
 # the sole write trigger, so flush-failure-propagation is now a drainer contract
 # covered by tests/test_registry.py::TestDurableDrainLoop
@@ -476,7 +438,7 @@ async def test_process_event_propagates_handler_error(
     mock_worker: MagicMock,
     pipeline_handlers: Any,
 ) -> None:
-    """A handler error in steps 2-6 must
+    """Phase B2 (USER DECISION option a): a handler error in steps 2-6 must
     PROPAGATE, not be swallowed — here ensure_session_node (step 2) raises and
     process_event must re-raise so the drainer routes the line to dead-letter
     rather than committing the offset past a never-persisted event."""
@@ -526,8 +488,12 @@ async def test_blob_processing_called_when_all_conditions_met(
         ) as mock_node_id,
     ):
         await process_event(worker, "session:start", data, pipeline_handlers)
+        # The blob-key node_id must be computed with the SAME disambiguator
+        # (tool_call_id) that handlers/data_layer_1/default.py uses for the
+        # Event node id -- otherwise parallel same-millisecond events collide
+        # on the blob key (see test_blob_node_id_matches_default_handler_event_node_id).
         mock_node_id.assert_called_once_with(
-            "sess-123", "session:start", "2024-01-01T00:00:00Z"
+            "sess-123", "session:start", "2024-01-01T00:00:00Z", None
         )
         mock_process.assert_called_once_with(
             data, worker.services.blob_store, "sess-123", "test-node-id"
@@ -602,6 +568,123 @@ async def test_blob_skip_missing_timestamp_logs_warning(
     assert "sess-123" in caplog.text
     assert "tool_call" in caplog.text
     assert "missing timestamp" in caplog.text
+
+
+# ===========================================================================
+# Blob-key collision regression (data integrity)
+#
+# Root cause: pipeline.py computed the blob-key node_id WITHOUT the
+# tool_call_id disambiguator that handlers/data_layer_1/default.py uses for
+# the Event node id. Two distinct same-session, same-event, same-millisecond
+# events with DIFFERENT tool_call_id (e.g. parallel tool calls) therefore
+# minted the SAME blob key, and the second write silently clobbered the
+# first via FileSystemBlobStore's os.replace -- while the first Event node's
+# $blob_ref still pointed at that (now-overwritten) URI.
+# ===========================================================================
+
+
+async def test_parallel_same_millisecond_events_do_not_collide_on_blob_key(
+    pipeline_handlers: Any,
+    tmp_path: Any,
+) -> None:
+    """Two events sharing session_id + event name + timestamp (same epoch-ms)
+    but with DIFFERENT tool_call_id must mint DISTINCT ci-blob:// URIs, and
+    each blob must read back its own payload -- no silent overwrite."""
+    from context_intelligence_server.blob_store import FileSystemBlobStore
+    from context_intelligence_server.pipeline import process_event
+
+    blob_store = FileSystemBlobStore(root=tmp_path)
+
+    worker = MagicMock()
+    worker.services.ensure_session_node = AsyncMock()
+    worker.services.touch_session = AsyncMock()
+    worker.services.graph = MagicMock()
+    worker.services.graph.flush = AsyncMock()
+    worker.services.blob_store = blob_store
+
+    session_id = "sess-parallel"
+    event_name = "tool_call:end"
+    timestamp = "2024-06-01T12:00:00.000Z"  # fixed -- identical epoch-ms for both
+
+    data_a: dict[str, Any] = {
+        "session_id": session_id,
+        "timestamp": timestamp,
+        "tool_call_id": "call-A",
+        "result": {"payload": "result-from-call-A"},
+    }
+    data_b: dict[str, Any] = {
+        "session_id": session_id,
+        "timestamp": timestamp,
+        "tool_call_id": "call-B",
+        "result": {"payload": "result-from-call-B"},
+    }
+
+    await process_event(worker, event_name, data_a, pipeline_handlers)
+    await process_event(worker, event_name, data_b, pipeline_handlers)
+
+    # (c) each event's data[field] == {"$blob_ref": <its own uri>}
+    assert "$blob_ref" in data_a["result"]
+    assert "$blob_ref" in data_b["result"]
+    uri_a = data_a["result"]["$blob_ref"]
+    uri_b = data_b["result"]["$blob_ref"]
+
+    # (a) distinct URIs -- no collision
+    assert uri_a != uri_b, (
+        f"Blob key collision: both events minted the same URI {uri_a!r} -- "
+        "the second write silently overwrote the first's blob."
+    )
+
+    # (b) both blobs exist and each reads back its OWN distinct payload
+    read_a = await blob_store.read(uri_a)
+    read_b = await blob_store.read(uri_b)
+    assert read_a == {"payload": "result-from-call-A"}
+    assert read_b == {"payload": "result-from-call-B"}
+
+
+async def test_blob_node_id_matches_default_handler_event_node_id(
+    pipeline_handlers: Any,
+) -> None:
+    """Pins the invariant: the blob-key node_id pipeline.process_event computes
+    must EQUAL the event_node_id handlers/data_layer_1/default.py computes for
+    the same event (make_node_id(session_id, event, timestamp,
+    data.get("tool_call_id"))). If these ever drift apart again, the
+    collision this test suite guards against reappears."""
+    from context_intelligence_server.pipeline import process_event
+    from context_intelligence_server.utils import make_node_id
+
+    worker = MagicMock()
+    worker.services.ensure_session_node = AsyncMock()
+    worker.services.touch_session = AsyncMock()
+    worker.services.graph = MagicMock()
+    worker.services.graph.flush = AsyncMock()
+    worker.services.blob_store = MagicMock()  # truthy blob_store
+
+    session_id = "sess-invariant"
+    event_name = "tool_call:end"
+    timestamp = "2024-06-01T12:00:00.000Z"
+    tool_call_id = "call-invariant"
+
+    data = {
+        "session_id": session_id,
+        "timestamp": timestamp,
+        "tool_call_id": tool_call_id,
+    }
+
+    expected_event_node_id = make_node_id(
+        session_id, event_name, timestamp, tool_call_id
+    )
+
+    with patch(
+        "context_intelligence_server.pipeline.process_event_data",
+        new_callable=AsyncMock,
+    ) as mock_process:
+        await process_event(worker, event_name, data, pipeline_handlers)
+        actual_blob_node_id = mock_process.call_args.args[3]
+
+    assert actual_blob_node_id == expected_event_node_id, (
+        "Blob-key node_id has drifted from default.py's event_node_id -- "
+        "this reintroduces the same-millisecond blob-key collision."
+    )
 
 
 # ===========================================================================

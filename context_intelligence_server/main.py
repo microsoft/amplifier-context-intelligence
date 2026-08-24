@@ -13,7 +13,6 @@ from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
-from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -32,13 +31,16 @@ from context_intelligence_server.authz import (  # noqa: F401 — re-exported fo
     require_read,
     require_write,
 )
-from context_intelligence_server.blob_store import AsyncDiskBlobStore
+from context_intelligence_server.blob_store import create_blob_store
 from context_intelligence_server.config import Neo4jClientConfig, Settings, get_settings
 from context_intelligence_server.idempotency import (
     EventIdempotencyCache,
     KeyedAsyncLocks,
 )
-from context_intelligence_server.identity_store import IdentityStore
+from context_intelligence_server.identity_store import (
+    IdentityStore,
+    create_identity_store,
+)
 from context_intelligence_server.logging_config import setup_logging
 from context_intelligence_server.models import (
     CypherRequest,
@@ -458,7 +460,7 @@ async def _boot_reclaim() -> None:
             logger.warning(
                 "boot_reclaimed reason=%s path=%s session=%s bytes=%d action=dry_run",
                 c.reason,
-                Path(settings.queues_path) / f"{key}.log",
+                qm.queues_dir / f"{key}.log",
                 key,
                 c.size,
             )
@@ -843,9 +845,9 @@ def create_asgi_app(
 
     if s.auth_mode == "entra":
         # Build and load the entra identity store.
-        entra_store = IdentityStore(Path(s.entra_identities_store_path))
+        entra_store = create_identity_store(s, "entra")
         entra_store.load()
-        if not entra_store.path.exists():
+        if not entra_store.exists():
             # First boot: seed from config, converting flat {oid: contributor_id}
             # to the rich {oid: {"id": contributor_id}} format IdentityStore expects.
             config_map = s.build_identity_map()
@@ -862,9 +864,8 @@ def create_asgi_app(
                 "entra identity map is EMPTY at startup (0 bound oids) — server "
                 "is UP and serving, but every delegated (human) token will "
                 "receive 403 until identities are onboarded. Bind the first user "
-                "with an IdentityAdmin-role token via PUT /admin/identities/{oid} "
-                "(store=%s). This is expected on a fresh /data volume.",
-                s.entra_identities_store_path,
+                "with an IdentityAdmin-role token via PUT /admin/identities/{oid}. "
+                "This is expected on a fresh /data volume."
             )
 
         # Disjointness invariant: each oid belongs to exactly one identity
@@ -899,9 +900,9 @@ def create_asgi_app(
         admin_api_key_digest = None
     else:
         # Build and load the API-key store.
-        key_store = IdentityStore(Path(s.api_keys_store_path))
+        key_store = create_identity_store(s, "api_key")
         key_store.load()
-        if not key_store.path.exists():
+        if not key_store.exists():
             # First boot: seed from config, converting flat {sha256: contributor_id}
             # to the rich {sha256: {"id": contributor_id}} format.
             config_ks = s.build_keystore()
@@ -919,9 +920,7 @@ def create_asgi_app(
                     "static keystore is EMPTY at startup (0 bound keys) — server "
                     "is UP but fail-CLOSED; every request will 401 until keys are "
                     "onboarded. Add the first key with the admin token via "
-                    "PUT /admin/keys/{sha256hash} (store=%s). Expected on a fresh "
-                    "/data volume.",
-                    s.api_keys_store_path,
+                    "PUT /admin/keys/{sha256hash}. Expected on a fresh /data volume."
                 )
             else:
                 logger.warning(
@@ -931,8 +930,7 @@ def create_asgi_app(
                     "/admin API is unreachable without an admin key: every token "
                     "401s at the middleware before require_admin runs). Set "
                     "admin_api_key/admin_api_key_sha256 to enable runtime "
-                    "onboarding, or add api_keys in config and restart. (store=%s)",
-                    s.api_keys_store_path,
+                    "onboarding, or add api_keys in config and restart."
                 )
 
         # Pass key_store.flat_dict (the LIVE dict) so the resolver sees any
@@ -1155,14 +1153,14 @@ async def post_events(
 
 @app.get("/blobs/{session_id}", dependencies=[Depends(require_read)])
 async def list_blobs(session_id: str) -> JSONResponse:
-    blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
-    uris = await blob_store.list(session_id)
+    blob_store = create_blob_store(_settings)
+    uris = [ref.uri async for ref in blob_store.list(session_id)]
     return JSONResponse(content={"session_id": session_id, "blobs": uris})
 
 
 @app.get("/blobs/{session_id}/{key}", dependencies=[Depends(require_read)])
 async def get_blob(session_id: str, key: str) -> JSONResponse:
-    blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
+    blob_store = create_blob_store(_settings)
     uri = f"ci-blob://{session_id}/{key}"
     try:
         content = await blob_store.read(uri)

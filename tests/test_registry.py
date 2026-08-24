@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import context_intelligence_server.registry as registry_module
-from context_intelligence_server.blob_store import AsyncDiskBlobStore
+from context_intelligence_server.blob_store import FileSystemBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.queue_manager import QueueManager, Record
 from context_intelligence_server.registry import (
@@ -247,10 +247,10 @@ class TestSessionWorkerHasServices:
     async def test_worker_services_blob_store_is_async_disk_blob_store(
         self, registry: SessionRegistry
     ) -> None:
-        """worker.services.blob_store is an AsyncDiskBlobStore instance."""
+        """worker.services.blob_store is an FileSystemBlobStore instance."""
         worker = registry.get_or_create("session-1", "/workspace/test")
 
-        assert isinstance(worker.services.blob_store, AsyncDiskBlobStore)
+        assert isinstance(worker.services.blob_store, FileSystemBlobStore)
 
     @pytest.mark.asyncio
     async def test_worker_services_blob_store_root_matches_settings_blob_path(
@@ -261,7 +261,7 @@ class TestSessionWorkerHasServices:
 
         settings = get_settings()
         blob_store = worker.services.blob_store
-        assert isinstance(blob_store, AsyncDiskBlobStore)
+        assert isinstance(blob_store, FileSystemBlobStore)
         assert blob_store._root == Path(settings.blob_path)
 
 
@@ -1990,7 +1990,7 @@ class TestGetOrCreateCreatedBy:
         with (
             patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
             patch(
-                "context_intelligence_server.registry.AsyncDiskBlobStore"
+                "context_intelligence_server.registry.create_blob_store"
             ) as MockBlob,
             patch(
                 "context_intelligence_server.registry.HookStateService"
@@ -2021,7 +2021,7 @@ class TestGetOrCreateCreatedBy:
         with (
             patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
             patch(
-                "context_intelligence_server.registry.AsyncDiskBlobStore"
+                "context_intelligence_server.registry.create_blob_store"
             ) as MockBlob,
             patch(
                 "context_intelligence_server.registry.HookStateService"
@@ -2047,7 +2047,7 @@ class TestSessionOwnershipInvariant:
       - log nothing at ERROR when the same (or None) created_by arrives;
       - log an ERROR and preserve the bound id when a different created_by arrives.
 
-    Mocking strategy: patch Neo4jGraphStore / AsyncDiskBlobStore / HookStateService
+    Mocking strategy: patch Neo4jGraphStore / FileSystemBlobStore / HookStateService
     exactly as TestGetOrCreateCreatedBy does.  After the first get_or_create call
     (which stores a worker whose .services is the mock_svc MagicMock), we manually
     set mock_svc.graph.created_by = "alice" to simulate the bound state — the real
@@ -2069,7 +2069,7 @@ class TestSessionOwnershipInvariant:
             caplog.at_level(logging.ERROR, logger="context_intelligence_server"),
             patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
             patch(
-                "context_intelligence_server.registry.AsyncDiskBlobStore"
+                "context_intelligence_server.registry.create_blob_store"
             ) as MockBlob,
             patch(
                 "context_intelligence_server.registry.HookStateService"
@@ -2109,7 +2109,7 @@ class TestSessionOwnershipInvariant:
             caplog.at_level(logging.ERROR, logger="context_intelligence_server"),
             patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
             patch(
-                "context_intelligence_server.registry.AsyncDiskBlobStore"
+                "context_intelligence_server.registry.create_blob_store"
             ) as MockBlob,
             patch(
                 "context_intelligence_server.registry.HookStateService"
@@ -2148,7 +2148,7 @@ class TestSessionOwnershipInvariant:
             caplog.at_level(logging.ERROR, logger="context_intelligence_server"),
             patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
             patch(
-                "context_intelligence_server.registry.AsyncDiskBlobStore"
+                "context_intelligence_server.registry.create_blob_store"
             ) as MockBlob,
             patch(
                 "context_intelligence_server.registry.HookStateService"

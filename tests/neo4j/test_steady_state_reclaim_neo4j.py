@@ -21,7 +21,7 @@ import pytest
 from neo4j import AsyncGraphDatabase
 
 from context_intelligence_server.neo4j_store import Neo4jGraphStore, ensure_neo4j_schema
-from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.queue_manager import FileSystemQueueManager, QueueManager
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
 
@@ -69,7 +69,7 @@ def _seq_event(i: int, sid: str) -> bytes:
 
 def _build_registry(queues_dir: Path) -> SessionRegistry:
     reg = SessionRegistry()
-    reg._queue_manager = QueueManager(queues_dir=queues_dir)
+    reg._queue_manager = FileSystemQueueManager(queues_dir=queues_dir)
     reg._write_semaphore = asyncio.Semaphore(8)
     reg._max_delivery_attempts = 3
     return reg
@@ -271,7 +271,7 @@ async def test_boot_recovered_session_compacts_before_dry_exit(
 
     queues_dir = tmp_path / "queues"
     reg = SessionRegistry()
-    reg._queue_manager = QueueManager(queues_dir=queues_dir)
+    reg._queue_manager = FileSystemQueueManager(queues_dir=queues_dir)
     reg._write_semaphore = asyncio.Semaphore(8)
     reg._max_delivery_attempts = 3
     qm = reg.queue_manager

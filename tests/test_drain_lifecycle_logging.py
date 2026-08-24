@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import context_intelligence_server.main as main_module
-from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.queue_manager import FileSystemQueueManager, QueueManager
 from context_intelligence_server.registry import SessionRegistry
 from context_intelligence_server.writer_lease import WriterLease, WriterLeaseConflict
 from tests.test_drain_supervision import (
@@ -324,7 +324,7 @@ class TestG5DeadLetterWriteFailure:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        qm = QueueManager(queues_dir=tmp_path / "queues")
+        qm = FileSystemQueueManager(queues_dir=tmp_path / "queues")
         sid = "d3-g5-dead-letter"
         injected = OSError(errno.EIO, "Input/output error")
         monkeypatch.setattr(qm, "_write_record", MagicMock(side_effect=injected))
@@ -374,7 +374,7 @@ class TestG6ReclaimOrphansMtimeStatFailure:
             return orig_stat(self, *a, **kw)  # type: ignore[misc]
 
         monkeypatch.setattr(Path, "stat", _fake_stat)
-        qm = QueueManager(queues_dir=qdir)
+        qm = FileSystemQueueManager(queues_dir=qdir)
 
         with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
             result = await qm.reclaim_orphans(
@@ -416,7 +416,7 @@ class TestG6ReclaimOrphansMtimeStatFailure:
             return orig_stat(self, *a, **kw)  # type: ignore[misc]
 
         monkeypatch.setattr(Path, "stat", _fake_stat)
-        qm = QueueManager(queues_dir=qdir)
+        qm = FileSystemQueueManager(queues_dir=qdir)
 
         with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
             result = await qm.reclaim_orphans(
