@@ -2,7 +2,7 @@
 
 Endpoints manage the entra-identities and api-keys stores at runtime with no
 server restart. Mutations flow through ``IdentityStore.put`` / ``delete``, which
-use the ROB-F2 commit order (write-file-then-swap-memory), so the persistent
+use the write-file-then-swap-memory commit order, so the persistent
 file and the in-process dict are always in sync.
 
 **Store access pattern**
@@ -13,10 +13,10 @@ Each endpoint reads its store from ``request.app.state``
 the router and the main module. If the relevant store is ``None`` for the
 current ``auth_mode``, the endpoint returns **503**.
 
-**Auth seam — T4 placeholder**
+**Auth seam — enforcement placeholder**
 
 ``require_admin`` is a NO-OP dependency applied to the whole ``/admin`` router
-via ``APIRouter(dependencies=[Depends(require_admin)])``. T5 replaces the
+via ``APIRouter(dependencies=[Depends(require_admin)])``. This replaces the
 function body with real enforcement (static: admin_api_key; entra: IdentityAdmin
 App Role) — the routes and tests do not change. Tests override it via::
 
@@ -33,14 +33,26 @@ log line to stdout → Log Analytics; raw keys are NEVER logged.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import re
+import time
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, field_validator
+from fastapi.responses import JSONResponse
+from neo4j import READ_ACCESS, WRITE_ACCESS
+from pydantic import BaseModel, Field, field_validator
 
-from context_intelligence_server.config import _ALL_ZEROS_GUID, _GUID_RE
+from context_intelligence_server.blob_processor import (
+    BLOB_REF_CARRIER_PROPERTIES as _BLOB_REF_CARRIER_PROPERTIES,
+)
+from context_intelligence_server.blob_store import BlobReference, create_blob_store
+from context_intelligence_server.config import _ALL_ZEROS_GUID, _GUID_RE, get_settings
 from context_intelligence_server.identity_store import IdentityStore
+from context_intelligence_server.maintenance import coordinator
+from context_intelligence_server.maintenance_ops import run_maintenance_operation
 
 # ---------------------------------------------------------------------------
 # Validation constants
@@ -49,9 +61,31 @@ from context_intelligence_server.identity_store import IdentityStore
 # Mirrors the 64-hex check in config._validate_api_keys (config.py:172-179).
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
-# Maximum contributor id length (TB-12).  Matches the cap implied by config
+# Maximum contributor id length.  Matches the cap implied by config
 # (non-empty, non-whitespace, sane upper bound for an identifier string).
 _MAX_CONTRIBUTOR_LEN = 256
+
+# ---------------------------------------------------------------------------
+# Blob-reclaim constants.
+# ---------------------------------------------------------------------------
+
+# Hard mtime-floor safety net, defense-in-depth behind
+# the durable undrained-queue gate. min_age_minutes below this is rejected
+# (422) rather than silently raised -- a caller passing 0 must not be able to
+# disable the age gate entirely.
+_MIN_AGE_FLOOR_MINUTES = 15
+
+# "sample" is bounded to keep the response small; totals (orphans_found,
+# reclaimable_bytes) remain authoritative even when the sample is truncated.
+_MAX_SAMPLE = 50
+
+# Single-flight guard for the DESTRUCTIVE reclaim apply. Two concurrent applies
+# would each honour max_delete independently, so together they could delete
+# twice the operator's intended blast radius; a second overlapping apply is
+# refused (409) rather than admitted. Per-process only. Flipped False->True with
+# no await between the check and the set, so the check-and-set is atomic under
+# asyncio. Dry-run never takes it -- only the delete phase is serialized.
+_reclaim_apply_inflight = False
 
 # ---------------------------------------------------------------------------
 # Module-level audit logger
@@ -61,7 +95,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Auth seam — real enforcement (T5)
+# Auth seam — real enforcement
 # ---------------------------------------------------------------------------
 
 
@@ -70,9 +104,9 @@ def require_admin(request: Request) -> None:
 
     Applied router-wide via ``APIRouter(dependencies=[Depends(require_admin)])``.
 
-    Security model (design §6, T5):
+    Security model:
     - The middleware (BearerTokenMiddleware) ALWAYS enforces authentication on
-      /admin/* paths (they are never in an exempt set — TB-07 startup assertion).
+      /admin/* paths (they are never in an exempt set — enforced by a startup assertion).
       A missing/invalid token → 401 before this function is ever reached.
     - This dependency enforces *authorization* (not authentication): the request
       has already been authenticated; here we check whether the authenticated
@@ -95,11 +129,11 @@ def require_admin(request: Request) -> None:
 
     Notes:
     - Tests override this with ``app.dependency_overrides[require_admin] = lambda: None``
-      to bypass enforcement in T4 route tests (this is the standard FastAPI override
+      to bypass enforcement in route-level tests (this is the standard FastAPI override
       mechanism; the lambda's signature must satisfy ITS OWN declared parameters —
       FastAPI injects based on the override's signature, not the original's).
     - The ``roles`` check reads ONLY the ``roles`` claim — never ``groups``.
-      Group membership in the token cannot grant admin access (TB-09).
+      Group membership in the token cannot grant admin access.
     """
     auth_mode: str = getattr(request.app.state, "auth_mode", "static")
     # Read auth metadata from scope state (set by BearerTokenMiddleware).
@@ -146,7 +180,7 @@ def require_admin(request: Request) -> None:
 
         # 403 when the token's `roles` claim does not contain the required role.
         # ONLY the `roles` claim is checked — `groups` is intentionally excluded
-        # so group membership cannot grant admin access (TB-09).
+        # so group membership cannot grant admin access.
         roles: list[str] = scope_state.get("roles", [])
         if entra_admin_role not in roles:
             raise HTTPException(
@@ -174,7 +208,7 @@ class IdentityBody(BaseModel):
     @field_validator("id")
     @classmethod
     def id_must_be_valid(cls, v: str) -> str:
-        """Validate contributor id: non-empty, non-whitespace, bounded, no null bytes (TB-12)."""
+        """Validate contributor id: non-empty, non-whitespace, bounded, no null bytes."""
         if not v.strip():
             raise ValueError("id must be a non-empty, non-whitespace string")
         if len(v) > _MAX_CONTRIBUTOR_LEN:
@@ -194,7 +228,7 @@ class KeyBody(BaseModel):
     @field_validator("id")
     @classmethod
     def id_must_be_valid(cls, v: str) -> str:
-        """Validate contributor id: non-empty, non-whitespace, bounded, no null bytes (TB-12)."""
+        """Validate contributor id: non-empty, non-whitespace, bounded, no null bytes."""
         if not v.strip():
             raise ValueError("id must be a non-empty, non-whitespace string")
         if len(v) > _MAX_CONTRIBUTOR_LEN:
@@ -207,7 +241,7 @@ class KeyBody(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Path-param validation helpers (TB-10)
+# Path-param validation helpers
 # ---------------------------------------------------------------------------
 
 
@@ -276,14 +310,14 @@ def _audit_put(
     """Emit one structured audit log line for a PUT (upsert) mutation.
 
     When *old_contributor* is set and differs from *contributor*, the entry
-    records an OVERWRITE event with old → new (TB-11).  Otherwise it records
+    records an OVERWRITE event with old → new.  Otherwise it records
     a normal insert/same-contributor upsert.
 
     NEVER logs raw keys — only the *target* (oid or hash) is recorded.
     """
     who = _admin_who(request)
     if old_contributor is not None and old_contributor != contributor:
-        # Overwrite: different contributor (TB-11 explicit old→new audit).
+        # Overwrite: different contributor (explicit old→new audit).
         logger.info(
             "admin.audit action=put target=%s old_contributor=%r new_contributor=%r who=%s",
             target,
@@ -307,6 +341,318 @@ def _audit_delete(request: Request, *, target: str) -> None:
         target,
         _admin_who(request),
     )
+
+
+def _audit_blob_reclaim_delete(request: Request, *, uri: str) -> None:
+    """Emit one structured audit log line per successfully-deleted blob.
+
+    NEVER logs blob contents -- only the ``ci-blob://`` URI is recorded.
+    """
+    logger.info(
+        "admin.audit action=blob_reclaim target=%s who=%s",
+        uri,
+        _admin_who(request),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Blob reclaim -- orphaned-blob GC.
+# ---------------------------------------------------------------------------
+
+
+def _access_mode_const(mode: str) -> str:
+    """Map the configured query access-mode string ("READ"/"WRITE") to the
+    driver's access-mode constant.
+
+    Deliberately duplicated (not imported) from ``main._neo4j_access_const``:
+    importing from ``main`` here would create a circular import (``main``
+    already imports ``routers.admin`` at module load time). Two lines of
+    duplication is cheaper than that coupling.
+    """
+    return READ_ACCESS if mode == "READ" else WRITE_ACCESS
+
+
+def _collect_blob_refs(obj: Any, out: set[str]) -> None:
+    """Recursively walk a decoded JSON value collecting ``$blob_ref`` URIs.
+
+    This is STRUCTURAL extraction
+    over the parsed object, never a regex over the serialized string. A
+    regex anchored on ``ci-blob://`` truncates at the first unescaped
+    special character (e.g. a literal ``"`` in a session_id, which
+    ``queue_manager._validate_session_id`` explicitly permits -- it only
+    rejects ``/ \\ \\0``), silently misclassifying a genuinely-referenced
+    blob as orphan. ``json.loads`` has already resolved all escaping by the
+    time this function runs, so any character in a URI (quotes, non-ASCII)
+    is handled correctly -- there is no APOC path and no regex path.
+    """
+    if isinstance(obj, dict):
+        ref = obj.get("$blob_ref")
+        if isinstance(ref, str):
+            out.add(ref)
+        for v in obj.values():
+            _collect_blob_refs(v, out)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_blob_refs(item, out)
+
+
+# Reference-scan hardening: the known node properties that can carry a
+# "ci-blob://" token anywhere in the graph, keyed to the property name
+# Cypher matches on.
+#
+# ASSUMPTION -- make it explicit + greppable: the reference scan is scoped to
+# EXACTLY these properties, not an all-property-all-node walk, for
+# performance (a per-property UNION lets Neo4j evaluate ONE property per row
+# instead of toString()-ing every key of every node -- this codebase has
+# scar tissue from a 1.3M-node AllNodesScan stall). Adding a NEW ci-blob
+# carrier property in the future (a new field-lifter, a new enricher
+# property, etc.) REQUIRES adding it to this tuple -- otherwise the reclaim
+# GC will not see refs stored there and could misclassify a live blob as an
+# orphan. Covers every carrier in the hardening doc's table:
+#   data        -- *Event.data (all 14 event types)
+#   tool_input  -- ToolPreEvent/ToolPostEvent.tool_input (L1), ToolCall.tool_input (L2)
+#   prompt      -- PromptSubmitEvent/PromptCompleteEvent.prompt (L1), Prompt.prompt (L2)
+#   response    -- OrchestratorRun.response (L2)
+# NOTE: the canonical allowlist lives in blob_processor as BLOB_REF_CARRIER_PROPERTIES
+# and is imported (aliased to _BLOB_REF_CARRIER_PROPERTIES) at the top of this module --
+# a single source of truth shared by the mint site (blob_processor) and this reclaim
+# scan. Do NOT re-declare it here.
+
+# Fallback extraction for carrier values that are NOT valid JSON (a bare
+# string property, e.g. a plain-string tool_input/prompt that itself
+# contains a ci-blob:// URI rather than the {"$blob_ref": "..."} wrapper).
+# Safe here -- unlike a regex over a JSON-*serialized* string (see the
+# docstring above) -- because these values are already fully-decoded Neo4j
+# property strings with no JSON escaping left to trip over.
+_BARE_BLOB_URI_RE = re.compile(r'ci-blob://[^"\s]+')
+
+
+def _extract_blob_refs_from_value(val: str, out: set[str]) -> None:
+    """Extract every ``ci-blob://`` URI referenced by one carrier property value.
+
+    Two extraction paths, unioned into *out*:
+
+    1. **Structural (preferred):** ``json.loads(val)`` then recurse with
+       :func:`_collect_blob_refs`. Handles the ``{"$blob_ref": "..."}``
+       JSON-string carriers -- ``neo4j_store._sanitize_properties``
+       JSON-serializes any dict/list property value on write, so
+       ``Event.data``, ``ToolCall.tool_input``, ``Prompt.prompt``, and
+       ``OrchestratorRun.response`` all round-trip through this path when
+       they hold a dict/list.
+    2. **Regex fallback (only on JSON-parse failure):** a plain-string
+       carrier is written through VERBATIM (``_sanitize_properties`` only
+       JSON-serializes dict/list values -- a bare string is stored as-is),
+       so it is never valid JSON and always lands here. Extracts every bare
+       ``ci-blob://[^"\\s]+`` token directly from the decoded string --
+       covers a lifted ``*.tool_input``/``*.prompt`` property that is a
+       plain string mentioning a blob URI.
+
+    A value that is neither valid JSON nor contains a bare token contributes
+    nothing -- this can only ever fail to positively assert a reference,
+    never falsely assert one, matching the conservative-skip contract of
+    :func:`_scan_referenced_uris`.
+    """
+    try:
+        obj = json.loads(val)
+    except (TypeError, ValueError):
+        out.update(_BARE_BLOB_URI_RE.findall(val))
+        return
+    _collect_blob_refs(obj, out)
+
+
+def _carrier_scan_clause(prop: str) -> str:
+    """Build one ``UNION ALL`` branch of the reclaim reference-scan query
+    for carrier property *prop*.
+
+    ``data`` is special-cased: ``Event.data`` is always a JSON string
+    (``DefaultHandler`` writes ``json.dumps(data)`` -- see
+    ``handlers/data_layer_1/default.py``) and the scan for it is scoped to
+    ``:Event``, matching this carrier's scope in the pre-hardening scan. Every
+    other registered carrier is an unrestricted-label match with
+    ``toString()``, since the property may be lifted onto any node type as a
+    dict, list, or bare string.
+    """
+    if prop == "data":
+        return "MATCH (n:Event) WHERE n.data CONTAINS 'ci-blob://' RETURN n.data AS val"
+    return (
+        f"MATCH (n) WHERE n.{prop} IS NOT NULL "
+        f"AND toString(n.{prop}) CONTAINS 'ci-blob://' "
+        f"RETURN toString(n.{prop}) AS val"
+    )
+
+
+# Generated FROM _BLOB_REF_CARRIER_PROPERTIES (imported from
+# blob_processor.BLOB_REF_CARRIER_PROPERTIES) -- not hand-duplicated -- so the
+# query text can never drift from the allowlist. See
+# tests/test_blob_processor.py for the regression test that locks this
+# agreement structurally (extracts every `n.<prop>` reference out of the
+# built query and diffs it against the allowlist tuple).
+_BLOB_REF_SCAN_QUERY = " UNION ALL ".join(
+    _carrier_scan_clause(prop) for prop in _BLOB_REF_CARRIER_PROPERTIES
+)
+
+
+async def _scan_referenced_uris(request: Request) -> set[str]:
+    """Enumerate every ``ci-blob://`` URI referenced anywhere in the graph.
+
+    Step 2 of the design -- deliberately GLOBAL, never workspace-filtered
+    (hazard #1): blobs are session_id-scoped while nodes are
+    (node_id, workspace)-scoped, so a per-workspace scan could delete another
+    workspace's live data.
+
+    Reference-scan hardening: the referenced set is computed GRAPH-WIDE over the
+    known ``ci-blob://`` carrier properties (:data:`_BLOB_REF_CARRIER_PROPERTIES`
+    -- ``data``, ``tool_input``, ``prompt``, ``response``), not ``Event.data``
+    only. This makes the scan correct BY CONSTRUCTION -- a strict superset of
+    the prior ``Event.data``-only scan -- rather than resting on the
+    (empirically true today, but unenforced) pipeline-ordering invariant that
+    ``DefaultHandler`` always persists every ref onto ``Event.data`` before any
+    field-lifter/enricher can strip or promote it elsewhere. Widening the scan
+    can only ever *protect* more blobs, never delete more: any URI the old
+    scan found is still found here (still scanned via the ``data`` branch),
+    plus any URI that lives ONLY on ``tool_input``/``prompt``/``response`` is
+    now ALSO found. See
+    ``tests/neo4j/test_blob_reclaim.py::test_b1_event_data_carries_every_blob_ref``
+    for the regression test that continues to pin the pipeline-ordering
+    invariant (belt-and-suspenders now, not the sole safety net), and the
+    ``test_*_only_referenced_via_*`` tests alongside it that pin the new
+    per-property carriers directly.
+
+    Query shape (performance-critical -- see :data:`_BLOB_REF_CARRIER_PROPERTIES`):
+    a ``UNION ALL`` of four single-property predicates, each touching exactly
+    ONE property per row (``data`` restricted to ``:Event``, matching the
+    prior scan's scope for that carrier; the other three unrestricted across
+    labels since ToolCall/Prompt/OrchestratorRun are ordinary nodes). This
+    avoids a pathological ``MATCH (n) ... [k IN keys(n) WHERE toString(n[k])
+    ...]`` all-property-all-node walk, which would toString() every key of
+    every node in the graph -- this codebase has scar tissue from exactly
+    that shape of full scan (a 1.3M-node AllNodesScan stall). ``UNION ALL``
+    (not plain ``UNION``) is deliberate: plain ``UNION``'s implicit DISTINCT
+    would force Neo4j to materialize and dedupe every row before returning
+    the first one, defeating streaming; the Python ``set`` below already
+    dedupes, so ``UNION ALL`` costs nothing and preserves the stream.
+
+    No APOC. Each returned value is
+    extracted via :func:`_extract_blob_refs_from_value` (structural
+    ``json.loads`` + recursive walk, falling back to a bare-token regex only
+    on JSON-parse failure -- see that function's docstring for why the regex
+    path is safe here and was NOT safe for the original ``Event.data`` scan).
+    A malformed/unparseable value is skipped conservatively -- it can never
+    positively assert an orphan, only fail to positively assert a reference.
+
+    Streams rows via the async driver iterator rather than materializing all
+    carrier-property strings at once (only the resulting, much smaller, URI
+    set is retained), per the design's "bound its own work" cost note.
+    """
+    driver = request.app.state.neo4j_query_driver
+    access_mode = _access_mode_const(request.app.state.neo4j_query_access_mode)
+    referenced: set[str] = set()
+    async with driver.session(default_access_mode=access_mode) as session:
+        # Graph-wide, per-property UNION ALL -- see the docstring above for
+        # why this shape (not an all-property walk, not plain UNION). The
+        # query text is generated from _BLOB_REF_CARRIER_PROPERTIES
+        # (_BLOB_REF_SCAN_QUERY, module level) -- not hand-duplicated here --
+        # so it can never drift from the allowlist.
+        result = await session.run(_BLOB_REF_SCAN_QUERY)
+        async for record in result:
+            val = record["val"]
+            if not isinstance(val, str):
+                # toString() on a non-null value is always a str; this guards
+                # conservatively against an unexpected driver type mapping.
+                continue
+            _extract_blob_refs_from_value(val, referenced)
+    return referenced
+
+
+async def _select_orphans(request: Request, *, min_age_minutes: int) -> dict[str, Any]:
+    """The ONE selection path shared by dry-run and apply.
+
+    Returns a dict with every response field EXCEPT ``dry_run``/``sample``/
+    ``rescanned``/``deleted``/``deleted_bytes`` (the caller fills those in),
+    plus a ``candidates`` key (list[BlobReference], sorted by uri for
+    deterministic sampling/capping) that the caller pops before returning the
+    response and uses to actually delete in apply mode.
+
+    Every blob is reached only through the BlobStore protocol -- ``scan()``
+    streams a ``BlobReference`` (uri + size + last_modified) per blob; no
+    filesystem path or on-disk layout crosses into this router.
+
+    Safety gates applied to every blob not in the referenced set:
+      1. Undrained-queue gate (primary, durable): skipped when the
+         session has a live worker (``registry.active_sessions()``) OR its
+         queue is not fully drained (``QueueManager.is_fully_drained``,
+         durable across restarts). Counted as ``skipped_pending_session``.
+      2. Age floor (defense-in-depth): skipped when younger than
+         ``min_age_minutes`` (already clamped >= ``_MIN_AGE_FLOOR_MINUTES`` by
+         the request body validator), measured by ``BlobReference.last_modified``.
+         Counted as ``skipped_recent``.
+    """
+    settings = get_settings()
+    blob_store = create_blob_store(settings)
+
+    referenced = await _scan_referenced_uris(request)
+
+    registry = request.app.state.registry
+    queue_manager = registry.queue_manager
+    live_workers = set(registry.active_sessions())
+
+    now = time.time()
+    age_cutoff_seconds = min_age_minutes * 60
+
+    scanned = 0
+    candidates: list[BlobReference] = []
+    skipped_recent = 0
+    skipped_pending_session = 0
+    reclaimable_bytes = 0
+
+    async for ref in blob_store.scan():
+        scanned += 1
+        if ref.uri in referenced:
+            continue
+        if ref.session_id in live_workers or not await queue_manager.is_fully_drained(
+            ref.session_id
+        ):
+            skipped_pending_session += 1
+            continue
+        if now - ref.last_modified < age_cutoff_seconds:
+            skipped_recent += 1
+            continue
+        candidates.append(ref)
+        reclaimable_bytes += ref.size
+
+    candidates.sort(key=lambda b: b.uri)
+
+    return {
+        "scanned_disk_blobs": scanned,
+        "referenced_uris": len(referenced),
+        "orphans_found": len(candidates),
+        "reclaimable_bytes": reclaimable_bytes,
+        "skipped_recent": skipped_recent,
+        "skipped_pending_session": skipped_pending_session,
+        "candidates": candidates,
+    }
+
+
+class BlobReclaimBody(BaseModel):
+    """Body for POST /admin/blobs/reclaim."""
+
+    dry_run: bool = True
+    min_age_minutes: int = 60
+    max_delete: int | None = Field(default=None, ge=1)
+
+    @field_validator("min_age_minutes")
+    @classmethod
+    def _min_age_at_least_floor(cls, v: int) -> int:
+        """Reject (422) below the hard safety floor
+        rather than silently raising -- a caller passing 0 must not be able
+        to disable the age gate.
+        """
+        if v < _MIN_AGE_FLOOR_MINUTES:
+            raise ValueError(
+                f"min_age_minutes must be >= {_MIN_AGE_FLOOR_MINUTES} "
+                f"(hard safety floor); got {v}"
+            )
+        return v
 
 
 # ---------------------------------------------------------------------------
@@ -375,14 +721,14 @@ def put_identity(
     """Upsert an entra identity (OID → contributor).
 
     Path-param guard: ``oid`` must be a valid GUID in lowercase hex and must
-    not be the all-zeros sentinel → **422** on violation (TB-10).
+    not be the all-zeros sentinel → **422** on violation.
 
     Write-through via ``IdentityStore.put``: the persistent file is updated
     atomically and the in-process map (shared with ``EntraResolver``) is
     updated immediately — no server restart required.
 
     An overwrite (existing oid with a different contributor) emits an explicit
-    audit line recording old → new contributor (TB-11).
+    audit line recording old → new contributor.
 
     Returns the stored record as ``{oid, id[, display_name]}``.
     """
@@ -447,10 +793,10 @@ def put_key(
     """Upsert a static API-key entry (sha256 hex → contributor).
 
     Path-param guard: ``sha256hash`` must be exactly 64 lowercase hex chars
-    → **422** on violation (TB-10).
+    → **422** on violation.
 
     Admin-key guard: the hash of the configured ``admin_api_key`` cannot be
-    shadow-bound via this endpoint → **409** (TB-05). The admin key lives in
+    shadow-bound via this endpoint → **409**. The admin key lives in
     config, not in the data keystore; rebinding its hash here would be
     confusing and is explicitly rejected.
 
@@ -464,7 +810,7 @@ def put_key(
     """
     _validate_hash(sha256hash)
 
-    # Admin-key un-shadowable guard (TB-05): reject PUT targeting the admin
+    # Admin-key un-shadowable guard: reject PUT targeting the admin
     # key's hash.  The admin key is a config credential, not a data store
     # entry; allowing it to be shadowed here would silently rebind it.
     admin_digest: str | None = getattr(request.app.state, "admin_api_key_digest", None)
@@ -501,10 +847,10 @@ def delete_key(
     """Delete a static API-key entry.
 
     Path-param guard: ``sha256hash`` must be exactly 64 lowercase hex chars
-    → **422** on violation (TB-10).
+    → **422** on violation.
 
     Admin-key guard: the hash of the configured ``admin_api_key`` cannot be
-    deleted via this endpoint → **409** (TB-05). The admin key is the
+    deleted via this endpoint → **409**. The admin key is the
     bootstrap floor — deleting it via the API must not be possible.
 
     Returns 200 on success, 404 when the hash is not present.
@@ -512,7 +858,7 @@ def delete_key(
     """
     _validate_hash(sha256hash)
 
-    # Admin-key un-deletable guard (TB-05): reject DELETE targeting the admin
+    # Admin-key un-deletable guard: reject DELETE targeting the admin
     # key's hash.  The admin key is the emergency-bootstrap credential; it must
     # never be deletable via the API (operators would lock themselves out).
     admin_digest: str | None = getattr(request.app.state, "admin_api_key_digest", None)
@@ -543,4 +889,202 @@ def list_keys(
     """
     return {
         "keys": [{"hash": h, "id": record.get("id", "")} for h, record in store.items()]
+    }
+
+
+# --- Blob reclaim (orphaned-blob GC) ----------------------------------------
+
+
+@router.post("/blobs/reclaim", status_code=200)
+async def reclaim_blobs(body: BlobReclaimBody, request: Request) -> dict[str, Any]:
+    """Preview (dry-run) or apply reclamation of orphaned blob files.
+
+    An orphan is an on-disk blob (``<blob_path>/<session_id>/blobs/<key>.json``)
+    whose ``ci-blob://`` URI is referenced by NO ``:Event.data`` anywhere in
+    the graph (scanned globally, across ALL workspaces), and whose session is
+    both fully drained (durable ``QueueManager`` state, not in-memory worker
+    liveness) and older than ``min_age_minutes``. See
+    the safety amendments (dry-run default, required max_delete cap,
+    graph-wide reference scan).
+
+    ``dry_run=true`` (default) computes and reports the candidate set without
+    deleting anything. ``dry_run=false`` requires ``max_delete`` (422
+    otherwise -- a conscious blast-radius opt-in for an irreversible,
+    cross-workspace delete) and performs its OWN fresh, authoritative
+    ``_select_orphans`` scan at delete time (``rescanned: true`` in the
+    response) -- it never deletes a URI that is referenced or pending at the
+    moment of deletion, independent of any earlier dry-run preview.
+
+    Deletion goes through ``BlobStore.delete(uri, if_unmodified=ref)`` -- a
+    fenced compare-and-delete that refuses (leaves the blob untouched) if the
+    blob was rewritten since ``scan()`` observed it, and is idempotent (a blob
+    already gone counts as not-deleted, never an error). Capped at
+    ``max_delete``; ``orphans_found`` and ``reclaimable_bytes`` always reflect
+    the FULL candidate set even when ``max_delete`` caps how many are actually
+    removed. One structured audit log line is emitted per successful delete;
+    blob CONTENTS are never logged, only the ``ci-blob://`` URI.
+    """
+    if not body.dry_run and body.max_delete is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "max_delete is required when dry_run=false -- a conscious "
+                "blast-radius opt-in for an irreversible, cross-workspace "
+                "delete. Omit dry_run (or set it true) to preview first."
+            ),
+        )
+
+    if body.dry_run:
+        # Preview only: compute the candidate set and report it, delete nothing.
+        selection = await _select_orphans(request, min_age_minutes=body.min_age_minutes)
+        candidates: list[BlobReference] = selection.pop("candidates")
+        return {
+            "dry_run": True,
+            **selection,
+            "sample": [b.uri for b in candidates[:_MAX_SAMPLE]],
+            "rescanned": False,
+            "deleted": 0,
+            "deleted_bytes": 0,
+        }
+
+    assert body.max_delete is not None  # guaranteed by the 422 guard above
+
+    # Acquire the destructive-apply single-flight BEFORE the authoritative scan,
+    # so a rejected concurrent apply fails fast and never even scans.
+    global _reclaim_apply_inflight
+    if _reclaim_apply_inflight:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "a blob-reclaim apply is already in progress -- concurrent "
+                "applies would each honour max_delete independently and "
+                "together exceed the intended blast radius. Retry once it "
+                "completes."
+            ),
+        )
+    _reclaim_apply_inflight = True
+    try:
+        # The apply's OWN fresh, authoritative scan at delete time -- it never
+        # deletes a URI that is referenced or pending at the moment of deletion,
+        # independent of any earlier dry-run preview.
+        selection = await _select_orphans(request, min_age_minutes=body.min_age_minutes)
+        candidates = selection.pop("candidates")
+        response: dict[str, Any] = {
+            "dry_run": False,
+            **selection,
+            "sample": [b.uri for b in candidates[:_MAX_SAMPLE]],
+            "rescanned": True,
+            "deleted": 0,
+            "deleted_bytes": 0,
+        }
+
+        blob_store = create_blob_store(get_settings())
+        deleted = 0
+        deleted_bytes = 0
+        # Each delete is fenced against the reference just observed by the scan
+        # above (delete refuses if the blob was rewritten since), so a blob that
+        # was concurrently re-minted or modified is left intact and counted as
+        # not-deleted rather than destroyed.
+        for ref in candidates[: body.max_delete]:
+            if not await blob_store.delete(ref.uri, if_unmodified=ref):
+                continue  # absent or changed since scan -- left untouched
+            deleted += 1
+            deleted_bytes += ref.size
+            _audit_blob_reclaim_delete(request, uri=ref.uri)
+    finally:
+        _reclaim_apply_inflight = False
+
+    response["deleted"] = deleted
+    response["deleted_bytes"] = deleted_bytes
+    return response
+
+
+# --- Maintenance operation --------------------------------------------------
+#
+# This endpoint is on ``maintenance.MAINTENANCE_ALLOW_LIST`` (enforced
+# structurally by ``main._assert_maintenance_endpoint_allow_listed`` at
+# startup) so it stays reachable even while the gate is closed -- otherwise
+# it would 503 at exactly the moment it exists to unblock.
+
+
+@router.post("/maintenance", status_code=202)
+async def post_maintenance(request: Request) -> JSONResponse:
+    """Trigger the maintenance repair operation (dedup -> :Node backfill ->
+    schema DDL), reusing the existing ``neo4j_store.run_repair`` -- see
+    ``maintenance_ops.run_maintenance_operation``.
+
+    Single-flight: ``coordinator.try_begin_op()`` is a
+    synchronous compare-and-swap with no ``await`` between check and set, so
+    two concurrent POSTs can never both start an op. A second POST while one
+    is running gets **409** with the in-progress ``run_id`` -- it never
+    starts a second op.
+
+    Returns promptly: the operation runs as a background
+    task; this handler returns **202** immediately rather than blocking for
+    the op's full duration (which includes the quiesce sleep + an
+    O(graph-size) dedup pass).
+
+    Idempotent honest re-scan: POST against an already-clean graph
+    still performs a genuine ``run_repair`` call and returns a **fresh**
+    ``run_id``/``completed_at`` with ``records_affected: 0`` -- it never
+    short-circuits, which would make ``0`` indistinguishable from "did not
+    run" and defeat the freshness marker.
+    """
+    run_id = coordinator.try_begin_op()
+    if run_id is None:
+        current = coordinator.current_op()
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "maintenance operation already running",
+                "run_id": current.run_id,
+                "state": current.state,
+            },
+        )
+
+    settings = get_settings()
+    # Defensive getattr (matches _check_driver_connected's convention above):
+    # lets this route degrade gracefully rather than 500 if ever hit before
+    # lifespan has bound a driver -- run_repair() will raise on a None
+    # driver, which finish_op() records as a normal `failed` outcome.
+    driver = getattr(request.app.state, "neo4j_driver", None)
+    task = asyncio.create_task(
+        run_maintenance_operation(
+            driver,
+            run_id,
+            quiesce_seconds=settings.maintenance_quiesce_seconds,
+        )
+    )
+    coordinator.retain_task(
+        task
+    )  # strong ref -- see MaintenanceCoordinator.retain_task
+
+    op = coordinator.current_op()
+    return JSONResponse(
+        status_code=202,
+        content={"run_id": run_id, "state": op.state, "started_at": op.started_at},
+    )
+
+
+@router.get("/maintenance", status_code=200)
+async def get_maintenance() -> dict[str, Any]:
+    """Report maintenance-operation progress.
+
+    Separate, admin-authenticated route, and never
+    folded into ``/status`` (``/status`` is unauthenticated; folding these
+    fields in would be an auth-boundary leak). ``state`` initializes to
+    ``"unknown"`` on boot so "never ran" is distinguishable from "ran, record
+    lost to a crash".
+    """
+    st = await coordinator.status()
+    op = st.op
+    return {
+        "mode": st.mode,
+        "state": op.state,
+        "run_id": op.run_id,
+        "started_at": op.started_at,
+        "completed_at": op.completed_at,
+        "elapsed_seconds": st.elapsed_seconds,
+        "records_affected": op.records_affected,
+        "error": op.error,
     }

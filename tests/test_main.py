@@ -37,6 +37,37 @@ async def test_status_body(client: httpx.AsyncClient) -> None:
     assert data["active_sessions"] == 0
 
 
+async def test_status_exposes_schema_version_drift_fields(
+    client: httpx.AsyncClient,
+) -> None:
+    """/status carries the compiled schema_version, the graph's stored version,
+    and a tri-state drift flag (True/False/None) -- distinct from server_version
+    and never a false "in sync"."""
+    from context_intelligence_server.status import SCHEMA_VERSION
+
+    data = (await client.get("/status")).json()
+    assert data["schema_version"] == SCHEMA_VERSION
+    assert "graph_schema_version" in data
+    # No live graph in this client fixture -> unknown drift, never a false sync.
+    assert data["schema_version_current"] is None
+    # Distinct key from PR#78's server_version (no collision).
+    assert data["server_version"] != data["schema_version"]
+
+
+async def test_status_carries_degraded_reason_via_boot(
+    client: httpx.AsyncClient,
+) -> None:
+    """The single global degraded_reason surfaces under /status boot."""
+    from context_intelligence_server.status import boot_state
+
+    boot_state.degrade("3 node(s) lacking the :Node label")
+    try:
+        data = (await client.get("/status")).json()
+        assert data["boot"]["degraded_reason"] == "3 node(s) lacking the :Node label"
+    finally:
+        boot_state.clear_degraded()
+
+
 async def test_post_events_returns_202(client: httpx.AsyncClient) -> None:
     response = await client.post(
         "/events",
@@ -1051,7 +1082,7 @@ async def test_crash_recovery_topup_drains_deferred_tail_across_passes(
     # stops reporting them (exactly what a real drainer does on completion).
     for sid in sids[:2]:
         batch = await qm.read_batch(sid, max_items=10)
-        await qm.commit(sid, batch.end_offset)
+        await qm.commit(sid, batch.end_offset, None)
 
     # Pass 2: the previously-DEFERRED tail is now dispatched -- not stranded.
     spawned.clear()
@@ -1271,6 +1302,121 @@ async def test_ensure_schema_ready_does_not_raise_on_clean_graph() -> None:
     assert main_module.app.state.schema_ready is True
 
 
+class TestSchemaAutoRepair:
+    """_schema_ready_or_auto_repair: lease-armed auto-repair on un-migrated data."""
+
+    @staticmethod
+    def _unmigrated_then_clean() -> AsyncMock:
+        # First schema check refuses (un-migrated), second succeeds (repaired).
+        return AsyncMock(
+            side_effect=[
+                RuntimeError("42 node(s) lacking the :Node label -- doctor --fix"),
+                None,
+            ]
+        )
+
+    async def test_armed_lease_auto_repairs_and_rearms_gate(self) -> None:
+        main_module.app.state.schema_ready = False
+        main_module.app.state.neo4j_driver = MagicMock()
+        # Start DEGRADED so a passing test proves clear_degraded() actually ran,
+        # not that degraded_reason happened to already be None.
+        main_module.boot_state.degrade("42 node(s) lacking the :Node label")
+        run_op = AsyncMock()
+
+        # First schema check refuses (un-migrated); the SECOND call -- the
+        # re-arm after repair -- is what must flip schema_ready. Model that by
+        # having the second call set it (as the real _ensure_schema_ready does),
+        # so a deleted re-arm block leaves schema_ready False and fails here.
+        call_count = {"n": 0}
+
+        async def _schema_check() -> None:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("42 node(s) lacking :Node -- doctor --fix")
+            main_module.app.state.schema_ready = True
+
+        with (
+            patch.object(main_module.writer_lease, "acquired", True),
+            patch(
+                "context_intelligence_server.main._ensure_schema_ready",
+                new=AsyncMock(side_effect=_schema_check),
+            ),
+            patch(
+                "context_intelligence_server.main.run_maintenance_operation",
+                new=run_op,
+            ),
+        ):
+            await main_module._schema_ready_or_auto_repair()
+
+        run_op.assert_awaited_once()  # repair ran (armed lease)
+        assert call_count["n"] == 2  # the re-arm re-check actually ran
+        assert main_module.app.state.schema_ready is True  # gate re-armed
+        assert main_module.boot_state.degraded_reason is None  # clear_degraded ran
+
+    async def test_unarmed_lease_does_not_repair_and_stays_gated(self) -> None:
+        main_module.app.state.schema_ready = False
+        main_module.app.state.neo4j_driver = MagicMock()
+        main_module.boot_state.clear_degraded()
+        run_op = AsyncMock()
+
+        with (
+            patch.object(main_module.writer_lease, "acquired", False),
+            patch(
+                "context_intelligence_server.main._ensure_schema_ready",
+                new=AsyncMock(
+                    side_effect=RuntimeError("42 node(s) lacking :Node -- doctor --fix")
+                ),
+            ),
+            patch(
+                "context_intelligence_server.main.run_maintenance_operation",
+                new=run_op,
+            ),
+        ):
+            await main_module._schema_ready_or_auto_repair()
+
+        run_op.assert_not_awaited()  # cross-replica safety: NO mutation unarmed
+        assert main_module.app.state.schema_ready is False  # stays gated
+        assert main_module.boot_state.degraded_reason is not None
+
+    async def test_never_raises_so_boot_continues_to_sweep(self) -> None:
+        # An unrepairable graph must not raise -- boot proceeds so the periodic
+        # sweep is still scheduled (the retry mechanism).
+        main_module.app.state.schema_ready = False
+        main_module.app.state.neo4j_driver = MagicMock()
+        with (
+            patch.object(main_module.writer_lease, "acquired", False),
+            patch(
+                "context_intelligence_server.main._ensure_schema_ready",
+                new=AsyncMock(side_effect=RuntimeError("un-migrated")),
+            ),
+        ):
+            await main_module._schema_ready_or_auto_repair()  # MUST NOT raise
+
+    async def test_concurrent_op_running_skips_double_repair(self) -> None:
+        # If a maintenance op is already running (e.g. /admin/maintenance won the
+        # coordinator CAS), boot auto-repair must NOT double-run.
+        main_module.app.state.schema_ready = False
+        main_module.app.state.neo4j_driver = MagicMock()
+        run_op = AsyncMock()
+        with (
+            patch.object(main_module.writer_lease, "acquired", True),
+            patch(
+                "context_intelligence_server.main._ensure_schema_ready",
+                new=AsyncMock(side_effect=RuntimeError("un-migrated")),
+            ),
+            patch.object(
+                main_module.coordinator, "try_begin_op", return_value=None
+            ),
+            patch(
+                "context_intelligence_server.main.run_maintenance_operation",
+                new=run_op,
+            ),
+        ):
+            await main_module._schema_ready_or_auto_repair()
+
+        run_op.assert_not_awaited()  # coordinator single-flight excluded it
+
+
 async def test_lifespan_does_not_raise_when_health_check_itself_fails(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1324,7 +1470,7 @@ async def test_lifespan_seeds_counters_from_disk(tmp_path: Path) -> None:
     await seed_qm.append(sid, line1)
     await seed_qm.append(sid, line2)
     committed = len(line1) + 1  # +1 for the appended trailing newline
-    await seed_qm.commit(sid, committed)
+    await seed_qm.commit(sid, committed, None)
 
     # Fresh registry reusing the same on-disk queue dir.
     reg = SessionRegistry()

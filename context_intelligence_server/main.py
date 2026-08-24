@@ -42,6 +42,12 @@ from context_intelligence_server.identity_store import (
     create_identity_store,
 )
 from context_intelligence_server.logging_config import setup_logging
+from context_intelligence_server.maintenance import (
+    MAINTENANCE_ALLOW_LIST,
+    coordinator,
+    maintenance_gate_middleware,
+)
+from context_intelligence_server.maintenance_ops import run_maintenance_operation
 from context_intelligence_server.models import (
     CypherRequest,
     EventRequest,
@@ -51,12 +57,17 @@ from context_intelligence_server.neo4j_store import (
     build_bounded_neo4j_driver,
     count_untagged_nodes,
     ensure_neo4j_schema,
+    read_graph_schema_version,
 )
 from context_intelligence_server.registry import SessionRegistry
 from context_intelligence_server.routers.admin import router as admin_router
 from context_intelligence_server.routers.queues import router as queues_router
 from context_intelligence_server.routers.version import router as version_router
-from context_intelligence_server.status import boot_state, build_status_response
+from context_intelligence_server.status import (
+    SCHEMA_VERSION,
+    boot_state,
+    build_status_response,
+)
 from context_intelligence_server.writer_lease import (
     WriterLeaseConflict,
     shutdown_lease_io,
@@ -327,6 +338,66 @@ async def _ensure_schema_ready() -> None:
     logger.info("lifespan_startup: Neo4j schema initialized")
 
 
+async def _schema_ready_or_auto_repair() -> None:
+    """Run the schema check; on un-migrated data, attempt a lease-armed repair.
+
+    ``_ensure_schema_ready`` refuses (raises ``RuntimeError``) on un-migrated
+    data. Rather than let that abort boot, repair it in place when it is safe to:
+
+    CROSS-REPLICA SAFETY: ``run_repair`` mutates the graph, so it fires ONLY when
+    ``writer_lease.acquired`` is True. The lease is a single-writer DETECTOR, not
+    a mutex -- a storage fault leaves it unarmed and boot proceeds -- so an
+    unarmed lease means we cannot prove we are the sole writer and MUST NOT
+    auto-mutate; the server stays gated and an operator repairs via
+    ``POST /admin/maintenance``. The repair runs under the coordinator's
+    single-flight (``try_begin_op``), so boot-repair and a concurrent
+    ``/admin/maintenance`` on this instance can never overlap. On success the
+    schema check is re-run to re-arm the global ``app.state.schema_ready`` gate.
+
+    Never raises: an unrepaired graph leaves ``schema_ready`` False and a
+    ``degraded_reason`` set, and the caller proceeds (the periodic sweep retries).
+    """
+    try:
+        await _ensure_schema_ready()
+        return
+    except RuntimeError:
+        pass  # un-migrated data -- fall through to the repair attempt
+
+    if not writer_lease.acquired:
+        reason = (
+            "un-migrated graph data and the writer lease is not armed -- "
+            "refusing to auto-repair (cannot confirm single writer); repair via "
+            "POST /admin/maintenance"
+        )
+        boot_state.degrade(reason)
+        logger.warning("schema_auto_repair_skipped reason=lease_unarmed")
+        return
+
+    run_id = coordinator.try_begin_op()
+    if run_id is None:
+        # A maintenance op is already running (e.g. /admin/maintenance); let it
+        # finish rather than double-running the repair.
+        logger.info("schema_auto_repair_skipped reason=op_already_running")
+        return
+
+    logger.info("schema_auto_repair_started run_id=%s", run_id)
+    # Records success/failure on the coordinator; never raises.
+    await run_maintenance_operation(
+        app.state.neo4j_driver,
+        run_id,
+        quiesce_seconds=_settings.maintenance_quiesce_seconds,
+    )
+    try:
+        await _ensure_schema_ready()
+    except RuntimeError as exc:
+        boot_state.degrade(f"auto-repair ran but schema still not ready: {exc}")
+        logger.error("schema_auto_repair_incomplete run_id=%s", run_id)
+        return
+    if app.state.schema_ready:
+        boot_state.clear_degraded()
+        logger.info("schema_auto_repair_succeeded run_id=%s", run_id)
+
+
 async def _crash_recovery_sweep_loop(interval: int, respawn_limit: int) -> None:
     """Periodically top the recovered-drainer pool back up to the ceiling so
     a finite ``crash_recovery_respawn_limit`` cannot permanently strand the
@@ -418,9 +489,9 @@ async def _boot_reclaim() -> None:
     # sync with test monkeypatches bound to the same object.
     settings = _settings
     boot_state.reclaim_enabled = settings.reclaim_enabled
-    # Iterate the QueueManager's own directory, not settings.queues_path --
-    # the two can differ (tests do this routinely).
-    keys = sorted(p.stem for p in qm.queues_dir.glob("*.log"))
+    # Enumerate through the QueueManager so the sweep is backend-agnostic --
+    # the queue owns its own storage layout, this loop never reaches into it.
+    keys = await qm.session_keys()
     reclaimed = 0
     reclaimed_bytes = 0
     kept = 0
@@ -530,7 +601,10 @@ async def _boot_reconcile() -> None:
     app.state.schema_ready = getattr(app.state, "schema_ready", False)
     try:
         boot_state.phase = "schema"
-        await _ensure_schema_ready()
+        # On un-migrated data this attempts a lease-armed auto-repair instead of
+        # raising -- so a schema failure never aborts boot and skips the sweep
+        # scheduling below (the sweep is this pass's retry mechanism).
+        await _schema_ready_or_auto_repair()
 
         boot_state.phase = "heal"
         _heal_result = await _phase_run(registry.queue_manager.heal_torn_tails())
@@ -634,6 +708,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Stash the resolved query access_mode so /cypher opens READ sessions without
     # re-resolving settings on every request.
     app.state.neo4j_query_access_mode = _query.access_mode
+    # Wire the live admin driver into the maintenance coordinator so its gate/
+    # status probe can run. Left unbound in tests, the probe returns None and the
+    # gate stays open -- the no-regression property for the existing suite.
+    coordinator.bind_driver(
+        app.state.neo4j_driver,
+        probe_ttl_seconds=_settings.maintenance_probe_ttl_seconds,
+    )
     # Schema init (indexes + the Session/:Node uniqueness constraints) no
     # longer runs synchronously here -- a Neo4j connectivity failure must
     # never raise out of lifespan (ASGI startup abort -> crash-loop). It now
@@ -697,6 +778,10 @@ app = FastAPI(
 app.include_router(admin_router)
 app.include_router(version_router)
 app.include_router(queues_router)
+# Allow-list gate: refuses non-allow-listed paths while a maintenance op runs.
+# Registered on `app` (not the auth-wrapped ASGI app) so it cannot be bypassed
+# by the bare `app` entrypoint; auth still runs first via the outer wrapper.
+app.middleware("http")(maintenance_gate_middleware)
 _start_time = time.time()
 registry = SessionRegistry()
 # Expose the registry singleton on app.state so routers can read it without
@@ -766,6 +851,21 @@ def _assert_admin_not_exempt() -> None:
             )
 
 
+def _assert_maintenance_endpoint_allow_listed() -> None:
+    """/admin/maintenance, /status, and /version must be on the maintenance
+    allow-list. Without this, /admin/maintenance could be gated by maintenance
+    mode -- 503ing at the exact moment it exists to unblock.
+    """
+    required = {"/admin/maintenance", "/status", "/version"}
+    missing = required - MAINTENANCE_ALLOW_LIST
+    if missing:
+        raise RuntimeError(
+            f"Availability invariant violated: {sorted(missing)!r} missing from "
+            f"maintenance.MAINTENANCE_ALLOW_LIST -- these paths must never be "
+            f"gated by maintenance mode."
+        )
+
+
 def _assert_neo4j_clients_explicit(settings: Settings) -> None:
     """The deployed profile must declare structured neo4j.admin /
     neo4j.cypher_query clients explicitly. When
@@ -804,6 +904,9 @@ def create_asgi_app(
     # Structural assertion: runs before middleware construction so the
     # failure is loud and immediate.
     _assert_admin_not_exempt()
+    # /admin/maintenance, /status, /version must never be gated by maintenance
+    # mode -- assert before middleware construction so the failure is immediate.
+    _assert_maintenance_endpoint_allow_listed()
 
     s = settings if settings is not None else _settings
     _assert_neo4j_clients_explicit(s)
@@ -1040,11 +1143,33 @@ async def get_status(request: Request) -> dict[str, Any]:
         # Same contract: aggregate integers only, cheap (stat-only,
         # short-TTL cached) even with a huge spool.
         response["spool"] = await registry.queue_manager.spool_stats()
+        # Schema-version drift: the compiled model version vs the graph's stored
+        # :SchemaMeta version. read_graph_schema_version returns None when the
+        # graph is unreachable or the baseline was never written; an absent
+        # driver is treated the same way -- drift=None (unknown), never a false
+        # "in sync" and never a 500 (/status must never raise). Gated with the
+        # disk reads above so /status stays graph-read-free while booting.
+        _schema_driver = getattr(request.app.state, "neo4j_driver", None)
+        graph_schema_version = (
+            await read_graph_schema_version(_schema_driver)
+            if _schema_driver is not None
+            else None
+        )
+        response["schema_version"] = SCHEMA_VERSION
+        response["graph_schema_version"] = graph_schema_version
+        response["schema_version_current"] = (
+            None
+            if graph_schema_version is None
+            else graph_schema_version == SCHEMA_VERSION
+        )
     else:
         # While booting, /status performs zero disk reads. metrics/spool stay
         # present but null, so an absent key is never confused with a version skew.
         response["metrics"] = None
         response["spool"] = None
+        response["schema_version"] = SCHEMA_VERSION
+        response["graph_schema_version"] = None
+        response["schema_version_current"] = None
         response["status_detail"] = {"reason": "booting"}
     # Surface auth mode/admin capability so operators can confirm admin is
     # enabled without tailing logs -- boolean flags only, no credentials.
@@ -1140,6 +1265,11 @@ async def post_events(
         body = await http_request.body()
         body_obj = json.loads(body)
         body_obj["created_by"] = contributor_id  # overwrite, never setdefault
+        # Lift the optional top-level working_dir envelope field into data so the
+        # Session-node write sees it; absent/empty leaves Session.working_dir null
+        # for a later event to populate.
+        if request.working_dir and isinstance(body_obj.get("data"), dict):
+            body_obj["data"]["working_dir"] = request.working_dir
         body = json.dumps(body_obj, separators=(",", ":")).encode()
         await registry.queue_manager.append(worker_key, body)
         # Bytes are on disk: the key may be burned now (a failed append

@@ -229,6 +229,29 @@ def reset_registry() -> Generator[None, None, None]:
     registry._write_semaphore = None
 
 
+@pytest.fixture(autouse=True)
+def reset_maintenance_coordinator() -> Generator[None, None, None]:
+    """Each test starts with (and leaves) a pristine MaintenanceCoordinator.
+
+    ``maintenance.coordinator`` is a process-wide singleton shared by the
+    drain-loop gate and the HTTP gate/status. A test that runs the real
+    ``lifespan()`` calls ``coordinator.bind_driver(...)`` against its own mock
+    driver; without this reset that leaks into the coordinator's TTL-cached
+    probe/op state and can spuriously close the gate for every other test.
+    Reset by copying a fresh instance's attributes in place, since other modules
+    hold a direct reference to THIS object.
+    """
+    from context_intelligence_server.maintenance import MaintenanceCoordinator
+    from context_intelligence_server.maintenance import coordinator as _coordinator
+
+    def _reset() -> None:
+        _coordinator.__dict__.update(vars(MaintenanceCoordinator()))
+
+    _reset()
+    yield
+    _reset()
+
+
 @pytest.fixture
 async def client() -> AsyncGenerator[httpx.AsyncClient, None]:
     async with httpx.AsyncClient(

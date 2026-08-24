@@ -798,6 +798,14 @@ class Settings(BaseSettings):
     # lease. Logs a warning every boot while set and is surfaced on /status.
     writer_lease_force_acquire: bool = False
 
+    # Maintenance mode: the live schema-health gate + /admin/maintenance repair.
+    maintenance_probe_ttl_seconds: float = 5.0  # :Node constraint probe cache TTL
+    maintenance_retry_after_seconds: int = 30  # Retry-After on the maintenance 503
+    # Bounded pre-repair quiesce so ordinary in-flight flushes settle before
+    # run_repair (drain poll interval is 0.05s); a flush outliving it is a
+    # residual risk the constraint create then fails loud on.
+    maintenance_quiesce_seconds: float = 2.0
+
     @field_validator("writer_lease_heartbeat_seconds")
     @classmethod
     def _validate_writer_lease_heartbeat_seconds(cls, v: float) -> float:

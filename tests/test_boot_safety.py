@@ -740,7 +740,7 @@ async def test_recovered_drainer_population_bounded_and_makes_progress(
         drain loop would otherwise never finish)."""
         batch = await qm.read_batch(worker.session_id, max_items=10)
         if batch.records:
-            await qm.commit(worker.session_id, batch.end_offset)
+            await qm.commit(worker.session_id, batch.end_offset, None)
         reg._deregister(worker.session_id)
 
     def _get_or_create(
@@ -908,7 +908,7 @@ async def test_dry_exit_fires_for_recovered_drainer_over_drained_log(
     reg._queue_manager = qm
     line = _line()
     await qm.append("sess-x", line)
-    await qm.commit("sess-x", len(line) + 1)  # fully drained, no terminal record
+    await qm.commit("sess-x", len(line) + 1, None)  # fully drained, no terminal record
 
     worker = _make_worker("sess-x", live_event_seen=False)  # recovered=True shape
     reg._register_for_test(worker)
@@ -927,7 +927,7 @@ async def test_dry_exit_negative_control_live_created_worker_never_exits(
     reg._queue_manager = qm
     line = _line()
     await qm.append("sess-live", line)
-    await qm.commit("sess-live", len(line) + 1)
+    await qm.commit("sess-live", len(line) + 1, None)
 
     worker = _make_worker("sess-live", live_event_seen=True)  # live path (default)
     reg._register_for_test(worker)
@@ -1162,7 +1162,7 @@ async def test_boot_reclaim_auto_reclaims_drained_log_under_shipped_defaults(
     qm = FileSystemQueueManager(queues_dir=tmp_path)
     line = _line()
     await qm.append("drained-key", line)
-    await qm.commit("drained-key", len(line))
+    await qm.commit("drained-key", len(line), None)
 
     monkeypatch.setattr(main_module.registry, "_queue_manager", qm)
     monkeypatch.setattr(main_module._settings, "reclaim_enabled", False)
@@ -1258,7 +1258,7 @@ async def test_boot_reclaim_drained_log_with_live_worker_is_skipped(
     qm = FileSystemQueueManager(queues_dir=tmp_path)
     line = _line()
     await qm.append("live-drained-key", line)
-    await qm.commit("live-drained-key", len(line))
+    await qm.commit("live-drained-key", len(line), None)
 
     reg = SessionRegistry()
     reg._queue_manager = qm
@@ -1383,12 +1383,13 @@ async def test_boot_reconcile_proceeds_past_schema_once_neo4j_recovers(
     topup_mock.assert_awaited_once()
 
 
-async def test_lifespan_survives_schema_data_conflict_records_boot_fail(
+async def test_lifespan_survives_schema_data_conflict_stays_gated_and_schedules_sweep(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reachable graph, genuinely un-migrated (untagged>0): still refuses to
-    start drainers, but via boot_state.fail (visible on /status) -- never an
-    unguarded raise out of lifespan."""
+    """Reachable graph, genuinely un-migrated (untagged>0), unarmed lease: it
+    refuses to start drainers and does NOT auto-mutate, but must stay gated via
+    ``awaiting_schema`` (not ``failed``) so the retry sweep is still scheduled.
+    Aborting at ``failed`` would skip sweep scheduling and strand the graph."""
     mock_driver = MagicMock()
     mock_driver.close = AsyncMock()
     monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 8)
@@ -1408,6 +1409,8 @@ async def test_lifespan_survives_schema_data_conflict_records_boot_fail(
             "context_intelligence_server.main.count_untagged_nodes",
             new=AsyncMock(return_value=3),
         ),
+        # Unarmed lease: auto-repair must NOT run; the server stays gated.
+        patch.object(main_module.writer_lease, "acquired", False),
         patch(
             "context_intelligence_server.main._crash_recovery_topup", new=topup_mock
         ),
@@ -1415,8 +1418,10 @@ async def test_lifespan_survives_schema_data_conflict_records_boot_fail(
         async with lifespan(main_module.app):  # must reach yield without raising
             await main_module.app.state.boot_task
             assert main_module.app.state.schema_ready is False
-            assert boot_state.phase == "failed"
-            assert boot_state.failed_step == "schema"
+            # Stays gated (not "failed") so the sweep loop is scheduled to retry.
+            assert boot_state.phase == "awaiting_schema"
+            assert boot_state.degraded_reason is not None
+            assert main_module.app.state.sweep_task is not None
 
     topup_mock.assert_not_called()
 

@@ -71,6 +71,19 @@ def test_settings_has_durable_queue_defaults():
     assert s.max_delivery_attempts == 5
 
 
+def test_maintenance_knob_defaults():
+    """Maintenance-mode knobs exist without disturbing PR#78 defaults."""
+    from context_intelligence_server.config import Settings
+
+    s = Settings()
+    assert s.maintenance_probe_ttl_seconds == 5.0
+    assert s.maintenance_retry_after_seconds == 30
+    assert s.maintenance_quiesce_seconds == 2.0
+    # Guard the two PR#78 defaults the maintenance work must not change.
+    assert s.writer_lease_mode == "enforce"
+    assert s.dead_letter_expiry_enabled is False
+
+
 # ---------------------------------------------------------------------------
 # crash_recovery_respawn_limit (Change 1)
 # ---------------------------------------------------------------------------
