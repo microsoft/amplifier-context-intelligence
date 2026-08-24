@@ -3,7 +3,7 @@
 Covers:
 - handled_events == frozenset({'content_block:start', 'content_block:end'})
 - content_block:start creates ContentBlock:SST_EVENT node keyed as
-  '{session_id}::block::{iteration_n}::{block_index}' with session_id, block_index,
+  '{iteration_id}::block::{block_index}' with session_id, block_index,
   started_at; iteration_n extracted from active_iteration_id cursor (split('::')[-1])
 - E07: Iteration -[:HAS_PART {sst_semantic: 'CONTAINS'}]-> ContentBlock
   created when active_iteration_id is set; NOT created when no active iteration (zero edges)
@@ -53,7 +53,7 @@ class TestContentBlockStartCreatesNode:
     async def test_node_created_with_correct_compound_key(
         self, services: HookStateService
     ) -> None:
-        """content_block:start must create node at '{session_id}::block::{iteration_n}::{block_index}'."""
+        """content_block:start must create node at '{iteration_id}::block::{block_index}'."""
         services.data_layer_2.active_iteration_id = "s1::iteration::1"
         handler = ContentBlockHandler(services)
         await handler(
@@ -64,7 +64,7 @@ class TestContentBlockStartCreatesNode:
                 "block_index": 0,
             },
         )
-        node_id = "s1::block::1::0"
+        node_id = "s1::iteration::1::block::0"
         node = await services.graph.get_node(node_id)
         assert node is not None, f"content_block:start must create node at '{node_id}'"
 
@@ -82,7 +82,7 @@ class TestContentBlockStartCreatesNode:
                 "block_index": 0,
             },
         )
-        node = await services.graph.get_node("s1::block::1::0")
+        node = await services.graph.get_node("s1::iteration::1::block::0")
         assert node is not None
         assert "ContentBlock" in node["labels"], (
             f"ContentBlock label missing. Got: {node['labels']}"
@@ -105,7 +105,7 @@ class TestContentBlockStartCreatesNode:
                 "block_index": 0,
             },
         )
-        node = await services.graph.get_node("s1::block::1::0")
+        node = await services.graph.get_node("s1::iteration::1::block::0")
         assert node is not None
         assert node.get("session_id") == "s1", (
             f"session_id property missing or wrong. Got: {node!r}"
@@ -125,7 +125,7 @@ class TestContentBlockStartCreatesNode:
                 "block_index": 2,
             },
         )
-        node = await services.graph.get_node("s1::block::1::2")
+        node = await services.graph.get_node("s1::iteration::1::block::2")
         assert node is not None
         assert node.get("block_index") == 2, (
             f"block_index property missing or wrong. Got: {node!r}"
@@ -158,7 +158,7 @@ class TestE07HasPartEdge:
             },
         )
         iteration_id = "s1::iteration::1"
-        block_id = "s1::block::1::0"
+        block_id = "s1::iteration::1::block::0"
         edge = await services.graph.get_edge(iteration_id, block_id)
         assert edge is not None, (
             f"E07 HAS_PART edge from '{iteration_id}' to '{block_id}' must exist "
@@ -228,7 +228,7 @@ class TestContentBlockEndUpsertsProperties:
                 "block": {"type": "text"},
             },
         )
-        node = await services.graph.get_node("s1::block::1::0")
+        node = await services.graph.get_node("s1::iteration::1::block::0")
         assert node is not None
         assert node.get("block_type") == "text", (
             f"content_block:end must set block_type from block.type. Got: {node!r}"
@@ -258,7 +258,7 @@ class TestContentBlockEndUpsertsProperties:
                 "block": {"type": "text"},
             },
         )
-        node = await services.graph.get_node("s1::block::1::0")
+        node = await services.graph.get_node("s1::iteration::1::block::0")
         assert node is not None
         assert node.get("ended_at") == "2026-01-01T00:01:00Z", (
             f"content_block:end must set ended_at. Got: {node!r}"
@@ -302,9 +302,9 @@ class TestContentBlockToolCallCache:
         )
         assert (
             services.data_layer_2.pending_tool_block_ids["tool-block-abc"]
-            == "s1::block::1::0"
+            == "s1::iteration::1::block::0"
         ), (
-            "pending_tool_block_ids['tool-block-abc'] must map to the block node id 's1::block::1::0'"
+            "pending_tool_block_ids['tool-block-abc'] must map to the block node id 's1::iteration::1::block::0'"
         )
 
     async def test_text_block_not_cached(self, services: HookStateService) -> None:
@@ -448,7 +448,7 @@ class TestContentBlockSourcedFrom:
                 "block_index": 0,
             },
         )
-        block_node_id = "s1::block::1::0"
+        block_node_id = "s1::iteration::1::block::0"
         data_layer_1_node_id = make_node_id("s1", "content_block:start", timestamp)
         edge = await services.graph.get_edge(block_node_id, data_layer_1_node_id)
         assert edge is not None, (
@@ -484,7 +484,7 @@ class TestContentBlockSourcedFrom:
                 "block": {"type": "text"},
             },
         )
-        block_node_id = "s1::block::1::0"
+        block_node_id = "s1::iteration::1::block::0"
         data_layer_1_node_id = make_node_id("s1", "content_block:end", end_timestamp)
         edge = await services.graph.get_edge(block_node_id, data_layer_1_node_id)
         assert edge is not None, (

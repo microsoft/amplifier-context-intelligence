@@ -740,7 +740,7 @@ async def test_recovered_drainer_population_bounded_and_makes_progress(
         drain loop would otherwise never finish)."""
         batch = await qm.read_batch(worker.session_id, max_items=10)
         if batch.records:
-            await qm.commit(worker.session_id, batch.end_offset)
+            await qm.commit(worker.session_id, batch.end_offset, None)
         reg._deregister(worker.session_id)
 
     def _get_or_create(
@@ -908,7 +908,9 @@ async def test_dry_exit_fires_for_recovered_drainer_over_drained_log(
     reg._queue_manager = qm
     line = _line()
     await qm.append("sess-x", line)
-    await qm.commit("sess-x", len(line) + 1)  # fully drained, no terminal record
+    await qm.commit(
+        "sess-x", len(line) + 1, None
+    )  # fully drained, no terminal record
 
     worker = _make_worker("sess-x", live_event_seen=False)  # recovered=True shape
     reg._register_for_test(worker)
@@ -927,7 +929,7 @@ async def test_dry_exit_negative_control_live_created_worker_never_exits(
     reg._queue_manager = qm
     line = _line()
     await qm.append("sess-live", line)
-    await qm.commit("sess-live", len(line) + 1)
+    await qm.commit("sess-live", len(line) + 1, None)
 
     worker = _make_worker("sess-live", live_event_seen=True)  # live path (default)
     reg._register_for_test(worker)
@@ -1162,7 +1164,7 @@ async def test_boot_reclaim_auto_reclaims_drained_log_under_shipped_defaults(
     qm = FileSystemQueueManager(queues_dir=tmp_path)
     line = _line()
     await qm.append("drained-key", line)
-    await qm.commit("drained-key", len(line))
+    await qm.commit("drained-key", len(line), None)
 
     monkeypatch.setattr(main_module.registry, "_queue_manager", qm)
     monkeypatch.setattr(main_module._settings, "reclaim_enabled", False)
@@ -1258,7 +1260,7 @@ async def test_boot_reclaim_drained_log_with_live_worker_is_skipped(
     qm = FileSystemQueueManager(queues_dir=tmp_path)
     line = _line()
     await qm.append("live-drained-key", line)
-    await qm.commit("live-drained-key", len(line))
+    await qm.commit("live-drained-key", len(line), None)
 
     reg = SessionRegistry()
     reg._queue_manager = qm

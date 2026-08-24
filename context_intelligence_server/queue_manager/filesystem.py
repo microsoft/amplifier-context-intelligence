@@ -170,6 +170,14 @@ class FileSystemQueueManager:
         # AND waiters == 1 (see _guard / delete_drained). No sweeper, no
         # timer, no refcount map, no eviction on the hot path.
         self._guards: dict[str, _KeyGuard] = {}
+        # Sessions with a dead-letter written since their last read_batch. A
+        # crash in the dead_letter->commit gap leaves a leading already-dead
+        # line uncommitted; the NEXT read_batch reconciles past it (once, then
+        # clears the flag) so a respawn cannot re-read and re-dead-letter it.
+        # In-memory only: process restart is covered by the boot-time global
+        # recovery_reconcile_dead(). Keeping this a dirty flag (not a per-poll
+        # scan) is what keeps the full .dead.jsonl read off the hot path.
+        self._dead_unreconciled: set[str] = set()
 
     @property
     def queues_dir(self) -> Path:
@@ -199,24 +207,69 @@ class FileSystemQueueManager:
         """
         return self._dir / f"{session_id}.log.compact.tmp"
 
-    def _read_committed_offset(self, session_id: str) -> int:
-        """Committed byte offset; reads bare-int and legacy JSON offset files."""
+    def _write_offset_record(
+        self, session_id: str, offset: int, cursor: dict[str, Any] | None
+    ) -> None:
+        """Sole writer of the ``.offset`` file: one atomic JSON record.
+
+        Writes ``{"v": 1, "offset": offset, "cursor": cursor}`` to a temp file
+        and ``os.replace``s it in, so a reader never sees a torn record. Folding
+        the cursor into the SAME record as the offset (not a sidecar file) is
+        what keeps the two from ever skewing: a crash loses both together, never
+        one without the other. No ``fsync`` -- process-crash-durable, not
+        power-durable, matching the rest of this module.
+        """
+        if cursor is not None and not isinstance(cursor, dict):
+            raise TypeError(
+                f"cursor must be a dict or None, got {type(cursor).__name__}"
+            )
+        final = self._offset_path(session_id)
+        tmp = self._dir / f"{session_id}.offset.tmp"
+        record = {"v": 1, "offset": offset, "cursor": cursor}
+        tmp.write_text(json.dumps(record, separators=(",", ":")), encoding="utf-8")
+        try:
+            os.replace(tmp, final)
+        except OSError:
+            # A failed rename leaves the prior committed record intact; drop the
+            # staged temp so a crashed write leaves nothing behind.
+            tmp.unlink(missing_ok=True)
+            raise
+
+    def _read_offset_record(self, session_id: str) -> tuple[int, dict[str, Any] | None]:
+        """Read the ``.offset`` file, returning ``(offset, cursor)``.
+
+        Accepts the current JSON record and the legacy bare-integer shape; a
+        missing or empty file yields ``(0, None)``. An unreadable cursor
+        degrades to ``None`` (an unknown ``v`` or non-dict ``cursor`` keeps the
+        offset but drops the cursor -- a corrupt cursor must not crash boot). An
+        unreadable OFFSET is NOT degraded: a malformed record raises, because
+        silently resetting a corrupt offset to 0 would replay the whole log and
+        manufacture duplicate nodes -- a worse, quieter failure than a loud one.
+        """
         try:
             text = self._offset_path(session_id).read_text("utf-8")
         except FileNotFoundError:
-            return 0
+            return 0, None
         text = text.strip()
         if not text:
-            return 0
+            return 0, None
         if text[0] == "{":
             try:
-                cursor = json.loads(text)
-                return int(cursor["offset"])
+                rec = json.loads(text)
+                offset = int(rec["offset"])
             except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 raise ValueError(
                     f"unparseable legacy offset document for session {session_id!r}"
                 ) from None
-        return int(text)
+            cursor = rec.get("cursor")
+            if rec.get("v") == 1 and isinstance(cursor, dict):
+                return offset, cursor
+            return offset, None
+        return int(text), None
+
+    def _read_committed_offset(self, session_id: str) -> int:
+        """Committed byte offset; reads envelope, bare-int, and legacy JSON."""
+        return self._read_offset_record(session_id)[0]
 
     @staticmethod
     def _last_complete_end(path: Path) -> int:
@@ -506,8 +559,18 @@ class FileSystemQueueManager:
     async def read_batch(self, session_id: str, max_items: int) -> Batch:
         self._validate_session_id(session_id)
         path = self._log_path(session_id)
+        # Reconcile past any leading already-dead line ONLY when a dead-letter
+        # was written since the last read (the dirty flag) -- never per poll, so
+        # the full .dead.jsonl read stays off the hot path. Clear the flag
+        # unconditionally: _reconcile_dead_key is fault-isolated (swallows
+        # OSError/ValueError -> 0), so a retry would not help, and leaving the
+        # flag set would re-scan every poll.
+        reconcile = session_id in self._dead_unreconciled
 
         def _read() -> Batch:
+            if reconcile:
+                self._reconcile_dead_key(session_id)
+                self._dead_unreconciled.discard(session_id)
             start = self._read_committed_offset(session_id)
             records: list[Record] = []
             consumed = 0
@@ -530,23 +593,45 @@ class FileSystemQueueManager:
 
         return await asyncio.to_thread(_read)
 
-    async def commit(self, session_id: str, new_offset: int) -> None:
-        """Atomically and durably persist ``new_offset`` (the ack).
+    async def commit(
+        self, session_id: str, new_offset: int, cursor: dict[str, Any] | None
+    ) -> None:
+        """Atomically and durably persist ``new_offset`` (the ack) + ``cursor``.
 
-        Writes the offset to a temp file and uses ``os.replace`` for an atomic
-        rename, so a reader never observes a torn or partial offset file. No
-        ``fsync`` is issued: the offset survives a process crash but not a
-        power loss.
+        ``cursor`` has NO default: every call site must pass it explicitly so it
+        is never silently omitted -- a missed site (or a plain rolling deploy
+        against an older signature) would null the cursor and reset the
+        cross-handler counters, manufacturing duplicate nodes on the next run.
+        Offset and cursor are written in the SAME atomic record, so they can
+        never skew. No ``fsync``: process-crash-durable, not power-durable.
         """
         self._validate_session_id(session_id)
-        final = self._offset_path(session_id)
-        tmp = self._dir / f"{session_id}.offset.tmp"
+        # cursor type is enforced by _write_offset_record (raises TypeError on a
+        # non-dict, non-None cursor) -- the sole writer, so the check lives in
+        # one place and survives -O rather than as a bypassable assert here.
 
-        def _commit() -> None:
-            tmp.write_text(str(new_offset), encoding="utf-8")
-            os.replace(tmp, final)
+        def _commit(guard: _KeyGuard) -> None:
+            # Same file_lock compact_committed_prefix takes: a commit that ran
+            # unlocked could interleave with compaction's read-committed /
+            # rebase-to-0 / replace-log sequence and be silently erased (or
+            # erase the rebase). Serializing both under the per-key lock closes
+            # that race.
+            with guard.file_lock:
+                self._write_offset_record(session_id, new_offset, cursor)
 
-        await asyncio.to_thread(_commit)
+        with self._guard(session_id) as guard:
+            async with guard.admission:
+                await _await_uninterrupted(asyncio.to_thread(_commit, guard))
+
+    async def read_cursor(self, session_id: str) -> dict[str, Any] | None:
+        """Return the persisted cursor for ``session_id``, or ``None``.
+
+        ``None`` covers: no offset file, a legacy bare-integer offset file, or a
+        JSON record whose cursor is absent/unreadable. This is the read side a
+        rebuilt worker uses to restore its cross-handler counters.
+        """
+        self._validate_session_id(session_id)
+        return await asyncio.to_thread(lambda: self._read_offset_record(session_id)[1])
 
     async def dead_letter(self, session_id: str, raw: bytes, error: str) -> None:
         """Append one dead-letter record for an unprocessable batch line.
@@ -581,6 +666,10 @@ class FileSystemQueueManager:
                     # (traceback carries the exception; exc is not repeated.)
                     logger.exception("dead_letter_write_failed session=%s", session_id)
                     raise
+        # The dead-letter is durable but the offset that accounts for it may not
+        # be committed yet (a crash in the gap leaves a leading already-dead
+        # line). Mark the session so the NEXT read_batch reconciles past it once.
+        self._dead_unreconciled.add(session_id)
 
     async def delete_drained(self, session_id: str) -> bool:
         """Remove the drained ``.log``/``.offset`` for a finalized session.
@@ -627,6 +716,12 @@ class FileSystemQueueManager:
                     )
                     return False
 
+                # Terminal cleanup: remove BOTH files. The cursor is intentionally
+                # dropped here -- a finalized session is done, and an orch_run_id
+                # is scoped by execution_start_ts, so a genuinely-new post-finalize
+                # run gets a distinct id regardless of the seq counter (no
+                # collision). Keeping the .offset would only leak a file per
+                # finalized session, which is why finalize removes it.
                 try:
                     log.unlink()
                 except FileNotFoundError:
@@ -667,14 +762,12 @@ class FileSystemQueueManager:
         """
         self._validate_session_id(session_id)
         log = self._log_path(session_id)
-        offset = self._offset_path(session_id)
-        offset_tmp = self._dir / f"{session_id}.offset.tmp"
         tmp = self._compact_tmp_path(session_id)
 
         def _compact(_guard: _KeyGuard) -> int:
             with _guard.file_lock:
                 try:
-                    c = self._read_committed_offset(session_id)
+                    c, cursor = self._read_offset_record(session_id)
                 except (OSError, ValueError):
                     return 0
                 try:
@@ -732,10 +825,11 @@ class FileSystemQueueManager:
                     return 0
 
                 # Step 5: rebase the offset to 0 FIRST -- the point of no
-                # return.
+                # return. The cursor rides along unchanged: rebasing the log to
+                # its undrained tail does not roll back cross-handler state, so
+                # a rebuild after compaction must still see the committed cursor.
                 try:
-                    offset_tmp.write_text("0", encoding="utf-8")
-                    os.replace(offset_tmp, offset)
+                    self._write_offset_record(session_id, 0, cursor)
                 except OSError:
                     logger.exception(
                         "compact_offset_rebase_failed session=%s", session_id
@@ -748,13 +842,12 @@ class FileSystemQueueManager:
                 try:
                     os.replace(tmp, log)
                 except OSError:
-                    # R3: restore the offset to C so this becomes a PURE
-                    # NO-OP -- never an in-process re-drive (which would
-                    # double-count `written` and drive the residual
-                    # negative).
+                    # Restore the offset to the committed value so a failed
+                    # compaction is a pure no-op, never an in-process re-drive
+                    # (which would double-count `written` and drive the
+                    # residual negative). The cursor is restored with it.
                     try:
-                        offset_tmp.write_text(str(c), encoding="utf-8")
-                        os.replace(offset_tmp, offset)
+                        self._write_offset_record(session_id, c, cursor)
                         logger.error(
                             "compact_replace_failed session=%s committed=%d "
                             "action=offset_restored",
@@ -1126,12 +1219,25 @@ class FileSystemQueueManager:
                 )
                 try:
                     if c.verdict is Verdict.RESET_OFFSET:
-                        # Unlink ONLY the offset (+ any stray .offset.tmp) --
-                        # the .log stays; the next drain re-reads from 0.
+                        # Reset the committed offset to 0 (the .log stays and
+                        # re-drains from 0), PRESERVING the cursor. After
+                        # compaction the .log is the undrained tail and the
+                        # committed cursor is the correct starting state for it;
+                        # wiping it would re-mint ids already persisted for the
+                        # reclaimed prefix. A missing/unreadable cursor (a truly
+                        # unparseable .offset) degrades to a bare removal, which
+                        # reads back as committed 0 all the same.
                         try:
-                            offset.unlink()
-                        except FileNotFoundError:
-                            pass
+                            _, _cursor = self._read_offset_record(c.key)
+                        except (OSError, ValueError):
+                            _cursor = None
+                        if _cursor is not None:
+                            self._write_offset_record(c.key, 0, _cursor)
+                        else:
+                            try:
+                                offset.unlink()
+                            except FileNotFoundError:
+                                pass
                         try:
                             offset_tmp.unlink()
                         except FileNotFoundError:
@@ -1380,6 +1486,23 @@ class FileSystemQueueManager:
             return result
 
         return await asyncio.to_thread(_scan)
+
+    async def is_fully_drained(self, session_id: str) -> bool:
+        """True iff the session has no undrained log data left.
+
+        Compares the committed offset against the end of complete (newline-
+        terminated) data, read straight from disk -- so it is independent of
+        in-memory worker liveness and stays correct across a crash + restart. A
+        session with no ``.log`` reads as drained (0 >= 0): it never had data.
+        """
+        self._validate_session_id(session_id)
+
+        def _check() -> bool:
+            return self._read_committed_offset(session_id) >= self._complete_data_end(
+                session_id
+            )
+
+        return await asyncio.to_thread(_check)
 
     async def recover(self) -> list[str]:
         """Return sorted session_ids that have a complete unprocessed line.
@@ -1806,6 +1929,46 @@ class FileSystemQueueManager:
             )
         return payloads
 
+    def _reconcile_dead_key(self, key: str) -> int:
+        """Advance ONE key's committed offset past its leading already-dead lines.
+
+        Fault-isolated: a corrupt/unreadable dead-payload set or offset for this
+        key returns 0 (logged) rather than raising, so neither the boot pass nor
+        the per-session respawn path it feeds can crash-loop on one bad key. The
+        committed cursor rides along unchanged -- skipping already-dead lines
+        does not change cross-handler state.
+        """
+        # Q-6: check `.log` existence BEFORE reading the whole `.dead.jsonl`
+        # into RAM. A key with only a `.dead.jsonl` (the common shape left by
+        # `delete_drained`) pays nothing here.
+        log_path = self._log_path(key)
+        if not log_path.exists():
+            return 0
+        try:
+            dead_payloads = self._dead_payload_set(key)
+            if not dead_payloads:
+                return 0
+            committed, cursor = self._read_offset_record(key)
+            complete_end = self._complete_data_end(key)
+            pos = committed
+            skipped = 0
+            with open(log_path, "rb") as f:
+                f.seek(committed)
+                while pos < complete_end:
+                    raw = f.readline()
+                    if not raw or not raw.endswith(b"\n"):
+                        break
+                    if raw[:-1] not in dead_payloads:
+                        break
+                    pos += len(raw)
+                    skipped += 1
+            if pos > committed:
+                self._write_offset_record(key, pos, cursor)
+            return skipped
+        except (OSError, ValueError):
+            logger.exception("recovery_reconcile_dead_key_failed key=%s", key)
+            return 0
+
     async def recovery_reconcile_dead(self) -> int:
         """Advance committed offsets past leading already-dead pending lines.
 
@@ -1821,43 +1984,7 @@ class FileSystemQueueManager:
         def _reconcile() -> int:
             total_skipped = 0
             for key in self._all_worker_keys():
-                # Q-6: check `.log` existence BEFORE reading the whole
-                # `.dead.jsonl` into RAM (+ a payload set at ~3.6x its size).
-                # A key with only a `.dead.jsonl` (the common shape left by
-                # `delete_drained`) previously paid that read for nothing,
-                # every boot, forever. Free fix.
-                log_path = self._log_path(key)
-                if not log_path.exists():
-                    continue
-                # Fault-isolate this key -- a corrupt/unreadable
-                # dead-payload set or offset for ONE key must not abort the
-                # reconcile pass for every other key. The boot
-                # hook this feeds must never crash-loop the share it reads.
-                try:
-                    dead_payloads = self._dead_payload_set(key)
-                    if not dead_payloads:
-                        continue
-                    committed = self._read_committed_offset(key)
-                    complete_end = self._complete_data_end(key)
-                    pos = committed
-                    with open(log_path, "rb") as f:
-                        f.seek(committed)
-                        while pos < complete_end:
-                            raw = f.readline()
-                            if not raw or not raw.endswith(b"\n"):
-                                break
-                            if raw[:-1] not in dead_payloads:
-                                break
-                            pos += len(raw)
-                            total_skipped += 1
-                    if pos > committed:
-                        final = self._offset_path(key)
-                        tmp = self._dir / f"{key}.offset.tmp"
-                        tmp.write_text(str(pos), encoding="utf-8")
-                        os.replace(tmp, final)
-                except (OSError, ValueError):
-                    logger.exception("recovery_reconcile_dead_key_failed key=%s", key)
-                    continue
+                total_skipped += self._reconcile_dead_key(key)
             self._stats_cache = None
             return total_skipped
 

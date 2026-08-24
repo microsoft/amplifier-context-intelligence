@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import pytest
 from unittest.mock import AsyncMock, patch
 
+import pytest
+from context_intelligence_server.handlers.data_layer_3.state import DataLayer3State
 from context_intelligence_server.services import (
     GraphState,
     HookConfig,
     HookStateService,
 )
-
 
 # ---------------------------------------------------------------------------
 # HookConfig tests
@@ -710,3 +710,84 @@ class TestHookStateServiceCreatedBy:
         store = GraphState()
         svc = HookStateService(workspace="/ws", graph_store=store, created_by="carol")
         assert svc.graph.created_by == "carol"
+
+
+class TestDurableCursor:
+    def test_snapshot_restore_round_trips_cursor_state(self) -> None:
+        src = HookStateService(workspace="/ws")
+        src.data_layer_2.iteration_count = 7
+        src.data_layer_2.execution_start_ts = "2026-01-01T00:00:02+00:00"
+        src.data_layer_2.active_iteration_id = "sid::iteration::7"
+        src.data_layer_3.active_recipe_run_stack = ["run-1", "run-2"]
+
+        snapshot = src.snapshot_cursor()
+
+        # A fresh worker (empty in-process state) restores from the snapshot.
+        dst = HookStateService(workspace="/ws")
+        dst.restore_cursor(snapshot)
+        assert dst.data_layer_2.iteration_count == 7
+        assert dst.data_layer_2.execution_start_ts == "2026-01-01T00:00:02+00:00"
+        assert dst.data_layer_2.active_iteration_id == "sid::iteration::7"
+        assert dst.data_layer_3.active_recipe_run_stack == ["run-1", "run-2"]
+
+    def test_restore_none_is_a_noop(self) -> None:
+        svc = HookStateService(workspace="/ws")
+        svc.data_layer_2.iteration_count = 3
+        svc.restore_cursor(None)  # legacy .offset with no cursor
+        assert svc.data_layer_2.iteration_count == 3
+
+    def test_restore_drops_unknown_keys_and_keeps_defaults(self) -> None:
+        svc = HookStateService(workspace="/ws")
+        svc.restore_cursor({"dl2": {"iteration_count": 5, "gone_field": "x"}})
+        assert svc.data_layer_2.iteration_count == 5
+        assert not hasattr(svc.data_layer_2, "gone_field")
+        # A field absent from the record keeps its dataclass default.
+        assert svc.data_layer_2.execution_start_ts is None
+
+    def test_corrupt_record_never_raises(self) -> None:
+        svc = HookStateService(workspace="/ws")
+        svc.restore_cursor({"dl2": "not-a-dict", "dl3": 123})  # type: ignore[dict-item]
+        assert svc.data_layer_2.iteration_count == 0
+
+    def test_restore_cursor_all_or_nothing_under_partial_failure(
+        self, monkeypatch
+    ) -> None:
+        """A failure partway through the restore (the second target's rebuild
+        raises) must leave BOTH live dataclasses at their pre-restore state --
+        never a half-restored hybrid where dl2 was replaced but dl3 was not."""
+        import dataclasses as _dc
+
+        svc = HookStateService(workspace="/ws")
+        svc.data_layer_2.iteration_count = 3
+        svc.data_layer_2.orch_run_seq = 5
+        svc.data_layer_2.active_orch_run_id = "OLD"
+        before_dl2 = svc.data_layer_2
+        before_dl3 = svc.data_layer_3
+
+        real_replace = _dc.replace
+
+        def _fail_on_dl3(obj, **kw):
+            if isinstance(obj, DataLayer3State):
+                raise RuntimeError("injected mid-rebuild failure on dl3")  # noqa: TRY004
+            return real_replace(obj, **kw)
+
+        monkeypatch.setattr(
+            "context_intelligence_server.services.dataclasses.replace", _fail_on_dl3
+        )
+        svc.restore_cursor(
+            {
+                "dl2": {
+                    "iteration_count": 99,
+                    "orch_run_seq": 77,
+                    "active_orch_run_id": "NEW",
+                },
+                "dl3": {},
+            }
+        )
+
+        # Neither live object was reassigned, and dl2's values are untouched.
+        assert svc.data_layer_2 is before_dl2
+        assert svc.data_layer_3 is before_dl3
+        assert svc.data_layer_2.iteration_count == 3
+        assert svc.data_layer_2.orch_run_seq == 5
+        assert svc.data_layer_2.active_orch_run_id == "OLD"

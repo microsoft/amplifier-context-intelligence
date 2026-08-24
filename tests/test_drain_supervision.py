@@ -1096,3 +1096,199 @@ class TestTerminalBatchFlushExhaustion:
         dead = await qm.read_dead_letters(sid)
         assert len(dead) == 1
         assert not qm._log_path(sid).exists(), "delete_drained must have run"
+
+
+class TestRetryDoesNotDuplicateIteration:
+    """In-place retry rolls the cross-handler counter back to its pre-attempt
+    state, so a replayed batch reproduces the SAME node ids instead of
+    duplicating them."""
+
+    async def test_in_place_retry_yields_exactly_one_iteration(self) -> None:
+        reg = SessionRegistry()
+        qm = reg.queue_manager
+        sid = "d1-retry-dedup"
+        # Fail the first multi-record flush exactly once, then succeed (in-place
+        # retry, no respawn). flushed is a SET: a duplicate id shows as an extra
+        # member, and a non-rolled-back counter yields iter::3/iter::4 too.
+        flush_calls = {"n": 0}
+
+        def _fail_first_multi(buf: set[str]) -> bool:
+            if len(buf) > 1:
+                flush_calls["n"] += 1
+                return flush_calls["n"] == 1
+            return False
+
+        graph = _FlakyGraph(fail_when=_fail_first_multi)
+        worker = _make_worker(sid, graph)
+        reg._register_for_test(worker)
+
+        async def _advance_and_buffer(
+            w: SessionWorker, event: str, data: object, handlers: object
+        ) -> None:
+            # Mimic a real enricher: bump the iteration counter, then buffer the
+            # id it produces. Without the pre-retry rollback the counter keeps
+            # climbing across attempts and the replay emits a DIFFERENT id.
+            w.services.data_layer_2.iteration_count += 1
+            w.services.graph.buffer.add(
+                f"iter::{w.services.data_layer_2.iteration_count}"
+            )
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            side_effect=_advance_and_buffer,
+        ):
+            await qm.append(sid, _line("e1", "/ws", {"session_id": sid}))
+            await qm.append(sid, _line("e2", "/ws", {"session_id": sid}))
+            reg.start_drain(worker)
+            await _drain_until_idle(reg, qm, worker, sid)
+            await _cancel_and_await(worker.task)
+
+        # Two records => ids iter::1, iter::2 written exactly once each. A missing
+        # rollback would additionally leave iter::3/iter::4 from the failed attempt.
+        assert graph.flushed == {"iter::1", "iter::2"}
+        assert (await qm.read_batch(sid, 10)).lines == []
+
+
+class TestCursorRestoredOnWorkerRebuild:
+    """A rebuilt worker restores the durable cursor the last commit persisted,
+    so cross-handler counters resume instead of restarting from zero (which
+    would remint node ids and duplicate them)."""
+
+    async def test_orch_run_seq_is_restored_before_a_rebuilt_worker_processes(
+        self,
+    ) -> None:
+        reg = SessionRegistry()
+        qm = reg.queue_manager
+        sid = "d1-cursor-rebuild"
+
+        # A prior worker committed a cursor carrying orch_run_seq=5, leaving one
+        # event still undrained (offset 0) for the rebuilt worker to pick up.
+        await qm.append(sid, _line("e1", "/ws", {"session_id": sid}))
+        await qm.commit(sid, 0, {"dl2": {"orch_run_seq": 5}, "dl3": {}})
+        assert (await qm.read_cursor(sid))["dl2"]["orch_run_seq"] == 5
+
+        # A REBUILT worker: a brand-new SessionWorker whose DataLayer2State starts
+        # at orch_run_seq=0. drain_worker must restore the persisted cursor before
+        # processing, so the counter is 5 (not 0) by the time an event is handled
+        # -- without the restore the next run would remint the already-used seq.
+        graph = _FlakyGraph()
+        worker = _make_worker(sid, graph)
+        assert worker.services.data_layer_2.orch_run_seq == 0
+        reg._register_for_test(worker)
+
+        captured: dict[str, int] = {}
+
+        async def _capture(w: SessionWorker, event, data, handlers) -> None:
+            captured["seq_at_process"] = w.services.data_layer_2.orch_run_seq
+            w.services.graph.buffer.add("e1")
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            side_effect=_capture,
+        ):
+            reg.start_drain(worker)
+            await _drain_until_idle(reg, qm, worker, sid)
+            await _cancel_and_await(worker.task)
+
+        assert captured.get("seq_at_process") == 5, (
+            "drain_worker must restore the durable cursor (orch_run_seq=5) before "
+            "processing any event; a rebuilt worker that starts from 0 would "
+            "remint already-used run ids"
+        )
+
+
+class TestExhaustedBatchCursorRollback:
+    """The dead-letter/isolation redrive must restore the pre-batch cursor,
+    exactly like the in-place-retry branch -- otherwise per-record commits
+    snapshot already-advanced counters and double-count on the redrive."""
+
+    async def test_exhausted_batch_restores_pre_batch_cursor(self) -> None:
+        reg = SessionRegistry()
+        qm = reg.queue_manager
+        sid = "d1-exhausted-dedup"
+
+        # Default _FlakyGraph rejects every multi-record flush, so the 2-record
+        # batch exhausts its retry budget and falls into _handle_exhausted_batch,
+        # which then isolates each single line (single-line flushes succeed).
+        graph = _FlakyGraph()
+        worker = _make_worker(sid, graph)
+        reg._register_for_test(worker)
+
+        async def _advance_and_buffer(
+            w: SessionWorker, event: str, data: object, handlers: object
+        ) -> None:
+            w.services.data_layer_2.iteration_count += 1
+            w.services.graph.buffer.add(
+                f"iter::{w.services.data_layer_2.iteration_count}"
+            )
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            side_effect=_advance_and_buffer,
+        ):
+            await qm.append(sid, _line("e1", "/ws", {"session_id": sid}))
+            await qm.append(sid, _line("e2", "/ws", {"session_id": sid}))
+            reg.start_drain(worker)
+            await _drain_until_idle(reg, qm, worker, sid)
+            await _cancel_and_await(worker.task)
+
+        # The isolation redrive must reproduce iter::1/iter::2. Without the
+        # pre-batch restore the failed batch's advanced counters would leak
+        # through and the isolated lines would flush iter::3/iter::4.
+        assert graph.flushed == {"iter::1", "iter::2"}
+        assert (await qm.read_batch(sid, 10)).lines == []
+
+
+class TestReadCursorFailureQuarantines:
+    """A corrupt/unparseable cursor read degrades to None instead of killing
+    the drain worker -- the committed offset is read separately, so the loss
+    costs at most a bounded replay, never a crash-loop."""
+
+    async def test_read_cursor_valueerror_is_quarantined_not_fatal(
+        self, caplog
+    ) -> None:
+        reg = SessionRegistry()
+        qm = reg.queue_manager
+        sid = "d1-cursor-corrupt"
+
+        await qm.append(sid, _line("e1", "/ws", {"session_id": sid}))
+
+        graph = _FlakyGraph()
+        worker = _make_worker(sid, graph)
+        reg._register_for_test(worker)
+
+        # Simulate a corrupt/legacy-unparseable cursor record: read_cursor raises
+        # ValueError. Before the fix this propagates and kills the drainer.
+        original_read_cursor = qm.read_cursor
+        calls = {"n": 0}
+
+        async def _raising_read_cursor(session_id: str):
+            calls["n"] += 1
+            raise ValueError("unparseable offset document")
+
+        async def _capture(w, event, data, handlers) -> None:
+            w.services.graph.buffer.add("e1")
+
+        with (
+            patch.object(qm, "read_cursor", side_effect=_raising_read_cursor),
+            patch(
+                "context_intelligence_server.registry.process_event",
+                side_effect=_capture,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            reg.start_drain(worker)
+            await _drain_until_idle(reg, qm, worker, sid)
+            await _cancel_and_await(worker.task)
+
+        # The worker degraded (logged a warning) and still drained the event,
+        # rather than dying with a drain_worker_died ERROR.
+        assert calls["n"] >= 1
+        assert graph.flushed == {"e1"}
+        assert any(
+            "cursor_read_failed" in r.getMessage() for r in caplog.records
+        ), "read_cursor failure must log a degrade warning, not crash the worker"
+        assert not any(
+            "drain_worker_died" in r.getMessage() for r in caplog.records
+        ), "a corrupt cursor read must never kill the drainer"
+        _ = original_read_cursor

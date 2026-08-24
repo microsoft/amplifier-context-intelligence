@@ -505,7 +505,12 @@ class TestDeadLetterWarning:
         poison.records = [Record(b"{ this is not valid json", 0, 25)]
 
         with caplog.at_level(logging.WARNING, logger="context_intelligence_server"):
-            await reg._handle_exhausted_batch(worker, poison, handlers=MagicMock())
+            await reg._handle_exhausted_batch(
+                worker,
+                poison,
+                handlers=MagicMock(),
+                pre_batch_cursor=worker.services.snapshot_cursor(),
+            )
 
         reg.queue_manager.dead_letter.assert_awaited()
         records = [

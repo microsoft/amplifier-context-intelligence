@@ -49,11 +49,18 @@ class ContentBlockHandler:
             return HookResult(action="continue")
 
         block_index = data.get("block_index")
-        iteration_id = self.services.data_layer_2.active_iteration_id
-        # ID format is "{session_id}::iteration::{n}"; [-1] extracts the iteration number.
-        # If the cursor format ever changes, this extraction must be updated to match.
-        iteration_n = iteration_id.split("::")[-1] if iteration_id else "0"
-        block_node_id = f"{session_id}::block::{iteration_n}::{block_index}"
+        # Key the block off the FULL active_iteration_id so a block inherits the
+        # iteration's run scope (including the run tiebreaker). Using only the
+        # trailing iteration number would let two runs that share an iteration
+        # number collide on the same block_node_id and MERGE-overwrite.
+        # Resolve the iteration id the same seq-aware way the Iteration handler
+        # does, so after a worker rebuild a block inherits the run's real
+        # iteration scope rather than the run-less fallback.
+        iteration_id = self.services.data_layer_2.resolve_active_iteration_id(
+            session_id
+        )
+        iteration_key = iteration_id if iteration_id else f"{session_id}::iteration::0"
+        block_node_id = f"{iteration_key}::block::{block_index}"
 
         if event == "content_block:start":
             await self._handle_start(session_id, block_node_id, block_index, data)

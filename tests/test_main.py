@@ -1051,7 +1051,7 @@ async def test_crash_recovery_topup_drains_deferred_tail_across_passes(
     # stops reporting them (exactly what a real drainer does on completion).
     for sid in sids[:2]:
         batch = await qm.read_batch(sid, max_items=10)
-        await qm.commit(sid, batch.end_offset)
+        await qm.commit(sid, batch.end_offset, None)
 
     # Pass 2: the previously-DEFERRED tail is now dispatched -- not stranded.
     spawned.clear()
@@ -1324,7 +1324,7 @@ async def test_lifespan_seeds_counters_from_disk(tmp_path: Path) -> None:
     await seed_qm.append(sid, line1)
     await seed_qm.append(sid, line2)
     committed = len(line1) + 1  # +1 for the appended trailing newline
-    await seed_qm.commit(sid, committed)
+    await seed_qm.commit(sid, committed, None)
 
     # Fresh registry reusing the same on-disk queue dir.
     reg = SessionRegistry()

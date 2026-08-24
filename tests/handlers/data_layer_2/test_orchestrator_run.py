@@ -66,7 +66,7 @@ class TestExecutionStartCreatesOrchestratorRun:
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        node_id = "s1::orch_run::2026-01-01T00:00:00Z"
+        node_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
         node = await services.graph.get_node(node_id)
         assert node is not None, f"execution:start must create node at '{node_id}'"
 
@@ -82,7 +82,7 @@ class TestExecutionStartCreatesOrchestratorRun:
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z")
+        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z::1")
         assert node is not None
         assert "OrchestratorRun" in node["labels"], (
             f"OrchestratorRun label missing. Got: {node['labels']}"
@@ -103,7 +103,7 @@ class TestExecutionStartCreatesOrchestratorRun:
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z")
+        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z::1")
         assert node is not None
         assert node.get("session_id") == "s1", (
             f"session_id property missing or wrong. Got: {node!r}"
@@ -124,7 +124,7 @@ class TestExecutionStartCreatesOrchestratorRun:
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z"
+        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
         edge = await services.graph.get_edge("s1", orch_run_id)
         assert edge is not None, (
             f"E01 HAS_EXECUTION edge from 's1' to '{orch_run_id}' must exist"
@@ -191,7 +191,7 @@ class TestExecutionEndUpsertsProperties:
                 "status": "completed",
             },
         )
-        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z")
+        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z::1")
         assert node is not None
         assert node.get("ended_at") == "2026-01-01T00:01:00Z", (
             f"ended_at must be set by execution:end. Got: {node!r}"
@@ -212,7 +212,7 @@ class TestExecutionEndUpsertsProperties:
                 "status": "completed",
             },
         )
-        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z")
+        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z::1")
         assert node is not None
         assert node.get("status") == "completed", (
             f"status must be set by execution:end. Got: {node!r}"
@@ -236,7 +236,7 @@ class TestExecutionEndUpsertsProperties:
                 "response": "final answer text",
             },
         )
-        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z")
+        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z::1")
         assert node is not None
         assert node.get("response") == "final answer text", (
             f"response must be set by execution:end. Got: {node!r}"
@@ -269,7 +269,7 @@ class TestOrchestratorCompleteUpsertsProperties:
                 "turn_count": 3,
             },
         )
-        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z")
+        node = await services.graph.get_node("s1::orch_run::2026-01-01T00:00:00Z::1")
         assert node is not None
         assert node.get("orchestrator_name") == "my-orchestrator", (
             f"orchestrator_name must be set by orchestrator:complete. Got: {node!r}"
@@ -366,7 +366,7 @@ class TestOrchestratorCompleteCursorLifecycle:
                 "turn_count": 1,
             },
         )
-        expected_run_id = "s1::orch_run::2026-01-01T00:00:00Z"
+        expected_run_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
         assert services.data_layer_2.last_completed_orch_run_id == expected_run_id, (
             f"last_completed_orch_run_id must be set to '{expected_run_id}'. "
             f"Got: {services.data_layer_2.last_completed_orch_run_id!r}"
@@ -420,7 +420,7 @@ class TestE14TriggersEdge:
                 "timestamp": "2026-01-01T00:01:00Z",
             },
         )
-        orch_run_id = "s1::orch_run::2026-01-01T00:01:00Z"
+        orch_run_id = "s1::orch_run::2026-01-01T00:01:00Z::1"
         prompt_id = "s1::prompt::2026-01-01T00:00:00Z"
         edge = await services.graph.get_edge(prompt_id, orch_run_id)
         assert edge is not None, (
@@ -509,7 +509,7 @@ class TestOrchestratorRunSourcedFrom:
                 "timestamp": "2026-01-01T00:00:00Z",
             },
         )
-        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z"
+        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
         data_layer_1_node_id = make_node_id(
             "s1", "execution:start", "2026-01-01T00:00:00Z"
         )
@@ -539,7 +539,7 @@ class TestOrchestratorRunSourcedFrom:
                 "status": "completed",
             },
         )
-        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z"
+        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
         data_layer_1_node_id = make_node_id(
             "s1", "execution:end", "2026-01-01T00:01:00Z"
         )
@@ -570,7 +570,7 @@ class TestOrchestratorRunSourcedFrom:
                 "turn_count": 3,
             },
         )
-        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z"
+        orch_run_id = "s1::orch_run::2026-01-01T00:00:00Z::1"
         data_layer_1_node_id = make_node_id(
             "s1", "orchestrator:complete", "2026-01-01T00:02:00Z"
         )
@@ -581,3 +581,58 @@ class TestOrchestratorRunSourcedFrom:
         assert edge.get("type") == "SOURCED_FROM", (
             f"Edge must have type='SOURCED_FROM'. Got: {edge.get('type')}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Run-id tiebreaker survives a worker rebuild (no seq-less collision)
+# ---------------------------------------------------------------------------
+
+
+class TestRunIdSurvivesRebuild:
+    """Two same-timestamp runs must get distinct ids, and an enrichment event
+    after a cursor rebuild must re-derive the run id WITH the seq -- never the
+    seq-less form that both collides same-timestamp runs and targets a node
+    execution:start never created."""
+
+    async def test_same_timestamp_runs_get_distinct_ids(
+        self, services: HookStateService
+    ) -> None:
+        handler = OrchestratorRunHandler(services)
+        ts = "2026-01-01T00:00:00Z"
+        await handler("execution:start", {"session_id": "s1", "timestamp": ts})
+        await handler("orchestrator:complete", {"session_id": "s1", "timestamp": ts})
+        await handler("execution:start", {"session_id": "s1", "timestamp": ts})
+
+        first = await services.graph.get_node(f"s1::orch_run::{ts}::1")
+        second = await services.graph.get_node(f"s1::orch_run::{ts}::2")
+        assert first is not None
+        assert second is not None  # distinct id despite identical timestamp
+
+    async def test_enrichment_after_rebuild_redereives_id_with_seq(
+        self, services: HookStateService
+    ) -> None:
+        handler = OrchestratorRunHandler(services)
+        ts = "2026-01-01T00:00:00Z"
+        await handler("execution:start", {"session_id": "s1", "timestamp": ts})
+
+        # Simulate a rebuilt worker restored from a partial/legacy cursor: the
+        # active_orch_run_id is missing, but execution_start_ts and orch_run_seq
+        # survive (they are what the cursor carries).
+        services.data_layer_2.active_orch_run_id = None
+        assert services.data_layer_2.execution_start_ts == ts
+        assert services.data_layer_2.orch_run_seq == 1
+
+        await handler(
+            "execution:end",
+            {"session_id": "s1", "timestamp": ts, "status": "ok"},
+        )
+
+        # The enrichment must land on the seq-qualified node execution:start
+        # created, not a seq-less orphan.
+        enriched = await services.graph.get_node(f"s1::orch_run::{ts}::1")
+        assert enriched is not None
+        assert enriched.get("ended_at") == ts  # RED before fix: enrichment
+        assert enriched.get("status") == "ok"  # went to the seq-less node
+        # And the seq-less collision id must NOT have been created.
+        orphan = await services.graph.get_node(f"s1::orch_run::{ts}")
+        assert orphan is None

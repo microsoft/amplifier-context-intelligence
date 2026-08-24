@@ -16,6 +16,19 @@ class DataLayer2State:
     # OrchestratorRun identity
     execution_start_ts: str | None = None
 
+    # Monotonic per-session run counter, incremented on each execution:start and
+    # folded into orch_run_id. Two runs that share an identical execution_start_ts
+    # (coarse clock, or a replayed execution:start) would otherwise collide on the
+    # same orch_run_id and MERGE-overwrite each other's nodes. Lives here so the
+    # durable cursor persists it across a worker rebuild.
+    orch_run_seq: int = 0
+
+    # The full orch_run_id of the active run, including the tiebreaker. Set at
+    # execution:start and read back by execution:end/orchestrator:complete and
+    # the Iteration/ContentBlock handlers, so every node in one run agrees on the
+    # same id without any site recomputing it from execution_start_ts alone.
+    active_orch_run_id: str | None = None
+
     # Iteration cursor read by ContentBlockHandler + ToolCallHandler
     active_iteration_id: str | None = None
 
@@ -28,6 +41,48 @@ class DataLayer2State:
     # E15 OrchestratorRun→Prompt turn-flow cursor
     last_completed_orch_run_id: str | None = None
 
-    # Iteration counter — incremented on each provider:request; used to compute
-    # iteration_id as '{session_id}::iteration::{iteration_count}'
+    # Iteration counter — incremented on each provider:request; combined with
+    # execution_start_ts (via IterationHandler) to compute the run-scoped
+    # iteration_id '{session_id}::orch_run::{execution_start_ts}::{seq}::iteration::{iteration_count}'
+    # (falls back to the bare '{session_id}::iteration::{iteration_count}' shape when no
+    # orchestrator run is active). Scoped per-session, not reset per run: uniqueness across
+    # runs comes from the orch_run_id prefix, not from this counter —
+    # resetting it would collide with ContentBlockHandler's block_node_id derivation, which
+    # keys solely off this counter's value, not the run.
     iteration_count: int = 0
+
+    def resolve_active_orch_run_id(self, session_id: str) -> str | None:
+        """Return the active run's orch_run_id, or None when no run is active.
+
+        Prefers the stored ``active_orch_run_id`` cursor. When that is absent
+        but a run IS active (``execution_start_ts`` set) — a partial cursor
+        after a worker rebuild — re-derives the same
+        ``{session_id}::orch_run::{execution_start_ts}::{seq}`` shape
+        ``execution:start`` produces, so every handler in one run agrees on the
+        id and the HAS_PART edge is never dropped onto a non-existent node.
+        Returns None only when no run is active (a loop-basic session).
+        """
+        if self.active_orch_run_id is not None:
+            return self.active_orch_run_id
+        if self.execution_start_ts is not None:
+            return (
+                f"{session_id}::orch_run::{self.execution_start_ts}"
+                f"::{self.orch_run_seq}"
+            )
+        return None
+
+    def resolve_active_iteration_id(self, session_id: str) -> str | None:
+        """Return the active iteration_id, or None when no iteration is active.
+
+        Prefers the stored ``active_iteration_id`` cursor. When that is absent
+        but a run+iteration is reconstructible (a partial cursor after a
+        rebuild), re-derives ``{orch_run_id}::iteration::{iteration_count}``
+        from the seq-aware run id, so a ContentBlock inherits the same run
+        scope every other handler agrees on rather than an orphan key.
+        """
+        if self.active_iteration_id is not None:
+            return self.active_iteration_id
+        run_id = self.resolve_active_orch_run_id(session_id)
+        if run_id is not None and self.iteration_count > 0:
+            return f"{run_id}::iteration::{self.iteration_count}"
+        return None

@@ -95,7 +95,7 @@ async def test_committing_rec_end_advances_exactly_one_record(qm, tmp_path):
     await qm.append("s1", b"third")
 
     batch = await qm.read_batch("s1", max_items=10)
-    await qm.commit("s1", batch.records[0].end)
+    await qm.commit("s1", batch.records[0].end, None)
 
     remaining = await qm.read_batch("s1", max_items=10)
     assert [r.raw for r in remaining.records] == [b"second", b"third"]
@@ -208,7 +208,7 @@ async def test_commit_advances_offset(qm):
     await qm.append("s1", b"a")
     await qm.append("s1", b"b")
     first = await qm.read_batch("s1", max_items=1)
-    await qm.commit("s1", first.end_offset)
+    await qm.commit("s1", first.end_offset, None)
     await qm.append("s1", b"c")
     second = await qm.read_batch("s1", max_items=10)
     assert second.lines == [b"b", b"c"]
@@ -221,7 +221,7 @@ async def test_commit_persists_across_a_new_instance(tmp_path):
     await qm1.append("s1", b"a")
     await qm1.append("s1", b"b")
     batch = await qm1.read_batch("s1", max_items=1)
-    await qm1.commit("s1", batch.end_offset)
+    await qm1.commit("s1", batch.end_offset, None)
     qm2 = FileSystemQueueManager(queues_dir=qdir)  # simulate restart
     resumed = await qm2.read_batch("s1", max_items=10)
     assert resumed.lines == [b"b"]
@@ -229,9 +229,9 @@ async def test_commit_persists_across_a_new_instance(tmp_path):
 
 async def test_commit_is_atomic_no_temp_leftover(qm, tmp_path):
     await qm.append("s1", b"a")
-    await qm.commit("s1", 2)
+    await qm.commit("s1", 2, None)
     qdir = tmp_path / "queues"
-    assert (qdir / "s1.offset").read_text("utf-8") == "2"
+    assert (qdir / "s1.offset").read_text("utf-8") == '{"v":1,"offset":2,"cursor":null}'
     assert list(qdir.glob("*.tmp")) == []
 
 
@@ -315,9 +315,35 @@ async def test_active_sessions_excludes_fully_committed(qm):
     await qm.append("s_active", b"x")  # appended, never committed -> undrained
     await qm.append("s_done", b"y")
     done = await qm.read_batch("s_done", max_items=10)
-    await qm.commit("s_done", done.end_offset)  # drained
+    await qm.commit("s_done", done.end_offset, None)  # drained
     active = await qm.active_sessions()
     assert active == ["s_active"]
+
+
+async def test_is_fully_drained_true_for_unknown_session(qm):
+    assert await qm.is_fully_drained("never_seen") is True
+
+
+async def test_is_fully_drained_false_while_uncommitted(qm):
+    await qm.append("s1", b"x")
+    assert await qm.is_fully_drained("s1") is False
+
+
+async def test_is_fully_drained_true_after_commit(qm):
+    await qm.append("s1", b"x")
+    batch = await qm.read_batch("s1", max_items=10)
+    await qm.commit("s1", batch.end_offset, None)
+    assert await qm.is_fully_drained("s1") is True
+
+
+async def test_is_fully_drained_ignores_torn_trailing_fragment(qm, tmp_path):
+    # A torn tail (bytes after the final newline) is not complete data, so a
+    # session whose complete lines are all committed reads as drained.
+    log = tmp_path / "queues" / "s1.log"
+    log.write_bytes(b"a\nb\nTORN_PARTIAL")
+    batch = await qm.read_batch("s1", max_items=10)
+    await qm.commit("s1", batch.end_offset, None)
+    assert await qm.is_fully_drained("s1") is True
 
 
 async def test_recover_empty_dir_is_safe(qm):
@@ -328,7 +354,7 @@ async def test_recover_reports_session_with_uncommitted_complete_line(qm, tmp_pa
     log = tmp_path / "queues" / "s1.log"
     log.write_bytes(b"a\nb\nTORN")  # two complete lines + torn tail
     assert await qm.recover() == ["s1"]
-    await qm.commit("s1", 4)  # past 'a\nb\n' == 4 bytes
+    await qm.commit("s1", 4, None)  # past 'a\nb\n' == 4 bytes
     assert await qm.recover() == []  # only torn tail remains -> not recoverable
 
 
@@ -359,7 +385,7 @@ async def test_read_batch_rejects_unsafe_session_id(qm, bad_id):
 @pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])
 async def test_commit_rejects_unsafe_session_id(qm, bad_id):
     with pytest.raises(ValueError):
-        await qm.commit(bad_id, 0)
+        await qm.commit(bad_id, 0, None)
 
 
 @pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])
@@ -379,7 +405,7 @@ async def test_delete_drained_removes_log_and_offset_keeps_dead(tmp_path) -> Non
 
     qm = FileSystemQueueManager(queues_dir=tmp_path)
     await qm.append("s", b"line")
-    await qm.commit("s", 5)
+    await qm.commit("s", 5, None)
     await qm.dead_letter("s", b"bad\n", "boom")
 
     await qm.delete_drained("s")
@@ -473,7 +499,7 @@ async def test_recovery_seed_counts_pending_and_committed(qm):
     await qm.append("s1", b"a")
     await qm.append("s1", b"b")
     await qm.append("s1", b"c")
-    await qm.commit("s1", 4)  # commit the first two complete lines
+    await qm.commit("s1", 4, None)  # commit the first two complete lines
 
     accepted, written = await qm.recovery_seed_counts()
 
@@ -484,7 +510,7 @@ async def test_recovery_seed_counts_pending_and_committed(qm):
 async def test_recovery_seed_counts_committed_includes_dead(qm):
     # C=1 committed, P=0 pending, D=1 dead. before-dead == 0.
     await qm.append("s2", b"a")
-    await qm.commit("s2", 2)
+    await qm.commit("s2", 2, None)
     await qm.dead_letter("s2", b"a", error="boom")
 
     accepted, written = await qm.recovery_seed_counts()
@@ -508,10 +534,10 @@ async def test_recovery_seed_counts_residual_is_zero_mixed_shape(qm):
     await qm.append("a", b"1")
     await qm.append("a", b"2")
     await qm.append("a", b"3")
-    await qm.commit("a", 4)
+    await qm.commit("a", 4, None)
     # Key B: 1 committed + 1 dead.
     await qm.append("b", b"x")
-    await qm.commit("b", 2)
+    await qm.commit("b", 2, None)
     await qm.dead_letter("b", b"x", error="boom")
     # Key C: dead-only (log reclaimed).
     await qm.dead_letter("c", b"poison", error="boom")
@@ -601,7 +627,7 @@ async def test_recovery_seed_counts_replay_window_residual_zero(qm):
     # log = [line0 committed][line0 re-appended pending]. C=1, P=1, D=1.
     # The re-appended line is absorbed into accepted_seed (counted in P and D).
     await qm.append("s6", b"a")
-    await qm.commit("s6", 2)
+    await qm.commit("s6", 2, None)
     await qm.dead_letter("s6", b"a", error="boom")
     await qm.append("s6", b"a")  # re-append the dead line for replay
 
@@ -641,7 +667,7 @@ async def test_spool_stats_fully_committed_session_not_pending(qm):
     (spool_bytes_total still reflects them)."""
     await qm.append("s1", b"a")
     line = b"a\n"
-    await qm.commit("s1", len(line))
+    await qm.commit("s1", len(line), None)
 
     stats = await qm.spool_stats()
 
@@ -666,7 +692,7 @@ async def test_spool_stats_multiple_sessions_aggregate(qm):
     await qm.append("s1", b"a")  # pending
     await qm.append("s2", b"b")
     line = b"b\n"
-    await qm.commit("s2", len(line))  # fully committed, not pending
+    await qm.commit("s2", len(line), None)  # fully committed, not pending
     await qm.append("s3", b"c")  # pending
 
     stats = await qm.spool_stats()
@@ -825,7 +851,7 @@ async def test_recovery_seed_counts_unchanged_under_streaming(qm):
     await qm.append("s1", b"a")
     await qm.append("s1", b"bb")
     line1 = b"a\n"
-    await qm.commit("s1", len(line1))  # 1 written, 1 still pending
+    await qm.commit("s1", len(line1), None)  # 1 written, 1 still pending
 
     accepted, written = await qm.recovery_seed_counts()
 
@@ -927,9 +953,173 @@ async def test_spool_stats_healthy_offsets_report_zero_corrupt(qm):
     fire on the normal committed-offset path)."""
     await qm.append("s1", b"a")
     line = b"a\n"
-    await qm.commit("s1", len(line))  # writes a valid numeric .offset
+    await qm.commit("s1", len(line), None)  # writes a valid numeric .offset
     qm._spool_cache = None
 
     stats = await qm.spool_stats()
 
     assert stats["corrupt_offsets"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Durable cursor folded into the atomic offset write
+# ---------------------------------------------------------------------------
+
+
+async def test_commit_requires_cursor_argument(qm):
+    """cursor has no default: omitting it fails loudly at call time.
+
+    A default would silently null the cursor on a missed migration site or a
+    rolling deploy against an older signature -- the exact silent-loss class.
+    """
+    with pytest.raises(TypeError):
+        await qm.commit("s1", 0)  # type: ignore[call-arg]
+
+
+async def test_commit_rejects_wrong_typed_cursor(qm):
+    """A non-dict, non-None cursor fails loud at write time.
+
+    Without this, a wrong-typed cursor is written verbatim and silently reads
+    back as None -- the same silent cross-handler-counter reset the required
+    arg exists to prevent.
+    """
+    await qm.append("s1", b"a")
+    with pytest.raises(TypeError):
+        await qm.commit("s1", 2, "not-a-dict")  # type: ignore[arg-type]
+
+
+async def test_commit_persists_cursor_in_same_record_as_offset(qm):
+    cursor = {"dl2": {"iteration_count": 4}, "dl3": {}}
+    await qm.append("s1", b"a")
+    await qm.commit("s1", 2, cursor)
+    assert await qm.read_cursor("s1") == cursor
+    assert qm._read_committed_offset("s1") == 2  # offset + cursor never skew
+
+
+async def test_read_cursor_is_none_for_bare_int_and_missing(qm):
+    assert await qm.read_cursor("never_seen") is None
+    qm._offset_path("s1").write_text("42", encoding="utf-8")  # legacy bare int
+    assert await qm.read_cursor("s1") is None
+    assert qm._read_committed_offset("s1") == 42  # bare-int still parses
+
+
+async def test_rolling_upgrade_bare_int_then_envelope(qm):
+    # An old worker wrote a bare-int offset; the new worker commits an envelope
+    # on top of the same session -- both are readable, the cursor now persists.
+    qm._offset_path("s1").write_text("10", encoding="utf-8")
+    assert await qm.read_cursor("s1") is None
+    await qm.commit("s1", 20, {"dl2": {"iteration_count": 9}, "dl3": {}})
+    assert qm._read_committed_offset("s1") == 20
+    assert await qm.read_cursor("s1") == {"dl2": {"iteration_count": 9}, "dl3": {}}
+
+
+async def test_corrupt_offset_record_raises_not_silently_zero(qm):
+    # A malformed record must raise, never degrade to 0 (0 replays the whole
+    # log and manufactures duplicate nodes -- a worse, quieter failure).
+    qm._offset_path("s1").write_text('{"v":1,"offset":"NaN"}', encoding="utf-8")
+    with pytest.raises(ValueError):
+        qm._read_committed_offset("s1")
+
+
+async def test_commit_is_atomic_across_a_mid_write_crash(qm, tmp_path, monkeypatch):
+    # Simulate os.replace failing mid-commit: the previously committed record
+    # must survive intact (no torn/partial offset file), and no .tmp leaks.
+    await qm.append("s1", b"a")
+    await qm.commit("s1", 2, {"dl2": {"iteration_count": 1}, "dl3": {}})
+
+    import context_intelligence_server.queue_manager.filesystem as qmmod
+
+    def _boom(src, dst):
+        raise OSError("simulated crash during os.replace")
+
+    monkeypatch.setattr(qmmod.os, "replace", _boom)
+    with pytest.raises(OSError):
+        await qm.commit("s1", 99, {"dl2": {"iteration_count": 2}, "dl3": {}})
+    monkeypatch.undo()
+
+    # The pre-crash record is intact; the crashed write left nothing behind.
+    assert qm._read_committed_offset("s1") == 2
+    assert await qm.read_cursor("s1") == {"dl2": {"iteration_count": 1}, "dl3": {}}
+    assert list((tmp_path / "queues").glob("*.tmp")) == []
+
+
+# ---------------------------------------------------------------------------
+# Every .offset writer preserves the cursor (not just commit())
+# ---------------------------------------------------------------------------
+
+
+async def test_compaction_preserves_committed_cursor(qm):
+    """Idle compaction must NOT wipe the cursor the last commit persisted.
+
+    compact_committed_prefix rebases the .offset to 0; if it writes a bare
+    "0" it destroys active_orch_run_id/orch_run_seq moments after commit wrote
+    them. Since queue_compact_enabled defaults True, this is the common path.
+    """
+    cursor = {
+        "dl2": {"active_orch_run_id": "s1::orch_run::T::1", "orch_run_seq": 1},
+        "dl3": {},
+    }
+    await qm.append("s1", b"a")  # bytes [0, 2)
+    await qm.append("s1", b"b")  # bytes [2, 4) -- an undrained tail to keep
+    await qm.commit("s1", 2, cursor)  # commit past the first line only
+
+    reclaimed = await qm.compact_committed_prefix("s1", 0)
+
+    assert reclaimed == 2  # the committed prefix was reclaimed
+    assert qm._read_committed_offset("s1") == 0  # offset rebased
+    assert await qm.read_cursor("s1") == cursor  # RED before fix: cursor wiped
+
+
+async def test_compaction_restore_on_replace_failure_preserves_cursor(qm, monkeypatch):
+    """A failed log-replace restores offset := C AND the cursor with it."""
+    cursor = {"dl2": {"orch_run_seq": 7}, "dl3": {}}
+    await qm.append("s1", b"a")
+    await qm.append("s1", b"b")
+    await qm.commit("s1", 2, cursor)
+
+    import context_intelligence_server.queue_manager.filesystem as qmmod
+
+    real_replace = qmmod.os.replace
+
+    def _fail_log_replace(src, dst):
+        # Fail only the .log replace (Step 6); let the .offset writes through.
+        if str(dst).endswith(".log"):
+            raise OSError("simulated log replace failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(qmmod.os, "replace", _fail_log_replace)
+    reclaimed = await qm.compact_committed_prefix("s1", 0)
+    monkeypatch.undo()
+
+    assert reclaimed == 0  # compaction was a no-op
+    assert qm._read_committed_offset("s1") == 2  # offset restored to C
+    assert await qm.read_cursor("s1") == cursor  # cursor restored with it
+
+
+async def test_recovery_reconcile_dead_preserves_cursor(qm):
+    """Advancing the offset past already-dead lines must keep the cursor."""
+    cursor = {"dl2": {"orch_run_seq": 3}, "dl3": {}}
+    line = b'{"event":"x","workspace":"/ws","data":{}}'
+    await qm.append("s1", line)  # one pending line at offset 0
+    await qm.commit("s1", 0, cursor)  # committed=0, cursor persisted
+    # Dead-letter that exact payload so reconcile steps the offset past it.
+    await qm.dead_letter("s1", line, "poison")
+
+    skipped = await qm.recovery_reconcile_dead()
+
+    assert skipped == 1  # the leading dead line was skipped
+    assert qm._read_committed_offset("s1") == len(line) + 1  # advanced past it
+    assert await qm.read_cursor("s1") == cursor  # RED before fix: cursor wiped
+
+
+async def test_read_cursor_unknown_version_degrades_to_none(qm):
+    """An unknown envelope version keeps the offset but drops the cursor.
+
+    Previously-untested: a forward-version record must read back as (offset,
+    None) rather than handing a foreign-shaped cursor to restore_cursor.
+    """
+    qm._offset_path("s1").write_text(
+        '{"v":2,"offset":5,"cursor":{"dl2":{"orch_run_seq":9}}}', encoding="utf-8"
+    )
+    assert await qm.read_cursor("s1") is None
+    assert qm._read_committed_offset("s1") == 5  # offset preserved

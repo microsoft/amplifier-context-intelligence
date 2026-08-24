@@ -7,8 +7,11 @@
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import fnmatch
 import logging
+from dataclasses import asdict
 from datetime import datetime
 from typing import Any
 
@@ -241,8 +244,89 @@ class HookStateService:
         self.data_layer_3 = DataLayer3State()
 
     # ------------------------------------------------------------------
+    # Durable cursor (survives a worker rebuild)
+    # ------------------------------------------------------------------
+
+    def snapshot_cursor(self) -> dict[str, Any]:
+        """Return a JSON-safe snapshot of cross-handler cursor state.
+
+        Snapshots the whole ``data_layer_2``/``data_layer_3`` dataclasses via
+        ``asdict`` (every field is JSON-native) rather than a hand-picked
+        allowlist that would silently miss a newly added field.
+        """
+        return {
+            "dl2": asdict(self.data_layer_2),
+            "dl3": asdict(self.data_layer_3),
+        }
+
+    def restore_cursor(self, record: dict[str, Any] | None) -> None:
+        """Restore cross-handler cursor state from a persisted snapshot.
+
+        No-op on ``record is None`` (a brand-new session, or a legacy
+        ``.offset`` with no cursor). Otherwise only field NAMES present on the
+        current dataclass are assigned -- unknown/renamed keys are dropped and a
+        field absent from the record keeps its default, so the persisted format
+        tolerates dataclass evolution in both directions without a version bump.
+
+        All-or-nothing: both replacement dataclasses are built and validated
+        BEFORE either live field is reassigned, so a failure partway through can
+        never leave a half-restored hybrid. Any failure is caught and logged,
+        leaving the dataclasses untouched: a corrupt or unexpected cursor must
+        never crash boot.
+        """
+        if record is None:
+            return
+        try:
+            rebuilt: list[tuple[str, Any]] = []
+            for key, target in (
+                ("dl2", self.data_layer_2),
+                ("dl3", self.data_layer_3),
+            ):
+                value = record.get(key)
+                if not isinstance(value, dict):
+                    continue
+                valid_fields = {f.name for f in dataclasses.fields(type(target))}
+                # Deep-copy every override value: pre_batch_cursor is snapshotted
+                # ONCE and replayed on up to _max_delivery_attempts retries, so a
+                # mutable field (e.g. pending_tool_block_ids dict,
+                # active_recipe_run_stack list) shared by reference would let an
+                # attempt's in-place mutation corrupt the baseline the NEXT
+                # rollback restores. Copying severs the live state from the
+                # snapshot so each restore reproduces the identical baseline.
+                overrides = {
+                    name: copy.deepcopy(v)
+                    for name, v in value.items()
+                    if name in valid_fields
+                }
+                # replace() builds a fresh instance; nothing is mutated in place
+                # until every target below has been built successfully.
+                rebuilt.append((key, dataclasses.replace(target, **overrides)))
+        except Exception:
+            logger.warning("cursor_restore_failed", exc_info=True)
+            return
+        for key, new_state in rebuilt:
+            if key == "dl2":
+                self.data_layer_2 = new_state
+            else:
+                self.data_layer_3 = new_state
+
+    # ------------------------------------------------------------------
     # Session node management
     # ------------------------------------------------------------------
+
+    def discard_buffered_writes(self) -> None:
+        """Drop the graph store's buffered writes AND the seen-session cache.
+
+        ``ensure_session_node`` marks a session id in ``_seen_sessions`` after a
+        merely BUFFERED upsert. When the isolation path discards that buffer the
+        node was never flushed, so the cache is now a lie: the re-dispatch would
+        early-return and never re-issue the Session node (losing its
+        status/started_at/StubSession). Clearing the cache with the buffer keeps
+        the two in lockstep -- a re-issued node is an idempotent MERGE, never a
+        duplicate.
+        """
+        self.graph.discard_buffer()
+        self._seen_sessions.clear()
 
     async def ensure_session_node(self, session_id: str, data: dict[str, Any]) -> None:
         """Idempotently create a Session node in the graph for *session_id*.

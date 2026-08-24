@@ -62,12 +62,24 @@ class OrchestratorRunHandler:
     # Sub-handlers
     # ------------------------------------------------------------------
 
+    def _resolve_run_id(self, session_id: str) -> str:
+        """Resolve the OrchestratorRun id an enrichment event must target.
+
+        Delegates to the shared seq-aware resolver so every handler agrees on
+        the id shape. The enrichment callers only reach here after guarding on
+        ``execution_start_ts is not None`` (a run is active), so the resolver
+        never returns None here.
+        """
+        run_id = self.services.data_layer_2.resolve_active_orch_run_id(session_id)
+        assert run_id is not None  # guarded by execution_start_ts on every caller
+        return run_id
+
     async def _handle_execution_start(
         self, session_id: str, data: dict[str, Any]
     ) -> None:
         """Create OrchestratorRun node and wire E01 (and optionally E14).
 
-        - Computes orch_run_id as '{session_id}::orch_run::{timestamp}'
+        - Computes orch_run_id as '{session_id}::orch_run::{timestamp}::{seq}'
         - Sets execution_start_ts cursor on DataLayer2State
         - Creates OrchestratorRun:SST_EVENT node with session_id + started_at
         - Creates E01: Session -[:HAS_EXECUTION {sst_semantic: 'CONTAINS'}]-> OrchestratorRun
@@ -75,10 +87,16 @@ class OrchestratorRunHandler:
           OrchestratorRun when last_prompt_id cursor is set
         """
         timestamp: str = data.get("timestamp", "")
-        orch_run_id = f"{session_id}::orch_run::{timestamp}"
+        # Tiebreaker: two runs sharing an identical timestamp (coarse clock or a
+        # replayed execution:start) must not collide on the same orch_run_id.
+        self.services.data_layer_2.orch_run_seq += 1
+        seq = self.services.data_layer_2.orch_run_seq
+        orch_run_id = f"{session_id}::orch_run::{timestamp}::{seq}"
 
-        # Store cursor so execution:end and orchestrator:complete can find this run
+        # Store cursors so execution:end, orchestrator:complete, and the
+        # Iteration/ContentBlock handlers all reuse this exact id.
         self.services.data_layer_2.execution_start_ts = timestamp
+        self.services.data_layer_2.active_orch_run_id = orch_run_id
 
         # Create the OrchestratorRun node
         await self.services.graph.upsert_node(
@@ -130,7 +148,7 @@ class OrchestratorRunHandler:
         if ts is None:
             return
 
-        orch_run_id = f"{session_id}::orch_run::{ts}"
+        orch_run_id = self._resolve_run_id(session_id)
         timestamp: str = data.get("timestamp", "")
 
         node_data: dict[str, Any] = {
@@ -167,7 +185,7 @@ class OrchestratorRunHandler:
         if ts is None:
             return
 
-        orch_run_id = f"{session_id}::orch_run::{ts}"
+        orch_run_id = self._resolve_run_id(session_id)
         timestamp: str = data.get("timestamp", "")
         orchestrator: str = data.get("orchestrator", "")
         turn_count: Any = data.get("turn_count")
@@ -213,3 +231,4 @@ class OrchestratorRunHandler:
         # Update cursors
         self.services.data_layer_2.last_completed_orch_run_id = orch_run_id
         self.services.data_layer_2.execution_start_ts = None
+        self.services.data_layer_2.active_orch_run_id = None

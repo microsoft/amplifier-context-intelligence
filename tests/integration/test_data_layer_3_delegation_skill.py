@@ -236,8 +236,9 @@ class TestSkillLoadViaFullPipeline:
             handlers,
         )
 
-        # iteration_id = SESSION_ID::iteration::1 (first iteration)
-        iteration_id = f"{SESSION_ID}::iteration::1"
+        # A run is active (execution:start fired), so the iteration id is
+        # run-scoped and carries the run tiebreaker (seq 1 for the first run).
+        iteration_id = f"{SESSION_ID}::orch_run::{T1}::1::iteration::1"
         skill_load_id = f"{SESSION_ID}::skill::{SKILL_NAME}::{T2}"
 
         # Verify active_iteration_id was set by IterationHandler
