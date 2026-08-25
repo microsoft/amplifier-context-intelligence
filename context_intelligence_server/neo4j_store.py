@@ -22,7 +22,31 @@ from neo4j import AsyncGraphDatabase
 from neo4j import unit_of_work as _unit_of_work
 from neo4j.exceptions import DriverError, Neo4jError
 
+from context_intelligence_server.config import Neo4jClientConfig
+
 _LOG = logging.getLogger(__name__)
+
+
+def build_bounded_neo4j_driver(
+    config: Neo4jClientConfig,
+    *,
+    max_connection_pool_size: int,
+    max_connection_lifetime: float,
+) -> Any:
+    """Construct an AsyncGraphDatabase driver with a bounded connection pool.
+
+    Single source of truth for the pool-bounding kwargs applied to any driver
+    meant to be shared across many logical callers (the lifespan admin driver,
+    the registry's per-session driver). Both ``main.build_neo4j_driver`` and
+    ``SessionRegistry`` call this so the two never diverge.
+    """
+    return AsyncGraphDatabase.driver(
+        config.url,
+        auth=config.auth,
+        max_connection_pool_size=max_connection_pool_size,
+        max_connection_lifetime=max_connection_lifetime,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Cypher identifier validation
@@ -1179,12 +1203,15 @@ class Neo4jGraphStore:
         flush_chunk_rows: int = 100,
         flush_chunk_bytes: int = 4_194_304,
         neo4j_lock_timeout: float | None = None,
+        driver: Any | None = None,
     ) -> None:
-        """Initialise the store and create the async Neo4j driver.
+        """Initialise the store, reusing or creating the async Neo4j driver.
 
         Args:
             uri:               Bolt/neo4j URI, e.g. ``bolt://localhost:7687``.
+                               Ignored when ``driver`` is provided.
             auth:              ``(username, password)`` tuple, or ``None`` for no-auth.
+                               Ignored when ``driver`` is provided.
             database:          Target Neo4j database name (default: ``"neo4j"``).
             workspace:         Workspace to scope writes to.  ``None`` resolves to
                                ``"default"`` via the ``workspace`` property.
@@ -1195,18 +1222,29 @@ class Neo4jGraphStore:
                                so a blocked flush raises ``Neo4jError``
                                instead of parking forever.  ``None`` disables
                                the timeout (default: no per-transaction limit).
-                               Also sets ``connection_acquisition_timeout`` on
-                               the driver to the same value so pool-exhaustion
-                               failures also surface quickly.
+                               When the store builds its own driver (``driver``
+                               not provided), this also sets
+                               ``connection_acquisition_timeout`` on it to the
+                               same value so pool-exhaustion failures surface
+                               quickly.
+            driver:            A pre-built async driver to reuse instead of
+                               constructing a new one. When provided, this store
+                               does not own the driver's lifecycle: ``close()``
+                               flushes and no-ops on the driver itself, leaving
+                               it open for other stores sharing it.
         """
-        # Explicit auto-retry budget for transient errors (e.g. deadlocks) so the
-        # managed-transaction retry window is deliberate and reviewable rather than
-        # relying on the driver default implicitly. 30.0s is a working default;
-        # design Open Question #3 — verify driver 6.1.0 backoff constants before tuning.
-        driver_kwargs: dict[str, Any] = {"max_transaction_retry_time": 30.0}
-        if neo4j_lock_timeout is not None and neo4j_lock_timeout > 0:
-            driver_kwargs["connection_acquisition_timeout"] = neo4j_lock_timeout
-        self._driver = AsyncGraphDatabase.driver(uri, auth=auth, **driver_kwargs)
+        if driver is not None:
+            self._driver = driver
+            self._owns_driver = False
+        else:
+            # Explicit auto-retry budget for transient errors (e.g. deadlocks) so
+            # the managed-transaction retry window is deliberate and reviewable
+            # rather than relying on the driver default implicitly.
+            driver_kwargs: dict[str, Any] = {"max_transaction_retry_time": 30.0}
+            if neo4j_lock_timeout is not None and neo4j_lock_timeout > 0:
+                driver_kwargs["connection_acquisition_timeout"] = neo4j_lock_timeout
+            self._driver = AsyncGraphDatabase.driver(uri, auth=auth, **driver_kwargs)
+            self._owns_driver = True
         self._database = database
         self._workspace = workspace
         self._created_by: str | None = None
@@ -1223,6 +1261,19 @@ class Neo4jGraphStore:
             if neo4j_lock_timeout and neo4j_lock_timeout > 0
             else None
         )
+
+    # ------------------------------------------------------------------
+    # owns_driver property
+    # ------------------------------------------------------------------
+
+    @property
+    def owns_driver(self) -> bool:
+        """True when this store built its own driver; False when injected.
+
+        Governs ``close()``: a store that does not own its driver must never
+        close it, since other stores may still be using it.
+        """
+        return self._owns_driver
 
     # ------------------------------------------------------------------
     # workspace property
@@ -1633,10 +1684,15 @@ class Neo4jGraphStore:
         # once Neo4j is reachable / duplicates are cleared by the dedup pass).
 
     async def close(self) -> None:
-        """Flush pending writes, await any background task, and close the driver.
+        """Flush pending writes and close the driver, if this store owns it.
 
         Handles event-loop mismatch gracefully when closing the driver from a
         different loop context.  Sets ``_closed`` on completion.
+
+        When the driver was injected (``owns_driver`` is False), the driver is
+        left open: it is shared with other stores/callers and closing it here
+        would break them out from under their own in-flight work. The shared
+        driver's owner is responsible for closing it exactly once.
         """
         # Final flush to persist remaining buffer contents
         try:
@@ -1646,11 +1702,12 @@ class Neo4jGraphStore:
                 "Final flush failed during close; buffered writes may be lost"
             )
 
-        # Close the driver, ignoring event-loop mismatch errors
-        try:
-            await self._driver.close()
-        except RuntimeError:
-            pass
+        if self._owns_driver:
+            # Close the driver, ignoring event-loop mismatch errors
+            try:
+                await self._driver.close()
+            except RuntimeError:
+                pass
 
         self._closed = True
 

@@ -46,6 +46,7 @@ from context_intelligence_server.models import (
     EventResponse,
 )
 from context_intelligence_server.neo4j_store import (
+    build_bounded_neo4j_driver,
     count_untagged_nodes,
     ensure_neo4j_schema,
 )
@@ -71,13 +72,19 @@ def _neo4j_access_const(mode: str) -> str:
 
 
 def build_neo4j_driver(config: Neo4jClientConfig) -> Any:
-    """Construct an AsyncGraphDatabase driver from a resolved Neo4j client config.
+    """Construct the pool-bounded admin AsyncGraphDatabase driver.
 
     Shared by ``lifespan()`` (the admin driver, on every server boot) and
     ``doctor.run_doctor()`` (the CLI), so the two entry points can never
-    construct the connection differently.
+    construct the connection differently. Delegates the actual driver
+    construction to ``build_bounded_neo4j_driver`` so the pool-bounding kwargs
+    have one source of truth, shared with ``SessionRegistry``'s driver.
     """
-    return AsyncGraphDatabase.driver(config.url, auth=config.auth)
+    return build_bounded_neo4j_driver(
+        config,
+        max_connection_pool_size=_settings.neo4j_max_connection_pool_size,
+        max_connection_lifetime=_settings.neo4j_max_connection_lifetime,
+    )
 
 
 # Module-level live identity-map stores. Exactly one is non-None at a time --
@@ -665,6 +672,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("lifespan_shutdown: closing Neo4j drivers")
         await app.state.neo4j_driver.close()
         await app.state.neo4j_query_driver.close()
+        # The registry's shared per-session driver is independent of the two
+        # above (its own pool, built from settings.resolve_neo4j_admin() the
+        # first time a session is created) -- close it here too so no bolt
+        # connection outlives the process.
+        await registry.close_neo4j_driver()
 
 
 app = FastAPI(

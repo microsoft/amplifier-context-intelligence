@@ -12,7 +12,10 @@ from typing import Any
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
-from context_intelligence_server.neo4j_store import Neo4jGraphStore
+from context_intelligence_server.neo4j_store import (
+    Neo4jGraphStore,
+    build_bounded_neo4j_driver,
+)
 from context_intelligence_server.pipeline import process_event, setup_handlers
 from context_intelligence_server.queue_manager import Batch, QueueManager
 from context_intelligence_server.services import HookStateService
@@ -82,6 +85,11 @@ class SessionRegistry:
         self._queue_manager: QueueManager | None = None
         self._write_semaphore: asyncio.Semaphore | None = None
         self._max_delivery_attempts: int = 0
+        # Shared, pool-bounded Neo4j driver for every per-session Neo4jGraphStore
+        # (see _ensure_neo4j_driver). Built lazily for the same reason as
+        # _queue_manager; kept separate from _ensure_infra so the two concerns
+        # can evolve independently.
+        self._neo4j_driver: Any | None = None
         # Live conservation counters surfaced via /status (accepted/written/
         # replayed/write_retries) so silently-dropped events are observable.
         self._accepted_total: int = 0
@@ -124,6 +132,38 @@ class SessionRegistry:
         if self._queue_manager is not None:
             return self._queue_manager.queues_dir
         return Path(get_settings().queues_path)
+
+    def _ensure_neo4j_driver(self) -> Any:
+        """Build the shared, pool-bounded Neo4j driver on first use.
+
+        Lazy for the same reason as ``_ensure_infra``. Kept as its own method
+        (not folded into ``_ensure_infra``) so the two constructions stay
+        independent edits.
+        """
+        if self._neo4j_driver is None:
+            settings = get_settings()
+            admin = settings.resolve_neo4j_admin()
+            self._neo4j_driver = build_bounded_neo4j_driver(
+                admin,
+                max_connection_pool_size=settings.neo4j_max_connection_pool_size,
+                max_connection_lifetime=settings.neo4j_max_connection_lifetime,
+            )
+        return self._neo4j_driver
+
+    @property
+    def neo4j_driver(self) -> Any:
+        """The single shared, pool-bounded driver used by every per-session
+        Neo4jGraphStore -- never closed by a per-session finalize."""
+        return self._ensure_neo4j_driver()
+
+    async def close_neo4j_driver(self) -> None:
+        """Close the shared driver exactly once, at process shutdown.
+
+        No-op if the driver was never built (no session has run yet).
+        """
+        if self._neo4j_driver is not None:
+            await self._neo4j_driver.close()
+            self._neo4j_driver = None
 
     @property
     def write_semaphore(self) -> asyncio.Semaphore:
@@ -782,6 +822,7 @@ class SessionRegistry:
             neo4j_store = Neo4jGraphStore(
                 uri=_admin.url,
                 auth=_admin.auth,
+                driver=self.neo4j_driver,
                 flush_chunk_rows=settings.neo4j_flush_chunk_rows,
                 flush_chunk_bytes=settings.neo4j_flush_chunk_bytes,
                 neo4j_lock_timeout=settings.neo4j_lock_timeout,
