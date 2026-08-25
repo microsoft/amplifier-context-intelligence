@@ -223,7 +223,7 @@ async def test_enforce_refusal_aborts_real_startup_before_boot_task(
     with (
         patch("context_intelligence_server.main.setup_logging"),
         patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
             return_value=mock_driver,
         ),
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
@@ -784,7 +784,7 @@ async def test_shutdown_never_raises_with_busy_gate(
         with (
             patch("context_intelligence_server.main.setup_logging"),
             patch(
-                "context_intelligence_server.main.AsyncGraphDatabase.driver",
+                "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
                 return_value=mock_driver,
             ),
             patch(

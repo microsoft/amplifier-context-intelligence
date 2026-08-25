@@ -1295,7 +1295,7 @@ async def test_shutdown_cancels_sweep_and_boot_tasks_before_closing_drivers(
     with (
         patch("context_intelligence_server.main.setup_logging"),
         patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
             return_value=mock_driver,
         ),
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
@@ -1334,7 +1334,7 @@ async def test_lifespan_survives_schema_init_neo4j_unreachable(
     with (
         patch("context_intelligence_server.main.setup_logging"),
         patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
             return_value=mock_driver,
         ),
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=schema_mock),
@@ -1367,7 +1367,7 @@ async def test_boot_reconcile_proceeds_past_schema_once_neo4j_recovers(
     with (
         patch("context_intelligence_server.main.setup_logging"),
         patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
             return_value=mock_driver,
         ),
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
@@ -1400,7 +1400,7 @@ async def test_lifespan_survives_schema_data_conflict_records_boot_fail(
     with (
         patch("context_intelligence_server.main.setup_logging"),
         patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
             return_value=mock_driver,
         ),
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),

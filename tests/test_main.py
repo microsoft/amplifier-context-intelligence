@@ -720,7 +720,7 @@ async def test_lifespan_creates_and_closes_driver(
             "context_intelligence_server.main.setup_logging",
         ) as mock_setup_logging,
         patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
             return_value=mock_driver,
         ) as mock_driver_factory,
     ):
@@ -782,7 +782,7 @@ async def test_lifespan_recovers_and_respawns_drainers(
     with (
         patch("context_intelligence_server.main.setup_logging"),
         patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
             return_value=mock_driver,
         ),
         patch(
@@ -824,7 +824,7 @@ async def test_lifespan_skips_recovery_for_empty_workspace(
     with (
         patch("context_intelligence_server.main.setup_logging"),
         patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
             return_value=mock_driver,
         ),
         patch(
@@ -881,7 +881,7 @@ async def test_lifespan_default_respawns_all_recovered_sessions_unbounded(
     with (
         patch("context_intelligence_server.main.setup_logging"),
         patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
             return_value=mock_driver,
         ),
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
@@ -915,7 +915,7 @@ async def test_lifespan_respawn_cap_defers_remainder_and_logs_warning(
     with (
         patch("context_intelligence_server.main.setup_logging"),
         patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
             return_value=mock_driver,
         ),
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
@@ -962,7 +962,7 @@ async def test_lifespan_deferred_sessions_untouched_and_recoverable_next_boot(
     with (
         patch("context_intelligence_server.main.setup_logging"),
         patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
             return_value=mock_driver,
         ),
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
@@ -1004,7 +1004,7 @@ async def test_lifespan_respawn_cap_zero_defers_everything(
     with (
         patch("context_intelligence_server.main.setup_logging"),
         patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
             return_value=mock_driver,
         ),
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
@@ -1079,7 +1079,7 @@ async def test_lifespan_enables_sweep_under_finite_limit(
     with (
         patch("context_intelligence_server.main.setup_logging"),
         patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
             return_value=mock_driver,
         ),
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
@@ -1108,7 +1108,7 @@ async def test_lifespan_no_sweep_when_limit_unbounded(
     with (
         patch("context_intelligence_server.main.setup_logging"),
         patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
             return_value=mock_driver,
         ),
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
@@ -1139,7 +1139,7 @@ async def test_lifespan_no_sweep_when_interval_zero(
     with (
         patch("context_intelligence_server.main.setup_logging"),
         patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
             return_value=mock_driver,
         ),
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
@@ -1282,7 +1282,7 @@ async def test_lifespan_does_not_raise_when_health_check_itself_fails(
     with (
         patch("context_intelligence_server.main.setup_logging"),
         patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
             return_value=mock_driver,
         ),
         patch(

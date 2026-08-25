@@ -18,7 +18,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
-from neo4j import READ_ACCESS, WRITE_ACCESS, AsyncGraphDatabase
+from neo4j import READ_ACCESS, WRITE_ACCESS
 
 from context_intelligence_server import __version__
 from context_intelligence_server.auth import (
@@ -622,9 +622,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Admin (read/write): schema init + all mutation paths. Shares
     # build_neo4j_driver() with doctor.run_doctor() so the two never diverge.
     app.state.neo4j_driver = build_neo4j_driver(_admin)
-    # Cypher-query (read-intent): /cypher + dashboard reads.
-    app.state.neo4j_query_driver = AsyncGraphDatabase.driver(
-        _query.url, auth=_query.auth
+    # Cypher-query (read-intent): /cypher + dashboard reads. Bounded through the
+    # same helper as the admin driver so every process-wide pool shares one cap.
+    app.state.neo4j_query_driver = build_bounded_neo4j_driver(
+        _query,
+        max_connection_pool_size=_settings.neo4j_max_connection_pool_size,
+        max_connection_lifetime=_settings.neo4j_max_connection_lifetime,
     )
     # Stash the resolved query access_mode so /cypher opens READ sessions without
     # re-resolving settings on every request.
