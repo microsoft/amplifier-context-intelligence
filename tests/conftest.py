@@ -121,6 +121,8 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
         neo4j_flush_chunk_rows: int = _real.neo4j_flush_chunk_rows
         neo4j_flush_chunk_bytes: int = _real.neo4j_flush_chunk_bytes
         neo4j_lock_timeout: float = _real.neo4j_lock_timeout
+        neo4j_max_connection_pool_size: int = _real.neo4j_max_connection_pool_size
+        neo4j_max_connection_lifetime: float = _real.neo4j_max_connection_lifetime
         # Mirrors real Settings fields drain_worker reads via get_settings().
         queue_compact_enabled: bool = _real.queue_compact_enabled
         queue_compact_min_prefix_bytes: int = _real.queue_compact_min_prefix_bytes
