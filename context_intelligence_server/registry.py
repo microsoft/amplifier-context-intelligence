@@ -132,15 +132,15 @@ class SessionRegistry:
 
     @property
     def queues_dir_path(self) -> Path:
-        """Queue directory path, resolved without constructing a QueueManager.
+        """Queue directory path for the WriterLease boot detector.
 
-        Unlike ``queue_manager``, never calls ``_ensure_infra`` -- avoids a
-        race where an observer builds a second QueueManager for the same
-        directory. Falls back to the same expression ``_ensure_infra`` uses,
-        so the two can never disagree.
+        Resolved straight from settings -- the single sanctioned exception to
+        the storage-boundary rule -- so the lease can locate the queue
+        directory WITHOUT constructing a QueueManager (avoiding a race where an
+        observer builds a second one for the same directory). This is the same
+        expression ``_ensure_infra`` feeds the queue-manager factory, so the
+        detector and the constructed queue can never disagree.
         """
-        if self._queue_manager is not None:
-            return self._queue_manager.queues_dir
         return Path(get_settings().queues_path)
 
     def _ensure_neo4j_driver(self) -> Any:

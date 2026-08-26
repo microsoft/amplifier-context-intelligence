@@ -41,10 +41,12 @@ class Batch:
         records: Queue-produced ``Record``s -- each carries its own opaque
             ``start``/``end`` cursor. The queue produces these offsets; a
             caller (the registry) only ever hands them back via ``commit``.
-        start_offset: Byte position in the log where this batch begins.
-        end_offset: Byte position in the log AFTER the last returned record.
-            This is the value passed to ``commit``. When no complete records
-            are available, ``end_offset == start_offset``.
+        start_offset: Opaque queue-produced cursor where this batch begins.
+        end_offset: Opaque queue-produced cursor AFTER the last returned
+            record -- the value handed back to ``commit``. Like ``Record``'s
+            ``start``/``end``, callers MUST NOT compute it or assume it is a
+            byte position; that framing is the queue's private invariant. When
+            no complete records are available, ``end_offset == start_offset``.
     """
 
     session_id: str
@@ -66,13 +68,11 @@ class Batch:
 class QueueManager(Protocol):
     """Durable, per-session append-only queue.
 
-    The method set mirrors the on-disk backend's public surface. A backend
-    reports its own queue root via ``queues_dir``; every other on-disk detail
-    stays private to the implementation.
+    The method set mirrors the on-disk backend's public surface. No ``Path`` or
+    on-disk-layout detail appears here: a caller enumerates sessions via
+    ``session_keys`` and never learns where (or whether) they live on a disk,
+    so the same consumers run unchanged against any backend.
     """
-
-    @property
-    def queues_dir(self) -> Any: ...
 
     async def heal_torn_tails(self) -> dict[str, int]: ...
 
@@ -109,6 +109,8 @@ class QueueManager(Protocol):
     ) -> dict[str, int]: ...
 
     async def active_sessions(self) -> list[str]: ...
+
+    async def session_keys(self) -> list[str]: ...
 
     async def recover(self) -> list[str]: ...
 

@@ -24,6 +24,7 @@ import context_intelligence_server.main as main_module
 import httpx
 import pytest
 from context_intelligence_server.config import Settings
+from context_intelligence_server.lease_store.filesystem import FileSystemLeaseStore
 from context_intelligence_server.main import lifespan
 from context_intelligence_server.queue_manager import FileSystemQueueManager, QueueManager
 from context_intelligence_server.status import boot_state
@@ -594,10 +595,10 @@ async def test_share_fault_at_boot_continues_in_every_mode(
 ) -> None:
     lease = WriterLease()
 
-    def _boom() -> None:
+    def _boom(_self: object) -> None:
         raise OSError(errno.ESTALE, "stale file handle")
 
-    monkeypatch.setattr(lease, "_read", _boom)
+    monkeypatch.setattr(FileSystemLeaseStore, "read", _boom)
 
     await lease.acquire(_settings(writer_lease_mode=mode), lambda: tmp_path)
 
@@ -644,17 +645,15 @@ async def test_hung_mount_acquire_times_out(tmp_path: Path) -> None:
     lease = WriterLease()
     blocker = threading.Event()
 
-    def _hang() -> None:
+    def _hang(_self: object) -> None:
         blocker.wait(timeout=5.0)
 
-    monkeypatch_target = lease
-    monkeypatch_target._read = _hang  # type: ignore[method-assign]
-
-    start = time.monotonic()
-    await lease.acquire(
-        _settings(writer_lease_acquire_timeout_seconds=0.1), lambda: tmp_path
-    )
-    elapsed = time.monotonic() - start
+    with patch.object(FileSystemLeaseStore, "read", _hang):
+        start = time.monotonic()
+        await lease.acquire(
+            _settings(writer_lease_acquire_timeout_seconds=0.1), lambda: tmp_path
+        )
+        elapsed = time.monotonic() - start
 
     assert lease.acquired is False
     assert lease.error is not None
@@ -663,16 +662,18 @@ async def test_hung_mount_acquire_times_out(tmp_path: Path) -> None:
     blocker.set()
 
 
-async def test_hung_mount_does_not_starve_shared_pool(tmp_path: Path) -> None:
+async def test_hung_mount_does_not_starve_shared_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """F2's bound: a stalled detector can never starve the append/commit path,
     which run on the SHARED default executor."""
     lease = WriterLease()
     blocker = threading.Event()
 
-    def _hang() -> None:
+    def _hang(_self: object) -> None:
         blocker.wait(timeout=3.0)
 
-    lease._read = _hang  # type: ignore[method-assign]
+    monkeypatch.setattr(FileSystemLeaseStore, "read", _hang)
 
     await lease.acquire(
         _settings(
@@ -721,7 +722,8 @@ async def test_submit_fail_releases_gate(tmp_path: Path) -> None:
         patch.object(wl_module._LEASE_IO, "submit", side_effect=_boom_once),
         pytest.raises(WriterLeaseBusy),
     ):
-        await lease._io(lease._read)
+        assert lease._store is not None
+        await lease._io(lease._store.read)
     assert lease._io_inflight is False
 
     # Re-arm: unpatched, a subsequent op succeeds.
@@ -836,7 +838,7 @@ async def test_status_writer_lease_present_during_boot_zero_disk_reads(
     lease = main_module.writer_lease
     await lease.acquire(_settings(), lambda: tmp_path)
 
-    lease_path = lease.path
+    lease_path = tmp_path / ".writer.lease"
     read_calls = {"n": 0}
     real_read_text = Path.read_text
 

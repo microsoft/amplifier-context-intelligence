@@ -5,6 +5,34 @@ All notable changes to the Context Intelligence Server are recorded here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.3.0]
+
+### Added
+
+- **`lease_store` package.** Writer-lease persistence now lives behind a
+  backend-neutral `LeaseStore` protocol (`protocol` + `filesystem` + `factory`),
+  the fourth storage backend alongside `blob_store`, `queue_manager`, and
+  `identity_store`. The writer-lease detector keeps all policy (staleness,
+  conflict, the bounded single-thread I/O executor) and reaches the lease only
+  through the store, so the same detector runs unchanged against any backend.
+- **`QueueManager.session_keys()`.** A backend-neutral way to enumerate every
+  persisted session key. Boot reclaim sweeps the queue through this method
+  instead of globbing the queue directory, so the sweep works unchanged against
+  any queue backend.
+- **Storage-boundary guard test.** A standing AST tripwire asserts no module
+  outside the four storage backend packages performs a storage-artifact file
+  operation (glob/unlink/scandir) or reads a storage root path; it now also
+  catches a raw `queues_dir` glob/path-join.
+
+### Changed
+
+- **`queues_dir` removed from the `QueueManager` Protocol.** A caller enumerates
+  sessions via `session_keys()` and never learns the on-disk layout. The single
+  sanctioned exception (`registry.queues_dir_path`, used by the WriterLease boot
+  detector) resolves the directory straight from settings. The `Batch`
+  docstring now states its offsets are opaque queue-produced cursors, matching
+  `Record`'s contract.
+
 ## [7.2.0]
 
 ### Added

@@ -320,6 +320,20 @@ async def test_active_sessions_excludes_fully_committed(qm):
     assert active == ["s_active"]
 
 
+async def test_session_keys_empty_for_fresh_queue(qm):
+    assert await qm.session_keys() == []
+
+
+async def test_session_keys_lists_every_persisted_session_sorted(qm):
+    # session_keys enumerates every session that has a log, regardless of drain
+    # state -- both the undrained and the fully-committed one appear, sorted.
+    await qm.append("s_beta", b"x")  # undrained
+    await qm.append("s_alpha", b"y")
+    done = await qm.read_batch("s_alpha", max_items=10)
+    await qm.commit("s_alpha", done.end_offset, None)  # drained but still present
+    assert await qm.session_keys() == ["s_alpha", "s_beta"]
+
+
 async def test_is_fully_drained_true_for_unknown_session(qm):
     assert await qm.is_fully_drained("never_seen") is True
 

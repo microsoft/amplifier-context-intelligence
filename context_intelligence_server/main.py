@@ -429,9 +429,9 @@ async def _boot_reclaim() -> None:
     # sync with test monkeypatches bound to the same object.
     settings = _settings
     boot_state.reclaim_enabled = settings.reclaim_enabled
-    # Iterate the QueueManager's own directory, not settings.queues_path --
-    # the two can differ (tests do this routinely).
-    keys = sorted(p.stem for p in qm.queues_dir.glob("*.log"))
+    # Enumerate the queue through the backend-neutral protocol method, not a
+    # raw directory glob, so the sweep works unchanged against any backend.
+    keys = await qm.session_keys()
     reclaimed = 0
     reclaimed_bytes = 0
     kept = 0
@@ -469,9 +469,8 @@ async def _boot_reclaim() -> None:
         # gated: they can act on a log whose offset was merely unreadable.
         if c.verdict.value != "drained" and not settings.reclaim_enabled:
             logger.warning(
-                "boot_reclaimed reason=%s path=%s session=%s bytes=%d action=dry_run",
+                "boot_reclaimed reason=%s session=%s bytes=%d action=dry_run",
                 c.reason,
-                qm.queues_dir / f"{key}.log",
                 key,
                 c.size,
             )

@@ -1708,6 +1708,21 @@ class FileSystemQueueManager:
 
         return await asyncio.to_thread(_scan)
 
+    async def session_keys(self) -> list[str]:
+        """Return every persisted session key (sorted).
+
+        A session key is present whenever the backend holds a queue log for it,
+        regardless of drain state or live-worker status. Callers that need to
+        sweep the whole queue (e.g. boot reclaim) enumerate here rather than
+        reaching into the backend's on-disk layout, so the sweep works
+        unchanged against any backend.
+        """
+
+        def _scan() -> list[str]:
+            return sorted(log.stem for log in self._dir.glob("*.log"))
+
+        return await asyncio.to_thread(_scan)
+
     async def is_fully_drained(self, session_id: str) -> bool:
         """True iff the session has no undrained log data left.
 
