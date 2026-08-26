@@ -5,7 +5,7 @@ All notable changes to the Context Intelligence Server are recorded here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [6.8.0]
+## [7.0.0]
 
 ### Changed (breaking)
 
@@ -15,25 +15,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never skew. This is a breaking change to the `QueueManager` Protocol that any
   alternate backend must implement; all in-repo callers are updated. A legacy
   bare-integer `.offset` written by an older build still reads its committed
-  position correctly, so an in-place upgrade is safe. The minor version bump
-  reflects the breaking Protocol surface change.
-- **`QueueManager` Protocol gains `read_cursor`, `is_fully_drained`, and
-  `reconcile_dead`** as members every backend must provide. `read_cursor`
-  returns the persisted cursor for a rebuilt worker; `is_fully_drained` reports
-  whether a session has undrained log data; `reconcile_dead` advances one
-  session's committed offset past its leading already-dead lines.
+  position correctly, so an in-place upgrade is safe.
+- **`QueueManager` Protocol gains `read_cursor`** as a member every backend
+  must provide: it returns the persisted cursor a rebuilt worker resumes from.
+  Log-structured-queue details stay off the Protocol -- dead-line
+  reconciliation is a filesystem-backend concern (a broker backend has no
+  leading-dead-line window), so it is reached through the concrete backend, not
+  the Protocol.
 
 ### Fixed
 
-- The durable cursor now survives every offset-mutation path, not just
-  `commit()`: idle compaction, the boot `RESET_OFFSET` reclaim, and finalize's
-  `delete_drained` preserve a non-empty cursor instead of wiping it with a bare
-  offset write.
-- `commit()` writes under the same per-key file lock as compaction, closing a
-  race where a concurrent commit during compaction could be silently erased.
+- The durable cursor now survives every offset-mutation path that keeps the
+  session alive, not just `commit()`: idle compaction and the boot
+  `RESET_OFFSET` reclaim preserve a non-empty cursor instead of wiping it with
+  a bare offset write. Finalize's `delete_drained` still drops it, which is
+  terminal cleanup, not loss: the session is over.
+- Every write to a session's `.offset` now happens through one writer that
+  takes the session's file lock itself and stages through a per-write temp
+  file. Previously the lock was the caller's job, and the dead-letter
+  reconcile reached by `read_batch` took none -- a commit racing it was
+  silently rolled back to the offset the reconcile had read (measured: 248 of
+  300 concurrent runs), and the shared temp name let one writer publish
+  another's half-written record.
 - A corrupt/unparseable `.offset` file now quarantines the one affected drain
   worker (logged, closed, deregistered) instead of crash-looping it; other
-  sessions keep draining.
+  sessions keep draining. Every read in the drain loop is covered, including
+  the idle dry-exit recheck and the `session:end` tail drain, which previously
+  escaped to the supervisor.
 - Cross-handler run-id resolution is consistent across the orchestrator-run,
   iteration, and content-block handlers, so a partial cursor after a worker
   rebuild no longer drops the `HAS_PART` edge or orphans ContentBlock nodes.
@@ -43,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A crash-then-respawn mid-isolation no longer re-dead-letters an
   already-dead-lettered record: the drain worker reconciles the session's
   leading dead lines on every (re)spawn, not only at boot.
+- Finalizing a session retires its dead letters out of the session's own name
+  instead of leaving them in place. A later session reusing the id no longer
+  reconciles against the previous session's dead payloads and commits past
+  events it never processed. The payloads are retained, still reported by
+  `GET /queues/dead-letter/{key}`, and still expire on their own schedule.
 - The Session node survives an exhausted-batch isolation: discarding the failed
   batch's buffer now also invalidates the seen-session cache, so the isolated
   re-dispatch re-issues the node instead of early-returning.

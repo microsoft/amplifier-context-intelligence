@@ -5,11 +5,12 @@ Per session ``<id>``: ``.log`` (append-only, ``\\n``-terminated records),
 letters), ``.log.compact.tmp`` (transient compaction copy).
 
 Framing (one event == one ``\\n``-terminated byte range) holds only while a
-single process writes the directory; each key's ``file_lock`` (a
-``threading.Lock`` held on the writing thread) serialises its writes. Records
-must contain no raw ``0x0A`` except the terminator. ``session_id`` is the raw
-filename stem and is rejected if empty or containing a separator or null byte.
-Appends are not ``fsync``ed: crash-durable, not power-loss-durable.
+single process writes the directory; each key's ``file_lock`` (held on the
+writing thread) serialises its writes, including every write of the ``.offset``
+record. Records must contain no raw ``0x0A`` except the terminator.
+``session_id`` is the raw filename stem and is rejected if empty or containing a
+separator or null byte. Appends are not ``fsync``ed: crash-durable, not
+power-loss-durable.
 """
 
 from __future__ import annotations
@@ -22,11 +23,12 @@ import logging
 import os
 import threading
 import time
+import uuid
 from collections.abc import Callable, Coroutine, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Self, TypeVar
 
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.queue_manager.protocol import Batch, Record
@@ -34,6 +36,10 @@ from context_intelligence_server.queue_manager.protocol import Batch, Record
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+# Ending shared by every ``.offset`` staging file, so one glob still reaps
+# strays left by a crash mid-write (``reclaim_orphans``).
+_OFFSET_TMP_SUFFIX = ".offset.tmp"
 
 # Fixed buffer size for streaming scans over a session ``.log`` (last-newline
 # search and newline counting). Bounds boot-time and /status memory to O(chunk)
@@ -97,12 +103,51 @@ def _reclaim_redrain_max_bytes() -> int:
     return get_settings().reclaim_redrain_max_bytes
 
 
+class _KeyLock:
+    """A reentrant lock whose held state can be observed.
+
+    Reentrancy is required because ``_write_offset_record`` takes this lock
+    itself while callers that need a wider atomic sequence (compaction, the
+    dead-letter reconcile) already hold it. ``threading.RLock`` alone would do,
+    but exposes no way to ask whether it is held, and the framing guarantees
+    here are asserted against exactly that.
+
+    ``depth`` is only ever changed while the lock is held, so a concurrent
+    reader sees either 0 (free) or a positive count (held).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._depth = 0
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if not self._lock.acquire(blocking, timeout):
+            return False
+        self._depth += 1
+        return True
+
+    def release(self) -> None:
+        self._depth -= 1
+        self._lock.release()
+
+    def locked(self) -> bool:
+        """Whether any thread currently holds this lock."""
+        return self._depth > 0
+
+    def __enter__(self) -> Self:
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.release()
+
+
 @dataclass
 class _KeyGuard:
     """Serializes access to one worker key's files.
 
-    ``file_lock`` (``threading.Lock``): correctness lock for the bytes, held on
-    the writing thread so no coroutine cancellation can release it mid-write.
+    ``file_lock`` (``_KeyLock``): correctness lock for the bytes, held on the
+    writing thread so no coroutine cancellation can release it mid-write.
     ``admission`` (``Semaphore(1)``): caps dispatched threads per key so one
     key cannot occupy the shared executor; not a correctness lock.
     ``waiters``: exact count of coroutines referencing this guard.
@@ -111,7 +156,7 @@ class _KeyGuard:
     """
 
     admission: asyncio.Lock
-    file_lock: threading.Lock
+    file_lock: _KeyLock
     waiters: int = 0
 
 
@@ -170,6 +215,11 @@ class FileSystemQueueManager:
         # AND waiters == 1 (see _guard / delete_drained). No sweeper, no
         # timer, no refcount map, no eviction on the hot path.
         self._guards: dict[str, _KeyGuard] = {}
+        # Serialises get-or-create of _guards. Guards are minted from the event
+        # loop (_guard) AND from worker threads (_key_guard, via the offset
+        # writer), and two guards for one key would mean two locks over the same
+        # bytes -- exactly the tear the guard exists to prevent.
+        self._guards_mutex = threading.Lock()
         # Sessions with a dead-letter written since their last read_batch. A
         # crash in the dead_letter->commit gap leaves a leading already-dead
         # line uncommitted; the NEXT read_batch reconciles past it (once, then
@@ -207,33 +257,67 @@ class FileSystemQueueManager:
         """
         return self._dir / f"{session_id}.log.compact.tmp"
 
+    def _offset_tmp_path(self, session_id: str) -> Path:
+        """A staging path used by exactly one ``.offset`` write.
+
+        The uniqueness component is what makes concurrent writers independent:
+        a shared staging name lets one writer ``os.replace`` a file the other is
+        still filling, publishing a half-written record. Keeps the
+        ``.offset.tmp`` ending so ``reclaim_orphans`` still reaps strays.
+        """
+        unique = f"{os.getpid()}-{uuid.uuid4().hex}"
+        return self._dir / f"{session_id}.{unique}{_OFFSET_TMP_SUFFIX}"
+
+    def _offset_tmp_owner(self, path: Path) -> str:
+        """Session id a ``.offset.tmp`` staging file belongs to.
+
+        Current names carry exactly one uniqueness component
+        (``<session>.<unique>.offset.tmp``); one left by an older build carries
+        none. Resolve to whichever form has a live ``.log`` so a staging file
+        beside a live session is never mistaken for an orphan.
+        """
+        stem = path.name[: -len(_OFFSET_TMP_SUFFIX)]
+        stripped = stem.rsplit(".", 1)[0]
+        if stripped != stem and self._log_path(stripped).exists():
+            return stripped
+        return stem
+
     def _write_offset_record(
         self, session_id: str, offset: int, cursor: dict[str, Any] | None
     ) -> None:
         """Sole writer of the ``.offset`` file: one atomic JSON record.
 
-        Writes ``{"v": 1, "offset": offset, "cursor": cursor}`` to a temp file
-        and ``os.replace``s it in, so a reader never sees a torn record. Folding
-        the cursor into the SAME record as the offset (not a sidecar file) is
-        what keeps the two from ever skewing: a crash loses both together, never
-        one without the other. No ``fsync`` -- process-crash-durable, not
-        power-durable, matching the rest of this module.
+        Takes the key's ``file_lock`` ITSELF rather than trusting callers to,
+        which is the invariant that keeps the record consistent: every path that
+        moves a session's offset -- commit, compaction's rebase, the
+        dead-letter reconcile -- is serialised here, at the one place it cannot
+        be forgotten. Reentrant, so a caller holding the lock across a wider
+        sequence still nests safely.
+
+        Writes ``{"v": 1, "offset": offset, "cursor": cursor}`` to a per-write
+        temp file and ``os.replace``s it in, so a reader never sees a torn
+        record. Folding the cursor into the SAME record as the offset (not a
+        sidecar file) is what keeps the two from ever skewing: a crash loses
+        both together, never one without the other. No ``fsync`` --
+        process-crash-durable, not power-durable, matching the rest of this
+        module.
         """
         if cursor is not None and not isinstance(cursor, dict):
             raise TypeError(
                 f"cursor must be a dict or None, got {type(cursor).__name__}"
             )
         final = self._offset_path(session_id)
-        tmp = self._dir / f"{session_id}.offset.tmp"
+        tmp = self._offset_tmp_path(session_id)
         record = {"v": 1, "offset": offset, "cursor": cursor}
-        tmp.write_text(json.dumps(record, separators=(",", ":")), encoding="utf-8")
-        try:
-            os.replace(tmp, final)
-        except OSError:
-            # A failed rename leaves the prior committed record intact; drop the
-            # staged temp so a crashed write leaves nothing behind.
-            tmp.unlink(missing_ok=True)
-            raise
+        with self._key_guard(session_id).file_lock:
+            tmp.write_text(json.dumps(record, separators=(",", ":")), encoding="utf-8")
+            try:
+                os.replace(tmp, final)
+            except OSError:
+                # A failed rename leaves the prior committed record intact; drop
+                # the staged temp so a crashed write leaves nothing behind.
+                tmp.unlink(missing_ok=True)
+                raise
 
     def _read_offset_record(self, session_id: str) -> tuple[int, dict[str, Any] | None]:
         """Read the ``.offset`` file, returning ``(offset, cursor)``.
@@ -270,6 +354,23 @@ class FileSystemQueueManager:
     def _read_committed_offset(self, session_id: str) -> int:
         """Committed byte offset; reads envelope, bare-int, and legacy JSON."""
         return self._read_offset_record(session_id)[0]
+
+    def _read_committed_offset_degrading(self, session_id: str) -> int | None:
+        """Committed offset, or ``None`` when the ``.offset`` is unreadable.
+
+        Factors the ``(OSError, ValueError)`` degrade the drain-loop reads
+        already apply (``read_batch`` -> the registry's ``_read_batch``
+        quarantine) so the FINALIZE path -- ``delete_drained`` and
+        ``is_fully_drained``, reached via ``_finalize_session`` on every normal
+        ``session:end`` -- degrades to a safe no-op instead of letting a corrupt
+        ``.offset`` raise out to the drain supervisor. The boot ``RESET_OFFSET``
+        reclaim (cursor-preserving) is what actually heals the file.
+        """
+        try:
+            return self._read_committed_offset(session_id)
+        except (OSError, ValueError):
+            logger.exception("committed_offset_unreadable session=%s", session_id)
+            return None
 
     @staticmethod
     def _last_complete_end(path: Path) -> int:
@@ -366,23 +467,46 @@ class FileSystemQueueManager:
 
     @contextlib.contextmanager
     def _guard(self, worker_key: str) -> Iterator[_KeyGuard]:
-        """Get-or-create this key's guard and register this coroutine as a holder.
+        """Get-or-create this key's guard and register this holder in ``waiters``.
 
-        The lookup and the ``waiters`` increment are one synchronous step with
-        no ``await`` between them, so an uncounted reference is impossible; the
-        ``finally`` decrements. Keep both statements synchronous -- a yield
-        point between them reintroduces the race. Every guarded operation uses
-        this.
+        The get-or-create AND the ``waiters`` increment happen together under
+        ``_guards_mutex``, and ``delete_drained``'s eviction gate takes the same
+        mutex to read ``waiters`` and drop the entry. That mutual exclusion is
+        load-bearing now that ``_guard`` is called from WORKER THREADS as well as
+        the event loop (the boot reconcile and ``reclaim_orphans``): without it,
+        an eviction could slip into the window between the map lookup and the
+        increment, drop the guard this caller is about to hold, and let the next
+        writer mint a SECOND ``_KeyLock`` over the same file (the guard-eviction
+        clobber). The ``finally`` decrements under the mutex too.
         """
-        guard = self._guards.get(worker_key)
-        if guard is None:
-            guard = _KeyGuard(asyncio.Lock(), threading.Lock())
-            self._guards[worker_key] = guard
-        guard.waiters += 1
+        with self._guards_mutex:
+            guard = self._guards.get(worker_key)
+            if guard is None:
+                guard = _KeyGuard(asyncio.Lock(), _KeyLock())
+                self._guards[worker_key] = guard
+            guard.waiters += 1
         try:
             yield guard
         finally:
-            guard.waiters -= 1
+            with self._guards_mutex:
+                guard.waiters -= 1
+
+    def _key_guard(self, worker_key: str) -> _KeyGuard:
+        """This key's guard, minted on first use. Safe from any thread.
+
+        Callers on the event loop should use ``_guard`` instead, so their
+        reference is counted in ``waiters``; this is the raw accessor for code
+        already running on a worker thread.
+        """
+        guard = self._guards.get(worker_key)
+        if guard is not None:
+            return guard
+        with self._guards_mutex:
+            guard = self._guards.get(worker_key)
+            if guard is None:
+                guard = _KeyGuard(asyncio.Lock(), _KeyLock())
+                self._guards[worker_key] = guard
+            return guard
 
     @staticmethod
     def _write_all(fd: int, data: bytes) -> None:
@@ -557,41 +681,54 @@ class FileSystemQueueManager:
                 )
 
     async def read_batch(self, session_id: str, max_items: int) -> Batch:
+        """Read up to ``max_items`` uncommitted records, oldest first.
+
+        Runs under the key's guard, like every other path that touches these
+        bytes: it can advance the offset (the dead-letter reconcile below), and
+        even its pure read must not observe the ``.log`` mid-swap while
+        compaction rebuilds it.
+        """
         self._validate_session_id(session_id)
         path = self._log_path(session_id)
-        # Reconcile past any leading already-dead line ONLY when a dead-letter
-        # was written since the last read (the dirty flag) -- never per poll, so
-        # the full .dead.jsonl read stays off the hot path. Clear the flag
-        # unconditionally: _reconcile_dead_key is fault-isolated (swallows
-        # OSError/ValueError -> 0), so a retry would not help, and leaving the
-        # flag set would re-scan every poll.
-        reconcile = session_id in self._dead_unreconciled
 
-        def _read() -> Batch:
-            if reconcile:
-                self._reconcile_dead_key(session_id)
-                self._dead_unreconciled.discard(session_id)
-            start = self._read_committed_offset(session_id)
-            records: list[Record] = []
-            consumed = 0
-            try:
-                with open(path, "rb") as f:
-                    f.seek(start)
-                    while len(records) < max_items:
-                        raw = f.readline()
-                        if not raw or not raw.endswith(b"\n"):
-                            # EOF, or a torn trailing line with no newline yet:
-                            # ignore the partial line and stop on a line boundary.
-                            break
-                        rec_start = start + consumed
-                        consumed += len(raw)
-                        rec_end = start + consumed
-                        records.append(Record(raw[:-1], rec_start, rec_end))
-            except FileNotFoundError:
-                pass
-            return Batch(session_id, records, start, start + consumed)
+        def _read(guard: _KeyGuard) -> Batch:
+            with guard.file_lock:
+                # Reconcile past any leading already-dead line ONLY when a
+                # dead-letter was written since the last read (the dirty flag)
+                # -- never per poll, so the full .dead.jsonl read stays off the
+                # hot path. Take-and-clear in one step so a dead_letter racing
+                # this read leaves the flag set for the NEXT read rather than
+                # having its request consumed here. Clearing is unconditional:
+                # _reconcile_dead_key is fault-isolated (swallows
+                # OSError/ValueError -> 0), so a retry would not help, and
+                # leaving the flag set would re-scan every poll.
+                if session_id in self._dead_unreconciled:
+                    self._dead_unreconciled.discard(session_id)
+                    self._reconcile_dead_key(session_id)
+                start = self._read_committed_offset(session_id)
+                records: list[Record] = []
+                consumed = 0
+                try:
+                    with open(path, "rb") as f:
+                        f.seek(start)
+                        while len(records) < max_items:
+                            raw = f.readline()
+                            if not raw or not raw.endswith(b"\n"):
+                                # EOF, or a torn trailing line with no newline
+                                # yet: ignore the partial line and stop on a
+                                # line boundary.
+                                break
+                            rec_start = start + consumed
+                            consumed += len(raw)
+                            rec_end = start + consumed
+                            records.append(Record(raw[:-1], rec_start, rec_end))
+                except FileNotFoundError:
+                    pass
+                return Batch(session_id, records, start, start + consumed)
 
-        return await asyncio.to_thread(_read)
+        with self._guard(session_id) as guard:
+            async with guard.admission:
+                return await _await_uninterrupted(asyncio.to_thread(_read, guard))
 
     async def commit(
         self, session_id: str, new_offset: int, cursor: dict[str, Any] | None
@@ -671,6 +808,43 @@ class FileSystemQueueManager:
         # line). Mark the session so the NEXT read_batch reconciles past it once.
         self._dead_unreconciled.add(session_id)
 
+    def _retired_dead_paths(self, session_id: str) -> list[Path]:
+        """This session's retired dead-letter files, oldest first.
+
+        The retirement timestamp sorts lexically, so plain sorting is append
+        order.
+        """
+        return sorted(self._dir.glob(f"{session_id}.finalized-*.dead.jsonl"))
+
+    def _retire_dead_letters(self, session_id: str) -> None:
+        """Move a finalized session's dead letters out of its own name.
+
+        A session id can be reused. Left in place, the previous session's
+        ``.dead.jsonl`` would make the new session's reconcile pass skip log
+        lines whose bytes merely match an OLD dead payload -- committing past
+        events that were never processed. Renaming ends that: the reconcile
+        only ever reads the live name. Nothing is discarded -- the retired name
+        still ends in ``.dead.jsonl``, so ``expire_dead_letters`` ages it out on
+        its own schedule and ``read_dead_letters`` still reports it under this
+        session. Also clears the in-memory reconcile flag, which would
+        otherwise make the reused id pay for a scan it cannot benefit from.
+
+        Caller must hold the key's ``file_lock`` (the rename must not race a
+        ``dead_letter`` append). Failure is logged, not raised: retiring is
+        hygiene, and failing the delete over it would retain a drained log.
+        """
+        self._dead_unreconciled.discard(session_id)
+        dead = self._dead_path(session_id)
+        retired = self._dir / f"{session_id}.finalized-{time.time_ns()}.dead.jsonl"
+        try:
+            os.replace(dead, retired)
+        except FileNotFoundError:
+            return
+        except OSError:
+            logger.exception("dead_letter_retire_failed session=%s", session_id)
+            return
+        logger.info("dead_letters_retired session=%s path=%s", session_id, retired.name)
+
     async def delete_drained(self, session_id: str) -> bool:
         """Remove the drained ``.log``/``.offset`` for a finalized session.
 
@@ -679,8 +853,10 @@ class FileSystemQueueManager:
         append. Refuses (returns False) if the log still has uncommitted bytes;
         the caller re-drains and retries a bounded number of times, and
         ``recover()`` picks up any give-up. A missing ``.log`` still unlinks a
-        stale ``.offset`` (else a recreated log reads past its own end). Keeps
-        ``.dead.jsonl``. Idempotent.
+        stale ``.offset`` (else a recreated log reads past its own end).
+        Dead letters are retained, but retired out of the session's own name so
+        a later session reusing the id starts clean (``_retire_dead_letters``).
+        Idempotent.
 
         The guard-map entry is dropped only when ``waiters == 1`` and identity
         matches; otherwise a still-referencing coroutine could later lock a
@@ -705,9 +881,21 @@ class FileSystemQueueManager:
                         offset.unlink()
                     except FileNotFoundError:
                         pass
+                    self._retire_dead_letters(session_id)
                     return True
 
-                committed = self._read_committed_offset(session_id)
+                committed = self._read_committed_offset_degrading(session_id)
+                if committed is None:
+                    # Corrupt .offset at finalize: we cannot prove the log is
+                    # fully committed, so do NOT delete and do NOT raise out to
+                    # the drain supervisor. Retained + recovered by the boot
+                    # RESET_OFFSET pass; returning False routes into finalize's
+                    # bounded retain/give-up path, identical to uncommitted-bytes.
+                    logger.warning(
+                        "delete_drained_retained session=%s reason=corrupt_offset",
+                        session_id,
+                    )
+                    return False
                 if size > committed:
                     logger.warning(
                         "delete_drained_retained session=%s uncommitted_bytes=%d",
@@ -730,17 +918,29 @@ class FileSystemQueueManager:
                     offset.unlink()
                 except FileNotFoundError:
                     pass
+                self._retire_dead_letters(session_id)
                 return True
 
         with self._guard(session_id) as guard:
             async with guard.admission:
                 ok = await _await_uninterrupted(asyncio.to_thread(_delete, guard))
                 # Still holding admission: apply the three-part removal
-                # condition. waiters == 1 is THIS call itself;
-                # anything higher means another coroutine holds the guard
-                # and removal must be skipped.
-                if ok and guard.waiters == 1 and self._guards.get(session_id) is guard:
-                    del self._guards[session_id]
+                # condition UNDER ``_guards_mutex`` -- the same lock ``_guard``
+                # increments ``waiters`` under. That mutual exclusion is what
+                # makes ``eviction can't happen underneath a live holder`` true
+                # even against a holder running on a worker thread (the boot
+                # reconcile / reclaim): the check-and-delete can no longer slip
+                # into the window between another caller's map lookup and its
+                # ``waiters`` increment. waiters == 1 is THIS call itself;
+                # anything higher means another holder exists and removal is
+                # skipped.
+                with self._guards_mutex:
+                    if (
+                        ok
+                        and guard.waiters == 1
+                        and self._guards.get(session_id) is guard
+                    ):
+                        del self._guards[session_id]
         return ok
 
     async def compact_committed_prefix(
@@ -896,38 +1096,46 @@ class FileSystemQueueManager:
     async def read_dead_letters(self, session_id: str) -> list[dict]:
         """Return all dead-letter records for ``session_id`` in append order.
 
-        Returns an empty list when no dead-letter file exists. A malformed
-        line is skipped (logged once, not per line) rather than raising --
-        reached by ``GET /queues/dead-letter/{key}`` and the replay path, and
-        a malformed record must not 500 an operator endpoint or abort a
-        replay.
+        Spans the retired files an earlier finalize left behind
+        (``_retire_dead_letters``), oldest first, so an operator still sees
+        everything ever dead-lettered under this id. Returns an empty list when
+        the session has none. A malformed line is skipped (logged once per
+        file, not per line) rather than raising -- reached by ``GET
+        /queues/dead-letter/{key}`` and the replay path, and a malformed record
+        must not 500 an operator endpoint or abort a replay.
         """
         self._validate_session_id(session_id)
 
         def _read() -> list[dict]:
-            try:
-                text = self._dead_path(session_id).read_text(encoding="utf-8")
-            except FileNotFoundError:
-                return []
             records: list[dict] = []
-            skipped = 0
-            for ln in text.splitlines():
-                if not ln.strip():
-                    continue
+            for path in [
+                *self._retired_dead_paths(session_id),
+                self._dead_path(session_id),
+            ]:
                 try:
-                    records.append(json.loads(ln))
-                except (
-                    json.JSONDecodeError,
-                    UnicodeDecodeError,
-                    ValueError,
-                    TypeError,
-                ):
-                    skipped += 1
+                    text = path.read_text(encoding="utf-8")
+                except FileNotFoundError:
                     continue
-            if skipped:
-                logger.warning(
-                    "dead_letter_unparseable key=%s skipped=%d", session_id, skipped
-                )
+                skipped = 0
+                for ln in text.splitlines():
+                    if not ln.strip():
+                        continue
+                    try:
+                        records.append(json.loads(ln))
+                    except (
+                        json.JSONDecodeError,
+                        UnicodeDecodeError,
+                        ValueError,
+                        TypeError,
+                    ):
+                        skipped += 1
+                        continue
+                if skipped:
+                    logger.warning(
+                        "dead_letter_unparseable key=%s skipped=%d",
+                        path.name,
+                        skipped,
+                    )
             return records
 
         return await asyncio.to_thread(_read)
@@ -1325,38 +1533,51 @@ class FileSystemQueueManager:
                 *((p, "orphan_offset") for p in offset_paths),
                 *((p, "orphan_offset_tmp") for p in tmp_paths),
             ]:
-                stem = path.name[
-                    : -len(".offset.tmp" if reason.endswith("tmp") else ".offset")
-                ]
+                stem = (
+                    self._offset_tmp_owner(path)
+                    if reason.endswith("tmp")
+                    else path.name[: -len(".offset")]
+                )
                 if self._log_path(stem).exists():
                     continue
-                try:
-                    size = path.stat().st_size
-                except OSError:
-                    failed += 1
-                    logger.exception(
-                        "boot_reclaim_failed reason=%s path=%s", reason, path
+                # Cheap pre-filter above avoids minting a guard for obviously
+                # live keys; the authoritative decision is re-made UNDER the
+                # same counted per-key lock every .offset writer takes, so this
+                # unlink can never race a concurrent offset write/os.replace (or
+                # delete) that would otherwise bypass the lock. `continue`
+                # inside the `with` still runs the guard's finally (decrements
+                # `waiters`) and releases file_lock.
+                with self._guard(stem) as guard, guard.file_lock:
+                    if self._log_path(stem).exists():
+                        continue
+                    try:
+                        size = path.stat().st_size
+                    except OSError:
+                        failed += 1
+                        logger.exception(
+                            "boot_reclaim_failed reason=%s path=%s", reason, path
+                        )
+                        continue
+                    logger.warning(
+                        "boot_reclaimed reason=%s path=%s session=%s bytes=%d "
+                        "action=%s",
+                        reason,
+                        path,
+                        stem,
+                        size,
+                        action,
                     )
-                    continue
-                logger.warning(
-                    "boot_reclaimed reason=%s path=%s session=%s bytes=%d action=%s",
-                    reason,
-                    path,
-                    stem,
-                    size,
-                    action,
-                )
-                if not enabled:
-                    continue
-                try:
-                    path.unlink()
-                    reclaimed += 1
-                    reclaimed_bytes += size
-                except OSError:
-                    failed += 1
-                    logger.exception(
-                        "boot_reclaim_failed reason=%s path=%s", reason, path
-                    )
+                    if not enabled:
+                        continue
+                    try:
+                        path.unlink()
+                        reclaimed += 1
+                        reclaimed_bytes += size
+                    except OSError:
+                        failed += 1
+                        logger.exception(
+                            "boot_reclaim_failed reason=%s path=%s", reason, path
+                        )
             for path in torn_paths:
                 try:
                     mtime = path.stat().st_mtime
@@ -1498,9 +1719,14 @@ class FileSystemQueueManager:
         self._validate_session_id(session_id)
 
         def _check() -> bool:
-            return self._read_committed_offset(session_id) >= self._complete_data_end(
-                session_id
-            )
+            committed = self._read_committed_offset_degrading(session_id)
+            if committed is None:
+                # Corrupt .offset: we cannot prove the session is drained, so
+                # report NOT drained (conservative) instead of raising out to
+                # the finalize/drain supervisor. Same degrade delete_drained
+                # applies; the boot RESET_OFFSET pass heals the file.
+                return False
+            return committed >= self._complete_data_end(session_id)
 
         return await asyncio.to_thread(_check)
 
@@ -1937,6 +2163,17 @@ class FileSystemQueueManager:
         the per-session respawn path it feeds can crash-loop on one bad key. The
         committed cursor rides along unchanged -- skipping already-dead lines
         does not change cross-handler state.
+
+        Holds the key's ``file_lock`` across the read AND the write via the
+        COUNTED ``_guard()`` -- not the raw ``_key_guard()`` accessor. This is a
+        read-modify-write of the offset, so a commit landing between the two
+        would be silently rolled back to the value read here. Routing through
+        ``_guard()`` also registers this caller in ``waiters``, so
+        ``delete_drained``'s eviction gate (``waiters == 1``) cannot drop the
+        guard-map entry out from under an in-flight reconcile -- which would let
+        the next writer mint a SECOND ``_KeyLock`` over the same file and
+        clobber it (the guard-eviction race). That counting is what lets the
+        boot sweep run concurrently with live drainers.
         """
         # Q-6: check `.log` existence BEFORE reading the whole `.dead.jsonl`
         # into RAM. A key with only a `.dead.jsonl` (the common shape left by
@@ -1948,22 +2185,23 @@ class FileSystemQueueManager:
             dead_payloads = self._dead_payload_set(key)
             if not dead_payloads:
                 return 0
-            committed, cursor = self._read_offset_record(key)
-            complete_end = self._complete_data_end(key)
-            pos = committed
-            skipped = 0
-            with open(log_path, "rb") as f:
-                f.seek(committed)
-                while pos < complete_end:
-                    raw = f.readline()
-                    if not raw or not raw.endswith(b"\n"):
-                        break
-                    if raw[:-1] not in dead_payloads:
-                        break
-                    pos += len(raw)
-                    skipped += 1
-            if pos > committed:
-                self._write_offset_record(key, pos, cursor)
+            with self._guard(key) as guard, guard.file_lock:
+                committed, cursor = self._read_offset_record(key)
+                complete_end = self._complete_data_end(key)
+                pos = committed
+                skipped = 0
+                with open(log_path, "rb") as f:
+                    f.seek(committed)
+                    while pos < complete_end:
+                        raw = f.readline()
+                        if not raw or not raw.endswith(b"\n"):
+                            break
+                        if raw[:-1] not in dead_payloads:
+                            break
+                        pos += len(raw)
+                        skipped += 1
+                if pos > committed:
+                    self._write_offset_record(key, pos, cursor)
             return skipped
         except (OSError, ValueError):
             logger.exception("recovery_reconcile_dead_key_failed key=%s", key)

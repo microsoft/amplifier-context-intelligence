@@ -39,6 +39,12 @@ _FINALIZE_DELETE_ATTEMPTS = 3
 _RESIDUAL_DEGRADED_GRACE = 15.0
 
 
+class _SessionQuarantined(Exception):
+    """Raised after a session has been closed and deregistered for a permanent
+    fault. The drain task must unwind to its entry point and return without
+    touching the worker again."""
+
+
 @dataclass
 class SessionWorker:
     session_id: str
@@ -368,26 +374,7 @@ class SessionRegistry:
 
         while True:
             try:
-                try:
-                    batch = await qm.read_batch(session_id, max_items=_DRAIN_MAX_BATCH)
-                except ValueError:
-                    # A ValueError here means the committed offset read parsed a
-                    # genuinely corrupt/unparseable .offset -- a PERMANENT fault,
-                    # raised before the guarded cursor read below is reached.
-                    # Quarantine this one session (close + deregister, exit
-                    # cleanly) so it does not crash-loop (respawn -> same corrupt
-                    # read -> die, forever). A transient OSError is NOT caught
-                    # here: it propagates to _on_drain_done for supervised
-                    # respawn, exactly as before. Other sessions keep draining;
-                    # the boot RESET_OFFSET pass heals the offset (cursor-preserving).
-                    logger.exception(
-                        "drain_worker_quarantined session=%s reason=corrupt_offset",
-                        session_id,
-                        extra={"session_id": session_id},
-                    )
-                    await self._safe_close(worker)
-                    self._deregister(session_id)
-                    return
+                batch = await self._read_batch(worker, _DRAIN_MAX_BATCH)
 
                 if not batch.records:
                     # Idle compaction runs before the dry-exit check below, so a
@@ -400,7 +387,7 @@ class SessionRegistry:
                     # Dry-exit for a recovered drainer with no terminal record: re-read
                     # after the await closes the race with a live POST arriving mid-check.
                     if not worker.live_event_seen:
-                        recheck = await qm.read_batch(session_id, max_items=1)
+                        recheck = await self._read_batch(worker, 1)
                         if not recheck.records and not worker.live_event_seen:
                             await self._safe_close(worker)
                             self._deregister(session_id)
@@ -560,6 +547,11 @@ class SessionRegistry:
                     await self._finalize_session(worker, handlers)
                     return
 
+            except _SessionQuarantined:
+                # _read_batch already closed, deregistered, and logged. Reached
+                # from any read in this loop, including the finalize tail drain.
+                return
+
             except asyncio.CancelledError:
                 # Cancelled while reading/idle (outer site; never reaches the inner try).
                 logger.info(
@@ -702,7 +694,7 @@ class SessionRegistry:
         qm = self.queue_manager
         session_id = worker.session_id
         while True:
-            tail = await qm.read_batch(session_id, max_items=_DRAIN_MAX_BATCH)
+            tail = await self._read_batch(worker, _DRAIN_MAX_BATCH)
             if not tail.records:
                 return True
             try:
@@ -798,6 +790,32 @@ class SessionRegistry:
             worker.events_processed,
             extra={"session_id": session_id},
         )
+
+    async def _read_batch(self, worker: SessionWorker, max_items: int) -> Batch:
+        """Read a batch for ``worker``, quarantining it on a corrupt offset.
+
+        A ``ValueError`` means the committed offset is genuinely unparseable --
+        a PERMANENT fault, so respawning would only reproduce it forever. The
+        session is closed and deregistered and ``_SessionQuarantined`` is
+        raised, which unwinds the drain task without touching the worker again;
+        other sessions keep draining and the boot RESET_OFFSET pass heals the
+        offset (cursor-preserving). A transient ``OSError`` is deliberately NOT
+        caught: it propagates to ``_on_drain_done`` for supervised respawn.
+
+        Every read in the drain loop goes through here, so no call site can be
+        the one that lets a corrupt offset escape to the supervisor.
+        """
+        try:
+            return await self.queue_manager.read_batch(worker.session_id, max_items)
+        except ValueError:
+            logger.exception(
+                "drain_worker_quarantined session=%s reason=corrupt_offset",
+                worker.session_id,
+                extra={"session_id": worker.session_id},
+            )
+            await self._safe_close(worker)
+            self._deregister(worker.session_id)
+            raise _SessionQuarantined(worker.session_id) from None
 
     async def _safe_close(self, worker: SessionWorker) -> None:
         """Close the graph store. A worker whose store has been closed is

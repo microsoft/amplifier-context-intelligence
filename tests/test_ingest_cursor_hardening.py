@@ -11,8 +11,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
+import threading
+import time
+from pathlib import Path
 from typing import Any, cast
 
+import pytest
 from context_intelligence_server.handlers.data_layer_2.iteration import (
     IterationHandler,
 )
@@ -20,7 +25,11 @@ from context_intelligence_server.handlers.data_layer_2.orchestrator_run import (
     OrchestratorRunHandler,
 )
 from context_intelligence_server.queue_manager import FileSystemQueueManager
-from context_intelligence_server.registry import SessionRegistry, SessionWorker
+from context_intelligence_server.registry import (
+    SessionRegistry,
+    SessionWorker,
+    _SessionQuarantined,
+)
 from context_intelligence_server.services import HookStateService
 
 
@@ -420,3 +429,376 @@ async def test_session_node_survives_isolation(monkeypatch) -> None:
     assert node is not None, "Session node was lost on isolation"
     assert node.get("status") == "running"
     assert node.get("started_at") == ts
+
+
+# ---------------------------------------------------------------------------
+# Fix 8: every path that moves a session's .offset serialises on its file_lock
+# ---------------------------------------------------------------------------
+
+
+async def _commit_racing_reconcile(queues_dir: Path) -> tuple[int, dict | None]:
+    """Run one commit concurrent with the read_batch dead-letter reconcile.
+
+    Both move the same session's ``.offset``: the commit writes it, and the
+    reconcile read-modify-writes it. Returns the record left on disk.
+    """
+    qm = FileSystemQueueManager(queues_dir=queues_dir)
+    sid = "s-race"
+    poison = b"poison-line"
+
+    await qm.append(sid, poison)
+    for i in range(20):
+        await qm.append(sid, b'{"n":%d}' % i)
+    # Arms the reconcile: the next read_batch walks the dead payloads and
+    # advances the offset past the already-dead leading line.
+    await qm.dead_letter(sid, poison, "boom")
+
+    await asyncio.gather(
+        qm.commit(sid, 999_999, {"dl2": {"orch_run_seq": 3}, "dl3": {}}),
+        qm.read_batch(sid, max_items=10),
+    )
+    return qm._read_offset_record(sid)
+
+
+async def test_concurrent_offset_writers_never_clobber_or_tear(tmp_path) -> None:
+    """A commit racing the reconcile must survive intact.
+
+    The reconcile reaches the offset through read_batch, on a different thread
+    than the commit. With both writes funnelled through the one locked writer,
+    the commit is never rolled back to the value the reconcile read before it
+    and the record is never half-written. Repeated because a race that survives
+    one interleaving proves nothing.
+    """
+    for attempt in range(25):
+        offset, cursor = await _commit_racing_reconcile(tmp_path / f"run{attempt}")
+        assert offset == 999_999, (
+            f"attempt {attempt}: the reconcile rolled the committed offset back "
+            f"to {offset} -- the session re-drains and duplicates those records"
+        )
+        assert cursor == {"dl2": {"orch_run_seq": 3}, "dl3": {}}, (
+            f"attempt {attempt}: committed cursor lost to a concurrent write"
+        )
+
+
+async def test_offset_writers_do_not_share_a_staging_path(tmp_path) -> None:
+    """Concurrent writers must stage to different temp files.
+
+    A shared staging name lets one writer rename a file the other is still
+    filling, publishing a half-written record -- corruption that no amount of
+    caller-side locking would prevent. The name still ends in ``.offset.tmp``
+    so ``reclaim_orphans`` keeps reaping strays.
+    """
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
+    await qm.append("s1", b"a")
+    paths = {qm._offset_tmp_path("s1") for _ in range(50)}
+
+    assert len(paths) == 50, "staging paths collided between writes"
+    assert all(p.name.endswith(".offset.tmp") for p in paths)
+    assert all(qm._offset_tmp_owner(p) == "s1" for p in paths), (
+        "reclaim_orphans could no longer tell which session a staging file "
+        "belongs to, and would reap one belonging to a live session"
+    )
+
+    # A staging file beside a live log is kept; a log-less stray is reaped.
+    live = qm._offset_tmp_path("s1")
+    live.write_text("{}", encoding="utf-8")
+    stray = qm._offset_tmp_path("s-gone")
+    stray.write_text("{}", encoding="utf-8")
+
+    await qm.reclaim_orphans(before_ts=time.time() + 60)
+
+    assert live.exists(), "reclaim reaped a staging file belonging to a live session"
+    assert not stray.exists(), "reclaim left a log-less staging file behind"
+
+
+# ---------------------------------------------------------------------------
+# Fix 9: every drain-loop read quarantines a corrupt offset, not just the first
+# ---------------------------------------------------------------------------
+
+
+async def test_corrupt_offset_at_idle_recheck_quarantines_worker(
+    caplog, monkeypatch
+) -> None:
+    """The dry-exit recheck read must quarantine like the main-loop read.
+
+    A recovered worker with no backlog rechecks before exiting; an offset that
+    goes unparseable between the two reads used to escape to the supervisor and
+    crash-loop the session.
+    """
+    reg = SessionRegistry()
+    qm = cast(FileSystemQueueManager, reg.queue_manager)
+    sid = "s-corrupt-recheck"
+    worker = _make_worker(sid, _InertGraph())
+    worker.live_event_seen = False
+    reg._register_for_test(worker)
+
+    reads = {"n": 0}
+    real_read = qm._read_offset_record
+
+    def _corrupt_after_first(session_id: str):
+        reads["n"] += 1
+        if reads["n"] > 1:
+            raise ValueError(f"unparseable offset document for {session_id!r}")
+        return real_read(session_id)
+
+    monkeypatch.setattr(qm, "_read_offset_record", _corrupt_after_first)
+
+    with caplog.at_level(logging.ERROR, logger="context_intelligence_server"):
+        await reg.drain_worker(worker, flush_timeout=0.05)
+
+    assert any("drain_worker_quarantined" in r.getMessage() for r in caplog.records)
+    assert sid not in reg._workers
+
+
+async def test_corrupt_offset_during_finalize_tail_quarantines_worker(
+    caplog,
+) -> None:
+    """The finalize tail-drain read must quarantine like the main-loop read.
+
+    This is the common ``session:end`` path; an unguarded ValueError here
+    escaped to the supervisor instead of quarantining the one bad session.
+    """
+    reg = SessionRegistry()
+    qm = cast(FileSystemQueueManager, reg.queue_manager)
+    sid = "s-corrupt-finalize"
+    await qm.append(sid, _line("session:end", {"session_id": sid}))
+    qm._offset_path(sid).write_text('{"v":1,"offset":"NOT-AN-INT"}', encoding="utf-8")
+
+    worker = _make_worker(sid, _InertGraph())
+    reg._register_for_test(worker)
+
+    with (
+        caplog.at_level(logging.ERROR, logger="context_intelligence_server"),
+        pytest.raises(_SessionQuarantined),
+    ):
+        await reg._drain_to_eof(worker, handlers=None)
+
+    assert any("drain_worker_quarantined" in r.getMessage() for r in caplog.records)
+    assert sid not in reg._workers
+    assert worker.store_closed is True
+
+
+# ---------------------------------------------------------------------------
+# Fix 10: a finalized session leaves no dead state behind for a reused id
+# ---------------------------------------------------------------------------
+
+
+async def test_delete_drained_retires_dead_letters_for_id_reuse(tmp_path) -> None:
+    """Finalizing must retire the dead letters out of the session's own name.
+
+    A session id can be reused. Left in place, the previous session's dead
+    payloads make the new session's first read skip its own leading lines --
+    committing past events that were never processed.
+    """
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
+    sid = "s-reuse"
+    poison = b"poison-line"
+
+    await qm.append(sid, poison)
+    await qm.dead_letter(sid, poison, "boom")
+    await qm.commit(sid, len(poison) + 1, None)
+    assert await qm.delete_drained(sid) is True
+
+    assert not (tmp_path / f"{sid}.dead.jsonl").exists()
+    retired = list(tmp_path.glob(f"{sid}.finalized-*.dead.jsonl"))
+    assert len(retired) == 1, "dead-letter payloads must be retained, not deleted"
+    assert sid not in qm._dead_unreconciled
+
+    # The reused id must read its own first line, not skip it as already-dead.
+    await qm.append(sid, poison)
+    batch = await qm.read_batch(sid, max_items=10)
+    assert [r.raw for r in batch.records] == [poison], (
+        "the reused session skipped its own line against the previous "
+        "session's dead payloads"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 11: the boot-sweep reconcile is COUNTED, so delete_drained's eviction
+# cannot drop the guard out from under it (the guard-eviction clobber, one
+# layer down from Fix 8). Also: reclaim_orphans unlinks under the key lock,
+# and the finalize offset reads degrade on a corrupt .offset.
+# ---------------------------------------------------------------------------
+
+
+def _seed_reconcilable(qm: FileSystemQueueManager, key: str, dead_lines: int) -> int:
+    """Seed a fully-committed log of ``dead_lines`` already-dead lines + a dead
+    file naming that payload, so ``_reconcile_dead_key`` does a real RMW and
+    ``delete_drained`` accepts (size == committed) and evicts. Returns the log
+    byte size."""
+    body = b"D\n" * dead_lines
+    qm._log_path(key).write_bytes(body)
+    qm._offset_path(key).write_text(
+        json.dumps({"v": 1, "offset": len(body), "cursor": None}), encoding="utf-8"
+    )
+    qm._dead_path(key).write_text(
+        json.dumps({"ts": time.time(), "error": "poison", "payload": "D"}) + "\n",
+        encoding="utf-8",
+    )
+    return len(body)
+
+
+async def test_boot_reconcile_counted_guard_survives_eviction_race(
+    tmp_path, monkeypatch
+) -> None:
+    """The boot-sweep reconcile must hold the COUNTED guard.
+
+    ``recovery_reconcile_dead`` reaches ``_reconcile_dead_key`` on a worker
+    thread. Before the fix it took ``file_lock`` through the RAW ``_key_guard``
+    accessor, so ``delete_drained``'s ``waiters == 1`` eviction gate could not
+    see it, evicted the guard-map entry mid-reconcile, and the next writer
+    minted a SECOND ``_KeyLock`` over the same file -- two locks, no mutual
+    exclusion, clobber. Drive the reconcile concurrently with an
+    eviction-then-remint on the same key, under maximally adverse scheduling,
+    and assert NO key ever had two distinct ``_KeyLock`` objects held at once.
+    """
+    # Passive detector: two distinct _KeyLock objects held for one key at the
+    # same instant is exactly the bypass. Patched on the class, auto-restored.
+    from context_intelligence_server.queue_manager import filesystem as fsmod
+
+    held: dict[str, set[int]] = {}
+    held_lock = threading.Lock()
+    violations: list[str] = []
+    real_acquire = fsmod._KeyLock.acquire
+    real_release = fsmod._KeyLock.release
+
+    def spy_acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        ok = real_acquire(self, blocking, timeout)
+        key = getattr(self, "_probe_key", None)
+        if ok and key is not None:
+            with held_lock:
+                s = held.setdefault(key, set())
+                s.add(id(self))
+                if len(s) > 1:
+                    violations.append(f"{key}:{sorted(s)}")
+        return ok
+
+    def spy_release(self) -> None:
+        key = getattr(self, "_probe_key", None)
+        if key is not None:
+            with held_lock:
+                held.get(key, set()).discard(id(self))
+        real_release(self)
+
+    real_key_guard = FileSystemQueueManager._key_guard
+
+    def tagging_key_guard(self, worker_key: str):
+        g = real_key_guard(self, worker_key)
+        # Tag the lock so the spy can attribute it to a key.
+        g.file_lock._probe_key = worker_key  # type: ignore[attr-defined]
+        return g
+
+    monkeypatch.setattr(fsmod._KeyLock, "acquire", spy_acquire)
+    monkeypatch.setattr(fsmod._KeyLock, "release", spy_release)
+    monkeypatch.setattr(FileSystemQueueManager, "_key_guard", tagging_key_guard)
+
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # maximally adverse: switch every few bytecodes
+    torn = 0
+    rounds = 300
+    try:
+        qm = FileSystemQueueManager(queues_dir=tmp_path)
+        for r in range(rounds):
+            key = f"k{r}"
+            _seed_reconcilable(qm, key, dead_lines=64)
+            barrier = threading.Barrier(2)
+
+            def _reconcile_thread(k: str = key, b: threading.Barrier = barrier) -> None:
+                b.wait()
+                # The boot-sweep entry point (iterates keys off worker thread).
+                qm._reconcile_dead_key(k)
+
+            t = threading.Thread(target=_reconcile_thread, name="boot-reconcile")
+            t.start()
+
+            async def _evict_then_remint(
+                k: str = key, b: threading.Barrier = barrier
+            ) -> None:
+                await asyncio.to_thread(b.wait)
+                await qm.delete_drained(k)  # the eviction path
+                await qm.append(k, b"D\n")  # the next writer that could re-mint
+
+            await _evict_then_remint()
+            t.join(10)
+
+            # The final .offset must be a parseable record, never torn.
+            try:
+                qm._read_offset_record(key)
+            except (ValueError, OSError):
+                torn += 1
+            for p in tmp_path.glob(f"{key}*"):
+                p.unlink(missing_ok=True)
+    finally:
+        sys.setswitchinterval(old_interval)
+
+    assert violations == [], (
+        f"two distinct _KeyLock objects were held for one key at once over "
+        f"{rounds} rounds -- the guard was evicted underneath a live reconcile: "
+        f"{violations[:3]}"
+    )
+    assert torn == 0, f"{torn}/{rounds} rounds left a torn .offset record"
+
+
+async def test_reclaim_orphans_unlinks_offset_under_key_lock(
+    tmp_path, monkeypatch
+) -> None:
+    """``reclaim_orphans`` must unlink an orphan ``.offset`` while holding the
+    key's ``file_lock`` -- the same lock every offset writer takes -- so the
+    unlink can never race a concurrent offset write. Observed by checking the
+    lock state at the moment of the unlink."""
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
+    stem = "orphan-key"
+    # An orphan .offset (NO .log beside it) -> a reclaim candidate.
+    qm._offset_path(stem).write_text(
+        json.dumps({"v": 1, "offset": 5, "cursor": None}), encoding="utf-8"
+    )
+    # Same guard object reclaim's counted _guard(stem) will resolve to.
+    guard = qm._key_guard(stem)
+    target = qm._offset_path(stem)
+
+    observed: dict[str, bool] = {}
+    real_unlink = Path.unlink
+
+    def spy_unlink(self: Path, *args: Any, **kwargs: Any) -> None:
+        if self == target:
+            observed["locked_at_unlink"] = guard.file_lock.locked()
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", spy_unlink)
+
+    result = await qm.reclaim_orphans(before_ts=time.time() + 60)
+
+    assert observed.get("locked_at_unlink") is True, (
+        "reclaim_orphans unlinked the orphan .offset WITHOUT holding the key's "
+        "file_lock -- a concurrent offset write could race the unlink"
+    )
+    assert not target.exists()
+    assert result["reclaimed"] >= 1
+
+
+async def test_finalize_offset_reads_degrade_on_corrupt_offset(tmp_path) -> None:
+    """``delete_drained`` and ``is_fully_drained`` read the committed offset on
+    the finalize path (``session:end``). A corrupt ``.offset`` must DEGRADE
+    (retain / report-not-drained) instead of raising out to the drain
+    supervisor and crashing the worker."""
+    qm = FileSystemQueueManager(queues_dir=tmp_path)
+    sid = "s-finalize-corrupt"
+    await qm.append(sid, b"one-real-line\n")
+    # A genuinely corrupt committed offset (non-int) beside a present log.
+    qm._offset_path(sid).write_text('{"v":1,"offset":"NOT-AN-INT"}', encoding="utf-8")
+
+    # Neither call may raise; both degrade to the safe, conservative answer.
+    drained = await qm.is_fully_drained(sid)
+    assert drained is False, (
+        "is_fully_drained must report NOT drained (conservative) on a corrupt "
+        ".offset, never raise"
+    )
+
+    deleted = await qm.delete_drained(sid)
+    assert deleted is False, (
+        "delete_drained must retain (return False) on a corrupt .offset so "
+        "finalize takes its bounded retain/give-up path -- never crash"
+    )
+    # Files retained for the boot RESET_OFFSET pass to heal, not destroyed.
+    assert qm._log_path(sid).exists()
+    assert qm._offset_path(sid).exists()

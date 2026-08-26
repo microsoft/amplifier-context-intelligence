@@ -412,7 +412,10 @@ async def test_delete_drained_removes_log_and_offset_keeps_dead(tmp_path) -> Non
 
     assert not (tmp_path / "s.log").exists()
     assert not (tmp_path / "s.offset").exists()
-    assert (tmp_path / "s.dead.jsonl").exists()  # retained
+    # Retained, but retired out of the live name so a session reusing this id
+    # cannot reconcile against these payloads. Still reported for the session.
+    assert not (tmp_path / "s.dead.jsonl").exists()
+    assert len(list(tmp_path.glob("s.finalized-*.dead.jsonl"))) == 1
     assert len(await qm.read_dead_letters("s")) == 1
 
 
