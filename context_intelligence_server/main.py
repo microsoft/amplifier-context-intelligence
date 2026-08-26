@@ -51,12 +51,18 @@ from context_intelligence_server.neo4j_store import (
     build_bounded_neo4j_driver,
     count_untagged_nodes,
     ensure_neo4j_schema,
+    ensure_schema_version_baseline,
+    read_graph_schema_version,
 )
 from context_intelligence_server.registry import SessionRegistry
 from context_intelligence_server.routers.admin import router as admin_router
 from context_intelligence_server.routers.queues import router as queues_router
 from context_intelligence_server.routers.version import router as version_router
-from context_intelligence_server.status import boot_state, build_status_response
+from context_intelligence_server.status import (
+    SCHEMA_VERSION,
+    boot_state,
+    build_status_response,
+)
 from context_intelligence_server.writer_lease import (
     WriterLeaseConflict,
     shutdown_lease_io,
@@ -325,6 +331,11 @@ async def _ensure_schema_ready() -> None:
         )
     app.state.schema_ready = True
     logger.info("lifespan_startup: Neo4j schema initialized")
+    # Record the graph's schema-version baseline once, AFTER the rest of the
+    # schema is established. Single-writer, startup-only: kept off the per-worker
+    # flush path. Never raises -- a transient failure leaves the marker absent,
+    # which /status surfaces as an unknown (never a false "in sync").
+    await ensure_schema_version_baseline(app.state.neo4j_driver)
 
 
 async def _crash_recovery_sweep_loop(interval: int, respawn_limit: int) -> None:
@@ -1040,11 +1051,33 @@ async def get_status(request: Request) -> dict[str, Any]:
         # Same contract: aggregate integers only, cheap (stat-only,
         # short-TTL cached) even with a huge spool.
         response["spool"] = await registry.queue_manager.spool_stats()
+        # Schema-version drift: the compiled model version vs the graph's stored
+        # :SchemaMeta version. read_graph_schema_version returns None when the
+        # graph is unreachable or the baseline was never written; an absent
+        # driver is treated the same way -- drift=None (unknown), never a false
+        # "in sync" and never a 500 (/status must never raise). Gated with the
+        # disk reads above so /status stays graph-read-free while booting.
+        _schema_driver = getattr(request.app.state, "neo4j_driver", None)
+        graph_schema_version = (
+            await read_graph_schema_version(_schema_driver)
+            if _schema_driver is not None
+            else None
+        )
+        response["schema_version"] = SCHEMA_VERSION
+        response["graph_schema_version"] = graph_schema_version
+        response["schema_version_current"] = (
+            None
+            if graph_schema_version is None
+            else graph_schema_version == SCHEMA_VERSION
+        )
     else:
         # While booting, /status performs zero disk reads. metrics/spool stay
         # present but null, so an absent key is never confused with a version skew.
         response["metrics"] = None
         response["spool"] = None
+        response["schema_version"] = SCHEMA_VERSION
+        response["graph_schema_version"] = None
+        response["schema_version_current"] = None
         response["status_detail"] = {"reason": "booting"}
     # Surface auth mode/admin capability so operators can confirm admin is
     # enabled without tailing logs -- boolean flags only, no credentials.

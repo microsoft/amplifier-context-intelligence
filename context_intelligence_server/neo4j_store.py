@@ -15,7 +15,7 @@ import json
 import logging
 import re
 from collections.abc import Generator
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, LiteralString, cast
 
 from neo4j import AsyncGraphDatabase
@@ -23,6 +23,7 @@ from neo4j import unit_of_work as _unit_of_work
 from neo4j.exceptions import DriverError, Neo4jError
 
 from context_intelligence_server.config import Neo4jClientConfig
+from context_intelligence_server.status import SCHEMA_VERSION
 
 _LOG = logging.getLogger(__name__)
 
@@ -925,6 +926,115 @@ async def ensure_neo4j_schema(
         )
 
         return fully_established
+
+
+async def ensure_schema_version_baseline(
+    driver: Any,
+    *,
+    database: str = "neo4j",
+) -> None:
+    """Create the :SchemaMeta uniqueness constraint and baseline singleton.
+
+    Baseline only -- create-if-absent, no comparison/migration. Call this
+    exactly once, from the lifespan startup handler, AFTER ``ensure_neo4j_schema``
+    has established the rest of the schema (indexes + uniqueness constraints).
+
+    Kept out of ``ensure_neo4j_schema`` on purpose: that runs on every
+    ``Neo4jGraphStore``'s first flush (once per worker, concurrently, on cold
+    start) and from ``run_repair``/``doctor --fix``. A SchemaMeta baseline write
+    is a single-writer, startup-only concern that must not fire per worker.
+
+    Ordering matters: the ``(:SchemaMeta).id`` uniqueness constraint is created
+    FIRST, then the singleton MERGE -- without the constraint, two concurrent
+    MERGEs on a fresh database can each create a ``{id: 'singleton'}`` node.
+
+    ``ON CREATE SET`` only: an existing node is left untouched. Reconciling a
+    stored ``schema_version`` against the running server's value is deferred;
+    the read path (``read_graph_schema_version``) and this write path stay
+    structurally separate so comparison/upgrade logic cannot creep in here.
+
+    O(1): one constraint DDL plus a MERGE on a fixed key -- never a scan. Any
+    ``Neo4jError``/``DriverError`` is logged and swallowed: a transient failure
+    on this passive data point must never crash boot.
+    """
+    try:
+        async with driver.session(database=database) as session:
+            try:
+                await session.run(
+                    "CREATE CONSTRAINT schemameta_id_unique IF NOT EXISTS "
+                    "FOR (m:SchemaMeta) REQUIRE m.id IS UNIQUE"
+                )
+            except (Neo4jError, DriverError) as exc:
+                if isinstance(exc, Neo4jError) and exc.code in _BENIGN_SCHEMA_CODES:
+                    _LOG.debug(
+                        "ensure_schema_version_baseline: SchemaMeta "
+                        "uniqueness constraint already present (benign "
+                        "concurrent-schema race, code=%s)",
+                        exc.code,
+                    )
+                else:
+                    _LOG.warning(
+                        "ensure_schema_version_baseline: could not create "
+                        "SchemaMeta uniqueness constraint; continuing "
+                        "without it: %s",
+                        exc,
+                    )
+
+            await session.run(
+                "MERGE (m:SchemaMeta {id: 'singleton'}) "
+                "ON CREATE SET m.schema_version = $schema_version, "
+                "m.last_updated = $now",
+                schema_version=SCHEMA_VERSION,
+                now=datetime.now(UTC).isoformat(),
+            )
+    except (Neo4jError, DriverError) as exc:
+        _LOG.warning(
+            "ensure_schema_version_baseline: could not write SchemaMeta "
+            "baseline singleton (connectivity error); continuing without "
+            "it: %s",
+            exc,
+        )
+
+
+async def read_graph_schema_version(
+    driver: Any,
+    *,
+    database: str = "neo4j",
+) -> int | None:
+    """Read-only: the STORED ``:SchemaMeta{id:'singleton'}.schema_version``.
+
+    Advisory drift signal only, not a guard. Read-only companion to
+    ``ensure_schema_version_baseline``, kept structurally apart from that write
+    path. It does NOT import or compare against ``SCHEMA_VERSION`` -- it only
+    reads back whatever is stored. ``GET /status`` compares the returned value
+    against ``status.SCHEMA_VERSION`` itself so a server/graph mismatch is
+    detectable; this function performs no comparison, gating, or migration.
+
+    Returns ``None`` when the singleton is absent (startup never ran the
+    baseline against this graph) or when the read fails for any reason (treated
+    as "unknown", never an error), mirroring the never-500-``/status`` contract.
+
+    O(1): a point lookup by the unique ``id`` key. Reads via ``async for``
+    (not ``.single()``) so it works against both the real async driver and the
+    test suite's mock session, which only implements async iteration.
+    """
+    try:
+        async with driver.session(database=database) as session:
+            result = await session.run(
+                "MATCH (m:SchemaMeta {id: 'singleton'}) "
+                "RETURN m.schema_version AS schema_version"
+            )
+            async for record in result:
+                value = record["schema_version"]
+                return int(value) if value is not None else None
+            return None
+    except Exception as exc:  # noqa: BLE001 - defensive: /status must never 500
+        _LOG.warning(
+            "read_graph_schema_version: could not read SchemaMeta singleton "
+            "(connectivity error?); returning None: %s",
+            exc,
+        )
+        return None
 
 
 def _serialized_row_size(value: Any) -> int:

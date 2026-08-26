@@ -5,6 +5,20 @@ All notable changes to the Context Intelligence Server are recorded here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.2.0]
+
+### Added
+
+- **Schema-version observability.** The server now records the graph data-model
+  version it wrote and reports drift on `/status`. A `SCHEMA_VERSION` constant
+  is the compiled model version; at startup the server writes a single
+  `:SchemaMeta{id:'singleton'}.schema_version` baseline (create-if-absent, off
+  the per-worker flush path). `GET /status` returns three fields:
+  `schema_version` (compiled), `graph_schema_version` (stored, or `null` when
+  the graph is unreachable or never baselined), and `schema_version_current`
+  (`true` in sync, `false` on mismatch, `null` when unknown). Advisory only —
+  reported, never gated or migrated; `/status` never raises on a read failure.
+
 ## [7.1.0]
 
 ### Added

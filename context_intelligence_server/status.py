@@ -13,6 +13,11 @@ from context_intelligence_server.config import get_settings
 # Resolved once at import time — never changes within a process lifetime.
 SERVER_VERSION: str = _pkg_version("context-intelligence-server")
 
+# Graph data-model version, distinct from the server release version above.
+# Bumped only when the node/edge schema changes; /status compares it against
+# the graph's stored :SchemaMeta.schema_version to surface drift.
+SCHEMA_VERSION: int = 1
+
 if TYPE_CHECKING:
     from context_intelligence_server.registry import SessionRegistry
 

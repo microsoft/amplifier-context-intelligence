@@ -1415,6 +1415,89 @@ async def test_status_includes_neo4j_connected_false_when_no_driver(
 
 
 # ---------------------------------------------------------------------------
+# /status schema-version drift reporting
+#
+# /status reports the compiled model version (SCHEMA_VERSION) alongside the
+# graph's stored value and a drift flag: in-sync -> True, mismatch -> False,
+# unknown (graph unreachable / baseline never written / no driver) -> None.
+# read_graph_schema_version is patched so the reporting logic is exercised
+# without a real graph.
+# ---------------------------------------------------------------------------
+
+
+async def test_status_schema_version_in_sync(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """graph version == SCHEMA_VERSION -> schema_version_current is True."""
+    from context_intelligence_server.status import SCHEMA_VERSION
+
+    monkeypatch.setattr(
+        main_module.app.state, "neo4j_driver", AsyncMock(), raising=False
+    )
+    monkeypatch.setattr(
+        main_module,
+        "read_graph_schema_version",
+        AsyncMock(return_value=SCHEMA_VERSION),
+    )
+
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["schema_version"] == SCHEMA_VERSION
+    assert data["graph_schema_version"] == SCHEMA_VERSION
+    assert data["schema_version_current"] is True
+
+
+async def test_status_schema_version_drift(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """graph version != SCHEMA_VERSION -> schema_version_current is False."""
+    from context_intelligence_server.status import SCHEMA_VERSION
+
+    monkeypatch.setattr(
+        main_module.app.state, "neo4j_driver", AsyncMock(), raising=False
+    )
+    monkeypatch.setattr(
+        main_module,
+        "read_graph_schema_version",
+        AsyncMock(return_value=SCHEMA_VERSION + 1),
+    )
+
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["schema_version"] == SCHEMA_VERSION
+    assert data["graph_schema_version"] == SCHEMA_VERSION + 1
+    assert data["schema_version_current"] is False
+
+
+async def test_status_schema_version_unknown_when_absent(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """graph version None (unreachable / never baselined) -> current is None."""
+    from context_intelligence_server.status import SCHEMA_VERSION
+
+    monkeypatch.setattr(
+        main_module.app.state, "neo4j_driver", AsyncMock(), raising=False
+    )
+    monkeypatch.setattr(
+        main_module,
+        "read_graph_schema_version",
+        AsyncMock(return_value=None),
+    )
+
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["schema_version"] == SCHEMA_VERSION
+    assert data["graph_schema_version"] is None
+    assert data["schema_version_current"] is None
+
+
+# ---------------------------------------------------------------------------
 # Concern B (council review) -- /status neo4j_query_connected field tests
 # ---------------------------------------------------------------------------
 
