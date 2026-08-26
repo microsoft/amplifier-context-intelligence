@@ -71,12 +71,12 @@ def build_neo4j_driver(config: Neo4jClientConfig) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Module-level live identity-map stores (T3)
+# Module-level live identity-map stores.
 #
-# Set by create_asgi_app() so the future /admin router can mutate the active
-# store without needing to carry a reference through the middleware chain.
-# Exactly ONE of these is non-None at any time — whichever mode is active.
-# The other is always reset to None so accessors return an unambiguous result.
+# Set by create_asgi_app() so the /admin router can mutate the active store
+# without carrying a reference through the middleware chain. Exactly ONE of
+# these is non-None at any time — whichever mode is active. The other is
+# always reset to None so accessors return an unambiguous result.
 # ---------------------------------------------------------------------------
 _api_key_store: IdentityStore | None = None
 _entra_identity_store: IdentityStore | None = None
@@ -102,10 +102,38 @@ def get_entra_identity_store() -> IdentityStore | None:
     return _entra_identity_store
 
 
+def _parse_workspace_and_creator(raw: str | bytes) -> tuple[str, str | None] | None:
+    """Return ``(workspace, created_by)`` iff ``raw`` parses to a dict with a
+    non-empty workspace, else ``None``. Total -- never raises."""
+    try:
+        obj = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    try:
+        workspace = obj.get("workspace", "")
+        created_by = obj.get("created_by")
+    except (AttributeError, TypeError):
+        return None
+    if not workspace:
+        return None
+    return workspace, created_by
+
+
+# Last-resort workspace sentinel when no head line resolves a workspace.
+# Dispatching under it still isolates the bad line and drains the rest --
+# without this, a session whose committed-offset head is torn/unparseable
+# (the exact shape corruption leaves behind) would never be recovered at
+# all, stranding whatever undamaged data follows it in the same log.
+_RECOVERY_FALLBACK_WORKSPACE = "unknown-recovered"
+
+
 def _recover_one_session(
     sid: str,
     first_line: str | bytes,
     get_or_create: Any,
+    first_log_line: bytes | None = None,
 ) -> bool:
     """Parse the first queued line for *sid* and respawn a drainer when valid.
 
@@ -115,32 +143,48 @@ def _recover_one_session(
     The queue-read step is handled by the caller (the lifespan loop or the test)
     so this function is pure — no I/O, fully synchronous.
 
+    Falls back to ``first_log_line`` (byte-0 of the log) when ``first_line``
+    doesn't resolve a workspace, then to the ``_RECOVERY_FALLBACK_WORKSPACE``
+    sentinel -- so a torn or corrupted head at the committed offset never
+    strands the (still durable, still on disk) data behind it.
+
     Args:
         sid:            Session id being recovered.
         first_line:     The first raw log line (bytes from QueueManager or str
                         from tests).  ``json.loads`` accepts both.
         get_or_create:  The registry callable — ``registry.get_or_create`` in
                         production or a spy in tests.
+        first_log_line: Byte-0 of the same session's ``.log``, if available --
+                        the fallback source when ``first_line`` is torn.
 
     Returns:
         True  – drainer was (re)spawned via *get_or_create*.
-        False – session skipped (empty/torn workspace, or malformed JSON line).
+        False – session skipped (no resolvable workspace anywhere available).
     """
-    try:
-        obj = json.loads(first_line)
-        workspace: str = obj.get("workspace", "")
-        created_by: str | None = obj.get("created_by")
-    except (ValueError, KeyError):
-        workspace = ""
-        created_by = None
-    if not workspace:
-        logger.warning(
-            "recovery_skipped session=%s: torn or empty workspace in first line",
-            sid,
-        )
-        return False
-    get_or_create(sid, workspace, created_by=created_by)
-    return True
+    parsed = _parse_workspace_and_creator(first_line)
+    if parsed is not None:
+        workspace, created_by = parsed
+        get_or_create(sid, workspace, created_by=created_by)
+        return True
+
+    if first_log_line is not None:
+        byte0_parsed = _parse_workspace_and_creator(first_log_line)
+        if byte0_parsed is not None:
+            workspace, created_by = byte0_parsed
+            logger.warning("recovery_fallback_workspace session=%s source=byte0", sid)
+            get_or_create(sid, workspace, created_by=created_by)
+            return True
+        # Last resort: dispatch under the sentinel anyway -- the drainer
+        # dead-letters the unparseable head and drains everything behind it.
+        logger.warning("recovery_fallback_workspace session=%s source=sentinel", sid)
+        get_or_create(sid, _RECOVERY_FALLBACK_WORKSPACE, created_by=None)
+        return True
+
+    logger.warning(
+        "recovery_skipped session=%s: torn or empty workspace in first line",
+        sid,
+    )
+    return False
 
 
 async def _crash_recovery_topup(respawn_limit: int | None) -> int:
@@ -164,14 +208,38 @@ async def _crash_recovery_topup(respawn_limit: int | None) -> int:
     to_process = recovered if respawn_limit is None else recovered[:respawn_limit]
     respawned = 0
     for sid in to_process:
-        batch = await registry.queue_manager.read_batch(sid, max_items=1)
+        # Guarded here (not inside read_batch, which must stay loud for the
+        # live drainer's hot path) so one bad key can't halt the whole pass.
+        try:
+            batch = await registry.queue_manager.read_batch(sid, max_items=1)
+        except (OSError, ValueError):
+            logger.exception("crash_recovery_topup_read_failed session=%s", sid)
+            continue
         if not batch.lines:
+            # recover()/read_batch disagreement (e.g. a concurrent finalize
+            # advanced the offset) -- not a loss, just no longer recoverable.
+            logger.warning(
+                "recovery_skipped_empty_batch session=%s reason=empty_batch",
+                sid,
+            )
             continue
         # NOTE: _recover_one_session returns True whenever it dispatched to
         # get_or_create, whether or not a drainer already existed (get_or_create
         # is idempotent). So this count is "sessions dispatched this pass", an
         # upper bound on newly-spawned drainers -- fine for an INFO log.
-        if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
+        dispatched = _recover_one_session(sid, batch.lines[0], registry.get_or_create)
+        if not dispatched:
+            # The committed-offset head didn't resolve a workspace (torn or
+            # corrupted) -- fall back to byte 0 of the same log before giving
+            # up, so a corrupted head never strands the data behind it.
+            first_log_line = await registry.queue_manager.read_first_line(sid)
+            dispatched = _recover_one_session(
+                sid,
+                batch.lines[0],
+                registry.get_or_create,
+                first_log_line=first_log_line,
+            )
+        if dispatched:
             respawned += 1
     return respawned
 
@@ -275,7 +343,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "(un-migrated). Cold start refuses to boot to avoid duplicating "
             "them on write. Run: context-intelligence-server doctor --fix"
         )
-    # Crash recovery (decisions #5/#6): on startup, respawn one drainer per
+    # One-time startup pass: truncate every queue file back to its last
+    # complete line, quarantining any torn tail left by a non-atomic write on
+    # cloud/SMB storage. Must run BEFORE any reader below (reconcile, seed,
+    # recover) touches these files, so they only ever see whole records.
+    _heal_result = await registry.queue_manager.heal_torn_tails()
+    logger.info("lifespan_startup: heal_torn_tails result=%s", _heal_result)
+
+    # Crash recovery: on startup, respawn one drainer per
     # session that still has an undrained, complete line. The workspace is
     # parsed from that session's FIRST log line so the respawned worker is
     # bound to the same workspace it was originally created with.
@@ -307,6 +382,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # call reports them again, and a new event for that session arriving
     # via POST /events spawns its drainer immediately via get_or_create(),
     # independent of this startup loop.
+    # Bound how many drainers this boot respawns: an unbounded backlog can
+    # respawn every drainer before the server serves a single request,
+    # driving startup RSS and boot time up with it. None (the default)
+    # preserves unbounded behaviour. `recovered` is already sorted
+    # (QueueManager.recover()), so which sessions run this boot vs. defer is
+    # deterministic across restarts of the same backlog. Deferred sessions
+    # are untouched -- no read, no write, no drainer -- so they remain fully
+    # durable and recoverable; a later boot's recover() reports them again,
+    # and a new event for that session spawns its drainer immediately via
+    # get_or_create(), independent of this startup loop.
     respawn_limit = _settings.crash_recovery_respawn_limit
     if respawn_limit is not None and len(recovered) > respawn_limit:
         to_process = recovered[:respawn_limit]
@@ -322,10 +407,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
             respawned += 1
     if deferred_count:
-        # Loud on purpose (WARNING, not INFO): a deferred backlog must never
-        # be a silent, un-discoverable fact -- that silence is exactly what
-        # let the 38 GB spool go unnoticed for two days in the incident this
-        # guards against. Names the exact counts and the setting to raise.
+        # WARNING, not INFO, on purpose: a deferred backlog must never be a
+        # silent, un-discoverable fact. Names the exact counts and the
+        # setting to raise.
         logger.warning(
             "lifespan_startup: crash-recovery respawn cap reached "
             "(crash_recovery_respawn_limit=%d): %d/%d respawned this boot, "
@@ -396,7 +480,7 @@ app.state.registry = registry
 idempotency_cache = EventIdempotencyCache()
 
 # Session-less events are keyed by a per-workspace sentinel stem so that events
-# from distinct workspaces never collide in one durable log (decision #10).
+# from distinct workspaces never collide in one durable log.
 _NO_SESSION_PREFIX = "_no_session__"
 
 
@@ -409,7 +493,7 @@ def _workspace_slug(workspace: str) -> str:
 def _validate_data_timestamp(data: dict[str, Any]) -> None:
     """Raise HTTPException(400) if data['timestamp'] is missing, empty, or not ISO-8601.
 
-    This is the ingest boundary check (Option A). Real Amplifier clients always
+    This is the ingest boundary check. Real Amplifier clients always
     supply data.timestamp (verified: 224,530 events on disk, 0 missing). This
     guard rejects only malformed/hand-rolled payloads with a clear 400, instead
     of accepting them silently and dead-lettering them later when the graph
@@ -431,7 +515,7 @@ def _validate_data_timestamp(data: dict[str, Any]) -> None:
 
 
 def _assert_admin_not_exempt() -> None:
-    """Startup assertion (TB-07): /admin/* must NEVER be in any exempt set.
+    """Startup assertion: /admin/* must NEVER be in any exempt set.
 
     Called by ``create_asgi_app`` before constructing the middleware.
     Raises ``RuntimeError`` if any ``/admin`` path or prefix appears in
@@ -463,7 +547,7 @@ def _assert_admin_not_exempt() -> None:
 
 
 def _assert_neo4j_clients_explicit(settings: Settings) -> None:
-    """Startup assertion (doc 11 gap #12): the deployed profile MUST declare the
+    """Startup assertion: the deployed profile MUST declare the
     structured neo4j.admin / neo4j.cypher_query clients explicitly.
 
     When settings.neo4j_require_explicit_clients is True, refuse to boot if the
@@ -477,7 +561,7 @@ def _assert_neo4j_clients_explicit(settings: Settings) -> None:
             "Neo4j config invariant violated: neo4j_require_explicit_clients=True but "
             "the structured `neo4j` block (admin + cypher_query) is absent — the server "
             "would silently fall back to legacy neo4j_* fields. The deployed profile MUST "
-            "declare both clients explicitly (doc 11 §Backward-compatibility). Set the "
+            "declare both clients explicitly. Set the "
             "`neo4j` block in amplifier-online.yaml / server-config.yaml, or unset "
             "neo4j_require_explicit_clients for a dev/transition deploy."
         )
@@ -503,8 +587,8 @@ def create_asgi_app(
     resolver builds a real ``PyJWKClient`` internally.
 
     Startup behavior on an EMPTY store:
-        An empty keystore (static) or empty identity map (entra) NO LONGER
-        raises — it is a supported bootstrap state. The server BOOTS
+        An empty keystore (static) or empty identity map (entra) does NOT
+        raise — it is a supported bootstrap state. The server BOOTS
         fail-CLOSED and logs a loud startup WARNING; every request 401/403s
         until the store is populated at runtime via the /admin API. Wide-open
         pass-through is reachable ONLY via the explicit
@@ -512,14 +596,14 @@ def create_asgi_app(
         credentials configured, which additionally logs a "WIDE OPEN" warning.
 
     Raises:
-        RuntimeError: (TB-07) When any ``/admin`` path or prefix appears in an
+        RuntimeError: When any ``/admin`` path or prefix appears in an
             auth-exempt set.  The admin API surface must never be unguarded.
     """
     global _api_key_store, _entra_identity_store
 
-    # TB-07 structural assertion: /admin must not be in any exempt set.
-    # This runs before any middleware construction so the failure is loud and
-    # immediate — no request ever reaches an unauthenticated /admin endpoint.
+    # Structural assertion: /admin must not be in any exempt set. Runs before
+    # any middleware construction so the failure is loud and immediate — no
+    # request ever reaches an unauthenticated /admin endpoint.
     _assert_admin_not_exempt()
 
     s = settings if settings is not None else _settings
@@ -534,21 +618,21 @@ def create_asgi_app(
     app.state.api_key_store = None
     app.state.entra_identity_store = None
 
-    # T5: store auth/admin config on app.state so the require_admin dependency
+    # Store auth/admin config on app.state so the require_admin dependency
     # can read it without importing from main (avoids circular import) and so
     # test-specific settings (passed via create_asgi_app(settings=...)) take
     # effect without relying on the module-level cached get_settings().
     app.state.auth_mode = s.auth_mode
     app.state.admin_api_key_configured = s.resolve_admin_api_key_digest() is not None
     app.state.entra_admin_role = s.entra_admin_role
-    # M2: service capability role names for require_write / require_read deps.
+    # Service capability role names for require_write / require_read deps.
     app.state.service_data_role = s.service_data_role
     app.state.reader_role = s.reader_role
 
     # Compute the admin-key digest for the middleware (static mode only).
     # The middleware checks the bearer token's sha256 against this digest BEFORE
     # calling the resolver, so the admin key can authenticate even though it is
-    # not in the data keystore (ROB F1).
+    # not in the data keystore.
     #
     # Storage-at-rest is resolved by Settings: the RECOMMENDED admin_api_key_sha256
     # (digest at rest) is used verbatim; the legacy raw admin_api_key (DEPRECATED,
@@ -600,36 +684,36 @@ def create_asgi_app(
                 s.entra_identities_store_path,
             )
 
-        # B4: boot disjointness invariant — each oid must belong to exactly one
+        # Boot disjointness invariant — each oid must belong to exactly one
         # identity source.  Building the service map here (not inline in the
         # EntraResolver call) lets us check the overlap BEFORE construction so
         # the server fails loudly at startup rather than silently misbehaving.
-        # This is cheap hygiene: B1 already keeps app tokens off the human map
-        # at request time; this prevents a same-oid-in-both misconfiguration.
+        # Existing logic already keeps app tokens off the human map at
+        # request time; this prevents a same-oid-in-both misconfiguration.
         _service_id_map = s.build_service_identity_map()
         _entra_oids = set(entra_store.flat_dict.keys())
         _service_oids = set(_service_id_map.keys())
         _overlap = _entra_oids & _service_oids
         if _overlap:
             raise RuntimeError(
-                f"Boot invariant violated (B4): oid(s) {sorted(_overlap)!r} appear "
+                f"Boot invariant violated: oid(s) {sorted(_overlap)!r} appear "
                 f"in both entra_identities and service_identities. Each oid must "
                 f"belong to exactly one identity source. Fix the config to remove "
                 f"the overlap before restarting."
             )
 
         # EntraResolver raises RuntimeError at construction if the JWKS
-        # prefetch fails (eager fail-closed guard from §8b / crusty gate).
+        # prefetch fails (eager fail-closed by design).
         # Pass entra_store.flat_dict (the LIVE dict) so the resolver sees
         # any put()/delete() made by /admin immediately, no restart required.
         resolver: StaticKeyResolver | EntraResolver = EntraResolver(
             s.azure_client_id,  # type: ignore[arg-type]  — validated non-None by config
             s.azure_tenant_id,  # type: ignore[arg-type]  — validated non-None by config
             entra_store.flat_dict,  # live reference — mutations visible immediately
-            service_identity_map=_service_id_map,  # B4: pre-built, disjointness verified
-            service_data_role=s.service_data_role,  # M2: role gate
-            reader_role=s.reader_role,  # M2: role gate
-            entra_admin_role=s.entra_admin_role,  # M2: role gate
+            service_identity_map=_service_id_map,  # pre-built, disjointness verified
+            service_data_role=s.service_data_role,
+            reader_role=s.reader_role,
+            entra_admin_role=s.entra_admin_role,
             jwks_client=_jwks_client,
         )
         # Entra mode does not use admin_api_key_digest (admin via roles claim).
@@ -680,8 +764,8 @@ def create_asgi_app(
 
     # Wide-open warning: fires ONLY on the explicit allow_unauthenticated
     # opt-out combined with no credentials configured. An empty keystore/map
-    # ALONE no longer triggers this (and no longer refuses to start) — it now
-    # boots fail-closed instead (see the empty-map/keystore warnings above).
+    # ALONE does not trigger this and does not refuse to start — it boots
+    # fail-closed instead (see the empty-map/keystore warnings above).
     if s.allow_unauthenticated and not resolver.auth_enabled:
         logger.warning(
             "allow_unauthenticated=True AND no credentials configured — the "
@@ -691,7 +775,7 @@ def create_asgi_app(
             "(entra) and unset allow_unauthenticated to enforce authentication."
         )
 
-    # Log admin capability status for operator visibility (E: status surfacing).
+    # Log admin capability status for operator visibility.
     if s.auth_mode == "static":
         _admin_status = (
             "enabled"
@@ -710,11 +794,11 @@ def create_asgi_app(
         _admin_status,
     )
 
-    # T6: store the admin-key digest on app.state so the /admin router handlers
+    # Store the admin-key digest on app.state so the /admin router handlers
     # can read it without importing from main (no circular import) and so that
     # test-specific settings are honoured.  In entra mode admin_api_key_digest
-    # has already been set to None above (line ~385); in static mode it is the
-    # sha256 of admin_api_key (or None when admin_api_key is not configured).
+    # has already been set to None above; in static mode it is the sha256 of
+    # admin_api_key (or None when admin_api_key is not configured).
     app.state.admin_api_key_digest = admin_api_key_digest
 
     return BearerTokenMiddleware(
@@ -729,27 +813,21 @@ def create_asgi_app(
 # Module-level ASGI app used by Gunicorn: context_intelligence_server.main:asgi_app
 # The raw `app` is kept for internal use and testing against un-authed routes.
 #
-# LAZY construction (PEP 562 module __getattr__), NOT built at import time.
-#
-# create_asgi_app() enforces the auth guard: it raises RuntimeError when no
-# authentication is configured at all (see its docstring / _assert_* helpers).
-# That guard is correct and must NOT be weakened. The problem was *timing*:
-# this module used to call create_asgi_app() unconditionally at import time,
-# which meant the console-script entry point (`context-intelligence-server`)
-# imports `main` to reach `main()`, so even `--help`/`--version` constructed
-# the whole ASGI app and hit the guard. An operator with a broken/absent
-# config couldn't ask the binary what version it was -- exactly when they
-# most need to.
+# Lazily constructed (PEP 562 module __getattr__), not built at import time:
+# create_asgi_app() enforces the auth guard (raises RuntimeError when no
+# authentication is configured; see its docstring / _assert_* helpers). The
+# console-script entry point imports this module just to reach `main()`, so
+# eager construction would make even `--help`/`--version` hit that guard --
+# an operator with a broken/absent config couldn't ask the binary its
+# version, exactly when they most need to.
 #
 # `_asgi_app` is the cache; `get_asgi_app()` builds-and-caches on first call;
-# `__getattr__` makes `context_intelligence_server.main.asgi_app` /
-# `from context_intelligence_server.main import asgi_app` keep working for
+# `__getattr__` keeps `context_intelligence_server.main.asgi_app` /
+# `from context_intelligence_server.main import asgi_app` working for
 # anything that reads the module attribute directly (gunicorn's `load()`,
-# tests) -- construction (and therefore the auth guard) now happens on first
-# access instead of at import time. Actually serving (`run()` -> `_App.load()`
-# -> `get_asgi_app()`) still triggers it, so an unconfigured server still
-# fails loud exactly as before -- only bare import / --help / --version are
-# spared.
+# tests). Actually serving (`run()` -> `_App.load()` -> `get_asgi_app()`)
+# still triggers construction, so an unconfigured server still fails loud --
+# only bare import / --help / --version are spared.
 _asgi_app: BearerTokenMiddleware | None = None
 
 
@@ -781,7 +859,7 @@ def __getattr__(name: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# M2 — service capability dependencies (moved to authz.py to avoid circular import)
+# Service capability dependencies (moved to authz.py to avoid circular import)
 #
 # require_write, require_read, _is_write_capable are imported from
 # context_intelligence_server.authz at the top of this file (re-exported here
@@ -795,28 +873,25 @@ async def get_status(request: Request) -> dict[str, Any]:
     response["neo4j_connected"] = await _check_driver_connected(
         request.app, "neo4j_driver"
     )
-    # Additive (Concern B, council review): surface the query (read-intent)
-    # driver's connectivity too, so a misconfigured cypher_query client shows
-    # up here instead of on the first /cypher call.
+    # Also surface the query (read-intent) driver's connectivity, so a
+    # misconfigured cypher_query client shows up here instead of on the
+    # first /cypher call.
     response["neo4j_query_connected"] = await _check_driver_connected(
         request.app, "neo4j_query_driver"
     )
     response["neo4j_url"] = _settings.resolve_neo4j_admin().url
     response["neo4j_browser_url"] = _settings.neo4j_browser_url
-    # Additive, aggregate-only conservation metrics (D3). /status is
-    # unauthenticated, so this block must NOT carry the per-key table or the
-    # dead-letter listing — both are authenticated-only.
+    # Aggregate-only conservation metrics. /status is unauthenticated, so
+    # this block must NOT carry the per-key table or the dead-letter
+    # listing — both are authenticated-only.
     response["metrics"] = await registry.pipeline_metrics()
-    # Additive, aggregate-only spool footprint (incident: a 38 GB / 583-file
-    # durable spool grew completely unnoticed -- the only symptom was a graph
-    # that had silently stopped updating). Same /status contract as `metrics`
-    # above: two aggregate integers only, no session ids, no workspace names,
-    # no per-key table. Cheap by construction (stat-only, short-TTL cached) --
-    # see QueueManager.spool_stats() for why this is safe on every poll even
-    # with a huge spool.
+    # Aggregate-only spool footprint: two integers only, no session ids, no
+    # workspace names, no per-key table -- same privacy contract as `metrics`
+    # above. Cheap by construction (stat-only, short-TTL cached); see
+    # QueueManager.spool_stats() for why this holds even under a huge spool.
     response["spool"] = await registry.queue_manager.spool_stats()
-    # T5 (E): surface auth mode and admin-API capability so operators can
-    # confirm admin is enabled without tailing startup logs.  /status is
+    # Surface auth mode and admin-API capability so operators can confirm
+    # admin is enabled without tailing startup logs.  /status is
     # unauthenticated — only config-level boolean flags are exposed here
     # (no credential values, no key hashes, no token details).
     _auth_mode = getattr(request.app.state, "auth_mode", _settings.auth_mode)
@@ -834,9 +909,7 @@ async def get_status(request: Request) -> dict[str, Any]:
             _admin_key_set if _auth_mode == "static" else bool(_entra_admin_role)
         ),
         # Surface the role names (not secrets) so operators can confirm which
-        # roles are configured without exposing credential values.  Additive:
-        # existing fields (mode, admin_api_enabled, entra_admin_role) are
-        # unchanged; reader_role and service_data_role are new in M2.
+        # roles are configured without exposing credential values.
         **(
             {
                 "entra_admin_role": _entra_admin_role,
@@ -901,7 +974,7 @@ async def post_events(
             )
             return EventResponse(status="duplicate", session_id=session_id or None)
     # Empty session_id maps to a per-workspace sentinel stem so session-less
-    # events from distinct workspaces never collide in one log (decision #10).
+    # events from distinct workspaces never collide in one log.
     worker_key = session_id or (_NO_SESSION_PREFIX + _workspace_slug(request.workspace))
     # Spawn (or reuse) the sticky drainer keyed by worker_key.
     registry.get_or_create(worker_key, request.workspace, created_by=contributor_id)
@@ -970,8 +1043,7 @@ def main(argv: list[str] | None = None) -> None:
 
     ``doctor [--fix]`` diagnoses (and, with ``--fix``, repairs) Neo4j graph
     health -- the two O(graph-size) migration scans (dedup + :Node backfill)
-    that used to run unconditionally at cold start now live ONLY here, never
-    on server boot. See ``context_intelligence_server.doctor``.
+    live ONLY here, never on server boot. See ``context_intelligence_server.doctor``.
     """
     parser = argparse.ArgumentParser(prog="context-intelligence-server")
     subparsers = parser.add_subparsers(dest="command")
@@ -1039,7 +1111,7 @@ def _validate_single_worker(workers: int | None = None) -> int:
             f"context-intelligence-server requires exactly one worker, got {effective}. "
             "The durable drainer assumes one drainer per session per process; unset "
             "WEB_CONCURRENCY or set WEB_CONCURRENCY=1. Multi-process operation needs a "
-            "distributed backend (Open Q7)."
+            "distributed backend."
         )
     return effective
 

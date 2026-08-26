@@ -1,12 +1,15 @@
-"""Tests for the on-disk durable queue manager (Phase B1)."""
+"""Tests for the on-disk durable queue manager."""
 
 from __future__ import annotations
 
 import time
 
 import pytest
-
-from context_intelligence_server.queue_manager import Batch, QueueManager
+from context_intelligence_server.queue_manager import (
+    Batch,
+    QueueManager,
+    Record,
+)
 
 
 @pytest.fixture
@@ -22,11 +25,79 @@ def test_constructor_creates_queues_dir(tmp_path):
 
 
 def test_batch_holds_its_fields():
-    batch = Batch(session_id="s1", lines=[b"a", b"b"], start_offset=0, end_offset=4)
+    """``batch.lines`` is derived from ``batch.records``."""
+    batch = Batch(
+        session_id="s1",
+        records=[Record(b"a", 0, 2), Record(b"b", 2, 4)],
+        start_offset=0,
+        end_offset=4,
+    )
     assert batch.session_id == "s1"
     assert batch.lines == [b"a", b"b"]
     assert batch.start_offset == 0
     assert batch.end_offset == 4
+
+
+# ---------------------------------------------------------------------------
+# Record / Batch.records: offsets are queue-produced and read-only for callers.
+# ---------------------------------------------------------------------------
+
+
+async def test_read_batch_records_carry_queue_produced_offsets(qm, tmp_path):
+    """Each record's start equals the previous record's end, the first/last
+    records bound the batch's start/end_offset, and no record's raw payload
+    has a trailing newline."""
+    await qm.append("s1", b"one")
+    await qm.append("s1", b"two")
+    await qm.append("s1", b"three")
+
+    batch = await qm.read_batch("s1", max_items=10)
+
+    assert len(batch.records) == 3
+    assert batch.records[0].start == batch.start_offset
+    assert batch.records[-1].end == batch.end_offset
+    for i in range(1, len(batch.records)):
+        assert batch.records[i].start == batch.records[i - 1].end
+    for rec in batch.records:
+        assert not rec.raw.endswith(b"\n")
+    assert [r.raw for r in batch.records] == [b"one", b"two", b"three"]
+
+
+async def test_batch_lines_is_derived_from_records(qm, tmp_path):
+    """``batch.lines`` always matches ``[r.raw for r in batch.records]``."""
+    await qm.append("s1", b"alpha")
+    await qm.append("s1", b"beta")
+
+    batch = await qm.read_batch("s1", max_items=10)
+
+    assert batch.lines == [r.raw for r in batch.records]
+
+
+async def test_read_batch_records_survive_a_torn_trailing_line(qm, tmp_path):
+    """A log ending in a partial (torn) line yields records only for the
+    complete lines that precede it; end_offset stops on the line boundary."""
+    log = tmp_path / "queues" / "s1.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_bytes(b"complete-one\ncomplete-two\ntorn-no-newline-yet")
+
+    batch = await qm.read_batch("s1", max_items=10)
+
+    assert [r.raw for r in batch.records] == [b"complete-one", b"complete-two"]
+    assert batch.end_offset == len(b"complete-one\ncomplete-two\n")
+
+
+async def test_committing_rec_end_advances_exactly_one_record(qm, tmp_path):
+    """``commit(sid, records[0].end)`` then a fresh ``read_batch`` returns
+    records ``[1:]``."""
+    await qm.append("s1", b"first")
+    await qm.append("s1", b"second")
+    await qm.append("s1", b"third")
+
+    batch = await qm.read_batch("s1", max_items=10)
+    await qm.commit("s1", batch.records[0].end)
+
+    remaining = await qm.read_batch("s1", max_items=10)
+    assert [r.raw for r in remaining.records] == [b"second", b"third"]
 
 
 async def test_append_writes_line_with_trailing_newline(qm, tmp_path):
@@ -161,6 +232,65 @@ async def test_commit_is_atomic_no_temp_leftover(qm, tmp_path):
     qdir = tmp_path / "queues"
     assert (qdir / "s1.offset").read_text("utf-8") == "2"
     assert list(qdir.glob("*.tmp")) == []
+
+
+# _read_committed_offset accepts the bare-int form and the legacy JSON offset
+# document; commit() still writes bare int. A present-but-unusable offset must
+# raise, never silently return 0 (0 would force a full re-drain).
+
+
+async def test_read_committed_offset_accepts_legacy_json_cursor(qm):
+    """A legacy JSON cursor document parses to its integer "offset" field."""
+    qm._offset_path("s1").write_text(
+        '{"v":1,"offset":12345,"cursor":{"dl2":{"a":1},"dl3":{}}}',
+        encoding="utf-8",
+    )
+    assert qm._read_committed_offset("s1") == 12345
+
+
+async def test_read_committed_offset_accepts_bare_int_unchanged(qm):
+    """Bare-int offsets (the current write format) still parse exactly."""
+    qm._offset_path("s1").write_text("980582046", encoding="utf-8")
+    assert qm._read_committed_offset("s1") == 980582046
+
+
+async def test_read_committed_offset_missing_file_is_zero(qm):
+    assert qm._read_committed_offset("never-written") == 0
+
+
+async def test_read_committed_offset_empty_file_is_zero(qm):
+    qm._offset_path("s1").write_text("", encoding="utf-8")
+    assert qm._read_committed_offset("s1") == 0
+
+
+async def test_read_committed_offset_legacy_json_without_usable_offset_raises(qm):
+    """A JSON object present but with no usable integer "offset" must raise
+    ValueError -- the same as any other unparseable offset -- rather than
+    silently returning 0 (which would trigger a full re-drain)."""
+    qm._offset_path("s1").write_text('{"v":1,"cursor":{}}', encoding="utf-8")
+    with pytest.raises(ValueError):
+        qm._read_committed_offset("s1")
+
+
+async def test_read_committed_offset_garbage_still_raises(qm):
+    """Genuinely unparseable text (not JSON, not an int) still raises."""
+    qm._offset_path("s1").write_text("not-a-number", encoding="utf-8")
+    with pytest.raises(ValueError):
+        qm._read_committed_offset("s1")
+
+
+async def test_read_batch_drains_session_with_legacy_json_offset(qm):
+    """A session with a legacy JSON-cursor .offset drains via the normal
+    read path (read_batch) with no ValueError -- the fix must reach the
+    hot path, not just the private helper."""
+    await qm.append("s1", b"a")
+    await qm.append("s1", b"b")
+    qm._offset_path("s1").write_text('{"v":1,"offset":2,"cursor":{}}', encoding="utf-8")
+
+    batch = await qm.read_batch("s1", max_items=10)
+
+    assert batch.start_offset == 2
+    assert batch.lines == [b"b"]
 
 
 async def test_active_sessions_excludes_fully_committed(qm):
@@ -317,7 +447,7 @@ async def test_derive_all_stats_caches_within_ttl(qm, monkeypatch):
     assert calls["n"] == 2
 
 
-# --- recovery_seed_counts (D2): residual-0-by-construction crash-recovery seed ---
+# --- recovery_seed_counts: residual-0-by-construction crash-recovery seed ---
 
 
 async def test_recovery_seed_counts_pending_and_committed(qm):
@@ -393,7 +523,7 @@ async def test_recovery_seed_counts_crash_window_residual_zero(qm):
     assert residual == 0
 
 
-# --- recovery_reconcile_dead (D2): close the dead_letter->commit crash window ---
+# --- recovery_reconcile_dead: close the dead_letter->commit crash window ---
 
 
 async def test_recovery_reconcile_dead_advances_past_already_dead_pending(qm):

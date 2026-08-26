@@ -301,32 +301,22 @@ class SessionHandler:
     async def _handle_end(
         self, session_id: str, timestamp: str, data: dict[str, Any]
     ) -> None:
-        # Read the session's current labels BEFORE writing the end-event upsert.
-        # After a flush (the drainer flushes between event batches) the node
-        # buffer is empty, so get_node falls through to Neo4j and returns the
-        # real persisted type label (SubSession / ForkedSession).  If we upsert
-        # first, that upsert creates a fresh buffer entry holding only
-        # ["Session", "SST_EVENT"], which SHADOWS the persisted type on the
-        # buffer-first get_node read -> _current_type reads None -> stub-recovery
-        # spuriously adds RootSession (a dual terminal label).  Reading first
-        # mirrors _handle_start and _handle_fork, which both read before writing.
+        # Read labels BEFORE the end-event upsert -- upserting first would
+        # shadow the persisted type label and spuriously trigger stub-recovery.
         existing = await self.services.graph.get_node(session_id)
         labels: list[str] = existing.get("labels", []) if existing else []
         _warn_if_dual_terminal(labels, session_id)
         parent_id = _parent_of(data)
 
         end_node_data: dict[str, Any] = {
-            "labels": ["Session", "SST_EVENT"],
+            # Seed with labels just read so this entry can't shed a
+            # persisted terminal type and trigger spurious stub-recovery.
+            "labels": ["Session", "SST_EVENT", *labels],
             "ended_at": timestamp,
             "status": "completed",
             "session_id": session_id,
         }
-        # Persist parent_id when the end payload carries one.  _handle_start and
-        # _handle_fork already write parent_id, but a session that reaches
-        # session:end WITHOUT a captured start/fork previously never had
-        # parent_id recorded at all — leaving `parent_id IS NULL` ambiguous
-        # between "genuinely no parent" and "parent never recorded". Only write
-        # when present in the payload; never fabricate a value when absent.
+        # Only write parent_id when present; never fabricate a value.
         if parent_id:
             end_node_data["parent_id"] = parent_id
 
@@ -358,14 +348,10 @@ class SessionHandler:
                 add_labels=transition.add,
             )
 
-        # Terminal event: flush directly. There is no hot path after session:end;
-        # all buffered data must reach the backing store before the process exits.
-        await self.services.graph.flush()
-
     async def _create_mount_plan(
         self, session_id: str, data_layer_1_fork_node_id: str
     ) -> None:
-        """E04: Session → MountPlan (record existence, no blob dereferencing).
+        """Session → MountPlan (record existence, no blob dereferencing).
         SOURCED_FROM: MountPlan → session:fork data_layer_1 event (blob source).
         """
         mount_plan_id = f"{session_id}::mount_plan"

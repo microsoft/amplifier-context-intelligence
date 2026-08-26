@@ -797,9 +797,10 @@ async def test_lifespan_recovers_and_respawns_drainers(
 async def test_lifespan_skips_recovery_for_empty_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A session whose first line has an empty workspace is NOT respawned
-    (spawning a workspace='' worker would violate the non-empty-workspace
-    invariant)."""
+    """A session whose only line has an empty workspace is dispatched under
+    the `_RECOVERY_FALLBACK_WORKSPACE` sentinel, never under workspace='' --
+    the fallback exists so a torn/corrupted head never strands the (still
+    durable) data behind it."""
     sid = "sess-empty-ws"
     qm = registry.queue_manager
     body = json.dumps(
