@@ -1009,12 +1009,19 @@ def _chunk_list(
 def _build_node_props(data: dict[str, Any], workspace: str) -> dict[str, Any]:
     """Assemble the sanitized props dict for a single node row.
 
-    ``labels`` and ``created_by`` are excluded from the returned dict:
+    ``labels``, ``created_by``, and ``working_dir`` are excluded from the returned dict:
     - ``labels`` are applied separately via ``SET n:Label`` statements (not stored as props).
     - ``created_by`` travels ONLY as the ``$created_by`` query param (never a node property)
       so it cannot affect node identity or clobber the ``ON CREATE SET n.created_by`` stamp.
+    - ``working_dir`` is excluded from the blind ``SET n += row.props`` so the
+      Session-node write can apply ``coalesce(n.working_dir, row.working_dir)``
+      instead of last-write-wins -- an already-set working_dir is never clobbered.
     """
-    raw = {k: v for k, v in data.items() if k not in ("labels", "created_by")}
+    raw = {
+        k: v
+        for k, v in data.items()
+        if k not in ("labels", "created_by", "working_dir")
+    }
     _convert_temporal_props(raw)  # ISO str -> datetime, in place
     props = Neo4jGraphStore._sanitize_properties(raw)
     props["workspace"] = workspace
@@ -1056,6 +1063,13 @@ async def _write_batch(
         row: dict[str, Any] = {"node_id": node_id, "props": props}
 
         if "Session" in labels:
+            # working_dir is a Session-only property carried as a separate
+            # top-level row key (not in props) so the MERGE below can coalesce
+            # it rather than blindly overwrite. Omitted when empty/absent, so
+            # coalesce(n.working_dir, null) is a no-op for such rows.
+            working_dir_value = data.get("working_dir")
+            if working_dir_value:
+                row["working_dir"] = working_dir_value
             session_rows.append(row)
         else:
             other_rows.append(row)
@@ -1085,7 +1099,12 @@ async def _write_batch(
             f"MERGE (n:{_UNIVERSAL_NODE_LABEL} "
             "{node_id: row.node_id, workspace: row.props.workspace}) "
             "ON CREATE SET n.created_by = $created_by "
-            "SET n += row.props, n:Session",
+            "SET n += row.props, n:Session "
+            # Populate-if-missing: fill working_dir only when it is still null,
+            # never clobber an already-set value (a concurrent/replica writer or
+            # an earlier event may have populated it). Rows without a working_dir
+            # carry a null row key, so this is a no-op for them.
+            "SET n.working_dir = coalesce(n.working_dir, row.working_dir)",
             rows=session_rows,
             created_by=created_by,
         )

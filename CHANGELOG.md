@@ -5,6 +5,33 @@ All notable changes to the Context Intelligence Server are recorded here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.1.0]
+
+### Added
+
+- **`working_dir` end-to-end on the Session node.** `EventRequest` accepts an
+  optional top-level `working_dir` envelope field (rejected only when
+  blank/whitespace-only); the events endpoint lifts it into the event data, and
+  `ensure_session_node` writes it onto the Session node. Populate-if-missing: a
+  node created before `working_dir` was known is backfilled by the first
+  subsequent event that carries a non-empty value. An already-set value is
+  never overwritten — the Neo4j write uses
+  `coalesce(n.working_dir, row.working_dir)` rather than last-write-wins.
+
+### Fixed
+
+- **`agent` persists across the delivery-order race.** The agent name for a
+  spawned sub-session arrives only on the parent's `delegate:agent_spawned`
+  event, but the child's own `session:start` can create the Session node first.
+  `ensure_session_node` now backfills `agent` on the existing-node branch with
+  the same populate-if-missing rule as `working_dir`, so it is no longer
+  silently dropped (which left `:Session.agent` empty and undercounted
+  `WHERE s.agent = ...` queries).
+- **IncompleteSession heal-forward.** A stale `IncompleteSession` marker —
+  stamped when a session's `session:end` drained before its `session:start`/
+  `session:fork` — is now stripped the moment the real start/fork is processed,
+  leaving only the correct terminal label.
+
 ## [7.0.0]
 
 ### Changed (breaking)

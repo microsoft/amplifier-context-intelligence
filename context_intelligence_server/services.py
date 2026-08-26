@@ -343,10 +343,28 @@ class HookStateService:
         if existing is not None:
             # Upsert a stub so this worker's own flush uses MERGE (idempotent)
             # instead of racing a second worker into creating a duplicate node.
-            await self.graph.upsert_node(
-                session_id,
-                {"labels": ["Session"], "status": "running", "session_id": session_id},
-            )
+            stub_data: dict[str, Any] = {
+                "labels": ["Session"],
+                "status": "running",
+                "session_id": session_id,
+            }
+            # Populate-if-missing: backfill working_dir on a node created before
+            # working_dir was known (or by a bare reference). Only when the event
+            # supplies one AND the node still lacks it; the DB-level coalesce
+            # guarantees an already-set value is never clobbered.
+            if data.get("working_dir") and not existing.get("working_dir"):
+                stub_data["working_dir"] = data["working_dir"]
+            # Same populate-if-missing rule for `agent`. The agent name for a
+            # spawned sub-session arrives ONLY on the parent's
+            # delegate:agent_spawned event; the child's own session:start (no
+            # top-level agent) can create the node first, so that later parent
+            # event routinely lands HERE. Without this, the parent's `agent` was
+            # silently dropped, leaving :Session.agent empty and breaking any
+            # `WHERE s.agent = ...` query. Only writes when the event supplies it
+            # AND the node still lacks it, so an already-set value is preserved.
+            if data.get("agent") and not existing.get("agent"):
+                stub_data["agent"] = data["agent"]
+            await self.graph.upsert_node(session_id, stub_data)
             self._seen_sessions.add(session_id)
             return
 
@@ -366,6 +384,10 @@ class HookStateService:
             node_data["started_at"] = _ts
         if "agent" in data:
             node_data["agent"] = data["agent"]
+        # Lift working_dir onto the Session node when the event carries one;
+        # absent/empty leaves it null for a later event to populate.
+        if data.get("working_dir"):
+            node_data["working_dir"] = data["working_dir"]
 
         await self.graph.upsert_node(session_id, node_data)
         self._seen_sessions.add(session_id)  # only cache after successful write

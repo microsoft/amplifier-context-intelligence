@@ -1140,6 +1140,11 @@ async def post_events(
         body = await http_request.body()
         body_obj = json.loads(body)
         body_obj["created_by"] = contributor_id  # overwrite, never setdefault
+        # Lift the optional top-level working_dir envelope field into data so the
+        # Session-node write sees it; absent/empty leaves Session.working_dir null
+        # for a later event to populate.
+        if request.working_dir and isinstance(body_obj.get("data"), dict):
+            body_obj["data"]["working_dir"] = request.working_dir
         body = json.dumps(body_obj, separators=(",", ":")).encode()
         await registry.queue_manager.append(worker_key, body)
         # Bytes are on disk: the key may be burned now (a failed append

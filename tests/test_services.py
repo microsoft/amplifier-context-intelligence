@@ -791,3 +791,130 @@ class TestDurableCursor:
         assert svc.data_layer_2.iteration_count == 3
         assert svc.data_layer_2.orch_run_seq == 5
         assert svc.data_layer_2.active_orch_run_id == "OLD"
+
+
+# ---------------------------------------------------------------------------
+# ensure_session_node populate-if-missing: working_dir + agent
+#
+# The `working_dir` (bundle-hook envelope field) and `agent` (parent's
+# delegate:agent_spawned) values can each arrive on a LATER event than the one
+# that first creates the Session node. On the existing-node branch they must be
+# backfilled when the node still lacks them, and NEVER overwrite an already-set
+# value.
+#
+# Two HookStateService instances share ONE GraphState to model the real
+# two-writer condition (each worker has its own cold _seen_sessions cache, so
+# the second writer genuinely reaches the graph-query existing-node branch
+# rather than short-circuiting on the warm-cache fast path).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestEnsureSessionNodeWorkingDir:
+    """working_dir survives a later-event delivery and is never clobbered."""
+
+    async def test_existing_node_populates_working_dir_from_later_event(self) -> None:
+        """A node created WITHOUT working_dir gets it backfilled by a later
+        event carrying one."""
+        graph = GraphState()
+        svc_first = HookStateService(graph_store=graph)
+        svc_later = HookStateService(graph_store=graph)
+
+        await svc_first.ensure_session_node(
+            "sess-wd", {"timestamp": "2026-01-01T00:00:00Z"}
+        )
+        node = await graph.get_node("sess-wd")
+        assert node is not None
+        assert node.get("working_dir") is None  # precondition
+
+        await svc_later.ensure_session_node(
+            "sess-wd", {"working_dir": "/home/u/project"}
+        )
+        node = await graph.get_node("sess-wd")
+        assert node is not None
+        assert node.get("working_dir") == "/home/u/project"
+
+    async def test_existing_node_does_not_clobber_working_dir(self) -> None:
+        """A later working_dir-less (or different) event must NOT overwrite an
+        already-set working_dir."""
+        graph = GraphState()
+        svc_first = HookStateService(graph_store=graph)
+        svc_later = HookStateService(graph_store=graph)
+
+        await svc_first.ensure_session_node(
+            "sess-wd2", {"working_dir": "/home/u/original"}
+        )
+        # A later event carrying a DIFFERENT working_dir must not win.
+        await svc_later.ensure_session_node("sess-wd2", {"working_dir": "/tmp/other"})
+        node = await graph.get_node("sess-wd2")
+        assert node is not None
+        assert node.get("working_dir") == "/home/u/original"
+
+    async def test_new_node_lifts_working_dir(self) -> None:
+        """A first event carrying working_dir writes it straight onto the node."""
+        graph = GraphState()
+        svc = HookStateService(graph_store=graph)
+        await svc.ensure_session_node(
+            "sess-wd3",
+            {"timestamp": "2026-01-01T00:00:00Z", "working_dir": "/home/u/fresh"},
+        )
+        node = await graph.get_node("sess-wd3")
+        assert node is not None
+        assert node.get("working_dir") == "/home/u/fresh"
+
+
+# ---------------------------------------------------------------------------
+# Issue #484: ensure_session_node must not drop `agent` on the existing-node
+# branch. The `agent` value for a spawned sub-session arrives on the parent's
+# delegate:agent_spawned event ({"agent": ...}), while the child's own
+# session:start (no top-level agent) can create the node first. When the parent
+# event then hits the existing-node branch, `agent` must still be persisted
+# (same populate-if-missing rule already applied to working_dir).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestEnsureSessionNodeAgentField:
+    """#484 regression: the agent name survives the child-first ordering race."""
+
+    async def test_existing_node_persists_agent_from_later_event(self) -> None:
+        """Child creates the node WITHOUT agent; a later writer carrying
+        {"agent": ...} (the parent's delegate:agent_spawned) must persist it."""
+        graph = GraphState()
+        svc_child = HookStateService(graph_store=graph)
+        svc_parent = HookStateService(graph_store=graph)
+
+        # Child's session:start reaches ensure_session_node first — no top-level agent.
+        await svc_child.ensure_session_node(
+            "child-484", {"timestamp": "2026-01-01T00:00:00Z"}
+        )
+        node = await graph.get_node("child-484")
+        assert node is not None
+        assert node.get("agent") is None  # precondition
+
+        # Parent's delegate:agent_spawned arrives later, carrying the agent name.
+        # Second writer's cache is cold, so this reaches the existing-node branch.
+        await svc_parent.ensure_session_node(
+            "child-484", {"agent": "foundation:git-ops"}
+        )
+        node = await graph.get_node("child-484")
+        assert node is not None
+        assert node.get("agent") == "foundation:git-ops"
+
+    async def test_existing_node_does_not_clobber_agent(self) -> None:
+        """A later agent-less writer must NOT wipe an already-set agent."""
+        graph = GraphState()
+        svc_parent = HookStateService(graph_store=graph)
+        svc_child = HookStateService(graph_store=graph)
+
+        # Parent creates the node first, with the agent set.
+        await svc_parent.ensure_session_node(
+            "child-484b", {"agent": "foundation:git-ops"}
+        )
+        # Child's later agent-less call hits the existing branch and must not clobber.
+        await svc_child.ensure_session_node(
+            "child-484b", {"timestamp": "2026-01-01T00:00:00Z"}
+        )
+        node = await graph.get_node("child-484b")
+        assert node is not None
+        assert node.get("agent") == "foundation:git-ops"
