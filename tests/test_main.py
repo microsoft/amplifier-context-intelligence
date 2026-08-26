@@ -4,8 +4,8 @@ import asyncio
 import contextlib
 import json
 import logging
-from pathlib import Path
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -162,7 +162,7 @@ async def test_post_events_increments_accepted_counter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A durably-accepted event increments the registry accepted_total (D2)."""
+    """A durably-accepted event increments the registry accepted_total."""
     from context_intelligence_server.queue_manager import QueueManager
 
     # Point the registry at a tmp queue dir so the durable append is isolated.
@@ -241,9 +241,7 @@ async def test_drain_loop_processes_event(
 ) -> None:
     """A posted event is drained from the durable log by the sticky drainer.
 
-    Migrated off the vestigial in-memory worker.queue (Phase B2, Task 5): the
-    durable drain loop reads from the on-disk QueueManager log, so success is
-    observed by polling that log to empty rather than worker.queue.join().
+    Success is observed by polling the on-disk QueueManager log to empty.
     """
     from context_intelligence_server.neo4j_store import Neo4jGraphStore
 
@@ -678,13 +676,15 @@ class TestMainDispatch:
         with its return code."""
         import context_intelligence_server.main as _main_mod
 
-        with patch(
-            "context_intelligence_server.doctor.run_doctor",
-            new_callable=AsyncMock,
-            return_value=0,
-        ) as mock_doctor:
-            with pytest.raises(SystemExit) as exc_info:
-                _main_mod.main(["doctor"])
+        with (
+            patch(
+                "context_intelligence_server.doctor.run_doctor",
+                new_callable=AsyncMock,
+                return_value=0,
+            ) as mock_doctor,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            _main_mod.main(["doctor"])
 
         mock_doctor.assert_awaited_once_with(fix=False)
         assert exc_info.value.code == 0
@@ -693,13 +693,15 @@ class TestMainDispatch:
         """main(["doctor", "--fix"]) calls doctor.run_doctor(fix=True)."""
         import context_intelligence_server.main as _main_mod
 
-        with patch(
-            "context_intelligence_server.doctor.run_doctor",
-            new_callable=AsyncMock,
-            return_value=1,
-        ) as mock_doctor:
-            with pytest.raises(SystemExit) as exc_info:
-                _main_mod.main(["doctor", "--fix"])
+        with (
+            patch(
+                "context_intelligence_server.doctor.run_doctor",
+                new_callable=AsyncMock,
+                return_value=1,
+            ) as mock_doctor,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            _main_mod.main(["doctor", "--fix"])
 
         mock_doctor.assert_awaited_once_with(fix=True)
         assert exc_info.value.code == 1
@@ -742,7 +744,7 @@ async def test_lifespan_creates_and_closes_driver(
 
 
 # ---------------------------------------------------------------------------
-# Lifespan crash-recovery + workers==1 guard tests (Phase B2)
+# Lifespan crash-recovery + workers==1 guard tests
 # ---------------------------------------------------------------------------
 
 
@@ -789,7 +791,8 @@ async def test_lifespan_recovers_and_respawns_drainers(
         ),
     ):
         async with lifespan(main_module.app):
-            pass
+            # Recovery is backgrounded -- await it before shutdown cancels it.
+            await main_module.app.state.boot_task
 
     assert (sid, "/recovered-ws") in spawned
 
@@ -797,9 +800,8 @@ async def test_lifespan_recovers_and_respawns_drainers(
 async def test_lifespan_skips_recovery_for_empty_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A session whose first line has an empty workspace is NOT respawned
-    (spawning a workspace='' worker would violate the non-empty-workspace
-    invariant)."""
+    """A session whose only line has an empty workspace is dispatched under
+    the `_RECOVERY_FALLBACK_WORKSPACE` sentinel, never under workspace=''."""
     sid = "sess-empty-ws"
     qm = registry.queue_manager
     body = json.dumps(
@@ -831,9 +833,15 @@ async def test_lifespan_skips_recovery_for_empty_workspace(
         ),
     ):
         async with lifespan(main_module.app):
-            pass
+            # Recovery is backgrounded -- await it before shutdown cancels it.
+            await main_module.app.state.boot_task
 
-    assert spawned == []
+    # Dispatched under the sentinel fallback, never under workspace=''.
+    assert len(spawned) == 1
+    dispatched_sid, dispatched_ws = spawned[0]
+    assert dispatched_sid == sid
+    assert dispatched_ws == main_module._RECOVERY_FALLBACK_WORKSPACE
+    assert dispatched_ws != ""
 
 
 # ---------------------------------------------------------------------------
@@ -855,9 +863,9 @@ async def _seed_recoverable_session(qm: Any, sid: str, workspace: str) -> None:
 async def test_lifespan_default_respawns_all_recovered_sessions_unbounded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Default (crash_recovery_respawn_limit=None) MUST preserve today's
-    behaviour exactly: every recovered session is respawned on this boot,
-    no matter how many there are."""
+    """An explicit unbounded ceiling (crash_recovery_respawn_limit=None)
+    respawns every recovered session on this boot, no matter how many
+    there are."""
     qm = registry.queue_manager
     sids = [f"sess-unbounded-{i}" for i in range(10)]
     for sid in sids:
@@ -867,7 +875,7 @@ async def test_lifespan_default_respawns_all_recovered_sessions_unbounded(
     monkeypatch.setattr(
         registry, "get_or_create", lambda s, w, **kw: spawned.append((s, w))
     )
-    assert main_module._settings.crash_recovery_respawn_limit is None
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", None)
 
     mock_driver = _patched_lifespan_deps()
     with (
@@ -879,7 +887,8 @@ async def test_lifespan_default_respawns_all_recovered_sessions_unbounded(
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
     ):
         async with lifespan(main_module.app):
-            pass
+            # Recovery is backgrounded -- await it before shutdown cancels it.
+            await main_module.app.state.boot_task
 
     assert {s for s, _w in spawned} == set(sids)
 
@@ -913,7 +922,8 @@ async def test_lifespan_respawn_cap_defers_remainder_and_logs_warning(
         caplog.at_level(logging.WARNING, logger="context_intelligence_server"),
     ):
         async with lifespan(main_module.app):
-            pass
+            # Recovery is backgrounded -- await it before shutdown cancels it.
+            await main_module.app.state.boot_task
 
     # Exactly the cap's worth of sessions were respawned -- never more.
     assert len(spawned) == 2
@@ -958,7 +968,8 @@ async def test_lifespan_deferred_sessions_untouched_and_recoverable_next_boot(
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
     ):
         async with lifespan(main_module.app):
-            pass
+            # Recovery is backgrounded -- await it before shutdown cancels it.
+            await main_module.app.state.boot_task
 
     assert len(spawned_boot1) == 1
     deferred_sids = set(sids) - {s for s, _w in spawned_boot1}
@@ -999,7 +1010,8 @@ async def test_lifespan_respawn_cap_zero_defers_everything(
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
     ):
         async with lifespan(main_module.app):
-            pass
+            # Recovery is backgrounded -- await it before shutdown cancels it.
+            await main_module.app.state.boot_task
 
     assert spawned == []
     recovered_again = await qm.recover()
@@ -1016,10 +1028,10 @@ async def test_lifespan_respawn_cap_zero_defers_everything(
 async def test_crash_recovery_topup_drains_deferred_tail_across_passes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The deferred tail is not stranded: with ceiling=2, pass 1 dispatches the
-    2 head sessions; once those finish draining (drop out of recover()), pass 2
-    dispatches the previously-deferred 2. Live recovered drainers never exceed
-    the ceiling."""
+    """With ceiling=2: pass 1 dispatches the 2 head sessions; once those
+    finish draining, pass 2 dispatches the previously-deferred 2. Tests
+    dispatch counting only -- see tests/test_boot_safety.py for the
+    live-drainer bound."""
     qm = registry.queue_manager
     sids = sorted(f"sess-sweep-{i}" for i in range(4))
     for sid in sids:
@@ -1029,8 +1041,10 @@ async def test_crash_recovery_topup_drains_deferred_tail_across_passes(
     monkeypatch.setattr(registry, "get_or_create", lambda s, w, **kw: spawned.append(s))
 
     # Pass 1: only the ceiling's worth (2) are dispatched; the tail is deferred.
-    dispatched = await main_module._crash_recovery_topup(2)
-    assert dispatched == 2
+    result = await main_module._crash_recovery_topup(2)
+    assert result.dispatched == 2
+    assert result.recovered == 4
+    assert result.deferred == 2
     assert set(spawned) == set(sids[:2])
 
     # The 2 head sessions finish draining -> commit them to EOF so recover()
@@ -1041,8 +1055,10 @@ async def test_crash_recovery_topup_drains_deferred_tail_across_passes(
 
     # Pass 2: the previously-DEFERRED tail is now dispatched -- not stranded.
     spawned.clear()
-    dispatched = await main_module._crash_recovery_topup(2)
-    assert dispatched == 2
+    result = await main_module._crash_recovery_topup(2)
+    assert result.dispatched == 2
+    assert result.recovered == 2
+    assert result.deferred == 0
     assert set(spawned) == set(sids[2:])
 
 
@@ -1070,7 +1086,9 @@ async def test_lifespan_enables_sweep_under_finite_limit(
         caplog.at_level(logging.INFO, logger="context_intelligence_server"),
     ):
         async with lifespan(main_module.app):
-            pass  # task is created on entry and cancelled cleanly on exit
+            # Recovery (incl. sweep-task creation) is backgrounded --
+            # await it before shutdown cancels it.
+            await main_module.app.state.boot_task
 
     assert any(
         "crash_recovery_sweep: enabled" in r.getMessage() for r in caplog.records
@@ -1097,7 +1115,8 @@ async def test_lifespan_no_sweep_when_limit_unbounded(
         caplog.at_level(logging.INFO, logger="context_intelligence_server"),
     ):
         async with lifespan(main_module.app):
-            pass
+            # Recovery is backgrounded -- await it before shutdown cancels it.
+            await main_module.app.state.boot_task
 
     assert not any(
         "crash_recovery_sweep: enabled" in r.getMessage() for r in caplog.records
@@ -1127,7 +1146,8 @@ async def test_lifespan_no_sweep_when_interval_zero(
         caplog.at_level(logging.INFO, logger="context_intelligence_server"),
     ):
         async with lifespan(main_module.app):
-            pass
+            # Recovery is backgrounded -- await it before shutdown cancels it.
+            await main_module.app.state.boot_task
 
     assert not any(
         "crash_recovery_sweep: enabled" in r.getMessage() for r in caplog.records
@@ -1149,19 +1169,18 @@ async def test_lifespan_no_sweep_when_interval_zero(
 # ---------------------------------------------------------------------------
 
 
-async def test_lifespan_calls_ensure_schema_with_fail_on_data_conflict() -> None:
-    """Cold start must call ensure_neo4j_schema with fail_on_data_conflict=True
+async def test_ensure_schema_ready_calls_schema_init_with_fail_on_data_conflict() -> (
+    None
+):
+    """Schema init (now _boot_reconcile's first phase, not synchronous
+    lifespan) must call ensure_neo4j_schema with fail_on_data_conflict=True
     -- boot refuses to proceed on a genuine :Node constraint data conflict
-    (duplicate legacy nodes), mirroring run_repair's contract. Safe at cold
-    start (nothing flushed yet); the flush path keeps the opposite default."""
-    mock_driver = _patched_lifespan_deps()
+    (duplicate legacy nodes), mirroring run_repair's contract."""
+    main_module.app.state.schema_ready = False
+    main_module.app.state.neo4j_driver = MagicMock()
     mock_ensure_schema = AsyncMock(return_value=True)
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
         patch(
             "context_intelligence_server.main.ensure_neo4j_schema",
             new=mock_ensure_schema,
@@ -1171,29 +1190,28 @@ async def test_lifespan_calls_ensure_schema_with_fail_on_data_conflict() -> None
             new=AsyncMock(return_value=0),
         ),
     ):
-        async with lifespan(main_module.app):
-            pass
+        await main_module._ensure_schema_ready()
 
     mock_ensure_schema.assert_awaited_once()
+    assert mock_ensure_schema.await_args is not None
     _args, kwargs = mock_ensure_schema.await_args
     assert kwargs.get("fail_on_data_conflict") is True, (
-        "lifespan must opt into fail_on_data_conflict=True -- cold start "
+        "schema init must opt into fail_on_data_conflict=True -- boot "
         "fails loud on a genuine data conflict (that contract now applies "
         "at boot too, not just to run_repair / `doctor --fix`)."
     )
+    assert main_module.app.state.schema_ready is True
 
 
-async def test_lifespan_raises_on_ensure_schema_data_conflict() -> None:
+async def test_ensure_schema_ready_raises_on_data_conflict() -> None:
     """When ensure_neo4j_schema itself raises (a genuine :Node constraint
-    data conflict under fail_on_data_conflict=True), lifespan must propagate
-    the RuntimeError -- boot refuses to start."""
-    mock_driver = _patched_lifespan_deps()
+    data conflict under fail_on_data_conflict=True), _ensure_schema_ready
+    propagates the RuntimeError -- caught by _boot_reconcile's own
+    exception-safe wrapper (boot_state.fail), never an ASGI-startup abort."""
+    main_module.app.state.schema_ready = False
+    main_module.app.state.neo4j_driver = MagicMock()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
         patch(
             "context_intelligence_server.main.ensure_neo4j_schema",
             new=AsyncMock(
@@ -1204,21 +1222,19 @@ async def test_lifespan_raises_on_ensure_schema_data_conflict() -> None:
         ),
         pytest.raises(RuntimeError, match="doctor --fix"),
     ):
-        async with lifespan(main_module.app):
-            pass
+        await main_module._ensure_schema_ready()
+
+    assert main_module.app.state.schema_ready is False
 
 
-async def test_lifespan_raises_on_untagged_nodes() -> None:
-    """On an un-migrated graph (untagged :Node count > 0), startup MUST
-    raise a RuntimeError naming `doctor --fix` -- boot refuses to start
-    rather than silently risking write-path duplication."""
-    mock_driver = _patched_lifespan_deps()
+async def test_ensure_schema_ready_raises_on_untagged_nodes() -> None:
+    """On an un-migrated graph (untagged :Node count > 0), schema init MUST
+    raise a RuntimeError naming `doctor --fix` -- boot refuses to mark
+    schema ready rather than silently risking write-path duplication."""
+    main_module.app.state.schema_ready = False
+    main_module.app.state.neo4j_driver = MagicMock()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
         patch(
             "context_intelligence_server.main.ensure_neo4j_schema",
             new=AsyncMock(return_value=True),
@@ -1229,25 +1245,21 @@ async def test_lifespan_raises_on_untagged_nodes() -> None:
         ),
         pytest.raises(RuntimeError, match="doctor --fix") as exc_info,
     ):
-        async with lifespan(main_module.app):
-            pass
+        await main_module._ensure_schema_ready()
 
     assert "42" in str(exc_info.value), (
         f"Expected the untagged count in the error message, got: {exc_info.value}"
     )
+    assert main_module.app.state.schema_ready is False
 
 
-async def test_lifespan_does_not_raise_on_clean_graph() -> None:
+async def test_ensure_schema_ready_does_not_raise_on_clean_graph() -> None:
     """On a fully-migrated graph (untagged count == 0, no constraint
-    conflict), startup does NOT raise -- the fail-loud guards are silent
-    when there is nothing to report."""
-    mock_driver = _patched_lifespan_deps()
+    conflict), schema init does NOT raise and marks schema_ready True."""
+    main_module.app.state.schema_ready = False
+    main_module.app.state.neo4j_driver = MagicMock()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.main.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
         patch(
             "context_intelligence_server.main.ensure_neo4j_schema",
             new=AsyncMock(return_value=True),
@@ -1257,10 +1269,10 @@ async def test_lifespan_does_not_raise_on_clean_graph() -> None:
             new=AsyncMock(return_value=0),
         ) as mock_count,
     ):
-        async with lifespan(main_module.app):
-            pass
+        await main_module._ensure_schema_ready()
 
     mock_count.assert_awaited_once()
+    assert main_module.app.state.schema_ready is True
 
 
 async def test_lifespan_does_not_raise_when_health_check_itself_fails(
@@ -1468,7 +1480,7 @@ async def test_status_includes_neo4j_query_connected_false_when_no_driver(
 
 
 # ---------------------------------------------------------------------------
-# /status pipeline metrics block (D3)
+# /status pipeline metrics block
 # ---------------------------------------------------------------------------
 
 
@@ -1666,7 +1678,7 @@ async def test_post_events_stamps_contributor_id_from_scope(
 
     # Temporarily configure a StaticKeyResolver on asgi_app so auth injects contributor_id.
     # T2: middleware now uses resolver= seam; patch asgi_app.resolver, not asgi_app.keystore.
-    from context_intelligence_server.auth import StaticKeyResolver  # noqa: PLC0415
+    from context_intelligence_server.auth import StaticKeyResolver
 
     test_token = "test-secret"
     test_keystore = {hashlib.sha256(test_token.encode()).hexdigest(): "alice"}
@@ -1716,7 +1728,7 @@ async def test_post_events_overwrites_client_supplied_created_by(
     monkeypatch.setattr(main_module.registry.queue_manager, "append", _fake_append)
 
     # T2: middleware now uses resolver= seam; patch asgi_app.resolver, not asgi_app.keystore.
-    from context_intelligence_server.auth import StaticKeyResolver  # noqa: PLC0415
+    from context_intelligence_server.auth import StaticKeyResolver
 
     test_token = "test-secret"
     test_keystore = {hashlib.sha256(test_token.encode()).hexdigest(): "real-owner"}
@@ -1812,6 +1824,7 @@ async def test_crash_recovery_passes_created_by_to_get_or_create(
         session_id: str,
         workspace: str,
         created_by: str | None = None,
+        **_kwargs: Any,  # Absorbs the new `recovered=` keyword, untested here
     ) -> MagicMock:
         calls.append(
             {"session_id": session_id, "workspace": workspace, "created_by": created_by}
@@ -1854,6 +1867,7 @@ async def test_crash_recovery_truncated_line_safe_skip(bad_line: str) -> None:
         session_id: str,
         workspace: str,
         created_by: str | None = None,
+        **_kwargs: Any,  # Absorbs the new `recovered=` keyword, untested here
     ) -> MagicMock:
         calls.append(
             {"session_id": session_id, "workspace": workspace, "created_by": created_by}

@@ -14,12 +14,20 @@ from context_intelligence_server.services import HookStateService
 
 
 class FakeGraph:
-    """Minimal async graph store that records which nodes get upserted."""
+    """Minimal async graph store that records which nodes get upserted.
+
+    Conforms fully to the ``GraphStore`` Protocol: the ``graph_store``
+    constructor parameter is typed as ``GraphStore | None``, so a fake
+    passed to it must structurally satisfy the Protocol even though this
+    test only exercises get_node/upsert_node. The extra members are
+    no-ops -- this test's behavior is unchanged.
+    """
 
     def __init__(self, nodes: dict[str, dict[str, Any]]) -> None:
         self.nodes = nodes
         self.touched: list[str] = []
         self.workspace = "test"
+        self.created_by: str | None = None
 
     async def get_node(self, node_id: str) -> dict[str, Any] | None:
         return self.nodes.get(node_id)
@@ -27,6 +35,26 @@ class FakeGraph:
     async def upsert_node(self, node_id: str, data: dict[str, Any]) -> None:
         self.touched.append(node_id)
         self.nodes.setdefault(node_id, {}).update(data)
+
+    async def upsert_edge(self, src_id: str, dst_id: str, data: dict[str, Any]) -> None:
+        pass
+
+    async def get_edge(self, src_id: str, dst_id: str) -> dict[str, Any] | None:
+        return None
+
+    async def find_delegation_by_sub_session(
+        self, sub_session_id: str, workspace: str
+    ) -> dict[str, Any] | None:
+        return None
+
+    def discard_buffer(self) -> None:
+        pass
+
+    async def flush(self) -> None:
+        pass
+
+    async def close(self) -> None:
+        pass
 
 
 async def test_touch_session_updates_only_direct_node() -> None:

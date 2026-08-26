@@ -62,6 +62,87 @@ ring_buffer: EventRingBuffer = EventRingBuffer()
 
 
 # ---------------------------------------------------------------------------
+# BootState
+# ---------------------------------------------------------------------------
+
+# `sweep`/`topup` are momentary step labels only -- the sweep loop runs
+# forever once started, so `_boot_reconcile` sets phase="ready" right after.
+# `schema` is the new first phase (Neo4j schema init); `awaiting_schema` is
+# the terminal-but-not-ready state when Neo4j stayed unreachable this pass --
+# the periodic sweep retries schema + topup and marks "ready" once it lands.
+_BOOT_PHASES = (
+    "recovering",
+    "schema",
+    "heal",
+    "reclaim",
+    "expire",  # dead-letter expiry, before reconcile
+    "reconcile",
+    "seed",
+    "topup",
+    "sweep",
+    "awaiting_schema",
+    "ready",
+    "failed",
+)
+
+
+@dataclasses.dataclass
+class BootState:
+    """Boot-safety progress, surfaced (additively) on /status.
+
+    Module-level singleton; all mutation happens on the event loop inside
+    ``_boot_reconcile`` between awaits, so plain ints need no lock.
+
+    ``phase`` defaults to ``"recovering"``, never ``"ready"``, so a bare ASGI
+    test client that never runs the real lifespan still gets a true value.
+    ``status`` stays ``"ok"``/200 at every phase including ``"failed"`` --
+    the boot phase is informational, never a liveness signal.
+    """
+
+    phase: str = "recovering"
+    started_at: float = 0.0
+    completed_at: float | None = None
+    reclaimed: int = 0
+    reclaimed_bytes: int = 0
+    kept: int = 0
+    failed: int = 0
+    resumed: int = 0
+    deferred: int = 0
+    error: str | None = None
+    failed_step: str | None = None
+    fallback_workspace_byte0: int = 0
+    fallback_workspace_sentinel: int = 0
+    reclaim_enabled: bool = False
+
+    def begin(self) -> None:
+        """Mark the start of boot reconciliation (called once, at boot)."""
+        self.phase = "recovering"
+        self.started_at = time.time()
+        self.completed_at = None
+        self.error = None
+        self.failed_step = None
+
+    def finish(self) -> None:
+        """Mark boot reconciliation as complete: phase -> "ready"."""
+        self.phase = "ready"
+        self.completed_at = time.time()
+
+    def fail(self, step: str, exc: BaseException) -> None:
+        """Mark boot reconciliation as FAILED. The server keeps serving."""
+        self.phase = "failed"
+        self.completed_at = time.time()
+        self.failed_step = step
+        self.error = f"{type(exc).__name__}: {exc}"
+
+    def snapshot(self) -> dict[str, Any]:
+        """Read-only view for /status. Plain dict, no I/O."""
+        return dataclasses.asdict(self)
+
+
+boot_state: BootState = BootState()
+
+
+# ---------------------------------------------------------------------------
 # error_count_last_hour
 # ---------------------------------------------------------------------------
 
@@ -85,26 +166,10 @@ def build_status_response(
 ) -> dict[str, Any]:
     """Build a status response dict from registry state and recent events.
 
-    Args:
-        registry: The active SessionRegistry.
-        start_time: Server start time as a Unix timestamp (from time.time()).
-
-    Returns:
-        A dict with keys: status, uptime_seconds, active_sessions, sessions,
-        recent_events, completed_sessions, error_count_last_hour, server_version,
-        orphaned_sessions.
-
-        Each entry in ``sessions`` includes the keys: session_id, workspace,
-        last_event, last_event_time, events_processed, orphaned,
-        last_successful_flush.
-
-        Note: ``orphaned_sessions`` is the count of ALL registered workers whose
-        drain task has completed (``task.done()``).  A worker filtered *out* of
-        the visible ``sessions`` list by ``status_inactive_timeout`` still
-        contributes to this count but will not appear with ``orphaned: True`` in
-        any per-session dict.  For a fresh OOM orphan this asymmetry is
-        irrelevant (OOM orphans are recent by definition); it can surface for
-        long-running orphans whose ``last_event_time`` ages past the timeout.
+    ``orphaned_sessions`` counts ALL workers whose drain task is done, even
+    ones filtered out of the visible ``sessions`` list by
+    ``status_inactive_timeout`` -- so the count and the per-session
+    ``orphaned`` flags can disagree for long-idle orphans.
     """
     settings = get_settings()
     now = time.time()

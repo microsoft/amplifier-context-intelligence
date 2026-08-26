@@ -76,21 +76,21 @@ def test_settings_has_durable_queue_defaults():
 # ---------------------------------------------------------------------------
 
 
-def test_crash_recovery_respawn_limit_defaults_to_unbounded():
-    """Default MUST preserve today's behaviour exactly: unbounded (None)."""
+def test_crash_recovery_respawn_limit_defaults_to_8():
+    """Default changes from unbounded (None) to a finite 8: an unbounded
+    ceiling started no sweep task, so it was never actually protective."""
     from context_intelligence_server.config import Settings
 
     s = Settings()
-    assert s.crash_recovery_respawn_limit is None
+    assert s.crash_recovery_respawn_limit == 8
 
 
-def test_crash_recovery_sweep_interval_defaults_to_300():
-    """A finite ceiling drains its deferred tail via a periodic sweep; the
-    default interval must be a sane positive value so a finite cap is safe
-    out of the box (not silently stranded)."""
+def test_crash_recovery_sweep_interval_defaults_to_60():
+    """Default changes from 300 to 60, coupled to the respawn-limit default
+    change above, so a finite ceiling's deferred tail actually drains."""
     from context_intelligence_server.config import Settings
 
-    assert Settings().crash_recovery_sweep_interval_seconds == 300
+    assert Settings().crash_recovery_sweep_interval_seconds == 60
 
 
 def test_crash_recovery_sweep_interval_accepts_zero_and_positive():

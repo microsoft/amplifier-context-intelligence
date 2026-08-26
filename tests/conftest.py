@@ -122,6 +122,9 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
         neo4j_flush_chunk_rows: int = _real.neo4j_flush_chunk_rows
         neo4j_flush_chunk_bytes: int = _real.neo4j_flush_chunk_bytes
         neo4j_lock_timeout: float = _real.neo4j_lock_timeout
+        # Mirrors real Settings fields drain_worker reads via get_settings().
+        queue_compact_enabled: bool = _real.queue_compact_enabled
+        queue_compact_min_prefix_bytes: int = _real.queue_compact_min_prefix_bytes
 
         # Neo4j two-client split (doc 12): SessionRegistry.get_or_create() calls
         # settings.resolve_neo4j_admin() directly, so this proxy (which stands
@@ -148,6 +151,34 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
         return_value=_SettingsProxy(),
     ):
         yield
+
+
+@pytest.fixture(autouse=True)
+def reset_boot_state() -> Generator[None, None, None]:
+    """Reset the module-level ``BootState`` singleton to ``"ready"`` around
+    each test, since ``/status``'s ``metrics``/``spool`` fields are
+    phase-gated and most tests never drive a real ``lifespan()`` boot."""
+    from context_intelligence_server.status import boot_state as _boot_state
+
+    def _reset() -> None:
+        _boot_state.phase = "ready"
+        _boot_state.started_at = 0.0
+        _boot_state.completed_at = None
+        _boot_state.reclaimed = 0
+        _boot_state.reclaimed_bytes = 0
+        _boot_state.kept = 0
+        _boot_state.failed = 0
+        _boot_state.resumed = 0
+        _boot_state.deferred = 0
+        _boot_state.error = None
+        _boot_state.failed_step = None
+        _boot_state.fallback_workspace_byte0 = 0
+        _boot_state.fallback_workspace_sentinel = 0
+        _boot_state.reclaim_enabled = False
+
+    _reset()
+    yield
+    _reset()
 
 
 @pytest.fixture(autouse=True)

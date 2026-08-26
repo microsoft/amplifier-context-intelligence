@@ -12,7 +12,7 @@ import json
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException  # noqa: F401  (HTTPException per spec)
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.requests import Request
 
 from context_intelligence_server.authz import require_read, require_write

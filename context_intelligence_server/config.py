@@ -11,6 +11,7 @@ Values are resolved in this priority order (highest first):
 
 import hashlib
 import logging
+import math
 import os
 import re
 from functools import lru_cache
@@ -842,11 +843,12 @@ class Settings(BaseSettings):
     # setting, and /status's spool block (pending_sessions, spool_bytes_total)
     # makes the backlog observable continuously, not just at boot.
     #
-    # None (the default) preserves TODAY'S BEHAVIOUR EXACTLY: unbounded,
-    # every recovered session is respawned on this boot, matching every
-    # existing deployment -- this PR is a no-op unless an operator opts in
-    # by setting a finite ceiling.
-    crash_recovery_respawn_limit: int | None = None
+    # None means unbounded; with an unbounded ceiling no sweep task starts
+    # (see crash_recovery_sweep_interval_seconds below), so a recovered
+    # drainer with no terminal record in its backlog never frees its slot.
+    # 8 is a pessimistic, single-line-overridable default that keeps that
+    # protection on out of the box; 0 remains a valid explicit opt-out.
+    crash_recovery_respawn_limit: int | None = 8
 
     @field_validator("crash_recovery_respawn_limit")
     @classmethod
@@ -871,13 +873,11 @@ class Settings(BaseSettings):
     # number of live recovered drainers stays <= the ceiling while the deferred
     # tail advances in deterministic sorted order as head sessions drain.
     #
-    # Default 300s applies ONLY when a finite ceiling is set; with the default
-    # crash_recovery_respawn_limit=None (unbounded) there is no deferred tail
-    # and NO sweep task is ever started -- so every existing deployment is
-    # completely unaffected. Set to 0 to DISABLE the sweep even under a finite
-    # ceiling (the deferred tail then drains only on restart or a new event --
-    # an explicit, documented choice, not a silent surprise).
-    crash_recovery_sweep_interval_seconds: int = 300
+    # Only relevant when crash_recovery_respawn_limit is finite: periodically
+    # re-runs recover() and tops the drainer pool back up to the ceiling, so
+    # a deferred tail of already-completed sessions keeps advancing instead
+    # of stalling until a restart or a new event. 0 disables the sweep.
+    crash_recovery_sweep_interval_seconds: int = 60
 
     @field_validator("crash_recovery_sweep_interval_seconds")
     @classmethod
@@ -888,6 +888,76 @@ class Settings(BaseSettings):
                 "crash_recovery_sweep_interval_seconds must be a non-negative "
                 f"integer (0 disables the sweep), got {v}"
             )
+        return v
+
+    # A bad `.offset` (unparseable, negative, or past-EOF) below this many
+    # bytes is reset (re-drained from byte 0, bounded and idempotent) rather
+    # than deleted outright; at/above the threshold the `.log` is deleted too.
+    # 0 means "always delete".
+    reclaim_redrain_max_bytes: int = 64 * 1024 * 1024
+
+    # Boot reclaim's delete/reset-offset actions ship disabled by default.
+    # With this False, boot still classifies every key and logs the same
+    # audit line (action=dry_run), but nothing is unlinked.
+    reclaim_enabled: bool = False
+
+    # The queue is a transient buffer, not an archive -- an open,
+    # actively-draining session's already-committed prefix is reclaimed
+    # continuously (not just at session:end), on the same committed-offset
+    # evidence delete_drained already uses for a finished session. False is
+    # a config-change-plus-restart kill switch, not a live toggle.
+    queue_compact_enabled: bool = True
+
+    # Bounds compaction frequency on a continuously-hot session: below this
+    # many committed bytes, the rewrite is skipped (the idle path closes the
+    # gap for free once the session goes idle).
+    queue_compact_min_prefix_bytes: int = 8 * 1024 * 1024
+
+    # Separate flag from reclaim_enabled: the log-less + stale-mtime predicate
+    # is a structural proof, not a heuristic, so gating this on reclaim_enabled
+    # would let dead-letters accumulate forever by default. Ships False: a
+    # dead-letter may be the only surviving copy of an un-recovered event --
+    # never auto-delete it without an explicit opt-in.
+    dead_letter_expiry_enabled: bool = False
+
+    # How long a log-less `.dead.jsonl` survives before being expired. <=0
+    # disables expiry outright (an explicit opt-out, not a silent one).
+    dead_letter_retention_seconds: float = 30 * 86400.0
+
+    @field_validator("queue_compact_min_prefix_bytes")
+    @classmethod
+    def _validate_queue_compact_bytes(cls, v: int) -> int:
+        """Fail loud on a negative value; 0 is a valid explicit opt-out."""
+        if v < 0:
+            raise ValueError(
+                f"queue_compact_min_prefix_bytes must be a non-negative integer, got {v}"
+            )
+        return v
+
+    @field_validator("dead_letter_retention_seconds")
+    @classmethod
+    def _validate_dead_letter_retention_seconds(cls, v: float) -> float:
+        """Fail loud on a negative retention; 0 (disabled) is valid."""
+        if v < 0:
+            raise ValueError(
+                "dead_letter_retention_seconds must be a non-negative number "
+                f"(0 disables expiry), got {v}"
+            )
+        return v
+
+    # Hard ceiling per boot-reconcile phase (heal/reclaim/expire/reconcile/
+    # seed/topup). A phase that hangs (e.g. a blocking stat/read on a
+    # degraded mount) would otherwise leave boot stuck pre-ready forever,
+    # latching /status's spool/metrics at null. <=0 disables the per-phase
+    # timeout (unbounded wait).
+    boot_phase_timeout_seconds: float = 300.0
+
+    @field_validator("boot_phase_timeout_seconds")
+    @classmethod
+    def _validate_boot_phase_timeout_seconds(cls, v: float) -> float:
+        """Fail loud on non-finite input; <=0 is the documented opt-out."""
+        if not math.isfinite(v):
+            raise ValueError(f"boot_phase_timeout_seconds must be finite, got {v}")
         return v
 
     # -------------------------------------------------------------------------
