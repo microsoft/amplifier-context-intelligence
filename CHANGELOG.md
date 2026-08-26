@@ -5,6 +5,29 @@ All notable changes to the Context Intelligence Server are recorded here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.4.0]
+
+### Added
+
+- **Orphaned-blob garbage collection.** New `POST /admin/blobs/reclaim`
+  endpoint reclaims blob-store artifacts no longer referenced by the graph. It
+  is protocol-only — enumeration via `BlobStore.scan()`, deletion via the
+  fenced `BlobStore.delete(uri, if_unmodified=ref)` compare-and-delete — so it
+  never touches a filesystem path, glob, or `os.unlink`, and never reaches the
+  queue / identity / lease stores or graph data. Safety gates: a graph-wide
+  reference scan over the blob-carrier allowlist, a not-live / durable
+  `is_fully_drained` session gate, a hard `min_age_minutes` floor (>= 15), a
+  destructive-apply single-flight (409 on overlap), a required `max_delete`
+  blast-radius cap, and **`dry_run=true` by default** (a preview that deletes
+  nothing). One structured audit line per delete; blob contents are never
+  logged, only the `ci-blob://` URI.
+- **Blob-carrier allowlist** (`BLOB_REF_CARRIER_PROPERTIES` in
+  `blob_processor`) — the single source of truth for which graph properties may
+  carry a `ci-blob://` reference, validated at import and enforced at the mint
+  site (`assert_carrier_registered`) so an unregistered carrier fails loud
+  rather than becoming a silent reclaim-GC hole. The reclaim reference-scan
+  Cypher is generated directly from this tuple, so the two can never drift.
+
 ## [7.3.0]
 
 ### Added
