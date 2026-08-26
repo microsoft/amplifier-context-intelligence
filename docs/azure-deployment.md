@@ -229,17 +229,26 @@ name: context-intelligence-neo4j
 stack: vm
 
 vm:
-  size: Standard_D2as_v5           # memory-optimized SKUs (E-series) for larger graphs
+  size: Standard_E8s_v5            # memory-optimized (E-series) — sized for the graph
   admin_username: azureuser
   ssh_public_key: "ssh-ed25519 AAAA..."   # PUBLIC half only; key auth, no passwords
   cloud_init: ./cloud-init.yaml            # contents inlined at `up`; runs on first boot
-  data_disk_gib: 64                        # persistent graph store; survives `up` re-runs
+  data_disk_gib: 256                       # persistent graph store; survives `up` re-runs
   static_private_ip: 10.100.4.4            # fixes the Bolt endpoint the web app hard-codes
   ports:
     - port: 7687                           # Neo4j Bolt — the ONLY inbound rule
       protocol: Tcp
       source: cae-infra                    # the CAE app-egress subnet (where the ACA app calls from)
 ```
+
+> **As-built (production, verified 2026-08-26).** The live Neo4j VM
+> `context-intelligence-neo4j` (RG `AO-NEO4J-RG`, westus2) runs
+> **`Standard_E8s_v5`** (8 vCPU / 64 GB), **Ubuntu 22.04 LTS gen2**, private IP
+> `10.100.4.4`. The graph is on an **attached 256 GiB Premium_LRS data disk**
+> (LUN 0); the OS disk is a separate 30 GiB StandardSSD_LRS. Both disks are
+> `deleteOption: Detach`, so they survive VM deletion. (The `vm` stack's default
+> base image is Ubuntu 24.04 LTS; this VM predates that default and is pinned to
+> 22.04 — override via `vm.image` only on a deliberate rebuild.)
 
 - **`static_private_ip`** must be a free address in the `vms` subnet
   (`10.100.4.0/24`); set it precisely because the web app's `NEO4J_URL` hard-codes
