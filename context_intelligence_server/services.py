@@ -227,6 +227,7 @@ class HookStateService:
         workspace: str = "default",
         graph_store: Any | None = None,
         *,
+        working_dir: str = "",
         created_by: str | None = None,
         raw_config: dict[str, Any] | None = None,
         blob_store: Any | None = None,
@@ -238,6 +239,7 @@ class HookStateService:
             self.graph = GraphState()
         self.graph.workspace = workspace
         self.graph.created_by = created_by
+        self.working_dir = working_dir
         self.blob_store = blob_store
         self._seen_sessions: set[str] = set()
         self.data_layer_2 = DataLayer2State()
@@ -316,6 +318,8 @@ class HookStateService:
             node_data["started_at"] = _ts
         if "agent" in data:
             node_data["agent"] = data["agent"]
+        if self.working_dir:
+            node_data["working_dir"] = self.working_dir
 
         await self.graph.upsert_node(session_id, node_data)
         self._seen_sessions.add(session_id)  # only cache after successful write

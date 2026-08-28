@@ -74,6 +74,27 @@ def test_event_request_workspace_non_empty_accepted():
     assert req.workspace == "my-project-slug"
 
 
+def test_event_request_working_dir_defaults_empty():
+    """working_dir defaults to an empty string when the payload omits it."""
+    req = EventRequest(
+        event="tool:pre",
+        workspace="main",
+        data={"session_id": "abc123"},
+    )
+    assert req.working_dir == ""
+
+
+def test_event_request_accepts_working_dir():
+    """working_dir is parsed off the top-level envelope, not from data."""
+    req = EventRequest(
+        event="tool:pre",
+        workspace="main",
+        working_dir="/home/user/project",
+        data={"session_id": "abc123"},
+    )
+    assert req.working_dir == "/home/user/project"
+
+
 def test_event_request_data_without_session_id():
     """EventRequest accepts data dict that has no session_id key."""
     req = EventRequest(

@@ -231,6 +231,26 @@ class TestHookStateService:
         assert "RootSession" not in node["labels"]
         assert node["status"] == "running"
 
+    async def test_ensure_session_node_lifts_working_dir(self):
+        """working_dir is stamped on the Session node when the service carries one."""
+        svc = HookStateService(working_dir="/home/user/project")
+        await svc.ensure_session_node(
+            "session-wd", {"started_at": "2024-01-01T00:00:00"}
+        )
+        node = await svc.graph.get_node("session-wd")
+        assert node is not None
+        assert node["working_dir"] == "/home/user/project"
+
+    async def test_ensure_session_node_omits_empty_working_dir(self):
+        """No working_dir property is written when the service has none."""
+        svc = HookStateService()
+        await svc.ensure_session_node(
+            "session-no-wd", {"started_at": "2024-01-01T00:00:00"}
+        )
+        node = await svc.graph.get_node("session-no-wd")
+        assert node is not None
+        assert "working_dir" not in node
+
     async def test_ensure_session_node_is_idempotent(self):
         """ensure_session_node is a no-op when session_id was already processed."""
         svc = HookStateService()

@@ -550,6 +550,7 @@ class SessionRegistry:
         self,
         session_id: str,
         workspace: str,
+        working_dir: str = "",
         created_by: str | None = None,
     ) -> SessionWorker:
         if session_id not in self._workers:
@@ -568,6 +569,7 @@ class SessionRegistry:
                 workspace=workspace,
                 services=HookStateService(
                     workspace=workspace,
+                    working_dir=working_dir,
                     created_by=created_by,
                     blob_store=blob_store,
                     graph_store=neo4j_store,

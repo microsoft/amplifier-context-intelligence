@@ -273,6 +273,35 @@ class TestDefaultHandlerDataProperty:
         assert data["custom_info"] == "extra-value"
 
 
+class TestDefaultHandlerWorkingDir:
+    """working_dir is lifted onto Event nodes as a first-class property."""
+
+    async def test_event_node_carries_working_dir(self) -> None:
+        services = HookStateService(working_dir="/home/user/project")
+        handler = DefaultHandler(services)
+        await handler(
+            "session:resume",
+            {"session_id": "s1", "timestamp": "2026-01-01T02:00:00Z"},
+        )
+        event_id = make_node_id("s1", "session:resume", "2026-01-01T02:00:00Z")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        assert node.get("working_dir") == "/home/user/project"
+
+    async def test_event_node_omits_empty_working_dir(
+        self, services: HookStateService
+    ) -> None:
+        handler = DefaultHandler(services)
+        await handler(
+            "session:resume",
+            {"session_id": "s1", "timestamp": "2026-01-01T02:00:00Z"},
+        )
+        event_id = make_node_id("s1", "session:resume", "2026-01-01T02:00:00Z")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        assert "working_dir" not in node
+
+
 class TestDefaultHandlerEdgeType:
     """HAS_EVENT edge has type='HAS_EVENT'."""
 
