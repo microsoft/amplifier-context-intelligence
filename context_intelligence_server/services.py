@@ -9,11 +9,34 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
+from context_intelligence_server.blob_store import BlobStore
+from context_intelligence_server.graph_store import SessionFamily, extract_blob_refs
 from context_intelligence_server.handlers.data_layer_2.state import DataLayer2State
 from context_intelligence_server.handlers.data_layer_3.state import DataLayer3State
+
+_FAMILY_EDGE_TYPES = frozenset({"HAS_SUBSESSION", "FORKED"})
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    """Parse an ISO-8601 timestamp string to ``datetime``; passes datetimes through.
+
+    GraphState keeps whatever was written (usually a str); unlike
+    Neo4jGraphStore there is no driver-side temporal normalisation, so this is
+    the in-memory equivalent of that read-path conversion.
+    """
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +194,102 @@ class GraphState:
             ):
                 return dict(data)
         return None
+
+    async def resolve_session_family(self, session_id: str) -> SessionFamily | None:
+        """In-memory equivalent of ``Neo4jGraphStore.resolve_session_family``.
+
+        Walks ``HAS_SUBSESSION``/``FORKED`` edges up to the root, then back
+        down to every descendant. See that method's docstring for the
+        family-subgraph (node/edge/blob) traversal rule.
+        """
+        start = self._nodes.get(session_id)
+        if start is None or "Session" not in start.get("labels", []):
+            return None
+
+        parent_of: dict[str, str] = {}
+        children: dict[str, list[str]] = {}
+        outgoing: dict[str, list[str]] = {}
+        for (src, dst), edata in self._edges.items():
+            outgoing.setdefault(src, []).append(dst)
+            if edata.get("type") in _FAMILY_EDGE_TYPES:
+                parent_of[dst] = src
+                children.setdefault(src, []).append(dst)
+
+        # Walk up to the root (tree structure: at most one parent per node).
+        root_id = session_id
+        visited_up = {root_id}
+        while root_id in parent_of:
+            root_id = parent_of[root_id]
+            if root_id in visited_up:
+                break  # defensive cycle guard; graph is acyclic by construction
+            visited_up.add(root_id)
+
+        # Walk down from the root to every descendant.
+        session_ids: set[str] = set()
+        stack = [root_id]
+        while stack:
+            nid = stack.pop()
+            if nid in session_ids:
+                continue
+            session_ids.add(nid)
+            stack.extend(children.get(nid, []))
+
+        # Family subgraph: expand outward from every family session, stopping
+        # at (but including) any :SST_CONCEPT node.
+        family_nodes: set[str] = set()
+        stack = list(session_ids)
+        while stack:
+            nid = stack.pop()
+            if nid in family_nodes:
+                continue
+            family_nodes.add(nid)
+            node_data = self._nodes.get(nid) or {}
+            if "SST_CONCEPT" in node_data.get("labels", []):
+                continue
+            stack.extend(outgoing.get(nid, []))
+
+        edge_count = sum(
+            1
+            for (src, dst) in self._edges
+            if src in family_nodes and dst in family_nodes
+        )
+
+        blob_refs: set[str] = set()
+        for nid in family_nodes:
+            blob_refs |= extract_blob_refs(self._nodes.get(nid) or {})
+
+        root_props = self._nodes.get(root_id) or {}
+        # GraphState has no per-node created_by stamp (unlike Neo4jGraphStore's
+        # `ON CREATE SET n.created_by`) -- fall back to the store-level value.
+        created_by = root_props.get("created_by") or self._created_by
+        started_at = _parse_timestamp(root_props.get("started_at"))
+
+        last_change: datetime | None = None
+        for sid in session_ids:
+            props = self._nodes.get(sid) or {}
+            candidate = _parse_timestamp(
+                props.get("last_updated")
+                or props.get("ended_at")
+                or props.get("started_at")
+            )
+            if candidate is not None and (
+                last_change is None or candidate > last_change
+            ):
+                last_change = candidate
+
+        return SessionFamily(
+            root_id=root_id,
+            session_ids=frozenset(session_ids),
+            blob_refs=frozenset(blob_refs),
+            node_count=len(family_nodes),
+            edge_count=edge_count,
+            created_by=created_by,
+            started_at=started_at,
+            last_change=last_change,
+            subsession_count=len(session_ids) - 1,
+            workspace=self._workspace,
+            working_dir=None,
+        )
 
     def remove_edge(self, src_id: str, dst_id: str) -> None:
         """Remove an edge from the in-memory store.
@@ -405,3 +524,23 @@ class HookStateService:
                 timestamp,
                 exc_info=True,
             )
+
+
+# ---------------------------------------------------------------------------
+# Blob-size composition
+# ---------------------------------------------------------------------------
+
+
+async def total_blob_size(blob_store: BlobStore, blob_refs: Iterable[str]) -> int:
+    """Sum the byte size of every ``ci-blob://`` URI in *blob_refs*.
+
+    Composes ``BlobStore.size()`` over the family's authoritative blob-ref set
+    (``SessionFamily.blob_refs``) -- the size lookup goes through the
+    ``BlobStore`` Protocol, never a raw filesystem stat, per the abstraction
+    principle in docs/02-server-design.md. A missing blob contributes 0 (same
+    idempotent-on-missing contract as ``BlobStore.size``/``delete_session``).
+    """
+    total = 0
+    for uri in blob_refs:
+        total += await blob_store.size(uri)
+    return total

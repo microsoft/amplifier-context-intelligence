@@ -23,6 +23,7 @@ from neo4j import unit_of_work as _unit_of_work
 from neo4j.exceptions import DriverError, Neo4jError
 
 from context_intelligence_server.config import Neo4jClientConfig
+from context_intelligence_server.graph_store import SessionFamily, extract_blob_refs
 
 _LOG = logging.getLogger(__name__)
 
@@ -227,6 +228,60 @@ def _edge_merge_cypher(edge_type: str) -> str:
 # TRANSACTIONS OF N ROWS).  A literal int is required by Cypher for the batch
 # size, so this constant is interpolated (never user-supplied).
 _NODE_BACKFILL_BATCH = 10_000
+
+# ---------------------------------------------------------------------------
+# Session-family resolution (resolve_session_family)
+# ---------------------------------------------------------------------------
+# Family membership is defined purely via HAS_SUBSESSION/FORKED edges, which
+# _handle_start/_handle_fork (session.py) create exactly once per session as
+# it is classified -- each session has at most one such incoming edge, so the
+# family is a tree (no cycles, unique parent).
+#
+# Step 1: expand UP from $session_id via incoming HAS_SUBSESSION/FORKED edges.
+# OPTIONAL MATCH returns one row per ancestor found (or one null row if
+# $session_id is already the root); the ancestor reached by the LONGEST
+# upward path is the root, by construction of the tree (no bound needed --
+# the walk always terminates because the graph is acyclic).
+# Step 2: expand DOWN from that root via the same edge types, `*0..` so the
+# root itself is included, to enumerate every family member.
+_FAMILY_RESOLVE_CYPHER = (
+    "MATCH (start:Session {node_id: $session_id, workspace: $workspace}) "
+    "OPTIONAL MATCH p = (start)<-[:HAS_SUBSESSION|FORKED*]-(ancestor:Session {workspace: $workspace}) "
+    "WITH start, ancestor, p "
+    "ORDER BY length(p) DESC "
+    "LIMIT 1 "
+    "WITH coalesce(ancestor, start) AS root "
+    "MATCH (root)-[:HAS_SUBSESSION|FORKED*0..]->(member:Session {workspace: $workspace}) "
+    "RETURN DISTINCT member.node_id AS session_id, root.node_id AS root_id, "
+    "properties(member) AS props"
+)
+
+# Family subgraph: from every family session node, expand outward along ANY
+# relationship type, `*0..` so the session nodes themselves are included.
+# `ALL(x IN nodes(path)[0..-1] WHERE NOT x:SST_CONCEPT)` stops expansion AT
+# (but includes) a :SST_CONCEPT node (Agent/Orchestrator/Recipe) -- those are
+# shared across sessions and are never owned by one family, so a path that
+# would continue past one is excluded entirely (any such path also exists at
+# the shorter length ending exactly at the concept node, which IS kept).
+_FAMILY_SUBGRAPH_CYPHER = (
+    "UNWIND $session_ids AS sid "
+    "MATCH (s:Session {node_id: sid, workspace: $workspace}) "
+    "WITH collect(s) AS seeds "
+    "CALL { "
+    "WITH seeds "
+    "UNWIND seeds AS s "
+    "MATCH path = (s)-[*0..]->(n {workspace: $workspace}) "
+    "WHERE ALL(x IN nodes(path)[0..-1] WHERE NOT x:SST_CONCEPT) "
+    "RETURN collect(DISTINCT n) AS family_nodes "
+    "} "
+    "WITH family_nodes "
+    "UNWIND family_nodes AS a "
+    "OPTIONAL MATCH (a)-[r]->(b) "
+    "WHERE b IN family_nodes "
+    "WITH family_nodes, collect(DISTINCT r) AS rels "
+    "RETURN size(family_nodes) AS node_count, size(rels) AS edge_count, "
+    "[n IN family_nodes | properties(n)] AS node_props"
+)
 
 
 def _validate_identifier(name: str, kind: str) -> None:
@@ -1479,6 +1534,89 @@ class Neo4jGraphStore:
             pass
 
         return None
+
+    async def resolve_session_family(self, session_id: str) -> SessionFamily | None:
+        """Resolve the whole session family for *session_id* against Neo4j.
+
+        See ``_FAMILY_RESOLVE_CYPHER``/``_FAMILY_SUBGRAPH_CYPHER`` above for
+        the exact traversal. Reads only the flushed/persisted graph (no
+        buffer-first fallback) -- summary/delete operate on already-ingested
+        sessions.
+
+        Returns ``None`` if *session_id* does not resolve to any known
+        ``:Session`` node in this store's workspace.
+        """
+        workspace = self.workspace
+        try:
+            resolve_result = await self._driver.execute_query(
+                _FAMILY_RESOLVE_CYPHER,
+                {"session_id": session_id, "workspace": workspace},
+                database_=self._database,
+            )
+        except Neo4jError:
+            return None
+
+        rows = resolve_result.records
+        if not rows:
+            return None
+
+        root_id: str = rows[0]["root_id"]
+        session_ids: set[str] = set()
+        member_props: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            sid: str = row["session_id"]
+            session_ids.add(sid)
+            member_props[sid] = {
+                k: _normalize_temporal(v) for k, v in dict(row["props"]).items()
+            }
+
+        node_count = 0
+        edge_count = 0
+        blob_refs: set[str] = set()
+        try:
+            subgraph_result = await self._driver.execute_query(
+                _FAMILY_SUBGRAPH_CYPHER,
+                {"session_ids": sorted(session_ids), "workspace": workspace},
+                database_=self._database,
+            )
+        except Neo4jError:
+            subgraph_result = None
+        if subgraph_result is not None and subgraph_result.records:
+            subgraph_row = subgraph_result.records[0]
+            node_count = subgraph_row["node_count"]
+            edge_count = subgraph_row["edge_count"]
+            for props in subgraph_row["node_props"]:
+                blob_refs |= extract_blob_refs(dict(props))
+
+        root_props = member_props.get(root_id, {})
+        created_by = root_props.get("created_by")
+        started_at = root_props.get("started_at")
+
+        last_change: datetime | None = None
+        for props in member_props.values():
+            candidate = (
+                props.get("last_updated")
+                or props.get("ended_at")
+                or props.get("started_at")
+            )
+            if isinstance(candidate, datetime) and (
+                last_change is None or candidate > last_change
+            ):
+                last_change = candidate
+
+        return SessionFamily(
+            root_id=root_id,
+            session_ids=frozenset(session_ids),
+            blob_refs=frozenset(blob_refs),
+            node_count=node_count,
+            edge_count=edge_count,
+            created_by=created_by if isinstance(created_by, str) else None,
+            started_at=started_at if isinstance(started_at, datetime) else None,
+            last_change=last_change,
+            subsession_count=len(session_ids) - 1,
+            workspace=workspace,
+            working_dir=None,
+        )
 
     async def get_edge(self, src_id: str, dst_id: str) -> dict[str, Any] | None:
         """Return edge data, checking the in-memory buffer first.
