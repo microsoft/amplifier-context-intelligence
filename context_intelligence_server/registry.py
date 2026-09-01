@@ -12,11 +12,14 @@ from typing import Any
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
-from context_intelligence_server.status import EventRecord, ring_buffer
-from context_intelligence_server.neo4j_store import Neo4jGraphStore
+from context_intelligence_server.neo4j_store import (
+    Neo4jGraphStore,
+    build_bounded_neo4j_driver,
+)
 from context_intelligence_server.pipeline import process_event, setup_handlers
 from context_intelligence_server.queue_manager import Batch, QueueManager
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.status import EventRecord, ring_buffer
 
 logger = logging.getLogger("context_intelligence_server")
 
@@ -76,6 +79,11 @@ class SessionRegistry:
         self._queue_manager: QueueManager | None = None
         self._write_semaphore: asyncio.Semaphore | None = None
         self._max_delivery_attempts: int = 0
+        # Shared, pool-bounded Neo4j driver for every per-session Neo4jGraphStore
+        # (see _ensure_neo4j_driver). Built lazily for the same reason as
+        # _queue_manager; kept separate from _ensure_infra so the two concerns
+        # can evolve independently.
+        self._neo4j_driver: Any | None = None
         # Live conservation counters surfaced via /status (accepted/written/
         # replayed/write_retries) so silently-dropped events are observable.
         self._accepted_total: int = 0
@@ -105,6 +113,72 @@ class SessionRegistry:
         self._ensure_infra()
         assert self._queue_manager is not None
         return self._queue_manager
+
+    def _ensure_neo4j_driver(self) -> Any:
+        """Build the shared, pool-bounded Neo4j driver on first use.
+
+        Lazy for the same reason as ``_ensure_infra``. Kept as its own method
+        (not folded into ``_ensure_infra``) so the two constructions stay
+        independent edits.
+        """
+        if self._neo4j_driver is None:
+            settings = get_settings()
+            admin = settings.resolve_neo4j_admin()
+            self._neo4j_driver = build_bounded_neo4j_driver(
+                admin,
+                max_connection_pool_size=settings.neo4j_max_connection_pool_size,
+                # Parity with the per-session driver this one replaces: a
+                # blocked acquisition must surface on the SAME budget as a
+                # blocked transaction. Load-bearing now in a way it was not
+                # before -- every session shares this one bounded pool, so
+                # acquisition can actually queue.
+                connection_acquisition_timeout=settings.neo4j_lock_timeout,
+            )
+        return self._neo4j_driver
+
+    @property
+    def neo4j_driver(self) -> Any:
+        """The single shared, pool-bounded driver used by every per-session
+        Neo4jGraphStore -- never closed by a per-session finalize."""
+        return self._ensure_neo4j_driver()
+
+    async def shutdown_workers(self) -> None:
+        """Quiesce every drain worker BEFORE the shared driver is closed.
+
+        Ordering invariant (must run before ``close_neo4j_driver``): a live
+        drainer that meets a closed shared driver fails its batch, spends its
+        ``max_delivery_attempts`` budget in ~250 ms (5 attempts x the 50 ms
+        ``_DRAIN_POLL_INTERVAL`` backoff), and falls into
+        ``_handle_exhausted_batch`` -- which dead-letters each line AND commits
+        the offset past it. Those are healthy events that merely happened to be
+        queued at shutdown, and once dead-lettered they never replay.
+
+        Cancelling instead routes each drainer through its ``CancelledError``
+        handler -> ``_safe_close(worker)`` -> a final flush on a driver that is
+        still open. Anything left uncommitted stays in the durable queue and
+        replays on the next boot, which is the pre-shared-driver behaviour.
+
+        Exceptions are collected, not raised: shutdown must not be derailed by
+        one failing worker.
+        """
+        tasks = [w.task for w in self._workers.values() if w.task is not None]
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def close_neo4j_driver(self) -> None:
+        """Close the shared driver exactly once, at process shutdown.
+
+        Call ``shutdown_workers()`` first -- see its docstring for why closing
+        this driver under a live drainer dead-letters good events.
+
+        No-op if the driver was never built (no session has run yet).
+        """
+        if self._neo4j_driver is not None:
+            await self._neo4j_driver.close()
+            self._neo4j_driver = None
 
     @property
     def write_semaphore(self) -> asyncio.Semaphore:
@@ -772,6 +846,7 @@ class SessionRegistry:
             neo4j_store = Neo4jGraphStore(
                 uri=_admin.url,
                 auth=_admin.auth,
+                driver=self.neo4j_driver,
                 flush_chunk_rows=settings.neo4j_flush_chunk_rows,
                 flush_chunk_bytes=settings.neo4j_flush_chunk_bytes,
                 neo4j_lock_timeout=settings.neo4j_lock_timeout,

@@ -444,5 +444,6 @@ with admin"). Runtime runbook: `docs/identity-management.md`.
 - **New API endpoint**: Add a route to `main.py` or a new router under `routers/`.
 - **Configuration**: Add fields to `ServerConfig` in `config.py`. Keep defaults conservative.
 - **Tests**: Every handler should have a unit test in `tests/handlers/`. Integration tests live in `tests/integration/`.
+- **Server process**: Gunicorn runs one `uvicorn_worker.UvicornWorker` (`worker_class` in `main.py` `run()`), from the `uvicorn-worker` package. Do not use the deprecated `uvicorn.workers` module.
 
 Run `uv run pytest tests/ -q` to verify before committing.

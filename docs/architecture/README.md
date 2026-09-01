@@ -259,22 +259,42 @@ and their typed relationships (`HAS_EVENT`, `EMITTED`, `REFERENCES_BLOB`).
 
 ## Neo4j client topology
 
-The server connects to Neo4j through **two drivers** rather than one. The **admin
-driver** (`neo4j_driver`) is opened in **WRITE** access mode and carries the ingest
-path — the drainer's batch flushes and schema work. The **cypher_query driver**
-(`neo4j_query_driver`) is opened in **READ** access mode and serves `POST /cypher`
-reads. Both drivers are created together in the dual-driver lifespan
-at startup and closed together at shutdown. With legacy flat config
-(`neo4j_url` / `neo4j_user` / `neo4j_password`), both drivers fall back to the same
-endpoint and shared credentials, differing only by access-mode hint; a structured
-`neo4j:` block lets the read driver take a separate credential and/or URL (e.g. a
-read replica). Their connection health is reported independently on `/status` as
-`neo4j_connected` (admin) and `neo4j_query_connected` (cypher_query).
+The server connects to Neo4j through **three drivers**, each with a distinct job.
+
+Two are owned by the lifespan. The **admin driver** (`neo4j_driver`) is opened in
+**WRITE** access mode and handles boot-time and operational work: schema creation,
+the untagged-node integrity check, and the `/status` connectivity probe. The
+**cypher_query driver** (`neo4j_query_driver`) is opened in **READ** access mode and
+serves `POST /cypher` reads. Both are created together at startup and closed
+together at shutdown. With legacy flat config (`neo4j_url` / `neo4j_user` /
+`neo4j_password`), both fall back to the same endpoint and shared credentials,
+differing only by access-mode hint; a structured `neo4j:` block lets the read driver
+take a separate credential and/or URL (e.g. a read replica). Their connection health
+is reported independently on `/status` as `neo4j_connected` (admin) and
+`neo4j_query_connected` (cypher_query).
+
+The third is the **shared session driver**, owned by `SessionRegistry`, and it is the
+one that carries the **ingest path** — every per-session `Neo4jGraphStore`'s batch
+flushes. It is built lazily on the first session (from the same resolved admin client
+config) with a bounded pool (`neo4j_max_connection_pool_size`, default 50) and
+injected into every store, so a per-session finalize can never close the driver other
+live sessions are still using. Before it existed, each session built and held its own
+unshared driver, which is how bolt connections accumulated until the server's thread
+pool starved. It is closed exactly once, at shutdown, and only *after*
+`SessionRegistry.shutdown_workers()` has quiesced the drain workers — closing it
+under a live drainer makes that drainer exhaust its retry budget and dead-letter
+healthy queued events.
+
+Because `/status` probes only the admin and cypher_query drivers,
+`neo4j_connected: true` does **not** by itself mean the ingest path is healthy.
+Ingest health is visible through the pipeline-conservation counters in the `metrics`
+block (`written_total`, `residual`, `degraded`).
 
 > **Note:** the existing `.dot` diagrams (e.g. `05-durable-ingest-queue`) show only
-> the **write path** through the admin driver. The two-driver split is not yet
-> rendered in any diagram — a dedicated topology diagram is a known follow-up. This
-> prose subsection is the interim reference; no new `.dot` is authored in this pass.
+> the **write path**, and label it as the admin driver — that write path is now the
+> shared session driver. The three-driver split is not yet rendered in any diagram —
+> a dedicated topology diagram is a known follow-up. This prose subsection is the
+> interim reference; no new `.dot` is authored in this pass.
 
 ---
 
