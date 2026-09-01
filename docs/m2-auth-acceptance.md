@@ -23,7 +23,7 @@
 > derivation, since that assertion (STEP A.1 #4, STEP B) targeted the
 > now-removed fallback. Re-running this gate after this change requires the test
 > caller's `oid` to be pre-mapped (`service_identities` seed or
-> `PUT /admin/identities`, `type=service`) — see the inline notes below.
+> `PUT /admin/identities`) — see the inline notes below.
 
 > **Secret hygiene.** This document uses **placeholder** identifiers only.
 > Never commit real client IDs, tenant IDs, or object IDs to this repo — see
@@ -264,8 +264,7 @@ fine):
    the note at the top of this document). It no longer gates anything in the
    resolver; the real requirement now is that the token's `oid` is
    mapped in the shared identity store (`service_identities` seed, or
-   `PUT /admin/identities` with `type=service`) — otherwise STEP A.2 now
-   fails with 403.
+   `PUT /admin/identities`) — otherwise STEP A.2 now fails with 403.
 
 A redacted claim summary is always printed (`aud`, `iss`, `tid`, `scp`
 presence, `idtyp`, `appidacr`, `roles`, `appid`, `azp`, and a truncated
@@ -294,8 +293,8 @@ Only runs when `ACCEPTANCE_SERVER_URL` is set:
 
 - `POST /events` with the real token → asserts **HTTP 202**. **This now
   requires the caller's `oid` to already be mapped** in the shared
-  identity store (`service_identities` seed or `PUT /admin/identities`,
-  `type=service`) — an unmapped oid gets **403** here instead of 202.
+  identity store (`service_identities` seed or `PUT /admin/identities`) —
+  an unmapped oid gets **403** here instead of 202.
 - Polls `POST /cypher` (best-effort, ~30s) for a node with
   `created_by == <mapped contributor id>` under the probe's `session_id`
   *(previously this checked `created_by == appid`; that fallback no longer

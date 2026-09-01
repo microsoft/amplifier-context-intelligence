@@ -266,9 +266,8 @@ resolver:
   - **Service (app / managed-identity)** — `scp` absent: authorized by an Entra
     **App Role** alone — `Contributor` (write + read) or `Reader` (read-only:
     `POST /cypher`, `GET /blobs/*`). `created_by` is the contributor id mapped
-    for `oid` in the same shared identity store `entra_identities` uses
-    (service records carry `type: "service"`). An unmapped `oid` is **403**,
-    never falling back to `appid`/`azp`/`oid`/display name.
+    for `oid` in the same shared identity store that `entra_identities` uses.
+    An unmapped `oid` is **403**, never falling back to `appid`/`azp`/`oid`/display name.
 
   See [docs/entra-auth-setup.md](docs/entra-auth-setup.md) for the canonical model.
 
@@ -377,7 +376,7 @@ Values are resolved with this priority (highest first):
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_CLIENT_ID` | `azure_client_id` | *(empty)* | App Registration (client) GUID. **Required when `auth_mode=entra`** (startup refuses otherwise). See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_TENANT_ID` | `azure_tenant_id` | *(empty)* | Azure AD tenant GUID. **Required when `auth_mode=entra`**. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES` (JSON) | `entra_identities` | *(empty)* | Identity map `oid -> {id: <contributor>}` for the **user (delegated)** path (oids are Azure Object IDs — **PII**, never commit real values). **Required (non-empty) when `auth_mode=entra`**; the matched `id` is recorded as `created_by`. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVICE_IDENTITIES` (JSON) | `service_identities` | *(empty)* | **Entra service path — optional, first-boot seed only.** `oid -> {id: <contributor>}` map seeding the **friendly `created_by`** identity for a service principal / managed identity into the same shared identity store `entra_identities` uses (tagged `type: "service"`). **Not an auth gate** (App Roles authorize; see below) and **never required** for boot — may be empty. An unmapped service `oid` is now **403** (no `appid` fallback). Runtime add/remove is via `PUT`/`DELETE /admin/identities` (`type=service`) — no redeploy needed. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVICE_IDENTITIES` (JSON) | `service_identities` | *(empty)* | **Entra service path — optional, first-boot seed only.** `oid -> {id: <contributor>}` map seeding the **friendly `created_by`** identity for a service principal / managed identity into the same shared identity store `entra_identities` uses. **Not an auth gate** (App Roles authorize; see below) and **never required** for boot — may be empty. An unmapped service `oid` is now **403** (no `appid` fallback). Runtime add/remove is via `PUT`/`DELETE /admin/identities` — no redeploy needed. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVICE_DATA_ROLE` | `service_data_role` | `Contributor` | **Entra service path.** App Role name whose presence in an app token's `roles` claim grants service **write + read**. `""`/`null` disables the service write path. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_READER_ROLE` | `reader_role` | `Reader` | **Entra service path.** App Role name granting service **read-only** access (`POST /cypher`, `GET /blobs/*`). `""`/`null` disables read-only app-token gating. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY` | `admin_api_key` | *(empty — admin API disabled)* | **Static-mode admin credential** — separate from the data `api_keys`; it is the only key allowed to call the `/admin/*` identity-map endpoints. Sent as a bearer token; the middleware recognizes it before the data keystore lookup. Empty → admin API returns `503`; regular data keys get `403` on `/admin/*`. Cannot be deleted/shadowed via the API. See [docs/identity-management.md](docs/identity-management.md). |

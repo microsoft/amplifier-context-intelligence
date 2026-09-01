@@ -322,7 +322,7 @@ Auth model facts (the canonical statement of "which tokens are accepted" lives i
     **App Role** alone — `Contributor` (write+read) or `Reader` (read-only:
     `POST /cypher`, `GET /blobs/*`). `created_by` = the contributor id mapped
     for `oid` in the **shared identity store** (same store `entra_identities`
-    uses; service records just carry `type: "service"`). A service
+    uses). A service
     `oid` with no mapping is **403** (fail-loud, names the principal) —
     `created_by` is **never** `appid`/`azp`/`oid`/display name. App-only / MI
     tokens (which carry `roles`, not `scp`) **are now accepted** on this path.
@@ -331,9 +331,9 @@ Auth model facts (the canonical statement of "which tokens are accepted" lives i
   mode.
 - Config fields: required for boot — `azure_client_id`, `azure_tenant_id`,
   `entra_identities`. Optional service-path — `service_identities` (a
-  **first-boot-only seed** into the same shared identity store, tagged
-  `type: "service"`; may be empty — service oids are onboarded/removed at
-  runtime via `/admin/identities`, no redeploy needed),
+  **first-boot-only seed** into the same shared identity store; may be empty —
+  service oids are onboarded/removed at runtime via `/admin/identities`,
+  no redeploy needed),
   `service_data_role` (default `Contributor`), `reader_role` (default `Reader`).
   Env prefix `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_`.
 - **Fail-closed:** misconfig (missing field / empty or malformed `entra_identities`)
@@ -365,7 +365,7 @@ Both auth modes can add/remove identities **at runtime, no restart**, via the
 - `entra_identities_store_path` backs **both** user and service identities —
   one shared store, disjoint oid space. There is deliberately no
   separate `/admin/services` endpoint; service identities are managed through
-  `PUT`/`DELETE`/`GET /admin/identities` with `type: "service"`.
+  `PUT`/`DELETE`/`GET /admin/identities`.
 - `IdentityStore` (`identity_store.py`) commits **write-file-then-swap-memory**
   (atomic file replace first, then memory) and **fails closed** on a corrupt file
   (empty map + loud log, never a crash-loop).

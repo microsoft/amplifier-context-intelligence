@@ -67,7 +67,7 @@ per-route capability gate before the data route handler.
     the missing role (`"app <appid> has no Contributor/Reader role on this API — assign
     one"`). `created_by` is then resolved **exactly like the user path**: `oid` → the
     **shared identity store** (the same store backing `entra_identities`;
-    service records carry `type: "service"`) → contributor id. An `oid` with **no**
+    contributor id. An `oid` with **no**
     mapping is a second, distinct `AuthError(403)` naming the principal (fail-loud,
     mirrors the user path's unmapped-oid 403) — **`created_by` is never**
     `appid`/`azp`/`oid`/`app_displayname` (those are raw, spoofable-or-machine claims,
@@ -113,9 +113,8 @@ How authentication is wired at boot inside `create_asgi_app()`. The function bra
 - **`entra` (M2 updated):** seeds **one shared `IdentityStore`**
   from config, checks the B4 disjointness invariant, eagerly fetches JWKS, and
   constructs `EntraResolver` with five parameters. Specifically:
-  1. **First-boot seed:** `build_identity_map()` (`entra_identities`, entries
-     default to `type: "user"`) and `build_service_identity_map()`
-     (`service_identities`, entries tagged `type: "service"`) are merged into one
+  1. **First-boot seed:** `build_identity_map()` (`entra_identities`) and
+     `build_service_identity_map()` (`service_identities`) are merged into one
      `rich_seed` and written into the **same** `entra_identities_store_path`
      `IdentityStore` via `seed()` — only when the store file doesn't exist yet (a
      pre-existing store, e.g. after an `/admin/identities` mutation, is loaded as-is;
@@ -131,7 +130,7 @@ How authentication is wired at boot inside `create_asgi_app()`. The function bra
      service_data_role, reader_role, entra_admin_role)`** — both `identity_map` and
      `service_identity_map` are passed the **same live `IdentityStore.flat_dict`
      reference** (one shared store, disjoint oid keyspace makes this safe): an
-     admin-onboarded service mapping (`PUT /admin/identities`, `type=service`)
+     admin-onboarded service mapping (`PUT /admin/identities`)
      resolves immediately, exactly like a user mapping — see diagram 08.
 
 A fail-closed gate then rejects boot if `resolver.auth_enabled` is `False` and
@@ -156,16 +155,11 @@ contributor) and the **api-keys store** (sha256 hash → contributor) through a 
 
 > **Update:** service identities are now managed through this **same**
 > `/admin/identities` API — there is deliberately **no separate** `/admin/services`
-> endpoint. Every identity record (`PUT`/`GET`/`DELETE /admin/identities`) carries a
-> `type: "user" | "service"` field (default `"user"`); `GET /admin/identities?type=service`
-> filters the listing to service records only. `service_identities` config remains a
-> **first-boot-only seed** into the same durable store `entra_identities` uses — it may
-> be empty/omitted, and service callers added after boot go through
-> `PUT`/`DELETE /admin/identities` (`type=service`), no redeploy needed. Records written
-> before this field existed are normalized to `type: "user"` on load and persisted back
-> (best-effort migration — a read-only-fs write failure logs a warning and keeps the
-> normalized data in memory only). See diagram 07 for how the shared store is seeded at
-> boot alongside the B4 disjointness gate.
+> endpoint. `service_identities` config remains a **first-boot-only seed** into the same
+> durable store `entra_identities` uses — it may be empty/omitted, and service callers
+> added after boot go through `PUT`/`DELETE /admin/identities`, no redeploy needed.
+> See diagram 07 for how the shared store is seeded at boot alongside the B4
+> disjointness gate.
 
 **Authorization gate (`require_admin`):** applied router-wide via
 `APIRouter(dependencies=[Depends(require_admin)])`. The middleware (`BearerTokenMiddleware`)

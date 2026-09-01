@@ -8,7 +8,7 @@ digraph auth_startup {
         ranksep   = 0.80
         fontname  = "Helvetica"
         fontsize  = 11
-        label     = "Auth Wiring at Boot \u2014 Mode Selection & Fail-Closed Startup Gates\n(context_intelligence_server/main.py \u2014 create_asgi_app()  \u00b7  auth.py \u2014 resolvers)\nM2: ONE shared IdentityStore seeded from entra_identities (type=user)\nand service_identities (type=service) + B4 disjointness gate before JWKS prefetch"
+        label     = "Auth Wiring at Boot \u2014 Mode Selection & Fail-Closed Startup Gates\n(context_intelligence_server/main.py \u2014 create_asgi_app()  \u00b7  auth.py \u2014 resolvers)\nM2: ONE shared IdentityStore seeded from entra_identities\nand service_identities (disjoint oids) + B4 disjointness gate before JWKS prefetch"
         labelloc  = t
         labeljust = c
     ]
@@ -85,12 +85,12 @@ digraph auth_startup {
         { rank = same; BuildIdentityMap; BuildServiceMap }
 
         BuildIdentityMap [
-            label     = "settings.build_identity_map()\n{oid_lower \u2192 contributor_id}\n(from entra_identities config; keys lowercased)\nFirst-boot seed into shared IdentityStore (type=user)\nLIVE via IdentityStore.flat_dict \u2014 runtime-mutable by /admin/identities"
+            label     = "settings.build_identity_map()\n{oid_lower \u2192 contributor_id}\n(from entra_identities config; keys lowercased)\nFirst-boot seed into shared IdentityStore\nLIVE via IdentityStore.flat_dict \u2014 runtime-mutable by /admin/identities"
             fillcolor = "#BBDEFB"
         ]
 
         BuildServiceMap [
-            label     = "build_service_identity_map()\n{oid_lower \u2192 contributor_id}\n(from service_identities config; keys lowercased)\nFirst-boot seed into the SAME shared IdentityStore as\n  entra_identities (type=service); may be empty\nRuntime CRUD via /admin/identities (type=service) \u2014\n  no separate /admin/services endpoint"
+            label     = "build_service_identity_map()\n{oid_lower \u2192 contributor_id}\n(from service_identities config; keys lowercased)\nFirst-boot seed into the SAME shared IdentityStore as\n  entra_identities; may be empty\nOnce the store file exists this config is IGNORED \u2014\n  boot logs a WARNING naming the ignored oids\nRuntime CRUD via /admin/identities \u2014\n  no separate /admin/services endpoint"
             fillcolor = "#BBDEFB"
         ]
 

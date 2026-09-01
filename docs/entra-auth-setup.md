@@ -102,15 +102,13 @@ validation (signature / audience / issuer / `tid`, below), a single
 
 > **`service_identities` is a config *seed*, not the runtime source of truth.**
 > Service (and user) identities both live in the **same durable `IdentityStore`**
-> (one shared JSON file, `entra_identities_store_path`), each record tagged
-> `type: "user"` or `type: "service"` (default `"user"`). `service_identities`
+> (one shared JSON file, `entra_identities_store_path`). `service_identities`
 > (env/YAML, same shape as `entra_identities`) only **seeds** that store on
 > **first boot** — it may be empty (bootstrap). After boot, service identities
 > are added/removed/listed at runtime through the **same** `/admin/identities`
-> endpoint `entra_identities` uses, passing `type=service` — there is
-> deliberately **no separate** `/admin/services` endpoint. An unmapped
-> role-bearing service is **not** authorized: it gets a 403, not a fallback
-> `created_by`.
+> endpoint `entra_identities` uses — there is deliberately **no separate**
+> `/admin/services` endpoint. An unmapped role-bearing service is **not**
+> authorized: it gets a 403, not a fallback `created_by`.
 
 > **Tenant policy note.** In a locked-down tenant that blocks client secrets,
 > service callers must obtain tokens via **Managed Identity** or **federated
@@ -174,8 +172,8 @@ other failure is a **401**.
 > store → a friendly contributor `id`. There is no fallback to `appid`, `azp`,
 > raw `oid`, or `app_displayname` for either users or services — an unmapped
 > `oid` is unauthorized (403), not attributed under a machine identifier. Seed
-> service identities via `service_identities`, or manage them at runtime via
-> `PUT /admin/identities` with `type: "service"`.
+> service identities via `service_identities` (first boot only), or manage them
+> at runtime via `PUT /admin/identities` — the same call used for a user.
 
 ### Admin authority and service roles — the `roles` claim
 
@@ -283,12 +281,18 @@ settings are all **optional at boot** and have working defaults:
 |---|---|---|---|---|
 | Service data role | `service_data_role` | `SERVICE_DATA_ROLE` | `Contributor` | App Role granting service **write + read**. `""`/`null` disables it. |
 | Reader role | `reader_role` | `READER_ROLE` | `Reader` | App Role granting service **read-only** (`POST /cypher`, `GET /blobs/*`). `""`/`null` disables it. |
-| Service identities | `service_identities` | `SERVICE_IDENTITIES` (JSON) | *(unset)* | **First-boot seed only**, `oid → {id: <contributor>}` — seeds the mapped contributor `id` into the same shared identity store `entra_identities` uses (tagged `type: "service"`). **Not itself an auth gate** (the App Role check gates authorization), but **is now required for attribution**: a role-bearing service whose `oid` isn't mapped gets **403**, never a fallback `created_by`. May be empty/omitted; add mappings later via `/admin/identities` (`type=service`), no redeploy. |
+| Service identities | `service_identities` | `SERVICE_IDENTITIES` (JSON) | *(unset)* | **First-boot seed only**, `oid → {id: <contributor>}` — seeds the mapped contributor `id` into the same shared identity store `entra_identities` uses. **Not itself an auth gate** (the App Role check gates authorization), but **is now required for attribution**: a role-bearing service whose `oid` isn't mapped gets **403**, never a fallback `created_by`. May be empty/omitted; add mappings later via `/admin/identities`, no redeploy. |
 
 > `service_identities` is validated with the **same** GUID-key / non-empty-`id`
 > rules as `entra_identities`, and — like `entra_identities` — an explicit
 > empty map is accepted (bootstrap on a fresh `/data` volume). Omit it, or
 > leave it empty, and onboard service identities at runtime instead.
+>
+> **First-boot-only seed:** `service_identities` populates the shared identity
+> store only on initial boot. Once the store file exists, config changes to
+> `service_identities` are ignored. The server logs a WARNING at startup naming
+> any ignored `service_identities` oids and points operators at
+> `PUT /admin/identities/{oid}` for runtime onboarding.
 
 ### 2.2 YAML config
 
@@ -464,9 +468,9 @@ To bind them:
      their own oid is not yet mapped** (the `/admin`-path bootstrap exemption).
      Full runbook: [identity-management.md](identity-management.md).
    - **Config + restart (OPTIONAL seed):** add `"<oid>": {id: <contributor>}` to
-     `entra_identities` and restart. A config seed is **no longer required** — it
-     only pre-populates an initially-empty store. The primary path is boot-empty +
-     the `/admin` API above.
+     `entra_identities` in `service_identities` (if the store doesn't exist yet)
+     and restart. A config seed is **no longer required** — it only pre-populates
+     an initially-empty store. The primary path is boot-empty + the `/admin` API above.
 
 The next call from that user → `created_by = <contributor>`.
 
@@ -549,7 +553,7 @@ the service path instead, where the question is App Roles, not scope.
 | **401** | both | **Token problem.** Missing / expired / wrong audience / wrong tenant / missing `oid`; or a **user** token whose `scp` lacks `access_as_user`; or an **ambiguous** token (`scp` *and* `idtyp=="app"`). | Re-acquire the token (§3.3). Confirm `--resource api://<AZURE_CLIENT_ID>`. |
 | **403** | user | **Identity not bound.** Your delegated token is valid, but your `oid` isn't in the operator's map. The body names your oid. | Send your oid (§3.2) to the operator to be added (§2.6). |
 | **403** | service | **No qualifying App Role.** Your app/service token is valid, but its `roles` has none of `Contributor`/`Reader`/`IdentityAdmin`. The body names your `appid`/`oid` and the required roles. | Have an admin assign the App Role in Entra ([service callers](identity-management.md#service-callers-entra-app-tokens)). |
-| **403** | service | **Identity not bound.** Your app/service token has a qualifying App Role, but its `oid` isn't in the shared identity store (`entra_identities`/`service_identities`). The body names your oid. | Send your oid to the operator to add via `service_identities` or `PUT /admin/identities` (`type=service`; §2.6 / [identity-management.md](identity-management.md)). |
+| **403** | service | **Identity not bound.** Your app/service token has a qualifying App Role, but its `oid` isn't in the shared identity store. The body names your oid. | Send your oid to the operator to add via `PUT /admin/identities` (§2.6 / [identity-management.md](identity-management.md)). |
 
 > **Behavior change (M2): 401 → 403 for role-less app tokens.** Before M2, an
 > app-only token (with `roles`, no `scp`) failed the `access_as_user` check and

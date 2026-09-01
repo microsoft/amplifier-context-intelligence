@@ -569,7 +569,8 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     # service_identities: the OID → contributor map for service principals /
     # managed identities.  Same shape as entra_identities; first-boot-only seed
-    # into the SAME shared store entra_identities uses (tagged type="service").
+    # into the SAME shared store entra_identities uses (oids are disjoint across
+    # users and service principals, so one oid -> contributor map serves both).
     #
     # Shape: { "<oid-GUID>": {"id": "<contributor>"} }
     #

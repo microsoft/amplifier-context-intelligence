@@ -36,14 +36,10 @@ File format (both modes share the same abstraction)::
       "<sha256_hex>": {"id": "<contributor_id>"}
     }
 
-    # entra-identities.json (one shared store serves BOTH user and service
-    # oids -- disjoint key spaces).
+    # entra-identities.json
     {
-      "<oid>": {"id": "<contributor_id>", "display_name": "<optional>", "type": "user"|"service"}
+      "<oid>": {"id": "<contributor_id>", "display_name": "<optional>"}
     }
-
-"type" is a record-contract field owned by this store: every record from
-``get()``/``items()`` carries an explicit "type" (default "user").
 """
 
 import json
@@ -53,26 +49,6 @@ import tempfile
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-# Valid values for the record-contract "type" field.
-_VALID_TYPES = frozenset({"user", "service"})
-
-
-def _normalize_record(value: dict[str, str]) -> dict[str, str]:
-    """Return a copy of *value* with "type" guaranteed present and valid.
-
-    - Absent "type" -> defaults to "user".
-    - Present "type" -> must be exactly "user" or "service"; anything else
-      raises ``ValueError`` (invalid inbound data, e.g. from ``put()``).
-
-    Never mutates *value* in place -- callers may still hold the original.
-    """
-    record = dict(value)
-    record_type = record.get("type", "user")
-    if record_type not in _VALID_TYPES:
-        raise ValueError(f"invalid type {record_type!r}: must be 'user' or 'service'")
-    record["type"] = record_type
-    return record
 
 
 class IdentityStore:
@@ -103,10 +79,6 @@ class IdentityStore:
 
         Missing file → empty dict (normal first boot, no log).
         Corrupt / non-dict → empty dict + LOUD error log, never raise.
-
-        Also migrates each record's "type" field and persists the change
-        atomically; a write failure here only logs, never raises — load()
-        must never crash the server.
         """
         if not self.path.exists():
             # Normal first boot — the file hasn't been written yet.
@@ -139,64 +111,24 @@ class IdentityStore:
             self._rebuild_flat()
             return
 
-        # Accept dict entries only; stray non-dict values are tolerated by
-        # silently dropping them (unrelated to the "type" migration below).
-        raw_records = {k: v for k, v in raw.items() if isinstance(v, dict)}
-
-        # Migrate each record's "type"; only rewrite the file if something changed.
-        normalized: dict[str, dict[str, str]] = {}
-        changed = False
-        for key, record in raw_records.items():
-            try:
-                normalized_record = _normalize_record(record)
-            except ValueError as exc:
-                logger.warning(
-                    "identity_store.load: record %s has an invalid 'type' "
-                    "(%r); dropping the entry rather than raise (load() "
-                    "must never crash the server): %s",
-                    key,
-                    record.get("type"),
-                    exc,
-                )
-                changed = True
-                continue
-            if normalized_record != record:
-                changed = True
-            normalized[key] = normalized_record
-
-        self._data = normalized
+        # Accept the data.  Individual entries with missing/bad types are tolerated
+        # by the load (they'll just produce no flat_dict entry), since the validator
+        # on put() guards inbound writes.
+        self._data = {k: v for k, v in raw.items() if isinstance(v, dict)}
         self._rebuild_flat()
-
-        if changed:
-            try:
-                self._write_atomic(self._data)
-            except Exception as exc:
-                logger.warning(
-                    "identity_store.load: could not persist migrated "
-                    "(type-normalized) records back to %s: %r — in-memory "
-                    "data is normalized but the file was not updated (e.g., "
-                    "read-only filesystem). The next put()/delete() will "
-                    "persist it.",
-                    self.path,
-                    exc,
-                )
 
     def put(self, key: str, value: dict[str, str]) -> None:
         """Upsert *key* → *value*.
 
         Commit order (F2): write tempfile → os.replace → update in-process.
         Raises on file-write failure; in-process state is UNCHANGED.
-
-        *value* is normalized via ``_normalize_record`` first (type is owned
-        by the store, not the caller); raises ``ValueError`` for an invalid type.
         """
-        record = _normalize_record(value)
         new_data = dict(self._data)
-        new_data[key] = record
+        new_data[key] = value
         self._write_atomic(new_data)
         # File write succeeded — now update in-process state.
-        self._data[key] = record
-        contributor_id = record.get("id", "")
+        self._data[key] = value
+        contributor_id = value.get("id", "")
         if contributor_id:
             self.flat_dict[key] = contributor_id
         else:
@@ -221,19 +153,16 @@ class IdentityStore:
         Unlike ``put()`` (which enforces F2 write-before-memory strictly), this
         method is designed for startup initialization from durable config.  It:
 
-        1. Normalizes every record via ``_normalize_record`` (raises
-           ``ValueError`` for an invalid "type").
-        2. Tries an atomic write of the normalized data to the store file.
-        3. Whether or not the write succeeds, updates ``_data`` and ``flat_dict``
+        1. Tries an atomic write of *data* to the store file.
+        2. Whether or not the write succeeds, updates ``_data`` and ``flat_dict``
            in-place (the data came from config, which is itself durable; a restart
            would re-seed from config again, so memory-ahead-of-disk is safe here).
 
         A warning is logged if the write fails so an operator knows the store file
         was not written (e.g., ``/data`` not yet mounted at startup).
         """
-        normalized_data = {key: _normalize_record(value) for key, value in data.items()}
         try:
-            self._write_atomic(normalized_data)
+            self._write_atomic(data)
         except Exception as exc:
             logger.warning(
                 "identity_store.seed: could not write seed to %s: %r "
@@ -243,7 +172,7 @@ class IdentityStore:
                 exc,
             )
         # Update in-memory regardless — data is from durable config.
-        self._data = normalized_data
+        self._data = dict(data)
         self._rebuild_flat()
 
     def get(self, key: str) -> dict[str, str] | None:

@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, field_validator
@@ -171,8 +170,6 @@ class IdentityBody(BaseModel):
 
     id: str
     display_name: str | None = None
-    # Admin-facing clarity only -- never affects resolver behavior (flat_dict stays oid -> id).
-    type: Literal["user", "service"] = "user"
 
     @field_validator("id")
     @classmethod
@@ -303,16 +300,11 @@ def _audit_put(
         )
 
 
-def _audit_delete(request: Request, *, target: str, type_: str | None = None) -> None:
-    """Emit one structured audit log line for a successful DELETE mutation.
-
-    ``type_`` (optional) records the caller-supplied ``type`` query param for
-    audit clarity; it does not affect what gets deleted.
-    """
+def _audit_delete(request: Request, *, target: str) -> None:
+    """Emit one structured audit log line for a successful DELETE mutation."""
     logger.info(
-        "admin.audit action=delete target=%s type=%s who=%s",
+        "admin.audit action=delete target=%s who=%s",
         target,
-        type_,
         _admin_who(request),
     )
 
@@ -392,14 +384,14 @@ def put_identity(
     An overwrite (existing oid with a different contributor) emits an explicit
     audit line recording old → new contributor (TB-11).
 
-    Returns the stored record as ``{oid, id, type[, display_name]}``.
+    Returns the stored record as ``{oid, id[, display_name]}``.
     """
     _validate_oid(oid)
 
     existing = store.get(oid)
     old_contributor: str | None = existing.get("id") if existing is not None else None
 
-    record: dict[str, str] = {"id": body.id, "type": body.type}
+    record: dict[str, str] = {"id": body.id}
     if body.display_name is not None:
         record["display_name"] = body.display_name
 
@@ -417,16 +409,11 @@ def put_identity(
 def delete_identity(
     oid: str,
     request: Request,
-    type: str = "user",  # mirrors IdentityBody.type; audit clarity only
     store: IdentityStore = Depends(_require_entra_store),
 ) -> dict[str, str | bool]:
     """Delete an entra identity.
 
     Path-param guard: ``oid`` must be a valid GUID → **422** on violation.
-
-    ``type`` (query param, default ``"user"``) is recorded on the audit line
-    only -- it does not gate the deletion, which always targets ``oid``
-    regardless of the stored record's actual type (one shared store).
 
     Returns 200 on success, 404 when the OID is not present.
     Deletion is write-through and immediately visible to the resolver.
@@ -434,28 +421,17 @@ def delete_identity(
     _validate_oid(oid)
     if store.get(oid) is None:
         raise HTTPException(status_code=404, detail=f"identity {oid!r} not found")
-    _audit_delete(request, target=oid, type_=type)
+    _audit_delete(request, target=oid)
     store.delete(oid)
     return {"oid": oid, "deleted": True}
 
 
 @router.get("/identities", status_code=200)
 def list_identities(
-    type: str | None = None,  # mirrors IdentityBody.type; optional filter
     store: IdentityStore = Depends(_require_entra_store),
 ) -> dict[str, list[dict[str, str]]]:
-    """List entra identities as ``{oid, id, type[, display_name]}``.
-
-    ``type`` (query param, optional) filters to only ``"user"`` or
-    ``"service"`` records when given; omit to list every identity regardless
-    of type (one shared store serves both).
-    """
-    # No display default needed -- the store guarantees every record
-    # carries an explicit "type" (identity_store._normalize_record).
-    identities = [{"oid": oid, **record} for oid, record in store.items()]
-    if type is not None:
-        identities = [i for i in identities if i["type"] == type]
-    return {"identities": identities}
+    """List all entra identities as ``{oid, id[, display_name]}``."""
+    return {"identities": [{"oid": oid, **record} for oid, record in store.items()]}
 
 
 # --- Static API keys --------------------------------------------------------

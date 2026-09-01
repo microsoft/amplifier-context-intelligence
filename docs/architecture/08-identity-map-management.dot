@@ -8,7 +8,7 @@ digraph identity_map_management {
         ranksep   = 0.80
         fontname  = "Helvetica"
         fontsize  = 11
-        label     = "Runtime Identity-Map Management \u2014 Admin API + Live Store\n(context_intelligence_server/routers/admin.py \u00b7 identity_store.py \u00b7 auth.py)\nService identities now share this SAME IdentityStore + /admin/identities API\n(tagged type=\"user\"|\"service\"; no separate /admin/services endpoint \u2014 see annotation below)"
+        label     = "Runtime Identity-Map Management \u2014 Admin API + Live Store\n(context_intelligence_server/routers/admin.py \u00b7 identity_store.py \u00b7 auth.py)\nService identities now share this SAME IdentityStore + /admin/identities API\n(one oid \u2192 contributor map; no separate /admin/services endpoint \u2014 see annotation below)"
         labelloc  = t
         labeljust = c
     ]
@@ -228,14 +228,14 @@ digraph identity_map_management {
         { rank = same; FileEntra; FileKeys }
 
         FileEntra [
-            label     = "entra-identities.json  (shared by user AND service oids)\n{\"<oid>\": {\"id\": \"<contrib>\", \"display_name?\": \"...\", \"type\": \"user\"|\"service\"}}\nread at boot into IdentityStore; resolver uses flat_dict at runtime\nrecords predating \"type\" are migrated to type=\"user\" on load and persisted back"
+            label     = "entra-identities.json  (shared by user AND service oids)\n{\"<oid>\": {\"id\": \"<contrib>\", \"display_name?\": \"...\"}}\nread at boot into IdentityStore; resolver uses flat_dict at runtime\nload() never rewrites this file \u2014 only put()/delete() persist"
             shape     = note
             style     = filled
             fillcolor = "#FFF8E1"
         ]
 
         FileKeys [
-            label     = "api-keys.json\n{\"<sha256_hex>\": {\"id\": \"<contributor>\", \"type\": \"user\"}}\nread at boot into IdentityStore; resolver uses flat_dict at runtime\n(same IdentityStore class backs this file too \u2014 records get type=\"user\" on load,\n harmless, nothing reads it)"
+            label     = "api-keys.json\n{\"<sha256_hex>\": {\"id\": \"<contributor>\"}}\nread at boot into IdentityStore; resolver uses flat_dict at runtime\n(same IdentityStore class backs this file too \u2014 static mode only,\n never loaded in entra mode)"
             shape     = note
             style     = filled
             fillcolor = "#FFF8E1"
@@ -431,9 +431,9 @@ digraph identity_map_management {
     EffLookup     -> EffResolved
 
     // ====================================================================
-    // SERVICE IDENTITIES \u2014 SAME STORE, TYPE-TAGGED
+    // SERVICE IDENTITIES \u2014 SAME STORE
     // service oids are NOT a separate system \u2014 same IdentityStore/flat_dict
-    // as entra_identities above, disjoint keyspace, tagged type="service"
+    // as entra_identities above, disjoint keyspace
     // ====================================================================
     subgraph cluster_service_static {
         graph [
@@ -446,7 +446,7 @@ digraph identity_map_management {
         ]
 
         ServiceStaticNote [
-            label     = "service_identities \u2014 FIRST-BOOT SEED ONLY\n\u2022 settings.service_identities (env-var / config) seeds oid\u2192id\n   pairs into the SAME entra-identities.json IdentityStore,\n   tagged type=\"service\" \u2014 may be empty (bootstrap)\n\u2022 NOT a separate store, NOT a separate durable file\n\u2022 Runtime CRUD via the SAME /admin/identities endpoint\n   (PUT/DELETE/GET, type=service) \u2014 NO /admin/services\n   endpoint exists (deliberately \u2014 one endpoint, one store)\n\u2022 An unmapped role-bearing service oid is now 403, never a\n   fallback created_by (mirrors the user path)\n\u2022 B4: disjoint from entra_identities by startup invariant,\n   checked against the two CONFIG maps (see diagram 07)\n\u2022 Passed to EntraResolver as the SAME live flat_dict\n   reference as entra_identities (one shared store)"
+            label     = "service_identities \u2014 FIRST-BOOT SEED ONLY\n\u2022 settings.service_identities (env-var / config) seeds oid\u2192id\n   pairs into the SAME entra-identities.json IdentityStore\n   \u2014 may be empty (bootstrap)\n\u2022 Config is read ONLY when the store file does not exist;\n   otherwise boot logs a WARNING naming the ignored oids\n\u2022 NOT a separate store, NOT a separate durable file\n\u2022 Runtime CRUD via the SAME /admin/identities endpoint\n   (PUT/DELETE/GET) \u2014 NO /admin/services\n   endpoint exists (deliberately \u2014 one endpoint, one store)\n\u2022 An unmapped role-bearing service oid is now 403, never a\n   fallback created_by (mirrors the user path)\n\u2022 B4: disjoint from entra_identities by startup invariant,\n   checked against the two CONFIG maps (see diagram 07)\n\u2022 Passed to EntraResolver as the SAME live flat_dict\n   reference as entra_identities (one shared store)"
             fillcolor = "#FFF3E0"
             fontname  = "Helvetica"
             fontsize  = 10
@@ -455,7 +455,7 @@ digraph identity_map_management {
 
     // Annotation edge: service oids resolve through the SAME live dict as user oids
     LiveEntra -> ServiceStaticNote [
-        label      = "service_identities shares THIS\nlive dict \u2014 same IdentityStore,\ntype=\"service\" tag only"
+        label      = "service_identities shares THIS\nlive dict \u2014 same IdentityStore,\none oid \u2192 contributor map"
         style      = dashed
         color      = "#E65100"
         fontcolor  = "#E65100"

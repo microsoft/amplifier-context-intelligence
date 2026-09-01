@@ -220,7 +220,7 @@ digraph auth_flow {
         ]
 
         ServiceCreatedBy [
-            label     = "created_by derivation  (SHARED IDENTITY STORE)\noid \u2192 identity store lookup (SAME store entra_identities uses;\n  service records tagged type=\"service\")\nMapped \u2192 contributor id.  Unmapped \u2192 403  (mirrors user path)\nNEVER appid / azp / oid / app_displayname as created_by"
+            label     = "created_by derivation  (SHARED IDENTITY STORE)\noid \u2192 identity store lookup (SAME store entra_identities uses;\n  oids are disjoint across users and services)\nMapped \u2192 contributor id.  Unmapped \u2192 403  (mirrors user path)\nNEVER appid / azp / oid / app_displayname as created_by"
             fillcolor = "#BBDEFB"
         ]
 

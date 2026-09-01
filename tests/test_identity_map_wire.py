@@ -543,6 +543,74 @@ class TestT3EntraWiring:
         )
 
 
+class TestIgnoredServiceIdentitiesWarning:
+    """service_identities is a first-boot seed; say so when it is being ignored.
+
+    Once the store file exists, config is never re-read into it.  An operator
+    who sets SERVICE_IDENTITIES on an already-deployed server gets no effect
+    at all, and the only symptom is a 403 whose message points at the
+    administrator rather than at the ignored config.  Boot must name the
+    ignored oids so the wrong lever is obvious.
+    """
+
+    _SERVICE_OID = "cccccccc-dddd-eeee-ffff-000011112222"
+
+    def _settings(self, tmp_path: Path, store_path: Path) -> Any:
+        from context_intelligence_server.config import Settings  # noqa: PLC0415
+
+        return Settings(
+            auth_mode="entra",
+            azure_client_id=FAKE_CLIENT_ID,
+            azure_tenant_id=FAKE_TENANT_ID,
+            entra_identities={FAKE_OID: {"id": FAKE_CONTRIBUTOR_ENTRA}},
+            service_identities={self._SERVICE_OID: {"id": "my-automation-service"}},
+            entra_identities_store_path=str(store_path),
+            api_keys_store_path=str(tmp_path / "api-keys.json"),
+        )
+
+    def test_warns_naming_oids_ignored_because_store_already_exists(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Store file present → config service oid is ignored → warning names it."""
+        from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
+
+        store_path = tmp_path / "entra-identities.json"
+        # An already-deployed server: the store file was written on an earlier boot.
+        store_path.write_text(json.dumps({FAKE_OID: {"id": FAKE_CONTRIBUTOR_ENTRA}}))
+
+        settings = self._settings(tmp_path, store_path)
+
+        with caplog.at_level("WARNING", logger="context_intelligence_server.main"):
+            create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        matching = [m for m in warnings if "service_identities config lists" in m]
+        assert matching, (
+            f"expected an ignored-service_identities warning, got {warnings!r}"
+        )
+        # The oid must be named — a warning that does not say WHICH principal is
+        # ignored leaves the operator exactly as stuck as no warning at all.
+        assert self._SERVICE_OID in matching[0]
+        assert "PUT /admin/identities" in matching[0]
+
+    def test_no_warning_on_first_boot_when_config_is_actually_seeded(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No store file → config IS seeded → the warning must not fire."""
+        from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
+
+        store_path = tmp_path / "entra-identities.json"
+        assert not store_path.exists(), "Pre-condition: first boot, no store file"
+
+        settings = self._settings(tmp_path, store_path)
+
+        with caplog.at_level("WARNING", logger="context_intelligence_server.main"):
+            create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert not [m for m in warnings if "service_identities config lists" in m]
+
+
 # ===========================================================================
 # T3: Mode-specific accessors
 # ===========================================================================

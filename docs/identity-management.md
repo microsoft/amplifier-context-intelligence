@@ -76,17 +76,16 @@ separate concerns, though: a role-bearing service also needs its `oid` mapped
 
 > **`service_identities` is a first-boot seed into the SAME store as
 > `entra_identities` — not a separate, static system.** Service identities live
-> in the identical durable `IdentityStore` behind `entra_identities`, each
-> record tagged `type: "user"` or `type: "service"` (default `"user"`).
+> in the identical durable `IdentityStore` behind `entra_identities`.
 > `service_identities` (env/YAML) only **seeds** that store on first boot and
-> may be empty. It is **not itself** the authorization gate (the App Role check
-> is), but it **is** required for attribution: a role-bearing service whose
-> `oid` isn't mapped now gets **403** — there is no fallback to the stable
-> `appid` GUID. To onboard, change, or remove a service identity **at
-> runtime, no restart**, use the **same** `/admin/identities` endpoint as
-> `entra_identities`, passing `type: "service"` (§3–4). **There is deliberately
-> no separate `/admin/services` endpoint** — one endpoint, one store, a `type`
-> field to tell the two apart.
+> may be empty. Once the store file exists, config changes to `service_identities`
+> have no effect; the server logs a WARNING at startup naming ignored `service_identities`
+> oids. It is **not itself** the authorization gate (the App Role check is), but it
+> **is** required for attribution: a role-bearing service whose `oid` isn't mapped now
+> gets **403** — there is no fallback to the stable `appid` GUID. To onboard, change,
+> or remove a service identity **at runtime, no restart**, use the **same**
+> `/admin/identities` endpoint as `entra_identities` (§3–4). **There is deliberately
+> no separate `/admin/services` endpoint** — one endpoint, one store.
 
 ### Static mode — set `admin_api_key`
 
@@ -124,19 +123,20 @@ the inactive mode is not loaded).
 
 ### Entra identities — `auth_mode=entra`
 
-One store, one endpoint, serves **both** user and service identities —
-a `type` field tells them apart:
+One store, one endpoint, serves **both** user and service identities — Entra
+`oid`s are disjoint across users and service principals, so a single
+`oid → contributor` map covers both:
 
 | Method & path | Body / query | Success |
 |---|---|---|
-| `PUT /admin/identities/{oid}` | `{"id": "<contributor>", "display_name": "<optional>", "type": "user"\|"service"}` (`type` optional, default `"user"`) | `200 {"oid","id","type"[,"display_name"]}` |
-| `DELETE /admin/identities/{oid}` | `?type=` optional (audit-only; does not gate the deletion) | `200 {"oid","deleted":true}` (`404` if absent) |
-| `GET /admin/identities` | `?type=user\|service` optional filter | `200 {"identities":[{"oid","id","type"[,"display_name"]}]}` |
+| `PUT /admin/identities/{oid}` | `{"id": "<contributor>", "display_name": "<optional>"}` | `200 {"oid","id"[,"display_name"]}` |
+| `DELETE /admin/identities/{oid}` | — | `200 {"oid","deleted":true}` (`404` if absent) |
+| `GET /admin/identities` | — | `200 {"identities":[{"oid","id"[,"display_name"]}]}` |
 
 - `{oid}` must be a **lowercase-hex GUID** (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`),
   not the all-zeros sentinel → otherwise `422`.
-- There is deliberately **no separate `/admin/services` endpoint** — pass
-  `type: "service"` on this same endpoint instead.
+- There is deliberately **no separate `/admin/services` endpoint** — service and
+  user identities are managed through the same endpoint.
 
 ### Static API keys — `auth_mode=static`
 
@@ -189,15 +189,14 @@ principals. Three steps:
    service token whose `oid` isn't mapped now gets **403** (names the
    principal) — an App Role alone is no longer sufficient. Map it either
    before first use (seed `service_identities` in config) or at **runtime, no
-   restart**, the same way a user is onboarded (§4, above), passing
-   `type: "service"`:
+   restart**, the same way a user is onboarded (§4, above):
 
    ```bash
    OID="aaaaaaaa-0000-0000-0000-000000000002"   # the service principal's oid
    curl -sS -X PUT "$SERVER/admin/identities/$OID" \
      -H "Authorization: Bearer [REDACTED:SECRET]" \
      -H "Content-Type: application/json" \
-     -d '{"id": "<contributor>", "type": "service"}'
+     -d '{"id": "<contributor>"}'
    ```
 3. **The caller requests a token** for **`api://<client_id>/.default`** via
    **Managed Identity** or **federated OIDC** (a client secret only where the

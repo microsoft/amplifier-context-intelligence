@@ -196,40 +196,6 @@ class TestIdentityCRUD:
         assert FAKE_OID_2 in oids
 
     @pytest.mark.anyio
-    async def test_put_identity_with_type_service_persists_and_filters(
-        self, entra_client: httpx.AsyncClient
-    ) -> None:
-        """PUT with type="service" persists it; GET ?type= filters correctly.
-
-        FAKE_OID was seeded via config (entra_identities, no explicit "type")
-        and must display/filter as the "user" default; FAKE_OID_2 is PUT here
-        with type="service" -- one shared store, both types.
-        """
-        resp = await entra_client.put(
-            f"/admin/identities/{FAKE_OID_2}",
-            json={"id": "my-automation-service", "type": "service"},
-        )
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["type"] == "service"
-
-        # Unfiltered GET lists both; the config-seeded entry defaults to "user".
-        resp = await entra_client.get("/admin/identities")
-        by_oid = {item["oid"]: item for item in resp.json()["identities"]}
-        assert by_oid[FAKE_OID_2]["type"] == "service"
-        assert by_oid[FAKE_OID]["type"] == "user"
-
-        # type=service filter returns only the service entry.
-        resp = await entra_client.get("/admin/identities", params={"type": "service"})
-        oids = {item["oid"] for item in resp.json()["identities"]}
-        assert oids == {FAKE_OID_2}
-
-        # type=user filter returns only the (config-seeded) user entry.
-        resp = await entra_client.get("/admin/identities", params={"type": "user"})
-        oids = {item["oid"] for item in resp.json()["identities"]}
-        assert oids == {FAKE_OID}
-
-    @pytest.mark.anyio
     async def test_delete_identity_returns_200(
         self, entra_client: httpx.AsyncClient
     ) -> None:
