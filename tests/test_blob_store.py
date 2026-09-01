@@ -26,9 +26,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-
 from context_intelligence_server.blob_store import AsyncDiskBlobStore, BlobStore
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -321,9 +319,8 @@ async def test_write_is_atomic_no_torn_file_on_failure(
     with patch(
         "context_intelligence_server.blob_store.os.replace",
         side_effect=OSError("simulated replace failure"),
-    ):
-        with pytest.raises(OSError):
-            await store.write(session_id, key, {"v": 1})
+    ), pytest.raises(OSError):
+        await store.write(session_id, key, {"v": 1})
 
     final_path = store.blob_path(session_id, key)
     # No torn file observable at the final path.
@@ -382,3 +379,23 @@ async def test_delete_session_isolates_other_sessions(
 
     assert await store.list("sess-a") == []
     assert await store.list("sess-b") == ["ci-blob://sess-b/k1"]
+
+
+# ---------------------------------------------------------------------------
+# size()
+# ---------------------------------------------------------------------------
+
+
+async def test_size_returns_byte_size_of_written_blob(
+    store: AsyncDiskBlobStore, tmp_path: Path
+) -> None:
+    """size() returns the exact on-disk byte size of the JSON file."""
+    uri = await store.write("sess-size", "k1", {"v": 1})
+    expected = (tmp_path / "sess-size" / "blobs" / "k1.json").stat().st_size
+    assert await store.size(uri) == expected
+    assert expected > 0
+
+
+async def test_size_missing_blob_returns_zero(store: AsyncDiskBlobStore) -> None:
+    """size() is idempotent-on-missing: returns 0, never raises."""
+    assert await store.size("ci-blob://never-existed/missing_key") == 0

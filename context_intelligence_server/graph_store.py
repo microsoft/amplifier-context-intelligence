@@ -43,7 +43,66 @@ Non-negotiable guarantees for all conforming implementations:
 
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
+
+_BLOB_REF_KEY = "$blob_ref"
+
+
+@dataclass(frozen=True)
+class SessionFamily:
+    """Whole-family resolution result backing the session-summary facts.
+
+    A session graph spans many session nodes (root + subsessions + forks),
+    never just the one passed in (see B1 in
+    docs/context-intelligence-delete-session-data.md). ``session_ids`` and
+    ``blob_refs`` are the authoritative sets: a later delete operation reuses
+    this exact resolution so its dry-run preview and its apply step can never
+    disagree.
+
+    ``node_count``/``edge_count`` and ``blob_refs`` cover the family's own
+    subgraph only -- traversal stops at (but includes) any ``:SST_CONCEPT``
+    node, since concept nodes (Agent/Orchestrator/Recipe) are shared across
+    sessions and are never owned by one family.
+    """
+
+    root_id: str
+    session_ids: frozenset[str]
+    blob_refs: frozenset[str]
+    node_count: int
+    edge_count: int
+    created_by: str | None
+    started_at: datetime | None
+    last_change: datetime | None
+    subsession_count: int
+    workspace: str
+    working_dir: str | None
+
+
+def extract_blob_refs(props: dict[str, Any]) -> frozenset[str]:
+    """Return the distinct ``ci-blob://`` URIs referenced anywhere in *props*.
+
+    Blob-offloaded fields (``blob_processor.py``) are written as
+    ``{"$blob_ref": uri}``. In-memory stores keep that nested-dict shape;
+    Neo4j has no nested-map property type, so ``Neo4jGraphStore._sanitize_properties``
+    JSON-serialises the same dict to a string. Both shapes are handled here so
+    every ``GraphStore`` implementation can share one extraction routine.
+    """
+    refs: set[str] = set()
+    for value in props.values():
+        candidate: Any = value
+        if isinstance(candidate, str) and _BLOB_REF_KEY in candidate:
+            try:
+                candidate = json.loads(candidate)
+            except ValueError:
+                continue
+        if isinstance(candidate, dict):
+            ref = candidate.get(_BLOB_REF_KEY)
+            if isinstance(ref, str):
+                refs.add(ref)
+    return frozenset(refs)
 
 
 @runtime_checkable
@@ -108,6 +167,19 @@ class GraphStore(Protocol):
         Checks the in-memory buffer first, consistent with ``get_node``/
         ``get_edge`` buffer-first semantics. Returns ``None`` if no matching
         Delegation node is found in either the buffer or the backing store.
+        """
+        ...
+
+    async def resolve_session_family(self, session_id: str) -> SessionFamily | None:
+        """Resolve the whole session family (root + all descendants) for *session_id*.
+
+        If *session_id* is not itself a root, first expands UP to the root by
+        walking ``HAS_SUBSESSION``/``FORKED`` edges, then returns the root plus
+        every descendant session -- never just the passed session alone (B1).
+        A sub-session id and its root id MUST resolve to the identical family.
+
+        Returns ``None`` if *session_id* does not resolve to any known
+        ``:Session`` node.
         """
         ...
 

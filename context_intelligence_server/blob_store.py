@@ -51,6 +51,17 @@ class BlobStore(Protocol):
         """Return all blob URIs for *session_id*, sorted lexicographically."""
         ...
 
+    async def size(self, uri: str) -> int:
+        """Return the byte size of the blob addressed by *uri*.
+
+        Idempotent: a missing blob returns 0, not an error (mirrors
+        ``delete_session``'s missing-is-zero contract).
+
+        Raises:
+            ValueError: If *uri* is not a valid ``ci-blob://`` URI.
+        """
+        ...
+
     async def delete_session(self, session_id: str) -> int:
         """Delete all blobs for *session_id* and return the number removed.
 
@@ -211,6 +222,19 @@ class AsyncDiskBlobStore:
             return [self._make_uri(session_id, key) for key in keys]
 
         return await asyncio.to_thread(_list)
+
+    async def size(self, uri: str) -> int:
+        """Return the byte size of the blob addressed by *uri*, or 0 if missing."""
+        session_id, key = self._parse_uri(uri)
+        path = self._blob_path(session_id, key)
+
+        def _size() -> int:
+            try:
+                return path.stat().st_size
+            except FileNotFoundError:
+                return 0
+
+        return await asyncio.to_thread(_size)
 
     async def delete_session(self, session_id: str) -> int:
         """Delete all blobs for *session_id* and return the number removed.
