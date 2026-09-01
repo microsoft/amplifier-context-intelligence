@@ -201,10 +201,14 @@ class TestResolveSessionGraphNeo4j:
         assert graph is not None
         assert graph.working_dir == "/mnt/workspaces/project-2501"
 
-    async def test_workspace_scoping_excludes_other_workspace(
+    async def test_resolves_regardless_of_callers_bound_workspace(
         self, neo4j_services: Any, neo4j_container: dict[str, Any]
     ) -> None:
-        """A same-named root in a DIFFERENT workspace must not be resolved."""
+        """resolve_session_graph takes no workspace argument -- it discovers
+        the workspace from the session id itself. A store instance bound to
+        a DIFFERENT workspace at construction must still resolve the graph,
+        and must report the workspace the session actually lives in (not
+        the store's own bound workspace)."""
         from context_intelligence_server.neo4j_store import Neo4jGraphStore
 
         store = neo4j_services.graph
@@ -217,8 +221,54 @@ class TestResolveSessionGraphNeo4j:
         )
         try:
             found = await other_store.resolve_session_graph("nf-fam-root")
-            assert found is None, (
-                "workspace scoping must exclude a graph from another workspace"
+            assert found is not None, (
+                "the workspace is discovered from the session id, not "
+                "supplied by the caller, so a differently-bound store must "
+                "still find it"
             )
+            assert found.workspace == "test", (
+                "the reported workspace must be the one the session "
+                "actually lives in, not other_store's own bound workspace"
+            )
+        finally:
+            await other_store.close()
+
+    async def test_ambiguous_session_id_across_workspaces_raises(
+        self, neo4j_services: Any, neo4j_container: dict[str, Any]
+    ) -> None:
+        """The SAME session id used in TWO DIFFERENT workspaces is refused
+        loudly rather than silently resolving one of them.
+
+        Session ids are supposed to be unique, so this should not happen in
+        practice -- but if it ever does, resolving (or deleting) by id alone
+        must raise instead of guessing which workspace was meant.
+        """
+        from context_intelligence_server.graph_store import AmbiguousSessionError
+        from context_intelligence_server.neo4j_store import Neo4jGraphStore
+
+        store = neo4j_services.graph
+        await _build_graph(store)
+
+        other_store = Neo4jGraphStore(
+            uri=neo4j_container["bolt_url"],
+            auth=(neo4j_container["user"], neo4j_container["password"]),
+            workspace="other-workspace",
+        )
+        try:
+            # Put a session with the SAME node_id "nf-fam-root" into a
+            # SECOND, different workspace.
+            await other_store.upsert_node(
+                "nf-fam-root",
+                {
+                    "labels": ["Session", "RootSession"],
+                    "started_at": "2026-05-01T00:00:00Z",
+                },
+            )
+            await other_store.flush()
+
+            with pytest.raises(AmbiguousSessionError, match="more than one workspace"):
+                await store.resolve_session_graph("nf-fam-root")
+            with pytest.raises(AmbiguousSessionError, match="more than one workspace"):
+                await other_store.resolve_session_graph("nf-fam-root")
         finally:
             await other_store.close()

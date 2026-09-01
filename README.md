@@ -320,8 +320,8 @@ Full runtime onboarding/offboarding runbook and the `/admin/*` API:
 | `GET` | `/blobs/{session_id}` | List all blob URIs for a session |
 | `GET` | `/blobs/{session_id}/{key}` | Retrieve a stored blob |
 | `POST` | `/cypher` | Proxy a Cypher query to Neo4j |
-| `GET` | `/sessions/{session_id}/summary?workspace=<ws>` | Report what deleting this session's data would remove, without deleting anything (needs read access) |
-| `DELETE` | `/sessions/{session_id}?workspace=<ws>&apply=<bool>` | Delete a whole session graph and its stored data. `apply=false` (default) returns the same preview and deletes nothing; `apply=true` deletes it (needs write access) |
+| `GET` | `/sessions/{session_id}/summary` | Report what deleting this session's data would remove, without deleting anything (needs read access) |
+| `DELETE` | `/sessions/{session_id}` | Delete a whole session graph and its stored data (needs write access) |
 | `GET` | `/queues/dead-letter` | List dead-letter queues — `worker_key`, `item_count`, `last_error`, `last_ts` (requires `Authorization: Bearer`) |
 | `POST` | `/queues/dead-letter/{worker_key}/replay` | Re-enqueue a worker's dead-letter records then purge; returns count re-enqueued (requires `Authorization: Bearer`) |
 | `POST` | `/queues/dead-letter/{worker_key}/purge` | Permanently delete a worker's dead-letter records; returns count purged (requires `Authorization: Bearer`) |
@@ -361,6 +361,9 @@ A user can remove data they contributed. Deleting a session removes the **whole 
 — the root session and every session below it (its subsessions and forks) — together with the
 data those sessions point to: their blobs, their queue files, and their dead-letter records.
 
+You only ever give the server a **session id**. There is no workspace to pass — the server looks
+up which workspace that session id belongs to on its own.
+
 - Passing **any** session id deletes the whole graph it belongs to. If you pass a subsession id,
   the server first finds that graph's root and then removes the whole graph. There is no way to
   delete a single subsession on its own.
@@ -370,15 +373,24 @@ data those sessions point to: their blobs, their queue files, and their dead-let
 
 Deleting is a two-step flow so nothing is removed by surprise:
 
-1. **Preview first.** `GET /sessions/{session_id}/summary?workspace=<ws>` (or `DELETE` with
-   `apply=false`) returns what would be removed: who created it, how many sessions, nodes, edges,
-   and blobs are in the graph, when it started and last changed, and whether it is ready to delete.
-   A session that changed less than a minute ago may still be receiving data.
-2. **Then apply.** `DELETE /sessions/{session_id}?workspace=<ws>&apply=true` performs the delete
-   and reports the counts of what was removed. Every applied delete is written to the server log.
+1. **Preview first.** `GET /sessions/{session_id}/summary` returns what would be removed: who
+   created it, how many sessions, nodes, edges, and blobs are in the graph, when it started and
+   last changed, and whether it is ready to delete. A session that changed less than a minute ago
+   may still be receiving data. Nothing is deleted by this call.
+2. **Then delete.** `DELETE /sessions/{session_id}` performs the delete and reports the counts of
+   what was removed. There is no preview flag on this call — it always deletes. Every applied
+   delete is written to the server log.
 
-The delete is refused with `409` if any session in the graph is still receiving data (its queue
-has records that have not finished being written). Wait until it has finished, then delete.
+A session can be deleted once it is **no longer receiving data** — that is, everything it sent
+has finished being written and nothing is still queued for it. This is the normal state for any
+session that has finished running, so in practice a session you want to remove can be deleted.
+
+The delete is refused with `409` only while a session in the graph is **still receiving data**
+(its queue has records that have not finished being written yet). This protects a session that is
+still live or still catching up: wait until it has finished, then delete. The summary's
+`last_change` field helps you tell — a change less than a minute ago may mean the session is still
+active. A `409` is also returned in the (should-not-happen) case where the session id is found in
+more than one workspace — the server refuses to guess which workspace was meant.
 
 The summary uses the read-only Neo4j connection; the actual delete uses the admin connection.
 

@@ -85,6 +85,25 @@ class SessionGraph:
     working_dir: str | None
 
 
+class AmbiguousSessionError(Exception):
+    """Raised when a session id is found in more than one workspace.
+
+    ``resolve_session_graph`` and ``delete_session_graph`` no longer take a
+    workspace as input -- they look up which workspace a session id belongs
+    to and use that. Session ids are supposed to be unique, so this should
+    not normally happen, but if it ever does, refusing loudly here is much
+    safer than picking one workspace and deleting the wrong graph.
+    """
+
+    def __init__(self, session_id: str, workspaces: list[str]) -> None:
+        self.session_id = session_id
+        self.workspaces = workspaces
+        super().__init__(
+            f"session id {session_id!r} exists in more than one workspace: "
+            f"{workspaces!r}"
+        )
+
+
 @dataclass(frozen=True)
 class GraphDeleteResult:
     """Result of a whole-graph ``delete_session_graph`` call.
@@ -171,6 +190,12 @@ class GraphStore(Protocol):
     async def resolve_session_graph(self, session_id: str) -> SessionGraph | None:
         """Resolve the whole session graph (root + all descendants) for *session_id*.
 
+        *session_id* is the only input needed -- there is no separate
+        workspace argument. The workspace a session lives in is looked up
+        from *session_id* itself (session ids are unique), and that
+        discovered workspace is what the rest of the resolution is scoped
+        to, so a session graph is still resolved within one workspace.
+
         If *session_id* is not itself a root, first expands UP to the root by
         walking ``HAS_SUBSESSION``/``FORKED`` edges, then returns the root plus
         every descendant session -- never just the passed session alone (B1).
@@ -178,11 +203,22 @@ class GraphStore(Protocol):
 
         Returns ``None`` if *session_id* does not resolve to any known
         ``:Session`` node.
+
+        Raises:
+            AmbiguousSessionError: If *session_id* is found in more than one
+                workspace. Session ids are supposed to be unique, so this
+                should not happen in practice, but this method refuses to
+                guess which workspace was meant rather than silently picking
+                one.
         """
         ...
 
     async def delete_session_graph(self, session_id: str) -> GraphDeleteResult | None:
         """Permanently delete the whole OWNED session graph for *session_id*.
+
+        *session_id* is the only input needed -- there is no separate
+        workspace argument. Like ``resolve_session_graph``, the workspace is
+        looked up from *session_id* itself, not supplied by the caller.
 
         Resolves the graph via the identical traversal ``resolve_session_graph``
         uses (root + all descendants, bounded at but not past any
@@ -194,11 +230,16 @@ class GraphStore(Protocol):
 
         A sub-session id and its root id MUST resolve to, and delete, the
         identical graph -- this reuses ``resolve_session_graph``'s exact
-        resolution so a delete can never diverge from what a prior dry-run
+        resolution so a delete can never diverge from what a prior preview
         summary promised.
 
         Returns ``None`` if *session_id* does not resolve to any known
         ``:Session`` node -- no writes occur in that case.
+
+        Raises:
+            AmbiguousSessionError: If *session_id* is found in more than one
+                workspace (see ``resolve_session_graph``). Nothing is deleted
+                in that case.
         """
         ...
 

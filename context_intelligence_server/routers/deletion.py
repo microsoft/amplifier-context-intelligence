@@ -1,18 +1,23 @@
 """Routes for deleting a session's stored data.
 
 These routes are a thin layer over ``DeletionService``. Each route reads the
-request, builds the graph store, blob store, and queue manager for one
-workspace, creates a ``DeletionService`` with them, calls it, and turns the
-answer into JSON. The routes do not talk to Neo4j or the file system on their
-own -- ``DeletionService`` already knows how to do that.
+request, builds the graph store, blob store, and queue manager, creates a
+``DeletionService`` with them, calls it, and turns the answer into JSON. The
+routes do not talk to Neo4j or the file system on their own --
+``DeletionService`` already knows how to do that.
 
-There are two routes:
+There are two routes, split by HTTP method instead of a query flag:
 
 - ``GET /sessions/{session_id}/summary`` -- read-only. Reports what deleting
-  this session's data would do, without deleting anything.
-- ``DELETE /sessions/{session_id}`` -- with ``apply=false`` (the default)
-  this is the same dry run as the GET route. With ``apply=true`` it actually
-  deletes the data.
+  this session's data would do, without deleting anything. This is the
+  preview step.
+- ``DELETE /sessions/{session_id}`` -- always performs the delete. There is
+  no dry-run flag here any more: the GET route above is the preview, and
+  this route is the one that actually removes the data.
+
+Neither route takes a ``workspace`` query parameter. A session id is the
+unique identifier the caller passes; the server looks up which workspace
+that session lives in on its own (see ``Neo4jGraphStore.resolve_session_graph``).
 """
 
 from __future__ import annotations
@@ -31,11 +36,21 @@ from context_intelligence_server.deletion import (
     DeletionResult,
     DeletionService,
 )
+from context_intelligence_server.graph_store import AmbiguousSessionError
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Plain-language detail shown to the caller when a session id is found in
+# more than one workspace. This should not happen in practice (session ids
+# are unique) -- see AmbiguousSessionError for why the server refuses to
+# guess rather than picking one workspace.
+_AMBIGUOUS_SESSION_DETAIL = (
+    "the session id exists in more than one workspace; this should not "
+    "happen and needs to be looked into before it can be resolved"
+)
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -83,40 +98,30 @@ def _build_service(graph_store: Neo4jGraphStore, request: Request) -> DeletionSe
     return DeletionService(graph_store, blob_store, queue_manager)
 
 
-async def read_deletion_service(request: Request, workspace: str) -> DeletionService:
+async def read_deletion_service(request: Request) -> DeletionService:
     """Build a DeletionService that only reads, through the read-only Neo4j
     connection (``app.state.neo4j_query_driver``).
 
-    Used by the summary route and by the delete route's dry run. Both only
-    read, so both use the read-only connection -- a read never goes through
-    the admin connection.
+    Used by the summary route. No workspace is supplied here -- the graph
+    store looks up which workspace a session id belongs to on its own.
     """
     graph_store = Neo4jGraphStore(
         uri="",
-        workspace=workspace,
         driver=request.app.state.neo4j_query_driver,
     )
     return _build_service(graph_store, request)
 
 
-async def delete_route_service(
-    request: Request, workspace: str, apply: bool = False
-) -> DeletionService:
-    """Build the DeletionService the delete route uses, choosing the Neo4j
-    connection by what the route is about to do.
+async def delete_route_service(request: Request) -> DeletionService:
+    """Build the DeletionService the delete route uses.
 
-    A dry run (``apply`` is false) only reads, so it uses the read-only
-    connection (``app.state.neo4j_query_driver``). A real delete (``apply`` is
-    true) changes stored data, so it uses the admin connection
-    (``app.state.neo4j_driver``). A read never goes through the admin
-    connection, and a change always does.
+    The delete route always changes stored data, so it always uses the
+    admin Neo4j connection (``app.state.neo4j_driver``) -- unlike the
+    summary route, there is no read-only path here any more, because there
+    is no more dry run on this route. No workspace is supplied -- the graph
+    store looks up which workspace a session id belongs to on its own.
     """
-    driver = (
-        request.app.state.neo4j_driver
-        if apply
-        else request.app.state.neo4j_query_driver
-    )
-    graph_store = Neo4jGraphStore(uri="", workspace=workspace, driver=driver)
+    graph_store = Neo4jGraphStore(uri="", driver=request.app.state.neo4j_driver)
     return _build_service(graph_store, request)
 
 
@@ -141,9 +146,14 @@ async def get_session_summary(
 ) -> dict[str, Any]:
     """Report what deleting this session's data would do. Deletes nothing.
 
-    Returns 404 when ``session_id`` does not match any known session.
+    Returns 404 when ``session_id`` does not match any known session, and
+    409 when ``session_id`` is somehow found in more than one workspace
+    (see ``AmbiguousSessionError`` -- this should not happen in practice).
     """
-    preview = await service.preview(session_id)
+    try:
+        preview = await service.preview(session_id)
+    except AmbiguousSessionError as exc:
+        raise HTTPException(status_code=409, detail=_AMBIGUOUS_SESSION_DETAIL) from exc
     if preview is None:
         raise HTTPException(status_code=404, detail=f"session {session_id!r} not found")
     return _preview_to_dict(preview)
@@ -156,32 +166,22 @@ async def get_session_summary(
 async def delete_session(
     session_id: str,
     request: Request,
-    apply: bool = False,
     service: DeletionService = Depends(delete_route_service),
 ) -> dict[str, Any]:
-    """Delete a session's data, or preview what deleting it would do.
+    """Delete a session's data. This always deletes -- to preview what would
+    be removed first, without deleting anything, call
+    ``GET /sessions/{session_id}/summary``.
 
-    With ``apply=false`` (the default) nothing is deleted: the response is
-    the same preview the GET summary route returns, and it only reads
-    (through the read-only connection).
-
-    With ``apply=true`` the data is actually deleted through the admin
-    connection, and the response reports what was removed.
-
-    Returns 404 when ``session_id`` does not match any known session, and
-    409 when the session (or a related session in the same graph) is still
-    receiving data and has not finished being written yet.
+    Returns 404 when ``session_id`` does not match any known session, 409
+    when the session (or a related session in the same graph) is still
+    receiving data and has not finished being written yet, and 409 when
+    ``session_id`` is somehow found in more than one workspace (see
+    ``AmbiguousSessionError`` -- this should not happen in practice).
     """
-    if not apply:
-        preview = await service.preview(session_id)
-        if preview is None:
-            raise HTTPException(
-                status_code=404, detail=f"session {session_id!r} not found"
-            )
-        return _preview_to_dict(preview)
-
     try:
         result = await service.apply(session_id, requested_by=_caller_id(request))
+    except AmbiguousSessionError as exc:
+        raise HTTPException(status_code=409, detail=_AMBIGUOUS_SESSION_DETAIL) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if result is None:
