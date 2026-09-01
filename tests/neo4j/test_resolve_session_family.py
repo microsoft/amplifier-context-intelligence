@@ -40,7 +40,11 @@ async def _build_family(store: Any) -> None:
     store.created_by = "colombod"
     await store.upsert_node(
         "nf-fam-root",
-        {"labels": ["Session", "RootSession"], "started_at": "2026-01-01T00:00:00Z"},
+        {
+            "labels": ["Session", "RootSession"],
+            "started_at": "2026-01-01T00:00:00Z",
+            "working_dir": "/mnt/workspaces/project-2501",
+        },
     )
     await store.upsert_node(
         "nf-fam-sub1",
@@ -219,6 +223,13 @@ class TestResolveSessionFamilyNeo4j:
         family = await store.resolve_session_family("nf-fam-fork1")
         assert family is not None
         assert family.created_by == "colombod"
+
+    async def test_working_dir_from_root(self, neo4j_services: Any) -> None:
+        store = neo4j_services.graph
+        await _build_family(store)
+        family = await store.resolve_session_family("nf-fam-fork1")
+        assert family is not None
+        assert family.working_dir == "/mnt/workspaces/project-2501"
 
     async def test_workspace_scoping_excludes_other_workspace(
         self, neo4j_services: Any, neo4j_container: dict[str, Any]

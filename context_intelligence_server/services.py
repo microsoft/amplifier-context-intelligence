@@ -263,6 +263,7 @@ class GraphState:
         # `ON CREATE SET n.created_by`) -- fall back to the store-level value.
         created_by = root_props.get("created_by") or self._created_by
         started_at = _parse_timestamp(root_props.get("started_at"))
+        working_dir = root_props.get("working_dir")
 
         last_change: datetime | None = None
         for sid in session_ids:
@@ -288,7 +289,7 @@ class GraphState:
             last_change=last_change,
             subsession_count=len(session_ids) - 1,
             workspace=self._workspace,
-            working_dir=None,
+            working_dir=working_dir if isinstance(working_dir, str) else None,
         )
 
     def remove_edge(self, src_id: str, dst_id: str) -> None:
