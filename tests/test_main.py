@@ -797,10 +797,11 @@ async def test_lifespan_recovers_and_respawns_drainers(
 async def test_lifespan_skips_recovery_for_empty_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A session whose only line has an empty workspace is dispatched under
-    the `_RECOVERY_FALLBACK_WORKSPACE` sentinel, never under workspace='' --
-    the fallback exists so a torn/corrupted head never strands the (still
-    durable) data behind it."""
+    """A session whose only line has an empty workspace is SKIPPED -- never
+    dispatched under workspace='' and never under a substitute. workspace is
+    the graph partition key, so a guessed value would write the session into a
+    partition it does not belong to; the log is left durable on disk and a
+    later boot reports the session again."""
     sid = "sess-empty-ws"
     qm = registry.queue_manager
     body = json.dumps(

@@ -234,9 +234,9 @@ async def test_commit_is_atomic_no_temp_leftover(qm, tmp_path):
     assert list(qdir.glob("*.tmp")) == []
 
 
-# _read_committed_offset accepts the bare-int form and the legacy JSON offset
-# document; commit() still writes bare int. A present-but-unusable offset must
-# raise, never silently return 0 (0 would force a full re-drain).
+# _read_committed_offset parses the bare-int form written by commit(). A
+# present-but-unusable offset must raise, never silently return 0 (0 would
+# force a full re-drain).
 
 
 async def test_read_committed_offset_accepts_bare_int_unchanged(qm):
