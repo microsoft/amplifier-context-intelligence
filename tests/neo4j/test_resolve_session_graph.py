@@ -1,17 +1,16 @@
 """Tier 3 - Neo4j integration proof for Neo4jGraphStore.resolve_session_graph.
 
-Ingests a multi-session graph (root + 2 subsessions + 1 fork) with $blob_ref
-values attached to nodes across several of those sessions, then proves:
+Ingests a multi-session graph (root + 2 subsessions + 1 fork) with a few
+extra event nodes attached to nodes across several of those sessions (used
+to build up node/edge counts -- blobs themselves are not this store's job,
+see BlobStore.list instead), then proves:
 
   (a) resolving from a SUB-session id yields the SAME graph (same session-id
       set) as resolving from the root id;
-  (b) the whole-graph blob count = the distinct $blob_ref URIs across the
-      graph (not just one session's), and a blob reachable only through a
-      shared :SST_CONCEPT node is correctly excluded;
-  (c) started_at and last_change are present, and last_change reflects the
+  (b) started_at and last_change are present, and last_change reflects the
       MAX across the graph (not just the root -- touch_session only ever
       updates the direct node's last_updated, per services.py);
-  (d) node/edge counts match the constructed graph exactly.
+  (c) node/edge counts match the constructed graph exactly.
 
 Run: uv run pytest tests/neo4j/test_resolve_session_graph.py -v -m neo4j
 """
@@ -27,15 +26,15 @@ pytestmark = pytest.mark.neo4j
 
 
 async def _build_graph(store: Any) -> None:
-    """Seed a root + 2 subsessions + 1 fork, with blobs on several sessions.
+    """Seed a root + 2 subsessions + 1 fork, with extra event nodes on several sessions.
 
     Tree shape:  root -[HAS_SUBSESSION]-> sub1 -[HAS_SUBSESSION]-> sub2
                  root -[FORKED]-> fork1
 
-    Blob-bearing event nodes attached at three different graph sessions
-    (root, sub2, fork1), plus a shared Agent (:SST_CONCEPT) reached from
-    fork1's Delegation, with an out-of-graph node hanging off the Agent to
-    prove traversal stops there (its blob must NOT be counted).
+    Event nodes attached at three different graph sessions (root, sub2,
+    fork1), plus a shared Agent (:SST_CONCEPT) reached from fork1's
+    Delegation, with an out-of-graph node hanging off the Agent to prove
+    traversal stops there.
     """
     store.created_by = "colombod"
     await store.upsert_node(
@@ -75,13 +74,10 @@ async def _build_graph(store: Any) -> None:
     )
     await store.upsert_edge("nf-fam-root", "nf-fam-fork1", {"type": "FORKED"})
 
-    # Blob-bearing nodes across several graph sessions.
+    # Extra event nodes across several graph sessions.
     await store.upsert_node(
         "nf-fam-root::orch::1",
-        {
-            "labels": ["OrchestratorRun", "SST_EVENT"],
-            "raw": {"$blob_ref": "ci-blob://nf-fam-root/orch1"},
-        },
+        {"labels": ["OrchestratorRun", "SST_EVENT"]},
     )
     await store.upsert_edge(
         "nf-fam-root", "nf-fam-root::orch::1", {"type": "HAS_EXECUTION"}
@@ -89,10 +85,7 @@ async def _build_graph(store: Any) -> None:
 
     await store.upsert_node(
         "nf-fam-sub2::tool::1",
-        {
-            "labels": ["ToolCall", "SST_EVENT"],
-            "result": {"$blob_ref": "ci-blob://nf-fam-sub2/tool1"},
-        },
+        {"labels": ["ToolCall", "SST_EVENT"]},
     )
     await store.upsert_edge(
         "nf-fam-sub2", "nf-fam-sub2::tool::1", {"type": "HAS_TOOL_CALL"}
@@ -100,10 +93,7 @@ async def _build_graph(store: Any) -> None:
 
     await store.upsert_node(
         "nf-fam-fork1::delegation::1",
-        {
-            "labels": ["Delegation", "SST_EVENT"],
-            "messages": {"$blob_ref": "ci-blob://nf-fam-fork1/del1"},
-        },
+        {"labels": ["Delegation", "SST_EVENT"]},
     )
     await store.upsert_edge(
         "nf-fam-fork1", "nf-fam-fork1::delegation::1", {"type": "TRIGGERED"}
@@ -116,10 +106,7 @@ async def _build_graph(store: Any) -> None:
     )
     await store.upsert_node(
         "nf-other-session-xyz::leak",
-        {
-            "labels": ["ToolCall", "SST_EVENT"],
-            "raw": {"$blob_ref": "ci-blob://nf-other-session-xyz/leak"},
-        },
+        {"labels": ["ToolCall", "SST_EVENT"]},
     )
     await store.upsert_edge(
         "nf-agent-shared", "nf-other-session-xyz::leak", {"type": "SOME_EDGE"}
@@ -167,27 +154,10 @@ class TestResolveSessionGraphNeo4j:
         assert graph is not None
         assert graph.subsession_count == 3
 
-    async def test_blob_count_is_whole_graph_not_one_session(
-        self, neo4j_services: Any
-    ) -> None:
-        """(b) blob count = distinct $blob_ref URIs across the WHOLE graph."""
-        store = neo4j_services.graph
-        await _build_graph(store)
-        graph = await store.resolve_session_graph("nf-fam-sub2")
-        assert graph is not None
-        assert graph.blob_refs == {
-            "ci-blob://nf-fam-root/orch1",
-            "ci-blob://nf-fam-sub2/tool1",
-            "ci-blob://nf-fam-fork1/del1",
-        }
-        assert len(graph.blob_refs) == 3
-        # Reachable only via the shared concept node -- must be excluded.
-        assert "ci-blob://nf-other-session-xyz/leak" not in graph.blob_refs
-
     async def test_started_at_and_last_change_present(
         self, neo4j_services: Any
     ) -> None:
-        """(c) started_at/last_change present; last_change is the graph MAX."""
+        """(b) started_at/last_change present; last_change is the graph MAX."""
         store = neo4j_services.graph
         await _build_graph(store)
         graph = await store.resolve_session_graph("nf-fam-root")
@@ -204,7 +174,7 @@ class TestResolveSessionGraphNeo4j:
     async def test_node_and_edge_counts_match_constructed_graph(
         self, neo4j_services: Any
     ) -> None:
-        """(d) node/edge counts match the constructed graph exactly."""
+        """(c) node/edge counts match the constructed graph exactly."""
         store = neo4j_services.graph
         await _build_graph(store)
         graph = await store.resolve_session_graph("nf-fam-root")

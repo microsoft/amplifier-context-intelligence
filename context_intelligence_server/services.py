@@ -14,11 +14,7 @@ from datetime import datetime
 from typing import Any
 
 from context_intelligence_server.blob_store import BlobStore
-from context_intelligence_server.graph_store import (
-    GraphDeleteResult,
-    SessionGraph,
-    extract_blob_refs,
-)
+from context_intelligence_server.graph_store import GraphDeleteResult, SessionGraph
 from context_intelligence_server.handlers.data_layer_2.state import DataLayer2State
 from context_intelligence_server.handlers.data_layer_3.state import DataLayer3State
 
@@ -204,7 +200,7 @@ class GraphState:
 
         Walks ``HAS_SUBSESSION``/``FORKED`` edges up to the root, then back
         down to every descendant. See that method's docstring for the
-        graph-subgraph (node/edge/blob) traversal rule.
+        graph-subgraph (node/edge) traversal rule.
         """
         start = self._nodes.get(session_id)
         if start is None or "Session" not in start.get("labels", []):
@@ -258,10 +254,6 @@ class GraphState:
             if src in graph_nodes and dst in graph_nodes
         )
 
-        blob_refs: set[str] = set()
-        for nid in graph_nodes:
-            blob_refs |= extract_blob_refs(self._nodes.get(nid) or {})
-
         root_props = self._nodes.get(root_id) or {}
         # GraphState has no per-node created_by stamp (unlike Neo4jGraphStore's
         # `ON CREATE SET n.created_by`) -- fall back to the store-level value.
@@ -285,7 +277,6 @@ class GraphState:
         return SessionGraph(
             root_id=root_id,
             session_ids=frozenset(session_ids),
-            blob_refs=frozenset(blob_refs),
             node_count=len(graph_nodes),
             edge_count=edge_count,
             created_by=created_by,
@@ -612,8 +603,9 @@ class HookStateService:
 async def total_blob_size(blob_store: BlobStore, blob_refs: Iterable[str]) -> int:
     """Sum the byte size of every ``ci-blob://`` URI in *blob_refs*.
 
-    Composes ``BlobStore.size()`` over the graph's authoritative blob-ref set
-    (``SessionGraph.blob_refs``) -- the size lookup goes through the
+    Composes ``BlobStore.size()`` over whatever URIs the caller passes in --
+    typically every URI the blob store itself listed for the graph's
+    sessions (``BlobStore.list``) -- the size lookup goes through the
     ``BlobStore`` Protocol, never a raw filesystem stat, per the abstraction
     principle in docs/02-server-design.md. A missing blob contributes 0 (same
     idempotent-on-missing contract as ``BlobStore.size``/``delete_session``).

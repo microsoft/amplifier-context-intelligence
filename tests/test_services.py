@@ -913,18 +913,6 @@ class TestGraphStateResolveSessionGraph:
         assert graph is not None
         assert graph.subsession_count == 3
 
-    async def test_blob_refs_span_whole_graph_and_exclude_concept_leak(self) -> None:
-        state = GraphState()
-        await _build_graph(state)
-        graph = await state.resolve_session_graph("fam-root")
-        assert graph is not None
-        assert graph.blob_refs == {
-            "ci-blob://fam-root/orch1",
-            "ci-blob://fam-sub2/tool1",
-            "ci-blob://fam-fork1/del1",
-        }
-        assert "ci-blob://other-session-xyz/leak" not in graph.blob_refs
-
     async def test_node_and_edge_counts_exclude_past_concept_boundary(self) -> None:
         state = GraphState()
         await _build_graph(state)
@@ -1015,7 +1003,7 @@ class TestGraphStateDeleteSessionGraph:
 
 
 class TestTotalBlobSize:
-    """total_blob_size() composes BlobStore.size() over a graph's blob_refs."""
+    """total_blob_size() composes BlobStore.size() over a list of blob URIs."""
 
     async def test_sums_sizes_across_multiple_refs(self, tmp_path) -> None:
         blob_store = AsyncDiskBlobStore(root=tmp_path)

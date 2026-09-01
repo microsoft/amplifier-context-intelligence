@@ -86,7 +86,7 @@ async def _build_graph(
 
     await store.upsert_node(
         "ds-fam-root::orch::1",
-        {"labels": ["OrchestratorRun", "SST_EVENT"], "raw": {"$blob_ref": blob_root}},
+        {"labels": ["OrchestratorRun", "SST_EVENT"]},
     )
     await store.upsert_edge(
         "ds-fam-root", "ds-fam-root::orch::1", {"type": "HAS_EXECUTION"}
@@ -94,7 +94,7 @@ async def _build_graph(
 
     await store.upsert_node(
         "ds-fam-sub2::tool::1",
-        {"labels": ["ToolCall", "SST_EVENT"], "result": {"$blob_ref": blob_sub2}},
+        {"labels": ["ToolCall", "SST_EVENT"]},
     )
     await store.upsert_edge(
         "ds-fam-sub2", "ds-fam-sub2::tool::1", {"type": "HAS_TOOL_CALL"}
@@ -102,7 +102,7 @@ async def _build_graph(
 
     await store.upsert_node(
         "ds-fam-fork1::delegation::1",
-        {"labels": ["Delegation", "SST_EVENT"], "messages": {"$blob_ref": blob_fork1}},
+        {"labels": ["Delegation", "SST_EVENT"]},
     )
     await store.upsert_edge(
         "ds-fam-fork1", "ds-fam-fork1::delegation::1", {"type": "TRIGGERED"}
