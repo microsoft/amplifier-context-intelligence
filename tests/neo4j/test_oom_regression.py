@@ -270,6 +270,10 @@ async def test_chunked_flush_drains_same_single_phase_buffer(
 # ---------------------------------------------------------------------------
 
 
+# The deterministic three-leg OOM recipe runs ~30s against the capped
+# container -- over the global 30s timeout once teardown is added. Give it
+# headroom; the global default stays 30s for every other test.
+@pytest.mark.timeout(180)
 async def test_finalization_path_freezes_then_restart_then_drains(
     neo4j_container_capped: dict[str, Any],
     caplog: pytest.LogCaptureFixture,

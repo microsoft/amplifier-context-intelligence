@@ -17,14 +17,13 @@ import pytest
 import context_intelligence_server.registry as registry_module
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
-from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.queue_manager import QueueManager, Record
 from context_intelligence_server.registry import (
     CompletedSession,
     SessionRegistry,
     SessionWorker,
 )
 from context_intelligence_server.services import HookStateService
-
 
 # ---------------------------------------------------------------------------
 # Factory helper
@@ -503,8 +502,7 @@ class TestDeadLetterWarning:
         # A malformed line makes _parse_line raise inside _handle_exhausted_batch,
         # triggering the dead-letter path.
         poison = MagicMock()
-        poison.lines = [b"{ this is not valid json"]
-        poison.start_offset = 0
+        poison.records = [Record(b"{ this is not valid json", 0, 25)]
 
         with caplog.at_level(logging.WARNING, logger="context_intelligence_server"):
             await reg._handle_exhausted_batch(worker, poison, handlers=MagicMock())
@@ -961,7 +959,9 @@ class TestDurableSessionEnd:
         cs = reg._completed[0]
         assert cs.session_id == sid
         assert cs.workspace == "/ws"
-        assert cs.events_processed == 2
+        # session:end is dispatched twice: once live, once via the
+        # finalize re-read.
+        assert cs.events_processed == 3
         assert cs.error_count == 0
         assert cs.ended_at > 0.0
         assert cs.duration_seconds >= 0.0
@@ -1268,7 +1268,7 @@ class TestGlobalWriteSemaphoreRealPath:
             queues_path = str(tmp_path / "queues")
             neo4j_url = "bolt://unused:7687"
             neo4j_user = "neo4j"
-            neo4j_password = "unused"  # noqa: S105 - test stub, not a real secret
+            neo4j_password = "unused"
             stale_session_timeout = 3600.0
             write_concurrency = 2
             max_delivery_attempts = 3
@@ -1403,7 +1403,7 @@ class TestHandlerErrorClose:
 
 
 # ---------------------------------------------------------------------------
-# Task 5 (D2): live conservation counters on SessionRegistry. These feed the
+# Live conservation counters on SessionRegistry. These feed the
 # pipeline-conservation snapshot in /status so silently-dropped events become
 # observable (accepted vs written vs replayed, plus write retries).
 # ---------------------------------------------------------------------------
@@ -1448,7 +1448,7 @@ class TestPipelineCounters:
 
 
 # ---------------------------------------------------------------------------
-# Task 6 (D2/D3): SessionRegistry.pipeline_metrics() assembles the live
+# Task 6: SessionRegistry.pipeline_metrics() assembles the live
 # conservation counters with disk-derived queue/dead aggregates into a single
 # health block (residual + degraded). This is the /status aggregate that makes
 # silent loss observable. LIVE per-process measure (not an all-time audit):
@@ -1620,7 +1620,7 @@ class TestDegradedFalsePositiveFix:
 
 
 # ---------------------------------------------------------------------------
-# Task 7 (D2): written/retry counter increments wired into the drainer at the
+# Task 7: written/retry counter increments wired into the drainer at the
 # four real commit/retry sites: (1) normal-path commit, (2) retry on flush
 # failure, (3) per-line success during exhausted-batch isolation, and (4) the
 # finalize tail commit. These prove the live conservation counters actually
@@ -1952,8 +1952,10 @@ class TestSessionFinalizedLog:
         worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
         reg._register_for_test(worker)
         # Isolate from the real queue: no tail to drain, no real disk I/O.
+        # (records=[] -- _finalize_session's tail loop now iterates Batch.records;
+        # lines is a derived property, so an empty records is an empty tail.)
         reg.queue_manager.read_batch = AsyncMock(  # type: ignore[method-assign]
-            return_value=MagicMock(lines=[])
+            return_value=MagicMock(records=[], lines=[])
         )
         reg.queue_manager.commit = AsyncMock()  # type: ignore[method-assign]
         reg.queue_manager.delete_drained = AsyncMock()  # type: ignore[method-assign]
@@ -2063,31 +2065,29 @@ class TestSessionOwnershipInvariant:
 
         reg = SessionRegistry()
 
-        with caplog.at_level(logging.ERROR, logger="context_intelligence_server"):
-            with (
-                patch(
-                    "context_intelligence_server.registry.Neo4jGraphStore"
-                ) as MockStore,
-                patch(
-                    "context_intelligence_server.registry.AsyncDiskBlobStore"
-                ) as MockBlob,
-                patch(
-                    "context_intelligence_server.registry.HookStateService"
-                ) as MockService,
-            ):
-                MockStore.return_value = MagicMock()
-                MockBlob.return_value = MagicMock()
-                mock_svc = MagicMock()
-                MockService.return_value = mock_svc
-                reg.start_drain = MagicMock()
+        with (
+            caplog.at_level(logging.ERROR, logger="context_intelligence_server"),
+            patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
+            patch(
+                "context_intelligence_server.registry.AsyncDiskBlobStore"
+            ) as MockBlob,
+            patch(
+                "context_intelligence_server.registry.HookStateService"
+            ) as MockService,
+        ):
+            MockStore.return_value = MagicMock()
+            MockBlob.return_value = MagicMock()
+            mock_svc = MagicMock()
+            MockService.return_value = mock_svc
+            reg.start_drain = MagicMock()
 
-                # First call — creates the worker, binds "alice"
-                reg.get_or_create("sess-same", "/ws", created_by="alice")
-                # Simulate what the real HookStateService sets on graph_store
-                mock_svc.graph.created_by = "alice"
+            # First call — creates the worker, binds "alice"
+            reg.get_or_create("sess-same", "/ws", created_by="alice")
+            # Simulate what the real HookStateService sets on graph_store
+            mock_svc.graph.created_by = "alice"
 
-                # Second call — same contributor, must be silent
-                worker = reg.get_or_create("sess-same", "/ws", created_by="alice")
+            # Second call — same contributor, must be silent
+            worker = reg.get_or_create("sess-same", "/ws", created_by="alice")
 
         error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
         assert error_records == [], (
@@ -2105,30 +2105,28 @@ class TestSessionOwnershipInvariant:
 
         reg = SessionRegistry()
 
-        with caplog.at_level(logging.ERROR, logger="context_intelligence_server"):
-            with (
-                patch(
-                    "context_intelligence_server.registry.Neo4jGraphStore"
-                ) as MockStore,
-                patch(
-                    "context_intelligence_server.registry.AsyncDiskBlobStore"
-                ) as MockBlob,
-                patch(
-                    "context_intelligence_server.registry.HookStateService"
-                ) as MockService,
-            ):
-                MockStore.return_value = MagicMock()
-                MockBlob.return_value = MagicMock()
-                mock_svc = MagicMock()
-                MockService.return_value = mock_svc
-                reg.start_drain = MagicMock()
+        with (
+            caplog.at_level(logging.ERROR, logger="context_intelligence_server"),
+            patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
+            patch(
+                "context_intelligence_server.registry.AsyncDiskBlobStore"
+            ) as MockBlob,
+            patch(
+                "context_intelligence_server.registry.HookStateService"
+            ) as MockService,
+        ):
+            MockStore.return_value = MagicMock()
+            MockBlob.return_value = MagicMock()
+            mock_svc = MagicMock()
+            MockService.return_value = mock_svc
+            reg.start_drain = MagicMock()
 
-                # First call — creates the worker bound to "alice"
-                reg.get_or_create("sess-none", "/ws", created_by="alice")
-                mock_svc.graph.created_by = "alice"
+            # First call — creates the worker bound to "alice"
+            reg.get_or_create("sess-none", "/ws", created_by="alice")
+            mock_svc.graph.created_by = "alice"
 
-                # Second call — created_by=None must never trigger the guard
-                worker = reg.get_or_create("sess-none", "/ws", created_by=None)
+            # Second call — created_by=None must never trigger the guard
+            worker = reg.get_or_create("sess-none", "/ws", created_by=None)
 
         error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
         assert error_records == [], (
@@ -2146,30 +2144,28 @@ class TestSessionOwnershipInvariant:
 
         reg = SessionRegistry()
 
-        with caplog.at_level(logging.ERROR, logger="context_intelligence_server"):
-            with (
-                patch(
-                    "context_intelligence_server.registry.Neo4jGraphStore"
-                ) as MockStore,
-                patch(
-                    "context_intelligence_server.registry.AsyncDiskBlobStore"
-                ) as MockBlob,
-                patch(
-                    "context_intelligence_server.registry.HookStateService"
-                ) as MockService,
-            ):
-                MockStore.return_value = MagicMock()
-                MockBlob.return_value = MagicMock()
-                mock_svc = MagicMock()
-                MockService.return_value = mock_svc
-                reg.start_drain = MagicMock()
+        with (
+            caplog.at_level(logging.ERROR, logger="context_intelligence_server"),
+            patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
+            patch(
+                "context_intelligence_server.registry.AsyncDiskBlobStore"
+            ) as MockBlob,
+            patch(
+                "context_intelligence_server.registry.HookStateService"
+            ) as MockService,
+        ):
+            MockStore.return_value = MagicMock()
+            MockBlob.return_value = MagicMock()
+            mock_svc = MagicMock()
+            MockService.return_value = mock_svc
+            reg.start_drain = MagicMock()
 
-                # First call — creates the worker bound to "alice"
-                reg.get_or_create("sess-conflict", "/ws", created_by="alice")
-                mock_svc.graph.created_by = "alice"
+            # First call — creates the worker bound to "alice"
+            reg.get_or_create("sess-conflict", "/ws", created_by="alice")
+            mock_svc.graph.created_by = "alice"
 
-                # Second call — conflicting contributor "bob" arrives
-                worker = reg.get_or_create("sess-conflict", "/ws", created_by="bob")
+            # Second call — conflicting contributor "bob" arrives
+            worker = reg.get_or_create("sess-conflict", "/ws", created_by="bob")
 
         # 1. An ERROR record must have been emitted
         error_records = [r for r in caplog.records if r.levelno == logging.ERROR]

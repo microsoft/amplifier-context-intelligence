@@ -17,11 +17,29 @@ from context_intelligence_server.graph_store import GraphStore, QueryableStore
 
 
 class MinimalGraphStore:
-    """Conforming implementation of GraphStore with all required members."""
+    """Conforming implementation of GraphStore with all required members.
+
+    The Protocol declares a settable ``workspace`` and a ``created_by``
+    getter/setter -- both required for a real isinstance() conformance
+    check to pass, so this fixture must carry them too (a
+    runtime_checkable Protocol only checks attribute PRESENCE).
+    """
 
     @property
     def workspace(self) -> str:
         return "test-workspace"
+
+    @workspace.setter
+    def workspace(self, value: str) -> None:
+        pass
+
+    @property
+    def created_by(self) -> str | None:
+        return None
+
+    @created_by.setter
+    def created_by(self, value: str | None) -> None:
+        pass
 
     async def upsert_node(self, node_id: str, data: dict[str, Any]) -> None:
         pass
@@ -76,11 +94,26 @@ class MissingUpsertNode:
 
 
 class MinimalQueryableStore:
-    """Conforming implementation of QueryableStore with all required members."""
+    """Conforming implementation of QueryableStore with all required members.
+
+    See MinimalGraphStore's docstring.
+    """
 
     @property
     def workspace(self) -> str:
         return "test-workspace"
+
+    @workspace.setter
+    def workspace(self, value: str) -> None:
+        pass
+
+    @property
+    def created_by(self) -> str | None:
+        return None
+
+    @created_by.setter
+    def created_by(self, value: str | None) -> None:
+        pass
 
     @property
     def supported_dialects(self) -> frozenset[str]:
