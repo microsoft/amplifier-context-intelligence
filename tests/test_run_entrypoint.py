@@ -7,7 +7,7 @@ import pytest
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.main import run
 from gunicorn.app.base import BaseApplication
-from uvicorn.workers import UvicornWorker
+from uvicorn_worker import UvicornWorker
 
 
 def test_run_uses_gunicorn_with_settings() -> None:
