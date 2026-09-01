@@ -348,3 +348,37 @@ async def test_write_replaces_atomically_on_success(
     assert final_path.read_text(encoding="utf-8") == '{"v": 1}'
     # No leftover temp files.
     assert list(final_path.parent.glob("*.tmp")) == []
+
+
+# ---------------------------------------------------------------------------
+# delete_session
+# ---------------------------------------------------------------------------
+
+
+async def test_delete_session_removes_all_blobs(store: AsyncDiskBlobStore) -> None:
+    """delete_session removes every blob and returns the count."""
+    await store.write("sess-del", "k1", {"v": 1})
+    await store.write("sess-del", "k2", {"v": 2})
+
+    removed = await store.delete_session("sess-del")
+
+    assert removed == 2
+    assert await store.list("sess-del") == []
+
+
+async def test_delete_session_missing_is_noop(store: AsyncDiskBlobStore) -> None:
+    """Deleting a session with no blobs returns 0 and does not raise."""
+    assert await store.delete_session("never-existed") == 0
+
+
+async def test_delete_session_isolates_other_sessions(
+    store: AsyncDiskBlobStore,
+) -> None:
+    """Deleting one session leaves other sessions' blobs intact."""
+    await store.write("sess-a", "k1", {"v": 1})
+    await store.write("sess-b", "k1", {"v": 1})
+
+    await store.delete_session("sess-a")
+
+    assert await store.list("sess-a") == []
+    assert await store.list("sess-b") == ["ci-blob://sess-b/k1"]
