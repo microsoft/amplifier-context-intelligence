@@ -1199,31 +1199,48 @@ class TestM2ServiceBranch:
         assert "Ambiguous" in err.reason
 
     def test_b1b_no_scp_no_idtyp_service_admitted(self) -> None:
-        """B1-b: no scp, no idtyp, roles=["Contributor"], appid → service admitted."""
+        """B1-b: no scp, no idtyp, roles=["Contributor"], mapped oid → service admitted.
+
+        Created_by now comes from the service map (never appid fallback),
+        so this resolver is built with a service_map hit for FAKE_SERVICE_OID.
+        """
         claims = _service_claims(roles=["Contributor"], appid=FAKE_APPID)
-        cid, roles, is_service = self._resolve_service(claims)
-        assert cid == FAKE_APPID
+        resolver = _make_service_resolver(
+            service_map={FAKE_SERVICE_OID.lower(): FAKE_SERVICE_CONTRIBUTOR}
+        )
+        cid, roles, is_service = self._resolve_service(claims, resolver=resolver)
+        assert cid == FAKE_SERVICE_CONTRIBUTOR
         assert roles == ["Contributor"]
         assert is_service is True
 
     # -- B2: idtyp normalization ---------------------------------------------
 
     def test_b2a_idtyp_mixed_case_space_service_branch(self) -> None:
-        """B2-a: idtyp=" App " (mixed case+space) → normalized "app"; service branch admitted."""
+        """B2-a: idtyp=" App " (mixed case+space) → normalized "app"; service branch admitted.
+
+        Uses a mapped resolver since an unmapped oid now 403s outright.
+        """
         claims = _service_claims(roles=["Reader"])
         claims["idtyp"] = " App "  # mixed case + surrounding whitespace
         # has_scp=False → B1 check is False → service branch
-        cid, roles, is_service = self._resolve_service(
-            claims, resolver=_make_service_resolver()
+        resolver = _make_service_resolver(
+            service_map={FAKE_SERVICE_OID.lower(): FAKE_SERVICE_CONTRIBUTOR}
         )
+        cid, roles, is_service = self._resolve_service(claims, resolver=resolver)
         assert is_service is True
         assert roles == ["Reader"]
 
     def test_b2b_idtyp_int_normalized_to_empty(self) -> None:
-        """B2-b: idtyp=123 (int) → normalized to ""; service branch; admit/deny by roles."""
+        """B2-b: idtyp=123 (int) → normalized to ""; service branch; admit/deny by roles.
+
+        Uses a mapped resolver since an unmapped oid now 403s outright.
+        """
         claims = _service_claims(roles=["Contributor"])
         claims["idtyp"] = 123  # int, not str → normalized to ""
-        cid, roles, is_service = self._resolve_service(claims)
+        resolver = _make_service_resolver(
+            service_map={FAKE_SERVICE_OID.lower(): FAKE_SERVICE_CONTRIBUTOR}
+        )
+        cid, roles, is_service = self._resolve_service(claims, resolver=resolver)
         assert is_service is True
         assert roles == ["Contributor"]
 
@@ -1243,33 +1260,41 @@ class TestM2ServiceBranch:
         assert cid == FAKE_SERVICE_CONTRIBUTOR
         assert is_service is True
 
-    def test_b6b_blank_appid_falls_through_to_azp(self) -> None:
-        """B6-b: map miss, appid blank → falls through to azp → created_by = azp."""
+    def test_b6b_unmapped_oid_blank_appid_raises_403(self) -> None:
+        """B6-b: map miss + blank appid → AuthError(403) naming the oid.
+
+        Never falls through to azp -- fail-loud, not a fallback chain.
+        """
         claims = _service_claims(
             oid=FAKE_SERVICE_OID,
-            appid="  ",  # blank — skipped by _first_nonblank
+            appid="  ",  # blank
             azp=FAKE_AZP,
             roles=["Reader"],
         )
-        cid, _, _ = self._resolve_service(claims)
-        assert cid == FAKE_AZP
+        err = self._resolve_raises(claims)
+        assert err.status_code == 403
+        assert FAKE_SERVICE_OID.lower() in err.reason.lower()
+        assert FAKE_AZP not in err.reason, "azp must never appear as created_by"
 
-    def test_b6c_oid_last_resort(self) -> None:
-        """B6-c: map miss, no appid, no azp → created_by = oid (last resort)."""
+    def test_b6c_unmapped_oid_no_appid_no_azp_raises_403(self) -> None:
+        """B6-c: map miss, no appid, no azp → AuthError(403) naming the oid.
+
+        Never falls back to using oid itself as created_by -- fail-loud.
+        """
         claims = _service_claims(oid=FAKE_SERVICE_OID, roles=["Contributor"])
         # No appid, no azp in claims
-        cid, _, is_service = self._resolve_service(claims)
-        assert cid == FAKE_SERVICE_OID
-        assert is_service is True
+        err = self._resolve_raises(claims)
+        assert err.status_code == 403
+        assert FAKE_SERVICE_OID.lower() in err.reason.lower()
 
     # -- B8: anti-spoof — app_displayname must never be used -----------------
 
     def test_b8_anti_spoof_app_displayname_not_used(self) -> None:
-        """B8: app_displayname="alice@contoso.com" (a human UPN) → created_by = appid, NOT display name.
+        """B8: unmapped oid + app_displayname (a human UPN) → AuthError(403).
 
-        app_displayname is operator-mutable in Entra (spoofable).  It is deliberately
-        excluded from the derivation chain.  A service whose app_displayname happens
-        to look like a human UPN must never inherit that UPN as its created_by.
+        app_displayname is operator-mutable in Entra (spoofable) and was never
+        part of the derivation; an unmapped service oid is now rejected outright
+        (never falls back to appid, azp, oid, or app_displayname).
         """
         claims = _service_claims(
             oid=FAKE_SERVICE_OID,
@@ -1277,10 +1302,10 @@ class TestM2ServiceBranch:
             roles=["Contributor"],
         )
         claims["app_displayname"] = "alice@contoso.com"  # human-looking display name
-        cid, _, _ = self._resolve_service(claims)
-        assert cid == FAKE_APPID, "created_by must be appid, not app_displayname"
-        assert cid != "alice@contoso.com", (
-            "app_displayname must never become created_by"
+        err = self._resolve_raises(claims)
+        assert err.status_code == 403
+        assert "alice@contoso.com" not in err.reason, (
+            "app_displayname must never appear as created_by (or in the 403)"
         )
 
     # -- B7: aud / iss enforced in shared validation (no new code) -----------
@@ -1342,9 +1367,16 @@ class TestM2ServiceBranch:
         assert err.status_code == 403
 
     def test_rg_reader_admitted(self) -> None:
-        """RG-reader: service token, roles=["Reader"] → admitted (…, ["Reader"], True)."""
+        """RG-reader: service token, roles=["Reader"] → admitted (…, ["Reader"], True).
+
+        Uses a mapped resolver since an unmapped oid now 403s outright
+        (this test's purpose is the role gate, not created_by derivation).
+        """
         claims = _service_claims(roles=["Reader"], appid=FAKE_APPID)
-        cid, roles, is_service = self._resolve_service(claims)
+        resolver = _make_service_resolver(
+            service_map={FAKE_SERVICE_OID.lower(): FAKE_SERVICE_CONTRIBUTOR}
+        )
+        cid, roles, is_service = self._resolve_service(claims, resolver=resolver)
         assert is_service is True
         assert "Reader" in roles
 
@@ -1361,9 +1393,16 @@ class TestM2ServiceBranch:
     # -- SV-ADM: service IdentityAdmin path ----------------------------------
 
     def test_sv_adm_identity_admin_admitted(self) -> None:
-        """SV-ADM: service token with IdentityAdmin role admitted; (…, ["IdentityAdmin"], True)."""
+        """SV-ADM: service token with IdentityAdmin role admitted; (…, ["IdentityAdmin"], True).
+
+        Uses a mapped resolver since an unmapped oid now 403s outright
+        (this test's purpose is the role gate, not created_by derivation).
+        """
         claims = _service_claims(roles=["IdentityAdmin"], appid=FAKE_APPID)
-        cid, roles, is_service = self._resolve_service(claims)
+        resolver = _make_service_resolver(
+            service_map={FAKE_SERVICE_OID.lower(): FAKE_SERVICE_CONTRIBUTOR}
+        )
+        cid, roles, is_service = self._resolve_service(claims, resolver=resolver)
         assert is_service is True
         assert "IdentityAdmin" in roles
 

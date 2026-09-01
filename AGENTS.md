@@ -320,25 +320,30 @@ Auth model facts (the canonical statement of "which tokens are accepted" lives i
     `oid` → contributor via `entra_identities`. *Unchanged.*
   - **Service (app / managed-identity)** — `scp` absent: authorized by an Entra
     **App Role** alone — `Contributor` (write+read) or `Reader` (read-only:
-    `POST /cypher`, `GET /blobs/*`). `created_by` = `service_identities[oid]` if
-    mapped, else the stable `appid`. App-only / MI tokens (which carry `roles`,
-    not `scp`) **are now accepted** on this path.
+    `POST /cypher`, `GET /blobs/*`). `created_by` = the contributor id mapped
+    for `oid` in the **shared identity store** (same store `entra_identities`
+    uses; service records just carry `type: "service"`). A service
+    `oid` with no mapping is **403** (fail-loud, names the principal) —
+    `created_by` is **never** `appid`/`azp`/`oid`/display name. App-only / MI
+    tokens (which carry `roles`, not `scp`) **are now accepted** on this path.
   - `scp` + `idtyp=="app"` → 401 (ambiguous, fail-closed).
 - The matched `created_by` surfaces on graph nodes — same provenance path as static
   mode.
 - Config fields: required for boot — `azure_client_id`, `azure_tenant_id`,
-  `entra_identities`. Optional service-path — `service_identities` (friendly
-  `created_by` map, **not** an auth gate, **no runtime CRUD** — config + redeploy),
+  `entra_identities`. Optional service-path — `service_identities` (a
+  **first-boot-only seed** into the same shared identity store, tagged
+  `type: "service"`; may be empty — service oids are onboarded/removed at
+  runtime via `/admin/identities`, no redeploy needed),
   `service_data_role` (default `Contributor`), `reader_role` (default `Reader`).
   Env prefix `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_`.
 - **Fail-closed:** misconfig (missing field / empty or malformed `entra_identities`)
   is a HARD startup error. `allow_unauthenticated` defaults to `false`; a server
   with no auth configured refuses to start.
 - **401** = bad/expired/wrong-audience/missing/ambiguous token; **403** = valid
-  token lacking authorization — a user whose `oid` is unmapped, or a service token
-  with no qualifying App Role (the 403 body names the principal + required roles).
-  **Behavior change (M2):** a token with no `scp` and no qualifying role now returns
-  **403** (was **401**).
+  token lacking authorization — a user or service principal whose `oid` is
+  unmapped, or a service token with no qualifying App Role (the 403 body names
+  the principal + reason/required roles). **Behavior change (M2):** a token
+  with no `scp` and no qualifying role now returns **403** (was **401**).
 
 > 🔒 **Secret hygiene — NO real identifiers in this product repo.** An `oid` is a
 > persistent personal identifier (PII). Never commit real oids, client IDs, or
@@ -357,6 +362,10 @@ Both auth modes can add/remove identities **at runtime, no restart**, via the
   resolver holds the dict **by reference**, so a `/admin` `PUT`/`DELETE` is visible
   on the next request. **No cache, no TTL** — safe because the pilot runs a
   **single replica** (the in-process map is the source of truth).
+- `entra_identities_store_path` backs **both** user and service identities —
+  one shared store, disjoint oid space. There is deliberately no
+  separate `/admin/services` endpoint; service identities are managed through
+  `PUT`/`DELETE`/`GET /admin/identities` with `type: "service"`.
 - `IdentityStore` (`identity_store.py`) commits **write-file-then-swap-memory**
   (atomic file replace first, then memory) and **fails closed** on a corrupt file
   (empty map + loud log, never a crash-loop).

@@ -498,6 +498,50 @@ class TestT3EntraWiring:
 
         assert middleware.resolver._identity_map is store.flat_dict  # type: ignore[union-attr]
 
+    def test_service_oid_seeded_and_resolves_via_shared_flat_dict(
+        self, tmp_path: Path
+    ) -> None:
+        """A service oid seeded from config lands in the SAME store/flat_dict.
+
+        One IdentityStore serves both user and service oids (disjoint key
+        spaces). The resolver's ``_identity_map`` and ``_service_identity_map``
+        are literally the SAME dict object as ``store.flat_dict`` -- no
+        separate service map, no separate store.
+        """
+        from context_intelligence_server.config import Settings  # noqa: PLC0415
+        from context_intelligence_server.main import (  # noqa: PLC0415
+            create_asgi_app,
+            get_entra_identity_store,
+        )
+
+        service_oid = "cccccccc-dddd-eeee-ffff-000011112222"
+        service_contributor = "my-automation-service"
+
+        settings = Settings(
+            auth_mode="entra",
+            azure_client_id=FAKE_CLIENT_ID,
+            azure_tenant_id=FAKE_TENANT_ID,
+            entra_identities={FAKE_OID: {"id": FAKE_CONTRIBUTOR_ENTRA}},
+            service_identities={service_oid: {"id": service_contributor}},
+            entra_identities_store_path=str(tmp_path / "entra-identities.json"),
+            api_keys_store_path=str(tmp_path / "api-keys.json"),
+        )
+
+        middleware = create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+        store = get_entra_identity_store()
+        assert store is not None
+
+        # Both the user oid and the service oid landed in the ONE store.
+        assert store.flat_dict[FAKE_OID] == FAKE_CONTRIBUTOR_ENTRA
+        assert store.flat_dict[service_oid] == service_contributor
+
+        # The resolver's user map, service map, and the store's flat_dict are
+        # all the SAME object -- a live admin PUT is visible to either path.
+        assert middleware.resolver._identity_map is store.flat_dict  # type: ignore[union-attr]
+        assert (
+            middleware.resolver._service_identity_map is store.flat_dict  # type: ignore[union-attr]
+        )
+
 
 # ===========================================================================
 # T3: Mode-specific accessors

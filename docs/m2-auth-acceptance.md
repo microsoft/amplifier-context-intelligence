@@ -12,6 +12,19 @@
 > token (no `idtyp`/`appidacr` emitted) — see §6. The offline synthetic-token
 > unit tests remain the fast regression layer.
 
+> **Superseded by the service-identity alignment change.** The resolver's `created_by` **fallback chain
+> described below no longer exists**: `service_identities[oid] → appid → azp
+> → oid` has been replaced by a single lookup into the shared identity store
+> (the same store `entra_identities` uses) — a role-bearing service token
+> whose `oid` isn't mapped is now **403**, never attributed under `appid`/
+> `azp`/`oid`. The "green on 2026-06-30" evidence above remains valid
+> historical proof that a real app-only token has the claim shape
+> `EntraResolver` expects; it does **not** re-validate `created_by`
+> derivation, since that assertion (STEP A.1 #4, STEP B) targeted the
+> now-removed fallback. Re-running this gate after this change requires the test
+> caller's `oid` to be pre-mapped (`service_identities` seed or
+> `PUT /admin/identities`, `type=service`) — see the inline notes below.
+
 > **Secret hygiene.** This document uses **placeholder** identifiers only.
 > Never commit real client IDs, tenant IDs, or object IDs to this repo — see
 > the PII warning in [`entra-auth-setup.md`](entra-auth-setup.md).
@@ -29,8 +42,10 @@ Team Pulse precedent (`auth.py` docstring), **not** from having seen one:
   user branch).
 - `roles` carries the App Role assignment as a list of strings (never
   `groups`).
-- `appid` / `azp` are present and stable, usable as a `created_by` fallback
-  when no `service_identities` mapping exists.
+- `appid` / `azp` are present and stable claims on the token — **superseded by
+  the service-identity alignment change**: neither is ever used for `created_by` any more. The resolver
+  requires the token's `oid` to be mapped in the shared identity store and
+  returns 403 otherwise (see the note at the top of this document).
 - `idtyp == "app"` is *sometimes* present (only actually checked by the
   resolver in the `[B1]` ambiguous-token case — when `scp` is unexpectedly
   also present).
@@ -244,8 +259,13 @@ fine):
    present.
 3. `roles` contains at least one of the server's configured App Roles
    (`Contributor` / `Reader` / `IdentityAdmin`, or your overrides from §3.5).
-4. `appid` or `azp` is present (the resolver's `created_by` fallback chain
-   needs one of these before it would fall back to bare `oid`).
+4. *(historical assertion, now superseded)* `appid` or `azp` is present — this
+   targeted the old `created_by` fallback chain, which no longer exists (see
+   the note at the top of this document). It no longer gates anything in the
+   resolver; the real requirement now is that the token's `oid` is
+   mapped in the shared identity store (`service_identities` seed, or
+   `PUT /admin/identities` with `type=service`) — otherwise STEP A.2 now
+   fails with 403.
 
 A redacted claim summary is always printed (`aud`, `iss`, `tid`, `scp`
 presence, `idtyp`, `appidacr`, `roles`, `appid`, `azp`, and a truncated
@@ -272,9 +292,14 @@ or wrong. If it fails with a 401, re-check the federated credential subject
 
 Only runs when `ACCEPTANCE_SERVER_URL` is set:
 
-- `POST /events` with the real token → asserts **HTTP 202**.
+- `POST /events` with the real token → asserts **HTTP 202**. **This now
+  requires the caller's `oid` to already be mapped** in the shared
+  identity store (`service_identities` seed or `PUT /admin/identities`,
+  `type=service`) — an unmapped oid gets **403** here instead of 202.
 - Polls `POST /cypher` (best-effort, ~30s) for a node with
-  `created_by == appid` under the probe's `session_id`. **This match
+  `created_by == <mapped contributor id>` under the probe's `session_id`
+  *(previously this checked `created_by == appid`; that fallback no longer
+  exists — see the note at the top of this document)*. **This match
   pattern is a best guess at the live graph schema** — the event pipeline
   is persist-then-202 (async drain to Neo4j), so this is inherently a
   polling check, not an immediate read. A failure here is a warning, not a
@@ -344,6 +369,11 @@ A green run is only useful if it is auditable. Attach to the PR:
 > stricter than the resolver) was therefore **deliberately broadened** to
 > accept `scp`-absent + (`appid` | `azp`) as a valid app-only signal. The
 > pre-run uncertainties below are retained for history.
+>
+> **Note:** the `azp = <present> created_by source ✓` line above reflects
+> historical behavior — `azp` fed the old fallback chain. `created_by`
+> now comes solely from the shared identity store's mapped contributor id; `azp`
+> is no longer read for this purpose.
 
 We have never seen a real Microsoft Entra app-only access token from this
 tenant, only Microsoft's general documentation and the Team Pulse mirror
@@ -376,9 +406,10 @@ first reading the printed claim summary and the resolver's actual error.
 ## 7. Reference — accurate to the code
 
 - Resolver under test: `context_intelligence_server/auth.py` —
-  `EntraResolver.resolve()`, the `scp`/`idtyp` discriminator, the
-  `created_by` fallback chain (`service_identities[oid]` → `appid` →
-  `azp` → `oid`).
+  `EntraResolver.resolve()`, the `scp`/`idtyp` discriminator, and
+  `created_by` resolution via the shared identity store lookup (`oid` →
+  mapped contributor id; unmapped → 403 — no more `appid`/`azp`/`oid`
+  fallback chain).
 - Config fields referenced: `context_intelligence_server/config.py` —
   `azure_client_id`, `azure_tenant_id`, `service_data_role`, `reader_role`,
   `entra_admin_role`.

@@ -72,7 +72,7 @@ validation (signature / audience / issuer / `tid`, below), a single
 | Token shape | Path | How it is authorized | `created_by` |
 |---|---|---|---|
 | **`scp` present** (and `idtyp != "app"`) | **User (delegated)** — *unchanged* | `scp` must contain `access_as_user`; then `oid` → `entra_identities` map | the mapped contributor `id` |
-| **`scp` absent** | **Service (app / daemon / managed-identity)** — *new* | an **App Role** alone: `roles` must contain `Contributor`, `Reader`, or `IdentityAdmin` | `service_identities[oid]` if mapped, else the stable `appid` |
+| **`scp` absent** | **Service (app / daemon / managed-identity)** — *new* | an **App Role** alone: `roles` must contain `Contributor`, `Reader`, or `IdentityAdmin` | the mapped contributor `id` for `oid` in the **shared identity store** (same store `entra_identities` uses); unmapped `oid` → **403** |
 | **`scp` present *and* `idtyp == "app"`** | — | anomalous (no legitimate Entra token is both) → **401**, fail-closed | — |
 
 - **User path — delegated, byte-for-byte unchanged.** A token Entra issues **in
@@ -95,12 +95,22 @@ validation (signature / audience / issuer / `tid`, below), a single
   assignment **is** the authorization decision — there is no server-side
   allow-list of service principals and no pre-registration step.
 
-> **`service_identities` is *not* an auth gate.** It is an **optional, static**
-> `oid → {id: <contributor>}` map (env/YAML, same shape as `entra_identities`)
-> that only supplies a **friendly `created_by` name**. An unmapped but
-> role-bearing service is fully authorized; its `created_by` simply falls back to
-> the stable `appid`. There is **no** runtime `/admin/services` endpoint — service
-> identities change only by editing config and redeploying.
+  A role-bearing service token whose `oid` is **not** in the identity store is
+  **also a 403** (fail-loud, naming the rejected principal) — mirroring the
+  user path. `created_by` is **never** derived from `appid`/`azp`/`oid`/display
+  name; the mapped contributor `id` is the only valid value.
+
+> **`service_identities` is a config *seed*, not the runtime source of truth.**
+> Service (and user) identities both live in the **same durable `IdentityStore`**
+> (one shared JSON file, `entra_identities_store_path`), each record tagged
+> `type: "user"` or `type: "service"` (default `"user"`). `service_identities`
+> (env/YAML, same shape as `entra_identities`) only **seeds** that store on
+> **first boot** — it may be empty (bootstrap). After boot, service identities
+> are added/removed/listed at runtime through the **same** `/admin/identities`
+> endpoint `entra_identities` uses, passing `type=service` — there is
+> deliberately **no separate** `/admin/services` endpoint. An unmapped
+> role-bearing service is **not** authorized: it gets a 403, not a fallback
+> `created_by`.
 
 > **Tenant policy note.** In a locked-down tenant that blocks client secrets,
 > service callers must obtain tokens via **Managed Identity** or **federated
@@ -151,18 +161,21 @@ discriminator (see the model table above):
 | User | Scope (`scp`) | must contain **`access_as_user`** | `"access_as_user" in scp.split()` |
 | User | Object ID (`oid`) | looked up in `entra_identities` → `created_by` | `identity_map[oid.lower()]` |
 | Service | App Role (`roles`) | must contain `Contributor`, `Reader`, **or** `IdentityAdmin` | `service_data_role`/`reader_role`/`entra_admin_role in roles` |
-| Service | Identity (`created_by`) | `service_identities[oid]` if mapped, else `appid` (never `app_displayname`) | truthiness chain |
+| Service | Identity (`created_by`) | mapped contributor `id` for `oid` in the shared identity store; unmapped → **403** | `identity_map[oid.lower()]` (never `appid`/`azp`/`oid`/`app_displayname`) |
 
 A valid **user** token whose `oid` is **not** in the map is a **403** (identity
 unbound). A valid **service** token with **no** qualifying App Role is a **403**
-(named principal + required roles). Any other failure is a **401**.
+(named principal + required roles); a role-bearing service token whose `oid`
+is **not** in the identity store is **also a 403** (named principal). Any
+other failure is a **401**.
 
-> **`created_by` legend — a GUID means a machine.** When `created_by` is a **GUID**
-> it is an **`appid`** (a service principal's application ID) — i.e. a **machine**
-> identity, resolvable in Entra by that app id. A **friendly** `created_by` name
-> appears only when the service's `oid` is present in the optional
-> `service_identities` map. (Delegated **users** always resolve to the friendly
-> contributor `id` from `entra_identities`.)
+> **`created_by` legend — always a contributor id, never a machine claim.**
+> Both paths resolve `created_by` the same way: `oid` → the shared identity
+> store → a friendly contributor `id`. There is no fallback to `appid`, `azp`,
+> raw `oid`, or `app_displayname` for either users or services — an unmapped
+> `oid` is unauthorized (403), not attributed under a machine identifier. Seed
+> service identities via `service_identities`, or manage them at runtime via
+> `PUT /admin/identities` with `type: "service"`.
 
 ### Admin authority and service roles — the `roles` claim
 
@@ -261,19 +274,21 @@ otherwise — see §2.5):
 | Identity map | `entra_identities` | `ENTRA_IDENTITIES` (JSON) | `oid → {id: <contributor>}` (the **user** path) |
 
 These four boot the **user** path. The **service** path needs **no required
-settings** — it works out of the box once an App Role is assigned in Entra. Its
-settings are all **optional** and have working defaults:
+config fields to boot**, but a service caller also needs its `oid` mapped in
+the identity store (seeded from `service_identities`, or added later via
+`/admin/identities`) — an App Role alone is no longer sufficient. Its
+settings are all **optional at boot** and have working defaults:
 
 | Field | YAML key | Env var (`AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_` + …) | Default | Meaning |
 |---|---|---|---|---|
 | Service data role | `service_data_role` | `SERVICE_DATA_ROLE` | `Contributor` | App Role granting service **write + read**. `""`/`null` disables it. |
 | Reader role | `reader_role` | `READER_ROLE` | `Reader` | App Role granting service **read-only** (`POST /cypher`, `GET /blobs/*`). `""`/`null` disables it. |
-| Service identities | `service_identities` | `SERVICE_IDENTITIES` (JSON) | *(unset)* | **Optional** `oid → {id: <contributor>}` map — a friendly `created_by` override only, **not** an auth gate. Unmapped services still authorize (via App Role); their `created_by` falls back to `appid`. No runtime CRUD — edit config and redeploy. |
+| Service identities | `service_identities` | `SERVICE_IDENTITIES` (JSON) | *(unset)* | **First-boot seed only**, `oid → {id: <contributor>}` — seeds the mapped contributor `id` into the same shared identity store `entra_identities` uses (tagged `type: "service"`). **Not itself an auth gate** (the App Role check gates authorization), but **is now required for attribution**: a role-bearing service whose `oid` isn't mapped gets **403**, never a fallback `created_by`. May be empty/omitted; add mappings later via `/admin/identities` (`type=service`), no redeploy. |
 
 > `service_identities` is validated with the **same** GUID-key / non-empty-`id`
-> rules as `entra_identities`, but it is **never** required for boot and never
-> participates in the entra startup validator. Omit it entirely if you don't need
-> friendly machine names.
+> rules as `entra_identities`, and — like `entra_identities` — an explicit
+> empty map is accepted (bootstrap on a fresh `/data` volume). Omit it, or
+> leave it empty, and onboard service identities at runtime instead.
 
 ### 2.2 YAML config
 
@@ -534,6 +549,7 @@ the service path instead, where the question is App Roles, not scope.
 | **401** | both | **Token problem.** Missing / expired / wrong audience / wrong tenant / missing `oid`; or a **user** token whose `scp` lacks `access_as_user`; or an **ambiguous** token (`scp` *and* `idtyp=="app"`). | Re-acquire the token (§3.3). Confirm `--resource api://<AZURE_CLIENT_ID>`. |
 | **403** | user | **Identity not bound.** Your delegated token is valid, but your `oid` isn't in the operator's map. The body names your oid. | Send your oid (§3.2) to the operator to be added (§2.6). |
 | **403** | service | **No qualifying App Role.** Your app/service token is valid, but its `roles` has none of `Contributor`/`Reader`/`IdentityAdmin`. The body names your `appid`/`oid` and the required roles. | Have an admin assign the App Role in Entra ([service callers](identity-management.md#service-callers-entra-app-tokens)). |
+| **403** | service | **Identity not bound.** Your app/service token has a qualifying App Role, but its `oid` isn't in the shared identity store (`entra_identities`/`service_identities`). The body names your oid. | Send your oid to the operator to add via `service_identities` or `PUT /admin/identities` (`type=service`; §2.6 / [identity-management.md](identity-management.md)). |
 
 > **Behavior change (M2): 401 → 403 for role-less app tokens.** Before M2, an
 > app-only token (with `roles`, no `scp`) failed the `access_as_user` check and
@@ -626,8 +642,10 @@ legibly instead of as a bare `Invalid isoformat string: ''`.
   - **User** (`scp` present): `scp` must contain `access_as_user`, `oid` →
     contributor; **403** when the `oid` is unbound.
   - **Service** (`scp` absent): `roles` must contain `Contributor`/`Reader`/
-    `IdentityAdmin`; `created_by` = `service_identities[oid]` → `appid` → `azp` →
-    `oid` (never `app_displayname`); **403** when no qualifying role.
+    `IdentityAdmin`; `created_by` = the shared identity store's mapped
+    contributor `id` for `oid` (never `appid`/`azp`/`oid`/`app_displayname`);
+    **403** when no qualifying role, **or** when the role-bearing `oid` is
+    unmapped.
   - `scp` + `idtyp=="app"` → **401** (ambiguous, fail-closed).
   - **401** otherwise = invalid/expired/missing/wrong-audience/wrong-tenant token.
 - Per-route capability gates: `context_intelligence_server/authz.py`

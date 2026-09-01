@@ -829,7 +829,8 @@ class TestValidateEntraIdentities:
         (Previously: raised ValidationError 'at least one entry'. The empty map
         is now accepted via allow_empty=True so the server boots on a fresh
         /data volume and is populated at runtime via PUT /admin/identities.
-        service_identities={} still raises — see the service-identities suite.)
+        service_identities={} is ALSO now accepted — see
+        test_empty_dict_accepted in the service-identities suite.)
         """
         from context_intelligence_server.config import Settings
 
@@ -1520,14 +1521,18 @@ class TestServiceIdentitiesValidator:
         s = Settings()
         assert s.service_identities is None
 
-    def test_empty_dict_raises(self) -> None:
-        """service_identities={} is a misconfiguration (fail-closed, mirrors entra_identities)."""
-        from pydantic import ValidationError
+    def test_empty_dict_accepted(self) -> None:
+        """service_identities={} is a SUPPORTED bootstrap state (mirrors entra_identities).
 
+        Previously: raised ValidationError 'at least one entry'. allow_empty=True
+        now accepts an explicit empty map so the server boots on a fresh /data
+        volume and service identities are onboarded at runtime via the same
+        /admin/identities endpoint entra_identities uses.
+        """
         from context_intelligence_server.config import Settings
 
-        with pytest.raises(ValidationError, match="at least one entry"):
-            Settings(service_identities={})
+        s = Settings(service_identities={})
+        assert s.service_identities == {}
 
     def test_non_guid_key_raises(self) -> None:
         """Non-GUID key raises ValidationError."""
@@ -1729,8 +1734,8 @@ class TestM2RegressionEntraIdentities:
         """entra_identities={} is now a SUPPORTED bootstrap state — returns {}.
 
         (Previously: raised ValidationError 'at least one entry'. allow_empty=True
-        is passed ONLY for entra_identities; service_identities={} still raises —
-        see test_service_identities_empty_dict_raises.)
+        is now passed for BOTH entra_identities and service_identities —
+        see test_empty_dict_accepted.)
         """
         from context_intelligence_server.config import Settings
 

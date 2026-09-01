@@ -13,9 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-
 from context_intelligence_server.identity_store import IdentityStore
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -27,11 +25,14 @@ FAKE_OID = "11111111-1111-1111-1111-111111111111"
 
 
 def _alice_entry() -> dict[str, str]:
-    return {"id": "alice"}
+    """A normalized record -- the store's record contract guarantees "type"
+    is always present (identity_store._normalize_record), so the expected
+    shape used throughout these tests includes it explicitly."""
+    return {"id": "alice", "type": "user"}
 
 
 def _bob_entry() -> dict[str, str]:
-    return {"id": "bob", "display_name": "Bob Smith"}
+    return {"id": "bob", "display_name": "Bob Smith", "type": "user"}
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +101,7 @@ class TestPutGetRoundtrip:
         store.put(FAKE_HASH_A, _alice_entry())
         store.put(FAKE_HASH_A, {"id": "alice-updated"})
 
-        assert store.get(FAKE_HASH_A) == {"id": "alice-updated"}
+        assert store.get(FAKE_HASH_A) == {"id": "alice-updated", "type": "user"}
 
     def test_sequential_puts_all_persist(self, tmp_path: Path) -> None:
         """Multiple sequential puts all persist correctly (each write is the full map)."""
@@ -314,3 +315,168 @@ class TestFlatDictLiveReference:
 
         assert store.flat_dict[FAKE_HASH_A] == "alice"
         assert store.flat_dict[FAKE_HASH_B] == "bob"
+
+
+# ---------------------------------------------------------------------------
+# T2.5 — "type" record contract: normalize on put()/seed(), migrate on load()
+# ---------------------------------------------------------------------------
+
+FAKE_OID_2 = "aaaaaaaa-0000-0000-0000-000000000001"
+
+
+class TestTypeNormalization:
+    """put()/seed() own the "type" field: default "user", "service" preserved,
+    invalid values rejected ("type" moves into the
+    store's record contract instead of being synthesized at the edges)."""
+
+    def test_put_defaults_missing_type_to_user(self, tmp_path: Path) -> None:
+        """put() with no "type" key in the value defaults it to "user"."""
+        store = IdentityStore(path=tmp_path / "store.json")
+        store.load()
+        store.put(FAKE_HASH_A, {"id": "alice"})
+
+        assert store.get(FAKE_HASH_A) == {"id": "alice", "type": "user"}
+
+    def test_put_preserves_type_service(self, tmp_path: Path) -> None:
+        """put() with type="service" persists it unchanged."""
+        store = IdentityStore(path=tmp_path / "store.json")
+        store.load()
+        store.put(FAKE_OID_2, {"id": "svc-agent", "type": "service"})
+
+        assert store.get(FAKE_OID_2) == {"id": "svc-agent", "type": "service"}
+
+    def test_put_rejects_invalid_type(self, tmp_path: Path) -> None:
+        """put() with a "type" other than "user"/"service" raises ValueError
+        and leaves the in-process dict unchanged."""
+        store = IdentityStore(path=tmp_path / "store.json")
+        store.load()
+
+        with pytest.raises(ValueError, match="invalid type"):
+            store.put(FAKE_HASH_A, {"id": "alice", "type": "admin"})
+
+        assert store.get(FAKE_HASH_A) is None
+
+    def test_seed_defaults_missing_type_to_user(self, tmp_path: Path) -> None:
+        """seed() with no "type" key in a record defaults it to "user"."""
+        store = IdentityStore(path=tmp_path / "store.json")
+        store.load()
+        store.seed({FAKE_HASH_A: {"id": "alice"}})
+
+        assert store.get(FAKE_HASH_A) == {"id": "alice", "type": "user"}
+
+    def test_seed_preserves_type_service(self, tmp_path: Path) -> None:
+        """seed() with type="service" persists it unchanged."""
+        store = IdentityStore(path=tmp_path / "store.json")
+        store.load()
+        store.seed({FAKE_OID_2: {"id": "svc-agent", "type": "service"}})
+
+        assert store.get(FAKE_OID_2) == {"id": "svc-agent", "type": "service"}
+
+    def test_seed_rejects_invalid_type(self, tmp_path: Path) -> None:
+        """seed() with an invalid "type" raises ValueError."""
+        store = IdentityStore(path=tmp_path / "store.json")
+        store.load()
+
+        with pytest.raises(ValueError, match="invalid type"):
+            store.seed({FAKE_HASH_A: {"id": "alice", "type": "admin"}})
+
+
+# ---------------------------------------------------------------------------
+# T2.6 — load() migrates old-format records (no "type") and persists it back
+# ---------------------------------------------------------------------------
+
+
+class TestLoadTypeMigration:
+    def test_load_migrates_missing_type_to_user_in_memory(self, tmp_path: Path) -> None:
+        """A record written before the "type" contract (no "type" key) is
+        normalized to type="user" in the in-process map after load()."""
+        store_path = tmp_path / "store.json"
+        store_path.write_text(
+            json.dumps({FAKE_HASH_A: {"id": "alice"}}), encoding="utf-8"
+        )
+
+        store = IdentityStore(path=store_path)
+        store.load()
+
+        assert store.get(FAKE_HASH_A) == {"id": "alice", "type": "user"}
+
+    def test_load_persists_migrated_type_back_to_disk(self, tmp_path: Path) -> None:
+        """After load() migrates an old-format record, re-reading the file
+        from disk shows "type" persisted (not just held in memory)."""
+        store_path = tmp_path / "store.json"
+        store_path.write_text(
+            json.dumps({FAKE_HASH_A: {"id": "alice"}}), encoding="utf-8"
+        )
+
+        store = IdentityStore(path=store_path)
+        store.load()
+
+        on_disk = json.loads(store_path.read_text(encoding="utf-8"))
+        assert on_disk[FAKE_HASH_A] == {"id": "alice", "type": "user"}
+
+    def test_load_already_normalized_does_not_rewrite_file(
+        self, tmp_path: Path
+    ) -> None:
+        """A file whose records already carry a valid "type" is not rewritten
+        on load() -- the mtime is unchanged (no unnecessary boot-time write)."""
+        store_path = tmp_path / "store.json"
+        store_path.write_text(
+            json.dumps({FAKE_HASH_A: {"id": "alice", "type": "user"}}),
+            encoding="utf-8",
+        )
+        mtime_before = store_path.stat().st_mtime_ns
+
+        store = IdentityStore(path=store_path)
+        store.load()
+
+        assert store.get(FAKE_HASH_A) == {"id": "alice", "type": "user"}
+        assert store_path.stat().st_mtime_ns == mtime_before, (
+            "load() must not rewrite the file when every record is already normalized"
+        )
+
+    def test_load_mixed_old_and_new_format_migrates_only_what_changed(
+        self, tmp_path: Path
+    ) -> None:
+        """A file with one old-format record (no "type") and one already-typed
+        "service" record: both come out correctly normalized, and the
+        already-typed record's value is unaffected."""
+        store_path = tmp_path / "store.json"
+        store_path.write_text(
+            json.dumps(
+                {
+                    FAKE_HASH_A: {"id": "alice"},
+                    FAKE_OID_2: {"id": "svc-agent", "type": "service"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        store = IdentityStore(path=store_path)
+        store.load()
+
+        assert store.get(FAKE_HASH_A) == {"id": "alice", "type": "user"}
+        assert store.get(FAKE_OID_2) == {"id": "svc-agent", "type": "service"}
+
+        on_disk = json.loads(store_path.read_text(encoding="utf-8"))
+        assert on_disk[FAKE_HASH_A] == {"id": "alice", "type": "user"}
+        assert on_disk[FAKE_OID_2] == {"id": "svc-agent", "type": "service"}
+
+    def test_load_invalid_type_dropped_without_raising(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A persisted record with a "type" that is neither "user" nor
+        "service" (e.g. hand-edited file) must not crash load() -- the
+        entry is dropped and a warning is logged."""
+        store_path = tmp_path / "store.json"
+        store_path.write_text(
+            json.dumps({FAKE_HASH_A: {"id": "alice", "type": "admin"}}),
+            encoding="utf-8",
+        )
+
+        store = IdentityStore(path=store_path)
+        with caplog.at_level(logging.WARNING):
+            store.load()  # must NOT raise
+
+        assert store.get(FAKE_HASH_A) is None
+        warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warning_records

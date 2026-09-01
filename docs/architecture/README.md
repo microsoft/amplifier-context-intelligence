@@ -65,12 +65,13 @@ per-route capability gate before the data route handler.
     authz gate** — admit iff `roles` contains `Contributor` (write + read), `Reader`
     (read only), or `IdentityAdmin` (admin); no role → `AuthError(403)` whose message names
     the missing role (`"app <appid> has no Contributor/Reader role on this API — assign
-    one"`). `created_by` is derived from **stable Azure-assigned claims only**: trusted
-    `service_identities[oid]` map (optional friendly-name override, _not_ an authorization
-    gate) → `appid`/`azp` → `oid` (truthiness chain, never key-presence); **`app_displayname`
-    is never used** (caller-spoofable, often absent on v2.0/MI tokens); fail-loud 403 if all
-    stable claims are absent (B8). There is no "unmapped → 403" on the service path — the map
-    is optional; an unmapped SP gets a stable GUID until an admin adds a friendly override.
+    one"`). `created_by` is then resolved **exactly like the user path**: `oid` → the
+    **shared identity store** (the same store backing `entra_identities`;
+    service records carry `type: "service"`) → contributor id. An `oid` with **no**
+    mapping is a second, distinct `AuthError(403)` naming the principal (fail-loud,
+    mirrors the user path's unmapped-oid 403) — **`created_by` is never**
+    `appid`/`azp`/`oid`/`app_displayname` (those are raw, spoofable-or-machine claims,
+    not contributors).
   - **Ambiguous token** (both `scp` + `idtyp=="app"`, or neither) → `AuthError(401)`,
     fail-closed (B1 mutual-exclusion, prevents namespace bleed).
   - **(B2)** `idtyp` is normalized before comparison: non-string → `""`, lower/strip.
@@ -109,25 +110,29 @@ How authentication is wired at boot inside `create_asgi_app()`. The function bra
 `auth_mode`:
 
 - **`static`:** builds `StaticKeyResolver(build_keystore())` — pure dict, no network.
-- **`entra` (M2 updated):** builds both identity maps from config, checks the B4
-  disjointness invariant, eagerly fetches JWKS, and constructs `EntraResolver` with five
-  parameters. Specifically:
-  1. **`build_identity_map()`** — `{oid_lower → contributor_id}` from `entra_identities`
-     config; passed as the **live** `IdentityStore.flat_dict` (runtime-mutable by
-     `/admin/identities` — see diagram 08).
-  2. **`build_service_identity_map()`** — `{oid_lower → friendly_name}` from
-     `service_identities` config; a **plain dict** (NOT an `IdentityStore`, NO durable
-     file). Static config only — managed by config change + redeploy, never by an admin
-     API.
-  3. **B4 disjointness invariant** (fail-closed gate before JWKS fetch): if
-     `entra_identities.keys() ∩ service_identities.keys() ≠ ∅` the server raises
-     `RuntimeError` and refuses to start. Note: B1 (`idtyp`-first branching) is the
-     security-critical human/service separation; B4 guards friendly-name collision hygiene.
-  4. **JWKS prefetch** — `PyJWKClient.fetch_data()` eagerly; fail-closed if the endpoint
+- **`entra` (M2 updated):** seeds **one shared `IdentityStore`**
+  from config, checks the B4 disjointness invariant, eagerly fetches JWKS, and
+  constructs `EntraResolver` with five parameters. Specifically:
+  1. **First-boot seed:** `build_identity_map()` (`entra_identities`, entries
+     default to `type: "user"`) and `build_service_identity_map()`
+     (`service_identities`, entries tagged `type: "service"`) are merged into one
+     `rich_seed` and written into the **same** `entra_identities_store_path`
+     `IdentityStore` via `seed()` — only when the store file doesn't exist yet (a
+     pre-existing store, e.g. after an `/admin/identities` mutation, is loaded as-is;
+     config never overwrites runtime-managed data).
+  2. **B4 disjointness invariant** (fail-closed gate before JWKS fetch): checked
+     against the **two config maps directly** — `build_identity_map().keys() ∩
+     build_service_identity_map().keys() ≠ ∅` → `RuntimeError`, refuses to start.
+     (Checked against the config maps, not the merged store's `flat_dict`, which now
+     legitimately holds both kinds of oid by design.)
+  3. **JWKS prefetch** — `PyJWKClient.fetch_data()` eagerly; fail-closed if the endpoint
      is unreachable or returns zero keys (`RuntimeError`, server refuses to start).
-  5. **`EntraResolver(client_id, tenant_id, identity_map, service_identity_map,
-     service_data_role, reader_role, entra_admin_role)`** — constructed after both maps
-     are built and B4 + JWKS gates pass.
+  4. **`EntraResolver(client_id, tenant_id, identity_map, service_identity_map,
+     service_data_role, reader_role, entra_admin_role)`** — both `identity_map` and
+     `service_identity_map` are passed the **same live `IdentityStore.flat_dict`
+     reference** (one shared store, disjoint oid keyspace makes this safe): an
+     admin-onboarded service mapping (`PUT /admin/identities`, `type=service`)
+     resolves immediately, exactly like a user mapping — see diagram 08.
 
 A fail-closed gate then rejects boot if `resolver.auth_enabled` is `False` and
 `allow_unauthenticated` is not set (the latter is a test/dev-only opt-out, never for
@@ -149,14 +154,18 @@ required for any mutation. The diagram covers both the **entra-identities store*
 contributor) and the **api-keys store** (sha256 hash → contributor) through a single shared
 `IdentityStore` abstraction.
 
-> **M2 scope note:** this diagram's admin API is **unchanged** from M1. The M2 dual-path adds
-> a `service_identities` map for service/app tokens, but **there is no `/admin/services`
-> endpoint** — that was deliberately excluded. `service_identities` is **static config only**:
-> a plain dict built from settings at boot via `build_service_identity_map()`, with no durable
-> file on `/data` and no runtime CRUD. Adding or removing a service caller requires a config
-> change and redeploy. The diagram annotates this explicitly (orange dashed cluster) to prevent
-> readers from assuming services are runtime-manageable. See diagram 07 for how the service
-> map is wired at boot alongside the B4 disjointness gate.
+> **Update:** service identities are now managed through this **same**
+> `/admin/identities` API — there is deliberately **no separate** `/admin/services`
+> endpoint. Every identity record (`PUT`/`GET`/`DELETE /admin/identities`) carries a
+> `type: "user" | "service"` field (default `"user"`); `GET /admin/identities?type=service`
+> filters the listing to service records only. `service_identities` config remains a
+> **first-boot-only seed** into the same durable store `entra_identities` uses — it may
+> be empty/omitted, and service callers added after boot go through
+> `PUT`/`DELETE /admin/identities` (`type=service`), no redeploy needed. Records written
+> before this field existed are normalized to `type: "user"` on load and persisted back
+> (best-effort migration — a read-only-fs write failure logs a warning and keeps the
+> normalized data in memory only). See diagram 07 for how the shared store is seeded at
+> boot alongside the B4 disjointness gate.
 
 **Authorization gate (`require_admin`):** applied router-wide via
 `APIRouter(dependencies=[Depends(require_admin)])`. The middleware (`BearerTokenMiddleware`)

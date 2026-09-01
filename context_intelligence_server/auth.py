@@ -84,18 +84,6 @@ class AuthError(Exception):
         self.reason = reason
 
 
-def _first_nonblank(*values: Any) -> str | None:
-    """Return the first value that is a non-empty, non-whitespace str, else None.
-
-    Used to chain service created_by candidates with truthiness semantics:
-    empty/whitespace/non-string candidates fall through (B6/B8).
-    """
-    for v in values:
-        if isinstance(v, str) and v.strip():
-            return v
-    return None
-
-
 def _resolve_token(token: str, keystore: dict[str, str]) -> str | None:
     """Return the contributor id for *token*, or ``None`` if not found.
 
@@ -478,29 +466,29 @@ class EntraResolver:
                 f"in Azure Entra, then re-request a token.",
             )
 
-        # --- created_by derivation [B6/B8]: stable claims, truthiness chaining,
-        #     NEVER app_displayname (spoofable in Entra — B8), fail-loud.
-        #     Order: service_map[oid] > appid > azp > oid.
+        # created_by comes only from the service identity map; an unmapped oid
+        # is 403, never appid/azp/oid/display_name (spoofable, not a contributor id).
         _oid_raw = claims.get("oid")
         oid_str = _oid_raw if isinstance(_oid_raw, str) and _oid_raw.strip() else ""
         oid_lower = oid_str.lower()
         mapped = self._service_identity_map.get(oid_lower) if oid_lower else None
 
-        created_by = _first_nonblank(
-            mapped,  # 1. operator-assigned contributor id
-            claims.get("appid"),  # 2. app client id (v1.0 token)
-            claims.get("azp"),  # 3. authorized party (v2.0 token)
-            oid_str,  # 4. SP object id (always present; last resort)
-        )
-        if created_by is None:
-            # Unreachable in practice (oid always present); fail-loud, never null.
+        if mapped is None:
+            _appid_raw = claims.get("appid")
+            _principal = (
+                _appid_raw
+                if isinstance(_appid_raw, str) and _appid_raw.strip()
+                else (oid_str or "(unknown)")
+            )
             raise AuthError(
-                401,
-                "Service token has no resolvable identity claim "
-                "(service map miss and appid/azp/oid all blank)",
+                403,
+                f"Service principal {_principal!r} is not authorized: oid "
+                f"{oid_lower!r} is not in the service identity map; contact "
+                f"the server administrator to add this identity "
+                f"(tenant {self._tenant_id!r})",
             )
 
-        return (created_by, roles, True)
+        return (mapped, roles, True)
 
 
 class StaticKeyResolver:

@@ -642,12 +642,21 @@ def create_asgi_app(
         entra_store = IdentityStore(Path(s.entra_identities_store_path))
         entra_store.load()
         if not entra_store.path.exists():
-            # First boot: seed in-process map from config.  Converts the flat
-            # {oid -> contributor_id} from build_identity_map() to the rich
-            # {oid -> {"id": contributor_id}} format that IdentityStore expects.
+            # First boot: seed in-process map from config -- ONE shared store
+            # serves both user and service oids (disjoint key spaces make sharing safe).
             config_map = s.build_identity_map()
+            config_service_map = s.build_service_identity_map()
+            rich_seed: dict[str, dict[str, str]] = {}
             if config_map:
-                rich_seed = {oid: {"id": cid} for oid, cid in config_map.items()}
+                rich_seed.update({oid: {"id": cid} for oid, cid in config_map.items()})
+            if config_service_map:
+                rich_seed.update(
+                    {
+                        oid: {"id": cid, "type": "service"}
+                        for oid, cid in config_service_map.items()
+                    }
+                )
+            if rich_seed:
                 entra_store.seed(rich_seed)
         _entra_identity_store = entra_store
         app.state.entra_identity_store = entra_store
@@ -668,14 +677,12 @@ def create_asgi_app(
             )
 
         # Boot disjointness invariant — each oid must belong to exactly one
-        # identity source.  Building the service map here (not inline in the
-        # EntraResolver call) lets us check the overlap BEFORE construction so
-        # the server fails loudly at startup rather than silently misbehaving.
-        # Existing logic already keeps app tokens off the human map at
-        # request time; this prevents a same-oid-in-both misconfiguration.
-        _service_id_map = s.build_service_identity_map()
-        _entra_oids = set(entra_store.flat_dict.keys())
-        _service_oids = set(_service_id_map.keys())
+        # identity source.  Checked against the two CONFIG maps, not the
+        # store's flat_dict: one shared store now holds user and service oids
+        # alike, so the store itself can no longer show the overlap.  This
+        # prevents a same-oid-in-both misconfiguration at startup.
+        _entra_oids = set(s.build_identity_map().keys())
+        _service_oids = set(s.build_service_identity_map().keys())
         _overlap = _entra_oids & _service_oids
         if _overlap:
             raise RuntimeError(
@@ -687,13 +694,15 @@ def create_asgi_app(
 
         # EntraResolver raises RuntimeError at construction if the JWKS
         # prefetch fails (eager fail-closed by design).
-        # Pass entra_store.flat_dict (the LIVE dict) so the resolver sees
-        # any put()/delete() made by /admin immediately, no restart required.
+        # Pass entra_store.flat_dict (the LIVE dict) as BOTH maps so the
+        # resolver sees any put()/delete() made by /admin immediately on
+        # either path, no restart required.
         resolver: StaticKeyResolver | EntraResolver = EntraResolver(
             s.azure_client_id,  # type: ignore[arg-type]  — validated non-None by config
             s.azure_tenant_id,  # type: ignore[arg-type]  — validated non-None by config
             entra_store.flat_dict,  # live reference — mutations visible immediately
-            service_identity_map=_service_id_map,  # pre-built, disjointness verified
+            # SAME live reference (one shared store, disjoint oid keyspace).
+            service_identity_map=entra_store.flat_dict,
             service_data_role=s.service_data_role,
             reader_role=s.reader_role,
             entra_admin_role=s.entra_admin_role,
