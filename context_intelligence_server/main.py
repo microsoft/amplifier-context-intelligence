@@ -641,13 +641,21 @@ def create_asgi_app(
         # Build and load the entra identity store.
         entra_store = IdentityStore(Path(s.entra_identities_store_path))
         entra_store.load()
+        _config_entra_map = s.build_identity_map()
+        _config_service_map = s.build_service_identity_map()
         if not entra_store.path.exists():
-            # First boot: seed in-process map from config.  Converts the flat
-            # {oid -> contributor_id} from build_identity_map() to the rich
-            # {oid -> {"id": contributor_id}} format that IdentityStore expects.
-            config_map = s.build_identity_map()
-            if config_map:
-                rich_seed = {oid: {"id": cid} for oid, cid in config_map.items()}
+            # First boot: seed in-process map from config -- ONE shared store
+            # serves both user and service oids (disjoint key spaces make sharing
+            # safe; the disjointness check below enforces that the two config
+            # maps never name the same oid).
+            rich_seed: dict[str, dict[str, str]] = {
+                oid: {"id": cid}
+                for oid, cid in (
+                    *_config_entra_map.items(),
+                    *_config_service_map.items(),
+                )
+            }
+            if rich_seed:
                 entra_store.seed(rich_seed)
         _entra_identity_store = entra_store
         app.state.entra_identity_store = entra_store
@@ -667,16 +675,35 @@ def create_asgi_app(
                 s.entra_identities_store_path,
             )
 
+        # service_identities is a FIRST-BOOT seed only: once the store file
+        # exists, config is never re-read into it. An operator who sets
+        # SERVICE_IDENTITIES on an already-deployed server would otherwise get
+        # no signal at all — the only symptom is a 403 on the service token,
+        # whose message points at the administrator, not at the ignored config.
+        # Name the ignored oids here so the wrong lever is obvious at boot.
+        _ignored_service_oids = sorted(
+            oid for oid in _config_service_map if oid not in entra_store.flat_dict
+        )
+        if _ignored_service_oids:
+            logger.warning(
+                "service_identities config lists %d oid(s) that are NOT in the "
+                "identity store and are being IGNORED: %r. service_identities "
+                "seeds the store on FIRST BOOT ONLY and store=%s already exists, "
+                "so config changes after the first boot have no effect and these "
+                "principals will receive 403. Add them at runtime with an "
+                "IdentityAdmin-role token via PUT /admin/identities/{oid} — no "
+                "redeploy required.",
+                len(_ignored_service_oids),
+                _ignored_service_oids,
+                s.entra_identities_store_path,
+            )
+
         # Boot disjointness invariant — each oid must belong to exactly one
-        # identity source.  Building the service map here (not inline in the
-        # EntraResolver call) lets us check the overlap BEFORE construction so
-        # the server fails loudly at startup rather than silently misbehaving.
-        # Existing logic already keeps app tokens off the human map at
-        # request time; this prevents a same-oid-in-both misconfiguration.
-        _service_id_map = s.build_service_identity_map()
-        _entra_oids = set(entra_store.flat_dict.keys())
-        _service_oids = set(_service_id_map.keys())
-        _overlap = _entra_oids & _service_oids
+        # identity source.  Checked against the two CONFIG maps, not the
+        # store's flat_dict: one shared store now holds user and service oids
+        # alike, so the store itself can no longer show the overlap.  This
+        # prevents a same-oid-in-both misconfiguration at startup.
+        _overlap = set(_config_entra_map) & set(_config_service_map)
         if _overlap:
             raise RuntimeError(
                 f"Boot invariant violated: oid(s) {sorted(_overlap)!r} appear "
@@ -687,13 +714,15 @@ def create_asgi_app(
 
         # EntraResolver raises RuntimeError at construction if the JWKS
         # prefetch fails (eager fail-closed by design).
-        # Pass entra_store.flat_dict (the LIVE dict) so the resolver sees
-        # any put()/delete() made by /admin immediately, no restart required.
+        # Pass entra_store.flat_dict (the LIVE dict) as BOTH maps so the
+        # resolver sees any put()/delete() made by /admin immediately on
+        # either path, no restart required.
         resolver: StaticKeyResolver | EntraResolver = EntraResolver(
             s.azure_client_id,  # type: ignore[arg-type]  — validated non-None by config
             s.azure_tenant_id,  # type: ignore[arg-type]  — validated non-None by config
             entra_store.flat_dict,  # live reference — mutations visible immediately
-            service_identity_map=_service_id_map,  # pre-built, disjointness verified
+            # SAME live reference (one shared store, disjoint oid keyspace).
+            service_identity_map=entra_store.flat_dict,
             service_data_role=s.service_data_role,
             reader_role=s.reader_role,
             entra_admin_role=s.entra_admin_role,

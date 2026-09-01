@@ -220,12 +220,12 @@ digraph auth_flow {
         ]
 
         ServiceCreatedBy [
-            label     = "created_by derivation  (STABLE CLAIMS ONLY \u2014 D7)\nTrusted map: service_identities[oid] \u2192 friendly name\n  (optional override \u2014 NOT a gate; no unmapped\u2192403 here)\nFallback (truthiness, NOT key-presence):\n  appid  \u2192  azp  \u2192  oid\nNEVER app_displayname  (caller-spoofable, often absent)\nFail-loud 403 if all stable claims absent  (B8)"
+            label     = "created_by derivation  (SHARED IDENTITY STORE)\noid \u2192 identity store lookup (SAME store entra_identities uses;\n  oids are disjoint across users and services)\nMapped \u2192 contributor id.  Unmapped \u2192 403  (mirrors user path)\nNEVER appid / azp / oid / app_displayname as created_by"
             fillcolor = "#BBDEFB"
         ]
 
         ServiceContrib [
-            label     = "contributor_id = stable service id (str \u2014 never null)\n  map name (\"ci-pipeline\") or Azure GUID (appid/oid)\nroles = token roles claim\n\u2192 return (contributor_id, roles)"
+            label     = "contributor_id = mapped contributor id (str \u2014 never null,\n  never appid/oid)\nroles = token roles claim\n\u2192 return (contributor_id, roles)"
             fillcolor = "#C8E6C9"
             fontname  = "Helvetica-Bold"
             penwidth  = 2.5
@@ -469,7 +469,7 @@ digraph auth_flow {
     RoleGate      -> ServiceCreatedBy      [label = "role present\n(Contributor\n| Reader\n| IdentityAdmin)"]
 
     // created_by derivation: stable claims only; fail-loud if all absent
-    ServiceCreatedBy -> AuthErrCatch       [label = "all stable claims\nabsent \u2192 403  (B8)", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
+    ServiceCreatedBy -> AuthErrCatch       [label = "oid unmapped\n\u2192 403  (mirrors user path)", style = dashed, color = "#BF360C", fontcolor = "#BF360C"]
     ServiceCreatedBy -> ServiceContrib     [label = "contributor_id\nresolved"]
 
     // Service success \u2014 contributor_id str (stable id) returns to middleware

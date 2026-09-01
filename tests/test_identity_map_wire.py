@@ -498,6 +498,118 @@ class TestT3EntraWiring:
 
         assert middleware.resolver._identity_map is store.flat_dict  # type: ignore[union-attr]
 
+    def test_service_oid_seeded_and_resolves_via_shared_flat_dict(
+        self, tmp_path: Path
+    ) -> None:
+        """A service oid seeded from config lands in the SAME store/flat_dict.
+
+        One IdentityStore serves both user and service oids (disjoint key
+        spaces). The resolver's ``_identity_map`` and ``_service_identity_map``
+        are literally the SAME dict object as ``store.flat_dict`` -- no
+        separate service map, no separate store.
+        """
+        from context_intelligence_server.config import Settings  # noqa: PLC0415
+        from context_intelligence_server.main import (  # noqa: PLC0415
+            create_asgi_app,
+            get_entra_identity_store,
+        )
+
+        service_oid = "cccccccc-dddd-eeee-ffff-000011112222"
+        service_contributor = "my-automation-service"
+
+        settings = Settings(
+            auth_mode="entra",
+            azure_client_id=FAKE_CLIENT_ID,
+            azure_tenant_id=FAKE_TENANT_ID,
+            entra_identities={FAKE_OID: {"id": FAKE_CONTRIBUTOR_ENTRA}},
+            service_identities={service_oid: {"id": service_contributor}},
+            entra_identities_store_path=str(tmp_path / "entra-identities.json"),
+            api_keys_store_path=str(tmp_path / "api-keys.json"),
+        )
+
+        middleware = create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+        store = get_entra_identity_store()
+        assert store is not None
+
+        # Both the user oid and the service oid landed in the ONE store.
+        assert store.flat_dict[FAKE_OID] == FAKE_CONTRIBUTOR_ENTRA
+        assert store.flat_dict[service_oid] == service_contributor
+
+        # The resolver's user map, service map, and the store's flat_dict are
+        # all the SAME object -- a live admin PUT is visible to either path.
+        assert middleware.resolver._identity_map is store.flat_dict  # type: ignore[union-attr]
+        assert (
+            middleware.resolver._service_identity_map is store.flat_dict  # type: ignore[union-attr]
+        )
+
+
+class TestIgnoredServiceIdentitiesWarning:
+    """service_identities is a first-boot seed; say so when it is being ignored.
+
+    Once the store file exists, config is never re-read into it.  An operator
+    who sets SERVICE_IDENTITIES on an already-deployed server gets no effect
+    at all, and the only symptom is a 403 whose message points at the
+    administrator rather than at the ignored config.  Boot must name the
+    ignored oids so the wrong lever is obvious.
+    """
+
+    _SERVICE_OID = "cccccccc-dddd-eeee-ffff-000011112222"
+
+    def _settings(self, tmp_path: Path, store_path: Path) -> Any:
+        from context_intelligence_server.config import Settings  # noqa: PLC0415
+
+        return Settings(
+            auth_mode="entra",
+            azure_client_id=FAKE_CLIENT_ID,
+            azure_tenant_id=FAKE_TENANT_ID,
+            entra_identities={FAKE_OID: {"id": FAKE_CONTRIBUTOR_ENTRA}},
+            service_identities={self._SERVICE_OID: {"id": "my-automation-service"}},
+            entra_identities_store_path=str(store_path),
+            api_keys_store_path=str(tmp_path / "api-keys.json"),
+        )
+
+    def test_warns_naming_oids_ignored_because_store_already_exists(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Store file present → config service oid is ignored → warning names it."""
+        from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
+
+        store_path = tmp_path / "entra-identities.json"
+        # An already-deployed server: the store file was written on an earlier boot.
+        store_path.write_text(json.dumps({FAKE_OID: {"id": FAKE_CONTRIBUTOR_ENTRA}}))
+
+        settings = self._settings(tmp_path, store_path)
+
+        with caplog.at_level("WARNING", logger="context_intelligence_server.main"):
+            create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        matching = [m for m in warnings if "service_identities config lists" in m]
+        assert matching, (
+            f"expected an ignored-service_identities warning, got {warnings!r}"
+        )
+        # The oid must be named — a warning that does not say WHICH principal is
+        # ignored leaves the operator exactly as stuck as no warning at all.
+        assert self._SERVICE_OID in matching[0]
+        assert "PUT /admin/identities" in matching[0]
+
+    def test_no_warning_on_first_boot_when_config_is_actually_seeded(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No store file → config IS seeded → the warning must not fire."""
+        from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
+
+        store_path = tmp_path / "entra-identities.json"
+        assert not store_path.exists(), "Pre-condition: first boot, no store file"
+
+        settings = self._settings(tmp_path, store_path)
+
+        with caplog.at_level("WARNING", logger="context_intelligence_server.main"):
+            create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert not [m for m in warnings if "service_identities config lists" in m]
+
 
 # ===========================================================================
 # T3: Mode-specific accessors

@@ -568,8 +568,9 @@ class Settings(BaseSettings):
     # M2 non-interactive auth: service / app-token identity path
     # -------------------------------------------------------------------------
     # service_identities: the OID → contributor map for service principals /
-    # managed identities.  Same shape as entra_identities; lives in config
-    # only (no durable store — service identities don't need runtime mutation).
+    # managed identities.  Same shape as entra_identities; first-boot-only seed
+    # into the SAME shared store entra_identities uses (oids are disjoint across
+    # users and service principals, so one oid -> contributor map serves both).
     #
     # Shape: { "<oid-GUID>": {"id": "<contributor>"} }
     #
@@ -587,12 +588,12 @@ class Settings(BaseSettings):
     def _validate_service_identities(
         cls, v: dict[str, dict[str, str]] | None
     ) -> dict[str, dict[str, str]] | None:
-        """Fail-closed: same GUID-map rules as entra_identities (shared helper).
+        """Same GUID-map rules as entra_identities (shared helper); empty map allowed.
 
-        Delegates to ``_validate_identity_map()``.  See that function's docstring
-        for the full rule set.
+        Delegates to ``_validate_identity_map()`` with ``allow_empty=True`` --
+        an empty map is a supported bootstrap state, not a startup error.
         """
-        return _validate_identity_map(v, "service_identities")
+        return _validate_identity_map(v, "service_identities", allow_empty=True)
 
     def build_service_identity_map(self) -> dict[str, str]:
         """Return ``{oid_lower -> contributor_id}`` for all configured service identities.

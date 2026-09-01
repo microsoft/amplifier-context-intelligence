@@ -569,9 +569,16 @@ variables are:
 | `AZURE_CLIENT_ID` | yes | App Registration (client) GUID |
 | `AZURE_TENANT_ID` | yes | Azure AD tenant GUID |
 | `ENTRA_IDENTITIES` (JSON) | yes | `oid → {id}` map for the **user (delegated)** path (**PII** — seed via admin API, do not commit) |
-| `SERVICE_IDENTITIES` (JSON) | no | Optional friendly-`created_by` map for **service** principals — not an auth gate, no runtime CRUD |
+| `SERVICE_IDENTITIES` (JSON) | no | First-boot seed for **service** principals into the same shared identity store `entra_identities` uses — not itself an auth gate, but an unmapped role-bearing service now gets **403**; may be empty, and identities can be onboarded/removed later via `/admin/identities`, no redeploy |
 | `SERVICE_DATA_ROLE` | no | App Role granting service write+read (default `Contributor`) |
 | `READER_ROLE` | no | App Role granting service read-only (default `Reader`) |
+
+> **Note: `SERVICE_IDENTITIES` seeds only on first boot.** The `service_identities`
+> config seeds the shared identity store on **first boot only**. Once the store file
+> (`/data/identity/entra-identities.json`) exists, config changes to `service_identities`
+> have no effect. The server logs a **WARNING** at startup naming any `service_identities`
+> oids being ignored for this reason, and points the operator at `PUT /admin/identities/{oid}`
+> instead for runtime onboarding (no redeploy needed).
 
 > **Operator note — service callers must use Managed Identity or federated OIDC,
 > not client secrets.** In a locked-down tenant, the service path (app-only tokens

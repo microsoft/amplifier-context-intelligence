@@ -55,7 +55,7 @@ server checks the role named by `entra_admin_role` (**default `IdentityAdmin`**)
 > `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_ADMIN_ROLE`. Setting it empty
 > (`null`) **disables** the admin API → callers get `503`.
 
-#### Entra App Roles and service identities (no runtime CRUD)
+#### Entra App Roles and service identities
 
 `IdentityAdmin` is one of **three** App Roles the server recognizes in an entra
 token's `roles` claim. The other two authorize the **service path** (app /
@@ -70,16 +70,22 @@ managed-identity tokens — see
 
 A service principal is authorized by an App Role **alone** — assigning the role
 in Entra *is* the onboarding step (§4). There is **no** server-side
-pre-registration of service principals.
+pre-registration of service principals. Authorization and identity are
+separate concerns, though: a role-bearing service also needs its `oid` mapped
+(below) or its requests get **403**.
 
-> **`service_identities` is OPTIONAL STATIC config — there is no runtime CRUD.**
-> Unlike the user `entra_identities` map (mutable live via `/admin/identities`),
-> the `service_identities` map (`oid → {id: <contributor>}`) lives **only** in
-> config (env/YAML). It is **not** an authorization gate — it only supplies a
-> **friendly `created_by`** name for a mapped service. An unmapped but
-> role-bearing service is still fully authorized; its `created_by` falls back to
-> the stable `appid` (a GUID). **There is no `/admin/services` endpoint** — to add
-> or change a friendly name, edit `service_identities` in config and redeploy.
+> **`service_identities` is a first-boot seed into the SAME store as
+> `entra_identities` — not a separate, static system.** Service identities live
+> in the identical durable `IdentityStore` behind `entra_identities`.
+> `service_identities` (env/YAML) only **seeds** that store on first boot and
+> may be empty. Once the store file exists, config changes to `service_identities`
+> have no effect; the server logs a WARNING at startup naming ignored `service_identities`
+> oids. It is **not itself** the authorization gate (the App Role check is), but it
+> **is** required for attribution: a role-bearing service whose `oid` isn't mapped now
+> gets **403** — there is no fallback to the stable `appid` GUID. To onboard, change,
+> or remove a service identity **at runtime, no restart**, use the **same**
+> `/admin/identities` endpoint as `entra_identities` (§3–4). **There is deliberately
+> no separate `/admin/services` endpoint** — one endpoint, one store.
 
 ### Static mode — set `admin_api_key`
 
@@ -117,7 +123,11 @@ the inactive mode is not loaded).
 
 ### Entra identities — `auth_mode=entra`
 
-| Method & path | Body | Success |
+One store, one endpoint, serves **both** user and service identities — Entra
+`oid`s are disjoint across users and service principals, so a single
+`oid → contributor` map covers both:
+
+| Method & path | Body / query | Success |
 |---|---|---|
 | `PUT /admin/identities/{oid}` | `{"id": "<contributor>", "display_name": "<optional>"}` | `200 {"oid","id"[,"display_name"]}` |
 | `DELETE /admin/identities/{oid}` | — | `200 {"oid","deleted":true}` (`404` if absent) |
@@ -125,6 +135,8 @@ the inactive mode is not loaded).
 
 - `{oid}` must be a **lowercase-hex GUID** (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`),
   not the all-zeros sentinel → otherwise `422`.
+- There is deliberately **no separate `/admin/services` endpoint** — service and
+  user identities are managed through the same endpoint.
 
 ### Static API keys — `auth_mode=static`
 
@@ -173,22 +185,31 @@ principals. Three steps:
    this API's App Registration, as an **Application**-type role assignment
    (*Enterprise Applications → your app → Users and groups*, or via Graph). This
    assignment **is** the authorization — no server change, no redeploy.
-2. **The caller requests a token** for **`api://<client_id>/.default`** via
+2. **Map the service principal's `oid` to a contributor.** A role-bearing
+   service token whose `oid` isn't mapped now gets **403** (names the
+   principal) — an App Role alone is no longer sufficient. Map it either
+   before first use (seed `service_identities` in config) or at **runtime, no
+   restart**, the same way a user is onboarded (§4, above):
+
+   ```bash
+   OID="aaaaaaaa-0000-0000-0000-000000000002"   # the service principal's oid
+   curl -sS -X PUT "$SERVER/admin/identities/$OID" \
+     -H "Authorization: Bearer [REDACTED:SECRET]" \
+     -H "Content-Type: application/json" \
+     -d '{"id": "<contributor>"}'
+   ```
+3. **The caller requests a token** for **`api://<client_id>/.default`** via
    **Managed Identity** or **federated OIDC** (a client secret only where the
    tenant permits — see the tenant policy note in
    [entra-auth-setup.md](entra-auth-setup.md#the-model--two-authentication-paths-user--service)).
    The token carries the App Role in `roles` and **no `scp`**, so it takes the
-   service path. On the next call it authenticates; `created_by` defaults to the
-   service principal's **`appid`** (a GUID).
-3. **(Optional) Add a friendly `created_by` name.** To stamp a human-readable
-   contributor instead of the `appid` GUID, add the service principal's `oid` to
-   the **static** `service_identities` map (`oid → {id: <contributor>}`) in
-   config and **redeploy**. This is config-only — there is **no** runtime endpoint
-   for it.
+   service path. On the next call it authenticates; `created_by` is the
+   contributor `id` mapped in step 2 — **never** a fallback `appid`/`azp`/`oid`.
 
-> To **remove** a service caller, unassign the App Role in Entra. (Deleting a
-> `service_identities` entry only drops the friendly name; the role assignment is
-> what authorizes.)
+> To **remove** a service caller's authorization, unassign the App Role in
+> Entra. To remove its identity mapping, `DELETE /admin/identities/{oid}` (same
+> endpoint as users) — but note the App Role is what authorizes; deleting only
+> the mapping leaves a role-bearing token unable to resolve `created_by` (403).
 
 ### Static (`auth_mode=static`)
 

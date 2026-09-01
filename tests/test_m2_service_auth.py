@@ -306,13 +306,18 @@ class TestM2CapabilityDeps:
 
     async def test_cap_sc_contributor_write_capable(
         self,
-        service_asgi: tuple[Any, Any],
+        service_asgi_with_map: tuple[Any, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """CAP-SC: service Contributor → POST /events → 2xx."""
+        """CAP-SC: service Contributor → POST /events → 2xx.
+
+        Uses service_asgi_with_map (mapped oid) since resolving created_by
+        requires a service identity map hit -- an unmapped oid now 403s
+        before role gating even runs.
+        """
         import context_intelligence_server.main as main_module  # noqa: PLC0415
 
-        private_key, asgi = service_asgi
+        private_key, asgi = service_asgi_with_map
         token = _sign_jwt(private_key, _service_claims(roles=["Contributor"]))
 
         monkeypatch.setattr(
@@ -368,13 +373,16 @@ class TestM2CapabilityDeps:
 
     async def test_cap_sr_r_reader_read_capable(
         self,
-        service_asgi: tuple[Any, Any],
+        service_asgi_with_map: tuple[Any, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """CAP-SR-r: service Reader → GET /blobs/{sid} → 2xx (require_read passes)."""
+        """CAP-SR-r: service Reader → GET /blobs/{sid} → 2xx (require_read passes).
+
+        Uses service_asgi_with_map (mapped oid) -- see CAP-SC docstring.
+        """
         import context_intelligence_server.main as main_module  # noqa: PLC0415
 
-        private_key, asgi = service_asgi
+        private_key, asgi = service_asgi_with_map
         token = _sign_jwt(private_key, _service_claims(roles=["Reader"]))
 
         monkeypatch.setattr(main_module, "AsyncDiskBlobStore", _MockBlobStore)
@@ -420,15 +428,16 @@ class TestM2CapabilityDeps:
 
     async def test_cap_sadm_a_admin_role_passes_require_admin(
         self,
-        service_asgi: tuple[Any, Any],
+        service_asgi_with_map: tuple[Any, Any],
     ) -> None:
         """CAP-SADM-a: service IdentityAdmin → GET /admin/identities → 2xx.
 
         require_admin (admin.py) checks 'IdentityAdmin' in roles; the service
         branch sets is_service=True and roles=["IdentityAdmin"] on scope state.
-        No change to admin.py needed (Q4 / §1.4).
+        No change to admin.py needed (Q4 / §1.4). Uses service_asgi_with_map
+        (mapped oid) -- see CAP-SC docstring.
         """
-        private_key, asgi = service_asgi
+        private_key, asgi = service_asgi_with_map
         token = _sign_jwt(private_key, _service_claims(roles=["IdentityAdmin"]))
 
         async with _make_client(asgi) as c:
@@ -447,13 +456,16 @@ class TestM2CapabilityDeps:
 
     async def test_cap_sc_r_contributor_read_capable(
         self,
-        service_asgi: tuple[Any, Any],
+        service_asgi_with_map: tuple[Any, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """CAP-SC-r: service Contributor → GET /blobs/{sid} → 2xx (write-capable → read-capable)."""
+        """CAP-SC-r: service Contributor → GET /blobs/{sid} → 2xx (write-capable → read-capable).
+
+        Uses service_asgi_with_map (mapped oid) -- see CAP-SC docstring.
+        """
         import context_intelligence_server.main as main_module  # noqa: PLC0415
 
-        private_key, asgi = service_asgi
+        private_key, asgi = service_asgi_with_map
         token = _sign_jwt(private_key, _service_claims(roles=["Contributor"]))
 
         monkeypatch.setattr(main_module, "AsyncDiskBlobStore", _MockBlobStore)
@@ -472,17 +484,18 @@ class TestM2CapabilityDeps:
 
     async def test_cap_cypher_read_reader_can_reach_cypher(
         self,
-        service_asgi: tuple[Any, Any],
+        service_asgi_with_map: tuple[Any, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """CAP-cypher-read: service Reader → POST /cypher (read query) → 2xx.
 
         /cypher is wired with require_read (NOT require_write per spec §5.3).
-        Reader is exactly the role meant to reach /cypher + /blobs.
+        Reader is exactly the role meant to reach /cypher + /blobs. Uses
+        service_asgi_with_map (mapped oid) -- see CAP-SC docstring.
         """
         from context_intelligence_server.main import app  # noqa: PLC0415
 
-        private_key, asgi = service_asgi
+        private_key, asgi = service_asgi_with_map
         token = _sign_jwt(private_key, _service_claims(roles=["Reader"]))
 
         # Mock the neo4j QUERY (read-intent) driver on app.state -- /cypher reads
@@ -508,7 +521,7 @@ class TestM2CapabilityDeps:
 
     async def test_cap_cypher_soft_reader_can_mutate_soft_m2(
         self,
-        service_asgi: tuple[Any, Any],
+        service_asgi_with_map: tuple[Any, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """CAP-cypher-soft: service Reader + MUTATING Cypher query → 2xx + mutation succeeds.
@@ -520,10 +533,11 @@ class TestM2CapabilityDeps:
 
         HARDENS TO 403 AT M3 via a read-only Neo4j DB user on the read path.
         Do NOT assert "cannot mutate" — that assertion would be false at M2.
+        Uses service_asgi_with_map (mapped oid) -- see CAP-SC docstring.
         """
         from context_intelligence_server.main import app  # noqa: PLC0415
 
-        private_key, asgi = service_asgi
+        private_key, asgi = service_asgi_with_map
         token = _sign_jwt(private_key, _service_claims(roles=["Reader"]))
 
         # Mock the neo4j QUERY (read-intent) driver — /cypher reads
@@ -671,6 +685,37 @@ class TestBootDisjointnessInvariant:
         # Must not raise — disjoint config is valid
         create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient(public_key))
 
+    def test_empty_service_identities_boots_without_error(
+        self,
+        rsa_keypair_cap: tuple[Any, Any],
+        tmp_path: Any,
+    ) -> None:
+        """service_identities={} boots cleanly (bootstrap state, not a startup error).
+
+        This was previously a hard ValidationError. An explicit empty map is
+        now accepted -- the same allow_empty=True treatment entra_identities
+        already had -- so a fresh deployment can onboard its first service
+        identity at runtime via PUT /admin/identities.
+        """
+        from context_intelligence_server.config import Settings  # noqa: PLC0415
+        from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
+
+        _, public_key = rsa_keypair_cap
+
+        settings = Settings(
+            auth_mode="entra",
+            azure_client_id=FAKE_CLIENT_ID,
+            azure_tenant_id=FAKE_TENANT_ID,
+            entra_identities={FAKE_OID_HUMAN: {"id": FAKE_CONTRIBUTOR_HUMAN}},
+            service_identities={},
+            entra_identities_store_path=str(tmp_path / "entra-ids-empty-svc.json"),
+            api_keys_store_path=str(tmp_path / "api-keys-empty-svc.json"),
+        )
+
+        # Must not raise -- an explicit empty service_identities map is a
+        # supported bootstrap state.
+        create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient(public_key))
+
 
 # ---------------------------------------------------------------------------
 # /status additive fields (M2)
@@ -727,15 +772,16 @@ class TestP3VerticalSlice:
     Captures queue-append bytes to assert the final created_by value.
     """
 
-    async def test_p3_unmapped_service_contributor_created_by_is_appid(
+    async def test_p3_unmapped_service_contributor_is_rejected(
         self,
         service_asgi: tuple[Any, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """P3 unmapped: service Contributor, oid NOT in any map → 202, created_by == appid.
+        """P3 unmapped: service Contributor, oid NOT in the service map → 403, no event ingested.
 
         service_asgi has no service_identities, so FAKE_OID_SERVICE is unmapped.
-        The resolver falls through to appid as the stable created_by.
+        The resolver now fails loud (mirrors the user branch's
+        unmapped-oid 403) instead of falling back to appid as created_by.
         """
         import context_intelligence_server.main as main_module  # noqa: PLC0415
 
@@ -768,17 +814,13 @@ class TestP3VerticalSlice:
                 headers={"Authorization": f"Bearer {token}"},
             )
 
-        assert resp.status_code == 202, (
-            f"P3-unmapped: expected 202 for service Contributor, "
+        assert resp.status_code == 403, (
+            f"P3-unmapped: expected 403 for unmapped service oid, "
             f"got {resp.status_code}: {resp.text}"
         )
-        assert len(captured) == 1, (
-            f"P3-unmapped: expected 1 queue append, got {len(captured)}"
-        )
-        body_obj = json.loads(captured[0])
-        assert body_obj["created_by"] == FAKE_APPID, (
-            f"P3-unmapped: created_by should be appid {FAKE_APPID!r}, "
-            f"got {body_obj.get('created_by')!r}"
+        assert len(captured) == 0, (
+            f"P3-unmapped: expected NO queue append for a rejected request, "
+            f"got {len(captured)}"
         )
 
     async def test_p3_mapped_service_oid_created_by_is_friendly_name(
@@ -1020,14 +1062,16 @@ class TestM2MessageContent:
 
     async def test_require_write_403_names_write_role(
         self,
-        service_asgi: tuple[Any, Any],
+        service_asgi_with_map: tuple[Any, Any],
     ) -> None:
         """Service Reader → POST /events → require_write 403 naming 'Contributor'.
 
         Reader passes the resolver (qualifying role), but require_write rejects
         it because Contributor is absent.  The 403 detail must name Contributor.
+        Uses service_asgi_with_map (mapped oid) so the resolver itself succeeds
+        (an unmapped oid now 403s before require_write ever runs).
         """
-        private_key, asgi = service_asgi
+        private_key, asgi = service_asgi_with_map
         token = _sign_jwt(private_key, _service_claims(roles=["Reader"]))
 
         async with _make_client(asgi) as c:
@@ -1052,14 +1096,16 @@ class TestM2MessageContent:
 
     async def test_require_read_403_names_reader_and_write_roles(
         self,
-        service_asgi: tuple[Any, Any],
+        service_asgi_with_map: tuple[Any, Any],
     ) -> None:
         """Service IdentityAdmin-only → GET /blobs → require_read 403 naming Reader and Contributor.
 
         IdentityAdmin passes the resolver but is neither Contributor nor Reader,
         so require_read rejects it.  The 403 detail must name both read roles.
+        Uses service_asgi_with_map (mapped oid) so the resolver itself succeeds
+        (an unmapped oid now 403s before require_read ever runs).
         """
-        private_key, asgi = service_asgi
+        private_key, asgi = service_asgi_with_map
         token = _sign_jwt(private_key, _service_claims(roles=["IdentityAdmin"]))
 
         async with _make_client(asgi) as c:
