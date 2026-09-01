@@ -349,6 +349,88 @@ async def test_delete_drained_removes_log_and_offset_keeps_dead(tmp_path) -> Non
     assert len(await qm.read_dead_letters("s")) == 1
 
 
+# ---------------------------------------------------------------------------
+# pending_count / delete_session (A3): drain precondition + full queue delete
+# ---------------------------------------------------------------------------
+
+
+async def test_pending_count_reflects_appended_uncommitted_records(qm):
+    await qm.append("s1", b"a")
+    await qm.append("s1", b"b")
+    assert await qm.pending_count("s1") == 2
+
+
+async def test_pending_count_zero_after_full_commit(qm):
+    await qm.append("s1", b"a")
+    await qm.append("s1", b"b")
+    batch = await qm.read_batch("s1", max_items=10)
+    await qm.commit("s1", batch.end_offset)
+    assert await qm.pending_count("s1") == 0
+
+
+async def test_pending_count_ignores_torn_trailing_line(qm, tmp_path):
+    log = tmp_path / "queues" / "s1.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_bytes(b"complete\nTORN_PARTIAL")
+    assert await qm.pending_count("s1") == 1  # torn tail never counts
+
+
+async def test_pending_count_zero_for_unknown_session(qm):
+    assert await qm.pending_count("never-written") == 0
+
+
+@pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])
+async def test_pending_count_rejects_unsafe_session_id(qm, bad_id):
+    with pytest.raises(ValueError):
+        await qm.pending_count(bad_id)
+
+
+async def test_delete_session_removes_log_offset_and_dead_letters(qm, tmp_path):
+    await qm.append("s", b"line")
+    await qm.commit("s", 5)
+    await qm.dead_letter("s", b"bad\n", "boom")
+
+    removed = await qm.delete_session("s")
+
+    assert removed is True
+    queues_dir = tmp_path / "queues"
+    assert not (queues_dir / "s.log").exists()
+    assert not (queues_dir / "s.offset").exists()
+    assert not (queues_dir / "s.dead.jsonl").exists()  # unlike delete_drained
+
+
+async def test_delete_session_refuses_when_pending(qm, tmp_path):
+    await qm.append("s", b"line")  # never committed -> pending
+
+    with pytest.raises(RuntimeError):
+        await qm.delete_session("s")
+
+    # Nothing was partially deleted.
+    queues_dir = tmp_path / "queues"
+    assert (queues_dir / "s.log").exists()
+    assert await qm.pending_count("s") == 1
+
+
+async def test_delete_session_idempotent_on_missing_session(qm):
+    assert await qm.delete_session("never-written") is False
+
+
+async def test_delete_session_removes_dead_letter_only_session(qm, tmp_path):
+    """A session with no pending log (only dead letters) can be deleted."""
+    await qm.dead_letter("s-dead", b"poison", error="boom")
+
+    removed = await qm.delete_session("s-dead")
+
+    assert removed is True
+    assert not (tmp_path / "queues" / "s-dead.dead.jsonl").exists()
+
+
+@pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])
+async def test_delete_session_rejects_unsafe_session_id(qm, bad_id):
+    with pytest.raises(ValueError):
+        await qm.delete_session(bad_id)
+
+
 async def test_derive_all_stats_counts_pending_and_dead(qm):
     # s1: two complete pending (uncommitted) lines, no dead letters.
     await qm.append("s1", b"a")
