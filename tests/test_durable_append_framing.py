@@ -940,7 +940,7 @@ def test_captured_valid_large_event_parses_cleanly() -> None:
     assert len(raw) > 1024 * 1024
     assert raw.count(b"\n") == 0
 
-    event, workspace, data = SessionRegistry._parse_line(raw)
+    event, workspace, _working_dir, data = SessionRegistry._parse_line(raw)
     assert event
     assert workspace
     assert isinstance(data, dict)

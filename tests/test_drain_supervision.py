@@ -117,7 +117,11 @@ class _SequencedFlushGraph:
 
 
 async def _accumulate(
-    worker: SessionWorker, event: str, data: object, handlers: object
+    worker: SessionWorker,
+    event: str,
+    data: object,
+    handlers: object,
+    **_kw: object,
 ) -> None:
     """Stand-in for ``process_event``: buffers the event name on the fake
     graph, exactly like ``_FaultInjectableGraph``'s harness in the sibling
@@ -698,7 +702,7 @@ class TestMechanismSpecific:
         mock_finalize.assert_awaited_once()
         pending = await qm.read_batch(sid, 10)
         assert len(pending.records) == 1
-        event, _ws, _data = reg._parse_line(pending.records[0].raw)
+        event, _ws, _wd, _data = reg._parse_line(pending.records[0].raw)
         assert event == "session:end"
 
     async def test_recover_reports_a_terminal_but_unfinalized_session(self) -> None:

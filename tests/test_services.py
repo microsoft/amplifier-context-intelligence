@@ -231,6 +231,73 @@ class TestHookStateService:
         assert "RootSession" not in node["labels"]
         assert node["status"] == "running"
 
+    async def test_ensure_session_node_lifts_working_dir(self):
+        """working_dir from the event envelope is stamped on a new Session node."""
+        svc = HookStateService()
+        await svc.ensure_session_node(
+            "session-wd",
+            {"started_at": "2024-01-01T00:00:00"},
+            working_dir="/home/user/project",
+        )
+        node = await svc.graph.get_node("session-wd")
+        assert node is not None
+        assert node["working_dir"] == "/home/user/project"
+
+    async def test_ensure_session_node_omits_absent_working_dir(self):
+        """No working_dir property is written when the event reports none."""
+        svc = HookStateService()
+        await svc.ensure_session_node(
+            "session-no-wd", {"started_at": "2024-01-01T00:00:00"}
+        )
+        node = await svc.graph.get_node("session-no-wd")
+        assert node is not None
+        assert "working_dir" not in node
+
+    async def test_ensure_session_node_backfills_existing_node(self):
+        """A Session node that already exists WITHOUT a working_dir gets one.
+
+        This is the re-import / crash-recovery path: the node survives from an
+        earlier run (or was stubbed by a delegation edge), so a fresh worker
+        takes the node-exists branch. Without populate-if-missing here, no
+        already-ingested session could ever be attributed to its folder.
+        """
+        svc = HookStateService()
+        # Simulate a node written by an earlier run, with no working_dir.
+        await svc.graph.upsert_node(
+            "session-backfill",
+            {
+                "labels": ["Session"],
+                "status": "running",
+                "session_id": "session-backfill",
+            },
+        )
+        # A DIFFERENT worker (cold _seen_sessions) drains an event for it.
+        svc2 = HookStateService(graph_store=svc.graph)
+        await svc2.ensure_session_node(
+            "session-backfill", {}, working_dir="/home/user/project"
+        )
+        node = await svc.graph.get_node("session-backfill")
+        assert node is not None
+        assert node["working_dir"] == "/home/user/project"
+
+    async def test_ensure_session_node_never_overwrites_working_dir(self):
+        """An already-attributed session is not re-attributed by a later event."""
+        svc = HookStateService()
+        await svc.graph.upsert_node(
+            "session-set",
+            {
+                "labels": ["Session"],
+                "status": "running",
+                "session_id": "session-set",
+                "working_dir": "/original/path",
+            },
+        )
+        svc2 = HookStateService(graph_store=svc.graph)
+        await svc2.ensure_session_node("session-set", {}, working_dir="/different/path")
+        node = await svc.graph.get_node("session-set")
+        assert node is not None
+        assert node["working_dir"] == "/original/path"
+
     async def test_ensure_session_node_is_idempotent(self):
         """ensure_session_node is a no-op when session_id was already processed."""
         svc = HookStateService()

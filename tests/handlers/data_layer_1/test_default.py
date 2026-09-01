@@ -273,6 +273,29 @@ class TestDefaultHandlerDataProperty:
         assert data["custom_info"] == "extra-value"
 
 
+class TestDefaultHandlerWorkingDir:
+    """working_dir is a SESSION attribute — Event nodes must not duplicate it."""
+
+    async def test_event_node_does_not_carry_working_dir(
+        self, services: HookStateService
+    ) -> None:
+        """Event nodes carry no working_dir property.
+
+        The folder a session ran in is stored once on its Session node; every
+        Event is one HAS_EVENT hop away, so a per-event copy buys no query and
+        costs a string on the highest-volume write path in the system.
+        """
+        handler = DefaultHandler(services)
+        await handler(
+            "session:resume",
+            {"session_id": "s1", "timestamp": "2026-01-01T02:00:00Z"},
+        )
+        event_id = make_node_id("s1", "session:resume", "2026-01-01T02:00:00Z")
+        node = await services.graph.get_node(event_id)
+        assert node is not None
+        assert "working_dir" not in node
+
+
 class TestDefaultHandlerEdgeType:
     """HAS_EVENT edge has type='HAS_EVENT'."""
 

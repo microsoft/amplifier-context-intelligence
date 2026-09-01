@@ -80,7 +80,11 @@ class TestG1DrainWorkerCancelled:
         release = asyncio.Event()
 
         async def _blocking_process(
-            worker: object, event: str, data: object, handlers: object
+            worker: object,
+            event: str,
+            data: object,
+            handlers: object,
+            **_kw: object,
         ) -> None:
             started.set()
             await release.wait()  # never set -- cancellation always wins here

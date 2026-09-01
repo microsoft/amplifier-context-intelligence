@@ -133,7 +133,9 @@ class TestOversizedEventControlPathIsolatesAndContinues:
         worker.services.graph = fake  # type: ignore[assignment]
         reg._register_for_test(worker)
 
-        async def _process(w: object, event: str, data: object, h: object) -> None:
+        async def _process(
+            w: object, event: str, data: object, h: object, **_kw: object
+        ) -> None:
             fake.buffer.add(event)
 
         with patch(

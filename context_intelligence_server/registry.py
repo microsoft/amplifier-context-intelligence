@@ -298,12 +298,20 @@ class SessionRegistry:
         event: str,
         data: dict[str, Any],
         handlers: Any,
+        *,
+        working_dir: str | None = None,
     ) -> None:
-        """Dispatch one event, update worker stats, and record to the ring buffer."""
+        """Dispatch one event, update worker stats, and record to the ring buffer.
+
+        *working_dir* is the envelope-level working directory read off the
+        queued line (``None`` when the line carries none); it is forwarded to
+        the pipeline so the Session node can be attributed to the folder the
+        session ran in.
+        """
         result = "ok"
         error = ""
         try:
-            await process_event(worker, event, data, handlers)
+            await process_event(worker, event, data, handlers, working_dir=working_dir)
             worker.last_event = event
             worker.last_event_time = time.time()
             worker.events_processed += 1
@@ -495,10 +503,28 @@ class SessionRegistry:
                 return
 
     @staticmethod
-    def _parse_line(raw: bytes) -> tuple[str, str, dict[str, Any]]:
-        """Decode an appended event line (raw EventRequest JSON)."""
+    def _parse_line(raw: bytes) -> tuple[str, str, str | None, dict[str, Any]]:
+        """Decode an appended event line (raw EventRequest JSON).
+
+        ``working_dir`` is a TOP-LEVEL envelope field (a sibling of
+        ``workspace``), not part of ``data`` — the hook emits it as a session
+        attribute rather than event content.  Reading it here, off the durable
+        queue line, is what makes working-dir attribution crash-safe: the value
+        was persisted with the event by ``post_events`` (which stores the raw
+        request body verbatim), so a worker respawned by crash recovery or
+        dead-letter replay reads the same value from the same bytes.  Binding
+        it to the in-memory worker instead would lose it on every restart.
+
+        Returns ``None`` — never ``""`` — when the line carries no working_dir,
+        so "not reported" stays distinguishable from a blank path downstream.
+        """
         obj = json.loads(raw.decode("utf-8"))
-        return obj["event"], obj.get("workspace", ""), obj.get("data", {})
+        return (
+            obj["event"],
+            obj.get("workspace", ""),
+            obj.get("working_dir") or None,
+            obj.get("data", {}),
+        )
 
     async def _process_batch(
         self, worker: SessionWorker, batch: Batch, handlers: Any
@@ -529,8 +555,10 @@ class SessionRegistry:
         terminal_at: int | None = None
         safe_count = 0
         for rec in batch.records:
-            event, _workspace, data = self._parse_line(rec.raw)
-            await self._process_one(worker, event, data, handlers)
+            event, _workspace, working_dir, data = self._parse_line(rec.raw)
+            await self._process_one(
+                worker, event, data, handlers, working_dir=working_dir
+            )
             if terminal_at is None:
                 if event in TERMINAL_EVENTS:
                     terminal_at = rec.start
@@ -569,7 +597,7 @@ class SessionRegistry:
         worker.services.graph.discard_buffer()
         for rec in batch.records:
             try:
-                event, _ws, data = self._parse_line(rec.raw)
+                event, _ws, working_dir, data = self._parse_line(rec.raw)
             except Exception as exc:
                 # Unparseable: can't be a terminal record -- poison as before.
                 await qm.dead_letter(session_id, rec.raw, str(exc))  # no re-framing
@@ -591,7 +619,9 @@ class SessionRegistry:
 
             wrote = False
             try:
-                await self._process_one(worker, event, data, handlers)
+                await self._process_one(
+                    worker, event, data, handlers, working_dir=working_dir
+                )
                 await self._flush_barrier(worker)
                 wrote = True
             except Exception as exc:

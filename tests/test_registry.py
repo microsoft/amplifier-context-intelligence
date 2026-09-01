@@ -761,7 +761,7 @@ class TestProcessOneLogsException:
         worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
         reg._register_for_test(worker)
 
-        async def mock_process(w, event, data, handlers):
+        async def mock_process(w, event, data, handlers, **_kw):
             raise ValueError("handler exploded")
 
         with (
@@ -1016,7 +1016,7 @@ class TestDurableSessionEnd:
         call_count = 0
 
         async def mock_process(
-            w: object, event: str, data: object, handlers: object
+            w: object, event: str, data: object, handlers: object, **_kw: object
         ) -> None:
             nonlocal call_count
             call_count += 1
@@ -1044,7 +1044,9 @@ class TestDurableSessionEnd:
         sid = "s-tail"
         processed: list[str] = []
 
-        async def _capture(w: object, event: str, data: object, h: object) -> None:
+        async def _capture(
+            w: object, event: str, data: object, h: object, **_kw: object
+        ) -> None:
             processed.append(event)
 
         worker = SessionWorker(
@@ -1204,7 +1206,9 @@ class TestDurableLinearPoisonIsolation:
         )
         worker.services.graph = fake  # type: ignore[assignment]
 
-        async def _process(w: object, event: str, data: object, h: object) -> None:
+        async def _process(
+            w: object, event: str, data: object, h: object, **_kw: object
+        ) -> None:
             # process_event buffers the line's write (here: the event name).
             fake.buffer.add(event)
 
@@ -1709,7 +1713,9 @@ class TestWrittenCounterWiring:
         )
         worker.services.graph = fake  # type: ignore[assignment]
 
-        async def _process(w: object, event: str, data: object, h: object) -> None:
+        async def _process(
+            w: object, event: str, data: object, h: object, **_kw: object
+        ) -> None:
             fake.buffer.add(event)
 
         reg._register_for_test(worker)
@@ -2186,3 +2192,56 @@ class TestSessionOwnershipInvariant:
 
         # 3. Worker is returned — no exception raised
         assert worker is not None
+
+
+class TestParseLineWorkingDir:
+    """_parse_line reads working_dir off the DURABLE queue line.
+
+    This is the load-bearing property of working-dir attribution: the value is
+    persisted with the event by post_events (which stores the raw request body
+    verbatim), so it is still there for a worker respawned by crash recovery or
+    dead-letter replay — neither of which ever sees the original HTTP request.
+    """
+
+    def test_parse_line_reads_top_level_working_dir(self) -> None:
+        from context_intelligence_server.registry import SessionRegistry
+
+        raw = json.dumps(
+            {
+                "event": "tool:pre",
+                "workspace": "-ws",
+                "working_dir": "/home/user/project",
+                "data": {"session_id": "s1"},
+            }
+        ).encode("utf-8")
+        event, workspace, working_dir, data = SessionRegistry._parse_line(raw)
+        assert event == "tool:pre"
+        assert workspace == "-ws"
+        assert working_dir == "/home/user/project"
+        assert data == {"session_id": "s1"}
+
+    def test_parse_line_working_dir_absent_is_none(self) -> None:
+        """A line with no working_dir yields None, not "" — absent != blank."""
+        from context_intelligence_server.registry import SessionRegistry
+
+        raw = json.dumps(
+            {"event": "tool:pre", "workspace": "-ws", "data": {"session_id": "s1"}}
+        ).encode("utf-8")
+        _event, _ws, working_dir, _data = SessionRegistry._parse_line(raw)
+        assert working_dir is None
+
+    def test_parse_line_working_dir_empty_string_is_none(self) -> None:
+        """An empty working_dir normalizes to None so it cannot satisfy the
+        populate-if-missing guard and block the real value later."""
+        from context_intelligence_server.registry import SessionRegistry
+
+        raw = json.dumps(
+            {
+                "event": "tool:pre",
+                "workspace": "-ws",
+                "working_dir": "",
+                "data": {"session_id": "s1"},
+            }
+        ).encode("utf-8")
+        _event, _ws, working_dir, _data = SessionRegistry._parse_line(raw)
+        assert working_dir is None

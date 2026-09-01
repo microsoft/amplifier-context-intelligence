@@ -70,7 +70,11 @@ class _AccumGraph:
 
 
 async def _accumulate(
-    worker: SessionWorker, event: str, data: object, handlers: object
+    worker: SessionWorker,
+    event: str,
+    data: object,
+    handlers: object,
+    **_kw: object,
 ) -> None:
     """Stand-in for ``process_event``: buffers the event name on the fake graph."""
     worker.services.graph.buffer.add(event)

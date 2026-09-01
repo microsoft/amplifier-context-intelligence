@@ -3363,3 +3363,104 @@ class TestDataConflictOnFlushPathDoesNotDeadLetter:
 
         with pytest.raises(RuntimeError, match="doctor --fix"):
             await run_repair(_FakeDriver(session))
+
+
+# ---------------------------------------------------------------------------
+# working_dir: populate-if-missing at the Session MERGE
+# ---------------------------------------------------------------------------
+
+
+class TestWorkingDirCoalesce:
+    """working_dir is coalesced, never blind-overwritten, on Session nodes.
+
+    Holding it out of ``row.props`` and applying
+    ``coalesce(n.working_dir, row.working_dir)`` makes "an already-attributed
+    session is never re-attributed" a DATABASE guarantee, so it also holds for
+    a concurrent writer or a replayed batch — not just for the in-process
+    guard in ensure_session_node.
+    """
+
+    def test_build_node_props_excludes_working_dir(self) -> None:
+        from context_intelligence_server.neo4j_store import _build_node_props
+
+        props = _build_node_props(
+            {"labels": ["Session"], "status": "running", "working_dir": "/p"},
+            "ws-1",
+        )
+        assert "working_dir" not in props, (
+            "working_dir must NOT ride in row.props — the blind `SET n += row.props` "
+            "would overwrite an already-set value, defeating populate-if-missing"
+        )
+        assert props["status"] == "running"
+
+    def test_write_batch_cypher_coalesces_working_dir(self) -> None:
+        import inspect
+
+        from context_intelligence_server import neo4j_store
+
+        source = inspect.getsource(neo4j_store._write_batch)
+        assert "coalesce(n.working_dir, row.working_dir)" in source, (
+            "the Session MERGE must coalesce working_dir rather than overwrite it"
+        )
+
+    async def test_write_batch_passes_working_dir_as_row_key(self) -> None:
+        """The Session row carries working_dir as a top-level key, not in props."""
+        from context_intelligence_server.neo4j_store import _write_batch
+
+        captured: list[dict[str, object]] = []
+
+        class _Tx:
+            async def run(self, statement: str, **kwargs: object) -> object:
+                captured.append({"statement": statement, "kwargs": kwargs})
+
+                class _R:
+                    async def consume(self) -> None:
+                        return None
+
+                return _R()
+
+        await _write_batch(
+            _Tx(),
+            {
+                "s1": {
+                    "labels": ["Session"],
+                    "status": "running",
+                    "working_dir": "/home/user/project",
+                }
+            },
+            {},
+            [],
+            "ws-1",
+        )
+        session_calls = [c for c in captured if "n:Session" in str(c["statement"])]
+        assert session_calls, "expected a Session MERGE statement"
+        rows = session_calls[0]["kwargs"]["rows"]  # type: ignore[index]
+        assert rows[0]["working_dir"] == "/home/user/project"
+        assert "working_dir" not in rows[0]["props"]
+
+    async def test_write_batch_omits_working_dir_row_key_when_absent(self) -> None:
+        """No working_dir on the node => no row key => the coalesce is a no-op."""
+        from context_intelligence_server.neo4j_store import _write_batch
+
+        captured: list[dict[str, object]] = []
+
+        class _Tx:
+            async def run(self, statement: str, **kwargs: object) -> object:
+                captured.append({"statement": statement, "kwargs": kwargs})
+
+                class _R:
+                    async def consume(self) -> None:
+                        return None
+
+                return _R()
+
+        await _write_batch(
+            _Tx(),
+            {"s1": {"labels": ["Session"], "status": "running"}},
+            {},
+            [],
+            "ws-1",
+        )
+        session_calls = [c for c in captured if "n:Session" in str(c["statement"])]
+        rows = session_calls[0]["kwargs"]["rows"]  # type: ignore[index]
+        assert "working_dir" not in rows[0]
