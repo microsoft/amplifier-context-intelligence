@@ -96,6 +96,21 @@ class DeletionService:
                 pending.append(sid)
         return pending
 
+    async def _blob_count(self, session_ids: frozenset[str]) -> int:
+        """Return the total number of blobs stored for every session in *session_ids*.
+
+        The blob store is keyed by session id and already knows every blob it
+        holds for a session (``BlobStore.list``), so this asks the blob store
+        directly instead of trying to find blob markers hidden inside graph
+        node data. This also means a blob is counted even if no node happens
+        to reference it -- the blob store is the one place that knows what it
+        is actually holding.
+        """
+        total = 0
+        for sid in session_ids:
+            total += len(await self._blobs.list(sid))
+        return total
+
     async def preview(self, session_id: str) -> DeletionPreview | None:
         """Resolve the whole session graph for *session_id* and report what
         deleting it would do -- mutates nothing.
@@ -107,12 +122,13 @@ class DeletionService:
             return None
 
         pending_sessions = await self._pending_sessions(graph.session_ids)
+        blob_count = await self._blob_count(graph.session_ids)
         return DeletionPreview(
             root_id=graph.root_id,
             session_ids=graph.session_ids,
             node_count=graph.node_count,
             edge_count=graph.edge_count,
-            blob_count=len(graph.blob_refs),
+            blob_count=blob_count,
             created_by=graph.created_by,
             started_at=graph.started_at,
             last_change=graph.last_change,
@@ -131,9 +147,9 @@ class DeletionService:
         Resolves the graph, enforces the drain precondition (every session in
         the graph must have zero pending queue records) across the WHOLE
         graph, then deletes in order: graph -> blobs (per session) -> queue
-        artifacts (per session). ``session_ids``/``blob_refs`` are captured
-        from the resolution BEFORE any delete, so losing the graph node set
-        first does not lose track of what else must be removed.
+        artifacts (per session). ``session_ids`` is captured from the
+        resolution BEFORE any delete, so losing the graph node set first does
+        not lose track of what else must be removed.
 
         Returns ``None`` if *session_id* does not resolve to any known
         session -- no writes occur in that case.
@@ -141,16 +157,13 @@ class DeletionService:
         Raises:
             RuntimeError: If any session in the graph has pending (uncommitted)
                 queue records (refuses, deletes nothing), or if the graph
-                vanishes between resolve and delete. A blob-count reconciliation
-                mismatch is logged as a warning, not raised -- the blobs are gone
-                either way and the delete is irreversible.
+                vanishes between resolve and delete.
         """
         graph = await self._graph.resolve_session_graph(session_id)
         if graph is None:
             return None
 
         session_ids = graph.session_ids
-        blob_refs = graph.blob_refs
 
         pending_sessions = await self._pending_sessions(session_ids)
         if pending_sessions:
@@ -170,21 +183,6 @@ class DeletionService:
         blobs_deleted = 0
         for sid in session_ids:
             blobs_deleted += await self._blobs.delete_session(sid)
-
-        if blobs_deleted != len(blob_refs):
-            # Observability only, never a failure: the blobs are gone either way.
-            # A session dir can legitimately hold unreferenced (orphan) blobs, and
-            # a referenced blob's file may already have been reclaimed, so an exact
-            # match is not guaranteed -- and raising here would report failure on an
-            # already-completed, irreversible delete.
-            logger.warning(
-                "session_deletion_blob_reconcile_mismatch root_id=%s "
-                "blobs_deleted=%d blob_refs=%d",
-                graph.root_id,
-                blobs_deleted,
-                len(blob_refs),
-                extra={"session_id": graph.root_id},
-            )
 
         queue_sessions_cleaned = 0
         for sid in session_ids:

@@ -43,12 +43,9 @@ Non-negotiable guarantees for all conforming implementations:
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
-
-_BLOB_REF_KEY = "$blob_ref"
 
 
 @dataclass(frozen=True)
@@ -57,20 +54,27 @@ class SessionGraph:
 
     A session graph spans many session nodes (root + subsessions + forks),
     never just the one passed in (see B1 in
-    docs/context-intelligence-delete-session-data.md). ``session_ids`` and
-    ``blob_refs`` are the authoritative sets: a later delete operation reuses
-    this exact resolution so its dry-run preview and its apply step can never
-    disagree.
+    docs/context-intelligence-delete-session-data.md). ``session_ids`` is
+    the authoritative set: a later delete operation reuses this exact
+    resolution so its dry-run preview and its apply step can never disagree.
 
-    ``node_count``/``edge_count`` and ``blob_refs`` cover the graph's own
-    subgraph only -- traversal stops at (but includes) any ``:SST_CONCEPT``
-    node, since concept nodes (Agent/Orchestrator/Recipe) are shared across
-    sessions and are never owned by one graph.
+    This carries the session ids and the graph facts (node/edge counts,
+    who started it, when it last changed) -- it does not carry the graph's
+    blobs. Blobs belong to the blob store, which is already keyed by
+    session id and can list every blob for a session directly
+    (``BlobStore.list``). The caller that needs blob counts or sizes (the
+    deletion service) asks the blob store for each session id in
+    ``session_ids`` and adds the results up, instead of this store trying to
+    find blob markers hidden inside node data.
+
+    ``node_count``/``edge_count`` cover the graph's own subgraph only --
+    traversal stops at (but includes) any ``:SST_CONCEPT`` node, since
+    concept nodes (Agent/Orchestrator/Recipe) are shared across sessions and
+    are never owned by one graph.
     """
 
     root_id: str
     session_ids: frozenset[str]
-    blob_refs: frozenset[str]
     node_count: int
     edge_count: int
     created_by: str | None
@@ -97,30 +101,6 @@ class GraphDeleteResult:
     root_id: str
     nodes_deleted: int
     relationships_deleted: int
-
-
-def extract_blob_refs(props: dict[str, Any]) -> frozenset[str]:
-    """Return the distinct ``ci-blob://`` URIs referenced anywhere in *props*.
-
-    Blob-offloaded fields (``blob_processor.py``) are written as
-    ``{"$blob_ref": uri}``. In-memory stores keep that nested-dict shape;
-    Neo4j has no nested-map property type, so ``Neo4jGraphStore._sanitize_properties``
-    JSON-serialises the same dict to a string. Both shapes are handled here so
-    every ``GraphStore`` implementation can share one extraction routine.
-    """
-    refs: set[str] = set()
-    for value in props.values():
-        candidate: Any = value
-        if isinstance(candidate, str) and _BLOB_REF_KEY in candidate:
-            try:
-                candidate = json.loads(candidate)
-            except ValueError:
-                continue
-        if isinstance(candidate, dict):
-            ref = candidate.get(_BLOB_REF_KEY)
-            if isinstance(ref, str):
-                refs.add(ref)
-    return frozenset(refs)
 
 
 @runtime_checkable

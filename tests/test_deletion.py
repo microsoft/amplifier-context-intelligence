@@ -89,7 +89,6 @@ async def _build_drained_multi_session_graph(
             "labels": ["Session", "RootSession"],
             "started_at": "2026-01-01T00:00:00",
             "created_by": "colombod",
-            "raw": {"$blob_ref": blob_root},
         },
     )
     await graph.upsert_node(
@@ -97,7 +96,6 @@ async def _build_drained_multi_session_graph(
         {
             "labels": ["Session", "SubSession"],
             "started_at": "2026-01-01T00:01:00",
-            "raw": {"$blob_ref": blob_sub1},
         },
     )
     await graph.upsert_edge(root, sub1, {"type": "HAS_SUBSESSION"})
@@ -106,8 +104,6 @@ async def _build_drained_multi_session_graph(
         {
             "labels": ["Session", "SubSession"],
             "started_at": "2026-01-01T00:02:00",
-            "result": {"$blob_ref": blob_sub2a},
-            "extra": {"$blob_ref": blob_sub2b},
         },
     )
     await graph.upsert_edge(sub1, sub2, {"type": "HAS_SUBSESSION"})
@@ -200,9 +196,7 @@ async def test_apply_refuses_and_deletes_nothing_when_pending(
 ) -> None:
     root, sub1 = "ap-root", "ap-sub1"
     blob_uri = await blob_store.write(root, "k1", {"v": 1})
-    await graph.upsert_node(
-        root, {"labels": ["Session", "RootSession"], "raw": {"$blob_ref": blob_uri}}
-    )
+    await graph.upsert_node(root, {"labels": ["Session", "RootSession"]})
     await graph.upsert_node(sub1, {"labels": ["Session", "SubSession"]})
     await graph.upsert_edge(root, sub1, {"type": "HAS_SUBSESSION"})
     await queue_manager.append(sub1, b'{"event": "tool:pre"}')  # uncommitted
@@ -303,13 +297,19 @@ async def test_apply_logs_the_deletion(
     ), "the applied deletion must be logged once at INFO with root_id/requested_by"
 
 
-async def test_apply_succeeds_and_warns_on_blob_reconcile_mismatch(
+async def test_preview_and_apply_count_every_blob_the_store_holds(
     service: DeletionService,
     graph: GraphState,
     blob_store: AsyncDiskBlobStore,
     queue_manager: QueueManager,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """Blob counting goes through the blob store, not through node data.
+
+    A blob written for a graph session is counted and deleted even though no
+    node property points at it -- the blob store already knows which blobs
+    belong to a session (``BlobStore.list``), so there is nothing left to
+    "reconcile" against a separate, node-derived count.
+    """
     root, sub1, sub2, concept = "rm-root", "rm-sub1", "rm-sub2", "rm-agent"
     blob_refs = await _build_drained_multi_session_graph(
         graph,
@@ -320,20 +320,17 @@ async def test_apply_succeeds_and_warns_on_blob_reconcile_mismatch(
         sub2=sub2,
         concept=concept,
     )
-    # An orphan blob: present on disk under a graph session, referenced by no node.
-    await blob_store.write(sub2, "orphan", {"v": "orphan"})
+    # A blob with no corresponding node property -- still a real file the
+    # blob store holds for this session.
+    await blob_store.write(sub2, "extra", {"v": "extra"})
 
-    with caplog.at_level(
-        logging.WARNING, logger="context_intelligence_server.deletion"
-    ):
-        result = await service.apply(root, requested_by="tester")
+    preview = await service.preview(root)
+    assert preview is not None
+    assert preview.blob_count == len(blob_refs) + 1
+
+    result = await service.apply(root, requested_by="tester")
 
     assert result is not None
-    assert result.blobs_deleted == len(blob_refs) + 1  # 5 removed, 4 referenced
+    assert result.blobs_deleted == len(blob_refs) + 1
     for sid in (root, sub1, sub2):
         assert await blob_store.list(sid) == []
-    assert any(
-        r.levelno == logging.WARNING
-        and "session_deletion_blob_reconcile_mismatch" in r.getMessage()
-        for r in caplog.records
-    ), "a blob-count mismatch must warn, not fail the delete"

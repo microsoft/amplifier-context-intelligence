@@ -24,11 +24,7 @@ from neo4j import unit_of_work as _unit_of_work
 from neo4j.exceptions import DriverError, Neo4jError
 
 from context_intelligence_server.config import Neo4jClientConfig
-from context_intelligence_server.graph_store import (
-    GraphDeleteResult,
-    SessionGraph,
-    extract_blob_refs,
-)
+from context_intelligence_server.graph_store import GraphDeleteResult, SessionGraph
 
 _LOG = logging.getLogger(__name__)
 
@@ -333,8 +329,7 @@ _GRAPH_SUBGRAPH_CYPHER = (
     "OPTIONAL MATCH (a)-[r]->(b) "
     "WHERE b IN graph_nodes "
     "WITH graph_nodes, collect(DISTINCT r) AS rels "
-    "RETURN size(graph_nodes) AS node_count, size(rels) AS edge_count, "
-    "[n IN graph_nodes | properties(n)] AS node_props"
+    "RETURN size(graph_nodes) AS node_count, size(rels) AS edge_count"
 )
 
 # ---------------------------------------------------------------------------
@@ -1787,7 +1782,6 @@ class Neo4jGraphStore:
 
         node_count = 0
         edge_count = 0
-        blob_refs: set[str] = set()
         try:
             subgraph_result = await self._driver.execute_query(
                 _GRAPH_SUBGRAPH_CYPHER,
@@ -1800,8 +1794,6 @@ class Neo4jGraphStore:
             subgraph_row = subgraph_result.records[0]
             node_count = subgraph_row["node_count"]
             edge_count = subgraph_row["edge_count"]
-            for props in subgraph_row["node_props"]:
-                blob_refs |= extract_blob_refs(dict(props))
 
         root_props = member_props.get(root_id, {})
         created_by = root_props.get("created_by")
@@ -1823,7 +1815,6 @@ class Neo4jGraphStore:
         return SessionGraph(
             root_id=root_id,
             session_ids=frozenset(session_ids),
-            blob_refs=frozenset(blob_refs),
             node_count=node_count,
             edge_count=edge_count,
             created_by=created_by if isinstance(created_by, str) else None,
