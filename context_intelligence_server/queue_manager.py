@@ -166,23 +166,13 @@ class QueueManager:
         return self._dir / f"{session_id}.dead.jsonl"
 
     def _read_committed_offset(self, session_id: str) -> int:
-        """Committed byte offset; reads bare-int and legacy JSON offset files."""
+        """Committed byte offset. A missing or empty ``.offset`` reads 0."""
         try:
             text = self._offset_path(session_id).read_text("utf-8")
         except FileNotFoundError:
             return 0
         text = text.strip()
-        if not text:
-            return 0
-        if text[0] == "{":
-            try:
-                cursor = json.loads(text)
-                return int(cursor["offset"])
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                raise ValueError(
-                    f"unparseable legacy offset document for session {session_id!r}"
-                ) from None
-        return int(text)
+        return int(text) if text else 0
 
     @staticmethod
     def _last_complete_end(path: Path) -> int:
@@ -195,8 +185,7 @@ class QueueManager:
         Streams BACKWARD from EOF in fixed chunks to find the last ``\\n`` --
         O(tail) memory and I/O, never O(file). Path-based (not
         session-id-based) so it serves both ``.log`` files (via
-        ``_complete_data_end``, a pure delegating refactor) and
-        ``.dead.jsonl`` files (``heal_torn_tails``).
+        ``_complete_data_end``) and ``.dead.jsonl`` files.
         """
         try:
             with open(path, "rb") as f:
@@ -317,7 +306,9 @@ class QueueManager:
         except OSError:
             logger.exception(
                 "append_partial_terminate_failed path=%s start=%d "
-                "(torn tail left; heal_torn_tails will remove it at next boot)",
+                "(torn fragment left unterminated; readers skip it, and the "
+                "next append merges it into one poison line that the drainer "
+                "dead-letters -- bytes are never silently removed)",
                 path,
                 start,
             )
@@ -343,104 +334,6 @@ class QueueManager:
                     raise
             finally:
                 os.close(fd)
-
-    @staticmethod
-    def _heal_one(path: Path) -> tuple[int, bool]:
-        """Heal one torn tail. Returns ``(bytes_discarded, healed)``.
-
-        Ordering is load-bearing: copy the torn bytes to a quarantine sidecar,
-        verify it is byte-complete, then truncate -- never the reverse. A
-        partial or failed quarantine leaves the file untouched (readers already
-        skip the tail; next boot retries). Raises ``OSError`` on any failure;
-        the caller catches it per file.
-        """
-        end = QueueManager._last_complete_end(path)
-        size = path.stat().st_size
-        if size <= end:
-            return 0, False
-        torn_bytes = size - end
-        quarantine = path.with_name(f"{path.name}.torn-{time.time_ns()}.bin")
-
-        with open(path, "rb") as src:
-            src.seek(end)
-            data = src.read()
-        if len(data) != torn_bytes:
-            raise OSError(
-                f"short read quarantining {path}: expected {torn_bytes} bytes, "
-                f"got {len(data)}"
-            )
-
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
-        fd = os.open(quarantine, flags, 0o644)
-        try:
-            QueueManager._write_all(fd, data)
-        finally:
-            os.close(fd)
-
-        written = quarantine.stat().st_size
-        if written != torn_bytes:
-            raise OSError(
-                f"quarantine incomplete for {path}: wrote {written} of {torn_bytes} bytes"
-            )
-
-        # ONLY now, with a verified-complete quarantine on disk, is it safe
-        # to shorten the original file.
-        os.truncate(path, end)
-        return torn_bytes, True
-
-    async def heal_torn_tails(self) -> dict[str, int]:
-        """One-time startup pass: truncate every queue file back to its last
-        complete line, quarantining the removed bytes.
-
-        Runs once per boot before any reader/writer is live, and is the only
-        place a queue file is shortened. Each ``*.log``/``*.dead.jsonl`` is
-        healed independently; a per-file failure is logged and skipped. Must
-        not raise (the caller is a lifespan hook; a raise would restart-loop on
-        the share being healed). Returns
-        ``{"files_healed", "bytes_discarded", "files_failed"}``.
-        """
-
-        def _heal_all() -> dict[str, int]:
-            files_healed = 0
-            bytes_discarded = 0
-            files_failed = 0
-            try:
-                paths = sorted(self._dir.glob("*.log")) + sorted(
-                    self._dir.glob("*.dead.jsonl")
-                )
-            except OSError:
-                logger.exception("heal_torn_tails_scan_failed dir=%s", self._dir)
-                return {
-                    "files_healed": 0,
-                    "bytes_discarded": 0,
-                    "files_failed": 0,
-                }
-            for path in paths:
-                try:
-                    discarded, healed = self._heal_one(path)
-                except OSError:
-                    files_failed += 1
-                    logger.exception("torn_tail_heal_failed path=%s", path)
-                    continue
-                if healed:
-                    files_healed += 1
-                    bytes_discarded += discarded
-                    logger.warning(
-                        "torn_tail_healed path=%s discarded=%d",
-                        path,
-                        discarded,
-                    )
-            result = {
-                "files_healed": files_healed,
-                "bytes_discarded": bytes_discarded,
-                "files_failed": files_failed,
-            }
-            logger.info("heal_torn_tails result=%s", result)
-            if files_failed:
-                logger.error("heal_torn_tails_incomplete files_failed=%d", files_failed)
-            return result
-
-        return await asyncio.to_thread(_heal_all)
 
     async def append(self, session_id: str, raw: bytes) -> None:
         """Durably append one record to ``session_id``'s ``.log``.
@@ -643,39 +536,6 @@ class QueueManager:
                     "dead_letter_unparseable key=%s skipped=%d", session_id, skipped
                 )
             return records
-
-        return await asyncio.to_thread(_read)
-
-    @staticmethod
-    def _is_parseable_line(raw: bytes) -> bool:
-        """Total: True iff ``raw`` is valid JSON. Never raises."""
-        try:
-            json.loads(raw)
-        except (ValueError, TypeError):
-            return False
-        return True
-
-    async def read_first_line(self, key: str) -> bytes | None:
-        """Return the FIRST (byte-0) line of ``key``'s `.log`, or None.
-
-        One `open` + one `readline` at offset 0 -- bounded, cheap. Returns
-        None when the file is missing, empty, or its first line is not yet
-        newline-terminated (torn/incomplete). Never raises:
-        this feeds the boot-path workspace-fallback resolution
-        (``main._recover_one_session``), which must be a total function.
-        """
-        self._validate_session_id(key)
-        path = self._log_path(key)
-
-        def _read() -> bytes | None:
-            try:
-                with open(path, "rb") as f:
-                    raw = f.readline()
-            except OSError:
-                return None
-            if not raw or not raw.endswith(b"\n"):
-                return None
-            return raw[:-1]
 
         return await asyncio.to_thread(_read)
 

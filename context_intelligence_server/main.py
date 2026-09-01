@@ -121,19 +121,10 @@ def _parse_workspace_and_creator(raw: str | bytes) -> tuple[str, str | None] | N
     return workspace, created_by
 
 
-# Last-resort workspace sentinel when no head line resolves a workspace.
-# Dispatching under it still isolates the bad line and drains the rest --
-# without this, a session whose committed-offset head is torn/unparseable
-# (the exact shape corruption leaves behind) would never be recovered at
-# all, stranding whatever undamaged data follows it in the same log.
-_RECOVERY_FALLBACK_WORKSPACE = "unknown-recovered"
-
-
 def _recover_one_session(
     sid: str,
     first_line: str | bytes,
     get_or_create: Any,
-    first_log_line: bytes | None = None,
 ) -> bool:
     """Parse the first queued line for *sid* and respawn a drainer when valid.
 
@@ -141,50 +132,37 @@ def _recover_one_session(
     real parsing/dispatch logic rather than reimplementing it inline.
 
     The queue-read step is handled by the caller (the lifespan loop or the test)
-    so this function is pure — no I/O, fully synchronous.
+    so this function is pure -- no I/O, fully synchronous.
 
-    Falls back to ``first_log_line`` (byte-0 of the log) when ``first_line``
-    doesn't resolve a workspace, then to the ``_RECOVERY_FALLBACK_WORKSPACE``
-    sentinel -- so a torn or corrupted head at the committed offset never
-    strands the (still durable, still on disk) data behind it.
+    A head line that does not resolve a workspace SKIPS the session rather than
+    guessing one. ``workspace`` is the graph partition key (every node is
+    MERGEd on ``{node_id, workspace}``), so dispatching under a substitute
+    would write the whole session into a partition it does not belong to and
+    drop its contributor -- worse, and harder to undo, than leaving the data
+    durable on disk for an operator. The log is untouched and a later boot
+    reports the session again.
 
     Args:
         sid:            Session id being recovered.
         first_line:     The first raw log line (bytes from QueueManager or str
                         from tests).  ``json.loads`` accepts both.
-        get_or_create:  The registry callable — ``registry.get_or_create`` in
+        get_or_create:  The registry callable -- ``registry.get_or_create`` in
                         production or a spy in tests.
-        first_log_line: Byte-0 of the same session's ``.log``, if available --
-                        the fallback source when ``first_line`` is torn.
 
     Returns:
-        True  – drainer was (re)spawned via *get_or_create*.
-        False – session skipped (no resolvable workspace anywhere available).
+        True  - drainer was (re)spawned via *get_or_create*.
+        False - session skipped (empty/torn workspace, or malformed JSON line).
     """
     parsed = _parse_workspace_and_creator(first_line)
-    if parsed is not None:
-        workspace, created_by = parsed
-        get_or_create(sid, workspace, created_by=created_by)
-        return True
-
-    if first_log_line is not None:
-        byte0_parsed = _parse_workspace_and_creator(first_log_line)
-        if byte0_parsed is not None:
-            workspace, created_by = byte0_parsed
-            logger.warning("recovery_fallback_workspace session=%s source=byte0", sid)
-            get_or_create(sid, workspace, created_by=created_by)
-            return True
-        # Last resort: dispatch under the sentinel anyway -- the drainer
-        # dead-letters the unparseable head and drains everything behind it.
-        logger.warning("recovery_fallback_workspace session=%s source=sentinel", sid)
-        get_or_create(sid, _RECOVERY_FALLBACK_WORKSPACE, created_by=None)
-        return True
-
-    logger.warning(
-        "recovery_skipped session=%s: torn or empty workspace in first line",
-        sid,
-    )
-    return False
+    if parsed is None:
+        logger.warning(
+            "recovery_skipped session=%s: torn or empty workspace in first line",
+            sid,
+        )
+        return False
+    workspace, created_by = parsed
+    get_or_create(sid, workspace, created_by=created_by)
+    return True
 
 
 async def _crash_recovery_topup(respawn_limit: int | None) -> int:
@@ -227,19 +205,7 @@ async def _crash_recovery_topup(respawn_limit: int | None) -> int:
         # get_or_create, whether or not a drainer already existed (get_or_create
         # is idempotent). So this count is "sessions dispatched this pass", an
         # upper bound on newly-spawned drainers -- fine for an INFO log.
-        dispatched = _recover_one_session(sid, batch.lines[0], registry.get_or_create)
-        if not dispatched:
-            # The committed-offset head didn't resolve a workspace (torn or
-            # corrupted) -- fall back to byte 0 of the same log before giving
-            # up, so a corrupted head never strands the data behind it.
-            first_log_line = await registry.queue_manager.read_first_line(sid)
-            dispatched = _recover_one_session(
-                sid,
-                batch.lines[0],
-                registry.get_or_create,
-                first_log_line=first_log_line,
-            )
-        if dispatched:
+        if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
             respawned += 1
     return respawned
 
@@ -343,13 +309,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "(un-migrated). Cold start refuses to boot to avoid duplicating "
             "them on write. Run: context-intelligence-server doctor --fix"
         )
-    # One-time startup pass: truncate every queue file back to its last
-    # complete line, quarantining any torn tail left by a non-atomic write on
-    # cloud/SMB storage. Must run BEFORE any reader below (reconcile, seed,
-    # recover) touches these files, so they only ever see whole records.
-    _heal_result = await registry.queue_manager.heal_torn_tails()
-    logger.info("lifespan_startup: heal_torn_tails result=%s", _heal_result)
-
     # Crash recovery: on startup, respawn one drainer per
     # session that still has an undrained, complete line. The workspace is
     # parsed from that session's FIRST log line so the respawned worker is

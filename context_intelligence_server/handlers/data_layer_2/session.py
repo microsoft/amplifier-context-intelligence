@@ -301,6 +301,18 @@ class SessionHandler:
     async def _handle_end(
         self, session_id: str, timestamp: str, data: dict[str, Any]
     ) -> None:
+        """Terminal handler. Runs TWICE per session and does NOT flush.
+
+        The drainer leaves the ``session:end`` record uncommitted so that
+        "ended but not finalized" survives a respawn, then re-dispatches it
+        during finalization (see ``SessionRegistry._process_batch``). Every
+        write below is therefore a read-then-MERGE and must stay idempotent.
+
+        There is also no ``graph.flush()`` here: the drainer's
+        ``_flush_barrier`` is the single write boundary, and it is the only
+        thing holding the Neo4j write semaphore. Flushing from a handler would
+        write outside that cap.
+        """
         # Read labels BEFORE the end-event upsert -- upserting first would
         # shadow the persisted type label and spuriously trigger stub-recovery.
         existing = await self.services.graph.get_node(session_id)

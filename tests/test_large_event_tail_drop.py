@@ -16,8 +16,7 @@ import asyncio
 import contextlib
 import functools
 import json
-import logging
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 

@@ -239,15 +239,6 @@ async def test_commit_is_atomic_no_temp_leftover(qm, tmp_path):
 # raise, never silently return 0 (0 would force a full re-drain).
 
 
-async def test_read_committed_offset_accepts_legacy_json_cursor(qm):
-    """A legacy JSON cursor document parses to its integer "offset" field."""
-    qm._offset_path("s1").write_text(
-        '{"v":1,"offset":12345,"cursor":{"dl2":{"a":1},"dl3":{}}}',
-        encoding="utf-8",
-    )
-    assert qm._read_committed_offset("s1") == 12345
-
-
 async def test_read_committed_offset_accepts_bare_int_unchanged(qm):
     """Bare-int offsets (the current write format) still parse exactly."""
     qm._offset_path("s1").write_text("980582046", encoding="utf-8")
@@ -277,20 +268,6 @@ async def test_read_committed_offset_garbage_still_raises(qm):
     qm._offset_path("s1").write_text("not-a-number", encoding="utf-8")
     with pytest.raises(ValueError):
         qm._read_committed_offset("s1")
-
-
-async def test_read_batch_drains_session_with_legacy_json_offset(qm):
-    """A session with a legacy JSON-cursor .offset drains via the normal
-    read path (read_batch) with no ValueError -- the fix must reach the
-    hot path, not just the private helper."""
-    await qm.append("s1", b"a")
-    await qm.append("s1", b"b")
-    qm._offset_path("s1").write_text('{"v":1,"offset":2,"cursor":{}}', encoding="utf-8")
-
-    batch = await qm.read_batch("s1", max_items=10)
-
-    assert batch.start_offset == 2
-    assert batch.lines == [b"b"]
 
 
 async def test_active_sessions_excludes_fully_committed(qm):

@@ -439,65 +439,6 @@ async def test_distinct_keys_append_concurrently(
 
 
 # ---------------------------------------------------------------------------
-# heal_torn_tails truncates and quarantines
-# ---------------------------------------------------------------------------
-
-
-async def test_heal_torn_tails_truncates_and_quarantines(tmp_path: Path) -> None:
-    qm = QueueManager(tmp_path)
-    key = "torn-key"
-    log_path = qm._log_path(key)
-    good = b'{"event":"a"}\n'
-    torn = b'{"event":"b","data":"partial-fragment-no-terminator'
-    log_path.write_bytes(good + torn)
-
-    result = await qm.heal_torn_tails()
-
-    assert result["files_healed"] == 1
-    assert result["bytes_discarded"] == len(torn)
-    assert result["files_failed"] == 0
-    assert log_path.read_bytes() == good, (
-        "file must end exactly at the last complete line"
-    )
-
-    sidecars = list(tmp_path.glob(f"{key}.log.torn-*.bin"))
-    assert len(sidecars) == 1
-    assert sidecars[0].read_bytes() == torn, "quarantined bytes must be byte-identical"
-
-    batch = await qm.read_batch(key, max_items=10)
-    assert len(batch.lines) == 1
-    assert batch.lines[0] == good[:-1]
-    assert _parses(batch.lines[0])
-
-
-async def test_heal_torn_tails_on_empty_and_newline_free_files(tmp_path: Path) -> None:
-    qm = QueueManager(tmp_path)
-    empty_key = "empty-key"
-    nf_key = "newline-free-key"
-    qm._log_path(empty_key).write_bytes(b"")
-    nf_fragment = b'{"event":"no-newline-yet"'
-    qm._log_path(nf_key).write_bytes(nf_fragment)
-
-    result = await qm.heal_torn_tails()
-
-    assert qm._log_path(empty_key).read_bytes() == b"", "0-byte file must be untouched"
-    assert not list(tmp_path.glob(f"{empty_key}.log.torn-*.bin")), (
-        "no sidecar for an empty file"
-    )
-
-    assert qm._log_path(nf_key).read_bytes() == b"", (
-        "newline-free file truncates to empty"
-    )
-    sidecars = list(tmp_path.glob(f"{nf_key}.log.torn-*.bin"))
-    assert len(sidecars) == 1
-    assert sidecars[0].read_bytes() == nf_fragment
-
-    assert result["files_failed"] == 0
-    # A file that was never referenced simply does not appear -- no-op, no exception.
-    assert not (tmp_path / "missing-key.log").exists()
-
-
-# ---------------------------------------------------------------------------
 # partial write failure discards the record; failure is loud
 # ---------------------------------------------------------------------------
 
@@ -567,7 +508,9 @@ async def test_partial_write_failure_logs_when_newline_terminate_fails(
         "newline-terminate failure must be logged at ERROR"
     )
 
-    # torn tail left untouched -- never truncated; heal_torn_tails removes it at boot
+    # Torn tail left untouched -- queue bytes are never removed. Readers skip an
+    # unterminated trailing fragment; the next append merges it into a single
+    # poison line that the drainer dead-letters.
     assert qm._log_path(key).read_bytes() == record[:8]
 
 
@@ -903,62 +846,6 @@ async def test_guard_survives_a_delete_that_races_a_parked_appender(
     batch = await qm.read_batch(key, max_items=10)
     assert len(batch.lines) == 2
     assert _parses(batch.lines[0]) and _parses(batch.lines[1])
-
-
-# ---------------------------------------------------------------------------
-# heal_torn_tails cannot crash boot
-# ---------------------------------------------------------------------------
-
-
-async def test_heal_torn_tails_survives_an_oserror_and_still_boots(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    qm = QueueManager(tmp_path)
-    good = b'{"event":"ok"}\n'
-    torn = b'{"event":"torn","data":"no-terminator-yet'
-    for name in ("a", "b", "c"):
-        qm._log_path(name).write_bytes(good + torn)
-
-    real_os_open = os.open
-    real_os_truncate = os.truncate
-
-    def _flaky_open(
-        path: Any, flags: int, mode: int = 0o777, *a: Any, **kw: Any
-    ) -> int:
-        if "a.log.torn-" in str(path):
-            raise OSError("simulated quarantine-copy failure for a")
-        return real_os_open(path, flags, mode, *a, **kw)
-
-    def _flaky_truncate(path: Any, length: int) -> None:
-        if str(path).endswith("b.log"):
-            raise OSError("simulated truncate failure for b")
-        return real_os_truncate(path, length)
-
-    monkeypatch.setattr(qm_module.os, "open", _flaky_open)
-    monkeypatch.setattr(qm_module.os, "truncate", _flaky_truncate)
-
-    with caplog.at_level(
-        logging.ERROR, logger="context_intelligence_server.queue_manager"
-    ):
-        result = await qm.heal_torn_tails()  # MUST NOT RAISE
-
-    assert result["files_failed"] == 2
-    assert result["files_healed"] == 1
-
-    # a: quarantine-copy raised -> file left EXACTLY as seeded, never truncated.
-    assert qm._log_path("a").read_bytes() == good + torn
-    assert not list(tmp_path.glob("a.log.torn-*.bin"))
-
-    # b: copy succeeded, truncate raised -> STILL left exactly as seeded
-    # (never truncated on a failed truncate call).
-    assert qm._log_path("b").read_bytes() == good + torn
-
-    # c: fully healed.
-    assert qm._log_path("c").read_bytes() == good
-    assert list(tmp_path.glob("c.log.torn-*.bin"))
-
-    error_msgs = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
-    assert sum("torn_tail_heal_failed" in m for m in error_msgs) == 2
 
 
 # ---------------------------------------------------------------------------

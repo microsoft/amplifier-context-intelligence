@@ -257,8 +257,14 @@ class SessionRegistry:
         """The one Neo4j-write boundary: a semaphore-gated, awaited flush.
 
         The semaphore caps concurrent write transactions across all session
-        drainers. The offset must only advance after this returns successfully;
-        correctness relies on the GraphStore protocol's flush-failure isolation.
+        drainers. The offset must only advance after this returns successfully.
+
+        Commit-after-flush is correct only because ``neo4j_store._flush_body``
+        snapshots-and-clears the buffer under ``_flush_lock`` and RESTORES it on
+        failure, plus the empty-buffer early return. That file is not modified
+        here; this barrier depends on it. This is also the ONLY place a flush
+        may happen -- a handler that flushes on its own would write outside the
+        semaphore (see ``SessionHandler._handle_end``).
         """
         async with self.write_semaphore:
             await worker.services.graph.flush()
@@ -430,6 +436,17 @@ class SessionRegistry:
         and ``safe_count`` is how many records precede it. Every record is
         still dispatched -- a failed terminal dispatch still goes through
         the retry/isolation path.
+
+        CONSEQUENCE -- ``session:end`` IS DISPATCHED TWICE PER SESSION. It is
+        dispatched here, but ``terminal_at`` leaves it UNCOMMITTED so that
+        "ended but not finalized" survives a respawn; ``_finalize_session``
+        then re-reads it via ``_drain_to_eof`` and dispatches it again. Every
+        handler on the terminal path must therefore be idempotent. The three
+        that claim ``session:end`` today (the data_layer_1 field lifter,
+        ``SessionHandler`` in data_layer_2, and ``DelegationHandler`` in
+        data_layer_3) are read-then-MERGE and tolerate it. Any new terminal
+        handler with a non-idempotent side effect (counters, appends,
+        notifications) will double-fire here.
         """
         from context_intelligence_server.pipeline import (
             TERMINAL_EVENTS,
