@@ -1591,6 +1591,7 @@ class Neo4jGraphStore:
         root_props = member_props.get(root_id, {})
         created_by = root_props.get("created_by")
         started_at = root_props.get("started_at")
+        working_dir = root_props.get("working_dir")
 
         last_change: datetime | None = None
         for props in member_props.values():
@@ -1615,7 +1616,7 @@ class Neo4jGraphStore:
             last_change=last_change,
             subsession_count=len(session_ids) - 1,
             workspace=workspace,
-            working_dir=None,
+            working_dir=working_dir if isinstance(working_dir, str) else None,
         )
 
     async def get_edge(self, src_id: str, dst_id: str) -> dict[str, Any] | None:
