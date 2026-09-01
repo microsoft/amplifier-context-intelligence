@@ -798,14 +798,16 @@ class Settings(BaseSettings):
         )
 
     # Upper bound on concurrent bolt connections for a driver shared across many
-    # logical callers (the lifespan admin driver, the registry's per-session
-    # driver). Well under the server's default bolt thread-pool size so a
-    # driver leak can no longer starve it.
+    # logical callers (the lifespan admin driver, the lifespan query driver, the
+    # registry's shared per-session driver). Well under the server's default
+    # bolt thread-pool size so a driver leak can no longer starve it. The neo4j
+    # driver's own default is 100; 50 is a deliberate reduction, since every
+    # session now shares one pool instead of holding a private one.
+    #
+    # No companion max_connection_lifetime knob: the driver already recycles
+    # pooled connections at 3600 s by default, so a setting whose default equals
+    # the library default would change nothing.
     neo4j_max_connection_pool_size: int = 50
-
-    # Recycles a pooled connection after this many seconds, so a long-idle
-    # connection cannot accumulate indefinitely on the server side.
-    neo4j_max_connection_lifetime: float = 3600.0
 
     @field_validator("neo4j_max_connection_pool_size")
     @classmethod
@@ -813,14 +815,6 @@ class Settings(BaseSettings):
         """Fail loud on a non-positive pool size."""
         if v <= 0:
             raise ValueError(f"neo4j_max_connection_pool_size must be > 0, got {v}")
-        return v
-
-    @field_validator("neo4j_max_connection_lifetime")
-    @classmethod
-    def _validate_neo4j_max_connection_lifetime(cls, v: float) -> float:
-        """Fail loud on a non-positive lifetime (must be finite so idle connections recycle)."""
-        if v <= 0:
-            raise ValueError(f"neo4j_max_connection_lifetime must be > 0, got {v}")
         return v
 
     # -------------------------------------------------------------------------

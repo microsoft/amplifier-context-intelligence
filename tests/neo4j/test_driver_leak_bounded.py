@@ -68,7 +68,6 @@ async def test_bolt_connections_stay_bounded_and_release(
         neo4j_user=user,
         neo4j_password=password,
         neo4j_max_connection_pool_size=POOL_SIZE,
-        neo4j_max_connection_lifetime=3600.0,
         blob_path=str(tmp_path / "blobs"),
         queues_path=str(tmp_path / "queues"),
     )

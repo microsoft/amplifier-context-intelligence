@@ -31,21 +31,47 @@ def build_bounded_neo4j_driver(
     config: Neo4jClientConfig,
     *,
     max_connection_pool_size: int,
-    max_connection_lifetime: float,
+    connection_acquisition_timeout: float | None = None,
 ) -> Any:
     """Construct an AsyncGraphDatabase driver with a bounded connection pool.
 
     Single source of truth for the pool-bounding kwargs applied to any driver
     meant to be shared across many logical callers (the lifespan admin driver,
-    the registry's per-session driver). Both ``main.build_neo4j_driver`` and
-    ``SessionRegistry`` call this so the two never diverge.
+    the lifespan query driver, the registry's shared per-session driver). All
+    three construct through here so they can never diverge.
+
+    Args:
+        max_connection_pool_size:
+            Hard cap on concurrent bolt connections for this driver.
+        connection_acquisition_timeout:
+            How long a caller waits for a free pooled connection before
+            failing. ``None`` (the lifespan drivers) leaves the driver default
+            in place, matching what those two did before they were routed
+            through this helper. ``SessionRegistry`` passes
+            ``settings.neo4j_lock_timeout`` so the shared per-session driver
+            keeps the acquisition budget the per-session drivers it replaced
+            carried -- and it matters more now, not less: one bounded pool is
+            shared by every session, so acquisition can genuinely queue.
+
+    ``max_connection_lifetime`` is deliberately not set: the neo4j driver
+    already recycles pooled connections at 3600 s by default, so passing it
+    would be a knob that changes nothing.
     """
-    return AsyncGraphDatabase.driver(
-        config.url,
-        auth=config.auth,
-        max_connection_pool_size=max_connection_pool_size,
-        max_connection_lifetime=max_connection_lifetime,
-    )
+    kwargs: dict[str, Any] = {
+        "max_connection_pool_size": max_connection_pool_size,
+        # Explicit auto-retry budget for transient errors (e.g. deadlocks) so
+        # the managed-transaction retry window is deliberate and reviewable
+        # rather than relying on the driver default implicitly. Carried over
+        # verbatim from the per-session driver construction this helper
+        # subsumed.
+        "max_transaction_retry_time": 30.0,
+    }
+    if (
+        connection_acquisition_timeout is not None
+        and connection_acquisition_timeout > 0
+    ):
+        kwargs["connection_acquisition_timeout"] = connection_acquisition_timeout
+    return AsyncGraphDatabase.driver(config.url, auth=config.auth, **kwargs)
 
 
 # ---------------------------------------------------------------------------

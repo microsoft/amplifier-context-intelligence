@@ -123,7 +123,6 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
         neo4j_flush_chunk_bytes: int = _real.neo4j_flush_chunk_bytes
         neo4j_lock_timeout: float = _real.neo4j_lock_timeout
         neo4j_max_connection_pool_size: int = _real.neo4j_max_connection_pool_size
-        neo4j_max_connection_lifetime: float = _real.neo4j_max_connection_lifetime
 
         # Neo4j two-client split (doc 12): SessionRegistry.get_or_create() calls
         # settings.resolve_neo4j_admin() directly, so this proxy (which stands

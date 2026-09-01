@@ -127,7 +127,12 @@ class SessionRegistry:
             self._neo4j_driver = build_bounded_neo4j_driver(
                 admin,
                 max_connection_pool_size=settings.neo4j_max_connection_pool_size,
-                max_connection_lifetime=settings.neo4j_max_connection_lifetime,
+                # Parity with the per-session driver this one replaces: a
+                # blocked acquisition must surface on the SAME budget as a
+                # blocked transaction. Load-bearing now in a way it was not
+                # before -- every session shares this one bounded pool, so
+                # acquisition can actually queue.
+                connection_acquisition_timeout=settings.neo4j_lock_timeout,
             )
         return self._neo4j_driver
 
@@ -137,8 +142,37 @@ class SessionRegistry:
         Neo4jGraphStore -- never closed by a per-session finalize."""
         return self._ensure_neo4j_driver()
 
+    async def shutdown_workers(self) -> None:
+        """Quiesce every drain worker BEFORE the shared driver is closed.
+
+        Ordering invariant (must run before ``close_neo4j_driver``): a live
+        drainer that meets a closed shared driver fails its batch, spends its
+        ``max_delivery_attempts`` budget in ~250 ms (5 attempts x the 50 ms
+        ``_DRAIN_POLL_INTERVAL`` backoff), and falls into
+        ``_handle_exhausted_batch`` -- which dead-letters each line AND commits
+        the offset past it. Those are healthy events that merely happened to be
+        queued at shutdown, and once dead-lettered they never replay.
+
+        Cancelling instead routes each drainer through its ``CancelledError``
+        handler -> ``_safe_close(worker)`` -> a final flush on a driver that is
+        still open. Anything left uncommitted stays in the durable queue and
+        replays on the next boot, which is the pre-shared-driver behaviour.
+
+        Exceptions are collected, not raised: shutdown must not be derailed by
+        one failing worker.
+        """
+        tasks = [w.task for w in self._workers.values() if w.task is not None]
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     async def close_neo4j_driver(self) -> None:
         """Close the shared driver exactly once, at process shutdown.
+
+        Call ``shutdown_workers()`` first -- see its docstring for why closing
+        this driver under a live drainer dead-letters good events.
 
         No-op if the driver was never built (no session has run yet).
         """

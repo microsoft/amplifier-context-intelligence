@@ -6,16 +6,23 @@ Covers:
   its own driver.
 - SessionRegistry hands the same driver instance to every per-session store
   instead of building one per session.
+- The shared driver keeps the pool cap AND the acquisition/retry budgets the
+  per-session drivers it replaced carried.
+- shutdown_workers() quiesces every drainer before the shared driver closes.
 """
 
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from context_intelligence_server.neo4j_store import Neo4jGraphStore
-from context_intelligence_server.registry import SessionRegistry
+from context_intelligence_server.config import Neo4jClientConfig, get_settings
+from context_intelligence_server.neo4j_store import (
+    Neo4jGraphStore,
+    build_bounded_neo4j_driver,
+)
+from context_intelligence_server.registry import SessionRegistry, SessionWorker
 
 # ---------------------------------------------------------------------------
 # Injected-driver seam (owns_driver)
@@ -158,8 +165,9 @@ async def test_n_sessions_build_exactly_one_driver(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_shared_driver_built_with_bounded_kwargs(monkeypatch) -> None:
-    """The single shared driver must be built WITH the bounded pool kwargs
-    (default pool size 50, lifetime 3600.0s) -- an unbounded build is the leak."""
+    """The single shared driver must be built WITH the bounded pool cap
+    (default 50) -- an unbounded build is the leak -- AND with the acquisition
+    budget the per-session drivers it replaced carried."""
     reg = SessionRegistry()
     builds = _spy_driver_factory(reg, monkeypatch)
 
@@ -168,9 +176,62 @@ async def test_shared_driver_built_with_bounded_kwargs(monkeypatch) -> None:
     assert len(builds) == 1
     kwargs = builds[0]["kwargs"]
     assert kwargs["max_connection_pool_size"] == 50
-    assert kwargs["max_connection_lifetime"] == 3600.0
+    # Parity with neo4j_lock_timeout (default 30.0): without this the driver
+    # silently falls back to its own 60.0s default, doubling how long a caller
+    # parks on an exhausted pool -- and the pool is now SHARED, so exhaustion
+    # is reachable in a way it never was with a private pool per session.
+    assert kwargs["connection_acquisition_timeout"] == get_settings().neo4j_lock_timeout
 
     _cancel_workers(reg)
+
+
+# ---------------------------------------------------------------------------
+# Driver-kwarg parity with the per-session driver this helper replaced
+# ---------------------------------------------------------------------------
+
+
+def test_build_bounded_driver_preserves_per_session_driver_kwargs() -> None:
+    """build_bounded_neo4j_driver must carry over BOTH kwargs the per-session
+    Neo4jGraphStore driver set, not just the new pool cap.
+
+    Regression guard: extracting the construction into a shared helper silently
+    dropped ``connection_acquisition_timeout`` (30.0 -> the driver's 60.0
+    default) and the explicit ``max_transaction_retry_time``.
+    """
+    config = Neo4jClientConfig(url="bolt://unused:7687", username="u", password="p")
+
+    with patch(
+        "context_intelligence_server.neo4j_store.AsyncGraphDatabase"
+    ) as mock_adb:
+        build_bounded_neo4j_driver(
+            config,
+            max_connection_pool_size=50,
+            connection_acquisition_timeout=30.0,
+        )
+
+    kwargs = mock_adb.driver.call_args.kwargs
+    assert kwargs["max_connection_pool_size"] == 50
+    assert kwargs["connection_acquisition_timeout"] == 30.0
+    assert kwargs["max_transaction_retry_time"] == 30.0
+    # Deliberately absent: the driver already defaults to 3600 s, so setting it
+    # would be a knob that changes nothing.
+    assert "max_connection_lifetime" not in kwargs
+
+
+def test_build_bounded_driver_omits_acquisition_timeout_when_not_given() -> None:
+    """The lifespan admin/query drivers pass no acquisition timeout, so the
+    helper must leave the driver default in place for them -- matching exactly
+    what those two did before they were routed through this helper."""
+    config = Neo4jClientConfig(url="bolt://unused:7687", username="u", password="p")
+
+    with patch(
+        "context_intelligence_server.neo4j_store.AsyncGraphDatabase"
+    ) as mock_adb:
+        build_bounded_neo4j_driver(config, max_connection_pool_size=50)
+
+    kwargs = mock_adb.driver.call_args.kwargs
+    assert "connection_acquisition_timeout" not in kwargs
+    assert kwargs["max_transaction_retry_time"] == 30.0
 
 
 @pytest.mark.asyncio
@@ -227,3 +288,81 @@ async def test_close_neo4j_driver_none_safe_when_no_session_ran() -> None:
     # Must not raise.
     await reg.close_neo4j_driver()
     assert reg._neo4j_driver is None
+
+
+# ---------------------------------------------------------------------------
+# Shutdown quiesce (shutdown_workers)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_shutdown_workers_cancels_and_awaits_every_drainer() -> None:
+    """shutdown_workers() must cancel AND await every live drain worker.
+
+    This is the ordering guard for the shared driver: a drainer still running
+    when the shared driver closes fails its batch, exhausts its retry budget,
+    and dead-letters healthy events (committing the offset past them).
+    """
+    reg = SessionRegistry()
+
+    started = asyncio.Event()
+
+    async def never_ending() -> None:
+        started.set()
+        await asyncio.sleep(3600)
+
+    workers = []
+    for i in range(3):
+        worker = SessionWorker(
+            session_id=f"s{i}",
+            workspace=f"/ws/{i}",
+            services=MagicMock(),
+        )
+        worker.task = asyncio.create_task(never_ending())
+        reg._workers[worker.session_id] = worker
+        workers.append(worker)
+
+    await started.wait()
+
+    await reg.shutdown_workers()
+
+    for worker in workers:
+        assert worker.task is not None
+        assert worker.task.done(), "shutdown_workers must AWAIT, not just cancel"
+        assert worker.task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_workers_no_op_with_no_workers() -> None:
+    """shutdown_workers() must be safe when no session ever ran."""
+    reg = SessionRegistry()
+    await reg.shutdown_workers()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_shutdown_workers_survives_a_failing_drainer() -> None:
+    """One worker raising during teardown must not abort the shutdown of the
+    others -- shutdown is not derailable by a single bad drainer."""
+    reg = SessionRegistry()
+
+    async def raises_on_cancel() -> None:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise RuntimeError("teardown blew up") from None
+
+    async def clean() -> None:
+        await asyncio.sleep(3600)
+
+    bad = SessionWorker(session_id="bad", workspace="/ws", services=MagicMock())
+    bad.task = asyncio.create_task(raises_on_cancel())
+    good = SessionWorker(session_id="good", workspace="/ws", services=MagicMock())
+    good.task = asyncio.create_task(clean())
+    reg._workers["bad"] = bad
+    reg._workers["good"] = good
+    await asyncio.sleep(0)
+
+    await reg.shutdown_workers()  # must not raise
+
+    assert bad.task.done()
+    assert good.task.done()

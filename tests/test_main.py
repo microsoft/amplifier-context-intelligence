@@ -741,6 +741,50 @@ async def test_lifespan_creates_and_closes_driver(
         assert mock_driver.close.await_count == 2
 
 
+async def test_lifespan_quiesces_drain_workers_before_closing_shared_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown MUST cancel the drain workers before closing the registry's
+    shared Neo4j driver.
+
+    Every session's graph store shares one driver now, so closing it under a
+    live drainer is not a per-session concern: the drainer's batch fails, it
+    burns its max_delivery_attempts budget in ~250ms, and
+    _handle_exhausted_batch dead-letters each line AND commits the offset past
+    it -- silently discarding healthy events that merely happened to be queued
+    at shutdown, with no replay on the next boot.
+    """
+    mock_driver = MagicMock()
+    mock_driver.close = AsyncMock()
+
+    calls: list[str] = []
+
+    async def record_shutdown_workers() -> None:
+        calls.append("shutdown_workers")
+
+    async def record_close_driver() -> None:
+        calls.append("close_neo4j_driver")
+
+    monkeypatch.setattr(
+        main_module.registry, "shutdown_workers", record_shutdown_workers
+    )
+    monkeypatch.setattr(main_module.registry, "close_neo4j_driver", record_close_driver)
+
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+    ):
+        async with lifespan(main_module.app):
+            assert calls == []
+
+    assert calls == ["shutdown_workers", "close_neo4j_driver"], (
+        f"drain workers must be quiesced BEFORE the shared driver closes; got {calls}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Lifespan crash-recovery + workers==1 guard tests (Phase B2)
 # ---------------------------------------------------------------------------

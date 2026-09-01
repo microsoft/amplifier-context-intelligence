@@ -73,7 +73,6 @@ def build_neo4j_driver(config: Neo4jClientConfig) -> Any:
     return build_bounded_neo4j_driver(
         config,
         max_connection_pool_size=_settings.neo4j_max_connection_pool_size,
-        max_connection_lifetime=_settings.neo4j_max_connection_lifetime,
     )
 
 
@@ -233,7 +232,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.neo4j_query_driver = build_bounded_neo4j_driver(
         _query,
         max_connection_pool_size=_settings.neo4j_max_connection_pool_size,
-        max_connection_lifetime=_settings.neo4j_max_connection_lifetime,
     )
     # Stash the resolved query access_mode so /cypher opens READ sessions without
     # re-resolving settings on every request.
@@ -378,6 +376,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             _sweep_task.cancel()
             with suppress(asyncio.CancelledError):
                 await _sweep_task
+        # ORDER IS LOAD-BEARING. Quiesce the drainers FIRST. Every session's
+        # graph store now shares ONE driver, so closing it under a live drainer
+        # is no longer a per-session concern: the drainer's batch fails, it
+        # spends its max_delivery_attempts budget in ~250 ms, and
+        # _handle_exhausted_batch dead-letters each line AND commits the offset
+        # past it -- discarding healthy events that merely happened to be
+        # queued at shutdown, with no replay on the next boot. Cancelling first
+        # routes each drainer through CancelledError -> _safe_close -> a final
+        # flush while the driver is still open.
+        logger.info("lifespan_shutdown: quiescing drain workers")
+        await registry.shutdown_workers()
         logger.info("lifespan_shutdown: closing Neo4j drivers")
         await app.state.neo4j_driver.close()
         await app.state.neo4j_query_driver.close()
