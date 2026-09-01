@@ -57,7 +57,10 @@ class MinimalGraphStore:
     ) -> dict[str, Any] | None:
         return None
 
-    async def resolve_session_family(self, session_id: str) -> Any:
+    async def resolve_session_graph(self, session_id: str) -> Any:
+        return None
+
+    async def delete_session_graph(self, session_id: str) -> Any:
         return None
 
     async def flush(self) -> None:
@@ -138,7 +141,10 @@ class MinimalQueryableStore:
     ) -> dict[str, Any] | None:
         return None
 
-    async def resolve_session_family(self, session_id: str) -> Any:
+    async def resolve_session_graph(self, session_id: str) -> Any:
+        return None
+
+    async def delete_session_graph(self, session_id: str) -> Any:
         return None
 
     async def flush(self) -> None:
