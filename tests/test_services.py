@@ -781,19 +781,19 @@ class TestHookStateServiceCreatedBy:
 
 
 # ---------------------------------------------------------------------------
-# GraphState.resolve_session_family tests
+# GraphState.resolve_session_graph tests
 # ---------------------------------------------------------------------------
 
 
-async def _build_family(state: GraphState) -> None:
+async def _build_graph(state: GraphState) -> None:
     """Seed a root + 2 subsessions + 1 fork, with blobs on several sessions.
 
     Tree shape:  root -[HAS_SUBSESSION]-> sub1 -[HAS_SUBSESSION]-> sub2
                  root -[FORKED]-> fork1
 
-    Blob-bearing event nodes attached at three different family sessions
+    Blob-bearing event nodes attached at three different graph sessions
     (root, sub2, fork1), plus a shared Agent (:SST_CONCEPT) reached from
-    fork1's Delegation, with an out-of-family node hanging off the Agent to
+    fork1's Delegation, with an out-of-graph node hanging off the Agent to
     prove traversal stops there.
     """
     state.created_by = "colombod"
@@ -833,7 +833,7 @@ async def _build_family(state: GraphState) -> None:
     )
     await state.upsert_edge("fam-root", "fam-fork1", {"type": "FORKED"})
 
-    # Blob-bearing nodes across several family sessions.
+    # Blob-bearing nodes across several graph sessions.
     await state.upsert_node(
         "fam-root::orch::1",
         {
@@ -880,20 +880,20 @@ async def _build_family(state: GraphState) -> None:
     )
 
 
-class TestGraphStateResolveSessionFamily:
-    """GraphState.resolve_session_family -- in-memory parity with Neo4jGraphStore."""
+class TestGraphStateResolveSessionGraph:
+    """GraphState.resolve_session_graph -- in-memory parity with Neo4jGraphStore."""
 
     async def test_returns_none_for_unknown_session(self) -> None:
         state = GraphState()
-        assert await state.resolve_session_family("does-not-exist") is None
+        assert await state.resolve_session_graph("does-not-exist") is None
 
-    async def test_sub_session_and_root_resolve_identical_family(self) -> None:
+    async def test_sub_session_and_root_resolve_identical_graph(self) -> None:
         state = GraphState()
-        await _build_family(state)
+        await _build_graph(state)
 
-        from_root = await state.resolve_session_family("fam-root")
-        from_sub = await state.resolve_session_family("fam-sub2")
-        from_fork = await state.resolve_session_family("fam-fork1")
+        from_root = await state.resolve_session_graph("fam-root")
+        from_sub = await state.resolve_session_graph("fam-sub2")
+        from_fork = await state.resolve_session_graph("fam-fork1")
 
         assert from_root is not None
         assert from_root.root_id == "fam-root"
@@ -908,51 +908,105 @@ class TestGraphStateResolveSessionFamily:
 
     async def test_subsession_count_excludes_root(self) -> None:
         state = GraphState()
-        await _build_family(state)
-        family = await state.resolve_session_family("fam-root")
-        assert family is not None
-        assert family.subsession_count == 3
+        await _build_graph(state)
+        graph = await state.resolve_session_graph("fam-root")
+        assert graph is not None
+        assert graph.subsession_count == 3
 
-    async def test_blob_refs_span_whole_family_and_exclude_concept_leak(self) -> None:
+    async def test_blob_refs_span_whole_graph_and_exclude_concept_leak(self) -> None:
         state = GraphState()
-        await _build_family(state)
-        family = await state.resolve_session_family("fam-root")
-        assert family is not None
-        assert family.blob_refs == {
+        await _build_graph(state)
+        graph = await state.resolve_session_graph("fam-root")
+        assert graph is not None
+        assert graph.blob_refs == {
             "ci-blob://fam-root/orch1",
             "ci-blob://fam-sub2/tool1",
             "ci-blob://fam-fork1/del1",
         }
-        assert "ci-blob://other-session-xyz/leak" not in family.blob_refs
+        assert "ci-blob://other-session-xyz/leak" not in graph.blob_refs
 
     async def test_node_and_edge_counts_exclude_past_concept_boundary(self) -> None:
         state = GraphState()
-        await _build_family(state)
-        family = await state.resolve_session_family("fam-root")
-        assert family is not None
+        await _build_graph(state)
+        graph = await state.resolve_session_graph("fam-root")
+        assert graph is not None
         # 4 sessions + orch + tool + delegation + agent (boundary, included) = 8
-        assert family.node_count == 8
+        assert graph.node_count == 8
         # root->sub1, sub1->sub2, root->fork1, root->orch, sub2->tool,
         # fork1->delegation, delegation->agent = 7 (agent->leak excluded)
-        assert family.edge_count == 7
+        assert graph.edge_count == 7
 
     async def test_created_by_and_started_at_from_root(self) -> None:
         state = GraphState()
-        await _build_family(state)
-        family = await state.resolve_session_family("fam-sub2")
-        assert family is not None
-        assert family.created_by == "colombod"
-        assert family.started_at is not None
-        assert family.started_at.isoformat() == "2026-01-01T00:00:00+00:00"
+        await _build_graph(state)
+        graph = await state.resolve_session_graph("fam-sub2")
+        assert graph is not None
+        assert graph.created_by == "colombod"
+        assert graph.started_at is not None
+        assert graph.started_at.isoformat() == "2026-01-01T00:00:00+00:00"
 
-    async def test_last_change_is_max_across_family_not_just_root(self) -> None:
+    async def test_last_change_is_max_across_graph_not_just_root(self) -> None:
         state = GraphState()
-        await _build_family(state)
-        family = await state.resolve_session_family("fam-root")
-        assert family is not None
+        await _build_graph(state)
+        graph = await state.resolve_session_graph("fam-root")
+        assert graph is not None
         # fam-sub2's last_updated (00:05) is later than root's started_at (00:00)
-        assert family.last_change is not None
-        assert family.last_change.isoformat() == "2026-01-01T00:05:00+00:00"
+        assert graph.last_change is not None
+        assert graph.last_change.isoformat() == "2026-01-01T00:05:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# GraphState.delete_session_graph tests
+# ---------------------------------------------------------------------------
+
+
+class TestGraphStateDeleteSessionGraph:
+    """GraphState.delete_session_graph -- in-memory parity with Neo4jGraphStore."""
+
+    async def test_returns_none_for_unknown_session(self) -> None:
+        state = GraphState()
+        assert await state.delete_session_graph("does-not-exist") is None
+
+    async def test_deletes_via_sub_session_id(self) -> None:
+        state = GraphState()
+        await _build_graph(state)
+
+        result = await state.delete_session_graph("fam-sub2")
+        assert result is not None
+        assert result.root_id == "fam-root"
+
+        for sid in ("fam-root", "fam-sub1", "fam-sub2", "fam-fork1"):
+            assert await state.get_node(sid) is None
+        assert await state.get_node("fam-root::orch::1") is None
+        assert await state.get_node("fam-sub2::tool::1") is None
+        assert await state.get_node("fam-fork1::delegation::1") is None
+
+    async def test_shared_concept_node_survives(self) -> None:
+        state = GraphState()
+        await _build_graph(state)
+        await state.delete_session_graph("fam-root")
+
+        assert await state.get_node("agent-shared") is not None
+
+    async def test_unrelated_session_reachable_only_via_concept_is_untouched(
+        self,
+    ) -> None:
+        state = GraphState()
+        await _build_graph(state)
+        await state.delete_session_graph("fam-root")
+
+        assert await state.get_node("other-session-xyz::leak") is not None
+        assert await state.get_edge("agent-shared", "other-session-xyz::leak") is not None
+
+    async def test_counts_match_deleted_nodes_and_edges(self) -> None:
+        state = GraphState()
+        await _build_graph(state)
+        result = await state.delete_session_graph("fam-root")
+        assert result is not None
+        # Owned = graph node_count (8) minus the boundary concept node (1) = 7.
+        assert result.nodes_deleted == 7
+        # Every edge except agent-shared -> leak (both endpoints not owned).
+        assert result.relationships_deleted == 7
 
 
 # ---------------------------------------------------------------------------
@@ -961,7 +1015,7 @@ class TestGraphStateResolveSessionFamily:
 
 
 class TestTotalBlobSize:
-    """total_blob_size() composes BlobStore.size() over a family's blob_refs."""
+    """total_blob_size() composes BlobStore.size() over a graph's blob_refs."""
 
     async def test_sums_sizes_across_multiple_refs(self, tmp_path) -> None:
         blob_store = AsyncDiskBlobStore(root=tmp_path)

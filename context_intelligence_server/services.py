@@ -14,11 +14,15 @@ from datetime import datetime
 from typing import Any
 
 from context_intelligence_server.blob_store import BlobStore
-from context_intelligence_server.graph_store import SessionFamily, extract_blob_refs
+from context_intelligence_server.graph_store import (
+    GraphDeleteResult,
+    SessionGraph,
+    extract_blob_refs,
+)
 from context_intelligence_server.handlers.data_layer_2.state import DataLayer2State
 from context_intelligence_server.handlers.data_layer_3.state import DataLayer3State
 
-_FAMILY_EDGE_TYPES = frozenset({"HAS_SUBSESSION", "FORKED"})
+_GRAPH_EDGE_TYPES = frozenset({"HAS_SUBSESSION", "FORKED"})
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
@@ -195,12 +199,12 @@ class GraphState:
                 return dict(data)
         return None
 
-    async def resolve_session_family(self, session_id: str) -> SessionFamily | None:
-        """In-memory equivalent of ``Neo4jGraphStore.resolve_session_family``.
+    async def resolve_session_graph(self, session_id: str) -> SessionGraph | None:
+        """In-memory equivalent of ``Neo4jGraphStore.resolve_session_graph``.
 
         Walks ``HAS_SUBSESSION``/``FORKED`` edges up to the root, then back
         down to every descendant. See that method's docstring for the
-        family-subgraph (node/edge/blob) traversal rule.
+        graph-subgraph (node/edge/blob) traversal rule.
         """
         start = self._nodes.get(session_id)
         if start is None or "Session" not in start.get("labels", []):
@@ -211,7 +215,7 @@ class GraphState:
         outgoing: dict[str, list[str]] = {}
         for (src, dst), edata in self._edges.items():
             outgoing.setdefault(src, []).append(dst)
-            if edata.get("type") in _FAMILY_EDGE_TYPES:
+            if edata.get("type") in _GRAPH_EDGE_TYPES:
                 parent_of[dst] = src
                 children.setdefault(src, []).append(dst)
 
@@ -234,15 +238,15 @@ class GraphState:
             session_ids.add(nid)
             stack.extend(children.get(nid, []))
 
-        # Family subgraph: expand outward from every family session, stopping
+        # Graph subgraph: expand outward from every graph session, stopping
         # at (but including) any :SST_CONCEPT node.
-        family_nodes: set[str] = set()
+        graph_nodes: set[str] = set()
         stack = list(session_ids)
         while stack:
             nid = stack.pop()
-            if nid in family_nodes:
+            if nid in graph_nodes:
                 continue
-            family_nodes.add(nid)
+            graph_nodes.add(nid)
             node_data = self._nodes.get(nid) or {}
             if "SST_CONCEPT" in node_data.get("labels", []):
                 continue
@@ -251,11 +255,11 @@ class GraphState:
         edge_count = sum(
             1
             for (src, dst) in self._edges
-            if src in family_nodes and dst in family_nodes
+            if src in graph_nodes and dst in graph_nodes
         )
 
         blob_refs: set[str] = set()
-        for nid in family_nodes:
+        for nid in graph_nodes:
             blob_refs |= extract_blob_refs(self._nodes.get(nid) or {})
 
         root_props = self._nodes.get(root_id) or {}
@@ -278,11 +282,11 @@ class GraphState:
             ):
                 last_change = candidate
 
-        return SessionFamily(
+        return SessionGraph(
             root_id=root_id,
             session_ids=frozenset(session_ids),
             blob_refs=frozenset(blob_refs),
-            node_count=len(family_nodes),
+            node_count=len(graph_nodes),
             edge_count=edge_count,
             created_by=created_by,
             started_at=started_at,
@@ -290,6 +294,79 @@ class GraphState:
             subsession_count=len(session_ids) - 1,
             workspace=self._workspace,
             working_dir=working_dir if isinstance(working_dir, str) else None,
+        )
+
+    async def delete_session_graph(self, session_id: str) -> GraphDeleteResult | None:
+        """In-memory equivalent of ``Neo4jGraphStore.delete_session_graph``.
+
+        Reuses ``resolve_session_graph`` to find the graph, then repeats its
+        exact traversal (up to the root, back down, then outward stopping at
+        but not past ``:SST_CONCEPT``) to partition the reachable nodes into
+        OWNED (removed) vs boundary concept (kept) -- see that method's
+        docstring for the traversal rule this must never diverge from.
+
+        Raises ``RuntimeError`` if, after removal, any owned node still exists
+        or any boundary concept node was wrongly removed -- the same gate
+        ``Neo4jGraphStore.delete_session_graph`` enforces.
+        """
+        graph = await self.resolve_session_graph(session_id)
+        if graph is None:
+            return None
+
+        parent_of: dict[str, str] = {}
+        children: dict[str, list[str]] = {}
+        outgoing: dict[str, list[str]] = {}
+        for (src, dst), edata in self._edges.items():
+            outgoing.setdefault(src, []).append(dst)
+            if edata.get("type") in _GRAPH_EDGE_TYPES:
+                parent_of[dst] = src
+                children.setdefault(src, []).append(dst)
+
+        owned: set[str] = set()
+        concept: set[str] = set()
+        stack = list(graph.session_ids)
+        visited: set[str] = set()
+        while stack:
+            nid = stack.pop()
+            if nid in visited:
+                continue
+            visited.add(nid)
+            node_data = self._nodes.get(nid) or {}
+            if "SST_CONCEPT" in node_data.get("labels", []):
+                concept.add(nid)
+                continue
+            owned.add(nid)
+            stack.extend(outgoing.get(nid, []))
+
+        relationships_deleted = sum(
+            1 for (src, dst) in self._edges if src in owned or dst in owned
+        )
+
+        for nid in owned:
+            self._nodes.pop(nid, None)
+        self._edges = {
+            key: data
+            for key, data in self._edges.items()
+            if key[0] not in owned and key[1] not in owned
+        }
+
+        survivors = [nid for nid in owned if nid in self._nodes]
+        if survivors:
+            raise RuntimeError(
+                f"delete_session_graph: owned node(s) survived deletion for "
+                f"graph root {graph.root_id!r}: {survivors!r}"
+            )
+        missing_concepts = [nid for nid in concept if nid not in self._nodes]
+        if missing_concepts:
+            raise RuntimeError(
+                f"delete_session_graph: shared concept node(s) were wrongly "
+                f"deleted for graph root {graph.root_id!r}: {missing_concepts!r}"
+            )
+
+        return GraphDeleteResult(
+            root_id=graph.root_id,
+            nodes_deleted=len(owned),
+            relationships_deleted=relationships_deleted,
         )
 
     def remove_edge(self, src_id: str, dst_id: str) -> None:
@@ -535,8 +612,8 @@ class HookStateService:
 async def total_blob_size(blob_store: BlobStore, blob_refs: Iterable[str]) -> int:
     """Sum the byte size of every ``ci-blob://`` URI in *blob_refs*.
 
-    Composes ``BlobStore.size()`` over the family's authoritative blob-ref set
-    (``SessionFamily.blob_refs``) -- the size lookup goes through the
+    Composes ``BlobStore.size()`` over the graph's authoritative blob-ref set
+    (``SessionGraph.blob_refs``) -- the size lookup goes through the
     ``BlobStore`` Protocol, never a raw filesystem stat, per the abstraction
     principle in docs/02-server-design.md. A missing blob contributes 0 (same
     idempotent-on-missing contract as ``BlobStore.size``/``delete_session``).

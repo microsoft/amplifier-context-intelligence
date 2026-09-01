@@ -52,8 +52,8 @@ _BLOB_REF_KEY = "$blob_ref"
 
 
 @dataclass(frozen=True)
-class SessionFamily:
-    """Whole-family resolution result backing the session-summary facts.
+class SessionGraph:
+    """Whole-graph resolution result backing the session-summary facts.
 
     A session graph spans many session nodes (root + subsessions + forks),
     never just the one passed in (see B1 in
@@ -62,10 +62,10 @@ class SessionFamily:
     this exact resolution so its dry-run preview and its apply step can never
     disagree.
 
-    ``node_count``/``edge_count`` and ``blob_refs`` cover the family's own
+    ``node_count``/``edge_count`` and ``blob_refs`` cover the graph's own
     subgraph only -- traversal stops at (but includes) any ``:SST_CONCEPT``
     node, since concept nodes (Agent/Orchestrator/Recipe) are shared across
-    sessions and are never owned by one family.
+    sessions and are never owned by one graph.
     """
 
     root_id: str
@@ -79,6 +79,24 @@ class SessionFamily:
     subsession_count: int
     workspace: str
     working_dir: str | None
+
+
+@dataclass(frozen=True)
+class GraphDeleteResult:
+    """Result of a whole-graph ``delete_session_graph`` call.
+
+    ``nodes_deleted``/``relationships_deleted`` count only the OWNED graph
+    subgraph that was actually removed -- i.e. the same node set
+    ``resolve_session_graph`` reports EXCLUDING any shared ``:SST_CONCEPT``
+    node (Agent/Orchestrator/Recipe). Concept nodes are never deleted, only
+    detached: ``relationships_deleted`` includes any edge from a deleted
+    owned node into a surviving concept node, since ``DETACH DELETE`` removes
+    that edge as a side effect of removing the owned endpoint.
+    """
+
+    root_id: str
+    nodes_deleted: int
+    relationships_deleted: int
 
 
 def extract_blob_refs(props: dict[str, Any]) -> frozenset[str]:
@@ -170,16 +188,37 @@ class GraphStore(Protocol):
         """
         ...
 
-    async def resolve_session_family(self, session_id: str) -> SessionFamily | None:
-        """Resolve the whole session family (root + all descendants) for *session_id*.
+    async def resolve_session_graph(self, session_id: str) -> SessionGraph | None:
+        """Resolve the whole session graph (root + all descendants) for *session_id*.
 
         If *session_id* is not itself a root, first expands UP to the root by
         walking ``HAS_SUBSESSION``/``FORKED`` edges, then returns the root plus
         every descendant session -- never just the passed session alone (B1).
-        A sub-session id and its root id MUST resolve to the identical family.
+        A sub-session id and its root id MUST resolve to the identical graph.
 
         Returns ``None`` if *session_id* does not resolve to any known
         ``:Session`` node.
+        """
+        ...
+
+    async def delete_session_graph(self, session_id: str) -> GraphDeleteResult | None:
+        """Permanently delete the whole OWNED session graph for *session_id*.
+
+        Resolves the graph via the identical traversal ``resolve_session_graph``
+        uses (root + all descendants, bounded at but not past any
+        ``:SST_CONCEPT`` node), then removes every node it owns -- the graph
+        nodes EXCLUDING shared ``:SST_CONCEPT`` nodes. Shared concept nodes
+        (Agent/Orchestrator/Recipe) are NEVER deleted, only detached: only
+        their edges into the deleted graph are removed, as a side effect of
+        removing the owned endpoint of each such edge.
+
+        A sub-session id and its root id MUST resolve to, and delete, the
+        identical graph -- this reuses ``resolve_session_graph``'s exact
+        resolution so a delete can never diverge from what a prior dry-run
+        summary promised.
+
+        Returns ``None`` if *session_id* does not resolve to any known
+        ``:Session`` node -- no writes occur in that case.
         """
         ...
 
