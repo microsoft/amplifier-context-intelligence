@@ -320,6 +320,8 @@ Full runtime onboarding/offboarding runbook and the `/admin/*` API:
 | `GET` | `/blobs/{session_id}` | List all blob URIs for a session |
 | `GET` | `/blobs/{session_id}/{key}` | Retrieve a stored blob |
 | `POST` | `/cypher` | Proxy a Cypher query to Neo4j |
+| `GET` | `/sessions/{session_id}/summary?workspace=<ws>` | Report what deleting this session's data would remove, without deleting anything (needs read access) |
+| `DELETE` | `/sessions/{session_id}?workspace=<ws>&apply=<bool>` | Delete a whole session graph and its stored data. `apply=false` (default) returns the same preview and deletes nothing; `apply=true` deletes it (needs write access) |
 | `GET` | `/queues/dead-letter` | List dead-letter queues — `worker_key`, `item_count`, `last_error`, `last_ts` (requires `Authorization: Bearer`) |
 | `POST` | `/queues/dead-letter/{worker_key}/replay` | Re-enqueue a worker's dead-letter records then purge; returns count re-enqueued (requires `Authorization: Bearer`) |
 | `POST` | `/queues/dead-letter/{worker_key}/purge` | Permanently delete a worker's dead-letter records; returns count purged (requires `Authorization: Bearer`) |
@@ -352,6 +354,33 @@ Full runtime onboarding/offboarding runbook and the `/admin/*` API:
 ```
 
 Use `"workspace": "*"` to query across all workspaces.
+
+### Deleting a session's data
+
+A user can remove data they contributed. Deleting a session removes the **whole session graph**
+— the root session and every session below it (its subsessions and forks) — together with the
+data those sessions point to: their blobs, their queue files, and their dead-letter records.
+
+- Passing **any** session id deletes the whole graph it belongs to. If you pass a subsession id,
+  the server first finds that graph's root and then removes the whole graph. There is no way to
+  delete a single subsession on its own.
+- Nodes that are **shared** with other sessions (for example an agent that several sessions used)
+  are kept. Only the links from those shared nodes into the deleted graph are removed.
+- Deleting is **permanent**. There is no restore.
+
+Deleting is a two-step flow so nothing is removed by surprise:
+
+1. **Preview first.** `GET /sessions/{session_id}/summary?workspace=<ws>` (or `DELETE` with
+   `apply=false`) returns what would be removed: who created it, how many sessions, nodes, edges,
+   and blobs are in the graph, when it started and last changed, and whether it is ready to delete.
+   A session that changed less than a minute ago may still be receiving data.
+2. **Then apply.** `DELETE /sessions/{session_id}?workspace=<ws>&apply=true` performs the delete
+   and reports the counts of what was removed. Every applied delete is written to the server log.
+
+The delete is refused with `409` if any session in the graph is still receiving data (its queue
+has records that have not finished being written). Wait until it has finished, then delete.
+
+The summary uses the read-only Neo4j connection; the actual delete uses the admin connection.
 
 ---
 
@@ -434,6 +463,10 @@ counters (accepted/written/in-queue/dead) from disk, so in-flight events are
 recovered rather than lost across a restart. The durable per-session logs — not
 just Neo4j — are the record for events that have been accepted but not yet written
 to the graph.
+
+Deleting a session (see [Deleting a session's data](#deleting-a-sessions-data))
+removes its data from all three of these places at once: its nodes and edges in the
+Neo4j graph, its blob files, and its queue and dead-letter files.
 
 For persistence on Azure Container Apps (persistent storage + Neo4j on AuraDB),
 see [docs/azure-deployment.md](docs/azure-deployment.md).
