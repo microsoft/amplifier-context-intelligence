@@ -1089,7 +1089,7 @@ def run() -> None:
             for key, value in {
                 "bind": f"{_settings.server_host}:{_settings.server_port}",
                 "workers": workers,
-                "worker_class": "uvicorn.workers.UvicornWorker",
+                "worker_class": "uvicorn_worker.UvicornWorker",
                 "timeout": _settings.gunicorn_worker_timeout,
                 "graceful_timeout": _settings.gunicorn_graceful_timeout,
                 "loglevel": _settings.log_level.lower(),

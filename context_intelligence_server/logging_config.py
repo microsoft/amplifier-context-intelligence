@@ -11,7 +11,7 @@ from context_intelligence_server.config import get_settings
 _MAX_BYTES = 10 * 1024 * 1024
 _BACKUP_COUNT = 5
 
-# Third-party loggers (gunicorn + uvicorn.workers.UvicornWorker) that install
+# Third-party loggers (gunicorn + uvicorn_worker.UvicornWorker) that install
 # their OWN handlers and do NOT propagate by default. Left alone, their lines
 # (startup, access, errors) reach stdout as PLAIN TEXT, which Azure Log Analytics
 # cannot parse. We strip those handlers and force propagation so every record

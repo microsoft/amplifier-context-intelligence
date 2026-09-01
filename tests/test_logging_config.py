@@ -339,7 +339,7 @@ class TestSetupLogging:
     def test_uvicorn_gunicorn_loggers_route_through_json_formatter(self) -> None:
         """uvicorn/gunicorn loggers must emit through the root JsonFormatter as one-line JSON.
 
-        Production runs gunicorn + uvicorn.workers.UvicornWorker. Those frameworks
+        Production runs gunicorn + uvicorn_worker.UvicornWorker. Those frameworks
         install their OWN handlers on the ``uvicorn*`` / ``gunicorn*`` loggers with
         ``propagate=False`` so their lines (startup, access, errors) reach stdout as
         PLAIN TEXT, which Azure Log Analytics cannot parse as JSON.
