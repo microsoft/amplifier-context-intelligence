@@ -134,14 +134,22 @@ async def process_event(
     event: str,
     data: dict[str, Any],
     handlers: PipelineHandlers,
+    *,
+    working_dir: str | None = None,
 ) -> None:
     """Process one event through the always-default + enrichers pipeline.
+
+    *working_dir* is the envelope-level working directory for this event
+    (``None`` when the client did not report one).  It is a session attribute,
+    not event content, so it is passed alongside *data* rather than injected
+    into it — keeping it out of the ``data`` blob stored on every Event node.
 
     Steps
     -----
     1. Extract ``session_id`` from *data*.
     2. If *session_id* is present, call ``worker.services.ensure_session_node``
-       to idempotently create a Session node before any handler runs.
+       to idempotently create a Session node before any handler runs, passing
+       *working_dir* so the node is attributed to the folder it ran in.
     3. Blob processing: if session_id + timestamp + blob_store are all present,
        call ``process_event_data``.  Log a WARNING if blob_store is present but
        timestamp is missing.
@@ -166,7 +174,9 @@ async def process_event(
     try:
         # Step 2 — ensure Session node exists for known sessions
         if session_id:
-            await worker.services.ensure_session_node(session_id, data)
+            await worker.services.ensure_session_node(
+                session_id, data, working_dir=working_dir
+            )
 
         # Step 3 — blob processing (after ensure_session_node, before dispatch)
         timestamp: str | None = (

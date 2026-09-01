@@ -227,7 +227,6 @@ class HookStateService:
         workspace: str = "default",
         graph_store: Any | None = None,
         *,
-        working_dir: str = "",
         created_by: str | None = None,
         raw_config: dict[str, Any] | None = None,
         blob_store: Any | None = None,
@@ -239,7 +238,6 @@ class HookStateService:
             self.graph = GraphState()
         self.graph.workspace = workspace
         self.graph.created_by = created_by
-        self.working_dir = working_dir
         self.blob_store = blob_store
         self._seen_sessions: set[str] = set()
         self.data_layer_2 = DataLayer2State()
@@ -249,8 +247,26 @@ class HookStateService:
     # Session node management
     # ------------------------------------------------------------------
 
-    async def ensure_session_node(self, session_id: str, data: dict[str, Any]) -> None:
+    async def ensure_session_node(
+        self,
+        session_id: str,
+        data: dict[str, Any],
+        *,
+        working_dir: str | None = None,
+    ) -> None:
         """Idempotently create a Session node in the graph for *session_id*.
+
+        *working_dir* is the folder the session ran in, read off the event
+        envelope.  It is applied POPULATE-IF-MISSING: written when the event
+        supplies one and the node does not already carry one, never overwritten
+        once set.  That rule is enforced twice — here (so an already-populated
+        node is left alone) and again at the Neo4j MERGE via ``coalesce``
+        (so a concurrent writer or a replayed batch cannot clobber it either).
+
+        Populate-if-missing is what makes backfill work: a Session node created
+        before working_dir was recorded — or created as a bare reference by a
+        delegation/fork edge — is filled in by the first later event that
+        carries one, including a re-import through the upload CLI.
 
         Uses a two-tier lookup for replay resilience:
 
@@ -271,7 +287,14 @@ class HookStateService:
         Only caches session_id after a successful write to ensure retry
         resilience on write failure.
         """
-        # Tier 1: fast path — warm cache hit
+        # Tier 1: fast path — warm cache hit.
+        # Safe with respect to working_dir: a worker only ever drains events for
+        # its OWN session (worker_key == session_id), and the hook stamps the
+        # same working_dir on every event of a session. So the FIRST call for
+        # this worker's own session already carries the value if it will ever
+        # carry one, and it is applied below before the cache is warmed. Nodes
+        # this worker stubs for OTHER sessions (a parent_id or a delegation's
+        # sub_session_id) are populated when that session's own worker runs.
         if session_id in self._seen_sessions:
             return
 
@@ -287,10 +310,19 @@ class HookStateService:
             #   4. Worker B's flush later issues a fresh MERGE → duplicate node.
             # upsert_node uses union-merge for labels, so existing type labels
             # (e.g. "RootSession") are preserved — this call never strips labels.
-            await self.graph.upsert_node(
-                session_id,
-                {"labels": ["Session"], "status": "running", "session_id": session_id},
-            )
+            stub_data: dict[str, Any] = {
+                "labels": ["Session"],
+                "status": "running",
+                "session_id": session_id,
+            }
+            # Populate-if-missing backfill. This is the branch a re-import lands
+            # in (the node survives from the original ingest) and the branch a
+            # worker respawned by crash recovery lands in. Only write when this
+            # event supplies a working_dir AND the stored node still lacks one,
+            # so an already-attributed session is never re-attributed.
+            if working_dir and not existing.get("working_dir"):
+                stub_data["working_dir"] = working_dir
+            await self.graph.upsert_node(session_id, stub_data)
             self._seen_sessions.add(session_id)
             return
 
@@ -318,8 +350,10 @@ class HookStateService:
             node_data["started_at"] = _ts
         if "agent" in data:
             node_data["agent"] = data["agent"]
-        if self.working_dir:
-            node_data["working_dir"] = self.working_dir
+        # Attribute the session to the folder it ran in. Absent/None leaves the
+        # property unset so a later event (or a re-import) can populate it.
+        if working_dir:
+            node_data["working_dir"] = working_dir
 
         await self.graph.upsert_node(session_id, node_data)
         self._seen_sessions.add(session_id)  # only cache after successful write

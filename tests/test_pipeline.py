@@ -351,7 +351,35 @@ async def test_process_event_calls_ensure_session_node(
 
     data = {"session_id": "sess-123"}
     await process_event(mock_worker, "session:start", data, pipeline_handlers)
-    mock_worker.services.ensure_session_node.assert_called_once_with("sess-123", data)
+    mock_worker.services.ensure_session_node.assert_called_once_with(
+        "sess-123", data, working_dir=None
+    )
+
+
+async def test_process_event_forwards_working_dir_to_ensure_session_node(
+    mock_worker: MagicMock,
+    pipeline_handlers: Any,
+) -> None:
+    """The envelope working_dir reaches the Session node write.
+
+    It is passed ALONGSIDE data rather than injected into it: working_dir is a
+    session attribute, and data is stored verbatim as a blob on every Event
+    node, so smuggling it there would duplicate it per event.
+    """
+    from context_intelligence_server.pipeline import process_event
+
+    data = {"session_id": "sess-123"}
+    await process_event(
+        mock_worker,
+        "session:start",
+        data,
+        pipeline_handlers,
+        working_dir="/home/user/project",
+    )
+    mock_worker.services.ensure_session_node.assert_called_once_with(
+        "sess-123", data, working_dir="/home/user/project"
+    )
+    assert "working_dir" not in data
 
 
 async def test_process_event_missing_session_id_skips_ensure_but_dispatches(

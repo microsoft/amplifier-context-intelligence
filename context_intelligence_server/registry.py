@@ -254,12 +254,20 @@ class SessionRegistry:
         event: str,
         data: dict[str, Any],
         handlers: Any,
+        *,
+        working_dir: str | None = None,
     ) -> None:
-        """Dispatch one event, update worker stats, and record to the ring buffer."""
+        """Dispatch one event, update worker stats, and record to the ring buffer.
+
+        *working_dir* is the envelope-level working directory read off the
+        queued line (``None`` when the line carries none); it is forwarded to
+        the pipeline so the Session node can be attributed to the folder the
+        session ran in.
+        """
         result = "ok"
         error = ""
         try:
-            await process_event(worker, event, data, handlers)
+            await process_event(worker, event, data, handlers, working_dir=working_dir)
             worker.last_event = event
             worker.last_event_time = time.time()
             worker.events_processed += 1
@@ -421,10 +429,28 @@ class SessionRegistry:
                 return
 
     @staticmethod
-    def _parse_line(raw: bytes) -> tuple[str, str, dict[str, Any]]:
-        """Decode an appended event line (raw EventRequest JSON)."""
+    def _parse_line(raw: bytes) -> tuple[str, str, str | None, dict[str, Any]]:
+        """Decode an appended event line (raw EventRequest JSON).
+
+        ``working_dir`` is a TOP-LEVEL envelope field (a sibling of
+        ``workspace``), not part of ``data`` — the hook emits it as a session
+        attribute rather than event content.  Reading it here, off the durable
+        queue line, is what makes working-dir attribution crash-safe: the value
+        was persisted with the event by ``post_events`` (which stores the raw
+        request body verbatim), so a worker respawned by crash recovery or
+        dead-letter replay reads the same value from the same bytes.  Binding
+        it to the in-memory worker instead would lose it on every restart.
+
+        Returns ``None`` — never ``""`` — when the line carries no working_dir,
+        so "not reported" stays distinguishable from a blank path downstream.
+        """
         obj = json.loads(raw.decode("utf-8"))
-        return obj["event"], obj.get("workspace", ""), obj.get("data", {})
+        return (
+            obj["event"],
+            obj.get("workspace", ""),
+            obj.get("working_dir") or None,
+            obj.get("data", {}),
+        )
 
     async def _process_batch(
         self, worker: SessionWorker, batch: Batch, handlers: Any
@@ -435,8 +461,10 @@ class SessionRegistry:
 
         saw_terminal = False
         for raw in batch.lines:
-            event, _workspace, data = self._parse_line(raw)
-            await self._process_one(worker, event, data, handlers)
+            event, _workspace, working_dir, data = self._parse_line(raw)
+            await self._process_one(
+                worker, event, data, handlers, working_dir=working_dir
+            )
             if event in TERMINAL_EVENTS:
                 saw_terminal = True
         return saw_terminal
@@ -465,8 +493,10 @@ class SessionRegistry:
         for raw in batch.lines:
             line_end = offset + len(raw) + 1  # +1 for the newline read_batch strips
             try:
-                event, _ws, data = self._parse_line(raw)
-                await self._process_one(worker, event, data, handlers)
+                event, _ws, working_dir, data = self._parse_line(raw)
+                await self._process_one(
+                    worker, event, data, handlers, working_dir=working_dir
+                )
                 await self._flush_barrier(worker)
                 self.record_written(1)
             except Exception as exc:
@@ -550,7 +580,6 @@ class SessionRegistry:
         self,
         session_id: str,
         workspace: str,
-        working_dir: str = "",
         created_by: str | None = None,
     ) -> SessionWorker:
         if session_id not in self._workers:
@@ -569,7 +598,6 @@ class SessionRegistry:
                 workspace=workspace,
                 services=HookStateService(
                     workspace=workspace,
-                    working_dir=working_dir,
                     created_by=created_by,
                     blob_store=blob_store,
                     graph_store=neo4j_store,

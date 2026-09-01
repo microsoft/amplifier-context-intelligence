@@ -74,14 +74,14 @@ def test_event_request_workspace_non_empty_accepted():
     assert req.workspace == "my-project-slug"
 
 
-def test_event_request_working_dir_defaults_empty():
-    """working_dir defaults to an empty string when the payload omits it."""
+def test_event_request_working_dir_defaults_none():
+    """working_dir defaults to None — "not reported", NOT the empty path."""
     req = EventRequest(
         event="tool:pre",
         workspace="main",
         data={"session_id": "abc123"},
     )
-    assert req.working_dir == ""
+    assert req.working_dir is None
 
 
 def test_event_request_accepts_working_dir():
@@ -93,6 +93,22 @@ def test_event_request_accepts_working_dir():
         data={"session_id": "abc123"},
     )
     assert req.working_dir == "/home/user/project"
+
+
+def test_event_request_rejects_blank_working_dir():
+    """A whitespace-only working_dir is never a legitimate path — reject it.
+
+    Absent is fine (None); blank is a malformed client, and must not reach the
+    Session node verbatim where it would satisfy the populate-if-missing guard
+    and permanently block the real value.
+    """
+    with pytest.raises(ValidationError):
+        EventRequest(
+            event="tool:pre",
+            workspace="main",
+            working_dir="   ",
+            data={"session_id": "abc123"},
+        )
 
 
 def test_event_request_data_without_session_id():

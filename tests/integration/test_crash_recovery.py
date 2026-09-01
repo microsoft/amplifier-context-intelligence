@@ -32,7 +32,9 @@ async def test_no_loss_after_crash_mid_drain() -> None:
     reg1 = SessionRegistry()
     processed_first: list[str] = []
 
-    async def _proc1(w: object, event: str, data: object, h: object) -> None:
+    async def _proc1(
+        w: object, event: str, data: object, h: object, **_kw: object
+    ) -> None:
         processed_first.append(event)
         await asyncio.sleep(0.01)  # slow enough to be interrupted mid-drain
 
@@ -57,7 +59,9 @@ async def test_no_loss_after_crash_mid_drain() -> None:
     reg2 = SessionRegistry()
     processed_second: list[str] = []
 
-    async def _proc2(w: object, event: str, data: object, h: object) -> None:
+    async def _proc2(
+        w: object, event: str, data: object, h: object, **_kw: object
+    ) -> None:
         processed_second.append(event)
 
     recovered = await reg2.queue_manager.recover()

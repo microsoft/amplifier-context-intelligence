@@ -96,8 +96,6 @@ class DefaultHandler:
             **lifted,
             "data": json.dumps(data),
         }
-        if self.services.working_dir:
-            node_props["working_dir"] = self.services.working_dir
         await self.services.graph.upsert_node(event_node_id, node_props)
 
         # Stage 5: HAS_EVENT edge — (Session)-[:HAS_EVENT {occurred_at}]->(Event)

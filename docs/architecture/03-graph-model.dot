@@ -41,6 +41,7 @@ digraph graph_model {
                 <TR><TD><B>:RootSession :Session :SST_EVENT</B></TD></TR>
                 <TR><TD>node_id: session UUID</TD></TR>
                 <TR><TD>workspace: string</TD></TR>
+                <TR><TD>working_dir: path (populate-if-missing)</TD></TR>
                 <TR><TD>started_at / ended_at: ISO 8601</TD></TR>
                 <TR><TD>status: "running" &#8594; closed</TD></TR>
             </TABLE>>
@@ -52,6 +53,7 @@ digraph graph_model {
                 <TR><TD><B>:SubSession :Session :SST_EVENT</B></TD></TR>
                 <TR><TD>node_id: child session UUID</TD></TR>
                 <TR><TD>workspace: string</TD></TR>
+                <TR><TD>working_dir: path (populate-if-missing)</TD></TR>
                 <TR><TD>started_at / ended_at: ISO 8601</TD></TR>
             </TABLE>>
         ]
@@ -62,6 +64,7 @@ digraph graph_model {
                 <TR><TD><B>:ForkedSession :Session :SST_EVENT</B></TD></TR>
                 <TR><TD>node_id: child session UUID</TD></TR>
                 <TR><TD>workspace: may be null</TD></TR>
+                <TR><TD>working_dir: path (populate-if-missing)</TD></TR>
                 <TR><TD>started_at: ISO 8601</TD></TR>
                 <TR><TD><I>Fork guard: permanent classification</I></TD></TR>
             </TABLE>>

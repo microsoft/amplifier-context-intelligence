@@ -904,12 +904,7 @@ async def post_events(
     # events from distinct workspaces never collide in one log (decision #10).
     worker_key = session_id or (_NO_SESSION_PREFIX + _workspace_slug(request.workspace))
     # Spawn (or reuse) the sticky drainer keyed by worker_key.
-    registry.get_or_create(
-        worker_key,
-        request.workspace,
-        working_dir=request.working_dir,
-        created_by=contributor_id,
-    )
+    registry.get_or_create(worker_key, request.workspace, created_by=contributor_id)
     # Re-parse the raw validated body bytes, stamp created_by (server-assigned,
     # unconditional overwrite — kills any client-supplied spoofed value), then
     # re-serialize compact JSON before persisting to the durable queue.
