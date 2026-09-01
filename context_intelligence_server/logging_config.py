@@ -11,11 +11,22 @@ from context_intelligence_server.config import get_settings
 _MAX_BYTES = 10 * 1024 * 1024
 _BACKUP_COUNT = 5
 
-# gunicorn + uvicorn_worker.UvicornWorker install their own handlers and do not
-# propagate. Strip those handlers and force propagation so their records reach
-# the root JsonFormatter as one-line JSON. Only lines emitted after
-# setup_logging() runs (inside the FastAPI lifespan) are reachable here; earlier
-# master/worker startup lines stay plain text.
+# Third-party loggers (gunicorn + uvicorn_worker.UvicornWorker) that install
+# their OWN handlers and do NOT propagate by default. Left alone, their lines
+# (startup, access, errors) reach stdout as PLAIN TEXT, which Azure Log Analytics
+# cannot parse. We strip those handlers and force propagation so every record
+# bubbles up to the root logger's JsonFormatter-wired handlers as one-line JSON.
+#
+# Boundary (confirmed by live gunicorn+UvicornWorker boot): the dividing line is
+# the moment the worker runs setup_logging() inside the FastAPI lifespan. EVERY
+# line emitted BEFORE that point is plain text and outside this function's reach
+# — this spans both the gunicorn MASTER lines ("Starting gunicorn", "Listening
+# at", "Booting worker", "Worker exited", "Shutting down") AND the early uvicorn
+# *worker* lines that fire before lifespan startup completes ("Started server
+# process", "Waiting for application startup"). Those plain-text lines are only
+# reachable via gunicorn's own --log-config / logconfig_dict. EVERYTHING emitted
+# AFTER setup_logging() runs — app logs, neo4j_store logs, uvicorn.error/access
+# at runtime, gunicorn.error worker events — is one-line JSON.
 _THIRD_PARTY_LOGGER_NAMES = (
     "uvicorn",
     "uvicorn.error",
