@@ -60,6 +60,22 @@ async def _neo4j_labels(services: Any, node_id: str) -> list[str]:
     return list(rows[0]["lbls"]) if rows else []
 
 
+async def _neo4j_props(services: Any, node_id: str) -> dict[str, Any]:
+    """Return properties from Neo4j directly (bypasses buffer).
+
+    Used to assert the end-handler's own writes (ended_at/status) genuinely
+    landed, so the assertion isn't merely re-checking the earlier start/fork
+    flush's data.
+    """
+    rows = await services.graph.execute_query(
+        "MATCH (n) WHERE n.node_id = $id AND n.workspace = $workspace "
+        "RETURN properties(n) AS props",
+        {"id": node_id, "workspace": services.graph.workspace},
+        workspace="*",
+    )
+    return dict(rows[0]["props"]) if rows else {}
+
+
 # ---------------------------------------------------------------------------
 # Store-level tests — prove the shadow mechanism directly
 # ---------------------------------------------------------------------------
@@ -268,7 +284,10 @@ class TestHandleEndSingleTerminalAfterFlush:
                 "timestamp": "2026-01-01T10:05:00Z",
             },
         )
-        # _handle_end calls flush() itself at the end.
+        # _handle_end does not flush itself; the drainer flushes after the
+        # batch. Flush here so this test's read sees the persisted result,
+        # as production does via the gated _flush_barrier.
+        await neo4j_services.graph.flush()
 
         # Read final labels directly from Neo4j (bypasses any buffer).
         final_labels = await _neo4j_labels(neo4j_services, child_id)
@@ -285,6 +304,17 @@ class TestHandleEndSingleTerminalAfterFlush:
         ]
         assert terminals == ["SubSession"], (
             f"Expected exactly one terminal label SubSession; got {terminals} in {final_labels}"
+        )
+
+        # The assertions below must depend on the end-handler's own writes
+        # having landed -- check ended_at/status so this isn't merely
+        # re-checking the earlier start+flush.
+        final_props = await _neo4j_props(neo4j_services, child_id)
+        assert final_props.get("status") == "completed", (
+            f"end-handler's status write missing from Neo4j: {final_props}"
+        )
+        assert final_props.get("ended_at") is not None, (
+            f"end-handler's ended_at write missing from Neo4j: {final_props}"
         )
 
     async def test_fork_flush_end_yields_single_terminal_label(

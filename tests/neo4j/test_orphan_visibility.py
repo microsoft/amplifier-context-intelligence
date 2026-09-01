@@ -266,14 +266,16 @@ async def test_finalization_orphan_surfaces_on_status(
         "not plain logger.error without exc_info"
     )
 
-    # 5. Committed offset frozen at the pre-terminal boundary, NOT at tail_end.
-    #    The drain committed the first batch (lines 1-100) but _finalize_session
-    #    returned early without committing the tail (lines 101-200).
+    # 5. Committed offset is frozen AT session:end's own start (not tail_end):
+    #    the drain commits UP TO session:end, so an unfinalized session stays re-derivable.
+    terminal_start = first_100.records[-1].start
     post_drain_batch = await qm.read_batch(sid, 1)
     committed_offset = post_drain_batch.start_offset
-    assert committed_offset == boundary, (
-        f"Committed offset {committed_offset} must equal boundary {boundary} "
-        "(drain committed first batch, OOM froze the tail)"
+    assert committed_offset == terminal_start, (
+        f"Committed offset {committed_offset} must equal terminal_start "
+        f"{terminal_start} (drain committed first batch UP TO session:end, "
+        "OOM froze the tail -- the offset is parked ON the terminal record "
+        "so an unfinalized session is durably re-derivable)"
     )
     assert committed_offset != tail_end, (
         f"Committed offset {committed_offset} must NOT equal tail_end {tail_end} "

@@ -1,6 +1,7 @@
 """Session registry — per-session worker management."""
 
 import asyncio
+import functools
 import json
 import logging
 import time
@@ -22,11 +23,12 @@ logger = logging.getLogger("context_intelligence_server")
 _DRAIN_MAX_BATCH = 100
 _DRAIN_POLL_INTERVAL = 0.05  # idle poll cadence; bounded by flush_timeout
 
-# A positive residual must PERSIST this long before it is called degraded.
-# Must exceed the worst-case transient-skew window: the derive_all_stats
-# cache TTL (1.0s) plus the /status poll cadence (~3s). 15s is >10x the cache
-# TTL, so any in-flight two-clock skew clears well before it trips degraded,
-# while a genuine (monotonic, non-clearing) silent drop still trips it.
+# Bounded retry count for the finalize delete-drained loop; not operator-tunable.
+# No backoff between attempts -- sleeping would widen the race window this closes.
+_FINALIZE_DELETE_ATTEMPTS = 3
+
+# Grace period before a positive residual is flagged degraded -- must exceed
+# the stats-cache TTL + poll cadence to avoid false positives from clock skew.
 _RESIDUAL_DEGRADED_GRACE = 15.0
 
 
@@ -41,10 +43,12 @@ class SessionWorker:
     events_processed: int = 0
     started_at: float = field(default_factory=time.time)
     error_count: int = 0
-    # Phase 2 (#278): liveness timestamp — when the flush boundary last
-    # completed for this worker. Defaults to creation time (NOT 0.0) so a
-    # brand-new worker reads as fresh, not ancient. Stamped in _flush_barrier.
+    # Timestamp when the flush boundary last completed; defaults to creation
+    # time (not 0.0) so a brand-new worker reads as fresh. Set in _flush_barrier.
     last_successful_flush: float = field(default_factory=time.time)
+    # Set True by _safe_close, as its FIRST statement. A worker
+    # whose store has been closed is never revived — see start_drain.
+    store_closed: bool = False
 
 
 @dataclass
@@ -64,26 +68,22 @@ class SessionRegistry:
     def __init__(self) -> None:
         self._workers: dict[str, SessionWorker] = {}
         self._completed: deque[CompletedSession] = deque(maxlen=100)
-        # Durable-ingest infrastructure, built lazily on first use. The
-        # module-level registry singleton is constructed at import time,
-        # before the per-test settings patch applies, so we cannot read
-        # settings here — see _ensure_infra().
+        # Strong refs to fire-and-forget close tasks -- asyncio only holds a
+        # weak ref, so without this a close can be GC'd mid-execution. Self-discards on done.
+        self._close_tasks: set[asyncio.Task] = set()
+        # Durable-ingest infra, built lazily (see _ensure_infra) since the
+        # module-level singleton is constructed before test settings patches apply.
         self._queue_manager: QueueManager | None = None
         self._write_semaphore: asyncio.Semaphore | None = None
         self._max_delivery_attempts: int = 0
-        # Live pipeline-conservation counters (D2): make silently-dropped
-        # events observable via /status. accepted = events admitted to the
-        # log; written = events persisted to Neo4j; replayed = events
-        # re-driven from the log on recovery; write_retries = transient
-        # write retries attempted by the drainer.
+        # Live conservation counters surfaced via /status (accepted/written/
+        # replayed/write_retries) so silently-dropped events are observable.
         self._accepted_total: int = 0
         self._written_total: int = 0
         self._replayed_total: int = 0
         self._write_retries_total: int = 0
-        # FIX B: monotonic timestamp when the residual first went positive and
-        # stayed unexplained. None means "clean". Gates the degraded flag so a
-        # transient two-clock skew never latches; only a sustained positive
-        # residual (real silent drop) does.
+        # Monotonic time the residual first went positive (None = clean).
+        # Gates `degraded` so transient clock skew doesn't latch it.
         self._residual_positive_since: float | None = None
 
     def _ensure_infra(self) -> None:
@@ -128,17 +128,10 @@ class SessionRegistry:
     def record_purged(self, n: int) -> None:
         """Remove n purged dead-letters from the accepted total (conservation).
 
-        A bare dead-letter purge unlinks the .dead.jsonl file, dropping `dead`
-        by n. Those lines were counted in `accepted` at ingest but never
-        `written`; discarding them from disk must also discard them from
-        `accepted`, or the residual latches at +n forever. Symmetric to
-        record_replayed, which moves lines dead -> in_queue and therefore must
-        NOT touch accepted.
-
-        Clamp: accepted can never fall below written. Under the single-writer
-        guarantee the clamp can never legitimately engage (a dead line is
-        accepted-but-not-written, so n <= accepted - written); if it does, log
-        a warning as an accounting-drift signal rather than silently masking it.
+        A dead-letter purge drops `dead` by n without ever having been
+        `written`, so `accepted` must drop too or the residual latches at +n
+        forever. Clamped so accepted never falls below written; an engaged
+        clamp logs a warning as an accounting-drift signal.
         """
         if n <= 0:
             return
@@ -178,38 +171,15 @@ class SessionRegistry:
         }
 
     async def pipeline_metrics(self) -> dict[str, Any]:
-        """Assemble the pipeline-conservation health block for /status (D2/D3).
+        """Assemble the pipeline-conservation health block for /status.
 
-        Combines the live in-memory counters (pipeline_counters) with the
-        disk-derived queue/dead aggregate (queue_manager.derive_all_stats) into
-        a single conservation view. The residual is the count of accepted
-        events that are neither persisted, nor still queued, nor dead-lettered:
-
-            residual = accepted - written - in_queue - dead
-
-        ``degraded`` is True whenever ``dead > 0`` (an accounted-for loss, no
-        grace period) OR the residual is POSITIVE and has stayed positive for
-        at least ``_RESIDUAL_DEGRADED_GRACE`` seconds. A negative residual is
-        never degraded (it is benign two-clock skew between the live counters
-        and the cached disk snapshot, clamped to a ``lost`` value of zero), and
-        a positive residual that clears before the grace window elapses is
-        treated as the same transient skew rather than real loss.
-
-        IMPORTANT caveats:
-        - This is a LIVE per-process measure, not an all-time audit. Finalized
-          session logs are deleted by ``delete_drained``, so their accepted /
-          written / in_queue contributions leave the disk-derived aggregate.
-          The in-memory accepted/written counters persist, so the residual
-          stays conserved for the lifetime of the process (seeded across
-          restarts via ``seed_counters``).
-        - It is only valid under the single-worker (single-process) guarantee:
-          one writer owns the counters and the on-disk queues.
-        - ``write_retries_total`` is the transient/deadlock proxy — the closest
-          observable signal for retried (e.g. DeadlockDetected) writes.
-        - ``deadlock_detected_total`` and ``events_failed_total`` are
-          intentionally omitted: neither is cleanly trackable at this layer.
-        - ``oldest_unflushed_age`` is DEFERRED to C2 and is intentionally
-          absent from this block.
+        Combines live counters with the disk-derived queue/dead aggregate.
+        residual = accepted - written - in_queue - dead. `degraded` is True
+        when dead > 0, or when a positive residual persists past
+        `_RESIDUAL_DEGRADED_GRACE` seconds (transient clock skew clears
+        before then). Live per-process only: finalized session logs are
+        deleted, but the in-memory counters persist across restarts via
+        `seed_counters`.
         """
         agg = await self.queue_manager.derive_all_stats()
         counters = self.pipeline_counters()
@@ -270,7 +240,7 @@ class SessionRegistry:
             result = "error"
             error = str(exc)
             worker.error_count += 1
-            raise  # Phase B2: propagate so the drainer dead-letters this line
+            raise  # Propagate so the drainer dead-letters this line
         finally:
             ring_buffer.add(
                 EventRecord(
@@ -284,23 +254,22 @@ class SessionRegistry:
             )
 
     async def _flush_barrier(self, worker: SessionWorker) -> None:
-        """The ONE Neo4j-write boundary: a semaphore-gated, awaited flush.
+        """The one Neo4j-write boundary: a semaphore-gated, awaited flush.
 
-        Acquiring self.write_semaphore caps the number of concurrent Neo4j
-        write transactions across ALL session drainers (the starvation guard).
-        The offset must only ever advance AFTER this returns successfully.
+        The semaphore caps concurrent write transactions across all session
+        drainers. The offset must only advance after this returns successfully.
 
-        Correctness of commit-after-flush depends on neo4j_store._flush_body
-        snapshotting+clearing the buffer under _flush_lock and RESTORING it on
-        failure (neo4j_store.py:686-696), plus the empty-buffer early return
-        (:656-657). We do not modify that file; we rely on it here.
+        Commit-after-flush is correct only because ``neo4j_store._flush_body``
+        snapshots-and-clears the buffer under ``_flush_lock`` and RESTORES it on
+        failure, plus the empty-buffer early return. That file is not modified
+        here; this barrier depends on it. This is also the ONLY place a flush
+        may happen -- a handler that flushes on its own would write outside the
+        semaphore (see ``SessionHandler._handle_end``).
         """
         async with self.write_semaphore:
             await worker.services.graph.flush()
-            # Phase 2 (#278): stamp liveness at the SINGLE flush boundary all
-            # three success paths funnel through. Marks completion of the flush
-            # barrier (advances even on an empty-buffer flush = liveness proof
-            # that the drainer reached and finished the write barrier).
+            # Stamped here (the one flush boundary) as liveness proof the
+            # drainer reached and finished the write barrier.
             worker.last_successful_flush = time.time()
 
     async def drain_worker(
@@ -308,14 +277,18 @@ class SessionRegistry:
     ) -> None:
         """Durable drain loop for one session.
 
-        Reads the next batch after the committed offset, dispatches each line
-        through process_event, then runs the single semaphore-gated flush
-        barrier and commits the offset only on success (the "ack"). A batch
-        that exhausts its retry budget — or that raises during dispatch — is
-        isolated ONE LINE AT A TIME and dead-lettered (never silently dropped).
-        When the log is idle the drainer polls and reaps the session if it has
-        been idle past the stale timeout. The drainer is the SOLE flush trigger
-        (process_event no longer self-flushes, Task 6).
+        Reads batches after the committed offset, dispatches each event, runs
+        the flush barrier, and commits only on success; an exhausted retry
+        budget dead-letters the batch line-by-line.
+
+        Any other exception propagates -- `_on_drain_done` is the sole
+        supervision point (logs, closes, deregisters so a respawn or boot
+        `recover()` picks it up). A terminal `session:end` record is left
+        uncommitted so a later drain re-enters `_finalize_session`.
+
+        The queue owns all byte-position math; this registry only chooses
+        which offset to commit via `qm.commit`/`qm.dead_letter`. When idle,
+        the drainer polls and reaps the session past the stale timeout.
         """
         handlers = setup_handlers(worker.services)
         qm = self.queue_manager
@@ -328,7 +301,7 @@ class SessionRegistry:
             try:
                 batch = await qm.read_batch(session_id, max_items=_DRAIN_MAX_BATCH)
 
-                if not batch.lines:
+                if not batch.records:
                     await asyncio.sleep(poll_interval)
                     idle_elapsed += poll_interval
                     if idle_elapsed >= flush_timeout:
@@ -340,9 +313,10 @@ class SessionRegistry:
                             > settings.stale_session_timeout
                         ):
                             logger.info(
-                                "Reaping stale session %s (idle > %s seconds)",
+                                "session_reaped_stale session=%s idle_seconds=%s",
                                 session_id,
                                 settings.stale_session_timeout,
+                                extra={"session_id": session_id},
                             )
                             await self._safe_close(worker)
                             self._deregister(session_id)
@@ -353,19 +327,29 @@ class SessionRegistry:
 
                 # --- dispatch + durable write barrier, one error path ---
                 try:
-                    saw_terminal = await self._process_batch(worker, batch, handlers)
+                    safe_count, terminal_at = await self._process_batch(
+                        worker, batch, handlers
+                    )
                     await self._flush_barrier(worker)
                 except asyncio.CancelledError:
+                    # INFO not ERROR: a cancel here is normally deliberate
+                    # (shutdown, idle reap, test teardown), not a failure.
+                    logger.info(
+                        "drain_worker_cancelled session=%s site=%s",
+                        session_id,
+                        "dispatch",
+                        extra={"session_id": session_id},
+                    )
                     await self._safe_close(worker)
+                    # Must deregister so get_or_create builds a fresh worker --
+                    # else start_drain's store_closed guard refuses it forever.
+                    self._deregister(session_id)
                     return
                 except Exception:
                     attempts += 1
                     self.record_write_retry()
-                    # Throttle the failure log off the local attempts counter
-                    # (resets to 0 on commit and after exhaustion): the first
-                    # failure gets ONE traceback (WARNING), middle attempts are
-                    # DEBUG, and budget exhaustion gets a single ERROR (no
-                    # per-attempt traceback storm).
+                    # First failure: WARNING w/ traceback. Middle attempts: DEBUG.
+                    # Exhaustion: single ERROR. Avoids a per-attempt traceback storm.
                     if attempts == 1:
                         logger.warning(
                             "drain_batch_failed session=%s attempt=%d",
@@ -389,35 +373,51 @@ class SessionRegistry:
                             extra={"session_id": session_id},
                         )
                     if attempts >= self._max_delivery_attempts:
-                        # Budget spent -> isolate the batch ONE LINE AT A TIME,
-                        # dead-letter the offending line(s), advance past all.
-                        await self._handle_exhausted_batch(worker, batch, handlers)
+                        # Budget spent: isolate the batch line-by-line and dead-letter.
+                        terminal_seen = await self._handle_exhausted_batch(
+                            worker, batch, handlers
+                        )
+                        if terminal_seen:
+                            # Mirror the normal terminal branch below: the
+                            # session:end record was left uncommitted, so
+                            # finalize instead of resuming the drain loop.
+                            await self._finalize_session(worker, handlers)
+                            return
                         attempts = 0
                         continue
-                    # Budget NOT yet spent: back off one poll interval before
-                    # re-reading the SAME offset (offset is not committed; the
-                    # idempotent MERGE makes the replay a no-op). The backoff
-                    # avoids a tight Neo4j-hammering retry loop on a transient
-                    # deadlock and keeps retries on the loop's poll cadence.
+                    # Not yet exhausted: back off before re-reading the same
+                    # offset (idempotent MERGE makes the replay a no-op).
                     await asyncio.sleep(poll_interval)
                     continue
 
                 attempts = 0
-                await qm.commit(session_id, batch.end_offset)
-                self.record_written(len(batch.lines))
+                # Commit only up to session:end -- leaving it uncommitted makes
+                # "ended but not finalized" durable across a respawn/recover().
+                commit_to = batch.end_offset if terminal_at is None else terminal_at
+                await qm.commit(session_id, commit_to)
+                counted = len(batch.records) if terminal_at is None else safe_count
+                self.record_written(counted)
                 logger.debug(
                     "batch_committed events=%d offset=%d",
-                    len(batch.lines),
-                    batch.end_offset,
+                    counted,
+                    commit_to,
                     extra={"session_id": session_id},
                 )
 
-                if saw_terminal:
+                if terminal_at is not None:
                     await self._finalize_session(worker, handlers)
                     return
 
             except asyncio.CancelledError:
+                # Cancelled while reading/idle (outer site; never reaches the inner try).
+                logger.info(
+                    "drain_worker_cancelled session=%s site=%s",
+                    session_id,
+                    "loop",
+                    extra={"session_id": session_id},
+                )
                 await self._safe_close(worker)
+                self._deregister(session_id)  # See the note above.
                 return
 
     @staticmethod
@@ -428,87 +428,166 @@ class SessionRegistry:
 
     async def _process_batch(
         self, worker: SessionWorker, batch: Batch, handlers: Any
-    ) -> bool:
-        """Dispatch each line in the batch; return True if it contained a
-        terminal (session:end) event."""
-        from context_intelligence_server.pipeline import TERMINAL_EVENTS  # noqa: PLC0415
+    ) -> tuple[int, int | None]:
+        """Dispatch every record; report the first terminal boundary.
 
-        saw_terminal = False
-        for raw in batch.lines:
-            event, _workspace, data = self._parse_line(raw)
+        Returns ``(safe_count, terminal_at)``: ``terminal_at`` is the queue-
+        produced start offset of the first ``session:end`` record (or None),
+        and ``safe_count`` is how many records precede it. Every record is
+        still dispatched -- a failed terminal dispatch still goes through
+        the retry/isolation path.
+
+        CONSEQUENCE -- ``session:end`` IS DISPATCHED TWICE PER SESSION. It is
+        dispatched here, but ``terminal_at`` leaves it UNCOMMITTED so that
+        "ended but not finalized" survives a respawn; ``_finalize_session``
+        then re-reads it via ``_drain_to_eof`` and dispatches it again. Every
+        handler on the terminal path must therefore be idempotent. The three
+        that claim ``session:end`` today (the data_layer_1 field lifter,
+        ``SessionHandler`` in data_layer_2, and ``DelegationHandler`` in
+        data_layer_3) are read-then-MERGE and tolerate it. Any new terminal
+        handler with a non-idempotent side effect (counters, appends,
+        notifications) will double-fire here.
+        """
+        from context_intelligence_server.pipeline import (
+            TERMINAL_EVENTS,
+        )
+
+        terminal_at: int | None = None
+        safe_count = 0
+        for rec in batch.records:
+            event, _workspace, data = self._parse_line(rec.raw)
             await self._process_one(worker, event, data, handlers)
-            if event in TERMINAL_EVENTS:
-                saw_terminal = True
-        return saw_terminal
+            if terminal_at is None:
+                if event in TERMINAL_EVENTS:
+                    terminal_at = rec.start
+                else:
+                    safe_count += 1
+        return safe_count, terminal_at
 
     async def _handle_exhausted_batch(
         self, worker: SessionWorker, batch: Batch, handlers: Any
-    ) -> None:
-        """Reprocess a poison batch ONE LINE AT A TIME (linear isolation).
+    ) -> bool:
+        """Reprocess a poison batch one line at a time (linear isolation).
 
-        Each line is dispatched + flushed individually under the write
-        semaphore. A line that still fails (parse error, handler error, or
-        repeated flush failure) is dead-lettered with its error AND its write
-        residue is discarded from the store buffer (COE blocker, decision #13);
-        good lines flush normally. Every line advances the offset past itself
-        (commit), so the whole batch is accounted for. No silent loss, no
-        binary shrink, no cross-line contamination.
+        Each record is dispatched and flushed individually. A record that
+        fails is dead-lettered and its buffer residue discarded so it can't
+        contaminate later records. Every non-terminal record advances the
+        offset to its own queue-produced end, so it is fully accounted for.
+
+        A record that successfully parses as a terminal ``session:end``
+        record is NOT dispatched or committed here -- isolation stops
+        immediately and returns True, leaving that record (and anything
+        after it) uncommitted, mirroring the normal drain loop's terminal
+        semantics (see ``drain_worker``/``_process_batch``). The caller must
+        then call ``_finalize_session`` instead of resuming the drain loop,
+        exactly like the non-exhausted terminal path: ``_finalize_session``'s
+        own ``_drain_to_eof`` re-reads and re-dispatches the terminal record.
+        A record whose bytes fail to parse is NOT terminal -- it is
+        dead-lettered and committed past like any other poison line.
+
+        Returns False when the whole batch is isolated without ever
+        reaching a terminal record (unchanged behavior: no finalization).
         """
         qm = self.queue_manager
         session_id = worker.session_id
-        # The failed BATCH flush left its writes resident in the store buffer
-        # (_flush_body restores on failure, neo4j_store.py:686-696). Discard that
-        # accumulated residue so the FIRST isolated line flushes from a clean
-        # buffer — otherwise the poison line's residue contaminates line 1.
+        # The failed batch flush left writes resident in the store buffer --
+        # discard so the first isolated record flushes from a clean buffer.
         worker.services.graph.discard_buffer()
-        offset = batch.start_offset
-        for raw in batch.lines:
-            line_end = offset + len(raw) + 1  # +1 for the newline read_batch strips
+        for rec in batch.records:
             try:
-                event, _ws, data = self._parse_line(raw)
-                await self._process_one(worker, event, data, handlers)
-                await self._flush_barrier(worker)
-                self.record_written(1)
+                event, _ws, data = self._parse_line(rec.raw)
             except Exception as exc:
-                await qm.dead_letter(session_id, raw + b"\n", str(exc))
+                # Unparseable: can't be a terminal record -- poison as before.
+                await qm.dead_letter(session_id, rec.raw, str(exc))  # no re-framing
                 logger.warning(
                     "dead_letter session=%s error=%s",
                     session_id,
                     exc,
+                    exc_info=exc,
                     extra={"session_id": session_id},
                 )
-                # COE blocker (decision #13): drop the failed line's residue so
-                # it cannot contaminate the NEXT line's flush. A successful flush
-                # clears the buffer itself; only the failure path needs this.
                 worker.services.graph.discard_buffer()
-            await qm.commit(session_id, line_end)
-            offset = line_end
+                await qm.commit(session_id, rec.end)  # queue-produced offset
+                continue
 
-    async def _finalize_session(self, worker: SessionWorker, handlers: Any) -> None:
-        """session:end seen: drain any tail lines read-to-EOF, then record the
-        CompletedSession, close the graph, deregister, and DELETE the drained
-        logs. Panel finding #7: if a tail flush fails, do NOT finalize — return
-        without recording/closing so the drainer retries (no tail loss)."""
+            from context_intelligence_server.pipeline import TERMINAL_EVENTS
+
+            if event in TERMINAL_EVENTS:
+                return True
+
+            wrote = False
+            try:
+                await self._process_one(worker, event, data, handlers)
+                await self._flush_barrier(worker)
+                wrote = True
+            except Exception as exc:
+                await qm.dead_letter(session_id, rec.raw, str(exc))  # no re-framing
+                logger.warning(
+                    "dead_letter session=%s error=%s",
+                    session_id,
+                    exc,
+                    exc_info=exc,
+                    extra={"session_id": session_id},
+                )
+                # Drop the failed record's residue so it cannot contaminate
+                # the NEXT record's flush. A successful flush clears the
+                # buffer itself; only the failure path needs this.
+                worker.services.graph.discard_buffer()
+            await qm.commit(session_id, rec.end)  # queue-produced offset
+            if wrote:
+                self.record_written(1)
+        return False
+
+    async def _drain_to_eof(self, worker: SessionWorker, handlers: Any) -> bool:
+        """Drain every remaining record for this session up to EOF.
+
+        Returns True when fully drained. Returns False when a tail flush
+        failed -- nothing was committed, and the caller must not finalize.
+        """
         qm = self.queue_manager
         session_id = worker.session_id
         while True:
             tail = await qm.read_batch(session_id, max_items=_DRAIN_MAX_BATCH)
-            if not tail.lines:
-                break
+            if not tail.records:
+                return True
             try:
                 await self._process_batch(worker, tail, handlers)
                 await self._flush_barrier(worker)
             except Exception:
                 logger.exception("finalize_tail_flush_failed session=%s", session_id)
-                return  # NOT finalized: keep worker alive, leave tail uncommitted
+                return False  # NOT finalized: keep worker alive, tail uncommitted
             await qm.commit(session_id, tail.end_offset)
-            self.record_written(len(tail.lines))
+            self.record_written(len(tail.records))
             logger.debug(
                 "batch_committed events=%d offset=%d",
-                len(tail.lines),
+                len(tail.records),
                 tail.end_offset,
                 extra={"session_id": session_id},
             )
+
+    async def _finalize_session(self, worker: SessionWorker, handlers: Any) -> None:
+        """session:end seen: drain to EOF, record CompletedSession, delete
+        the drained log, close the graph, then deregister -- in that order.
+
+        If the tail flush fails, finalization is aborted (no record/close)
+        so a respawn retries. ``delete_drained`` returning False means an
+        append landed after drain -- retried up to
+        ``_FINALIZE_DELETE_ATTEMPTS`` times, re-draining each time; a
+        persistent failure retains the log as a bounded, non-lossy residual.
+        """
+        qm = self.queue_manager
+        session_id = worker.session_id
+        if not await self._drain_to_eof(worker, handlers):
+            # Orphan: still registered, task about to finish. Recoverable --
+            # a respawn or boot recover() re-enters _finalize_session. Stays
+            # registered so orphaned_sessions() surfaces it on /status.
+            logger.warning(
+                "finalize_orphan session=%s reason=tail_flush_failed "
+                "recoverable=respawn",
+                session_id,
+                extra={"session_id": session_id},
+            )
+            return
 
         ended_at = time.time()
         self._completed.append(
@@ -522,11 +601,40 @@ class SessionRegistry:
                 duration_seconds=ended_at - worker.started_at,
             )
         )
+        # Reclaim disk (keep .dead.jsonl). delete_drained's return is
+        # load-bearing: False means an append landed after drain -- retry below.
+        for attempt in range(1, _FINALIZE_DELETE_ATTEMPTS + 1):
+            if await qm.delete_drained(session_id):
+                break
+            logger.warning(
+                "finalize_delete_retained session=%s attempt=%d/%d",
+                session_id,
+                attempt,
+                _FINALIZE_DELETE_ATTEMPTS,
+                extra={"session_id": session_id},
+            )
+            if attempt == _FINALIZE_DELETE_ATTEMPTS:
+                # Give up: log retained, picked up by recover() or the sweep.
+                logger.error(
+                    "finalize_delete_gave_up session=%s retained_log=true "
+                    "pickup=recover_sweep",
+                    session_id,
+                    extra={"session_id": session_id},
+                )
+                break
+            if not await self._drain_to_eof(worker, handlers):
+                # Permanent orphan: this session can never re-enter
+                # _finalize_session, so nothing will retry it on its own.
+                # Stays registered so orphaned_sessions() surfaces it on /status.
+                logger.error(
+                    "finalize_orphan session=%s reason=delete_retry_exhausted "
+                    "permanent=true",
+                    session_id,
+                    extra={"session_id": session_id},
+                )
+                return  # late-tail flush failed: same semantics as the first pass
         await self._safe_close(worker)
-        self._deregister(session_id)
-        # Panel finding #5: reclaim disk — a fully drained, finalized session no
-        # longer needs its .log/.offset. Keep .dead.jsonl (retained dead-letter).
-        await qm.delete_drained(session_id)
+        self._deregister(session_id)  # the LAST act -- no await after this
         logger.info(
             "session_finalized session=%s events=%d",
             session_id,
@@ -535,15 +643,90 @@ class SessionRegistry:
         )
 
     async def _safe_close(self, worker: SessionWorker) -> None:
+        """Close the graph store. A worker whose store has been closed is
+        never revived (see ``start_drain``'s guard) -- mark it FIRST, before
+        the await, so there is no suspension point between "we began
+        closing" and "it is marked"."""
+        worker.store_closed = True
         try:
             await worker.services.graph.close()
         except Exception:
             logger.exception("graph.close failed for session %s", worker.session_id)
 
+    @staticmethod
+    def _task_failure(task: asyncio.Task) -> BaseException | None:
+        """The exception a finished task died with, else None.
+
+        None for a task that is still running, was cancelled, or returned
+        cleanly. Checking ``cancelled()`` first is mandatory: ``task.exception()``
+        RAISES ``CancelledError`` on a cancelled task.
+        """
+        if not task.done() or task.cancelled():
+            return None
+        return task.exception()
+
+    def _on_drain_done(self, worker: SessionWorker, task: asyncio.Task) -> None:
+        """The ONE supervision point for a finished drain task.
+
+        Synchronous by asyncio contract, invoked via ``call_soon`` exactly
+        once per task, and only ever AFTER the task is done -- so it can
+        never race a live drainer.
+        """
+        exc = self._task_failure(task)
+        if exc is None:
+            return  # cancelled, or a clean return
+        session_id = worker.session_id
+        try:
+            logger.error(
+                "drain_worker_died session=%s",
+                session_id,
+                exc_info=exc,
+                extra={"session_id": session_id},
+            )
+        finally:
+            # Teardown must happen even if logging itself failed.
+            self._deregister(session_id)  # sync; first, so revival unblocks
+            try:
+                close_task = asyncio.get_running_loop().create_task(
+                    self._safe_close(worker), name=f"close-{session_id}"
+                )
+            except RuntimeError:  # loop already closing at shutdown
+                logger.warning(
+                    "drain_worker_died_close_skipped session=%s",
+                    session_id,
+                    extra={"session_id": session_id},
+                )
+            else:
+                # Hold a strong ref -- asyncio only keeps a weak one, so
+                # without this the close task can be GC'd mid-execution.
+                self._close_tasks.add(close_task)
+                close_task.add_done_callback(self._close_tasks.discard)
+
     def start_drain(self, worker: SessionWorker) -> None:
-        if worker.task is None or worker.task.done():
-            worker.task = asyncio.create_task(
-                self.drain_worker(worker), name=f"drain-{worker.session_id}"
+        if worker.store_closed:
+            # Spent store: draining through it would dead-letter good events.
+            # The closer MUST also deregister, or this refuses the worker forever.
+            return
+        task = worker.task
+        if task is not None:
+            if not task.done():
+                return  # live drainer -- nothing to do
+            if self._task_failure(task) is not None:
+                # Crashed; the done-callback owns teardown and will deregister.
+                return
+        # A previous, cleanly-finished task means this is a respawn, distinct
+        # from a brand-new worker (task is None, logged by get_or_create).
+        respawn = task is not None
+        new_task = asyncio.create_task(
+            self.drain_worker(worker), name=f"drain-{worker.session_id}"
+        )
+        new_task.add_done_callback(functools.partial(self._on_drain_done, worker))
+        worker.task = new_task
+        if respawn:
+            logger.info(
+                "drainer_respawned session=%s",
+                worker.session_id,
+                extra={"session_id": worker.session_id},
             )
 
     def get_or_create(
@@ -580,10 +763,11 @@ class SessionRegistry:
                 extra={"session_id": session_id},
             )
         else:
-            # Session-ownership invariant: each session_id is owned by exactly one
-            # contributor; the bound created_by (set once at creation) is load-bearing
-            # for provenance.  Log at ERROR — not WARNING — so monitoring surfaces a
-            # violation observably; preserve the bound id and don't crash live ingest.
+            # Respawn on every repeat event so a deregistered-but-not-yet-
+            # revived worker comes back the moment traffic resumes.
+            self.start_drain(self._workers[session_id])
+            # Each session_id is owned by exactly one contributor. ERROR (not
+            # WARNING) so monitoring surfaces a violation; ingest still proceeds.
             if created_by is not None:
                 bound = getattr(
                     self._workers[session_id].services.graph, "created_by", None
@@ -606,6 +790,13 @@ class SessionRegistry:
     def remove(self, session_id: str) -> None:
         worker = self._workers.pop(session_id, None)
         if worker and worker.task and not worker.task.done():
+            # Forced removal of a still-live task; the normal path is a graceful finalize.
+            logger.info(
+                "drain_worker_remove session=%s had_live_task=%s",
+                session_id,
+                True,
+                extra={"session_id": session_id},
+            )
             worker.task.cancel()
 
     def _deregister(self, session_id: str) -> None:
@@ -629,14 +820,11 @@ class SessionRegistry:
         return list(self._workers.values())
 
     def orphaned_sessions(self) -> list[SessionWorker]:
-        """Return workers that are still registered but whose drain task has
-        finished — the silent-stall signal for #278.
+        """Return workers still registered whose drain task has finished.
 
-        A worker is orphaned iff it is in _workers AND its task has completed
-        (task.done()). This catches the finalization-path orphan (a tail flush
-        failure returns early without deregistering, so the task completes but
-        the worker is never removed) and any unhandled exception that escapes
-        the drain loop. Deterministic and instant — no timer, no threshold.
+        Orphaned iff in ``_workers`` AND ``task.done()`` -- catches a tail-
+        flush failure that returns early without deregistering, and any
+        unhandled exception escaping the drain loop. Deterministic, no timer.
         """
         return [
             worker
