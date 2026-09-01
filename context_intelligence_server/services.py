@@ -198,6 +198,20 @@ class GraphState:
     async def resolve_session_graph(self, session_id: str) -> SessionGraph | None:
         """In-memory equivalent of ``Neo4jGraphStore.resolve_session_graph``.
 
+        *session_id* is the only input -- there is no workspace argument.
+        The workspace reported on the returned ``SessionGraph`` is read off
+        the session node itself (``node["workspace"]``), the same "discover
+        it, do not require it" rule ``Neo4jGraphStore`` follows, falling
+        back to this store's own bound workspace when a node was written
+        without an explicit ``workspace`` property.
+
+        ``GraphState`` holds the nodes for exactly one workspace per
+        instance (``self._nodes`` is one flat dict, keyed by node_id alone),
+        so a node_id can never be found under two different workspaces
+        here -- the ambiguity ``Neo4jGraphStore`` must guard against
+        (``AmbiguousSessionError``) cannot structurally occur in this
+        in-memory store.
+
         Walks ``HAS_SUBSESSION``/``FORKED`` edges up to the root, then back
         down to every descendant. See that method's docstring for the
         graph-subgraph (node/edge) traversal rule.
@@ -205,6 +219,7 @@ class GraphState:
         start = self._nodes.get(session_id)
         if start is None or "Session" not in start.get("labels", []):
             return None
+        workspace = start.get("workspace") or self._workspace
 
         parent_of: dict[str, str] = {}
         children: dict[str, list[str]] = {}
@@ -283,7 +298,7 @@ class GraphState:
             started_at=started_at,
             last_change=last_change,
             subsession_count=len(session_ids) - 1,
-            workspace=self._workspace,
+            workspace=workspace,
             working_dir=working_dir if isinstance(working_dir, str) else None,
         )
 

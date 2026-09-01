@@ -36,8 +36,11 @@ How the graph is built:
         the test could observe it as pending) -- a separate session with
         no worker attached avoids that race entirely.
 
-The GET summary call and both DELETE calls (dry run and real) always go
-through HTTP, against the real running FastAPI app.
+The GET summary call (the preview) and the DELETE calls (which now always
+delete -- there is no dry-run flag any more) always go through HTTP, against
+the real running FastAPI app. Neither call takes a workspace query
+parameter: the server looks up which workspace a session id belongs to on
+its own.
 """
 
 from __future__ import annotations
@@ -316,11 +319,14 @@ async def test_delete_session_endpoint_end_to_end(
         await helper_store.flush()
 
         # --------------------------------------------------------------
-        # Step 3 -- GET summary through HTTP, from a SUBsession id, and
-        # check it resolves the whole graph. blob_count must be greater
+        # Step 3 -- GET summary through HTTP, from a SUBsession id, with NO
+        # workspace query param -- the server looks up which workspace the
+        # session belongs to on its own. Checks it resolves the whole
+        # graph, and that GET deletes nothing: blob_count must be greater
         # than 0 and match the number of real blobs the blob store lists
-        # for the graph's sessions -- the proof that the summary now sees
-        # real blobs without any hand-attached node property.
+        # for the graph's sessions (the proof that the summary now sees
+        # real blobs without any hand-attached node property), and every
+        # node/blob is still there afterwards.
         # --------------------------------------------------------------
         real_blob_uris: list[str] = []
         for session_id in (ROOT, SUB1, SUB2, FORK1):
@@ -329,9 +335,7 @@ async def test_delete_session_endpoint_end_to_end(
             f"expected one real blob each for root/sub2/fork1, found {real_blob_uris!r}"
         )
 
-        summary_resp = await client.get(
-            f"/sessions/{SUB2}/summary", params={"workspace": WORKSPACE}
-        )
+        summary_resp = await client.get(f"/sessions/{SUB2}/summary")
         assert summary_resp.status_code == 200, summary_resp.text
         summary = summary_resp.json()
         assert summary["root_id"] == ROOT
@@ -342,47 +346,35 @@ async def test_delete_session_endpoint_end_to_end(
         assert summary["deletable"] is True
         assert summary["pending_sessions"] == []
 
-        # --------------------------------------------------------------
-        # Step 4 -- dry run (apply=false) deletes nothing.
-        # --------------------------------------------------------------
-        dry_run_resp = await client.delete(
-            f"/sessions/{SUB2}", params={"workspace": WORKSPACE, "apply": "false"}
-        )
-        assert dry_run_resp.status_code == 200, dry_run_resp.text
-        assert dry_run_resp.json()["deletable"] is True
-
         for session_id in (ROOT, SUB1, SUB2, FORK1):
             assert await helper_store.get_node(session_id) is not None, (
-                f"{session_id} should still exist after a dry run"
+                f"{session_id} should still exist after a GET summary"
             )
         assert await blob_store.list(ROOT) != []
         assert await blob_store.list(SUB2) != []
         assert await blob_store.list(FORK1) != []
 
         # --------------------------------------------------------------
-        # Step 5 -- deleting a session that is still receiving data
+        # Step 4 -- deleting a session that is still receiving data
         # returns 409 and deletes nothing. Uses the separate pending
         # session seeded above, with an uncommitted queue record and no
-        # live drain worker to race against.
+        # live drain worker to race against. No workspace query param here
+        # either.
         # --------------------------------------------------------------
         await main_module.registry.queue_manager.append(
             PENDING_ROOT, b'{"event": "session:start", "data": {}}'
         )
-        pending_delete_resp = await client.delete(
-            f"/sessions/{PENDING_ROOT}",
-            params={"workspace": WORKSPACE, "apply": "true"},
-        )
+        pending_delete_resp = await client.delete(f"/sessions/{PENDING_ROOT}")
         assert pending_delete_resp.status_code == 409, pending_delete_resp.text
         assert await helper_store.get_node(PENDING_ROOT) is not None, (
             "a 409 refusal must not delete anything"
         )
 
         # --------------------------------------------------------------
-        # Step 6 -- the real delete (apply=true), through HTTP.
+        # Step 5 -- the real delete, through HTTP. DELETE always deletes
+        # now -- there is no apply flag, and no workspace query param.
         # --------------------------------------------------------------
-        delete_resp = await client.delete(
-            f"/sessions/{SUB2}", params={"workspace": WORKSPACE, "apply": "true"}
-        )
+        delete_resp = await client.delete(f"/sessions/{SUB2}")
         assert delete_resp.status_code == 200, delete_resp.text
         result = delete_resp.json()
         assert result["root_id"] == ROOT
@@ -391,7 +383,7 @@ async def test_delete_session_endpoint_end_to_end(
         assert result["queue_sessions_cleaned"] == 4
 
         # --------------------------------------------------------------
-        # Step 7 -- verify directly against the real stores.
+        # Step 6 -- verify directly against the real stores.
         # --------------------------------------------------------------
         for session_id in (ROOT, SUB1, SUB2, FORK1):
             assert await helper_store.get_node(session_id) is None, (

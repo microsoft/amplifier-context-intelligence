@@ -4,10 +4,9 @@ These are router tests, not full end-to-end tests: they replace the two
 dependency functions that build a real DeletionService (``read_deletion_service``
 and ``delete_route_service``) with a fake service, using
 ``app.dependency_overrides``. This proves the route-to-service wiring (which
-session id and workspace reach the service, how the apply flag is handled,
-how a 404/409 is produced) and the read/write auth gating, without needing a
-real Neo4j connection. A real-server-plus-Neo4j end-to-end test is a separate,
-later item.
+session id reaches the service, how a 404/409 is produced) and the read/write
+auth gating, without needing a real Neo4j connection. A real-server-plus-Neo4j
+end-to-end test is a separate, later item.
 """
 
 from __future__ import annotations
@@ -21,6 +20,7 @@ import httpx
 import pytest
 from context_intelligence_server.authz import require_write
 from context_intelligence_server.deletion import DeletionPreview, DeletionResult
+from context_intelligence_server.graph_store import AmbiguousSessionError
 from context_intelligence_server.main import app
 from context_intelligence_server.routers import deletion as deletion_router
 from fastapi import HTTPException
@@ -66,16 +66,20 @@ class _FakeDeletionService:
         self,
         preview: DeletionPreview | None = None,
         result: DeletionResult | None = None,
-        apply_error: str | None = None,
+        apply_error: Exception | None = None,
+        preview_error: Exception | None = None,
     ) -> None:
         self._preview = preview
         self._result = result
         self._apply_error = apply_error
+        self._preview_error = preview_error
         self.preview_calls: list[str] = []
         self.apply_calls: list[tuple[str, str | None]] = []
 
     async def preview(self, session_id: str) -> DeletionPreview | None:
         self.preview_calls.append(session_id)
+        if self._preview_error is not None:
+            raise self._preview_error
         return self._preview
 
     async def apply(
@@ -83,7 +87,7 @@ class _FakeDeletionService:
     ) -> DeletionResult | None:
         self.apply_calls.append((session_id, requested_by))
         if self._apply_error is not None:
-            raise RuntimeError(self._apply_error)
+            raise self._apply_error
         return self._result
 
 
@@ -101,21 +105,15 @@ def _clear_overrides() -> Any:
     app.dependency_overrides.pop(require_write, None)
 
 
-def _override_read_service(
-    fake: _FakeDeletionService, captured_workspace: list[str]
-) -> None:
-    async def _fake(workspace: str) -> _FakeDeletionService:
-        captured_workspace.append(workspace)
+def _override_read_service(fake: _FakeDeletionService) -> None:
+    async def _fake() -> _FakeDeletionService:
         return fake
 
     app.dependency_overrides[deletion_router.read_deletion_service] = _fake
 
 
-def _override_delete_service(
-    fake: _FakeDeletionService, captured_workspace: list[str]
-) -> None:
-    async def _fake(workspace: str) -> _FakeDeletionService:
-        captured_workspace.append(workspace)
+def _override_delete_service(fake: _FakeDeletionService) -> None:
+    async def _fake() -> _FakeDeletionService:
         return fake
 
     app.dependency_overrides[deletion_router.delete_route_service] = _fake
@@ -154,12 +152,9 @@ class TestGetSessionSummary:
     ) -> None:
         preview = _sample_preview()
         fake = _FakeDeletionService(preview=preview)
-        captured: list[str] = []
-        _override_read_service(fake, captured)
+        _override_read_service(fake)
 
-        response = await client.get(
-            "/sessions/root-1/summary", params={"workspace": "ws1"}
-        )
+        response = await client.get("/sessions/root-1/summary")
 
         assert response.status_code == 200
         body = response.json()
@@ -179,19 +174,45 @@ class TestGetSessionSummary:
             "pending_sessions": [],
         }
         assert fake.preview_calls == ["root-1"]
-        # The workspace query param reached the service-building dependency.
-        assert captured == ["ws1"]
+
+    @pytest.mark.anyio
+    async def test_no_workspace_query_param_needed(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """The summary route takes no workspace query param at all -- the
+        session id alone is enough to reach the service."""
+        fake = _FakeDeletionService(preview=_sample_preview())
+        _override_read_service(fake)
+
+        response = await client.get("/sessions/root-1/summary")
+
+        assert response.status_code == 200
+        assert fake.preview_calls == ["root-1"]
 
     @pytest.mark.anyio
     async def test_unknown_session_returns_404(self, client: httpx.AsyncClient) -> None:
         fake = _FakeDeletionService(preview=None)
-        _override_read_service(fake, [])
+        _override_read_service(fake)
 
-        response = await client.get(
-            "/sessions/does-not-exist/summary", params={"workspace": "ws1"}
-        )
+        response = await client.get("/sessions/does-not-exist/summary")
 
         assert response.status_code == 404
+
+    @pytest.mark.anyio
+    async def test_ambiguous_session_id_returns_409(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """A session id found in more than one workspace is a 409, not a 500
+        or a silent guess."""
+        fake = _FakeDeletionService(
+            preview_error=AmbiguousSessionError("root-1", ["ws1", "ws2"])
+        )
+        _override_read_service(fake)
+
+        response = await client.get("/sessions/root-1/summary")
+
+        assert response.status_code == 409
+        assert "more than one workspace" in response.json()["detail"]
 
     @pytest.mark.anyio
     async def test_allows_a_caller_who_fails_require_write(
@@ -200,44 +221,22 @@ class TestGetSessionSummary:
         """The summary route is gated by require_read only. A caller who is
         refused by require_write must still be able to read the summary."""
         fake = _FakeDeletionService(preview=_sample_preview())
-        _override_read_service(fake, [])
+        _override_read_service(fake)
         app.dependency_overrides[require_write] = _reject_write
 
-        response = await client.get(
-            "/sessions/root-1/summary", params={"workspace": "ws1"}
-        )
+        response = await client.get("/sessions/root-1/summary")
 
         assert response.status_code == 200
 
 
 class TestDeleteSession:
     @pytest.mark.anyio
-    async def test_dry_run_returns_preview_and_calls_no_apply(
-        self, client: httpx.AsyncClient
-    ) -> None:
-        preview = _sample_preview()
-        fake = _FakeDeletionService(preview=preview)
-        captured: list[str] = []
-        _override_delete_service(fake, captured)
-
-        response = await client.delete("/sessions/root-1", params={"workspace": "ws1"})
-
-        assert response.status_code == 200
-        assert response.json()["root_id"] == "root-1"
-        assert response.json()["deletable"] is True
-        assert fake.preview_calls == ["root-1"]
-        assert fake.apply_calls == []  # nothing was deleted
-        assert captured == ["ws1"]
-
-    @pytest.mark.anyio
-    async def test_apply_returns_result(self, client: httpx.AsyncClient) -> None:
+    async def test_delete_returns_result(self, client: httpx.AsyncClient) -> None:
         result = _sample_result()
         fake = _FakeDeletionService(result=result)
-        _override_delete_service(fake, [])
+        _override_delete_service(fake)
 
-        response = await client.delete(
-            "/sessions/root-1", params={"workspace": "ws1", "apply": "true"}
-        )
+        response = await client.delete("/sessions/root-1")
 
         assert response.status_code == 200
         assert response.json() == {
@@ -248,61 +247,83 @@ class TestDeleteSession:
             "blobs_deleted": 2,
             "queue_sessions_cleaned": 2,
         }
-        assert fake.preview_calls == []  # dry run was skipped
+        assert fake.preview_calls == []  # DELETE never previews -- GET does
         assert len(fake.apply_calls) == 1
         assert fake.apply_calls[0][0] == "root-1"
 
     @pytest.mark.anyio
-    async def test_apply_passes_the_authenticated_caller_as_requested_by(self) -> None:
+    async def test_no_workspace_query_param_needed(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """The delete route takes no workspace query param at all -- the
+        session id alone is enough to reach the service."""
+        fake = _FakeDeletionService(result=_sample_result())
+        _override_delete_service(fake)
+
+        response = await client.delete("/sessions/root-1")
+
+        assert response.status_code == 200
+        assert fake.apply_calls == [("root-1", None)]
+
+    @pytest.mark.anyio
+    async def test_passes_the_authenticated_caller_as_requested_by(self) -> None:
         result = _sample_result()
         fake = _FakeDeletionService(result=result)
-        _override_delete_service(fake, [])
+        _override_delete_service(fake)
 
         async with _client_with_scope_state({"contributor_id": "alice"}) as client:
-            response = await client.delete(
-                "/sessions/root-1", params={"workspace": "ws1", "apply": "true"}
-            )
+            response = await client.delete("/sessions/root-1")
 
         assert response.status_code == 200
         assert fake.apply_calls == [("root-1", "alice")]
 
     @pytest.mark.anyio
-    async def test_apply_unknown_session_returns_404(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_unknown_session_returns_404(self, client: httpx.AsyncClient) -> None:
         fake = _FakeDeletionService(result=None)
-        _override_delete_service(fake, [])
+        _override_delete_service(fake)
 
-        response = await client.delete(
-            "/sessions/does-not-exist", params={"workspace": "ws1", "apply": "true"}
-        )
+        response = await client.delete("/sessions/does-not-exist")
 
         assert response.status_code == 404
 
     @pytest.mark.anyio
-    async def test_apply_conflict_when_sessions_still_receiving_data(
+    async def test_conflict_when_sessions_still_receiving_data(
         self, client: httpx.AsyncClient
     ) -> None:
-        fake = _FakeDeletionService(apply_error="sessions still draining: ['sub-1']")
-        _override_delete_service(fake, [])
-
-        response = await client.delete(
-            "/sessions/root-1", params={"workspace": "ws1", "apply": "true"}
+        fake = _FakeDeletionService(
+            apply_error=RuntimeError("sessions still draining: ['sub-1']")
         )
+        _override_delete_service(fake)
+
+        response = await client.delete("/sessions/root-1")
 
         assert response.status_code == 409
         assert "still draining" in response.json()["detail"]
+
+    @pytest.mark.anyio
+    async def test_ambiguous_session_id_returns_409(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """A session id found in more than one workspace is a 409, not a 500
+        or a silent guess."""
+        fake = _FakeDeletionService(
+            apply_error=AmbiguousSessionError("root-1", ["ws1", "ws2"])
+        )
+        _override_delete_service(fake)
+
+        response = await client.delete("/sessions/root-1")
+
+        assert response.status_code == 409
+        assert "more than one workspace" in response.json()["detail"]
 
     @pytest.mark.anyio
     async def test_refuses_a_caller_who_fails_require_write(
         self, client: httpx.AsyncClient
     ) -> None:
         fake = _FakeDeletionService(result=_sample_result())
-        _override_delete_service(fake, [])
+        _override_delete_service(fake)
         app.dependency_overrides[require_write] = _reject_write
 
-        response = await client.delete(
-            "/sessions/root-1", params={"workspace": "ws1", "apply": "true"}
-        )
+        response = await client.delete("/sessions/root-1")
 
         assert response.status_code == 403

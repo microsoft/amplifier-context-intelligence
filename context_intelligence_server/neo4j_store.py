@@ -23,7 +23,11 @@ from neo4j import unit_of_work as _unit_of_work
 from neo4j.exceptions import DriverError, Neo4jError
 
 from context_intelligence_server.config import Neo4jClientConfig
-from context_intelligence_server.graph_store import GraphDeleteResult, SessionGraph
+from context_intelligence_server.graph_store import (
+    AmbiguousSessionError,
+    GraphDeleteResult,
+    SessionGraph,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -230,12 +234,35 @@ def _edge_merge_cypher(edge_type: str) -> str:
 _NODE_BACKFILL_BATCH = 10_000
 
 # ---------------------------------------------------------------------------
+# Entry-session workspace discovery (resolve_session_graph/delete_session_graph)
+# ---------------------------------------------------------------------------
+# Neither method takes a workspace as input any more. Instead, this query
+# finds every ":Session" node with the given node_id -- no workspace filter
+# at all -- and returns the distinct set of workspace values found on those
+# nodes. Session ids are supposed to be unique, so in the normal case this
+# returns exactly one row (one workspace). Zero rows means the session id is
+# unknown anywhere. More than one distinct workspace means the same session
+# id exists in more than one workspace -- the caller must refuse and raise
+# rather than silently pick one and risk resolving (or deleting) the wrong
+# graph.
+_ENTRY_SESSION_WORKSPACE_CYPHER = (
+    "MATCH (start:Session {node_id: $session_id}) "
+    "RETURN DISTINCT start.workspace AS workspace"
+)
+
+# ---------------------------------------------------------------------------
 # Session-graph resolution (resolve_session_graph)
 # ---------------------------------------------------------------------------
 # Graph membership is defined purely via HAS_SUBSESSION/FORKED edges, which
 # _handle_start/_handle_fork (session.py) create exactly once per session as
 # it is classified -- each session has at most one such incoming edge, so the
 # graph is a tree (no cycles, unique parent).
+#
+# $workspace here is the workspace ALREADY DISCOVERED by
+# _ENTRY_SESSION_WORKSPACE_CYPHER above, not something the caller supplied --
+# by the time this query runs, the caller has already confirmed $session_id
+# lives in exactly this one workspace, so scoping every step of the walk by
+# it keeps the whole resolution inside that one workspace.
 #
 # Step 1: expand UP from $session_id via incoming HAS_SUBSESSION/FORKED edges.
 # OPTIONAL MATCH returns one row per ancestor found (or one null row if
@@ -1593,8 +1620,48 @@ class Neo4jGraphStore:
 
         return None
 
+    async def _discover_session_workspace(self, session_id: str) -> str | None:
+        """Find the one workspace *session_id* lives in, with no workspace given.
+
+        Looks up every ``:Session`` node with this node_id -- across every
+        workspace, not just this store's own -- via
+        ``_ENTRY_SESSION_WORKSPACE_CYPHER``, and returns the single workspace
+        value found on those nodes.
+
+        Returns ``None`` if *session_id* does not match any known ``:Session``
+        node anywhere.
+
+        Raises:
+            AmbiguousSessionError: If *session_id* matches ``:Session`` nodes
+                in more than one distinct workspace. This should not happen
+                in practice (session ids are unique), but if it ever does,
+                this refuses to guess rather than silently picking one
+                workspace and resolving (or deleting) the wrong graph.
+        """
+        try:
+            lookup_result = await self._driver.execute_query(
+                _ENTRY_SESSION_WORKSPACE_CYPHER,
+                {"session_id": session_id},
+                database_=self._database,
+            )
+        except Neo4jError:
+            return None
+
+        workspaces = {row["workspace"] for row in lookup_result.records}
+        if not workspaces:
+            return None
+        if len(workspaces) > 1:
+            raise AmbiguousSessionError(session_id, sorted(workspaces))
+        return next(iter(workspaces))
+
     async def resolve_session_graph(self, session_id: str) -> SessionGraph | None:
         """Resolve the whole session graph for *session_id* against Neo4j.
+
+        *session_id* is the only input -- there is no workspace argument.
+        The workspace is looked up from *session_id* itself (see
+        ``_discover_session_workspace``), then that discovered workspace
+        scopes the rest of the resolution, so the resolved graph still comes
+        from exactly one workspace.
 
         See ``_GRAPH_RESOLVE_CYPHER``/``_GRAPH_SUBGRAPH_CYPHER`` above for
         the exact traversal. Reads only the flushed/persisted graph (no
@@ -1602,9 +1669,15 @@ class Neo4jGraphStore:
         sessions.
 
         Returns ``None`` if *session_id* does not resolve to any known
-        ``:Session`` node in this store's workspace.
+        ``:Session`` node in any workspace.
+
+        Raises:
+            AmbiguousSessionError: If *session_id* is found in more than one
+                workspace. See ``_discover_session_workspace``.
         """
-        workspace = self.workspace
+        workspace = await self._discover_session_workspace(session_id)
+        if workspace is None:
+            return None
         try:
             resolve_result = await self._driver.execute_query(
                 _GRAPH_RESOLVE_CYPHER,
@@ -1676,11 +1749,16 @@ class Neo4jGraphStore:
     async def delete_session_graph(self, session_id: str) -> GraphDeleteResult | None:
         """DETACH DELETE the whole OWNED session graph for *session_id* in Neo4j.
 
+        *session_id* is the only input -- there is no workspace argument.
         Reuses ``resolve_session_graph`` to find the graph (same seeds, same
-        boundary rule), then:
+        boundary rule, same discovered-workspace lookup -- see that method's
+        docstring), then:
 
         1. Partitions the graph's reachable nodes into OWNED (deleted) vs
-           boundary ``:SST_CONCEPT`` (kept) via ``_GRAPH_NODE_PARTITION_CYPHER``.
+           boundary ``:SST_CONCEPT`` (kept) via ``_GRAPH_NODE_PARTITION_CYPHER``,
+           scoped by the workspace ``resolve_session_graph`` already
+           discovered (``graph.workspace``) -- never this store's own bound
+           workspace, which the delete no longer depends on.
         2. Counts the relationships the delete will remove (incident to any
            owned node, either direction) BEFORE deleting -- they no longer
            exist to count afterwards.
@@ -1697,12 +1775,17 @@ class Neo4jGraphStore:
         resolved, failures during the delete/verify steps are NOT swallowed
         (unlike the lenient read-path queries above): a destructive operation
         that cannot prove its own result must fail loud, not report zero.
+
+        Raises:
+            AmbiguousSessionError: If *session_id* is found in more than one
+                workspace (raised by ``resolve_session_graph`` before any
+                write is attempted -- nothing is deleted in that case).
         """
         graph = await self.resolve_session_graph(session_id)
         if graph is None:
             return None
 
-        workspace = self.workspace
+        workspace = graph.workspace
         partition_result = await self._driver.execute_query(
             _GRAPH_NODE_PARTITION_CYPHER,
             {"session_ids": sorted(graph.session_ids), "workspace": workspace},
