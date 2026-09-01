@@ -45,7 +45,8 @@ def test_injected_driver_reports_owns_driver_false() -> None:
 @pytest.mark.asyncio
 async def test_close_on_injected_driver_does_not_close_it() -> None:
     """Closing one store sharing an injected driver must not close the driver
-    out from under a second store still using it (the #489 safety property)."""
+    out from under a second store still using it -- the safety property the
+    whole shared-driver change rests on."""
     shared_driver = AsyncMock()
 
     store_a = Neo4jGraphStore(uri="bolt://unused:7687", driver=shared_driver)
