@@ -16,7 +16,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
-from neo4j import READ_ACCESS, WRITE_ACCESS, AsyncGraphDatabase
+from neo4j import READ_ACCESS, WRITE_ACCESS
 
 from context_intelligence_server import __version__
 from context_intelligence_server.auth import (
@@ -41,6 +41,7 @@ from context_intelligence_server.models import (
     EventResponse,
 )
 from context_intelligence_server.neo4j_store import (
+    build_bounded_neo4j_driver,
     count_untagged_nodes,
     ensure_neo4j_schema,
 )
@@ -61,13 +62,18 @@ def _neo4j_access_const(mode: str) -> str:
 
 
 def build_neo4j_driver(config: Neo4jClientConfig) -> Any:
-    """Construct an AsyncGraphDatabase driver from a resolved Neo4j client config.
+    """Construct the pool-bounded admin AsyncGraphDatabase driver.
 
     Shared by ``lifespan()`` (the admin driver, on every server boot) and
     ``doctor.run_doctor()`` (the CLI), so the two entry points can never
-    construct the connection differently.
+    construct the connection differently. Delegates the actual driver
+    construction to ``build_bounded_neo4j_driver`` so the pool-bounding kwargs
+    have one source of truth, shared with ``SessionRegistry``'s driver.
     """
-    return AsyncGraphDatabase.driver(config.url, auth=config.auth)
+    return build_bounded_neo4j_driver(
+        config,
+        max_connection_pool_size=_settings.neo4j_max_connection_pool_size,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -255,9 +261,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # build_neo4j_driver() is the SAME helper doctor.run_doctor() uses, so the
     # server and the doctor CLI can never construct this connection differently.
     app.state.neo4j_driver = build_neo4j_driver(_admin)
-    # Cypher-query (read-intent): /cypher + dashboard reads.
-    app.state.neo4j_query_driver = AsyncGraphDatabase.driver(
-        _query.url, auth=_query.auth
+    # Cypher-query (read-intent): /cypher + dashboard reads. Bounded through the
+    # same helper as the admin driver so every process-wide pool shares one cap.
+    app.state.neo4j_query_driver = build_bounded_neo4j_driver(
+        _query,
+        max_connection_pool_size=_settings.neo4j_max_connection_pool_size,
     )
     # Stash the resolved query access_mode so /cypher opens READ sessions without
     # re-resolving settings on every request.
@@ -411,9 +419,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             _sweep_task.cancel()
             with suppress(asyncio.CancelledError):
                 await _sweep_task
+        # ORDER IS LOAD-BEARING. Quiesce the drainers FIRST. Every session's
+        # graph store now shares ONE driver, so closing it under a live drainer
+        # is no longer a per-session concern: the drainer's batch fails, it
+        # spends its max_delivery_attempts budget in ~250 ms, and
+        # _handle_exhausted_batch dead-letters each line AND commits the offset
+        # past it -- discarding healthy events that merely happened to be
+        # queued at shutdown, with no replay on the next boot. Cancelling first
+        # routes each drainer through CancelledError -> _safe_close -> a final
+        # flush while the driver is still open.
+        logger.info("lifespan_shutdown: quiescing drain workers")
+        await registry.shutdown_workers()
         logger.info("lifespan_shutdown: closing Neo4j drivers")
         await app.state.neo4j_driver.close()
         await app.state.neo4j_query_driver.close()
+        # The registry's shared per-session driver is independent of the two
+        # above (its own pool, built from settings.resolve_neo4j_admin() the
+        # first time a session is created) -- close it here too so no bolt
+        # connection outlives the process.
+        await registry.close_neo4j_driver()
 
 
 app = FastAPI(
