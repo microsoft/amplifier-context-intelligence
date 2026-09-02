@@ -322,6 +322,7 @@ Full runtime onboarding/offboarding runbook and the `/admin/*` API:
 | `POST` | `/cypher` | Proxy a Cypher query to Neo4j |
 | `GET` | `/sessions/{session_id}/summary` | Report what deleting this session's data would remove, without deleting anything (needs read access) |
 | `DELETE` | `/sessions/{session_id}` | Delete a whole session graph and its stored data (needs write access) |
+| `GET` | `/whoami` | Report the caller's own identity (`{"contributor_id": "..."}`, or `null` when auth is off) -- needs read access |
 | `GET` | `/queues/dead-letter` | List dead-letter queues — `worker_key`, `item_count`, `last_error`, `last_ts` (requires `Authorization: Bearer`) |
 | `POST` | `/queues/dead-letter/{worker_key}/replay` | Re-enqueue a worker's dead-letter records then purge; returns count re-enqueued (requires `Authorization: Bearer`) |
 | `POST` | `/queues/dead-letter/{worker_key}/purge` | Permanently delete a worker's dead-letter records; returns count purged (requires `Authorization: Bearer`) |

@@ -50,6 +50,7 @@ from context_intelligence_server.routers.admin import router as admin_router
 from context_intelligence_server.routers.deletion import router as deletion_router
 from context_intelligence_server.routers.queues import router as queues_router
 from context_intelligence_server.routers.version import router as version_router
+from context_intelligence_server.routers.whoami import router as whoami_router
 from context_intelligence_server.status import build_status_response
 
 _settings = get_settings()
@@ -456,6 +457,7 @@ app.include_router(admin_router)
 app.include_router(version_router)
 app.include_router(queues_router)
 app.include_router(deletion_router)
+app.include_router(whoami_router)
 _start_time = time.time()
 registry = SessionRegistry()
 # Expose the registry singleton on app.state so routers can read it via
