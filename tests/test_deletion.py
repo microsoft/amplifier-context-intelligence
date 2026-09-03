@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
-from context_intelligence_server.deletion import DeletionService
+from context_intelligence_server.deletion import DeletionService, SessionsPendingError
 from context_intelligence_server.queue_manager import QueueManager
 from context_intelligence_server.services import GraphState
 
@@ -201,8 +201,11 @@ async def test_apply_refuses_and_deletes_nothing_when_pending(
     await graph.upsert_edge(root, sub1, {"type": "HAS_SUBSESSION"})
     await queue_manager.append(sub1, b'{"event": "tool:pre"}')  # uncommitted
 
-    with pytest.raises(RuntimeError, match="pending"):
+    with pytest.raises(SessionsPendingError, match="pending") as excinfo:
         await service.apply(root)
+    # The retryable refusal names exactly which sessions are still draining.
+    assert excinfo.value.pending_sessions == [sub1]
+    assert excinfo.value.root_id == root
 
     # Nothing deleted: graph, blob, and queue artifacts all survive.
     assert await graph.get_node(root) is not None

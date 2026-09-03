@@ -35,6 +35,7 @@ from context_intelligence_server.deletion import (
     DeletionPreview,
     DeletionResult,
     DeletionService,
+    SessionsPendingError,
 )
 from context_intelligence_server.graph_store import AmbiguousSessionError
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
@@ -172,14 +173,31 @@ async def delete_session(
     be removed first, without deleting anything, call
     ``GET /sessions/{session_id}/summary``.
 
-    Returns 404 when ``session_id`` does not match any known session, 409
-    when the session (or a related session in the same graph) is still
-    receiving data and has not finished being written yet, and 409 when
-    ``session_id`` is somehow found in more than one workspace (see
-    ``AmbiguousSessionError`` -- this should not happen in practice).
+    Returns 404 when ``session_id`` does not match any known session, and 409
+    in two distinct, machine-distinguishable cases:
+
+    - The session (or a related session in the same graph) still has undrained
+      queue records -- ``reason: "sessions_pending"``. This is transient and
+      **retryable**: the response carries a ``Retry-After`` header and a body
+      ``retry_after_seconds`` + ``pending_sessions`` so the caller can back off
+      and retry once the drain finishes.
+    - The session id is somehow found in more than one workspace
+      (``AmbiguousSessionError``) -- not retryable; no ``Retry-After``.
     """
     try:
         result = await service.apply(session_id, requested_by=_caller_id(request))
+    except SessionsPendingError as exc:
+        retry_after = get_settings().delete_retry_after_seconds
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "sessions_pending",
+                "message": str(exc),
+                "pending_sessions": exc.pending_sessions,
+                "retry_after_seconds": retry_after,
+            },
+            headers={"Retry-After": str(retry_after)},
+        ) from exc
     except AmbiguousSessionError as exc:
         raise HTTPException(status_code=409, detail=_AMBIGUOUS_SESSION_DETAIL) from exc
     except RuntimeError as exc:

@@ -19,7 +19,11 @@ from typing import Any
 import httpx
 import pytest
 from context_intelligence_server.authz import require_write
-from context_intelligence_server.deletion import DeletionPreview, DeletionResult
+from context_intelligence_server.deletion import (
+    DeletionPreview,
+    DeletionResult,
+    SessionsPendingError,
+)
 from context_intelligence_server.graph_store import AmbiguousSessionError
 from context_intelligence_server.main import app
 from context_intelligence_server.routers import deletion as deletion_router
@@ -290,15 +294,40 @@ class TestDeleteSession:
     async def test_conflict_when_sessions_still_receiving_data(
         self, client: httpx.AsyncClient
     ) -> None:
+        """An undrained graph is a retryable 409: it carries a Retry-After
+        header and a machine-readable body (reason + pending_sessions +
+        retry_after_seconds) so the caller can back off and retry."""
         fake = _FakeDeletionService(
-            apply_error=RuntimeError("sessions still draining: ['sub-1']")
+            apply_error=SessionsPendingError("root-1", ["sub-1"])
         )
         _override_delete_service(fake)
 
         response = await client.delete("/sessions/root-1")
 
         assert response.status_code == 409
-        assert "still draining" in response.json()["detail"]
+        retry_after = response.headers.get("Retry-After")
+        assert retry_after is not None and int(retry_after) > 0
+        detail = response.json()["detail"]
+        assert detail["reason"] == "sessions_pending"
+        assert detail["pending_sessions"] == ["sub-1"]
+        assert detail["retry_after_seconds"] == int(retry_after)
+
+    @pytest.mark.anyio
+    async def test_graph_vanished_race_is_a_plain_409(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """A non-pending RuntimeError (graph vanished between resolve and
+        delete) is still a 409, but NOT retryable -- no Retry-After header."""
+        fake = _FakeDeletionService(
+            apply_error=RuntimeError("graph vanished between resolve and delete")
+        )
+        _override_delete_service(fake)
+
+        response = await client.delete("/sessions/root-1")
+
+        assert response.status_code == 409
+        assert "Retry-After" not in response.headers
+        assert "vanished" in response.json()["detail"]
 
     @pytest.mark.anyio
     async def test_ambiguous_session_id_returns_409(
