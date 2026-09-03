@@ -388,10 +388,12 @@ session that has finished running, so in practice a session you want to remove c
 
 The delete is refused with `409` only while a session in the graph is **still receiving data**
 (its queue has records that have not finished being written yet). This protects a session that is
-still live or still catching up: wait until it has finished, then delete. The summary's
-`last_change` field helps you tell — a change less than a minute ago may mean the session is still
-active. A `409` is also returned in the (should-not-happen) case where the session id is found in
-more than one workspace — the server refuses to guess which workspace was meant.
+still live or still catching up: wait until it has finished, then delete. Because this is a
+temporary state, that `409` carries a `Retry-After` header and a body with `retry_after_seconds`
+and the `pending_sessions` still draining, so a caller can back off and retry without guessing.
+A `409` is also returned in the (should-not-happen) case where the session id is found in
+more than one workspace — the server refuses to guess which workspace was meant. That one has no
+`Retry-After`: it is not retryable.
 
 The summary uses the read-only Neo4j connection; the actual delete uses the admin connection.
 
