@@ -10,7 +10,6 @@ from typing import Any
 
 from context_intelligence_server.graph_store import GraphStore, QueryableStore
 
-
 # ---------------------------------------------------------------------------
 # Minimal conforming implementations for isinstance checks
 # ---------------------------------------------------------------------------
@@ -56,6 +55,12 @@ class MinimalGraphStore:
     async def find_delegation_by_sub_session(
         self, sub_session_id: str, workspace: str
     ) -> dict[str, Any] | None:
+        return None
+
+    async def resolve_session_graph(self, session_id: str) -> Any:
+        return None
+
+    async def delete_session_graph(self, session_id: str) -> Any:
         return None
 
     async def flush(self) -> None:
@@ -134,6 +139,12 @@ class MinimalQueryableStore:
     async def find_delegation_by_sub_session(
         self, sub_session_id: str, workspace: str
     ) -> dict[str, Any] | None:
+        return None
+
+    async def resolve_session_graph(self, session_id: str) -> Any:
+        return None
+
+    async def delete_session_graph(self, session_id: str) -> Any:
         return None
 
     async def flush(self) -> None:
@@ -243,6 +254,7 @@ def test_queryable_store_exported():
 def test_no_graph_forest_name_references():
     """Verify graph_forest_name does not appear anywhere in graph_store.py."""
     import inspect
+
     import context_intelligence_server.graph_store as m
 
     source = inspect.getsource(m)

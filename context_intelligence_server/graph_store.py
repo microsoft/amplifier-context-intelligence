@@ -43,7 +43,83 @@ Non-negotiable guarantees for all conforming implementations:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
+
+
+@dataclass(frozen=True)
+class SessionGraph:
+    """Whole-graph resolution result backing the session-summary facts.
+
+    A session graph spans many session nodes (root + subsessions + forks),
+    never just the one passed in (see B1 in
+    docs/context-intelligence-delete-session-data.md). ``session_ids`` is
+    the authoritative set: a later delete operation reuses this exact
+    resolution so its dry-run preview and its apply step can never disagree.
+
+    This carries the session ids and the graph facts (node/edge counts,
+    who started it, when it last changed) -- it does not carry the graph's
+    blobs. Blobs belong to the blob store, which is already keyed by
+    session id and can list every blob for a session directly
+    (``BlobStore.list``). The caller that needs blob counts or sizes (the
+    deletion service) asks the blob store for each session id in
+    ``session_ids`` and adds the results up, instead of this store trying to
+    find blob markers hidden inside node data.
+
+    ``node_count``/``edge_count`` cover the graph's own subgraph only --
+    traversal stops at (but includes) any ``:SST_CONCEPT`` node, since
+    concept nodes (Agent/Orchestrator/Recipe) are shared across sessions and
+    are never owned by one graph.
+    """
+
+    root_id: str
+    session_ids: frozenset[str]
+    node_count: int
+    edge_count: int
+    created_by: str | None
+    started_at: datetime | None
+    last_change: datetime | None
+    subsession_count: int
+    workspace: str
+    working_dir: str | None
+
+
+class AmbiguousSessionError(Exception):
+    """Raised when a session id is found in more than one workspace.
+
+    ``resolve_session_graph`` and ``delete_session_graph`` no longer take a
+    workspace as input -- they look up which workspace a session id belongs
+    to and use that. Session ids are supposed to be unique, so this should
+    not normally happen, but if it ever does, refusing loudly here is much
+    safer than picking one workspace and deleting the wrong graph.
+    """
+
+    def __init__(self, session_id: str, workspaces: list[str]) -> None:
+        self.session_id = session_id
+        self.workspaces = workspaces
+        super().__init__(
+            f"session id {session_id!r} exists in more than one workspace: "
+            f"{workspaces!r}"
+        )
+
+
+@dataclass(frozen=True)
+class GraphDeleteResult:
+    """Result of a whole-graph ``delete_session_graph`` call.
+
+    ``nodes_deleted``/``relationships_deleted`` count only the OWNED graph
+    subgraph that was actually removed -- i.e. the same node set
+    ``resolve_session_graph`` reports EXCLUDING any shared ``:SST_CONCEPT``
+    node (Agent/Orchestrator/Recipe). Concept nodes are never deleted, only
+    detached: ``relationships_deleted`` includes any edge from a deleted
+    owned node into a surviving concept node, since ``DETACH DELETE`` removes
+    that edge as a side effect of removing the owned endpoint.
+    """
+
+    root_id: str
+    nodes_deleted: int
+    relationships_deleted: int
 
 
 @runtime_checkable
@@ -108,6 +184,62 @@ class GraphStore(Protocol):
         Checks the in-memory buffer first, consistent with ``get_node``/
         ``get_edge`` buffer-first semantics. Returns ``None`` if no matching
         Delegation node is found in either the buffer or the backing store.
+        """
+        ...
+
+    async def resolve_session_graph(self, session_id: str) -> SessionGraph | None:
+        """Resolve the whole session graph (root + all descendants) for *session_id*.
+
+        *session_id* is the only input needed -- there is no separate
+        workspace argument. The workspace a session lives in is looked up
+        from *session_id* itself (session ids are unique), and that
+        discovered workspace is what the rest of the resolution is scoped
+        to, so a session graph is still resolved within one workspace.
+
+        If *session_id* is not itself a root, first expands UP to the root by
+        walking ``HAS_SUBSESSION``/``FORKED`` edges, then returns the root plus
+        every descendant session -- never just the passed session alone (B1).
+        A sub-session id and its root id MUST resolve to the identical graph.
+
+        Returns ``None`` if *session_id* does not resolve to any known
+        ``:Session`` node.
+
+        Raises:
+            AmbiguousSessionError: If *session_id* is found in more than one
+                workspace. Session ids are supposed to be unique, so this
+                should not happen in practice, but this method refuses to
+                guess which workspace was meant rather than silently picking
+                one.
+        """
+        ...
+
+    async def delete_session_graph(self, session_id: str) -> GraphDeleteResult | None:
+        """Permanently delete the whole OWNED session graph for *session_id*.
+
+        *session_id* is the only input needed -- there is no separate
+        workspace argument. Like ``resolve_session_graph``, the workspace is
+        looked up from *session_id* itself, not supplied by the caller.
+
+        Resolves the graph via the identical traversal ``resolve_session_graph``
+        uses (root + all descendants, bounded at but not past any
+        ``:SST_CONCEPT`` node), then removes every node it owns -- the graph
+        nodes EXCLUDING shared ``:SST_CONCEPT`` nodes. Shared concept nodes
+        (Agent/Orchestrator/Recipe) are NEVER deleted, only detached: only
+        their edges into the deleted graph are removed, as a side effect of
+        removing the owned endpoint of each such edge.
+
+        A sub-session id and its root id MUST resolve to, and delete, the
+        identical graph -- this reuses ``resolve_session_graph``'s exact
+        resolution so a delete can never diverge from what a prior preview
+        summary promised.
+
+        Returns ``None`` if *session_id* does not resolve to any known
+        ``:Session`` node -- no writes occur in that case.
+
+        Raises:
+            AmbiguousSessionError: If *session_id* is found in more than one
+                workspace (see ``resolve_session_graph``). Nothing is deleted
+                in that case.
         """
         ...
 

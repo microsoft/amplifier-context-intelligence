@@ -23,6 +23,11 @@ from neo4j import unit_of_work as _unit_of_work
 from neo4j.exceptions import DriverError, Neo4jError
 
 from context_intelligence_server.config import Neo4jClientConfig
+from context_intelligence_server.graph_store import (
+    AmbiguousSessionError,
+    GraphDeleteResult,
+    SessionGraph,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -227,6 +232,141 @@ def _edge_merge_cypher(edge_type: str) -> str:
 # TRANSACTIONS OF N ROWS).  A literal int is required by Cypher for the batch
 # size, so this constant is interpolated (never user-supplied).
 _NODE_BACKFILL_BATCH = 10_000
+
+# ---------------------------------------------------------------------------
+# Entry-session workspace discovery (resolve_session_graph/delete_session_graph)
+# ---------------------------------------------------------------------------
+# Neither method takes a workspace as input any more. Instead, this query
+# finds every ":Session" node with the given node_id -- no workspace filter
+# at all -- and returns the distinct set of workspace values found on those
+# nodes. Session ids are supposed to be unique, so in the normal case this
+# returns exactly one row (one workspace). Zero rows means the session id is
+# unknown anywhere. More than one distinct workspace means the same session
+# id exists in more than one workspace -- the caller must refuse and raise
+# rather than silently pick one and risk resolving (or deleting) the wrong
+# graph.
+_ENTRY_SESSION_WORKSPACE_CYPHER = (
+    "MATCH (start:Session {node_id: $session_id}) "
+    "RETURN DISTINCT start.workspace AS workspace"
+)
+
+# ---------------------------------------------------------------------------
+# Session-graph resolution (resolve_session_graph)
+# ---------------------------------------------------------------------------
+# Graph membership is defined purely via HAS_SUBSESSION/FORKED edges, which
+# _handle_start/_handle_fork (session.py) create exactly once per session as
+# it is classified -- each session has at most one such incoming edge, so the
+# graph is a tree (no cycles, unique parent).
+#
+# $workspace here is the workspace ALREADY DISCOVERED by
+# _ENTRY_SESSION_WORKSPACE_CYPHER above, not something the caller supplied --
+# by the time this query runs, the caller has already confirmed $session_id
+# lives in exactly this one workspace, so scoping every step of the walk by
+# it keeps the whole resolution inside that one workspace.
+#
+# Step 1: expand UP from $session_id via incoming HAS_SUBSESSION/FORKED edges.
+# OPTIONAL MATCH returns one row per ancestor found (or one null row if
+# $session_id is already the root); the ancestor reached by the LONGEST
+# upward path is the root, by construction of the tree (no bound needed --
+# the walk always terminates because the graph is acyclic).
+# Step 2: expand DOWN from that root via the same edge types, `*0..` so the
+# root itself is included, to enumerate every graph member.
+_GRAPH_RESOLVE_CYPHER = (
+    "MATCH (start:Session {node_id: $session_id, workspace: $workspace}) "
+    "OPTIONAL MATCH p = (start)<-[:HAS_SUBSESSION|FORKED*]-(ancestor:Session {workspace: $workspace}) "
+    "WITH start, ancestor, p "
+    "ORDER BY length(p) DESC "
+    "LIMIT 1 "
+    "WITH coalesce(ancestor, start) AS root "
+    "MATCH (root)-[:HAS_SUBSESSION|FORKED*0..]->(member:Session {workspace: $workspace}) "
+    "RETURN DISTINCT member.node_id AS session_id, root.node_id AS root_id, "
+    "properties(member) AS props"
+)
+
+# Graph subgraph: from every graph session node, expand outward along ANY
+# relationship type, `*0..` so the session nodes themselves are included.
+# `ALL(x IN nodes(path)[0..-1] WHERE NOT x:SST_CONCEPT)` stops expansion AT
+# (but includes) a :SST_CONCEPT node (Agent/Orchestrator/Recipe) -- those are
+# shared across sessions and are never owned by one graph, so a path that
+# would continue past one is excluded entirely (any such path also exists at
+# the shorter length ending exactly at the concept node, which IS kept).
+_GRAPH_SUBGRAPH_CYPHER = (
+    "UNWIND $session_ids AS sid "
+    "MATCH (s:Session {node_id: sid, workspace: $workspace}) "
+    "WITH collect(s) AS seeds "
+    "CALL { "
+    "WITH seeds "
+    "UNWIND seeds AS s "
+    "MATCH path = (s)-[*0..]->(n {workspace: $workspace}) "
+    "WHERE ALL(x IN nodes(path)[0..-1] WHERE NOT x:SST_CONCEPT) "
+    "RETURN collect(DISTINCT n) AS graph_nodes "
+    "} "
+    "WITH graph_nodes "
+    "UNWIND graph_nodes AS a "
+    "OPTIONAL MATCH (a)-[r]->(b) "
+    "WHERE b IN graph_nodes "
+    "WITH graph_nodes, collect(DISTINCT r) AS rels "
+    "RETURN size(graph_nodes) AS node_count, size(rels) AS edge_count"
+)
+
+# ---------------------------------------------------------------------------
+# Whole-graph delete (delete_session_graph)
+# ---------------------------------------------------------------------------
+# Same seed set (graph session_ids) and boundary rule (stop AT but not past
+# a :SST_CONCEPT node) as _GRAPH_SUBGRAPH_CYPHER above, so delete can never
+# diverge from what resolve_session_graph already resolved. Unlike the
+# subgraph query, this one partitions the traversal result into OWNED nodes
+# (deleted) vs boundary :SST_CONCEPT nodes (kept, verified to survive) and
+# returns elementId -- the identity DETACH DELETE by elementId needs.
+_GRAPH_NODE_PARTITION_CYPHER = (
+    "UNWIND $session_ids AS sid "
+    "MATCH (s:Session {node_id: sid, workspace: $workspace}) "
+    "WITH collect(s) AS seeds "
+    "CALL { "
+    "WITH seeds "
+    "UNWIND seeds AS s "
+    "MATCH path = (s)-[*0..]->(n {workspace: $workspace}) "
+    "WHERE ALL(x IN nodes(path)[0..-1] WHERE NOT x:SST_CONCEPT) "
+    "RETURN collect(DISTINCT n) AS graph_nodes "
+    "} "
+    "UNWIND graph_nodes AS n "
+    "RETURN elementId(n) AS eid, n:SST_CONCEPT AS is_concept"
+)
+
+# Distinct count of relationships incident (either direction) to any of the
+# owned nodes named in $element_ids -- exactly the set DETACH DELETE removes.
+# Must run BEFORE the delete batches below (the relationships are gone after).
+_GRAPH_REL_COUNT_CYPHER = (
+    "UNWIND $element_ids AS eid "
+    "MATCH (n) WHERE elementId(n) = eid "
+    "OPTIONAL MATCH (n)-[r]-() "
+    "RETURN count(DISTINCT r) AS rel_count"
+)
+
+# 2-phase delete primitive: enumerate elementIds (above), then DETACH DELETE
+# by elementId in batches -- the proven pattern from ci_session_purge, which
+# deleted a 2601-node graph this way. DETACH DELETE on an owned node removes
+# every relationship touching it, including any edge into a surviving
+# :SST_CONCEPT node -- that edge's removal IS the "detach" the design calls for.
+_GRAPH_DELETE_BATCH_CYPHER = (
+    "UNWIND $element_ids AS eid "
+    "MATCH (n) WHERE elementId(n) = eid "
+    "DETACH DELETE n"
+)
+
+# elementId-list existence count -- shared by both post-delete gate checks
+# (owned nodes must be gone, concept nodes must survive).
+_COUNT_NODES_BY_ELEMENT_ID_CYPHER = (
+    "UNWIND $element_ids AS eid "
+    "MATCH (n) WHERE elementId(n) = eid "
+    "RETURN count(n) AS c"
+)
+
+# Row cap per DETACH DELETE batch. elementId strings are tiny, so only the row
+# bound matters in practice; the byte bound is kept generous as a defensive
+# ceiling, mirroring the dual-bound _chunk_list contract used by the flush path.
+_DELETE_BATCH_ROWS = 500
+_DELETE_BATCH_BYTES = 10_000_000
 
 
 def _validate_identifier(name: str, kind: str) -> None:
@@ -1479,6 +1619,239 @@ class Neo4jGraphStore:
             pass
 
         return None
+
+    async def _discover_session_workspace(self, session_id: str) -> str | None:
+        """Find the one workspace *session_id* lives in, with no workspace given.
+
+        Looks up every ``:Session`` node with this node_id -- across every
+        workspace, not just this store's own -- via
+        ``_ENTRY_SESSION_WORKSPACE_CYPHER``, and returns the single workspace
+        value found on those nodes.
+
+        Returns ``None`` if *session_id* does not match any known ``:Session``
+        node anywhere.
+
+        Raises:
+            AmbiguousSessionError: If *session_id* matches ``:Session`` nodes
+                in more than one distinct workspace. This should not happen
+                in practice (session ids are unique), but if it ever does,
+                this refuses to guess rather than silently picking one
+                workspace and resolving (or deleting) the wrong graph.
+        """
+        try:
+            lookup_result = await self._driver.execute_query(
+                _ENTRY_SESSION_WORKSPACE_CYPHER,
+                {"session_id": session_id},
+                database_=self._database,
+            )
+        except Neo4jError:
+            return None
+
+        workspaces = {row["workspace"] for row in lookup_result.records}
+        if not workspaces:
+            return None
+        if len(workspaces) > 1:
+            raise AmbiguousSessionError(session_id, sorted(workspaces))
+        return next(iter(workspaces))
+
+    async def resolve_session_graph(self, session_id: str) -> SessionGraph | None:
+        """Resolve the whole session graph for *session_id* against Neo4j.
+
+        *session_id* is the only input -- there is no workspace argument.
+        The workspace is looked up from *session_id* itself (see
+        ``_discover_session_workspace``), then that discovered workspace
+        scopes the rest of the resolution, so the resolved graph still comes
+        from exactly one workspace.
+
+        See ``_GRAPH_RESOLVE_CYPHER``/``_GRAPH_SUBGRAPH_CYPHER`` above for
+        the exact traversal. Reads only the flushed/persisted graph (no
+        buffer-first fallback) -- summary/delete operate on already-ingested
+        sessions.
+
+        Returns ``None`` if *session_id* does not resolve to any known
+        ``:Session`` node in any workspace.
+
+        Raises:
+            AmbiguousSessionError: If *session_id* is found in more than one
+                workspace. See ``_discover_session_workspace``.
+        """
+        workspace = await self._discover_session_workspace(session_id)
+        if workspace is None:
+            return None
+        try:
+            resolve_result = await self._driver.execute_query(
+                _GRAPH_RESOLVE_CYPHER,
+                {"session_id": session_id, "workspace": workspace},
+                database_=self._database,
+            )
+        except Neo4jError:
+            return None
+
+        rows = resolve_result.records
+        if not rows:
+            return None
+
+        root_id: str = rows[0]["root_id"]
+        session_ids: set[str] = set()
+        member_props: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            sid: str = row["session_id"]
+            session_ids.add(sid)
+            member_props[sid] = {
+                k: _normalize_temporal(v) for k, v in dict(row["props"]).items()
+            }
+
+        node_count = 0
+        edge_count = 0
+        try:
+            subgraph_result = await self._driver.execute_query(
+                _GRAPH_SUBGRAPH_CYPHER,
+                {"session_ids": sorted(session_ids), "workspace": workspace},
+                database_=self._database,
+            )
+        except Neo4jError:
+            subgraph_result = None
+        if subgraph_result is not None and subgraph_result.records:
+            subgraph_row = subgraph_result.records[0]
+            node_count = subgraph_row["node_count"]
+            edge_count = subgraph_row["edge_count"]
+
+        root_props = member_props.get(root_id, {})
+        created_by = root_props.get("created_by")
+        started_at = root_props.get("started_at")
+        working_dir = root_props.get("working_dir")
+
+        last_change: datetime | None = None
+        for props in member_props.values():
+            candidate = (
+                props.get("last_updated")
+                or props.get("ended_at")
+                or props.get("started_at")
+            )
+            if isinstance(candidate, datetime) and (
+                last_change is None or candidate > last_change
+            ):
+                last_change = candidate
+
+        return SessionGraph(
+            root_id=root_id,
+            session_ids=frozenset(session_ids),
+            node_count=node_count,
+            edge_count=edge_count,
+            created_by=created_by if isinstance(created_by, str) else None,
+            started_at=started_at if isinstance(started_at, datetime) else None,
+            last_change=last_change,
+            subsession_count=len(session_ids) - 1,
+            workspace=workspace,
+            working_dir=working_dir if isinstance(working_dir, str) else None,
+        )
+
+    async def delete_session_graph(self, session_id: str) -> GraphDeleteResult | None:
+        """DETACH DELETE the whole OWNED session graph for *session_id* in Neo4j.
+
+        *session_id* is the only input -- there is no workspace argument.
+        Reuses ``resolve_session_graph`` to find the graph (same seeds, same
+        boundary rule, same discovered-workspace lookup -- see that method's
+        docstring), then:
+
+        1. Partitions the graph's reachable nodes into OWNED (deleted) vs
+           boundary ``:SST_CONCEPT`` (kept) via ``_GRAPH_NODE_PARTITION_CYPHER``,
+           scoped by the workspace ``resolve_session_graph`` already
+           discovered (``graph.workspace``) -- never this store's own bound
+           workspace, which the delete no longer depends on.
+        2. Counts the relationships the delete will remove (incident to any
+           owned node, either direction) BEFORE deleting -- they no longer
+           exist to count afterwards.
+        3. ``DETACH DELETE``s the owned nodes by elementId, in batches
+           (``_DELETE_BATCH_ROWS`` per query) -- the proven 2-phase pattern
+           from ``ci_session_purge``, which scales to large families.
+        4. Verifies the gate this feature promises: every owned node is
+           actually gone, and every boundary concept node actually survives.
+           A violation raises ``RuntimeError`` rather than returning a result
+           that misrepresents what happened.
+
+        Returns ``None`` if *session_id* does not resolve to any known
+        ``:Session`` node -- no writes occur in that case. Once a graph is
+        resolved, failures during the delete/verify steps are NOT swallowed
+        (unlike the lenient read-path queries above): a destructive operation
+        that cannot prove its own result must fail loud, not report zero.
+
+        Raises:
+            AmbiguousSessionError: If *session_id* is found in more than one
+                workspace (raised by ``resolve_session_graph`` before any
+                write is attempted -- nothing is deleted in that case).
+        """
+        graph = await self.resolve_session_graph(session_id)
+        if graph is None:
+            return None
+
+        workspace = graph.workspace
+        partition_result = await self._driver.execute_query(
+            _GRAPH_NODE_PARTITION_CYPHER,
+            {"session_ids": sorted(graph.session_ids), "workspace": workspace},
+            database_=self._database,
+        )
+        owned_ids: list[str] = []
+        concept_ids: list[str] = []
+        for row in partition_result.records:
+            (concept_ids if row["is_concept"] else owned_ids).append(row["eid"])
+
+        if not owned_ids:
+            # Every graph session node is itself owned, so this should be
+            # unreachable in practice -- defensive, not a real code path.
+            return GraphDeleteResult(
+                root_id=graph.root_id, nodes_deleted=0, relationships_deleted=0
+            )
+
+        rel_result = await self._driver.execute_query(
+            _GRAPH_REL_COUNT_CYPHER,
+            {"element_ids": owned_ids},
+            database_=self._database,
+        )
+        relationships_deleted = (
+            rel_result.records[0]["rel_count"] if rel_result.records else 0
+        )
+
+        for batch in _chunk_list(owned_ids, _DELETE_BATCH_ROWS, _DELETE_BATCH_BYTES):
+            await self._driver.execute_query(
+                _GRAPH_DELETE_BATCH_CYPHER,
+                {"element_ids": batch},
+                database_=self._database,
+            )
+
+        # Gate: every owned node must actually be gone.
+        survivor_result = await self._driver.execute_query(
+            _COUNT_NODES_BY_ELEMENT_ID_CYPHER,
+            {"element_ids": owned_ids},
+            database_=self._database,
+        )
+        survivor_count = survivor_result.records[0]["c"] if survivor_result.records else 0
+        if survivor_count:
+            raise RuntimeError(
+                f"delete_session_graph: {survivor_count} owned node(s) survived "
+                f"DETACH DELETE for graph root {graph.root_id!r}"
+            )
+
+        # Gate: every boundary concept node must still exist.
+        if concept_ids:
+            concept_result = await self._driver.execute_query(
+                _COUNT_NODES_BY_ELEMENT_ID_CYPHER,
+                {"element_ids": concept_ids},
+                database_=self._database,
+            )
+            concept_count = concept_result.records[0]["c"] if concept_result.records else 0
+            if concept_count != len(concept_ids):
+                raise RuntimeError(
+                    f"delete_session_graph: expected {len(concept_ids)} shared "
+                    f"concept node(s) to survive for graph root "
+                    f"{graph.root_id!r}, found {concept_count}"
+                )
+
+        return GraphDeleteResult(
+            root_id=graph.root_id,
+            nodes_deleted=len(owned_ids),
+            relationships_deleted=relationships_deleted,
+        )
 
     async def get_edge(self, src_id: str, dst_id: str) -> dict[str, Any] | None:
         """Return edge data, checking the in-memory buffer first.

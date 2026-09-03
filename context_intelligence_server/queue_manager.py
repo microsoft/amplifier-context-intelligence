@@ -500,6 +500,57 @@ class QueueManager:
                     del self._guards[session_id]
         return ok
 
+    async def delete_session(self, session_id: str) -> bool:
+        """Permanently remove ALL queue artifacts for ``session_id``.
+
+        Unlike ``delete_drained`` (which deliberately keeps ``.dead.jsonl``),
+        this removes ``.log``, ``.offset``, AND ``.dead.jsonl`` -- a
+        session-data delete must not leave dead letters behind. Returns True
+        if anything was removed; idempotent (a session with no files at all
+        returns False).
+
+        Refuses (raises ``RuntimeError``, deletes nothing) if the session
+        still has pending (uncommitted) records. The pending check is
+        computed under ``guard.file_lock`` -- atomically with the delete
+        itself, using the same ``_read_committed_offset`` /
+        ``_complete_data_end`` / ``_count_newlines`` helpers ``recover()``
+        and ``pending_count`` use -- so it can never race a concurrent
+        append and can never disagree with the drainer's own definition of
+        "pending".
+        """
+        self._validate_session_id(session_id)
+        log = self._log_path(session_id)
+        offset = self._offset_path(session_id)
+        dead = self._dead_path(session_id)
+
+        def _delete(guard: _KeyGuard) -> bool:
+            with guard.file_lock:
+                committed = self._read_committed_offset(session_id)
+                complete_end = self._complete_data_end(session_id)
+                pending = self._count_newlines(session_id, committed, complete_end)
+                if pending:
+                    raise RuntimeError(
+                        f"delete_session refused: session={session_id!r} has "
+                        f"{pending} pending (uncommitted) record(s); drain "
+                        "before deleting"
+                    )
+                removed = False
+                for path in (log, offset, dead):
+                    try:
+                        path.unlink()
+                        removed = True
+                    except FileNotFoundError:
+                        pass
+                return removed
+
+        with self._guard(session_id) as guard:
+            async with guard.admission:
+                removed = await _await_uninterrupted(asyncio.to_thread(_delete, guard))
+                # Same three-part removal condition as delete_drained.
+                if guard.waiters == 1 and self._guards.get(session_id) is guard:
+                    del self._guards[session_id]
+        return removed
+
     async def read_dead_letters(self, session_id: str) -> list[dict]:
         """Return all dead-letter records for ``session_id`` in append order.
 
@@ -599,6 +650,28 @@ class QueueManager:
             return result
 
         return await asyncio.to_thread(_scan)
+
+    async def pending_count(self, session_id: str) -> int:
+        """Count of complete, uncommitted lines pending in a session's ``.log``.
+
+        Authoritative "how much is left to drain" query -- reuses the exact
+        ``_read_committed_offset`` / ``_complete_data_end`` / ``_count_newlines``
+        helpers ``recover()`` and ``recovery_seed_counts`` already use to
+        decide the same thing, so it can never disagree with the drainer's
+        own definition of "pending". 0 means drained: nothing left to
+        commit. A torn trailing fragment (bytes after the final newline)
+        never counts as pending, matching ``recover()``. This is the query
+        the delete-session precondition ("drained, nothing pending") must
+        call before deleting.
+        """
+        self._validate_session_id(session_id)
+
+        def _count() -> int:
+            committed = self._read_committed_offset(session_id)
+            complete_end = self._complete_data_end(session_id)
+            return self._count_newlines(session_id, committed, complete_end)
+
+        return await asyncio.to_thread(_count)
 
     def _count_dead(self, worker_key: str) -> int:
         """Count complete (newline-terminated) dead-letter lines for a key.

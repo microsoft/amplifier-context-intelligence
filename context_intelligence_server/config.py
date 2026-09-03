@@ -824,6 +824,12 @@ class Settings(BaseSettings):
     blob_path: str = "/data/blobs"
     queues_path: str = "/data/queues"
 
+    # Seconds advertised in the Retry-After header (and body) of a 409 when a
+    # delete is refused because the graph still has undrained queue records.
+    # The condition is transient -- the drain clears it -- so the caller is told
+    # how long to wait before retrying. A small poll interval; configurable.
+    delete_retry_after_seconds: int = 2
+
     # -------------------------------------------------------------------------
     # Durable ingest queue
     # -------------------------------------------------------------------------

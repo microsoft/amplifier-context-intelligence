@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-import pytest
 from unittest.mock import AsyncMock, patch
 
+import pytest
+from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.services import (
     GraphState,
     HookConfig,
     HookStateService,
+    total_blob_size,
 )
-
 
 # ---------------------------------------------------------------------------
 # HookConfig tests
@@ -777,3 +778,253 @@ class TestHookStateServiceCreatedBy:
         store = GraphState()
         svc = HookStateService(workspace="/ws", graph_store=store, created_by="carol")
         assert svc.graph.created_by == "carol"
+
+
+# ---------------------------------------------------------------------------
+# GraphState.resolve_session_graph tests
+# ---------------------------------------------------------------------------
+
+
+async def _build_graph(state: GraphState) -> None:
+    """Seed a root + 2 subsessions + 1 fork, with blobs on several sessions.
+
+    Tree shape:  root -[HAS_SUBSESSION]-> sub1 -[HAS_SUBSESSION]-> sub2
+                 root -[FORKED]-> fork1
+
+    Blob-bearing event nodes attached at three different graph sessions
+    (root, sub2, fork1), plus a shared Agent (:SST_CONCEPT) reached from
+    fork1's Delegation, with an out-of-graph node hanging off the Agent to
+    prove traversal stops there.
+    """
+    state.created_by = "colombod"
+    await state.upsert_node(
+        "fam-root",
+        {
+            "labels": ["Session", "RootSession"],
+            "started_at": "2026-01-01T00:00:00+00:00",
+        },
+    )
+    await state.upsert_node(
+        "fam-sub1",
+        {
+            "labels": ["Session", "SubSession"],
+            "parent_id": "fam-root",
+            "started_at": "2026-01-01T00:01:00+00:00",
+        },
+    )
+    await state.upsert_edge("fam-root", "fam-sub1", {"type": "HAS_SUBSESSION"})
+    await state.upsert_node(
+        "fam-sub2",
+        {
+            "labels": ["Session", "SubSession"],
+            "parent_id": "fam-sub1",
+            "started_at": "2026-01-01T00:02:00+00:00",
+            "last_updated": "2026-01-01T00:05:00+00:00",
+        },
+    )
+    await state.upsert_edge("fam-sub1", "fam-sub2", {"type": "HAS_SUBSESSION"})
+    await state.upsert_node(
+        "fam-fork1",
+        {
+            "labels": ["Session", "ForkedSession"],
+            "parent_id": "fam-root",
+            "started_at": "2026-01-01T00:03:00+00:00",
+        },
+    )
+    await state.upsert_edge("fam-root", "fam-fork1", {"type": "FORKED"})
+
+    # Blob-bearing nodes across several graph sessions.
+    await state.upsert_node(
+        "fam-root::orch::1",
+        {
+            "labels": ["OrchestratorRun", "SST_EVENT"],
+            "raw": {"$blob_ref": "ci-blob://fam-root/orch1"},
+        },
+    )
+    await state.upsert_edge("fam-root", "fam-root::orch::1", {"type": "HAS_EXECUTION"})
+
+    await state.upsert_node(
+        "fam-sub2::tool::1",
+        {
+            "labels": ["ToolCall", "SST_EVENT"],
+            "result": {"$blob_ref": "ci-blob://fam-sub2/tool1"},
+        },
+    )
+    await state.upsert_edge("fam-sub2", "fam-sub2::tool::1", {"type": "HAS_TOOL_CALL"})
+
+    await state.upsert_node(
+        "fam-fork1::delegation::1",
+        {
+            "labels": ["Delegation", "SST_EVENT"],
+            "messages": {"$blob_ref": "ci-blob://fam-fork1/del1"},
+        },
+    )
+    await state.upsert_edge(
+        "fam-fork1", "fam-fork1::delegation::1", {"type": "TRIGGERED"}
+    )
+
+    # Shared concept node -- traversal must stop here, not continue past it.
+    await state.upsert_node("agent-shared", {"labels": ["Agent", "SST_CONCEPT"]})
+    await state.upsert_edge(
+        "fam-fork1::delegation::1", "agent-shared", {"type": "HAS_AGENT"}
+    )
+    await state.upsert_node(
+        "other-session-xyz::leak",
+        {
+            "labels": ["ToolCall", "SST_EVENT"],
+            "raw": {"$blob_ref": "ci-blob://other-session-xyz/leak"},
+        },
+    )
+    await state.upsert_edge(
+        "agent-shared", "other-session-xyz::leak", {"type": "SOME_EDGE"}
+    )
+
+
+class TestGraphStateResolveSessionGraph:
+    """GraphState.resolve_session_graph -- in-memory parity with Neo4jGraphStore."""
+
+    async def test_returns_none_for_unknown_session(self) -> None:
+        state = GraphState()
+        assert await state.resolve_session_graph("does-not-exist") is None
+
+    async def test_sub_session_and_root_resolve_identical_graph(self) -> None:
+        state = GraphState()
+        await _build_graph(state)
+
+        from_root = await state.resolve_session_graph("fam-root")
+        from_sub = await state.resolve_session_graph("fam-sub2")
+        from_fork = await state.resolve_session_graph("fam-fork1")
+
+        assert from_root is not None
+        assert from_root.root_id == "fam-root"
+        assert from_root.session_ids == frozenset(
+            {"fam-root", "fam-sub1", "fam-sub2", "fam-fork1"}
+        )
+        assert from_sub is not None
+        assert from_sub.session_ids == from_root.session_ids
+        assert from_sub.root_id == from_root.root_id
+        assert from_fork is not None
+        assert from_fork.session_ids == from_root.session_ids
+
+    async def test_subsession_count_excludes_root(self) -> None:
+        state = GraphState()
+        await _build_graph(state)
+        graph = await state.resolve_session_graph("fam-root")
+        assert graph is not None
+        assert graph.subsession_count == 3
+
+    async def test_node_and_edge_counts_exclude_past_concept_boundary(self) -> None:
+        state = GraphState()
+        await _build_graph(state)
+        graph = await state.resolve_session_graph("fam-root")
+        assert graph is not None
+        # 4 sessions + orch + tool + delegation + agent (boundary, included) = 8
+        assert graph.node_count == 8
+        # root->sub1, sub1->sub2, root->fork1, root->orch, sub2->tool,
+        # fork1->delegation, delegation->agent = 7 (agent->leak excluded)
+        assert graph.edge_count == 7
+
+    async def test_created_by_and_started_at_from_root(self) -> None:
+        state = GraphState()
+        await _build_graph(state)
+        graph = await state.resolve_session_graph("fam-sub2")
+        assert graph is not None
+        assert graph.created_by == "colombod"
+        assert graph.started_at is not None
+        assert graph.started_at.isoformat() == "2026-01-01T00:00:00+00:00"
+
+    async def test_last_change_is_max_across_graph_not_just_root(self) -> None:
+        state = GraphState()
+        await _build_graph(state)
+        graph = await state.resolve_session_graph("fam-root")
+        assert graph is not None
+        # fam-sub2's last_updated (00:05) is later than root's started_at (00:00)
+        assert graph.last_change is not None
+        assert graph.last_change.isoformat() == "2026-01-01T00:05:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# GraphState.delete_session_graph tests
+# ---------------------------------------------------------------------------
+
+
+class TestGraphStateDeleteSessionGraph:
+    """GraphState.delete_session_graph -- in-memory parity with Neo4jGraphStore."""
+
+    async def test_returns_none_for_unknown_session(self) -> None:
+        state = GraphState()
+        assert await state.delete_session_graph("does-not-exist") is None
+
+    async def test_deletes_via_sub_session_id(self) -> None:
+        state = GraphState()
+        await _build_graph(state)
+
+        result = await state.delete_session_graph("fam-sub2")
+        assert result is not None
+        assert result.root_id == "fam-root"
+
+        for sid in ("fam-root", "fam-sub1", "fam-sub2", "fam-fork1"):
+            assert await state.get_node(sid) is None
+        assert await state.get_node("fam-root::orch::1") is None
+        assert await state.get_node("fam-sub2::tool::1") is None
+        assert await state.get_node("fam-fork1::delegation::1") is None
+
+    async def test_shared_concept_node_survives(self) -> None:
+        state = GraphState()
+        await _build_graph(state)
+        await state.delete_session_graph("fam-root")
+
+        assert await state.get_node("agent-shared") is not None
+
+    async def test_unrelated_session_reachable_only_via_concept_is_untouched(
+        self,
+    ) -> None:
+        state = GraphState()
+        await _build_graph(state)
+        await state.delete_session_graph("fam-root")
+
+        assert await state.get_node("other-session-xyz::leak") is not None
+        assert await state.get_edge("agent-shared", "other-session-xyz::leak") is not None
+
+    async def test_counts_match_deleted_nodes_and_edges(self) -> None:
+        state = GraphState()
+        await _build_graph(state)
+        result = await state.delete_session_graph("fam-root")
+        assert result is not None
+        # Owned = graph node_count (8) minus the boundary concept node (1) = 7.
+        assert result.nodes_deleted == 7
+        # Every edge except agent-shared -> leak (both endpoints not owned).
+        assert result.relationships_deleted == 7
+
+
+# ---------------------------------------------------------------------------
+# total_blob_size() service helper
+# ---------------------------------------------------------------------------
+
+
+class TestTotalBlobSize:
+    """total_blob_size() composes BlobStore.size() over a list of blob URIs."""
+
+    async def test_sums_sizes_across_multiple_refs(self, tmp_path) -> None:
+        blob_store = AsyncDiskBlobStore(root=tmp_path)
+        uri_a = await blob_store.write("sess-a", "k1", {"v": 1})
+        uri_b = await blob_store.write("sess-b", "k1", {"v": [1, 2, 3]})
+
+        expected = await blob_store.size(uri_a) + await blob_store.size(uri_b)
+        total = await total_blob_size(blob_store, [uri_a, uri_b])
+        assert total == expected
+        assert total > 0
+
+    async def test_missing_refs_contribute_zero(self, tmp_path) -> None:
+        blob_store = AsyncDiskBlobStore(root=tmp_path)
+        uri = await blob_store.write("sess-a", "k1", {"v": 1})
+        real_size = await blob_store.size(uri)
+
+        total = await total_blob_size(
+            blob_store, [uri, "ci-blob://never-existed/missing"]
+        )
+        assert total == real_size
+
+    async def test_empty_refs_returns_zero(self, tmp_path) -> None:
+        blob_store = AsyncDiskBlobStore(root=tmp_path)
+        assert await total_blob_size(blob_store, []) == 0

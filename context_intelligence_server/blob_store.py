@@ -51,6 +51,24 @@ class BlobStore(Protocol):
         """Return all blob URIs for *session_id*, sorted lexicographically."""
         ...
 
+    async def size(self, uri: str) -> int:
+        """Return the byte size of the blob addressed by *uri*.
+
+        Idempotent: a missing blob returns 0, not an error (mirrors
+        ``delete_session``'s missing-is-zero contract).
+
+        Raises:
+            ValueError: If *uri* is not a valid ``ci-blob://`` URI.
+        """
+        ...
+
+    async def delete_session(self, session_id: str) -> int:
+        """Delete all blobs for *session_id* and return the number removed.
+
+        Idempotent: a session with no stored blobs returns 0, not an error.
+        """
+        ...
+
     async def dump(self, uri: str, dest_dir: Path | str | None = None) -> str:
         """Copy the blob file addressed by *uri* to *dest_dir*.
 
@@ -204,6 +222,37 @@ class AsyncDiskBlobStore:
             return [self._make_uri(session_id, key) for key in keys]
 
         return await asyncio.to_thread(_list)
+
+    async def size(self, uri: str) -> int:
+        """Return the byte size of the blob addressed by *uri*, or 0 if missing."""
+        session_id, key = self._parse_uri(uri)
+        path = self._blob_path(session_id, key)
+
+        def _size() -> int:
+            try:
+                return path.stat().st_size
+            except FileNotFoundError:
+                return 0
+
+        return await asyncio.to_thread(_size)
+
+    async def delete_session(self, session_id: str) -> int:
+        """Delete all blobs for *session_id* and return the number removed.
+
+        Removes ``<root>/<session_id>/``. Idempotent: a session with no
+        stored blobs returns 0 and is not an error.
+        """
+        session_dir = self._root / session_id
+        blobs_dir = session_dir / "blobs"
+
+        def _delete() -> int:
+            if not blobs_dir.exists():
+                return 0
+            count = sum(1 for _ in blobs_dir.glob("*.json"))
+            shutil.rmtree(session_dir)
+            return count
+
+        return await asyncio.to_thread(_delete)
 
     async def dump(self, uri: str, dest_dir: Path | str | None = None) -> str:
         """Copy the blob file addressed by *uri* to *dest_dir*.
