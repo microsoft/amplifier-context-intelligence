@@ -31,6 +31,27 @@ class _QueueManagerLike(Protocol):
     async def delete_session(self, session_id: str) -> bool: ...
 
 
+class SessionsPendingError(Exception):
+    """Raised by ``apply`` when the graph still has undrained queue records.
+
+    The delete is refused (nothing is written) because one or more sessions in
+    the graph still have complete-but-uncommitted queue lines left to drain.
+    This is a *transient, retryable* condition: once the drain finishes,
+    ``pending_count`` returns to 0 and the same delete succeeds. The offending
+    session ids are carried on ``pending_sessions`` so the caller can report
+    exactly what is still in flight and can be told, machine-readably, to retry.
+    """
+
+    def __init__(self, root_id: str, pending_sessions: list[str]) -> None:
+        self.root_id = root_id
+        self.pending_sessions = pending_sessions
+        super().__init__(
+            f"apply refused: graph root={root_id!r} has pending "
+            f"(uncommitted) session(s) {pending_sessions!r}; drain before "
+            "deleting -- nothing was deleted"
+        )
+
+
 @dataclass(frozen=True)
 class DeletionPreview:
     """Dry-run facts for a whole session graph -- mutates nothing.
@@ -155,9 +176,10 @@ class DeletionService:
         session -- no writes occur in that case.
 
         Raises:
-            RuntimeError: If any session in the graph has pending (uncommitted)
-                queue records (refuses, deletes nothing), or if the graph
-                vanishes between resolve and delete.
+            SessionsPendingError: If any session in the graph still has pending
+                (uncommitted) queue records -- refuses, deletes nothing. This is
+                retryable: it carries ``pending_sessions`` and clears once drained.
+            RuntimeError: If the graph vanishes between resolve and delete.
         """
         graph = await self._graph.resolve_session_graph(session_id)
         if graph is None:
@@ -167,11 +189,7 @@ class DeletionService:
 
         pending_sessions = await self._pending_sessions(session_ids)
         if pending_sessions:
-            raise RuntimeError(
-                f"apply refused: graph root={graph.root_id!r} has pending "
-                f"(uncommitted) session(s) {pending_sessions!r}; drain before "
-                "deleting -- nothing was deleted"
-            )
+            raise SessionsPendingError(graph.root_id, pending_sessions)
 
         graph_result = await self._graph.delete_session_graph(session_id)
         if graph_result is None:
