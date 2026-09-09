@@ -20,6 +20,36 @@ import pytest  # noqa: E402
 from context_intelligence_server.main import app, registry  # noqa: E402
 from context_intelligence_server.services import HookStateService  # noqa: E402
 
+# Guarded import so the suite still COLLECTS against unfixed source (where the
+# process-wide schema latch does not exist yet). Without this, reverting the
+# fix would break collection for every test in the repo, and the new guards
+# below would "fail" at import time rather than for the reason they exist.
+try:  # pragma: no cover - import resolution differs pre/post fix
+    from context_intelligence_server.neo4j_store import (  # noqa: E402
+        reset_schema_state,
+    )
+except ImportError:  # pragma: no cover - exercised only against unfixed code
+
+    def reset_schema_state() -> None:  # type: ignore[misc]
+        """No-op stand-in: unfixed code has no process-wide latch to reset."""
+
+
+@pytest.fixture(autouse=True)
+def _reset_neo4j_schema_state() -> Generator[None, None, None]:
+    """Clear the process-wide Neo4j schema latch around EVERY test.
+
+    ``neo4j_store._SCHEMA_READY`` is deliberately process-global: it is what
+    stops every per-session store from re-running the same ~11-statement
+    catalog pass on its first flush. Process-global state is also test-order
+    poison -- without this reset, the first test that fully establishes the
+    schema would silently short-circuit the schema path in every test that ran
+    after it, and those tests would pass or fail depending on collection order.
+    Resetting on both sides of the yield keeps each test's view independent.
+    """
+    reset_schema_state()
+    yield
+    reset_schema_state()
+
 
 # ---------------------------------------------------------------------------
 # Shared Neo4j mock helpers (used by POST /cypher tests)

@@ -44,6 +44,7 @@ from context_intelligence_server.neo4j_store import (
     build_bounded_neo4j_driver,
     count_untagged_nodes,
     ensure_neo4j_schema,
+    mark_schema_ready,
 )
 from context_intelligence_server.registry import SessionRegistry
 from context_intelligence_server.routers.admin import router as admin_router
@@ -289,8 +290,34 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # here mirrors run_repair's contract: a :Node constraint data conflict
     # raises a RuntimeError naming `doctor --fix` instead of being logged
     # and swallowed.
-    await ensure_neo4j_schema(app.state.neo4j_driver, fail_on_data_conflict=True)
-    logger.info("lifespan_startup: Neo4j schema initialized")
+    schema_fully_established = await ensure_neo4j_schema(
+        app.state.neo4j_driver, fail_on_data_conflict=True
+    )
+    # Seed the PROCESS-wide schema latch, but ONLY on a fully-established pass.
+    #
+    # fail_on_data_conflict=True makes this call fail closed on a :Node
+    # constraint DATA conflict -- but a CONNECTIVITY failure on any individual
+    # index/constraint is deliberately swallowed and reported through the
+    # return value instead (see ensure_neo4j_schema's docstring). Latching
+    # unconditionally would therefore mark a HALF-BUILT schema as ready and
+    # permanently disable the per-flush self-heal for the whole process --
+    # exactly the "constraint created once, never retried" gap
+    # Neo4jGraphStore._ensure_schema exists to close.
+    #
+    # On the happy path this seed is what stops every per-session store from
+    # re-running the same ~11-statement catalog pass on its first flush -- and,
+    # whenever that pass cannot complete, on EVERY subsequent flush -- competing
+    # for the very bolt pool it needs. See neo4j_store._SCHEMA_READY.
+    if schema_fully_established:
+        mark_schema_ready()
+        logger.info("lifespan_startup: Neo4j schema initialized")
+    else:
+        logger.warning(
+            "lifespan_startup: Neo4j schema NOT fully established (indexes or "
+            "constraints missing); leaving the process-wide latch unset so the "
+            "flush path retries schema init (rate-limited by "
+            "neo4j_store._SCHEMA_RETRY_BACKOFF_SECONDS)."
+        )
     # Fail-loud migration-health guard: duplicate nodes are already caught
     # above by the :Node constraint (fail_on_data_conflict=True); this catches
     # the OTHER un-migrated shape the constraint can't see on its own --

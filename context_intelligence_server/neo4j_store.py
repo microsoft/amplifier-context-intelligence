@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from collections.abc import Generator
 from datetime import datetime
 from typing import Any, LiteralString, cast
@@ -196,6 +197,45 @@ _NODE_MATCH_BY_ID = (
 # while holding its pooled connection for the duration.
 _NODE_GET_BY_ID_CYPHER = (
     f"{_NODE_MATCH_BY_ID} RETURN properties(n) AS props, labels(n) AS lbls"
+)
+
+# Single-edge read-by-endpoints, anchored on BOTH :Node endpoints so the
+# planner seeks the :Node(node_id, workspace) unique index twice and then walks
+# only that node's own relationships.
+#
+# The previous form was ``MATCH ()-[r]->() WHERE r.src_id = ... AND r.dst_id =
+# ... AND r.workspace = ...``: relationship property indexes in Neo4j are
+# TYPE-scoped, and this pattern names no type, so no index could back it and it
+# planned as an AllRelationshipsScan -- the same defect class as the label-free
+# get_node() MATCH, over a set that is larger still (a graph has more
+# relationships than nodes).
+#
+# The relationship-property predicates are deliberately RETAINED after the
+# anchor. They are now evaluated against the handful of relationships incident
+# to one node rather than every relationship in the graph, so they cost nothing
+# -- and keeping them makes this a strictly NARROWING change: any edge the old
+# form would have returned and the new one would not is one whose endpoints do
+# not exist as :Node, which the edge writer (_edge_merge_cypher, which MERGEs
+# both :Node endpoints) structurally cannot produce.
+_EDGE_GET_BY_ENDPOINTS_CYPHER = (
+    f"MATCH (src:{_UNIVERSAL_NODE_LABEL} "
+    "{node_id: $src_id, workspace: $workspace})-[r]->"
+    f"(dst:{_UNIVERSAL_NODE_LABEL} "
+    "{node_id: $dst_id, workspace: $workspace}) "
+    "WHERE r.src_id = $src_id AND r.dst_id = $dst_id "
+    "AND r.workspace = $workspace "
+    "RETURN properties(r) AS props"
+)
+
+# Delegation lookup by the session it spawned. Named here (rather than inlined
+# at the call site) so it sits beside the composite index that backs it --
+# idx_delegation_sub_session on :Delegation(sub_session_id, workspace), created
+# in ensure_neo4j_schema. The query shape was already correct; before that index
+# existed it simply had nothing to seek and planned as a NodeByLabelScan across
+# every :Delegation node.
+_DELEGATION_BY_SUB_SESSION_CYPHER = (
+    "MATCH (d:Delegation {sub_session_id: $sid, workspace: $workspace}) "
+    "RETURN properties(d) AS props"
 )
 
 
@@ -629,6 +669,96 @@ async def run_repair(driver: Any, database: str = "neo4j") -> dict[str, int]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Process-wide schema latch.
+#
+# ``ensure_neo4j_schema`` has two callers whose SCOPES differ, and conflating
+# them is what turned a connectivity blip into a per-flush DDL storm:
+#
+#   - The FastAPI lifespan (``main.py``) runs it ONCE PER PROCESS, before the
+#     server accepts a single request, with ``fail_on_data_conflict=True`` --
+#     it refuses to boot unless the schema is fully established.
+#   - ``Neo4jGraphStore._ensure_schema`` runs it from inside ``_flush_body``,
+#     latched on ``self._schema_initialized`` -- a PER-STORE flag, and a store
+#     is constructed PER SESSION (``registry.get_or_create``).
+#
+# So the per-store latch made every new session pay a full ~11-statement DDL
+# pass on its first flush, and -- whenever that pass could not complete -- pay
+# it again on EVERY subsequent flush of EVERY session, with no backoff. Each
+# attempt opens a session and issues ~11 sequential catalog statements, every
+# one of which must acquire a pooled bolt connection; under pool starvation
+# each acquisition burns the full acquisition timeout before failing. That is
+# a large, futile, self-reinforcing load applied at exactly the moment the
+# pool is already exhausted, and it runs BEFORE any data is written
+# (``_flush_body`` awaits ``_ensure_schema`` ahead of Phase 1).
+#
+# Two changes fix that without weakening the self-heal:
+#
+#   1. ``_SCHEMA_READY`` is PROCESS-wide. The lifespan seeds it via
+#      ``mark_schema_ready()`` once its own fail-closed pass succeeds, so in
+#      the server the per-flush call becomes a single boolean read forever --
+#      it can never discover anything cold start did not already establish.
+#      Contexts with no lifespan (tests, CLI tools, direct store use) never
+#      seed it and keep today's behaviour: the first store to fully establish
+#      the schema sets it for the process.
+#   2. A failed pass no longer retries on the very next flush.
+#      ``_SCHEMA_RETRY_BACKOFF_SECONDS`` puts a floor between attempts, so a
+#      connectivity blip can no longer become a per-flush storm. The self-heal
+#      survives -- it just stops competing with the writes it is meant to
+#      enable.
+# ---------------------------------------------------------------------------
+_SCHEMA_RETRY_BACKOFF_SECONDS = 30.0
+
+_SCHEMA_READY: bool = False
+_SCHEMA_LAST_ATTEMPT: float | None = None
+
+
+def mark_schema_ready() -> None:
+    """Record that the Neo4j schema is fully established for THIS process.
+
+    Called by the FastAPI lifespan after its own fail-closed
+    ``ensure_neo4j_schema(..., fail_on_data_conflict=True)`` pass succeeds, and
+    by any store whose own pass fully establishes the schema. Once set, every
+    per-flush ``_ensure_schema`` call short-circuits to a boolean read.
+    """
+    global _SCHEMA_READY
+    _SCHEMA_READY = True
+
+
+def schema_ready() -> bool:
+    """Whether the schema has been fully established in this process."""
+    return _SCHEMA_READY
+
+
+def reset_schema_state() -> None:
+    """Clear the process-wide schema latch and backoff clock.
+
+    Exists for tests: the latch is deliberately process-global, so without an
+    explicit reset one test that establishes the schema would silently suppress
+    the schema path in every test that ran after it.
+    """
+    global _SCHEMA_READY, _SCHEMA_LAST_ATTEMPT
+    _SCHEMA_READY = False
+    _SCHEMA_LAST_ATTEMPT = None
+
+
+def _schema_retry_allowed() -> bool:
+    """Whether enough time has passed since the last un-latched schema attempt.
+
+    Records the attempt time as a side effect when it returns True, so two
+    concurrent flushes cannot both decide to run a full DDL pass.
+    """
+    global _SCHEMA_LAST_ATTEMPT
+    now = time.monotonic()
+    if (
+        _SCHEMA_LAST_ATTEMPT is not None
+        and now - _SCHEMA_LAST_ATTEMPT < _SCHEMA_RETRY_BACKOFF_SECONDS
+    ):
+        return False
+    _SCHEMA_LAST_ATTEMPT = now
+    return True
+
+
 async def ensure_neo4j_schema(
     driver: Any,
     database: str = "neo4j",
@@ -784,6 +914,20 @@ async def ensure_neo4j_schema(
             await _create_index(
                 "CREATE INDEX idx_session_created_by IF NOT EXISTS "
                 "FOR (n:Session) ON (n.created_by)"
+            )
+            and fully_established
+        )
+        # Backs find_delegation_by_sub_session's lookup
+        # (_DELEGATION_BY_SUB_SESSION_CYPHER). Without it that MATCH names a
+        # label but no indexed property, so it plans as a NodeByLabelScan over
+        # EVERY :Delegation node in the graph. It is not a rare path -- the
+        # self-delegation resolver hits it on live ingest whenever a parent
+        # Delegation has already flushed out of the in-memory buffer -- and it
+        # grows without bound as delegation volume grows.
+        fully_established = (
+            await _create_index(
+                "CREATE INDEX idx_delegation_sub_session IF NOT EXISTS "
+                "FOR (n:Delegation) ON (n.sub_session_id, n.workspace)"
             )
             and fully_established
         )
@@ -1473,8 +1617,7 @@ class Neo4jGraphStore:
         # Neo4j fallback
         try:
             result = await self._driver.execute_query(
-                "MATCH (d:Delegation {sub_session_id: $sid, workspace: $workspace}) "
-                "RETURN properties(d) AS props",
+                cast(LiteralString, _DELEGATION_BY_SUB_SESSION_CYPHER),
                 {"sid": sub_session_id, "workspace": workspace},
                 database_=self._database,
             )
@@ -1504,10 +1647,7 @@ class Neo4jGraphStore:
         # Neo4j fallback
         try:
             result = await self._driver.execute_query(
-                "MATCH ()-[r]->() "
-                "WHERE r.src_id = $src_id AND r.dst_id = $dst_id "
-                "AND r.workspace = $workspace "
-                "RETURN properties(r) AS props",
+                cast(LiteralString, _EDGE_GET_BY_ENDPOINTS_CYPHER),
                 {"src_id": src_id, "dst_id": dst_id, "workspace": self.workspace},
                 database_=self._database,
             )
@@ -1728,15 +1868,42 @@ class Neo4jGraphStore:
         any duplicates.  This closes the "constraint created once, never retried"
         data-integrity gap, where a missing uniqueness constraint would otherwise let
         concurrent MERGE accrue duplicate Session/Event nodes until process restart.
+
+        Two latches, checked in order, both O(1):
+
+        - ``self._schema_initialized`` -- THIS store already established it.
+        - ``schema_ready()`` -- ANY caller in this PROCESS already established
+          it, including the FastAPI lifespan's own fail-closed cold-start pass.
+          In the server that is the branch which always fires: cold start
+          already ran ``ensure_neo4j_schema(..., fail_on_data_conflict=True)``
+          and refused to boot otherwise, so a per-flush pass here can only
+          re-confirm what is already true -- at a cost of ~11 catalog
+          statements per flush, per session. See the ``_SCHEMA_READY`` block
+          above for why that mattered so much under pool starvation.
+
+        When neither latch is set, the attempt is additionally rate-limited by
+        ``_schema_retry_allowed()``: a pass that could not complete (e.g. Neo4j
+        unreachable, connectivity errors swallowed so real events are not
+        dead-lettered) no longer retries on the very NEXT flush. Skipping a
+        retry is safe precisely because the pass is a no-op in the healthy case
+        and a storm in the degraded one -- the writes that follow it have never
+        depended on it having run on this particular flush.
         """
-        if self._schema_initialized:
+        if self._schema_initialized or schema_ready():
+            return
+
+        if not _schema_retry_allowed():
             return
 
         fully_established = await ensure_neo4j_schema(self._driver, self._database)
         if fully_established:
             self._schema_initialized = True
-        # else: leave the flag False so the NEXT flush retries schema init (self-heals
-        # once Neo4j is reachable / duplicates are cleared by the dedup pass).
+            # "Fully established" is a PROCESS-wide fact, not a per-store one --
+            # latch it so sibling stores (one per session) never repeat the pass.
+            mark_schema_ready()
+        # else: leave both flags False so a LATER flush retries schema init, subject
+        # to the backoff above (self-heals once Neo4j is reachable / duplicates are
+        # cleared by the dedup pass).
 
     async def close(self) -> None:
         """Flush pending writes and close the driver, if this store owns it.
