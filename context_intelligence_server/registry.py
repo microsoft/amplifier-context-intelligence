@@ -403,6 +403,25 @@ class SessionRegistry:
                             await self._safe_close(worker)
                             self._deregister(session_id)
                             return
+                        # Trim as we go: don't wait for a clean session:end
+                        # (_finalize_session) to reclaim disk. delete_drained
+                        # is idempotent, takes the key's file_lock, REFUSES
+                        # (returns False, cheaply) while any uncommitted
+                        # bytes remain, keeps .dead.jsonl, and unlinks a
+                        # stale .offset so a log recreated later cannot read
+                        # past its own end -- the exact same call
+                        # _finalize_session already makes, just triggered
+                        # here too, earlier and repeatedly, so a session
+                        # that goes quiet without ever finalizing cleanly
+                        # (crash, orphan, indefinite idle) doesn't keep its
+                        # drained .log/.offset on disk -- and off every
+                        # later boot's recovery scan -- forever.
+                        if await qm.delete_drained(session_id):
+                            logger.debug(
+                                "spool_trimmed session=%s",
+                                session_id,
+                                extra={"session_id": session_id},
+                            )
                     continue
 
                 idle_elapsed = 0.0

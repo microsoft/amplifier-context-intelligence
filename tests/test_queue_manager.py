@@ -575,17 +575,20 @@ async def test_recovery_seed_counts_replay_window_residual_zero(qm):
 
 
 # ---------------------------------------------------------------------------
-# spool_stats (Change 2): cheap, aggregate-only spool footprint for /status
+# spool stats (Change 2, split for the /status-must-never-scan fix):
+# refresh_spool_stats() does the ONE-AND-ONLY directory scan and populates
+# the cache; spool_stats() is a synchronous, read-only, never-scans cache
+# read for /status. See QueueManager.refresh_spool_stats/spool_stats.
 # ---------------------------------------------------------------------------
 
 
-async def test_spool_stats_counts_pending_session_and_bytes(qm, tmp_path):
+async def test_refresh_spool_stats_counts_pending_session_and_bytes(qm, tmp_path):
     """A session with unconsumed log data counts as pending; total bytes
     reflects every file on disk (.log + .offset + .dead.jsonl)."""
     await qm.append("s1", b"a")
     await qm.append("s1", b"b")
 
-    stats = await qm.spool_stats()
+    stats = await qm.refresh_spool_stats()
 
     assert stats["pending_sessions"] == 1
     queues_dir = tmp_path / "queues"
@@ -594,7 +597,7 @@ async def test_spool_stats_counts_pending_session_and_bytes(qm, tmp_path):
     assert expected_bytes > 0
 
 
-async def test_spool_stats_fully_committed_session_not_pending(qm):
+async def test_refresh_spool_stats_fully_committed_session_not_pending(qm):
     """A session whose committed offset reaches EOF is NOT counted as
     pending, even though its .log/.offset files still occupy disk space
     (spool_bytes_total still reflects them)."""
@@ -602,25 +605,25 @@ async def test_spool_stats_fully_committed_session_not_pending(qm):
     line = b"a\n"
     await qm.commit("s1", len(line))
 
-    stats = await qm.spool_stats()
+    stats = await qm.refresh_spool_stats()
 
     assert stats["pending_sessions"] == 0
     assert stats["spool_bytes_total"] > 0  # log + offset files still on disk
 
 
-async def test_spool_stats_dead_letter_only_session_not_pending(qm):
+async def test_refresh_spool_stats_dead_letter_only_session_not_pending(qm):
     """A dead-letter-only key (no .log) contributes bytes but is never
     counted as a pending session -- pending_sessions is defined purely over
     .log files with unconsumed data."""
     await qm.dead_letter("s-dead", b"poison", error="boom")
 
-    stats = await qm.spool_stats()
+    stats = await qm.refresh_spool_stats()
 
     assert stats["pending_sessions"] == 0
     assert stats["spool_bytes_total"] > 0
 
 
-async def test_spool_stats_multiple_sessions_aggregate(qm):
+async def test_refresh_spool_stats_multiple_sessions_aggregate(qm):
     """pending_sessions counts sessions independently; bytes sum across all."""
     await qm.append("s1", b"a")  # pending
     await qm.append("s2", b"b")
@@ -628,19 +631,20 @@ async def test_spool_stats_multiple_sessions_aggregate(qm):
     await qm.commit("s2", len(line))  # fully committed, not pending
     await qm.append("s3", b"c")  # pending
 
-    stats = await qm.spool_stats()
+    stats = await qm.refresh_spool_stats()
 
     assert stats["pending_sessions"] == 2
 
 
-async def test_spool_stats_returns_only_aggregate_keys_no_identifiers(qm):
-    """/status is unauthenticated: spool_stats() must return ONLY the two
-    aggregate integers -- no session ids, workspace names, or per-key table
-    of any kind, so there's nothing to accidentally leak through /status."""
+async def test_refresh_spool_stats_returns_only_aggregate_keys_no_identifiers(qm):
+    """/status is unauthenticated: the spool snapshot must carry ONLY the
+    three aggregate fields -- no session ids, workspace names, or per-key
+    table of any kind, so there's nothing to accidentally leak through
+    /status."""
     await qm.append("my-secret-session-id", b"a")
     await qm.dead_letter("another-session-id", b"poison", error="boom")
 
-    stats = await qm.spool_stats()
+    stats = await qm.refresh_spool_stats()
 
     assert set(stats.keys()) == {
         "pending_sessions",
@@ -651,10 +655,14 @@ async def test_spool_stats_returns_only_aggregate_keys_no_identifiers(qm):
     assert "my-secret-session-id" not in serialized
     assert "another-session-id" not in serialized
 
+    # spool_stats() (the /status read path) exposes the exact same snapshot.
+    assert qm.spool_stats() == stats
 
-async def test_spool_stats_caches_within_ttl(qm, monkeypatch):
-    """Repeated calls within the TTL window are served from cache -- the
-    directory is not re-scanned on every /status poll."""
+
+async def test_refresh_spool_stats_always_scans_no_ttl_gate(qm, monkeypatch):
+    """refresh_spool_stats() has NO TTL gate -- every call re-scans the
+    directory. The old read-side TTL is gone; cadence is now owned entirely
+    by the background refresher loop (main.py._spool_stats_refresher)."""
     import pathlib
 
     await qm.append("s1", b"a")
@@ -674,14 +682,42 @@ async def test_spool_stats_caches_within_ttl(qm, monkeypatch):
 
     monkeypatch.setattr(pathlib.Path, "iterdir", counting_iterdir)
 
-    await qm.spool_stats()
-    await qm.spool_stats()  # within TTL -> served from cache
-    assert calls["n"] == 1
-
-    # Age the cache past the TTL; the next call must recompute.
-    qm._spool_cache_at = time.monotonic() - (qm._spool_cache_ttl + 1.0)
-    await qm.spool_stats()
+    await qm.refresh_spool_stats()
+    await qm.refresh_spool_stats()  # no TTL -- scans again every time
     assert calls["n"] == 2
+
+
+def test_spool_stats_is_synchronous_read_only_and_never_scans(qm, monkeypatch):
+    """spool_stats() must NEVER touch the filesystem: it is a pure,
+    synchronous cache read. An empty cache returns the unavailable sentinel
+    (never scans, never raises); a populated cache returns exactly that
+    snapshot -- this is the entire point of the refresh/read split that
+    fixes /status stalling on a large spool (see the module docstring)."""
+    import pathlib
+
+    def _boom(self: pathlib.Path) -> None:
+        raise AssertionError("spool_stats() touched the filesystem via iterdir()")
+
+    monkeypatch.setattr(pathlib.Path, "iterdir", _boom)
+
+    # Empty cache: the sentinel, no scan, no raise.
+    assert qm.spool_stats() == {
+        "pending_sessions": -1,
+        "spool_bytes_total": -1,
+        "corrupt_offsets": -1,
+    }
+
+    # Populated cache: returns exactly that snapshot, still without scanning.
+    qm._spool_cache = {
+        "pending_sessions": 3,
+        "spool_bytes_total": 12345,
+        "corrupt_offsets": 0,
+    }
+    assert qm.spool_stats() == {
+        "pending_sessions": 3,
+        "spool_bytes_total": 12345,
+        "corrupt_offsets": 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -792,9 +828,9 @@ async def test_recovery_seed_counts_unchanged_under_streaming(qm):
     assert accepted == 2  # one written + one pending
 
 
-async def test_spool_stats_empty_directory(qm):
-    """An empty spool directory reports zero for both aggregates."""
-    stats = await qm.spool_stats()
+async def test_refresh_spool_stats_empty_directory(qm):
+    """An empty spool directory reports zero for all three aggregates."""
+    stats = await qm.refresh_spool_stats()
     assert stats == {
         "pending_sessions": 0,
         "spool_bytes_total": 0,
@@ -803,25 +839,26 @@ async def test_spool_stats_empty_directory(qm):
 
 
 # ---------------------------------------------------------------------------
-# spool_stats health-endpoint safety (regression, ci_pr73-ueh):
-# /status is the unauthenticated ACA health probe and calls spool_stats()
-# unconditionally. spool_stats() uses iterdir() (raises on a missing dir),
-# unlike every sibling reader which uses glob() (empty on a missing dir), so
-# a transiently-unavailable queue dir or a corrupt .offset MUST degrade to a
-# sentinel, never raise -- an escape becomes a 500 -> failed probe -> restart.
+# refresh_spool_stats health-endpoint safety (regression, ci_pr73-ueh):
+# the background refresher (main.py._spool_stats_refresher) calls
+# refresh_spool_stats() unconditionally. It uses iterdir() (raises on a
+# missing dir), unlike every sibling reader which uses glob() (empty on a
+# missing dir), so a transiently-unavailable queue dir or a corrupt .offset
+# MUST degrade to a sentinel, never raise -- an escape would kill the
+# refresher loop and (pre-split) would have 500'd /status directly.
 # ---------------------------------------------------------------------------
 
 
-async def test_spool_stats_missing_directory_returns_sentinel(qm, tmp_path):
-    """A missing queue dir makes iterdir() raise FileNotFoundError; spool_stats
-    must return the degraded sentinel {-1, -1} rather than propagate (which
-    would 500 the /status health probe -- e.g. during an Azure Files remount)."""
+async def test_refresh_spool_stats_missing_directory_returns_sentinel(qm, tmp_path):
+    """A missing queue dir makes iterdir() raise FileNotFoundError;
+    refresh_spool_stats() must return the degraded sentinel {-1, -1, -1}
+    rather than propagate (which would kill the background refresher loop --
+    e.g. during an Azure Files remount)."""
     import shutil
 
     shutil.rmtree(tmp_path / "queues")
-    qm._spool_cache = None  # bypass the TTL cache so the scan actually runs
 
-    stats = await qm.spool_stats()
+    stats = await qm.refresh_spool_stats()
 
     assert stats == {
         "pending_sessions": -1,
@@ -830,65 +867,107 @@ async def test_spool_stats_missing_directory_returns_sentinel(qm, tmp_path):
     }
 
 
-async def test_spool_stats_sentinel_is_not_cached(qm, tmp_path):
-    """The degraded sentinel is NOT cached: once the directory is healthy
-    again, the very next call recovers the real aggregate numbers."""
+async def test_refresh_spool_stats_sentinel_is_not_cached(qm, tmp_path):
+    """A failed refresh does NOT overwrite the cache: once the directory is
+    healthy again, the very next refresh recovers the real aggregate numbers
+    (and, meanwhile, spool_stats() never reports a fabricated sentinel as a
+    real snapshot)."""
     import shutil
 
     queues_dir = tmp_path / "queues"
     shutil.rmtree(queues_dir)
-    qm._spool_cache = None
-    assert await qm.spool_stats() == {
+    assert await qm.refresh_spool_stats() == {
         "pending_sessions": -1,
         "spool_bytes_total": -1,
         "corrupt_offsets": -1,
     }
+    assert qm._spool_cache is None  # the sentinel was never cached
 
-    # Filesystem recovers; no manual cache reset -- the sentinel was never stored.
+    # Filesystem recovers.
     queues_dir.mkdir(parents=True, exist_ok=True)
     await qm.append("s1", b"a")
 
-    stats = await qm.spool_stats()
+    stats = await qm.refresh_spool_stats()
     assert stats["pending_sessions"] == 1
     assert stats["spool_bytes_total"] > 0
+    assert qm.spool_stats() == stats  # now cached, and readable without a scan
 
 
-async def test_spool_stats_corrupt_offset_does_not_sink_scan(qm):
+async def test_refresh_spool_stats_corrupt_offset_does_not_sink_scan(qm):
     """A corrupt/unreadable .offset for one session must not fail the whole
-    scan (which would 500 /status): that file's bytes still count, only its
-    pending calc is skipped."""
+    scan: that file's bytes still count, only its pending calc is skipped."""
     await qm.append("s1", b"a")
     qm._offset_path("s1").write_text("not-a-number", encoding="utf-8")
-    qm._spool_cache = None
 
-    stats = await qm.spool_stats()
+    stats = await qm.refresh_spool_stats()
 
     assert stats["spool_bytes_total"] > 0
     assert isinstance(stats["pending_sessions"], int)
 
 
-async def test_spool_stats_counts_corrupt_offsets(qm):
+async def test_refresh_spool_stats_counts_corrupt_offsets(qm):
     """A non-numeric .offset is surfaced as an aggregate corrupt_offsets count
     (the ONLY visibility signal -- no logging). A healthy session contributes 0."""
     await qm.append("s-good", b"a")  # valid: no .offset yet -> committed 0
     await qm.append("s-bad", b"a")
     qm._offset_path("s-bad").write_text("not-a-number", encoding="utf-8")
-    qm._spool_cache = None
 
-    stats = await qm.spool_stats()
+    stats = await qm.refresh_spool_stats()
 
     assert stats["corrupt_offsets"] == 1
     assert stats["spool_bytes_total"] > 0  # corrupt file's bytes still counted
 
 
-async def test_spool_stats_healthy_offsets_report_zero_corrupt(qm):
+async def test_refresh_spool_stats_healthy_offsets_report_zero_corrupt(qm):
     """corrupt_offsets is 0 when every .offset is a valid integer (it must not
     fire on the normal committed-offset path)."""
     await qm.append("s1", b"a")
     line = b"a\n"
     await qm.commit("s1", len(line))  # writes a valid numeric .offset
-    qm._spool_cache = None
 
-    stats = await qm.spool_stats()
+    stats = await qm.refresh_spool_stats()
 
     assert stats["corrupt_offsets"] == 0
+
+
+async def test_spool_stats_age_seconds_none_before_any_refresh(qm):
+    """spool_stats_age_seconds() is None until refresh_spool_stats() has
+    produced its first snapshot -- pure arithmetic, never touches disk."""
+    assert qm.spool_stats_age_seconds() is None
+
+
+async def test_spool_stats_age_seconds_reflects_time_since_refresh(qm):
+    """After a refresh, spool_stats_age_seconds() reports elapsed time (>= 0,
+    rounded to 1dp) and grows as time passes -- how /status tells a fresh
+    snapshot from a stale one."""
+    await qm.refresh_spool_stats()
+    age0 = qm.spool_stats_age_seconds()
+    assert isinstance(age0, float)
+    assert age0 >= 0.0
+
+    qm._spool_cache_at = time.monotonic() - 5.0
+    age1 = qm.spool_stats_age_seconds()
+    assert age1 >= 5.0
+
+
+async def test_recovery_seed_counts_residual_zero_after_trimming_dead_letter_session(
+    qm,
+):
+    """Conservation holds after Change 2's early trim: a session whose
+    .log/.offset have already been reclaimed by delete_drained() (leaving
+    only its .dead.jsonl) still seeds a zero residual -- the dead record is
+    accounted for entirely through `dead`, not lost when its log disappears."""
+    await qm.append("s1", b"a")
+    line = b"a\n"
+    await qm.commit("s1", len(line))  # fully drained/committed
+    await qm.dead_letter("s1", b"a", error="boom")  # a dead-letter record too
+
+    assert await qm.delete_drained("s1") is True  # log/offset reclaimed
+    assert not qm._log_path("s1").exists()
+    assert not qm._offset_path("s1").exists()
+    assert qm._dead_path("s1").exists()
+
+    accepted, written = await qm.recovery_seed_counts()
+    stats = await qm.derive_all_stats()
+    residual = accepted - written - stats["in_queue_total"] - stats["dead_total"]
+    assert residual == 0

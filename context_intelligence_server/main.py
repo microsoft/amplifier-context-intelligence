@@ -385,6 +385,36 @@ async def _startup_recovery_body(app: FastAPI) -> None:
         await _crash_recovery_sweep_loop(_sweep_interval, respawn_limit)
 
 
+async def _spool_stats_refresher(app: FastAPI) -> None:
+    """Periodically refresh the spool snapshot ``/status`` reads.
+
+    Started by ``lifespan`` as a background task, same as ``_startup_recovery``
+    -- this is the ONLY place that calls ``QueueManager.refresh_spool_stats()``
+    (the actual directory scan). ``/status`` (via
+    ``QueueManager.spool_stats()``) only ever reads the snapshot this loop
+    produces, so its response time no longer depends on spool size (incident
+    2026-09-09: an inline scan of a ~5000-file Azure Files SMB spool made
+    ``/status`` time out at 180s while ``/version`` answered instantly).
+
+    A single failed refresh must not kill this loop -- the snapshot simply
+    goes stale, which ``/status``'s ``spool.as_of_seconds`` field makes
+    honestly visible, rather than the health probe losing spool visibility
+    outright. CancelledError (shutdown) always propagates.
+    """
+    while True:
+        try:
+            await registry.queue_manager.refresh_spool_stats()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A failed refresh must not kill the loop -- the snapshot simply
+            # goes stale (see spool.as_of_seconds); log and retry next tick.
+            logger.exception(
+                "spool_stats_refresh_failed: snapshot is now stale; will retry"
+            )
+        await asyncio.sleep(_settings.spool_stats_refresh_interval_seconds)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application lifespan: configure logging and create shared Neo4j driver."""
@@ -498,6 +528,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.recovery_complete = asyncio.Event()
     app.state.recovery_error = None
     _recovery_task: asyncio.Task[None] = asyncio.create_task(_startup_recovery(app))
+    # Background spool-stats refresher (see _spool_stats_refresher): same
+    # create_task/cancel-on-shutdown pattern as _recovery_task above, so
+    # /status's spool block is served from a periodically-refreshed snapshot
+    # instead of scanning the queue directory inline on every request.
+    _spool_stats_task: asyncio.Task[None] = asyncio.create_task(
+        _spool_stats_refresher(app)
+    )
 
     try:
         yield
@@ -508,6 +545,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         _recovery_task.cancel()
         with suppress(asyncio.CancelledError):
             await _recovery_task
+        # Cancel the spool-stats refresher too -- it holds no drainer-related
+        # state, but it must not keep touching a queue directory that a
+        # shutting-down process may be tearing down around it.
+        _spool_stats_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _spool_stats_task
         # ORDER IS LOAD-BEARING. Quiesce the drainers FIRST. Every session's
         # graph store now shares ONE driver, so closing it under a live drainer
         # is no longer a per-session concern: the drainer's batch fails, it
@@ -986,11 +1029,16 @@ async def get_status(request: Request) -> dict[str, Any]:
     # this block must NOT carry the per-key table or the dead-letter
     # listing — both are authenticated-only.
     response["metrics"] = await registry.pipeline_metrics()
-    # Aggregate-only spool footprint: two integers only, no session ids, no
-    # workspace names, no per-key table -- same privacy contract as `metrics`
-    # above. Cheap by construction (stat-only, short-TTL cached); see
-    # QueueManager.spool_stats() for why this holds even under a huge spool.
-    response["spool"] = await registry.queue_manager.spool_stats()
+    # Aggregate-only spool footprint: no session ids, no workspace names, no
+    # per-key table -- same privacy contract as `metrics` above. spool_stats()
+    # is a synchronous, O(1) cache read -- it never scans the queue
+    # directory (see QueueManager.spool_stats() / _spool_stats_refresher).
+    # `as_of_seconds` tells callers how stale that snapshot is (None before
+    # the background refresher has produced one), so /status never presents
+    # a cached number as though it were live.
+    _spool: dict[str, Any] = dict(registry.queue_manager.spool_stats())
+    _spool["as_of_seconds"] = registry.queue_manager.spool_stats_age_seconds()
+    response["spool"] = _spool
     # Crash recovery now runs in the BACKGROUND so the HTTP surface opens
     # immediately (see _startup_recovery). While it is still running, the
     # conservation counters above have not been seeded yet, so say so rather

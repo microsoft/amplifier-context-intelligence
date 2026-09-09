@@ -1149,6 +1149,87 @@ class TestDurableStaleReaping:
         assert sid not in reg._workers
 
 
+class TestDurableSpoolTrim:
+    """Change 2 (fix/trim-spool-as-processed): the idle branch of the drain
+    loop attempts delete_drained() on every idle tick, not just on a clean
+    session:end -- so disk is reclaimed as sessions go quiet instead of only
+    at _finalize_session."""
+
+    async def test_idle_drained_session_trims_log_and_offset_keeps_dead_letters(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """A fully-drained (committed-to-EOF) idle session gets its .log and
+        .offset reclaimed by the drain loop's idle branch, WITHOUT a
+        session:end ever being seen -- and its .dead.jsonl survives."""
+        reg, qm = reg_qm
+        sid = "s-trim"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        # A dead-letter file already exists for this session (e.g. from an
+        # earlier failure) and must survive the trim -- delete_drained keeps
+        # .dead.jsonl.
+        await qm.dead_letter(sid, b"poison", error="boom")
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            await qm.append(sid, _line("tool:pre", "/ws", {"session_id": sid}))
+            # Tiny flush_timeout so the idle branch's reclaim attempt fires
+            # quickly once the appended line has drained.
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
+            for _ in range(200):
+                await asyncio.sleep(0.02)
+                if not qm._log_path(sid).exists():
+                    break
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert not qm._log_path(sid).exists()
+        assert not qm._offset_path(sid).exists()
+        assert qm._dead_path(sid).exists()  # kept -- never touched by trim
+
+    async def test_idle_uncommitted_bytes_are_never_trimmed(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """A torn (non-newline-terminated) tail is uncommitted, unreadable
+        bytes that read_batch never surfaces as a record, so the idle branch
+        fires repeatedly with nothing to dispatch -- but delete_drained
+        refuses every time (size > committed), so the files are retained,
+        never silently dropped."""
+        reg, qm = reg_qm
+        sid = "s-trim-uncommitted"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        # A torn tail: bytes with no trailing newline are never a complete
+        # record (read_batch's readline() breaks on it), so they sit
+        # uncommitted indefinitely without any drain_worker dispatch at all.
+        with open(qm._log_path(sid), "ab") as f:
+            f.write(b"torn-no-newline-yet")
+
+        task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
+        # Give the idle branch several chances to fire (and refuse) the trim.
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert qm._log_path(sid).exists()  # never dropped -- delete_drained refused
+
+
 class _AccumBufferGraph:
     """FAITHFUL model of a real store's accumulating buffer (NOT a hollow mock).
 

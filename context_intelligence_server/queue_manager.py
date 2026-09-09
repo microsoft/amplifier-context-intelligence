@@ -140,15 +140,17 @@ class QueueManager:
         self._stats_cache: dict[str, Any] | None = None
         self._stats_cache_at: float = 0.0
         self._stats_cache_ttl: float = 1.0
-        # Separate cache for spool_stats(). A longer TTL than _stats_cache_ttl
-        # is fine here: spool_stats() is an
-        # operator-facing "is the backlog growing" signal, not a
-        # correctness-sensitive value, so a few extra seconds of staleness is
-        # an acceptable trade for fewer directory scans under frequent
-        # /status polling.
+        # Snapshot for spool_stats() / spool_stats_age_seconds(). Written
+        # ONLY by refresh_spool_stats(), which a background loop
+        # (_spool_stats_refresher in main.py) calls on its own cadence
+        # (config.spool_stats_refresh_interval_seconds) -- NOT gated by a
+        # read-side TTL. spool_stats() itself is a pure cache read and never
+        # scans the directory: a ~5000-file spool on Azure Files SMB
+        # previously made the inline per-request scan take minutes
+        # (incident 2026-09-09), because /status called the equivalent of
+        # today's refresh_spool_stats() directly, on every request.
         self._spool_cache: dict[str, int] | None = None
         self._spool_cache_at: float = 0.0
-        self._spool_cache_ttl: float = 5.0
         # One _KeyGuard per worker key that has been appended to and
         # not yet finalized-and-deleted. Created lazily by _guard(); removed
         # ONLY by delete_drained, under the admission lock, gated on identity
@@ -679,26 +681,32 @@ class QueueManager:
         self._stats_cache_at = now
         return stats
 
-    async def spool_stats(self) -> dict[str, int]:
-        """Cheap, aggregate-only spool footprint for the unauthenticated /status.
+    async def refresh_spool_stats(self) -> dict[str, int]:
+        """Scan the spool directory and refresh the snapshot ``spool_stats()`` serves.
 
         Returns two integers: ``pending_sessions`` (keys whose committed offset
         is below the ``.log`` size) and ``spool_bytes_total`` (bytes across all
-        queue files). Sized via ``stat()`` per file -- O(file count), never
-        O(bytes) -- and cached for ``_spool_cache_ttl`` seconds. No identifiers
-        are returned or derivable.
+        queue files), plus ``corrupt_offsets`` (a non-numeric ``.offset``
+        count). Sized via ``stat()`` per file -- O(file count), never
+        O(bytes). No identifiers are returned or derivable.
 
-        Must not raise (/status is the unauthenticated health probe): a
-        directory-level failure returns the uncached sentinel ``{-1, -1}`` and a
-        per-file failure skips that entry. ``-1`` means "temporarily
-        unavailable", distinct from a real ``0``.
+        This is the ONLY method that walks the queue directory for spool
+        stats. On success it stores the result as the snapshot
+        ``spool_stats()`` reads (``_spool_cache`` / ``_spool_cache_at``) --
+        the sole write path for that cache. Intended to be called
+        periodically off the request path (see ``_spool_stats_refresher`` in
+        main.py), on ``config.spool_stats_refresh_interval_seconds``; never
+        from ``/status`` directly, which is exactly what made a ~5000-file
+        spool on Azure Files SMB stall the unauthenticated health probe for
+        minutes (incident 2026-09-09).
+
+        Must not raise (called from a background loop that must keep
+        running): a per-file failure skips that entry, and a directory-level
+        failure returns the uncached sentinel ``{-1, -1, -1}`` WITHOUT
+        touching ``_spool_cache`` -- a prior good snapshot survives a
+        transient scan failure rather than being wiped by it. ``-1`` means
+        "temporarily unavailable", distinct from a real ``0``.
         """
-        now = time.monotonic()
-        if (
-            self._spool_cache is not None
-            and (now - self._spool_cache_at) < self._spool_cache_ttl
-        ):
-            return self._spool_cache
 
         def _scan() -> dict[str, int]:
             spool_bytes_total = 0
@@ -742,9 +750,12 @@ class QueueManager:
             stats = await asyncio.to_thread(_scan)
         except (OSError, ValueError):
             # Queue dir missing/unavailable, or a transient FS error mid-scan.
-            # /status must return 200: degrade to an uncached sentinel so the
-            # next poll retries once the filesystem recovers. -1 means
-            # "temporarily unavailable", distinct from a real 0.
+            # The refresher must keep running regardless: degrade to the
+            # uncached sentinel so the next refresh retries once the
+            # filesystem recovers, and so /status's `as_of_seconds` shows the
+            # existing snapshot (if any) going stale rather than this failure
+            # silently overwriting it. -1 means "temporarily unavailable",
+            # distinct from a real 0.
             return {
                 "pending_sessions": -1,
                 "spool_bytes_total": -1,
@@ -752,8 +763,47 @@ class QueueManager:
             }
 
         self._spool_cache = stats
-        self._spool_cache_at = now
+        self._spool_cache_at = time.monotonic()
         return stats
+
+    def spool_stats(self) -> dict[str, int]:
+        """Cheap, read-only, aggregate-only spool footprint for the unauthenticated /status.
+
+        Returns the snapshot last produced by ``refresh_spool_stats()`` (see
+        ``_spool_stats_refresher`` in main.py), or the sentinel
+        ``{"pending_sessions": -1, "spool_bytes_total": -1,
+        "corrupt_offsets": -1}`` when no snapshot has been produced yet
+        (``-1`` means "temporarily unavailable", distinct from a real ``0``).
+        No identifiers are returned or derivable.
+
+        Synchronous and NEVER touches the filesystem -- that is the entire
+        point of the refresh/read split (see ``refresh_spool_stats``).
+        O(1) regardless of spool size, on every call. Never raises.
+
+        Returns a FRESH dict each call (not a reference into the cache), so a
+        caller (e.g. ``/status``) can add fields of its own -- such as
+        ``as_of_seconds`` via ``spool_stats_age_seconds()`` -- without
+        mutating the snapshot the next caller sees.
+        """
+        if self._spool_cache is not None:
+            return dict(self._spool_cache)
+        return {
+            "pending_sessions": -1,
+            "spool_bytes_total": -1,
+            "corrupt_offsets": -1,
+        }
+
+    def spool_stats_age_seconds(self) -> float | None:
+        """Seconds since the cached spool snapshot was last refreshed.
+
+        Returns ``None`` when ``refresh_spool_stats()`` has never produced a
+        snapshot yet. Lets ``/status`` distinguish a fresh reading from a
+        stale one instead of presenting whatever is cached as though it were
+        live. Pure arithmetic: never touches the filesystem, never raises.
+        """
+        if self._spool_cache is None:
+            return None
+        return round(time.monotonic() - self._spool_cache_at, 1)
 
     async def dead_letter_keys(self) -> list[str]:
         """Return sorted worker keys that have a ``.dead.jsonl`` file.
