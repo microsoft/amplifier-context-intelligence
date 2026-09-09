@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from neo4j.exceptions import Neo4jError
 
+from context_intelligence_server import neo4j_store as neo4j_store_module
 from context_intelligence_server.graph_store import GraphStore, QueryableStore
 from context_intelligence_server.neo4j_store import (
     Neo4jGraphStore,
@@ -32,6 +33,42 @@ from context_intelligence_server.neo4j_store import (
     _validate_identifier,
     ensure_neo4j_schema,
 )
+
+# Guarded imports for names introduced by this change, so the suite still
+# COLLECTS against unfixed source and the guards below fail for the reason they
+# exist rather than at import time. Each fallback is byte-identical to the
+# unfixed production value, so a revert still fails RED on the genuine pre-fix
+# query / behaviour.
+try:  # pragma: no cover - import resolution differs pre/post fix
+    from context_intelligence_server.neo4j_store import (
+        _DELEGATION_BY_SUB_SESSION_CYPHER,
+        _EDGE_GET_BY_ENDPOINTS_CYPHER,
+    )
+except ImportError:  # pragma: no cover - exercised only against unfixed code
+    _EDGE_GET_BY_ENDPOINTS_CYPHER = (
+        "MATCH ()-[r]->() "
+        "WHERE r.src_id = $src_id AND r.dst_id = $dst_id "
+        "AND r.workspace = $workspace "
+        "RETURN properties(r) AS props"
+    )
+    _DELEGATION_BY_SUB_SESSION_CYPHER = (
+        "MATCH (d:Delegation {sub_session_id: $sid, workspace: $workspace}) "
+        "RETURN properties(d) AS props"
+    )
+
+try:  # pragma: no cover - import resolution differs pre/post fix
+    from context_intelligence_server.neo4j_store import (
+        mark_schema_ready,
+        schema_ready,
+    )
+except ImportError:  # pragma: no cover - exercised only against unfixed code
+
+    def mark_schema_ready() -> None:  # type: ignore[misc]
+        """No-op stand-in: unfixed code has no process-wide schema latch."""
+
+    def schema_ready() -> bool:  # type: ignore[misc]
+        """Always False: unfixed code has no process-wide schema latch."""
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -2532,9 +2569,20 @@ class TestSchemaLatchOnSuccess:
             "never retried and duplicate Session/Event nodes accrue."
         )
 
-    async def test_ensure_schema_retries_until_established_then_latches(self) -> None:
+    async def test_ensure_schema_retries_until_established_then_latches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Degraded first run retries on the next flush, then latches and stops re-running."""
         from neo4j.exceptions import ServiceUnavailable
+
+        # An un-latched retry is now rate-limited (_SCHEMA_RETRY_BACKOFF_SECONDS)
+        # so a connectivity blip cannot become a per-flush DDL storm. This test
+        # is about the RETRY semantics, not the rate limit -- the rate limit has
+        # its own guard in TestSchemaRetryBackoff -- so collapse the window to
+        # zero and let the two flushes run back to back as they always did.
+        monkeypatch.setattr(
+            neo4j_store_module, "_SCHEMA_RETRY_BACKOFF_SECONDS", 0.0, raising=False
+        )
 
         store = _make_store()
         store._schema_initialized = False
@@ -3513,3 +3561,408 @@ class TestWorkingDirCoalesce:
         session_calls = [c for c in captured if "n:Session" in str(c["statement"])]
         rows = session_calls[0]["kwargs"]["rows"]  # type: ignore[index]
         assert "working_dir" not in rows[0]
+
+
+# ---------------------------------------------------------------------------
+# Wide-query containment: every persisted read must be able to SEEK an index.
+#
+# PR #98 fixed get_node()'s label-free MATCH, which planned as an AllNodesScan
+# over the 12.09M-node production graph, held its pooled bolt connection for
+# ~60s per call, and (51 concurrent, 50-connection pool) exhausted the shared
+# pool until live activity records were dead-lettered.
+#
+# These guards cover the REST of that bug class rather than the one instance:
+# the two remaining unindexed reads, and a source-level tripwire so the next
+# hand-rolled query cannot re-introduce the pattern silently.
+# ---------------------------------------------------------------------------
+
+
+async def test_get_edge_fallback_is_node_anchored_not_all_relationships_scan():
+    """get_edge()'s Neo4j fallback must anchor on :Node, never scan all relationships.
+
+    ``MATCH ()-[r]->() WHERE r.src_id = ...`` names no relationship type, and
+    Neo4j relationship property indexes are TYPE-scoped, so no index could back
+    it: it plans as an AllRelationshipsScan. That is the same defect class as
+    the get_node() AllNodesScan over a set that is larger still -- a graph has
+    more relationships than nodes.
+
+    FAILS before fix -> query is 'MATCH ()-[r]->() WHERE ...' (unanchored).
+    PASSES after fix  -> both endpoints are :Node identity patterns, so the
+                         planner seeks the (node_id, workspace) unique index
+                         and walks only that node's own relationships.
+    """
+    store = _make_store(workspace="ws-1")
+    store._edge_buffer = {}
+
+    mock_result = MagicMock()
+    mock_result.records = []
+    mock_execute = AsyncMock(return_value=mock_result)
+    store._driver.execute_query = mock_execute  # type: ignore[attr-defined]
+
+    await store.get_edge("src-1", "dst-1")
+
+    query: str = mock_execute.call_args[0][0]
+    assert "MATCH ()-[r]->()" not in query.replace(" ", "").replace(
+        "MATCH()-[r]->()", "MATCH ()-[r]->()"
+    ), f"get_edge must not scan every relationship in the graph. Query: {query!r}"
+    assert query.count(f":{_UNIVERSAL_NODE_LABEL}") == 2, (
+        f"get_edge must anchor BOTH endpoints on ':{_UNIVERSAL_NODE_LABEL}' so each "
+        f"is an index seek on (node_id, workspace). Query: {query!r}"
+    )
+    assert query == _EDGE_GET_BY_ENDPOINTS_CYPHER, (
+        "get_edge must issue the shared _EDGE_GET_BY_ENDPOINTS_CYPHER constant "
+        "rather than a hand-rolled string that can drift."
+    )
+
+
+async def test_get_edge_fallback_still_binds_endpoints_and_workspace():
+    """The anchored rewrite must not change get_edge's parameter contract."""
+    store = _make_store(workspace="ws-alpha")
+    store._edge_buffer = {}
+
+    mock_result = MagicMock()
+    mock_result.records = []
+    mock_execute = AsyncMock(return_value=mock_result)
+    store._driver.execute_query = mock_execute  # type: ignore[attr-defined]
+
+    await store.get_edge("a", "b")
+
+    params = mock_execute.call_args[0][1]
+    assert params == {"src_id": "a", "dst_id": "b", "workspace": "ws-alpha"}, (
+        f"get_edge must still bind src_id/dst_id/workspace unchanged; got {params!r}"
+    )
+
+
+async def test_delegation_lookup_uses_shared_indexed_constant():
+    """find_delegation_by_sub_session must issue the constant the index backs."""
+    store = _make_store(workspace="ws-1")
+
+    mock_result = MagicMock()
+    mock_result.records = []
+    mock_execute = AsyncMock(return_value=mock_result)
+    store._driver.execute_query = mock_execute  # type: ignore[attr-defined]
+
+    await store.find_delegation_by_sub_session("sub-1", "ws-1")
+
+    query: str = mock_execute.call_args[0][0]
+    assert query == _DELEGATION_BY_SUB_SESSION_CYPHER, (
+        "find_delegation_by_sub_session must issue the shared "
+        "_DELEGATION_BY_SUB_SESSION_CYPHER constant, which sits beside the "
+        f"idx_delegation_sub_session index that backs it. Query: {query!r}"
+    )
+    assert "sub_session_id" in query and "workspace" in query, (
+        "The lookup must key on BOTH indexed properties (sub_session_id, "
+        f"workspace) or the composite index cannot be seeked. Query: {query!r}"
+    )
+
+
+async def test_schema_creates_delegation_sub_session_index():
+    """ensure_neo4j_schema must create the index backing the Delegation lookup.
+
+    Without it the lookup names a label but no indexed property, so it plans as
+    a NodeByLabelScan over EVERY :Delegation node. That path is live ingest --
+    the self-delegation resolver hits it whenever the parent Delegation has
+    already flushed out of the in-memory buffer -- and it grows without bound
+    as delegation volume grows.
+    """
+    session = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.run = AsyncMock(return_value=AsyncMock())
+    driver = MagicMock()
+    driver.session = MagicMock(return_value=session)
+
+    await ensure_neo4j_schema(driver)
+
+    statements = [str(call.args[0]) for call in session.run.await_args_list]
+    delegation_idx = [
+        s for s in statements if "Delegation" in s and "CREATE INDEX" in s
+    ]
+    assert delegation_idx, (
+        "ensure_neo4j_schema must CREATE INDEX on :Delegation for the "
+        f"sub_session_id lookup. Statements issued: {statements}"
+    )
+    assert any("sub_session_id" in s and "workspace" in s for s in delegation_idx), (
+        "The Delegation index must be composite on (sub_session_id, workspace) "
+        f"-- the exact keys the lookup filters on. Got: {delegation_idx}"
+    )
+
+
+def test_no_unindexed_scan_patterns_in_neo4j_store_source():
+    """Source-level tripwire: no NEW label-free / all-relationship query may ship.
+
+    get_node() broke because it hand-rolled its own query string while three
+    sibling call sites composed theirs from the shared ``_NODE_MATCH_BY_ID``
+    prefix -- so it inherited none of their index-scoped-ness, and none of the
+    existing plan guards covered it. Guarding one call site per outage does not
+    scale; this guards the whole module, including queries nobody has written
+    yet.
+
+    The allow-list below is the complete, reviewed inventory of deliberately
+    label-free statements. Every one is either answered from Neo4j's O(1)
+    counts store or is an explicitly O(graph-size) repair path that only runs
+    under ``doctor --fix`` -- never on the hot ingest path. Adding an entry is
+    the review checkpoint: if a new query needs to be here, that needs to be an
+    argued decision, not an accident.
+    """
+    import pathlib  # noqa: PLC0415
+    import re  # noqa: PLC0415
+
+    source_path = (
+        pathlib.Path(neo4j_store_module.__file__).resolve()  # type: ignore[arg-type]
+    )
+    lines = source_path.read_text(encoding="utf-8").splitlines()
+
+    # MATCH (n) / MATCH (foo) -- a node pattern carrying no label. Neo4j property
+    # indexes are label-scoped, so such a pattern can never use one.
+    unlabelled_node = re.compile(r"MATCH\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\)")
+    # MATCH ()-[r]-> -- a relationship pattern carrying no type. Relationship
+    # property indexes are type-scoped, so likewise no index can back it.
+    untyped_relationship = re.compile(r"MATCH\s*\(\s*\)\s*-\s*\[")
+
+    allowed = {
+        # Docstring prose explaining why the edge writer uses MERGE, not MATCH.
+        "Why MERGE and not MATCH: the old ``MATCH (src) MATCH (dst)`` was an inner join",
+        # _DUPLICATE_DETECT_CYPHER -- doctor --fix only, explicitly O(graph-size).
+        '"MATCH (n) "',
+        # _UNTAGGED_COUNT_CYPHER -- doctor --fix pre/post accounting only.
+        'f"MATCH (n) WHERE NOT n:{_UNIVERSAL_NODE_LABEL} RETURN count(n) AS c"',
+        # _TOTAL_NODE_COUNT_CYPHER -- answered from the O(1) counts store.
+        '_TOTAL_NODE_COUNT_CYPHER = "MATCH (n) RETURN count(n) AS c"',
+        # backfill_node_labels -- doctor --fix only, batched IN TRANSACTIONS.
+        'f"MATCH (n) WHERE NOT n:{_UNIVERSAL_NODE_LABEL} "',
+    }
+
+    offenders: list[str] = []
+    for lineno, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue  # a comment cannot execute
+        if stripped in allowed:
+            continue
+        if unlabelled_node.search(line) or untyped_relationship.search(line):
+            offenders.append(f"{source_path.name}:{lineno}: {stripped}")
+
+    assert not offenders, (
+        "New unindexed scan pattern(s) in neo4j_store.py. A label-free MATCH "
+        "(n) or an untyped MATCH ()-[r]-> cannot use ANY Neo4j index and plans "
+        "as a full AllNodesScan / AllRelationshipsScan -- the 12.09M-node, "
+        "~60s-per-call, pool-exhausting stall this module has now hit twice. "
+        "Scope the pattern to a label/type it has an index for, or -- if the "
+        "scan is genuinely intended and off the hot path -- add the exact line "
+        "to this test's allow-list with a comment saying why.\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Schema pass: process-wide latch and retry backoff.
+#
+# ensure_neo4j_schema ran once per STORE, and a store is created per SESSION,
+# so every new session paid a full ~11-statement DDL pass on its first flush --
+# and, whenever that pass could not complete, paid it again on EVERY subsequent
+# flush with no backoff. Each statement must acquire a pooled bolt connection,
+# and _flush_body awaits _ensure_schema BEFORE writing any data, so under pool
+# starvation this became a self-reinforcing storm competing with the very
+# writes it exists to enable.
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaProcessLatch:
+    """The schema latch is process-wide, and the lifespan can seed it."""
+
+    async def test_ensure_schema_skips_entirely_when_process_latch_set(self) -> None:
+        """A store must not re-run the DDL pass once ANY caller established it.
+
+        This is the branch that always fires in the server: the FastAPI
+        lifespan runs ensure_neo4j_schema(fail_on_data_conflict=True) before
+        accepting a single request and refuses to boot unless it succeeds, so
+        a per-flush pass can only re-confirm what is already true -- at ~11
+        catalog statements per flush, per session.
+
+        FAILS before fix -> the per-store flag is the only latch, so the store
+                            opens a session and re-runs the whole pass.
+        PASSES after fix  -> schema_ready() short-circuits before any I/O.
+        """
+        store = _make_store()
+        store._schema_initialized = False
+        store._driver.session = MagicMock(
+            side_effect=AssertionError(
+                "schema pass ran despite the process-wide latch being set"
+            )
+        )
+
+        mark_schema_ready()
+        assert schema_ready() is True
+
+        await store._ensure_schema()  # must not touch the driver at all
+
+        store._driver.session.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_successful_store_pass_latches_for_the_whole_process(self) -> None:
+        """One store fully establishing the schema spares its siblings the pass.
+
+        Stores are per-session; without a process-wide latch, N concurrent
+        sessions each pay the same DDL pass on their first flush.
+        """
+        assert schema_ready() is False, "autouse fixture must reset the latch"
+
+        first = _make_store()
+        first._schema_initialized = False
+        ok_session = AsyncMock()
+        ok_session.__aenter__ = AsyncMock(return_value=ok_session)
+        ok_session.run = AsyncMock(return_value=AsyncMock())
+        first._driver.session = MagicMock(return_value=ok_session)
+
+        await first._ensure_schema()
+
+        assert first._schema_initialized is True
+        assert schema_ready() is True, (
+            "A fully established schema is a PROCESS-wide fact -- it must latch "
+            "for sibling stores, not just for the store that established it."
+        )
+
+        sibling = _make_store()
+        sibling._schema_initialized = False
+        sibling._driver.session = MagicMock(
+            side_effect=AssertionError("sibling store re-ran the schema pass")
+        )
+        await sibling._ensure_schema()
+        sibling._driver.session.assert_not_called()  # type: ignore[attr-defined]
+
+
+class TestSchemaRetryBackoff:
+    """A failed schema pass must not retry on the very next flush."""
+
+    @staticmethod
+    def _degraded_session() -> AsyncMock:
+        from neo4j.exceptions import ServiceUnavailable  # noqa: PLC0415
+
+        session = AsyncMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+
+        async def _run(statement: str, *args: object, **kwargs: object) -> AsyncMock:
+            if "CREATE CONSTRAINT" in str(statement):
+                raise ServiceUnavailable("connection refused")
+            return AsyncMock()
+
+        session.run = AsyncMock(side_effect=_run)
+        return session
+
+    async def test_failed_pass_does_not_retry_on_the_next_flush(self) -> None:
+        """Back-to-back flushes must issue ONE degraded pass, not two.
+
+        Without backoff, a connectivity blip turns into a per-flush DDL storm:
+        every flush of every session re-attempts ~11 catalog statements, each
+        one waiting out the full connection-acquisition timeout against the
+        pool it is already starving.
+
+        FAILS before fix -> both flushes run the pass (2 sessions opened).
+        PASSES after fix  -> the second is suppressed by the backoff window.
+        """
+        store = _make_store()
+        store._schema_initialized = False
+        sessions = [self._degraded_session(), self._degraded_session()]
+        store._driver.session = MagicMock(side_effect=sessions)
+
+        await store._ensure_schema()
+        await store._ensure_schema()
+
+        assert store._driver.session.call_count == 1, (  # type: ignore[attr-defined]
+            "A failed schema pass must not be retried on the immediately "
+            "following flush -- that is the per-flush DDL storm. Sessions "
+            f"opened: {store._driver.session.call_count}"  # type: ignore[attr-defined]
+        )
+        assert store._schema_initialized is False, (
+            "Suppressing a retry must not latch a half-built schema."
+        )
+
+    async def test_retry_resumes_once_the_backoff_window_elapses(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Backoff delays the retry; it must never cancel the self-heal."""
+        store = _make_store()
+        store._schema_initialized = False
+        degraded = self._degraded_session()
+        ok_session = AsyncMock()
+        ok_session.__aenter__ = AsyncMock(return_value=ok_session)
+        ok_session.run = AsyncMock(return_value=AsyncMock())
+        store._driver.session = MagicMock(side_effect=[degraded, ok_session])
+
+        await store._ensure_schema()
+        assert store._schema_initialized is False
+
+        # Simulate the window elapsing rather than sleeping through it.
+        monkeypatch.setattr(
+            neo4j_store_module, "_SCHEMA_RETRY_BACKOFF_SECONDS", 0.0, raising=False
+        )
+
+        await store._ensure_schema()
+        assert store._schema_initialized is True, (
+            "Once the window elapses the retry must run and latch -- backoff "
+            "delays the self-heal, it does not disable it."
+        )
+
+
+class TestLifespanSchemaLatchSeeding:
+    """The lifespan may only seed the process latch on a FULLY established pass.
+
+    ``ensure_neo4j_schema(fail_on_data_conflict=True)`` fails closed on a
+    :Node constraint DATA conflict, but a CONNECTIVITY failure on any single
+    index/constraint is swallowed and reported through the RETURN VALUE. A
+    lifespan that latched unconditionally would mark a half-built schema ready
+    and permanently disable the per-flush self-heal -- reopening the
+    "constraint created once, never retried" data-integrity gap.
+    """
+
+    async def test_incomplete_schema_pass_must_not_latch(self) -> None:
+        """A False return from the cold-start pass must leave the latch unset."""
+        assert schema_ready() is False, "autouse fixture must reset the latch"
+
+        # Mirror the lifespan's own decision rule against a degraded pass.
+        from neo4j.exceptions import ServiceUnavailable  # noqa: PLC0415
+
+        session = AsyncMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+
+        async def _run(statement: str, *args: object, **kwargs: object) -> AsyncMock:
+            if "CREATE CONSTRAINT" in str(statement):
+                raise ServiceUnavailable("connection refused")
+            return AsyncMock()
+
+        session.run = AsyncMock(side_effect=_run)
+        driver = MagicMock()
+        driver.session = MagicMock(return_value=session)
+
+        fully_established = await ensure_neo4j_schema(
+            driver, fail_on_data_conflict=True
+        )
+        assert fully_established is False, (
+            "A swallowed connectivity failure must be reported via the return "
+            "value -- this is the signal the lifespan gates its seed on."
+        )
+
+        if fully_established:  # pragma: no cover - guarding the wrong branch
+            mark_schema_ready()
+
+        assert schema_ready() is False, (
+            "Latching on an incomplete schema pass would permanently disable "
+            "the per-flush self-heal for the whole process."
+        )
+
+    async def test_complete_schema_pass_latches(self) -> None:
+        """A True return must seed the latch, so stores skip the redundant pass."""
+        session = AsyncMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.run = AsyncMock(return_value=AsyncMock())
+        driver = MagicMock()
+        driver.session = MagicMock(return_value=session)
+
+        fully_established = await ensure_neo4j_schema(
+            driver, fail_on_data_conflict=True
+        )
+        assert fully_established is True
+
+        if fully_established:
+            mark_schema_ready()
+
+        assert schema_ready() is True

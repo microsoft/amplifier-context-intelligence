@@ -415,3 +415,121 @@ async def test_get_node_fallback_uses_index_seek_not_allnodesscan(
         "get_node()'s Neo4j fallback is not index-backed -- expected a "
         f"NodeIndexSeek / NodeUniqueIndexSeek. Plan operators: {ops}"
     )
+
+
+# The EXACT queries the production get_edge() / find_delegation_by_sub_session()
+# fallbacks issue. Separate try/except blocks (not folded into the ones above)
+# for the same reason documented there: those names already exist on unfixed
+# code, so a shared block would fall back wholesale and break sibling tests for
+# the wrong reason. Each fallback is byte-identical to its *unfixed* source, so
+# a revert still fails RED on the real pre-fix plan.
+try:  # pragma: no cover - import resolution differs pre/post fix
+    from context_intelligence_server.neo4j_store import _EDGE_GET_BY_ENDPOINTS_CYPHER
+except ImportError:  # pragma: no cover - exercised only against unfixed code
+    _EDGE_GET_BY_ENDPOINTS_CYPHER = (
+        "MATCH ()-[r]->() "
+        "WHERE r.src_id = $src_id AND r.dst_id = $dst_id "
+        "AND r.workspace = $workspace "
+        "RETURN properties(r) AS props"
+    )
+
+try:  # pragma: no cover - import resolution differs pre/post fix
+    from context_intelligence_server.neo4j_store import (
+        _DELEGATION_BY_SUB_SESSION_CYPHER,
+    )
+except ImportError:  # pragma: no cover - exercised only against unfixed code
+    _DELEGATION_BY_SUB_SESSION_CYPHER = (
+        "MATCH (d:Delegation {sub_session_id: $sid, workspace: $workspace}) "
+        "RETURN properties(d) AS props"
+    )
+
+
+async def _flush_one_edge(container: dict[str, Any], src_id: str, dst_id: str) -> None:
+    """Drive one edge (and its two endpoint nodes) through the real flush path."""
+    store = Neo4jGraphStore(
+        uri=container["bolt_url"],
+        auth=(container["user"], container["password"]),
+        workspace="test",
+    )
+    try:
+        await store.upsert_node(src_id, {"labels": ["Event"]})
+        await store.upsert_node(dst_id, {"labels": ["Event"]})
+        await store.upsert_edge(src_id, dst_id, {"type": "CONTAINS"})
+        await store.flush()
+    finally:
+        await store.close()
+
+
+async def test_get_edge_fallback_does_not_scan_all_relationships(
+    neo4j_container: dict[str, Any],
+) -> None:
+    """get_edge()'s Neo4j fallback must not plan as an AllRelationshipsScan.
+
+    Relationship property indexes in Neo4j are TYPE-scoped, so the unfixed
+    ``MATCH ()-[r]->() WHERE r.src_id = ...`` -- which names no type -- could
+    not use any index and scanned every relationship in the graph. Same defect
+    class as the get_node() AllNodesScan, over a set that is larger still.
+
+    RED  (unfixed): MATCH ()-[r]->() WHERE r.src_id ... -> AllRelationshipsScan
+    GREEN (fixed):  both endpoints anchored on :Node -> the planner seeks the
+                    (node_id, workspace) unique index and expands only that
+                    node's own relationships.
+    """
+    await _flush_one_edge(neo4j_container, "edge-plan-src", "edge-plan-dst")
+
+    ops = _explain_ops(
+        neo4j_container,
+        _EDGE_GET_BY_ENDPOINTS_CYPHER,
+        src_id="edge-plan-src",
+        dst_id="edge-plan-dst",
+        workspace="test",
+    )
+
+    assert ops, "EXPLAIN returned no plan operators for the get_edge query"
+    assert not any("AllRelationshipsScan" in op for op in ops), (
+        f"get_edge() still scans every relationship in the graph. Plan operators: {ops}"
+    )
+    assert not any("AllNodesScan" in op for op in ops), (
+        f"get_edge() must not full-scan nodes either. Plan operators: {ops}"
+    )
+    assert any("IndexSeek" in op for op in ops), (
+        "get_edge() is not index-backed -- expected a NodeIndexSeek / "
+        f"NodeUniqueIndexSeek on the anchored endpoints. Plan operators: {ops}"
+    )
+
+
+async def test_delegation_lookup_uses_index_seek_not_label_scan(
+    neo4j_container: dict[str, Any],
+) -> None:
+    """find_delegation_by_sub_session must seek its composite index, never label-scan.
+
+    The query shape was always correct -- it just had no index to seek, so it
+    planned as a NodeByLabelScan across EVERY :Delegation node. This is a live
+    ingest path (the self-delegation resolver, whenever the parent Delegation
+    has already flushed out of the in-memory buffer), and it grows without
+    bound as delegation volume grows.
+
+    RED  (unfixed): no idx_delegation_sub_session -> NodeByLabelScan
+    GREEN (fixed):  CREATE INDEX ... FOR (n:Delegation)
+                    ON (n.sub_session_id, n.workspace) -> NodeIndexSeek
+    """
+    # Any flush drives ensure_neo4j_schema, which creates the index under test.
+    await _flush_one_non_session_node(neo4j_container, "delegation-plan-seed", {"v": 1})
+
+    ops = _explain_ops(
+        neo4j_container,
+        _DELEGATION_BY_SUB_SESSION_CYPHER,
+        sid="sub-session-1",
+        workspace="test",
+    )
+
+    assert ops, "EXPLAIN returned no plan operators for the Delegation lookup"
+    assert not any("NodeByLabelScan" in op for op in ops), (
+        "find_delegation_by_sub_session still scans every :Delegation node -- "
+        "the idx_delegation_sub_session composite index is missing or unusable. "
+        f"Plan operators: {ops}"
+    )
+    assert any("IndexSeek" in op for op in ops), (
+        "find_delegation_by_sub_session is not index-backed -- expected a "
+        f"NodeIndexSeek on (sub_session_id, workspace). Plan operators: {ops}"
+    )
