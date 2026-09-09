@@ -188,6 +188,16 @@ _NODE_MATCH_BY_ID = (
     f"MATCH (n:{_UNIVERSAL_NODE_LABEL} {{node_id: $node_id, workspace: $workspace}})"
 )
 
+# Single-node read-by-identity, built on the shared _NODE_MATCH_BY_ID prefix so
+# it can never drift back to a label-free MATCH.  This is the get_node() Neo4j
+# fallback, which runs on the hot per-event path (touch_session -> get_node), so
+# it MUST plan as a NodeUniqueIndexSeek: as a label-free MATCH it planned as an
+# AllNodesScan over the whole graph and, at 12.09M nodes, took ~60s per call
+# while holding its pooled connection for the duration.
+_NODE_GET_BY_ID_CYPHER = (
+    f"{_NODE_MATCH_BY_ID} RETURN properties(n) AS props, labels(n) AS lbls"
+)
+
 
 def _edge_merge_cypher(edge_type: str) -> str:
     """Return the UNWIND edge-MERGE query for *edge_type* — self-healing endpoints.
@@ -1416,9 +1426,8 @@ class Neo4jGraphStore:
         # Neo4j fallback
         try:
             result = await self._driver.execute_query(
-                "MATCH (n) WHERE n.node_id = $id AND n.workspace = $workspace "
-                "RETURN properties(n) AS props, labels(n) AS lbls",
-                {"id": node_id, "workspace": self.workspace},
+                cast(LiteralString, _NODE_GET_BY_ID_CYPHER),
+                {"node_id": node_id, "workspace": self.workspace},
                 database_=self._database,
             )
             records = result.records

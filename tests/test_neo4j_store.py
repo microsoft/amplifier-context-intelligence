@@ -28,6 +28,7 @@ from context_intelligence_server.neo4j_store import (
     Neo4jGraphStore,
     _convert_temporal_props,
     _normalize_temporal,
+    _UNIVERSAL_NODE_LABEL,
     _validate_identifier,
     ensure_neo4j_schema,
 )
@@ -1015,9 +1016,57 @@ async def test_get_node_fallback_queries_by_node_id_property():
         "Expected driver.execute_query to be called for Neo4j fallback"
     )
     query: str = mock_execute.call_args[0][0]
-    assert "n.node_id" in query, (
-        f"Fallback query must filter on 'n.node_id' (the property flush stores on nodes), "
-        f"but the issued query was: {query!r}"
+    # Syntax-agnostic: the key may appear as ``n.node_id = $node_id`` (WHERE
+    # form) or as ``{node_id: $node_id}`` (map-pattern form).  What matters is
+    # that identity is keyed on the ``node_id`` property and never on ``id``.
+    assert "node_id" in query, (
+        f"Fallback query must key on the 'node_id' property (the one flush stores "
+        f"on nodes), but the issued query was: {query!r}"
+    )
+    assert "n.id" not in query, (
+        f"Fallback query must NOT filter on 'n.id' -- no node carries that "
+        f"property, so it silently returns None. Issued query: {query!r}"
+    )
+    params = mock_execute.call_args[0][1]
+    assert params.get("node_id") == "session-123", (
+        f"Fallback must bind the node id to the $node_id parameter; got {params!r}"
+    )
+
+
+async def test_get_node_fallback_is_label_scoped_for_index_seek():
+    """Post-flush fallback must scope the MATCH to the universal :Node label.
+
+    Neo4j property indexes are label-scoped, so a label-free ``MATCH (n)``
+    cannot use ANY index and plans as an AllNodesScan over the whole graph.
+    On the 12.09M-node production graph that made every get_node() fallback
+    take ~60s while holding its pooled bolt connection; 51 concurrent calls
+    exhausted the 50-connection shared pool and ingest dead-lettered live
+    events on the 30s connection_acquisition_timeout.
+
+    The live query-plan proof lives in
+    tests/neo4j/test_node_index_seek.py, but that file is marked ``neo4j`` and
+    is deselected from the default suite -- so this unit-level guard is the one
+    that runs in ordinary CI.
+
+    FAILS before fix  -> query is 'MATCH (n) WHERE ...' (no label).
+    PASSES after fix  -> query scopes to ':Node'.
+    """
+    store = _make_store()
+    store._node_buffer = {}
+
+    mock_result = MagicMock()
+    mock_result.records = []
+    mock_execute = AsyncMock(return_value=mock_result)
+    store._driver.execute_query = mock_execute  # type: ignore[attr-defined]
+
+    await store.get_node("session-123")
+
+    query: str = mock_execute.call_args[0][0]
+    assert f":{_UNIVERSAL_NODE_LABEL}" in query, (
+        f"Fallback query must scope the MATCH to the universal "
+        f"':{_UNIVERSAL_NODE_LABEL}' label so the composite "
+        f"(node_id, workspace) index backs it -- a label-free MATCH plans as a "
+        f"full-graph AllNodesScan. Issued query: {query!r}"
     )
 
 
