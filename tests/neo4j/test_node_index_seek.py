@@ -78,6 +78,24 @@ except ImportError:  # pragma: no cover - exercised only against unfixed code
         )
 
 
+# The EXACT single-node read the production get_node() Neo4j fallback issues.
+# Deliberately a SEPARATE try/except from the block above: _NODE_MATCH_BY_ID
+# already exists on unfixed code, so folding this import in with it would make
+# the whole block fall back and break the other tests for the wrong reason.
+# The fallback is byte-identical to the *unfixed* get_node() query (label-free,
+# $id rather than $node_id) so a revert still fails RED on AllNodesScan.
+try:  # pragma: no cover - import resolution differs pre/post fix
+    from context_intelligence_server.neo4j_store import _NODE_GET_BY_ID_CYPHER
+
+    _GET_NODE_PARAM = "node_id"
+except ImportError:  # pragma: no cover - exercised only against unfixed code
+    _NODE_GET_BY_ID_CYPHER = (
+        "MATCH (n) WHERE n.node_id = $id AND n.workspace = $workspace "
+        "RETURN properties(n) AS props, labels(n) AS lbls"
+    )
+    _GET_NODE_PARAM = "id"
+
+
 def _collect_operators(plan: dict[str, Any]) -> list[str]:
     """Recursively collect every operatorType in a Neo4j EXPLAIN/PROFILE plan."""
     ops: list[str] = []
@@ -357,4 +375,43 @@ async def test_label_patch_match_uses_index_seek_not_allnodesscan(
     assert any("IndexSeek" in op for op in ops), (
         "Label-write MATCH is not index-backed — expected a NodeIndexSeek "
         f"against idx_node_universal. Plan operators: {ops}"
+    )
+
+
+async def test_get_node_fallback_uses_index_seek_not_allnodesscan(
+    neo4j_container: dict[str, Any],
+) -> None:
+    """get_node()'s Neo4j fallback must seek the :Node index, never scan.
+
+    This is the hot per-event read (touch_session -> get_node -> this query),
+    so a full scan here is not a slow edge case -- it saturates the shared
+    bolt pool and stalls ingest for every session.
+
+    Observed in production on the 12.09M-node graph: the label-free form
+    planned as ``AllNodesScan`` (estimated 12,091,187 rows), each call ran
+    ~60s holding its pooled connection, 51 ran concurrently against a
+    50-connection pool, and every further acquire died on the 30s
+    ``connection_acquisition_timeout`` -- dead-lettering live events.
+
+    RED  (unfixed): MATCH (n) WHERE n.node_id = $id ... is label-free, so no
+                    label-scoped index is usable -> AllNodesScan.
+    GREEN (fixed):  MATCH (n:Node {node_id, workspace}) -> NodeUniqueIndexSeek
+                    against the :Node(node_id, workspace) composite index.
+    """
+    await _flush_one_non_session_node(neo4j_container, "get-node-plan-1", {"v": 1})
+
+    ops = _explain_ops(
+        neo4j_container,
+        _NODE_GET_BY_ID_CYPHER,
+        **{_GET_NODE_PARAM: "get-node-plan-1", "workspace": "test"},
+    )
+
+    assert ops, "EXPLAIN returned no plan operators for the get_node query"
+    assert not any("AllNodesScan" in op for op in ops), (
+        "get_node()'s Neo4j fallback still does a full-graph AllNodesScan "
+        f"(the 12.09M-node pool-exhaustion stall). Plan operators: {ops}"
+    )
+    assert any("IndexSeek" in op for op in ops), (
+        "get_node()'s Neo4j fallback is not index-backed -- expected a "
+        f"NodeIndexSeek / NodeUniqueIndexSeek. Plan operators: {ops}"
     )
