@@ -42,7 +42,6 @@ from context_intelligence_server.models import (
 )
 from context_intelligence_server.neo4j_store import (
     build_bounded_neo4j_driver,
-    count_untagged_nodes,
     ensure_neo4j_schema,
     mark_schema_ready,
 )
@@ -245,6 +244,147 @@ async def _crash_recovery_sweep_loop(interval: int, respawn_limit: int) -> None:
             logger.warning("crash_recovery_sweep: tick failed, will retry: %s", exc)
 
 
+async def _startup_recovery(app: FastAPI) -> None:
+    """Crash-recovery pass + deferred-backlog sweep, off the startup path.
+
+    Runs as a background task created by ``lifespan`` so that startup can
+    complete -- and the HTTP surface open -- in ~1s regardless of how large
+    the durable spool is. Sets ``app.state.recovery_complete`` when the
+    one-shot recovery pass is done, so ``/status`` can say so honestly
+    rather than reporting un-seeded counters as though they were settled.
+
+    Thin wrapper around ``_startup_recovery_body``: as a BACKGROUND task, an
+    unhandled exception here would otherwise be swallowed until garbage
+    collection ("Task exception was never retrieved") -- silently leaving the
+    counters unseeded and no drainers respawned, with a server that looks
+    perfectly healthy. On the old inline path the same failure aborted boot
+    loudly. Log it, record it for ``/status``, and always set the event so
+    ``/status`` cannot report "recovery in progress" forever.
+    """
+    try:
+        await _startup_recovery_body(app)
+    except asyncio.CancelledError:
+        raise  # shutdown -- not a failure, and must propagate
+    except Exception as exc:  # noqa: BLE001 - background task boundary
+        app.state.recovery_error = repr(exc)
+        logger.exception(
+            "startup_recovery: FAILED -- conservation counters may be unseeded "
+            "and recovered drainers may not have respawned. The server is still "
+            "serving; a later boot's recover() reports the same sessions again, "
+            "and a new event for a session spawns its drainer via get_or_create()."
+        )
+    finally:
+        app.state.recovery_complete.set()
+
+
+async def _startup_recovery_body(app: FastAPI) -> None:
+    """The actual recovery pass. See ``_startup_recovery`` for why it is split."""
+    # Crash recovery: on startup, respawn one drainer per
+    # session that still has an undrained, complete line. The workspace is
+    # parsed from that session's FIRST log line so the respawned worker is
+    # bound to the same workspace it was originally created with.
+    #
+    # Conservation-counter recovery runs FIRST, and its two steps are
+    # order-load-bearing: reconcile MUST precede seed. recovery_reconcile_dead
+    # advances committed offsets past already-dead pending lines so the
+    # dead-letter counts are settled; only then does recovery_seed_counts read
+    # disk to reconstruct the accepted/written baseline. Seeding before
+    # reconciling would leave a residual==1 false DEGRADED. Both run before the
+    # respawn loop so the respawned drainers start from a conserved baseline.
+    await registry.queue_manager.recovery_reconcile_dead()
+    _accepted_seed, _written_seed = await registry.queue_manager.recovery_seed_counts()
+    registry.seed_counters(_accepted_seed, _written_seed)
+    recovered = await registry.queue_manager.recover()
+    # Bound how many drainers this boot respawns (incident: an unbounded
+    # backlog respawned 94/94 drainers before the server could serve a
+    # single request, driving a ~4 minute boot and 43.9 GB RSS that tripped
+    # the OOM killer -- which then never let the backlog shrink because
+    # every restart repeated the same unbounded respawn). None (the default)
+    # preserves today's behaviour exactly: every recovered session is
+    # processed on this boot, unbounded. `recovered` is already sorted
+    # (QueueManager.recover()), so which sessions are processed this boot
+    # vs. deferred is deterministic across restarts of the same backlog.
+    #
+    # Deferred sessions are NOT touched in any way here -- no read, no
+    # write, no drainer -- so they remain exactly as durable and
+    # recoverable as they were before this boot: a later boot's recover()
+    # call reports them again, and a new event for that session arriving
+    # via POST /events spawns its drainer immediately via get_or_create(),
+    # independent of this startup loop.
+    # Bound how many drainers this boot respawns: an unbounded backlog can
+    # respawn every drainer before the server serves a single request,
+    # driving startup RSS and boot time up with it. None (the default)
+    # preserves unbounded behaviour. `recovered` is already sorted
+    # (QueueManager.recover()), so which sessions run this boot vs. defer is
+    # deterministic across restarts of the same backlog. Deferred sessions
+    # are untouched -- no read, no write, no drainer -- so they remain fully
+    # durable and recoverable; a later boot's recover() reports them again,
+    # and a new event for that session spawns its drainer immediately via
+    # get_or_create(), independent of this startup loop.
+    respawn_limit = _settings.crash_recovery_respawn_limit
+    if respawn_limit is not None and len(recovered) > respawn_limit:
+        to_process = recovered[:respawn_limit]
+        deferred_count = len(recovered) - respawn_limit
+    else:
+        to_process = recovered
+        deferred_count = 0
+    respawned = 0
+    for sid in to_process:
+        batch = await registry.queue_manager.read_batch(sid, max_items=1)
+        if not batch.lines:
+            continue
+        if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
+            respawned += 1
+    if deferred_count:
+        # WARNING, not INFO, on purpose: a deferred backlog must never be a
+        # silent, un-discoverable fact. Names the exact counts and the
+        # setting to raise.
+        logger.warning(
+            "startup_recovery: crash-recovery respawn cap reached "
+            "(crash_recovery_respawn_limit=%d): %d/%d respawned this boot, "
+            "%d session(s) deferred to a later boot (untouched on disk, "
+            "still fully recoverable). Raise crash_recovery_respawn_limit "
+            "to respawn more per boot.",
+            respawn_limit,
+            respawned,
+            len(to_process),
+            deferred_count,
+        )
+    logger.info(
+        "startup_recovery: crash recovery respawned %d/%d drainers",
+        respawned,
+        len(recovered),
+    )
+    # The one-shot pass is done: counters are seeded and this boot's drainers
+    # are up. /status can now report settled numbers rather than mid-recovery
+    # ones. Set BEFORE the sweep loop below, which never returns. (The wrapper
+    # also sets it in a finally, so a failure cannot pin /status at
+    # "in progress" forever -- but on the success path it must be set HERE, or
+    # the sweep loop would delay it indefinitely.)
+    app.state.recovery_complete.set()
+    # Periodic deferred-backlog sweep: only meaningful under a FINITE ceiling
+    # (a deferred tail can exist). With the default unbounded ceiling
+    # (respawn_limit is None) there is no deferred tail, so the loop is not
+    # entered -- existing deployments are completely unaffected. When a finite
+    # ceiling IS set, this drains the deferred tail over time instead of
+    # stranding it until a restart or a new event (see _crash_recovery_sweep_loop
+    # and config.crash_recovery_sweep_interval_seconds).
+    #
+    # AWAITED rather than wrapped in its own create_task: this coroutine is
+    # already a background task that lifespan cancels on shutdown, so awaiting
+    # the sweep here means one task to cancel instead of two -- and no way for
+    # the sweep to outlive its parent.
+    _sweep_interval = _settings.crash_recovery_sweep_interval_seconds
+    if respawn_limit is not None and _sweep_interval > 0:
+        logger.info(
+            "crash_recovery_sweep: enabled (interval=%ds, ceiling=%d) -- "
+            "deferred backlog will drain progressively, not just on restart",
+            _sweep_interval,
+            respawn_limit,
+        )
+        await _crash_recovery_sweep_loop(_sweep_interval, respawn_limit)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application lifespan: configure logging and create shared Neo4j driver."""
@@ -318,134 +458,56 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "flush path retries schema init (rate-limited by "
             "neo4j_store._SCHEMA_RETRY_BACKOFF_SECONDS)."
         )
-    # Fail-loud migration-health guard: duplicate nodes are already caught
-    # above by the :Node constraint (fail_on_data_conflict=True); this catches
-    # the OTHER un-migrated shape the constraint can't see on its own --
-    # nodes that simply lack the :Node label altogether, which violate no
-    # constraint and so raise nothing by themselves. O(1) via the counts
-    # store (see count_untagged_nodes) -- this must never regress into the
-    # AllNodesScan stall PR #67 removed from the write path.
+    # NOTE: the O(1) untagged-:Node boot guard that used to sit here has been
+    # REMOVED. It refused to boot when any node lacked the universal :Node
+    # label. Two things made it dead weight:
     #
-    # A connectivity/probe failure here is NOT the same as "confirmed
-    # un-migrated" -- it means graph state could not be determined, not that
-    # it was determined to be bad -- so it is logged at DEBUG and swallowed
-    # rather than treated as a corruption finding; the flush path's
-    # self-heal still covers a genuinely dirty graph once it becomes
-    # reachable.
-    try:
-        untagged = await count_untagged_nodes(app.state.neo4j_driver)
-    except Exception as exc:  # noqa: BLE001 - connectivity probe, not a confirmed bad state
-        _LOG_MSG = "startup migration-health probe skipped (graph unreachable?): %s"
-        logger.debug(_LOG_MSG, exc)
-        untagged = 0
-    if untagged:
-        raise RuntimeError(
-            f"Neo4j graph has {untagged} node(s) lacking the :Node label "
-            "(un-migrated). Cold start refuses to boot to avoid duplicating "
-            "them on write. Run: context-intelligence-server doctor --fix"
-        )
-    # Crash recovery: on startup, respawn one drainer per
-    # session that still has an undrained, complete line. The workspace is
-    # parsed from that session's FIRST log line so the respawned worker is
-    # bound to the same workspace it was originally created with.
+    #   1. Nothing in this service can produce an untagged node. Every
+    #      node-creating statement in neo4j_store is label-scoped -- the node
+    #      MERGE, both edge-endpoint MERGEs, and the session write path all
+    #      MERGE (n:Node {node_id, workspace}).
+    #   2. Since get_node()/get_edge() became :Node-scoped, an untagged node is
+    #      also INVISIBLE to every read. Read and write paths now agree, so a
+    #      stray untagged node is inert dead data, not a correctness hazard --
+    #      and refusing to serve over inert data is disproportionate.
     #
-    # Conservation-counter recovery runs FIRST, and its two steps are
-    # order-load-bearing: reconcile MUST precede seed. recovery_reconcile_dead
-    # advances committed offsets past already-dead pending lines so the
-    # dead-letter counts are settled; only then does recovery_seed_counts read
-    # disk to reconstruct the accepted/written baseline. Seeding before
-    # reconciling would leave a residual==1 false DEGRADED. Both run before the
-    # respawn loop so the respawned drainers start from a conserved baseline.
-    await registry.queue_manager.recovery_reconcile_dead()
-    _accepted_seed, _written_seed = await registry.queue_manager.recovery_seed_counts()
-    registry.seed_counters(_accepted_seed, _written_seed)
-    recovered = await registry.queue_manager.recover()
-    # Bound how many drainers this boot respawns (incident: an unbounded
-    # backlog respawned 94/94 drainers before the server could serve a
-    # single request, driving a ~4 minute boot and 43.9 GB RSS that tripped
-    # the OOM killer -- which then never let the backlog shrink because
-    # every restart repeated the same unbounded respawn). None (the default)
-    # preserves today's behaviour exactly: every recovered session is
-    # processed on this boot, unbounded. `recovered` is already sorted
-    # (QueueManager.recover()), so which sessions are processed this boot
-    # vs. deferred is deterministic across restarts of the same backlog.
+    # The capability is not gone: `context-intelligence-server doctor` still
+    # reports untagged nodes via diagnose()/count_untagged_nodes, and
+    # `doctor --fix` still repairs them. Detection moved to the operator path,
+    # where it belongs; it is no longer a boot gate. (Historically this check
+    # was itself an AllNodesScan and caused a 25-30s boot stall until PR #67
+    # made it O(1) -- a second reason not to keep it on the startup path.)
+
+    # Crash recovery runs as a BACKGROUND task -- it MUST NOT gate serving.
     #
-    # Deferred sessions are NOT touched in any way here -- no read, no
-    # write, no drainer -- so they remain exactly as durable and
-    # recoverable as they were before this boot: a later boot's recover()
-    # call reports them again, and a new event for that session arriving
-    # via POST /events spawns its drainer immediately via get_or_create(),
-    # independent of this startup loop.
-    # Bound how many drainers this boot respawns: an unbounded backlog can
-    # respawn every drainer before the server serves a single request,
-    # driving startup RSS and boot time up with it. None (the default)
-    # preserves unbounded behaviour. `recovered` is already sorted
-    # (QueueManager.recover()), so which sessions run this boot vs. defer is
-    # deterministic across restarts of the same backlog. Deferred sessions
-    # are untouched -- no read, no write, no drainer -- so they remain fully
-    # durable and recoverable; a later boot's recover() reports them again,
-    # and a new event for that session spawns its drainer immediately via
-    # get_or_create(), independent of this startup loop.
-    respawn_limit = _settings.crash_recovery_respawn_limit
-    if respawn_limit is not None and len(recovered) > respawn_limit:
-        to_process = recovered[:respawn_limit]
-        deferred_count = len(recovered) - respawn_limit
-    else:
-        to_process = recovered
-        deferred_count = 0
-    respawned = 0
-    for sid in to_process:
-        batch = await registry.queue_manager.read_batch(sid, max_items=1)
-        if not batch.lines:
-            continue
-        if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
-            respawned += 1
-    if deferred_count:
-        # WARNING, not INFO, on purpose: a deferred backlog must never be a
-        # silent, un-discoverable fact. Names the exact counts and the
-        # setting to raise.
-        logger.warning(
-            "lifespan_startup: crash-recovery respawn cap reached "
-            "(crash_recovery_respawn_limit=%d): %d/%d respawned this boot, "
-            "%d session(s) deferred to a later boot (untouched on disk, "
-            "still fully recoverable). Raise crash_recovery_respawn_limit "
-            "to respawn more per boot.",
-            respawn_limit,
-            respawned,
-            len(to_process),
-            deferred_count,
-        )
-    logger.info(
-        "lifespan_startup: crash recovery respawned %d/%d drainers",
-        respawned,
-        len(recovered),
-    )
-    # Periodic deferred-backlog sweep: only meaningful under a FINITE ceiling
-    # (a deferred tail can exist). With the default unbounded ceiling
-    # (respawn_limit is None) there is no deferred tail, so NO background task
-    # is started -- existing deployments are completely unaffected. When a
-    # finite ceiling IS set, this drains the deferred tail over time instead of
-    # stranding it until a restart or a new event (see _crash_recovery_sweep_loop
-    # and config.crash_recovery_sweep_interval_seconds).
-    _sweep_task: asyncio.Task[None] | None = None
-    _sweep_interval = _settings.crash_recovery_sweep_interval_seconds
-    if respawn_limit is not None and _sweep_interval > 0:
-        _sweep_task = asyncio.create_task(
-            _crash_recovery_sweep_loop(_sweep_interval, respawn_limit)
-        )
-        logger.info(
-            "crash_recovery_sweep: enabled (interval=%ds, ceiling=%d) -- "
-            "deferred backlog will drain progressively, not just on restart",
-            _sweep_interval,
-            respawn_limit,
-        )
+    # uvicorn runs the ASGI lifespan to completion BEFORE it handles a single
+    # request (uvicorn/server.py: `await self.startup()` then
+    # `await self.main_loop()`), and gunicorn binds the socket before that. So
+    # any work done here is work during which the process ACCEPTS connections
+    # and answers none -- /version and /status included, however cheap they
+    # are. Incident 2026-09-09: a ~5000-file spool on Azure Files kept this
+    # loop busy for 9+ minutes; ACA's tcpSocket probes saw an open port and
+    # reported the replica Healthy while every request timed out at the APIM
+    # gateway (231s), and clients dropped events from full buffers.
+    #
+    # Moving it behind create_task lets startup complete in ~1s, so the HTTP
+    # surface is up regardless of spool size. This is safe because respawn is
+    # idempotent by construction -- see _crash_recovery_topup, which is already
+    # documented as safe to call repeatedly on a LIVE server, and which the
+    # sweep loop has always called against a serving process.
+    app.state.recovery_complete = asyncio.Event()
+    app.state.recovery_error = None
+    _recovery_task: asyncio.Task[None] = asyncio.create_task(_startup_recovery(app))
+
     try:
         yield
     finally:
-        if _sweep_task is not None:
-            _sweep_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await _sweep_task
+        # Cancel background recovery FIRST: it spawns drainers, and shutdown
+        # below quiesces them. Letting it keep spawning into a shutting-down
+        # registry would race the quiesce and dead-letter healthy events.
+        _recovery_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _recovery_task
         # ORDER IS LOAD-BEARING. Quiesce the drainers FIRST. Every session's
         # graph store now shares ONE driver, so closing it under a live drainer
         # is no longer a per-session concern: the drainer's batch fails, it
@@ -929,6 +991,15 @@ async def get_status(request: Request) -> dict[str, Any]:
     # above. Cheap by construction (stat-only, short-TTL cached); see
     # QueueManager.spool_stats() for why this holds even under a huge spool.
     response["spool"] = await registry.queue_manager.spool_stats()
+    # Crash recovery now runs in the BACKGROUND so the HTTP surface opens
+    # immediately (see _startup_recovery). While it is still running, the
+    # conservation counters above have not been seeded yet, so say so rather
+    # than letting a caller read mid-recovery numbers as settled ones.
+    _recovery_evt = getattr(request.app.state, "recovery_complete", None)
+    response["recovery_complete"] = bool(_recovery_evt and _recovery_evt.is_set())
+    # "complete" alone would be a lie by omission when recovery FAILED: the
+    # event is set either way (see _startup_recovery's finally).
+    response["recovery_error"] = getattr(request.app.state, "recovery_error", None)
     # Surface auth mode and admin-API capability so operators can confirm
     # admin is enabled without tailing startup logs.  /status is
     # unauthenticated — only config-level boolean flags are exposed here

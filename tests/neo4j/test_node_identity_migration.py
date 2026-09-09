@@ -289,8 +289,19 @@ async def _run_migration_assertions(neo4j_container: dict[str, Any]) -> None:
 async def test_cold_start_guard_detects_untagged_only_graph(
     neo4j_container: dict[str, Any],
 ) -> None:
-    """Reproduces main.py's lifespan cold-start guard, against a REAL Neo4j,
-    for the untagged-only shape the :Node constraint alone CANNOT see.
+    """Exercises ``count_untagged_nodes`` and ``ensure_neo4j_schema`` against
+    a REAL Neo4j, for the untagged-only shape the :Node constraint alone
+    CANNOT see.
+
+    NOTE: main.py's ``lifespan()`` no longer calls ``count_untagged_nodes``
+    at all -- the O(1) untagged-:Node boot guard this test used to describe
+    was REMOVED (nothing in this service can produce an untagged node, and
+    since get_node()/get_edge() became :Node-scoped, an untagged node is
+    inert dead data rather than a correctness hazard; detection moved
+    entirely to the `doctor` operator path). This test does not call
+    ``lifespan()`` and its assertions are unaffected by that removal -- it
+    verifies the two underlying primitives directly, still used by
+    ``doctor``/``run_repair``.
 
     Uses ``_seed_untagged_only_graph`` (NOT ``_seed_dirty_graph``, whose
     duplicate ``dup-1`` :Event nodes trip the separate, always fail-open
@@ -298,22 +309,19 @@ async def test_cold_start_guard_detects_untagged_only_graph(
     ``test_run_repair_dedups_backfills_and_constrains``). Every node seeded
     here has a unique (node_id, workspace) and no label collision, so NO
     uniqueness constraint (Session/Event/Node) sees a conflict -- the ONLY
-    defect is the missing ``:Node`` label, which is exactly why the lifespan
-    guard needs its second, independent check (``count_untagged_nodes``):
-    the constraint step provides no signal for this case on its own.
+    defect is the missing ``:Node`` label, which is exactly why
+    ``count_untagged_nodes`` exists as a second, independent check: the
+    constraint step provides no signal for this case on its own.
 
-    Reproduces the lifespan's two ordered steps directly against the live
-    container (the guard logic is inline in ``main.py``'s ``lifespan()``,
-    not its own importable function):
+    Exercises the two primitives directly against the live container:
 
       1. ``ensure_neo4j_schema(driver, fail_on_data_conflict=True)`` --
          succeeds (``True``), no constraint conflict to raise on.
       2. ``count_untagged_nodes(driver)`` -- reports > 0.
 
-    Together, (1) succeeding and (2) being > 0 is precisely the condition
-    under which ``lifespan()`` raises ``RuntimeError`` naming
-    ``doctor --fix`` -- i.e. the un-migrated (untagged-only) graph IS
-    detected and cold start WOULD refuse to boot.
+    Together, (1) succeeding and (2) being > 0 is the un-migrated
+    (untagged-only) graph signature ``doctor``/``run_repair`` uses to detect
+    and repair this shape -- no longer a boot-time condition.
     """
     _wipe(neo4j_container)
     try:
@@ -324,10 +332,10 @@ async def test_cold_start_guard_detects_untagged_only_graph(
             auth=(neo4j_container["user"], neo4j_container["password"]),
         )
         try:
-            # Step 1 (lifespan): fail-loud schema init does NOT raise here --
-            # none of the seeded nodes carry :Node (or collide under any
-            # OTHER constraint), so no constraint sees a conflict. This is
-            # the case the constraint check alone misses.
+            # Step 1: fail-loud schema init does NOT raise here -- none of
+            # the seeded nodes carry :Node (or collide under any OTHER
+            # constraint), so no constraint sees a conflict. This is the
+            # case the constraint check alone misses.
             established = await ensure_neo4j_schema(driver, fail_on_data_conflict=True)
             assert established is True, (
                 "ensure_neo4j_schema(fail_on_data_conflict=True) must succeed "
@@ -335,13 +343,14 @@ async def test_cold_start_guard_detects_untagged_only_graph(
                 "dirty graph -- there is no constraint conflict to raise on."
             )
 
-            # Step 2 (lifespan): the O(1) untagged guard DOES catch it.
+            # Step 2: the O(1) untagged counter DOES catch it (no longer
+            # called by lifespan() -- see the doctor operator path).
             untagged = await count_untagged_nodes(driver)
             assert untagged > 0, (
                 "count_untagged_nodes must report the seeded untagged legacy "
-                "nodes (legacy-sess-only + legacy-bare) -- this is the exact "
-                "signal main.py's lifespan() uses to raise RuntimeError and "
-                "refuse to boot on an un-migrated graph."
+                "nodes (legacy-sess-only + legacy-bare) -- this is the "
+                "signal `doctor`/`run_repair` use to detect and repair an "
+                "un-migrated graph."
             )
         finally:
             await driver.close()
