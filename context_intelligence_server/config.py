@@ -911,6 +911,31 @@ class Settings(BaseSettings):
             )
         return v
 
+    # How often the background loop (_spool_stats_refresher in main.py) walks
+    # the queue directory to refresh the snapshot QueueManager.spool_stats()
+    # serves to /status. Exists because that scan is NOT cheap enough to run
+    # on the request path: incident 2026-09-09 -- /status called the
+    # equivalent of today's refresh_spool_stats() inline, per request, and on
+    # a ~5000-file spool on Azure Files SMB that meant a stat() round trip
+    # per file (plus an open+read+close of every session's .offset), taking
+    # minutes while /version on the same server returned in under a second.
+    # Moving the scan to a periodic background refresh makes /status's read
+    # O(1) regardless of spool size; this setting controls how stale that
+    # snapshot is allowed to get between refreshes (surfaced honestly via
+    # /status's spool.as_of_seconds, never presented as though it were live).
+    spool_stats_refresh_interval_seconds: float = 60.0
+
+    @field_validator("spool_stats_refresh_interval_seconds")
+    @classmethod
+    def _validate_spool_stats_refresh_interval(cls, v: float) -> float:
+        """Fail loud on a non-positive interval; there is no "disabled" value."""
+        if v <= 0:
+            raise ValueError(
+                "spool_stats_refresh_interval_seconds must be a positive "
+                f"number of seconds, got {v}"
+            )
+        return v
+
     # -------------------------------------------------------------------------
     # Logging
     # -------------------------------------------------------------------------

@@ -971,6 +971,93 @@ async def test_recovery_task_is_cancelled_on_shutdown() -> None:
     assert leftover == [], f"recovery task(s) still pending after shutdown: {leftover}"
 
 
+# ---------------------------------------------------------------------------
+# Background spool-stats refresher (fix/trim-spool-as-processed): /status
+# must never scan the queue directory itself -- a background loop refreshes
+# the snapshot it reads instead.
+# ---------------------------------------------------------------------------
+
+
+async def test_spool_stats_refresher_survives_a_failing_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A single failed refresh must not kill the background loop -- it logs
+    at ERROR and keeps going (the snapshot just goes stale; see /status's
+    spool.as_of_seconds)."""
+    monkeypatch.setattr(
+        main_module._settings, "spool_stats_refresh_interval_seconds", 0.01
+    )
+
+    calls = {"n": 0}
+    real_refresh = registry.queue_manager.refresh_spool_stats
+
+    async def _flaky_refresh() -> dict[str, int]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom-spool-refresh")
+        return await real_refresh()
+
+    monkeypatch.setattr(registry.queue_manager, "refresh_spool_stats", _flaky_refresh)
+
+    with caplog.at_level(logging.ERROR, logger="context_intelligence_server"):
+        task = asyncio.create_task(main_module._spool_stats_refresher(main_module.app))
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if calls["n"] >= 2:
+                break
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert calls["n"] >= 2  # the loop kept going after the failure
+    error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("spool_stats_refresh_failed" in r.getMessage() for r in error_records)
+
+
+async def test_spool_stats_refresher_task_is_cancelled_on_shutdown() -> None:
+    """Shutdown must cancel the background spool-stats refresher task -- not
+    leave it running against a queue directory a shutting-down process may
+    be tearing down around it (mirrors
+    test_recovery_task_is_cancelled_on_shutdown)."""
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+    ):
+        async with lifespan(main_module.app):
+            # Let the refresher task actually get scheduled and complete at
+            # least one iteration (initial refresh, then its sleep).
+            await asyncio.sleep(0.05)
+
+            # Confirm the task actually exists WHILE lifespan is running --
+            # otherwise the "no leftover after shutdown" check below would
+            # pass vacuously if the task were never spawned at all. Match
+            # the background task's own coroutine call form (with the
+            # opening paren) -- not just the substring
+            # "_spool_stats_refresher", which this very test function's name
+            # also contains.
+            running = [
+                t
+                for t in asyncio.all_tasks()
+                if not t.done() and "_spool_stats_refresher(" in repr(t)
+            ]
+            assert running, "spool stats refresher task was never scheduled"
+
+    leftover = [
+        t
+        for t in asyncio.all_tasks()
+        if not t.done() and "_spool_stats_refresher(" in repr(t)
+    ]
+    assert leftover == [], (
+        f"spool stats refresher task(s) still pending after shutdown: {leftover}"
+    )
+
+
 async def test_status_reports_recovery_state_before_lifespan_has_run(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -1724,7 +1811,9 @@ async def test_status_includes_metrics_block(client: httpx.AsyncClient) -> None:
 async def test_status_includes_spool_block(client: httpx.AsyncClient) -> None:
     """/status carries an additive, aggregate-only spool block so a growing
     on-disk backlog is never invisible (the 38 GB / two-day incident this
-    guards against had zero signal anywhere)."""
+    guards against had zero signal anywhere). Now also carries
+    `as_of_seconds` (Change 1) so a caller can tell a fresh reading from a
+    stale one instead of assuming the numbers are live."""
     response = await client.get("/status")
     assert response.status_code == 200
     data = response.json()
@@ -1735,17 +1824,38 @@ async def test_status_includes_spool_block(client: httpx.AsyncClient) -> None:
         "pending_sessions",
         "spool_bytes_total",
         "corrupt_offsets",
+        "as_of_seconds",
     }
     assert isinstance(spool["pending_sessions"], int)
     assert isinstance(spool["spool_bytes_total"], int)
     assert isinstance(spool["corrupt_offsets"], int)
 
 
-async def test_status_spool_block_reflects_real_backlog(
+async def test_status_spool_as_of_seconds_none_before_any_refresh(
     client: httpx.AsyncClient,
 ) -> None:
-    """The spool block's numbers move when there's real undrained data on
-    disk -- not a hardcoded placeholder."""
+    """Before the background refresher has ever populated the cache (the
+    `client` fixture never runs `lifespan`, so no refresh has happened),
+    /status reports the sentinel with `as_of_seconds` None -- /status itself
+    never scans, so there is nothing else it could honestly report."""
+    response = await client.get("/status")
+    spool = response.json()["spool"]
+
+    assert spool == {
+        "pending_sessions": -1,
+        "spool_bytes_total": -1,
+        "corrupt_offsets": -1,
+        "as_of_seconds": None,
+    }
+
+
+async def test_status_spool_block_reflects_real_backlog_after_refresh(
+    client: httpx.AsyncClient,
+) -> None:
+    """The spool block's numbers move once the background refresher has run
+    -- not a hardcoded placeholder. /status itself never scans (Change 1), so
+    the test drives the refresh explicitly, exactly as
+    main.py._spool_stats_refresher does on its own cadence."""
     qm = registry.queue_manager
     body = json.dumps(
         {
@@ -1756,13 +1866,16 @@ async def test_status_spool_block_reflects_real_backlog(
     ).encode("utf-8")
     await qm.append("sess-spool-visible", body)
     # get_or_create is bypassed here (raw append only) so this line stays
-    # undrained -- exactly the "pending" shape spool_stats() measures.
+    # undrained -- exactly the "pending" shape refresh_spool_stats() measures.
+    await qm.refresh_spool_stats()
 
     response = await client.get("/status")
     data = response.json()
 
     assert data["spool"]["pending_sessions"] >= 1
     assert data["spool"]["spool_bytes_total"] > 0
+    assert isinstance(data["spool"]["as_of_seconds"], float)
+    assert data["spool"]["as_of_seconds"] >= 0.0
 
 
 async def test_status_spool_block_never_leaks_session_identifiers(
@@ -1780,6 +1893,7 @@ async def test_status_spool_block_never_leaks_session_identifiers(
         }
     ).encode("utf-8")
     await qm.append(secret_sid, body)
+    await qm.refresh_spool_stats()
 
     response = await client.get("/status")
     raw_text = response.text
@@ -1793,13 +1907,14 @@ async def test_status_corrupt_offset_returns_200_and_surfaces_count(
     client: httpx.AsyncClient,
 ) -> None:
     """Regression (ci_pr73-267): a corrupt .offset previously 500'd /status via
-    derive_all_stats() (which runs before spool_stats in get_status). /status
-    must now stay 200 AND surface the corruption as spool.corrupt_offsets -- the
-    only signal (no logging, so the polled health path is never flooded)."""
+    derive_all_stats() (which runs before the spool block in get_status).
+    /status must stay 200 AND surface the corruption as spool.corrupt_offsets
+    -- the only signal (no logging, so the polled health path is never
+    flooded) -- once a refresh has actually observed it."""
     qm = registry.queue_manager
     await qm.append("sess-corrupt-offset", b"a")
     qm._offset_path("sess-corrupt-offset").write_text("not-a-number", encoding="utf-8")
-    qm._spool_cache = None  # bypass TTL cache so the corruption is seen now
+    await qm.refresh_spool_stats()  # the only thing that scans; sees the corruption
 
     response = await client.get("/status")
 
@@ -1809,21 +1924,13 @@ async def test_status_corrupt_offset_returns_200_and_surfaces_count(
 
 async def test_status_returns_200_when_spool_dir_unavailable(
     client: httpx.AsyncClient,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression (ci_pr73-ueh): /status is the ACA health probe. spool_stats()
-    scans the queue dir with iterdir() (raises on a missing dir), unlike the
-    glob()-based sibling readers. A transiently-unavailable queue dir (e.g. an
-    Azure Files SMB remount) must NOT turn /status into a 500 -> failed probe
-    -> container restart loop. It must return 200 with a degraded sentinel."""
-    qm = registry.queue_manager
-    # Point the scan at a directory that does not exist so iterdir() raises,
-    # exactly as it would during an SMB mount drop. Bypass the TTL cache so the
-    # scan actually runs on this call.
-    monkeypatch.setattr(qm, "_dir", tmp_path / "gone")
-    monkeypatch.setattr(qm, "_spool_cache", None)
-
+    """Regression (ci_pr73-ueh): /status is the ACA health probe. It must
+    never turn a broken/unavailable queue dir into a 500 -> failed probe ->
+    container restart loop. Since Change 1, /status's spool block is a pure
+    cache read (QueueManager.spool_stats()) that never touches the
+    filesystem at all -- so this holds unconditionally, without needing to
+    break the directory for this specific request."""
     response = await client.get("/status")
 
     assert response.status_code == 200
@@ -1831,6 +1938,7 @@ async def test_status_returns_200_when_spool_dir_unavailable(
         "pending_sessions": -1,
         "spool_bytes_total": -1,
         "corrupt_offsets": -1,
+        "as_of_seconds": None,
     }
 
 
