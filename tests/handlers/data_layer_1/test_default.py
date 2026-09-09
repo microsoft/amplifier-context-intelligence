@@ -698,3 +698,104 @@ class TestDefaultHandlerFieldLifting:
         # UniversalLifter always fires regardless of event type
         assert node.get("session_id") == "s1"
         assert node.get("parent_id") == "parent-sess-custom"
+
+
+class TestDeriveLabelsAlwaysEmitsValidNeo4jIdentifiers:
+    """derive_labels is a TRUST BOUNDARY and must never emit an invalid label.
+
+    Labels are derived SERVER-SIDE from a client-supplied event name, but were
+    only validated much later, at flush, by
+    ``neo4j_store._validate_identifier`` (``^[A-Za-z_][A-Za-z0-9_]*$``).
+
+    INCIDENT 2026-09-09 (production, team-shared): ``_EVENT_PARTS_RE`` split on
+    ``[:_]`` only, so a hyphen inside a part survived ``.capitalize()`` into the
+    label. The event ``routing_matrix-loaded`` produced the label
+    ``RoutingMatrix-loadedEvent``, whose write raised ValueError and failed the
+    WHOLE chunk::
+
+        flush_chunk_failed workspace=... nodes=192 edges=479
+        dead_letter error=Invalid Neo4j label identifier: 'RoutingMatrix-loadedEvent'
+
+    The batch then burned ``max_delivery_attempts`` and
+    ``_handle_exhausted_batch`` dead-lettered the offending line AND committed
+    the offset past it -- so 192 nodes and 479 edges of healthy, unrelated
+    events were destroyed because they shared a batch with one bad name.
+
+    A failure this far from its cause must not be reachable: every label this
+    function returns is checked here against the exact regex the writer uses.
+    """
+
+    # The writer's rule, imported rather than re-spelled, so this cannot drift.
+    @staticmethod
+    def _assert_all_valid(event_name: str) -> list[str]:
+        from context_intelligence_server.neo4j_store import (  # noqa: PLC0415
+            _SAFE_IDENTIFIER_RE,
+        )
+
+        labels = DefaultHandler.derive_labels(event_name)
+        invalid = [lbl for lbl in labels if not _SAFE_IDENTIFIER_RE.match(lbl)]
+        assert not invalid, (
+            f"derive_labels({event_name!r}) produced label(s) the Neo4j write "
+            f"path REJECTS: {invalid}. A label that fails validation at flush "
+            f"fails its whole chunk and dead-letters unrelated events with it."
+        )
+        return labels
+
+    def test_the_exact_production_event_name_that_caused_the_incident(self) -> None:
+        """RED before the fix: yielded 'RoutingMatrix-loadedEvent'."""
+        labels = self._assert_all_valid("routing_matrix-loaded")
+        assert labels == [
+            "RoutingMatrixLoadedEvent",
+            "RoutingMatrixLoadedEvent",
+            "Event",
+        ]
+
+    def test_hyphen_in_the_category_part(self) -> None:
+        """A hyphen before the final colon poisons the CATEGORY label too."""
+        labels = self._assert_all_valid("routing-matrix:loaded")
+        assert labels == ["RoutingMatrixLoadedEvent", "RoutingMatrixEvent", "Event"]
+
+    def test_other_separators_are_split_not_passed_through(self) -> None:
+        """Dots, slashes and spaces are just as invalid as hyphens."""
+        assert self._assert_all_valid("a.b/c d") == ["ABCDEvent", "ABCDEvent", "Event"]
+
+    def test_leading_digit_is_prefixed(self) -> None:
+        """Neo4j identifiers may not START with a digit, only contain one."""
+        labels = self._assert_all_valid("2fa:verify")
+        assert labels == ["E2faVerifyEvent", "E2faEvent", "Event"]
+
+    def test_name_with_no_alphanumeric_content_falls_back(self) -> None:
+        """'---' must not collapse to the bare 'Event' base label.
+
+        Collapsing would silently merge unrelated events under the label every
+        Event already carries, which is a data-quality bug rather than a crash.
+        """
+        for pathological in ("---", "::", "", "  "):
+            labels = self._assert_all_valid(pathological)
+            assert labels == ["UnnamedEvent", "UnnamedEvent", "Event"], (
+                f"{pathological!r} produced {labels}"
+            )
+
+    def test_documented_examples_are_unchanged(self) -> None:
+        """The fix must not alter any name that was already valid."""
+        assert self._assert_all_valid("tool:pre") == [
+            "ToolPreEvent",
+            "ToolEvent",
+            "Event",
+        ]
+        assert self._assert_all_valid("recipe:loop_iter") == [
+            "RecipeLoopIterEvent",
+            "RecipeEvent",
+            "Event",
+        ]
+        assert self._assert_all_valid("my_event") == [
+            "MyEventEvent",
+            "MyEventEvent",
+            "Event",
+        ]
+        assert self._assert_all_valid("ping") == ["PingEvent", "PingEvent", "Event"]
+        assert self._assert_all_valid("session:start") == [
+            "SessionStartEvent",
+            "SessionEvent",
+            "Event",
+        ]
