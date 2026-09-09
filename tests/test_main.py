@@ -797,6 +797,196 @@ def _patched_lifespan_deps() -> Any:
     return mock_driver
 
 
+# ---------------------------------------------------------------------------
+# Background recovery task: startup must not block HTTP (fix/startup-must-
+# not-block-http)
+# ---------------------------------------------------------------------------
+
+
+async def test_status_and_version_respond_while_recovery_is_still_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE load-bearing regression test: HTTP must be answerable while the
+    background recovery task is still running.
+
+    uvicorn runs the ASGI lifespan to completion BEFORE it starts
+    main_loop (i.e. before it accepts/answers a single request), so any
+    startup work that runs INLINE in lifespan means the process accepts TCP
+    connections and answers nothing until that work finishes -- this is
+    exactly the 2026-09-09 incident (a ~5000-file spool kept lifespan busy
+    for 9+ minutes while ACA's tcpSocket probe reported the replica healthy).
+    Moving recovery behind ``asyncio.create_task`` lets lifespan yield
+    almost immediately, so /version and /status must respond -- and report
+    recovery as still in progress -- while recovery is deliberately held
+    open by a test-controlled gate.
+
+    Against the OLD inline-recovery code this test CANNOT pass. Verified
+    directly (git stash on context_intelligence_server/main.py only): the
+    pre-fix module has no ``_startup_recovery_body`` at all -- recovery ran
+    fully inline inside ``lifespan`` -- so the monkeypatch.setattr below
+    fails fast with AttributeError. Had that seam existed but still run
+    synchronously before the ``yield``, this test would instead hang
+    forever (lifespan never yields while the gate is unset) until the
+    suite's timeout fired. Either way, the old code cannot make this test
+    pass -- that failure IS the regression this test guards against.
+    """
+    recovery_gate = asyncio.Event()
+
+    async def _blocked_recovery(app: Any) -> None:
+        await recovery_gate.wait()
+
+    monkeypatch.setattr(
+        main_module,
+        "_startup_recovery_body",
+        AsyncMock(side_effect=_blocked_recovery),
+    )
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+    ):
+        async with lifespan(main_module.app):
+            # Recovery is genuinely still running: lifespan already yielded
+            # without waiting for it.
+            assert main_module.app.state.recovery_complete.is_set() is False
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main_module.app),
+                base_url="http://test",
+            ) as c:
+                version_response = await c.get("/version")
+                assert version_response.status_code == 200
+                assert "version" in version_response.json()
+
+                status_response = await c.get("/status")
+                assert status_response.status_code == 200
+                assert status_response.json()["recovery_complete"] is False
+
+                # Release the gate and wait for the background pass to finish.
+                recovery_gate.set()
+                await asyncio.wait_for(
+                    main_module.app.state.recovery_complete.wait(), timeout=5
+                )
+
+                settled_response = await c.get("/status")
+                assert settled_response.status_code == 200
+                settled_data = settled_response.json()
+                assert settled_data["recovery_complete"] is True
+                assert settled_data["recovery_error"] is None
+
+
+async def test_recovery_failure_is_logged_and_does_not_take_down_the_server(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failure inside the background recovery pass must be logged and
+    recorded on app.state -- never swallowed.
+
+    As a bare background task (no ``_startup_recovery`` wrapper) an
+    unhandled exception here would vanish until garbage collection ("Task
+    exception was never retrieved"), leaving the conservation counters
+    unseeded and no drainers respawned behind a server that otherwise looks
+    perfectly healthy. On the OLD inline path the same failure aborted boot
+    loudly instead. The wrapper must catch it, log it, and stash it on
+    ``app.state.recovery_error`` so /status can surface it too.
+    """
+    boom = RuntimeError("boom-test-recovery-failure")
+    monkeypatch.setattr(
+        main_module, "_startup_recovery_body", AsyncMock(side_effect=boom)
+    )
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        caplog.at_level(logging.ERROR, logger="context_intelligence_server"),
+    ):
+        async with lifespan(main_module.app):
+            await asyncio.wait_for(
+                main_module.app.state.recovery_complete.wait(), timeout=5
+            )
+            assert "boom-test-recovery-failure" in main_module.app.state.recovery_error
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main_module.app),
+                base_url="http://test",
+            ) as c:
+                response = await c.get("/status")
+            assert response.status_code == 200
+            assert "boom-test-recovery-failure" in response.json()["recovery_error"]
+
+    error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("startup_recovery" in r.getMessage() for r in error_records), (
+        f"expected an ERROR log mentioning startup_recovery; "
+        f"got {[r.getMessage() for r in error_records]}"
+    )
+
+
+async def test_recovery_task_is_cancelled_on_shutdown() -> None:
+    """Shutdown must cancel the background recovery task -- not leave it running.
+
+    Recovery spawns drainers and shutdown quiesces them (see
+    ``test_lifespan_quiesces_drain_workers_before_closing_shared_driver``); a
+    recovery task that survives lifespan exit would keep racing that
+    quiesce, spawning new drainers into a registry that is being torn down
+    and risking dead-lettered healthy events.
+    """
+    never_set = asyncio.Event()
+
+    async def _blocked_forever(app: Any) -> None:
+        await never_set.wait()
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        patch(
+            "context_intelligence_server.main._startup_recovery_body",
+            new=AsyncMock(side_effect=_blocked_forever),
+        ),
+    ):
+        async with lifespan(main_module.app):
+            # Let the recovery task actually get scheduled and start blocking.
+            await asyncio.sleep(0)
+            assert main_module.app.state.recovery_complete.is_set() is False
+
+    leftover = [
+        t
+        for t in asyncio.all_tasks()
+        if not t.done() and "_startup_recovery" in repr(t)
+    ]
+    assert leftover == [], f"recovery task(s) still pending after shutdown: {leftover}"
+
+
+async def test_status_reports_recovery_state_before_lifespan_has_run(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/status must degrade gracefully -- not 500 -- when app.state has never
+    had recovery_complete/recovery_error set (lifespan hasn't run yet)."""
+    monkeypatch.delattr(main_module.app.state, "recovery_complete", raising=False)
+    monkeypatch.delattr(main_module.app.state, "recovery_error", raising=False)
+
+    response = await client.get("/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["recovery_complete"] is False
+    assert data["recovery_error"] is None
+
+
 async def test_lifespan_recovers_and_respawns_drainers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -833,7 +1023,11 @@ async def test_lifespan_recovers_and_respawns_drainers(
         ),
     ):
         async with lifespan(main_module.app):
-            pass
+            # Recovery now runs in a background task; wait for the one-shot
+            # pass to finish before asserting on its effects.
+            await asyncio.wait_for(
+                main_module.app.state.recovery_complete.wait(), timeout=5
+            )
 
     assert (sid, "/recovered-ws") in spawned
 
@@ -925,7 +1119,9 @@ async def test_lifespan_default_respawns_all_recovered_sessions_unbounded(
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
     ):
         async with lifespan(main_module.app):
-            pass
+            await asyncio.wait_for(
+                main_module.app.state.recovery_complete.wait(), timeout=5
+            )
 
     assert {s for s, _w in spawned} == set(sids)
 
@@ -959,7 +1155,9 @@ async def test_lifespan_respawn_cap_defers_remainder_and_logs_warning(
         caplog.at_level(logging.WARNING, logger="context_intelligence_server"),
     ):
         async with lifespan(main_module.app):
-            pass
+            await asyncio.wait_for(
+                main_module.app.state.recovery_complete.wait(), timeout=5
+            )
 
     # Exactly the cap's worth of sessions were respawned -- never more.
     assert len(spawned) == 2
@@ -1004,7 +1202,9 @@ async def test_lifespan_deferred_sessions_untouched_and_recoverable_next_boot(
         patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
     ):
         async with lifespan(main_module.app):
-            pass
+            await asyncio.wait_for(
+                main_module.app.state.recovery_complete.wait(), timeout=5
+            )
 
     assert len(spawned_boot1) == 1
     deferred_sids = set(sids) - {s for s, _w in spawned_boot1}
@@ -1116,7 +1316,14 @@ async def test_lifespan_enables_sweep_under_finite_limit(
         caplog.at_level(logging.INFO, logger="context_intelligence_server"),
     ):
         async with lifespan(main_module.app):
-            pass  # task is created on entry and cancelled cleanly on exit
+            # The sweep is awaited inside the same background task, entered
+            # right after recovery_complete is set -- waiting for the event
+            # is enough for the "enabled" log line to have already fired by
+            # the time we resume (it's emitted synchronously before the
+            # sweep loop's first suspending await).
+            await asyncio.wait_for(
+                main_module.app.state.recovery_complete.wait(), timeout=5
+            )
 
     assert any(
         "crash_recovery_sweep: enabled" in r.getMessage() for r in caplog.records
@@ -1183,15 +1390,16 @@ async def test_lifespan_no_sweep_when_interval_zero(
 # ---------------------------------------------------------------------------
 # Cold start FAILS LOUD on schema/data corruption that requires `doctor
 # --fix` (design decision, reversing the lifespan half of f4d8bab): an
-# un-migrated graph -- duplicate legacy nodes (caught by the :Node
-# constraint via fail_on_data_conflict=True) OR nodes lacking the :Node
-# label altogether (caught by the O(1) count_untagged_nodes guard) -- must
-# refuse to boot. Nothing has been written yet at cold start, so refusing to
-# boot loses no data. The migration itself still lives ONLY in `doctor
-# --fix` (run_repair); the flush path still self-heals (see
-# tests/neo4j/test_node_identity_migration.py). A connectivity/probe
-# failure (graph unreachable) is NOT treated as "confirmed un-migrated" and
-# must not crash boot.
+# un-migrated graph with duplicate legacy nodes (caught by the :Node
+# constraint via fail_on_data_conflict=True) must refuse to boot. Nothing
+# has been written yet at cold start, so refusing to boot loses no data.
+# The migration itself still lives ONLY in `doctor --fix` (run_repair); the
+# flush path still self-heals (see tests/neo4j/test_node_identity_migration.py).
+#
+# The O(1) untagged-:Node boot guard that used to sit alongside this check
+# has been REMOVED (see test_lifespan_does_not_gate_boot_on_untagged_nodes
+# below for why) -- detection of untagged nodes moved entirely to the
+# `doctor` operator path.
 # ---------------------------------------------------------------------------
 
 
@@ -1211,10 +1419,6 @@ async def test_lifespan_calls_ensure_schema_with_fail_on_data_conflict() -> None
         patch(
             "context_intelligence_server.main.ensure_neo4j_schema",
             new=mock_ensure_schema,
-        ),
-        patch(
-            "context_intelligence_server.main.count_untagged_nodes",
-            new=AsyncMock(return_value=0),
         ),
     ):
         async with lifespan(main_module.app):
@@ -1254,39 +1458,32 @@ async def test_lifespan_raises_on_ensure_schema_data_conflict() -> None:
             pass
 
 
-async def test_lifespan_raises_on_untagged_nodes() -> None:
-    """On an un-migrated graph (untagged :Node count > 0), startup MUST
-    raise a RuntimeError naming `doctor --fix` -- boot refuses to start
-    rather than silently risking write-path duplication."""
-    mock_driver = _patched_lifespan_deps()
-    with (
-        patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch(
-            "context_intelligence_server.main.ensure_neo4j_schema",
-            new=AsyncMock(return_value=True),
-        ),
-        patch(
-            "context_intelligence_server.main.count_untagged_nodes",
-            new=AsyncMock(return_value=42),
-        ),
-        pytest.raises(RuntimeError, match="doctor --fix") as exc_info,
-    ):
-        async with lifespan(main_module.app):
-            pass
+async def test_lifespan_does_not_gate_boot_on_untagged_nodes() -> None:
+    """The O(1) untagged-:Node boot guard has been REMOVED entirely --
+    startup no longer counts or checks untagged nodes at all, and no longer
+    raises when they exist.
 
-    assert "42" in str(exc_info.value), (
-        f"Expected the untagged count in the error message, got: {exc_info.value}"
+    Two things made the guard dead weight: (1) nothing in this service can
+    produce an untagged node -- every node-creating statement in
+    neo4j_store is a label-scoped MERGE (n:Node {node_id, workspace}); and
+    (2) since get_node()/get_edge() became :Node-scoped, an untagged node is
+    also invisible to every read, so a stray one is inert dead data, not a
+    correctness hazard -- refusing to serve over it would be disproportionate.
+
+    The capability is not gone: `context-intelligence-server doctor` still
+    reports and repairs untagged nodes via diagnose()/count_untagged_nodes;
+    detection simply moved to the operator path and is no longer a boot gate.
+
+    This test asserts the removal is genuine (not just untested): boot
+    succeeds with no untagged-count patching of any kind, and the function
+    main.py used to import for this guard no longer exists on the module.
+    """
+    assert not hasattr(main_module, "count_untagged_nodes"), (
+        "count_untagged_nodes must no longer be imported into main -- the "
+        "untagged-node boot guard was removed; detection lives only on the "
+        "doctor operator path now."
     )
 
-
-async def test_lifespan_does_not_raise_on_clean_graph() -> None:
-    """On a fully-migrated graph (untagged count == 0, no constraint
-    conflict), startup does NOT raise -- the fail-loud guards are silent
-    when there is nothing to report."""
     mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
@@ -1298,40 +1495,6 @@ async def test_lifespan_does_not_raise_on_clean_graph() -> None:
             "context_intelligence_server.main.ensure_neo4j_schema",
             new=AsyncMock(return_value=True),
         ),
-        patch(
-            "context_intelligence_server.main.count_untagged_nodes",
-            new=AsyncMock(return_value=0),
-        ) as mock_count,
-    ):
-        async with lifespan(main_module.app):
-            pass
-
-    mock_count.assert_awaited_once()
-
-
-async def test_lifespan_does_not_raise_when_health_check_itself_fails(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A health-check probe failure (e.g. count_untagged_nodes raising due to
-    a transient connectivity blip) must NOT be treated as a confirmed
-    un-migrated graph -- it is logged at DEBUG and swallowed, and boot
-    proceeds. Connectivity failure != confirmed data corruption."""
-    mock_driver = _patched_lifespan_deps()
-    with (
-        patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch(
-            "context_intelligence_server.main.ensure_neo4j_schema",
-            new=AsyncMock(return_value=True),
-        ),
-        patch(
-            "context_intelligence_server.main.count_untagged_nodes",
-            new=AsyncMock(side_effect=RuntimeError("transient connectivity blip")),
-        ),
-        caplog.at_level(logging.DEBUG),
     ):
         async with lifespan(main_module.app):  # MUST NOT raise
             pass
