@@ -971,3 +971,115 @@ async def test_recovery_seed_counts_residual_zero_after_trimming_dead_letter_ses
     stats = await qm.derive_all_stats()
     residual = accepted - written - stats["in_queue_total"] - stats["dead_total"]
     assert residual == 0
+
+
+# ---------------------------------------------------------------------------
+# reclaim_drained_orphans: reclaim .log/.offset for keys with no live worker
+# (fix/trim-spool-as-processed) -- the per-session idle-branch trim only ever
+# runs for a session with a live drain worker, so a session that fully
+# drained and then went away keeps its files forever without this sweep.
+# ---------------------------------------------------------------------------
+
+
+async def test_reclaim_drained_orphans_removes_fully_drained_key(qm, tmp_path):
+    """A fully-drained (committed-to-EOF) key's .log/.offset are removed, and
+    the exact byte size of that log is reported back."""
+    line = b"hello\n"
+    await qm.append("s1", line)
+    await qm.commit("s1", len(line))
+    log_size = qm._log_path("s1").stat().st_size
+    assert log_size == len(line)
+
+    result = await qm.reclaim_drained_orphans()
+
+    assert result == (1, log_size)
+    assert not qm._log_path("s1").exists()
+    assert not qm._offset_path("s1").exists()
+
+
+async def test_reclaim_drained_orphans_keeps_dead_letters(qm):
+    """A reclaimed key's .dead.jsonl survives -- only .log/.offset are removed."""
+    line = b"hello\n"
+    await qm.append("s1", line)
+    await qm.commit("s1", len(line))
+    await qm.dead_letter("s1", b"poison", error="boom")
+
+    result = await qm.reclaim_drained_orphans()
+
+    assert result == (1, len(line))
+    assert not qm._log_path("s1").exists()
+    assert qm._dead_path("s1").exists()  # retained
+    assert len(await qm.read_dead_letters("s1")) == 1
+
+
+async def test_reclaim_drained_orphans_skips_key_with_uncommitted_bytes(qm):
+    """A key whose log has bytes beyond the committed offset is left
+    entirely untouched -- delete_drained refuses it, so it is never counted."""
+    await qm.append("s-pending", b"a")  # no commit() -> committed offset is 0
+
+    result = await qm.reclaim_drained_orphans()
+
+    assert result == (0, 0)
+    assert qm._log_path("s-pending").exists()
+
+
+async def test_reclaim_drained_orphans_ignores_dead_letter_only_key(qm):
+    """A key with only a .dead.jsonl (no .log at all) reclaims nothing --
+    delete_drained returns True for it (nothing to remove), but with a zero
+    log size it must not be counted as a reclaimed key."""
+    await qm.dead_letter("s-dead-only", b"poison", error="boom")
+
+    result = await qm.reclaim_drained_orphans()
+
+    assert result == (0, 0)
+    assert qm._dead_path("s-dead-only").exists()
+
+
+async def test_reclaim_drained_orphans_mixed_directory(qm):
+    """Two fully-drained keys and one pending key: only the drained keys are
+    reclaimed (count and byte total cover exactly those two), and the
+    pending key's files are left in place."""
+    line_a = b"aaa\n"
+    line_b = b"bbbbb\n"
+    await qm.append("s-drained-a", line_a)
+    await qm.commit("s-drained-a", len(line_a))
+    await qm.append("s-drained-b", line_b)
+    await qm.commit("s-drained-b", len(line_b))
+    await qm.append("s-pending", b"c")  # never committed
+
+    result = await qm.reclaim_drained_orphans()
+
+    assert result == (2, len(line_a) + len(line_b))
+    assert not qm._log_path("s-drained-a").exists()
+    assert not qm._offset_path("s-drained-a").exists()
+    assert not qm._log_path("s-drained-b").exists()
+    assert not qm._offset_path("s-drained-b").exists()
+    assert qm._log_path("s-pending").exists()
+
+
+async def test_reclaim_drained_orphans_per_key_failure_does_not_abort_pass(
+    qm, monkeypatch
+):
+    """One key raising out of delete_drained() must not stop the sweep --
+    the other drained key is still reclaimed and nothing propagates."""
+    line_good = b"good\n"
+    line_bad = b"bad\n"
+    await qm.append("s-good", line_good)
+    await qm.commit("s-good", len(line_good))
+    await qm.append("s-bad", line_bad)
+    await qm.commit("s-bad", len(line_bad))
+
+    original_delete_drained = qm.delete_drained
+
+    async def _flaky_delete_drained(session_id: str) -> bool:
+        if session_id == "s-bad":
+            raise OSError("simulated failure")
+        return await original_delete_drained(session_id)
+
+    monkeypatch.setattr(qm, "delete_drained", _flaky_delete_drained)
+
+    result = await qm.reclaim_drained_orphans()
+
+    assert result == (1, len(line_good))
+    assert not qm._log_path("s-good").exists()
+    assert qm._log_path("s-bad").exists()  # left untouched after the failure

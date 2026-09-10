@@ -355,6 +355,34 @@ async def _startup_recovery_body(app: FastAPI) -> None:
         respawned,
         len(recovered),
     )
+    # Reclaim orphaned drained files. The drain loop's per-session trim only
+    # fires for a session that HAS a live worker, and crash recovery respawns a
+    # worker only for a session with UNDRAINED data -- so a session that fully
+    # drained and then went away keeps its .log/.offset forever and is re-walked
+    # by every later boot's recovery. Measured 2026-09-09 on a real spool: 25
+    # fully-drained logs, ~1.7 GiB, including a 691 MB and a 600 MB file, none
+    # of which the per-session trim could ever see.
+    #
+    # Runs AFTER recovery_seed_counts (above) so the conservation baseline is
+    # read from disk before anything is removed, and after the respawn loop so
+    # a session that DOES have pending data already has its drainer. Safe by
+    # delegation: delete_drained refuses while any uncommitted byte remains, so
+    # this can never take a log a drainer still needs. Never raises.
+    try:
+        (
+            _reclaimed_keys,
+            _reclaimed_bytes,
+        ) = await registry.queue_manager.reclaim_drained_orphans()
+    except Exception:  # noqa: BLE001 - disk reclaim must never fail a boot
+        logger.exception("startup_recovery: orphan reclaim failed; continuing")
+    else:
+        if _reclaimed_keys:
+            logger.info(
+                "startup_recovery: reclaimed %d fully-drained session file(s), "
+                "%d byte(s) of spool",
+                _reclaimed_keys,
+                _reclaimed_bytes,
+            )
     # The one-shot pass is done: counters are seeded and this boot's drainers
     # are up. /status can now report settled numbers rather than mid-recovery
     # ones. Set BEFORE the sweep loop below, which never returns. (The wrapper

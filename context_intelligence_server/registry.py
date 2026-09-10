@@ -417,7 +417,11 @@ class SessionRegistry:
                         # drained .log/.offset on disk -- and off every
                         # later boot's recovery scan -- forever.
                         if await qm.delete_drained(session_id):
-                            logger.debug(
+                            # INFO, not DEBUG: a reclaim that leaves no trace
+                            # in the journal is one an operator cannot confirm
+                            # is happening. Measured 2026-09-09: 16 files were
+                            # trimmed on a live box and the log showed nothing.
+                            logger.info(
                                 "spool_trimmed session=%s",
                                 session_id,
                                 extra={"session_id": session_id},

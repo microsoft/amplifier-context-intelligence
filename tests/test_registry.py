@@ -1229,6 +1229,55 @@ class TestDurableSpoolTrim:
 
         assert qm._log_path(sid).exists()  # never dropped -- delete_drained refused
 
+    async def test_idle_drained_session_trim_logs_at_info(
+        self, reg_qm: tuple[SessionRegistry, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The drain loop's idle-branch trim log ("spool_trimmed") fires at
+        INFO, not DEBUG -- a reclaim that leaves no trace in the journal is
+        one an operator cannot confirm is happening (fix/trim-spool-as-
+        processed: 16 files were trimmed on a live box and the log showed
+        nothing at the old DEBUG level)."""
+        reg, qm = reg_qm
+        sid = "s-trim-info"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        with (
+            patch(
+                "context_intelligence_server.registry.process_event",
+                new_callable=AsyncMock,
+            ),
+            caplog.at_level(logging.INFO, logger="context_intelligence_server"),
+        ):
+            await qm.append(sid, _line("tool:pre", "/ws", {"session_id": sid}))
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
+            for _ in range(200):
+                await asyncio.sleep(0.02)
+                if not qm._log_path(sid).exists():
+                    break
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert not qm._log_path(sid).exists()  # trim did happen
+
+        info_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.INFO
+            and "spool_trimmed" in r.getMessage()
+            and getattr(r, "session_id", None) == sid
+        ]
+        assert info_records, (
+            f"expected an INFO 'spool_trimmed' record for session={sid}; got "
+            f"{[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
 
 class _AccumBufferGraph:
     """FAITHFUL model of a real store's accumulating buffer (NOT a hollow mock).

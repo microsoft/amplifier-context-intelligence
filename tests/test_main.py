@@ -972,6 +972,91 @@ async def test_recovery_task_is_cancelled_on_shutdown() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Startup recovery: reclaim orphaned drained spool files
+# (fix/trim-spool-as-processed)
+# ---------------------------------------------------------------------------
+
+
+async def test_startup_recovery_logs_reclaimed_orphans(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``_startup_recovery_body`` calls ``reclaim_drained_orphans()`` and,
+    when keys were reclaimed, logs an INFO line naming the exact counts --
+    an operator signal that orphaned spool files were swept on this boot."""
+    monkeypatch.setattr(
+        registry.queue_manager,
+        "reclaim_drained_orphans",
+        AsyncMock(return_value=(3, 4096)),
+    )
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        caplog.at_level(logging.INFO, logger="context_intelligence_server"),
+    ):
+        async with lifespan(main_module.app):
+            await asyncio.wait_for(
+                main_module.app.state.recovery_complete.wait(), timeout=5
+            )
+            assert main_module.app.state.recovery_error is None
+
+    reclaimed_records = [
+        r for r in caplog.records if "startup_recovery: reclaimed" in r.getMessage()
+    ]
+    assert reclaimed_records, (
+        f"expected an INFO 'startup_recovery: reclaimed' log; got "
+        f"{[r.getMessage() for r in caplog.records]}"
+    )
+    message = reclaimed_records[0].getMessage()
+    assert "3" in message
+    assert "4096" in message
+
+
+async def test_startup_recovery_orphan_reclaim_failure_does_not_fail_boot(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising ``reclaim_drained_orphans()`` must not fail startup recovery
+    -- it is caught and logged INSIDE ``_startup_recovery_body``, so the boot
+    completes normally: ``recovery_complete`` still gets set and
+    ``recovery_error`` stays None (the outer ``_startup_recovery`` wrapper
+    never sees an exception)."""
+    monkeypatch.setattr(
+        registry.queue_manager,
+        "reclaim_drained_orphans",
+        AsyncMock(side_effect=RuntimeError("boom-orphan-reclaim")),
+    )
+
+    mock_driver = _patched_lifespan_deps()
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        caplog.at_level(logging.ERROR, logger="context_intelligence_server"),
+    ):
+        async with lifespan(main_module.app):
+            await asyncio.wait_for(
+                main_module.app.state.recovery_complete.wait(), timeout=5
+            )
+            assert main_module.app.state.recovery_error is None
+
+    error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("orphan reclaim failed" in r.getMessage() for r in error_records), (
+        f"expected an ERROR log mentioning 'orphan reclaim failed'; "
+        f"got {[r.getMessage() for r in error_records]}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Background spool-stats refresher (fix/trim-spool-as-processed): /status
 # must never scan the queue directory itself -- a background loop refreshes
 # the snapshot it reads instead.

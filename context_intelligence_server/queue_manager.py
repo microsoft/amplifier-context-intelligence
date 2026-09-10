@@ -616,6 +616,54 @@ class QueueManager:
         """
         return self._stream_newlines(self._dead_path(worker_key))
 
+    async def reclaim_drained_orphans(self) -> tuple[int, int]:
+        """Delete the ``.log``/``.offset`` of every FULLY-DRAINED key on disk.
+
+        Returns ``(keys_reclaimed, bytes_reclaimed)``.
+
+        WHY THIS EXISTS (measured 2026-09-09, local box): the drain loop's
+        per-session trim only fires for a session that currently HAS a live
+        drain worker. Crash recovery respawns a worker only for a session with
+        UNDRAINED data, so a session that was fully drained and then went away
+        gets no worker, never reaches the idle branch, and keeps its files
+        forever -- and every later boot's recovery re-walks them. On a real
+        spool that was 25 fully-drained logs totalling ~1.7 GiB, including a
+        691 MB and a 600 MB file, none of which the per-session trim could
+        ever see.
+
+        Safe by construction, because it delegates to ``delete_drained``:
+        idempotent, takes the key's ``file_lock``, REFUSES (cheaply, returning
+        False) while any uncommitted byte remains, keeps ``.dead.jsonl``, and
+        unlinks a stale ``.offset`` so a log recreated later cannot read past
+        its own end. A key with a live worker mid-drain is therefore skipped
+        by ``delete_drained`` itself -- no separate exclusion list, and no way
+        for this to race a drainer into losing data.
+
+        Cost is O(keys), never O(bytes): one ``stat`` for the size (so the
+        reclaimed total can be reported) plus ``delete_drained``'s own
+        stat + offset read. Never raises: a per-key failure is logged and
+        skipped so one unreadable file cannot abort the pass.
+        """
+        keys_reclaimed = 0
+        bytes_reclaimed = 0
+        for key in self._all_worker_keys():
+            try:
+                try:
+                    size = self._log_path(key).stat().st_size
+                except FileNotFoundError:
+                    size = 0
+                if await self.delete_drained(key):
+                    # Only count a key that actually had a log to reclaim --
+                    # delete_drained also returns True for a key whose log was
+                    # already absent (dead-letter-only), which reclaims nothing.
+                    if size:
+                        keys_reclaimed += 1
+                        bytes_reclaimed += size
+            except (OSError, ValueError):
+                logger.warning("reclaim_drained_orphans_key_failed key=%s", key)
+                continue
+        return keys_reclaimed, bytes_reclaimed
+
     def _all_worker_keys(self) -> list[str]:
         """Return the sorted union of ``.log`` and ``.dead.jsonl`` stems.
 
