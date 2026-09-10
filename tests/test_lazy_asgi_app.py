@@ -38,10 +38,48 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
+# Wall-clock budget for a subprocess that is expected to exit almost
+# immediately (`--help`, `--version`, an import). Generous already: these
+# never reach gunicorn.
+_FAST_CLI_TIMEOUT_S = 15
+
+# Budget for a `serve` invocation that must fail its startup guard. This one
+# pays for spawn + a cold import of the whole server package (fastapi, neo4j,
+# pydantic) + gunicorn arbiter start + fork + worker load() before the guard
+# can raise at all -- and it pays it on a shared CI runner with a cold page
+# cache, not on a warm dev box.
+#
+# CI FLAKE 2026-09-10 (run 34419935174, main @ 7c021bc): this test tripped a
+# 15s timeout and was reported as a guard regression. It was not. The same
+# tree had passed CI twice on its branch (e58bbcd, 1f60669), and locally the
+# guard fires in 0.74s with returncode 3 and a full traceback. The subprocess
+# had only reached "Starting gunicorn" -- it never got to worker boot, so the
+# guard never had the chance to fire. A tight wall-clock budget on a cold
+# runner is not evidence about the guard.
+#
+# Raising this costs NOTHING on a healthy run (the process exits in under a
+# second) and only spends real time when something is genuinely wrong -- which
+# is exactly when you want to wait and capture the output rather than SIGKILL
+# it and lose the buffered stderr.
+_SERVE_CLI_TIMEOUT_S = 90
+
+
 def _run_cli(
-    args: list[str], *, cwd: Path, env: dict[str, str]
+    args: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: int = _FAST_CLI_TIMEOUT_S,
 ) -> subprocess.CompletedProcess:
-    """Invoke the CLI's main() in a fresh subprocess (genuinely fresh import)."""
+    """Invoke the CLI's main() in a fresh subprocess (genuinely fresh import).
+
+    On timeout, re-raises with the partial stdout/stderr attached to the
+    message. A bare ``TimeoutExpired`` says only "15 seconds passed", which
+    tells the next reader nothing about WHERE the process was stuck -- and the
+    SIGKILL discards whatever the child had buffered. Surfacing the partial
+    output is the difference between "the guard regressed" and "the runner was
+    slow and never reached worker boot".
+    """
     code = (
         "import sys\n"
         "from context_intelligence_server.main import main\n"
@@ -50,15 +88,25 @@ def _run_cli(
         "except SystemExit as e:\n"
         "    sys.exit(e.code if e.code is not None else 0)\n"
     )
-    return subprocess.run(
-        [sys.executable, "-c", code, *args],
-        cwd=str(cwd),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            [sys.executable, "-c", code, *args],
+            cwd=str(cwd),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(
+            f"CLI subprocess {args!r} did not exit within {timeout}s.\n"
+            f"This is a WALL-CLOCK timeout, NOT proof that a guard failed to "
+            f"fire -- check the partial output below for how far it got "
+            f"before it was killed.\n"
+            f"--- partial stdout ---\n{exc.stdout or '<empty>'}\n"
+            f"--- partial stderr ---\n{exc.stderr or '<empty>'}"
+        ) from exc
 
 
 def _clean_env(tmp_path: Path) -> dict[str, str]:
@@ -190,7 +238,9 @@ class TestAuthGuardStillFiresWhenServing:
         # construction (inside the worker's load()), before ever binding
         # matters for the assertion.
         env["AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVER_PORT"] = "18321"
-        result = _run_cli(["serve"], cwd=PROJECT_ROOT, env=env)
+        result = _run_cli(
+            ["serve"], cwd=PROJECT_ROOT, env=env, timeout=_SERVE_CLI_TIMEOUT_S
+        )
         assert result.returncode != 0
         assert "neo4j_require_explicit_clients" in result.stdout + result.stderr
 

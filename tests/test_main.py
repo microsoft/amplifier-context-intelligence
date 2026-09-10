@@ -1708,6 +1708,7 @@ async def test_lifespan_seeds_counters_from_disk(tmp_path: Path) -> None:
     accepted_seed, written_seed = await reg.queue_manager.recovery_seed_counts()
     reg.seed_counters(accepted_seed, written_seed)
 
+    await reg.queue_manager.refresh_all_stats()
     metrics = await reg.pipeline_metrics()
     assert metrics["accepted_total"] == 2
     assert metrics["written_total"] == 1

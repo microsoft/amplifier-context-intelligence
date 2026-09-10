@@ -1608,6 +1608,7 @@ class TestPipelineMetrics:
         reg.record_replayed(1)
         reg.record_write_retry()
 
+        await reg.queue_manager.refresh_all_stats()
         metrics = await reg.pipeline_metrics()
 
         assert metrics["accepted_total"] == 5
@@ -1638,6 +1639,7 @@ class TestPipelineMetrics:
         monkeypatch.setattr(registry_module, "_RESIDUAL_DEGRADED_GRACE", 0.0)
         reg.seed_counters(accepted=4, written=1)
 
+        await reg.queue_manager.refresh_all_stats()
         metrics = await reg.pipeline_metrics()
 
         assert metrics["in_queue_total"] == 0
@@ -1657,11 +1659,61 @@ class TestPipelineMetrics:
 
         reg.seed_counters(accepted=1, written=0)
 
+        await reg.queue_manager.refresh_all_stats()
         metrics = await reg.pipeline_metrics()
 
         assert metrics["residual"] == 0
         assert metrics["dead_letter_total"] == 1
         assert metrics["degraded"] is True
+
+
+# ---------------------------------------------------------------------------
+# Cold-window contract (incident 2026-09-10): before refresh_all_stats() has
+# ever produced a snapshot, pipeline_metrics() must not fabricate numbers --
+# it must suppress residual/degraded entirely rather than treat unknown
+# in_queue/dead as zero. Without this, a hanging endpoint is merely traded
+# for a lying one. See QueueManager.derive_all_stats / registry.pipeline_metrics.
+# ---------------------------------------------------------------------------
+
+
+class TestPipelineMetricsColdWindow:
+    async def test_cold_cache_suppresses_residual_and_does_not_latch_grace_timer(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """With a COLD stats cache (refresh_all_stats() never called), even
+        a live-counter state that would otherwise imply a large positive
+        residual must be suppressed entirely: stats_available False,
+        residual None, degraded False, as_of_seconds None. Critically,
+        _residual_positive_since must NOT be latched by this cold call --
+        the grace-period timer must not start on unknown data."""
+        reg, _qm = reg_qm
+        # Would imply residual == 100 if the cold aggregate were trusted.
+        reg.seed_counters(accepted=100, written=0)
+
+        metrics = await reg.pipeline_metrics()
+
+        assert metrics["stats_available"] is False
+        assert metrics["residual"] is None
+        assert metrics["degraded"] is False
+        assert metrics["as_of_seconds"] is None
+        assert reg._residual_positive_since is None
+
+    async def test_after_refresh_reports_available_stats_and_age(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """After await refresh_all_stats(), pipeline_metrics() reports
+        stats_available True, a real numeric residual, and as_of_seconds as
+        a float >= 0 -- the snapshot is no longer unknown."""
+        reg, qm = reg_qm
+        reg.seed_counters(accepted=3, written=1)
+
+        await qm.refresh_all_stats()
+        metrics = await reg.pipeline_metrics()
+
+        assert metrics["stats_available"] is True
+        assert metrics["residual"] == 2
+        assert isinstance(metrics["as_of_seconds"], float)
+        assert metrics["as_of_seconds"] >= 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1696,6 +1748,7 @@ class TestDegradedFalsePositiveFix:
 
         assert reg.pipeline_counters()["accepted_total"] == 0
 
+        await qm.refresh_all_stats()
         metrics = await reg.pipeline_metrics()
         assert metrics["residual"] == 0
         assert metrics["degraded"] is False
@@ -1715,6 +1768,7 @@ class TestDegradedFalsePositiveFix:
         reg.record_written(2)
         await qm.append(sid, _line("tool:pre", "/ws", {"session_id": sid}))
 
+        await qm.refresh_all_stats()
         metrics = await reg.pipeline_metrics()
 
         assert metrics["residual"] == -1
@@ -1731,6 +1785,7 @@ class TestDegradedFalsePositiveFix:
         await qm.dead_letter(sid, _line("bad", "/ws", {"session_id": sid}), "boom")
         reg.seed_counters(accepted=1, written=0)
 
+        await qm.refresh_all_stats()
         metrics = await reg.pipeline_metrics()
 
         assert metrics["dead_letter_total"] >= 1
@@ -1747,6 +1802,7 @@ class TestDegradedFalsePositiveFix:
         monkeypatch.setattr(registry_module, "_RESIDUAL_DEGRADED_GRACE", 0.0)
         reg.seed_counters(accepted=2, written=1)
 
+        await reg.queue_manager.refresh_all_stats()
         metrics = await reg.pipeline_metrics()
 
         assert metrics["residual"] == 1

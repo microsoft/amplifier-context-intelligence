@@ -356,7 +356,8 @@ async def test_derive_all_stats_counts_pending_and_dead(qm):
     # s2: no pending log data, one dead letter.
     await qm.dead_letter("s2", b"poison", error="boom")
 
-    stats = await qm.derive_all_stats()
+    await qm.refresh_all_stats()
+    stats = qm.derive_all_stats()
 
     assert stats["in_queue_total"] == 2
     assert stats["dead_total"] == 1
@@ -402,7 +403,15 @@ async def test_purge_dead_letters_rejects_unsafe_session_id(qm, bad_id):
         await qm.purge_dead_letters(bad_id)
 
 
-async def test_derive_all_stats_caches_within_ttl(qm, monkeypatch):
+async def test_refresh_all_stats_always_scans_no_ttl_gate(qm, monkeypatch):
+    """refresh_all_stats() has NO TTL gate -- every call re-scans the spool.
+
+    INCIDENT 2026-09-10: the old derive_all_stats() scanned inline on every
+    /status call, gated only by a 1-second read-side TTL -- which spares the
+    SECOND caller and never the first. On a ~5000-key spool on Azure Files
+    SMB that made /status time out at 60-180s while /version answered in 0s
+    on the same replica. Cadence is now owned entirely by the background
+    refresher loop (main.py._spool_stats_refresher), not a read-side TTL."""
     await qm.append("s1", b"a")
 
     calls = {"n": 0}
@@ -414,14 +423,46 @@ async def test_derive_all_stats_caches_within_ttl(qm, monkeypatch):
 
     monkeypatch.setattr(qm, "_all_worker_keys", counting)
 
-    await qm.derive_all_stats()
-    await qm.derive_all_stats()  # within TTL -> served from cache
-    assert calls["n"] == 1
-
-    # Age the cache past the TTL; the next call must recompute.
-    qm._stats_cache_at = time.monotonic() - (qm._stats_cache_ttl + 1.0)
-    await qm.derive_all_stats()
+    await qm.refresh_all_stats()
+    await qm.refresh_all_stats()  # no TTL -- scans again every time
     assert calls["n"] == 2
+
+
+def test_derive_all_stats_is_synchronous_read_only_and_never_scans(qm, monkeypatch):
+    """derive_all_stats() must NEVER touch the filesystem: it is a pure,
+    synchronous cache read. An empty cache returns the unavailable sentinel
+    (stats_available False, zeroed aggregates, never scans, never raises); a
+    populated cache returns that snapshot plus stats_available True -- this
+    is the entire point of the refresh/read split that fixes /status
+    stalling on a large spool (see the module docstring / incident above)."""
+    import pathlib
+
+    def _boom(self: pathlib.Path) -> None:
+        raise AssertionError("derive_all_stats() touched the filesystem via glob()")
+
+    monkeypatch.setattr(pathlib.Path, "glob", _boom)
+
+    # Cold cache: the sentinel, no scan, no raise.
+    assert qm.derive_all_stats() == {
+        "per_key": [],
+        "in_queue_total": 0,
+        "dead_total": 0,
+        "stats_available": False,
+    }
+
+    # Populated cache: returns exactly that snapshot plus stats_available,
+    # still without scanning.
+    qm._stats_cache = {
+        "per_key": [{"worker_key": "s1", "in_queue": 2, "dead": 0}],
+        "in_queue_total": 2,
+        "dead_total": 0,
+    }
+    assert qm.derive_all_stats() == {
+        "per_key": [{"worker_key": "s1", "in_queue": 2, "dead": 0}],
+        "in_queue_total": 2,
+        "dead_total": 0,
+        "stats_available": True,
+    }
 
 
 # --- recovery_seed_counts: residual-0-by-construction crash-recovery seed ---
@@ -476,7 +517,8 @@ async def test_recovery_seed_counts_residual_is_zero_mixed_shape(qm):
     await qm.dead_letter("c", b"poison", error="boom")
 
     accepted, written = await qm.recovery_seed_counts()
-    stats = await qm.derive_all_stats()
+    await qm.refresh_all_stats()
+    stats = qm.derive_all_stats()
 
     residual = accepted - written - stats["in_queue_total"] - stats["dead_total"]
     assert residual == 0
@@ -495,7 +537,8 @@ async def test_recovery_seed_counts_crash_window_residual_zero(qm):
     assert written == 0  # NOT -1 (the crash-window trap)
     assert accepted == 2  # written_seed(0) + pending(1) + dead(1)
 
-    stats = await qm.derive_all_stats()
+    await qm.refresh_all_stats()
+    stats = qm.derive_all_stats()
     residual = accepted - written - stats["in_queue_total"] - stats["dead_total"]
     assert residual == 0
 
@@ -549,7 +592,8 @@ async def test_recovery_reconcile_then_seed_keeps_residual_zero(qm):
 
     await qm.recovery_reconcile_dead()
     accepted, written = await qm.recovery_seed_counts()
-    stats = await qm.derive_all_stats()
+    await qm.refresh_all_stats()
+    stats = qm.derive_all_stats()
 
     residual = accepted - written - stats["in_queue_total"] - stats["dead_total"]
     assert residual == 0
@@ -569,7 +613,8 @@ async def test_recovery_seed_counts_replay_window_residual_zero(qm):
     # written_seed = max(0, 1-1)=0; accepted_seed = 0 + 1 + 1 = 2
     assert (accepted, written) == (2, 0)
 
-    stats = await qm.derive_all_stats()
+    await qm.refresh_all_stats()
+    stats = qm.derive_all_stats()
     residual = accepted - written - stats["in_queue_total"] - stats["dead_total"]
     assert residual == 0
 
@@ -968,7 +1013,8 @@ async def test_recovery_seed_counts_residual_zero_after_trimming_dead_letter_ses
     assert qm._dead_path("s1").exists()
 
     accepted, written = await qm.recovery_seed_counts()
-    stats = await qm.derive_all_stats()
+    await qm.refresh_all_stats()
+    stats = qm.derive_all_stats()
     residual = accepted - written - stats["in_queue_total"] - stats["dead_total"]
     assert residual == 0
 
