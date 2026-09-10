@@ -1898,8 +1898,15 @@ class Neo4jGraphStore:
             working_dir=working_dir if isinstance(working_dir, str) else None,
         )
 
-    async def delete_session_graph(self, session_id: str) -> GraphDeleteResult | None:
+    async def delete_session_graph(
+        self, session_id: str, *, graph: SessionGraph | None = None
+    ) -> GraphDeleteResult | None:
         """DETACH DELETE the whole OWNED session graph for *session_id* in Neo4j.
+
+        *graph*, when supplied, is an already-resolved ``SessionGraph`` for
+        *session_id* (e.g. the one the caller previewed) -- passing it skips the
+        internal ``resolve_session_graph`` round-trip. It must have been resolved
+        for this same *session_id*; when omitted the graph is resolved here.
 
         *session_id* is the only input -- there is no workspace argument.
         Reuses ``resolve_session_graph`` to find the graph (same seeds, same
@@ -1933,7 +1940,8 @@ class Neo4jGraphStore:
                 workspace (raised by ``resolve_session_graph`` before any
                 write is attempted -- nothing is deleted in that case).
         """
-        graph = await self.resolve_session_graph(session_id)
+        if graph is None:
+            graph = await self.resolve_session_graph(session_id)
         if graph is None:
             return None
 

@@ -213,7 +213,9 @@ class GraphStore(Protocol):
         """
         ...
 
-    async def delete_session_graph(self, session_id: str) -> GraphDeleteResult | None:
+    async def delete_session_graph(
+        self, session_id: str, *, graph: SessionGraph | None = None
+    ) -> GraphDeleteResult | None:
         """Permanently delete the whole OWNED session graph for *session_id*.
 
         *session_id* is the only input needed -- there is no separate

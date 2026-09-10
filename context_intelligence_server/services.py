@@ -302,7 +302,9 @@ class GraphState:
             working_dir=working_dir if isinstance(working_dir, str) else None,
         )
 
-    async def delete_session_graph(self, session_id: str) -> GraphDeleteResult | None:
+    async def delete_session_graph(
+        self, session_id: str, *, graph: SessionGraph | None = None
+    ) -> GraphDeleteResult | None:
         """In-memory equivalent of ``Neo4jGraphStore.delete_session_graph``.
 
         Reuses ``resolve_session_graph`` to find the graph, then repeats its
@@ -315,7 +317,8 @@ class GraphState:
         or any boundary concept node was wrongly removed -- the same gate
         ``Neo4jGraphStore.delete_session_graph`` enforces.
         """
-        graph = await self.resolve_session_graph(session_id)
+        if graph is None:
+            graph = await self.resolve_session_graph(session_id)
         if graph is None:
             return None
 

@@ -211,7 +211,8 @@ class DeletionService:
             except RuntimeError as exc:
                 raise SessionsPendingError(graph.root_id, [sid]) from exc
 
-        graph_result = await self._graph.delete_session_graph(session_id)
+        # Pass the graph resolved above so the delete does not re-resolve it.
+        graph_result = await self._graph.delete_session_graph(session_id, graph=graph)
         if graph_result is None:
             raise RuntimeError(
                 f"apply: graph for root={graph.root_id!r} vanished between "
