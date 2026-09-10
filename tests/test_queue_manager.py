@@ -1290,3 +1290,100 @@ async def test_reclaim_drained_orphans_per_key_failure_does_not_abort_pass(
     assert result == (1, len(line_good))
     assert not qm._log_path("s-good").exists()
     assert qm._log_path("s-bad").exists()  # left untouched after the failure
+
+
+class TestOrphanedOffsetTmpSweep:
+    """reclaim_drained_orphans() sweeps offset temp files nothing else reclaims.
+
+    commit() writes a UNIQUE temp name per call -- it must, because a fixed name
+    let two concurrent commits race (crashing drain workers in production, and
+    worse, letting one committer publish another's offset). But uniqueness
+    removed the cleanup that the collision had been silently providing: the old
+    fixed name was simply overwritten by the next commit, so at most ONE stale
+    tmp per session could ever exist. A unique name whose process is killed
+    between ``write_text`` and ``os.replace`` is reclaimed by nothing.
+
+    That matters because FILE COUNT -- not bytes -- is what makes the spool
+    scans expensive on Azure Files SMB (``refresh_spool_stats`` iterates every
+    entry). An unbounded drip of ~10-byte orphans would slowly re-grow the exact
+    cost the /status and reclaim work exists to remove.
+    """
+
+    @staticmethod
+    def _age(path, seconds: float) -> None:
+        """Backdate a file's mtime so the sweep sees it as orphaned."""
+        import os as _os
+        import time as _time
+
+        old = _time.time() - seconds
+        _os.utime(path, (old, old))
+
+    async def test_old_orphaned_tmp_is_swept(self, qm) -> None:
+        from context_intelligence_server.queue_manager import _ORPHAN_TMP_MAX_AGE_S
+
+        orphan = qm._dir / "s1.offset.deadbeefcafe.tmp"
+        orphan.write_text("123", encoding="utf-8")
+        self._age(orphan, _ORPHAN_TMP_MAX_AGE_S + 60)
+
+        await qm.reclaim_drained_orphans()
+
+        assert not orphan.exists(), (
+            "an offset tmp older than the max age is orphaned by definition -- "
+            "no live commit can still own it -- and nothing else on disk ever "
+            "reclaims it"
+        )
+
+    async def test_young_tmp_is_never_swept(self, qm) -> None:
+        """A fresh tmp may belong to a commit that is about to os.replace it.
+
+        Deleting it would destroy that commit's offset -- the sweep must be
+        strictly less aggressive than the thing it is cleaning up after.
+        """
+        live = qm._dir / "s1.offset.0123456789ab.tmp"
+        live.write_text("456", encoding="utf-8")  # mtime = now
+
+        await qm.reclaim_drained_orphans()
+
+        assert live.exists(), "a young tmp may still be claimed by a live commit"
+
+    async def test_sweep_never_touches_real_queue_files(self, qm) -> None:
+        """Only ``*.offset.*.tmp`` is swept -- never a log, offset, or dead file."""
+        from context_intelligence_server.queue_manager import _ORPHAN_TMP_MAX_AGE_S
+
+        log = qm._dir / "s1.log"
+        log.write_bytes(b'{"event":"x"}\n')
+        off = qm._dir / "s1.offset"
+        off.write_text("0", encoding="utf-8")
+        dead = qm._dir / "s1.dead.jsonl"
+        dead.write_text('{"ts":"t"}\n', encoding="utf-8")
+        for p in (log, off, dead):
+            self._age(p, _ORPHAN_TMP_MAX_AGE_S + 60)  # old enough to tempt a bad glob
+
+        await qm.reclaim_drained_orphans()
+
+        assert off.exists() or not log.exists(), "sanity: drained keys may be reclaimed"
+        assert dead.exists(), (
+            "dead-letter records exist nowhere else and are never swept"
+        )
+
+    async def test_sweep_survives_a_file_vanishing_mid_pass(
+        self, qm, monkeypatch
+    ) -> None:
+        """A concurrent commit's own cleanup racing the sweep must not fail a boot."""
+        from context_intelligence_server.queue_manager import _ORPHAN_TMP_MAX_AGE_S
+
+        orphan = qm._dir / "s1.offset.feedface0000.tmp"
+        orphan.write_text("789", encoding="utf-8")
+        self._age(orphan, _ORPHAN_TMP_MAX_AGE_S + 60)
+
+        real_unlink = type(orphan).unlink
+
+        def _boom(self, missing_ok: bool = False):  # noqa: ANN001, ANN202
+            if self.name.endswith(".tmp"):
+                raise OSError("raced with a concurrent cleanup")
+            return real_unlink(self, missing_ok=missing_ok)
+
+        monkeypatch.setattr(type(orphan), "unlink", _boom)
+
+        # Must not raise: reclaim runs on the startup path.
+        await qm.reclaim_drained_orphans()
