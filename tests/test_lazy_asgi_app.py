@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import subprocess
 import sys
+
+import pytest
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -224,6 +226,24 @@ class TestAuthGuardStillFiresWhenServing:
                 "create_asgi_app() must still raise for this misconfiguration"
             )
 
+    # The project-wide pytest-timeout is 30s (pyproject.toml). This test spawns a
+    # REAL gunicorn: fresh interpreter, cold import of the whole server package,
+    # arbiter start, fork, worker load() -- only then can the guard raise. On a
+    # cold CI runner that has exceeded 30s, and pytest-timeout then kills the test
+    # OUTRIGHT: _run_cli's own diagnostic (which reports the subprocess's partial
+    # stdout/stderr and says plainly that a wall-clock timeout is NOT proof a guard
+    # failed to fire) never gets to run, so CI reports an opaque hang instead of
+    # what the child was doing.
+    #
+    # CI FAILURE 2026-09-10 (main @ 8831d60): exactly that -- "Timeout (>30.0s)
+    # from pytest-timeout" with `timeout = 89591` still on the clock, i.e. the 90s
+    # subprocess budget had barely started. Raising the subprocess budget without
+    # raising the ENCLOSING cap just moved which timer fired first.
+    #
+    # This ceiling sits ABOVE _SERVE_CLI_TIMEOUT_S so the inner, diagnostic timeout
+    # always wins. It does not make a healthy run slower (that exits in ~1s); it
+    # only decides whether a failure is readable.
+    @pytest.mark.timeout(_SERVE_CLI_TIMEOUT_S + 60)
     def test_serve_still_fails_loud_for_a_real_misconfiguration(
         self, tmp_path: Path
     ) -> None:

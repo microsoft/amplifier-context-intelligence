@@ -30,6 +30,14 @@ from typing import Any, TypeVar
 
 logger = logging.getLogger(__name__)
 
+# A commit's temp file exists for microseconds between write and os.replace.
+# Anything older than this is definitively orphaned by an abnormal termination
+# (SIGKILL / OOM-kill / power loss) and can never be claimed by a live commit.
+# Deliberately generous: the cost of leaving one extra hour of garbage is
+# nothing; the cost of deleting a tmp a live commit is about to replace is a
+# lost offset.
+_ORPHAN_TMP_MAX_AGE_S = 3600.0
+
 _T = TypeVar("_T")
 
 # Fixed buffer size for streaming scans over a session ``.log`` (last-newline
@@ -682,6 +690,7 @@ class QueueManager:
         """
         keys_reclaimed = 0
         bytes_reclaimed = 0
+        tmps_swept = 0
         for key in self._all_worker_keys():
             try:
                 try:
@@ -698,6 +707,42 @@ class QueueManager:
             except (OSError, ValueError):
                 logger.warning("reclaim_drained_orphans_key_failed key=%s", key)
                 continue
+
+        # Sweep orphaned offset temp files.
+        #
+        # WHY: commit() writes a UNIQUE temp name per call (it has to -- a fixed
+        # name let two concurrent commits race, crashing drain workers and, worse,
+        # letting one committer publish another's offset). But uniqueness removed
+        # the cleanup the collision was silently providing: the old fixed name was
+        # overwritten by the next commit, so at most ONE stale tmp per session
+        # could exist. A unique name killed between write_text and os.replace is
+        # never reclaimed by anything.
+        #
+        # That matters here specifically because FILE COUNT -- not bytes -- is what
+        # makes the spool scans expensive on Azure Files SMB (refresh_spool_stats
+        # iterates every entry). An unbounded drip of ~10-byte orphans would slowly
+        # re-grow the exact cost the /status and reclaim work exists to remove.
+        #
+        # Runs here because this already walks the spool at startup, so the sweep
+        # is free. Never raises: a failed sweep must not fail a boot.
+        now = time.time()
+        for tmp in self._dir.glob("*.offset.*.tmp"):
+            try:
+                if now - tmp.stat().st_mtime < _ORPHAN_TMP_MAX_AGE_S:
+                    continue  # young enough that a live commit may still own it
+                tmp.unlink(missing_ok=True)
+                tmps_swept += 1
+            except OSError:
+                # Raced with a concurrent commit's own cleanup, or unreadable.
+                # Either way it is not this pass's problem.
+                continue
+        if tmps_swept:
+            logger.info(
+                "reclaim_drained_orphans: swept %d orphaned offset temp file(s) "
+                "older than %.0fs",
+                tmps_swept,
+                _ORPHAN_TMP_MAX_AGE_S,
+            )
         return keys_reclaimed, bytes_reclaimed
 
     def _all_worker_keys(self) -> list[str]:
