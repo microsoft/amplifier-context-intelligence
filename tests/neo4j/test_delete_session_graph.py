@@ -229,3 +229,75 @@ class TestDeleteSessionGraphNeo4j:
         assert result_a.root_id == "df-fam-root"
         assert result_a.nodes_deleted == 7
         assert result_a.relationships_deleted == 7
+
+
+async def _build_large_adverse_graph(store: Any) -> tuple[int, str]:
+    """Build a deliberately adverse graph for the whole-graph traversal:
+    a branchy session tree, several events per session, and a DIAMOND where
+    every event points at one shared :SST_CONCEPT agent (many paths converging
+    on the boundary node). Returns (owned_node_count, root_id).
+
+    This is the shape that stresses ``_GRAPH_SUBGRAPH_CYPHER`` /
+    ``_GRAPH_NODE_PARTITION_CYPHER``: the traversal must fan out over the whole
+    tree, stop AT (not past) the shared concept despite countless paths reaching
+    it, and still resolve + delete correctly. A regression here is a hang or a
+    wrong count, not a subtle value.
+    """
+    store.created_by = "colombod"
+    root = "big-root"
+    await store.upsert_node(root, {"labels": ["Session", "RootSession"]})
+    await store.upsert_node("big-agent", {"labels": ["Agent", "SST_CONCEPT"]})
+    sessions = [root]
+    frontier = [root]
+    sid = 0
+    # depth 4, branch 3 -> 121 sessions (bounded so the throwaway CI Neo4j stays fast)
+    for _ in range(4):
+        nxt: list[str] = []
+        for parent in frontier:
+            for _b in range(3):
+                sid += 1
+                child = f"big-s{sid}"
+                await store.upsert_node(
+                    child, {"labels": ["Session", "SubSession"], "parent_id": parent}
+                )
+                await store.upsert_edge(parent, child, {"type": "HAS_SUBSESSION"})
+                sessions.append(child)
+                nxt.append(child)
+        frontier = nxt
+    owned = len(sessions)  # sessions
+    # 2 events per session, each also edged to the ONE shared agent (the diamond).
+    for i, ses in enumerate(sessions):
+        for e in range(2):
+            ev = f"big-e{i}-{e}"
+            await store.upsert_node(ev, {"labels": ["Event"]})
+            await store.upsert_edge(ses, ev, {"type": "HAS_EVENT"})
+            await store.upsert_edge(ev, "big-agent", {"type": "USED_AGENT"})
+            owned += 1  # event (the agent is a boundary concept, NOT owned)
+    await store.flush()
+    return owned, root
+
+
+class TestDeleteLargeAdverseGraph:
+    """Whole-graph resolve + delete on a real Neo4j, at a size and shape that
+    exercises the unbounded traversal rather than a 7-node toy graph."""
+
+    async def test_resolves_and_deletes_a_large_diamond_graph(
+        self, neo4j_services: Any
+    ) -> None:
+        store = neo4j_services.graph
+        owned, root = await _build_large_adverse_graph(store)
+
+        # Resolve returns the whole owned graph plus the one boundary concept.
+        graph = await store.resolve_session_graph(root)
+        assert graph is not None
+        assert graph.node_count == owned + 1  # + the shared agent (boundary, included)
+
+        # Delete removes every owned node, keeps the shared concept, and the
+        # boundary-pruned traversal terminates (a hang would fail the suite).
+        result = await store.delete_session_graph(root, graph=graph)
+        assert result is not None
+        assert result.nodes_deleted == owned
+        assert await store.get_node(root) is None
+        agent = await store.get_node("big-agent")
+        assert agent is not None
+        assert "SST_CONCEPT" in agent.get("labels", [])
