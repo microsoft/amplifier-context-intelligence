@@ -328,7 +328,7 @@ _GRAPH_RESOLVE_CYPHER = (
     "ORDER BY length(p) DESC "
     "LIMIT 1 "
     "WITH coalesce(ancestor, start) AS root "
-    "MATCH (root)-[:HAS_SUBSESSION|FORKED*0..]->(member:Session {workspace: $workspace}) "
+    "MATCH (root:Session)-[:HAS_SUBSESSION|FORKED*0..]->(member:Session {workspace: $workspace}) "
     "RETURN DISTINCT member.node_id AS session_id, root.node_id AS root_id, "
     "properties(member) AS props"
 )

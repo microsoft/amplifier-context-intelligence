@@ -3730,6 +3730,18 @@ def test_no_unindexed_scan_patterns_in_neo4j_store_source():
         '_TOTAL_NODE_COUNT_CYPHER = "MATCH (n) RETURN count(n) AS c"',
         # backfill_node_labels -- doctor --fix only, batched IN TRANSACTIONS.
         'f"MATCH (n) WHERE NOT n:{_UNIVERSAL_NODE_LABEL} "',
+        # Whole-graph delete/summary (delete_session_graph / resolve_session_graph),
+        # off the ingest hot path. Each is a bounded expand from an already-bound
+        # row set, NOT an AllNodesScan:
+        #   elementId(n) = eid is a direct NodeByElementIdSeek -- label-independent
+        #   by design, so an owned node and a boundary :SST_CONCEPT node both
+        #   resolve by identity (adding a label would wrongly exclude concepts).
+        '"MATCH (n) WHERE elementId(n) = eid "',
+        #   (n) is the node just seeked by elementId on the line above.
+        '"OPTIONAL MATCH (n)-[r]-() "',
+        #   (a) is bound by `UNWIND graph_nodes AS a` -- a collected, workspace-
+        #   scoped node set from the traversal, not a fresh match.
+        '"OPTIONAL MATCH (a)-[r]->(b) "',
     }
 
     offenders: list[str] = []
