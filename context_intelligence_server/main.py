@@ -431,7 +431,12 @@ async def _spool_stats_refresher(app: FastAPI) -> None:
     """
     while True:
         try:
+            # Both disk-derived /status blocks refresh here, together: the
+            # spool footprint AND the queue/dead aggregate. Either one left on
+            # the request path re-creates the timeout this loop exists to
+            # prevent -- PR #101 moved only the first and /status stayed down.
             await registry.queue_manager.refresh_spool_stats()
+            await registry.queue_manager.refresh_all_stats()
         except asyncio.CancelledError:
             raise
         except Exception:

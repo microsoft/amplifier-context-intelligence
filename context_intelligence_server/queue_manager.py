@@ -139,7 +139,6 @@ class QueueManager:
         self._dir.mkdir(parents=True, exist_ok=True)
         self._stats_cache: dict[str, Any] | None = None
         self._stats_cache_at: float = 0.0
-        self._stats_cache_ttl: float = 1.0
         # Snapshot for spool_stats() / spool_stats_age_seconds(). Written
         # ONLY by refresh_spool_stats(), which a background loop
         # (_spool_stats_refresher in main.py) calls on its own cadence
@@ -678,20 +677,29 @@ class QueueManager:
             keys.add(dead.name[: -len(".dead.jsonl")])
         return sorted(keys)
 
-    async def derive_all_stats(self) -> dict[str, Any]:
-        """Derive live queue stats purely from disk, with a short TTL cache.
+    async def refresh_all_stats(self) -> dict[str, Any]:
+        """Scan the spool and refresh the snapshot ``derive_all_stats()`` serves.
 
         Aggregates per-worker ``in_queue`` (complete uncommitted lines) and
         ``dead`` (dead-letter records). ``in_queue`` is a tail read from the
-        committed offset to EOF (the whole file is never read); results are
-        cached for ``_stats_cache_ttl`` seconds since ``/status`` polls often.
+        committed offset to EOF (the whole file is never read).
+
+        THE ONLY thing that touches disk for these figures, and it is called
+        exclusively by the background refresher (``_spool_stats_refresher`` in
+        main.py) -- NEVER from a request handler.
+
+        INCIDENT 2026-09-10: this scan used to run INLINE on every ``/status``
+        call, gated only by a 1-second read-side TTL. A read-side TTL spares
+        the SECOND caller and never the first, so on team-shared's ~5000-key
+        spool every poll past the TTL paid a full per-key walk -- an
+        ``open+read`` of each ``.offset``, a streamed newline count of each
+        undrained tail, and a read of each ``.dead.jsonl``, all over Azure
+        Files SMB. ``/status`` timed out at 60s/120s/150s/180s while
+        ``/version`` answered in 0s and ``POST /events`` in 1s on the SAME
+        replica. PR #101 fixed the identical flaw in ``spool_stats`` and
+        MISSED this second walk in the same handler.
         """
         now = time.monotonic()
-        if (
-            self._stats_cache is not None
-            and (now - self._stats_cache_at) < self._stats_cache_ttl
-        ):
-            return self._stats_cache
 
         def _all() -> dict[str, Any]:
             per_key: list[dict[str, Any]] = []
@@ -728,6 +736,41 @@ class QueueManager:
         self._stats_cache = stats
         self._stats_cache_at = now
         return stats
+
+    def derive_all_stats(self) -> dict[str, Any]:
+        """Return the last snapshot from ``refresh_all_stats()``. NEVER scans.
+
+        Synchronous, pure cache read, no filesystem access, never raises --
+        so ``/status``'s cost is O(1) no matter how large the spool is. See
+        ``refresh_all_stats`` for the incident that required this split.
+
+        Before the first refresh completes there is no snapshot. Rather than
+        scan (which is the whole bug) or invent numbers, this returns
+        ``stats_available: False`` with zeroed aggregates, and
+        ``Registry.pipeline_metrics`` uses that flag to SUPPRESS its
+        residual/degraded determination for that window -- otherwise
+        ``residual = accepted - written - in_queue - dead`` would read the
+        absent in_queue/dead as 0 and report a fabricated loss. A hanging
+        endpoint traded for a lying one is not a fix.
+        """
+        if self._stats_cache is None:
+            return {
+                "per_key": [],
+                "in_queue_total": 0,
+                "dead_total": 0,
+                "stats_available": False,
+            }
+        return {**self._stats_cache, "stats_available": True}
+
+    def all_stats_age_seconds(self) -> float | None:
+        """Seconds since ``refresh_all_stats()`` last produced a snapshot.
+
+        ``None`` when it never has. Lets ``/status`` state the snapshot's
+        staleness instead of presenting it as live.
+        """
+        if self._stats_cache is None:
+            return None
+        return max(0.0, time.monotonic() - self._stats_cache_at)
 
     async def refresh_spool_stats(self) -> dict[str, int]:
         """Scan the spool directory and refresh the snapshot ``spool_stats()`` serves.

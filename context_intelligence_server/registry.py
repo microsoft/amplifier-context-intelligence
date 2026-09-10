@@ -255,10 +255,19 @@ class SessionRegistry:
         deleted, but the in-memory counters persist across restarts via
         `seed_counters`.
         """
-        agg = await self.queue_manager.derive_all_stats()
+        # Cache-only read: NEVER scans the spool. See
+        # QueueManager.refresh_all_stats for the incident that required this
+        # (an inline per-key walk here made /status time out at 60-180s on a
+        # ~5000-key spool while /version answered in 0s on the same replica).
+        agg = self.queue_manager.derive_all_stats()
         counters = self.pipeline_counters()
         in_queue = agg["in_queue_total"]
         dead = agg["dead_total"]
+        # False only in the window before the background refresher has produced
+        # its first snapshot. in_queue/dead are then 0 because they are UNKNOWN,
+        # not because they are zero -- so the residual below would be inflated by
+        # exactly the backlog we cannot see yet.
+        stats_available = agg.get("stats_available", True)
         residual = (
             counters["accepted_total"] - counters["written_total"] - in_queue - dead
         )
@@ -266,7 +275,10 @@ class SessionRegistry:
         # legitimately exceed accepted, so residual<0 is purely a sampling skew
         # between the fresh counters and the cached disk snapshot. Clamp the
         # loss signal at zero -- only a positive residual can mean real loss.
-        lost = max(0, residual)
+        # Suppress the loss signal entirely while the aggregates are unknown:
+        # reporting a fabricated residual (and latching _residual_positive_since
+        # from it) would trade a hanging endpoint for a lying one.
+        lost = max(0, residual) if stats_available else 0
         now = time.monotonic()
         if lost > 0:
             if self._residual_positive_since is None:
@@ -280,7 +292,10 @@ class SessionRegistry:
         # dead>0 is an accounted-for loss and is degraded immediately (no grace).
         # A positive residual is degraded only once it has PERSISTED past the
         # grace window -- transient in-flight skew clears before then.
-        degraded = dead > 0 or sustained
+        # dead>0 cannot be trusted before the first snapshot either -- it is 0
+        # by absence, not by measurement -- so degraded stays False until the
+        # refresher has actually looked.
+        degraded = stats_available and (dead > 0 or sustained)
         return {
             "accepted_total": counters["accepted_total"],
             "written_total": counters["written_total"],
@@ -288,8 +303,13 @@ class SessionRegistry:
             "write_retries_total": counters["write_retries_total"],
             "in_queue_total": in_queue,
             "dead_letter_total": dead,
-            "residual": residual,
+            "residual": residual if stats_available else None,
             "degraded": degraded,
+            # Callers must be able to tell "measured zero" from "not yet
+            # measured"; as_of_seconds carries the snapshot's age (None before
+            # the first refresh), mirroring /status's spool.as_of_seconds.
+            "stats_available": stats_available,
+            "as_of_seconds": self.queue_manager.all_stats_age_seconds(),
         }
 
     async def _process_one(

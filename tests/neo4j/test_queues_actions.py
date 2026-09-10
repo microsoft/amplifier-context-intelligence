@@ -173,6 +173,10 @@ async def test_replay_rewrites_through_real_drainer(
     #    ingest of the replayed line is accounted for (accepted=1), then the
     #    drainer's write balances it. residual == 0, degraded False, no dead.
     reg.seed_counters(accepted=1, written=0)
+    # pipeline_metrics() is a CACHE-ONLY read now (the inline per-key walk it
+    # used to do made /status time out at 60-180s on a ~5000-key spool); the
+    # background refresher owns the scan, so drive it explicitly here.
+    await reg.queue_manager.refresh_all_stats()
     metrics = await reg.pipeline_metrics()
     assert metrics["dead_letter_total"] == 0, metrics
     assert metrics["residual"] == 0, metrics
