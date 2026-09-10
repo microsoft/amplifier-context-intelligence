@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import time
 
 import pytest
@@ -232,6 +234,147 @@ async def test_commit_is_atomic_no_temp_leftover(qm, tmp_path):
     qdir = tmp_path / "queues"
     assert (qdir / "s1.offset").read_text("utf-8") == "2"
     assert list(qdir.glob("*.tmp")) == []
+
+
+# ---------------------------------------------------------------------------
+# commit(): tmp-path collision regression (incident 2026-09-10, team-shared
+# production). commit() used to build a FIXED temp path
+# ("{session_id}.offset.tmp"), shared by every concurrent committer of the
+# same session, and takes no lock -- so two overlapping commits raced on one
+# path: the loser's os.replace(tmp, final) saw FileNotFoundError (the crash,
+# ``drain_worker_died``), and worse, the SURVIVING replace silently published
+# the OTHER caller's offset, which could skip records forward past ones never
+# actually written to Neo4j. The fix makes the tmp path unique per call (see
+# queue_manager.py's commit() docstring). These tests guard both the crash
+# and the silent-loss half of that incident.
+# ---------------------------------------------------------------------------
+
+
+async def test_commit_concurrent_calls_for_same_session_do_not_raise(
+    qm, tmp_path, monkeypatch
+):
+    """Two overlapping commit() calls for the SAME session, forced to
+    interleave so BOTH writes land before EITHER os.replace runs, must not
+    raise -- and the final .offset must equal one of the two committed
+    values.
+
+    On the pre-fix source (fixed tmp name) this exact interleaving makes the
+    second write clobber the first's tmp file; the second commit replaces
+    first and succeeds, but the first's subsequent os.replace() then finds
+    its tmp gone and raises FileNotFoundError -- this is the literal
+    incident traceback. A unique-per-call tmp path makes the two commits
+    independent, so neither raises no matter which write happens first.
+    """
+    import pathlib
+
+    real_write_text = pathlib.Path.write_text
+    first_written = threading.Event()
+    second_written = threading.Event()
+
+    def synced_write_text(self: pathlib.Path, *args, **kwargs):
+        result = real_write_text(self, *args, **kwargs)
+        # Only synchronize the two commits' OWN offset-tmp writes -- matches
+        # both the old fixed name ("s1.offset.tmp") and the new unique one
+        # ("s1.offset.<uuid>.tmp").
+        if self.name.startswith("s1.offset") and self.name.endswith(".tmp"):
+            if not first_written.is_set():
+                first_written.set()
+                # Block here so the SECOND call's write (and its own
+                # os.replace, if it gets there first) happens before this
+                # (first) call proceeds to its own os.replace.
+                assert second_written.wait(timeout=5), (
+                    "second commit's write never landed -- test is broken, "
+                    "not the production code"
+                )
+            else:
+                second_written.set()
+        return result
+
+    monkeypatch.setattr(pathlib.Path, "write_text", synced_write_text)
+
+    results = await asyncio.gather(
+        qm.commit("s1", 100), qm.commit("s1", 200), return_exceptions=True
+    )
+
+    assert results == [None, None], results
+    final = (tmp_path / "queues" / "s1.offset").read_text("utf-8").strip()
+    assert final in ("100", "200")
+
+
+async def test_commit_leaves_no_tmp_files_after_sequential_commits(qm, tmp_path):
+    """Sequential (non-overlapping) commits never leave a unique tmp file
+    behind. Unlike the old fixed name (accidentally self-cleaning -- the
+    next commit just overwrote it), a unique-per-call tmp is NOT
+    self-cleaning, so cleanup must be explicit on every single call, not
+    just correct by accident on the first one."""
+    qdir = tmp_path / "queues"
+    for offset in (10, 20, 30, 40, 50):
+        await qm.commit("s1", offset)
+    assert list(qdir.glob("*.tmp")) == []
+    assert (qdir / "s1.offset").read_text("utf-8") == "50"
+
+
+async def test_commit_cleans_up_tmp_when_replace_fails(qm, tmp_path, monkeypatch):
+    """When os.replace() fails mid-commit, the unique tmp file must be
+    unlinked and the error must still propagate. A unique tmp is garbage
+    nothing else will ever reuse; without explicit cleanup on failure, every
+    failed commit would leak a file into the spool that the reclaim paths
+    don't know about."""
+    import os
+
+    def failing_replace(src, dst):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+
+    with pytest.raises(OSError):
+        await qm.commit("s1", 100)
+
+    qdir = tmp_path / "queues"
+    assert list(qdir.glob("*.tmp")) == []
+
+
+async def test_commit_concurrency_at_scale_no_raise_no_leak(qm, tmp_path):
+    """50 concurrent commit() calls for the same session: none raise, the
+    final offset is one of the submitted values, and no tmp files survive.
+    On the pre-fix source (one shared fixed tmp path, no lock), this many
+    concurrent committers reliably collide."""
+    offsets = list(range(1, 51))
+    results = await asyncio.gather(
+        *(qm.commit("s1", off) for off in offsets), return_exceptions=True
+    )
+
+    assert results == [None] * len(offsets), results
+    qdir = tmp_path / "queues"
+    assert list(qdir.glob("*.tmp")) == []
+    final = int((qdir / "s1.offset").read_text("utf-8").strip())
+    assert final in offsets
+
+
+def test_source_never_reintroduces_fixed_offset_tmp_path():
+    """Regression guard for the 2026-09-10 tmp-path collision incident: the
+    tmp path assigned in commit()/recovery_reconcile_dead() must always be
+    UNIQUE PER CALL. A fixed literal f-string like f"{session_id}.offset.tmp"
+    (an interpolated identifier immediately followed by the literal
+    ".offset.tmp", with no per-call uniquifier such as uuid.uuid4().hex in
+    between) is exactly the bug that let two concurrent commits for the same
+    session collide on one path. This checks the actual f-string ASSIGNMENT
+    pattern via regex, not prose: the commit() docstring deliberately
+    mentions the old name in plain backticks (no f"" prefix), which this
+    pattern does not match, so the incident writeup itself can't trip it."""
+    import pathlib
+    import re
+
+    import context_intelligence_server.queue_manager as qm_mod
+
+    source = pathlib.Path(qm_mod.__file__).read_text(encoding="utf-8")
+    fixed_name_pattern = re.compile(r'f"\{\w+\}\.offset\.tmp"')
+    matches = fixed_name_pattern.findall(source)
+    assert matches == [], (
+        f"Found fixed (non-unique) offset tmp path assignment(s): {matches} "
+        "-- this reintroduces the 2026-09-10 tmp-path collision bug. The "
+        "tmp path must include a per-call uniquifier (e.g. uuid.uuid4().hex)."
+    )
 
 
 # _read_committed_offset parses the bare-int form written by commit(). A
@@ -583,6 +726,24 @@ async def test_recovery_reconcile_dead_noop_without_dead_file(qm):
     assert skipped == 0
     batch = await qm.read_batch("s1", max_items=10)
     assert batch.lines == [b"line"]  # untouched
+
+
+async def test_recovery_reconcile_dead_leaves_no_tmp_file(qm, tmp_path):
+    """recovery_reconcile_dead()'s offset rewrite uses the same
+    unique-per-call tmp pattern as commit() (see queue_manager.py's
+    recovery_reconcile_dead -- these two sites can collide with EACH OTHER
+    since PR #99, the same incident class as commit()'s). Seed a key whose
+    leading pending line is already dead-lettered so pos > committed and the
+    offset is actually rewritten -- a no-op reconcile would never touch a
+    tmp file at all, so this must force the rewrite branch to run."""
+    await qm.append("s1", b"poison")
+    await qm.dead_letter("s1", b"poison", error="boom")
+
+    skipped = await qm.recovery_reconcile_dead()
+
+    assert skipped == 1  # confirms the offset-rewrite branch actually ran
+    qdir = tmp_path / "queues"
+    assert list(qdir.glob("*.tmp")) == []
 
 
 async def test_recovery_reconcile_then_seed_keeps_residual_zero(qm):
