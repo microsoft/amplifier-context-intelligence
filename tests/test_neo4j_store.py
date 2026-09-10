@@ -3739,9 +3739,6 @@ def test_no_unindexed_scan_patterns_in_neo4j_store_source():
         '"MATCH (n) WHERE elementId(n) = eid "',
         #   (n) is the node just seeked by elementId on the line above.
         '"OPTIONAL MATCH (n)-[r]-() "',
-        #   (a) is bound by `UNWIND graph_nodes AS a` -- a collected, workspace-
-        #   scoped node set from the traversal, not a fresh match.
-        '"OPTIONAL MATCH (a)-[r]->(b) "',
     }
 
     offenders: list[str] = []

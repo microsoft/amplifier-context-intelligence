@@ -333,54 +333,37 @@ _GRAPH_RESOLVE_CYPHER = (
     "properties(member) AS props"
 )
 
-# Graph subgraph: from every graph session node, expand outward along ANY
-# relationship type, `*0..` so the session nodes themselves are included.
-# `ALL(x IN nodes(path)[0..-1] WHERE NOT x:SST_CONCEPT)` stops expansion AT
-# (but includes) a :SST_CONCEPT node (Agent/Orchestrator/Recipe) -- those are
-# shared across sessions and are never owned by one graph, so a path that
-# would continue past one is excluded entirely (any such path also exists at
-# the shorter length ending exactly at the concept node, which IS kept).
-_GRAPH_SUBGRAPH_CYPHER = (
+# Graph subgraph traversal -- collected by a frontier BFS in the application
+# layer (``_collect_graph_node_ids``), NOT a single variable-length path query.
+#
+# A ``MATCH path = (s)-[*0..]->(n) WHERE ALL(x IN nodes(path) ...)`` binds the
+# path and inspects its nodes, which disqualifies Neo4j's pruning var-length
+# expansion: the planner must enumerate EVERY path before it can dedupe nodes.
+# A parallel tool-call / delegation group is written as a transitive tournament
+# (each member edged to every prior member -- see data_layer_2/tool_call.py and
+# data_layer_3/delegation.py), and a tournament on k nodes has Theta(2^k) paths,
+# so a single k~20 group would enumerate ~1e6 paths on both delete and summary.
+#
+# These two one-hop queries drive a visited-set BFS instead: expand only FROM
+# non-concept nodes, so a :SST_CONCEPT node (Agent/Orchestrator/Recipe, shared
+# across graphs) is INCLUDED when reached but never expanded THROUGH -- the same
+# boundary rule, at O(nodes + edges) with every node and edge visited once.
+
+# Resolve the seed session nodes to their elementIds (the BFS start frontier).
+_GRAPH_SEED_ELEMENT_IDS_CYPHER = (
     "UNWIND $session_ids AS sid "
     "MATCH (s:Session {node_id: sid, workspace: $workspace}) "
-    "WITH collect(s) AS seeds "
-    "CALL { "
-    "WITH seeds "
-    "UNWIND seeds AS s "
-    "MATCH path = (s)-[*0..]->(n {workspace: $workspace}) "
-    "WHERE ALL(x IN nodes(path)[0..-1] WHERE NOT x:SST_CONCEPT) "
-    "RETURN collect(DISTINCT n) AS graph_nodes "
-    "} "
-    "WITH graph_nodes "
-    "UNWIND graph_nodes AS a "
-    "OPTIONAL MATCH (a)-[r]->(b) "
-    "WHERE b IN graph_nodes "
-    "WITH graph_nodes, collect(DISTINCT r) AS rels "
-    "RETURN size(graph_nodes) AS node_count, size(rels) AS edge_count"
+    "RETURN elementId(s) AS eid"
 )
 
-# ---------------------------------------------------------------------------
-# Whole-graph delete (delete_session_graph)
-# ---------------------------------------------------------------------------
-# Same seed set (graph session_ids) and boundary rule (stop AT but not past
-# a :SST_CONCEPT node) as _GRAPH_SUBGRAPH_CYPHER above, so delete can never
-# diverge from what resolve_session_graph already resolved. Unlike the
-# subgraph query, this one partitions the traversal result into OWNED nodes
-# (deleted) vs boundary :SST_CONCEPT nodes (kept, verified to survive) and
-# returns elementId -- the identity DETACH DELETE by elementId needs.
-_GRAPH_NODE_PARTITION_CYPHER = (
-    "UNWIND $session_ids AS sid "
-    "MATCH (s:Session {node_id: sid, workspace: $workspace}) "
-    "WITH collect(s) AS seeds "
-    "CALL { "
-    "WITH seeds "
-    "UNWIND seeds AS s "
-    "MATCH path = (s)-[*0..]->(n {workspace: $workspace}) "
-    "WHERE ALL(x IN nodes(path)[0..-1] WHERE NOT x:SST_CONCEPT) "
-    "RETURN collect(DISTINCT n) AS graph_nodes "
-    "} "
-    "UNWIND graph_nodes AS n "
-    "RETURN elementId(n) AS eid, n:SST_CONCEPT AS is_concept"
+# One BFS hop: every outgoing edge from a frontier node to an in-workspace node.
+# ``(a WHERE elementId(a) = eid)`` is a direct NodeByElementIdSeek (the inline
+# form keeps it off the label-free-scan tripwire); the caller supplies only
+# non-concept frontier ids, so this never expands through a boundary concept.
+_GRAPH_EXPAND_HOP_CYPHER = (
+    "UNWIND $frontier AS eid "
+    "MATCH (a WHERE elementId(a) = eid)-[r]->(b {workspace: $workspace}) "
+    "RETURN elementId(r) AS rid, elementId(b) AS bid, b:SST_CONCEPT AS is_concept"
 )
 
 # Distinct count of relationships incident (either direction) to any of the
@@ -1806,6 +1789,50 @@ class Neo4jGraphStore:
             raise AmbiguousSessionError(session_id, sorted(workspaces))
         return next(iter(workspaces))
 
+    async def _collect_graph_node_ids(
+        self, session_ids: list[str], workspace: str
+    ) -> tuple[list[str], list[str], int]:
+        """Frontier BFS over the owned graph, stopping AT (not through) concepts.
+
+        Returns ``(owned_element_ids, concept_element_ids, edge_count)``. Seeds
+        are the session nodes; each hop expands only FROM non-concept nodes, so
+        a :SST_CONCEPT node is included when first reached but never expanded
+        through. Every node is visited once and every edge traversed once, so a
+        dense parallel-group tournament costs its edge count, not 2^k paths.
+        """
+        seed_result = await self._driver.execute_query(
+            _GRAPH_SEED_ELEMENT_IDS_CYPHER,
+            {"session_ids": session_ids, "workspace": workspace},
+            database_=self._database,
+        )
+        owned: set[str] = {row["eid"] for row in seed_result.records}
+        if not owned:
+            return [], [], 0
+
+        concept: set[str] = set()
+        edges: set[str] = set()
+        frontier: list[str] = list(owned)
+        while frontier:
+            hop_result = await self._driver.execute_query(
+                _GRAPH_EXPAND_HOP_CYPHER,
+                {"frontier": frontier, "workspace": workspace},
+                database_=self._database,
+            )
+            next_frontier: list[str] = []
+            for row in hop_result.records:
+                edges.add(row["rid"])
+                bid: str = row["bid"]
+                if bid in owned or bid in concept:
+                    continue
+                if row["is_concept"]:
+                    concept.add(bid)  # boundary: keep it, never expand through it
+                else:
+                    owned.add(bid)
+                    next_frontier.append(bid)
+            frontier = next_frontier
+
+        return list(owned), list(concept), len(edges)
+
     async def resolve_session_graph(self, session_id: str) -> SessionGraph | None:
         """Resolve the whole session graph for *session_id* against Neo4j.
 
@@ -1815,7 +1842,7 @@ class Neo4jGraphStore:
         scopes the rest of the resolution, so the resolved graph still comes
         from exactly one workspace.
 
-        See ``_GRAPH_RESOLVE_CYPHER``/``_GRAPH_SUBGRAPH_CYPHER`` above for
+        See ``_GRAPH_RESOLVE_CYPHER`` and ``_collect_graph_node_ids`` for
         the exact traversal. Reads only the flushed/persisted graph (no
         buffer-first fallback) -- summary/delete operate on already-ingested
         sessions.
@@ -1856,17 +1883,13 @@ class Neo4jGraphStore:
         node_count = 0
         edge_count = 0
         try:
-            subgraph_result = await self._driver.execute_query(
-                _GRAPH_SUBGRAPH_CYPHER,
-                {"session_ids": sorted(session_ids), "workspace": workspace},
-                database_=self._database,
+            owned_ids, concept_ids, edge_count = await self._collect_graph_node_ids(
+                sorted(session_ids), workspace
             )
+            node_count = len(owned_ids) + len(concept_ids)
         except Neo4jError:
-            subgraph_result = None
-        if subgraph_result is not None and subgraph_result.records:
-            subgraph_row = subgraph_result.records[0]
-            node_count = subgraph_row["node_count"]
-            edge_count = subgraph_row["edge_count"]
+            node_count = 0
+            edge_count = 0
 
         root_props = member_props.get(root_id, {})
         created_by = root_props.get("created_by")
@@ -1914,7 +1937,7 @@ class Neo4jGraphStore:
         docstring), then:
 
         1. Partitions the graph's reachable nodes into OWNED (deleted) vs
-           boundary ``:SST_CONCEPT`` (kept) via ``_GRAPH_NODE_PARTITION_CYPHER``,
+           boundary ``:SST_CONCEPT`` (kept) via ``_collect_graph_node_ids``,
            scoped by the workspace ``resolve_session_graph`` already
            discovered (``graph.workspace``) -- never this store's own bound
            workspace, which the delete no longer depends on.
@@ -1946,15 +1969,9 @@ class Neo4jGraphStore:
             return None
 
         workspace = graph.workspace
-        partition_result = await self._driver.execute_query(
-            _GRAPH_NODE_PARTITION_CYPHER,
-            {"session_ids": sorted(graph.session_ids), "workspace": workspace},
-            database_=self._database,
+        owned_ids, concept_ids, _ = await self._collect_graph_node_ids(
+            sorted(graph.session_ids), workspace
         )
-        owned_ids: list[str] = []
-        concept_ids: list[str] = []
-        for row in partition_result.records:
-            (concept_ids if row["is_concept"] else owned_ids).append(row["eid"])
 
         if not owned_ids:
             # Every graph session node is itself owned, so this should be

@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
-from context_intelligence_server.deletion import DeletionService
+from context_intelligence_server.deletion import DeletionService, SessionsPendingError
 from context_intelligence_server.queue_manager import QueueManager
 
 pytestmark = pytest.mark.neo4j
@@ -244,7 +244,7 @@ class TestDeletionServiceNeo4j:
         # Leave sub2 with an uncommitted append after the drain above.
         await queue_manager.append("ds-fam-sub2", b'{"event": "late"}')
 
-        with pytest.raises(RuntimeError, match="pending"):
+        with pytest.raises(SessionsPendingError, match="pending"):
             await service.apply("ds-fam-root")
 
         # Nothing deleted.

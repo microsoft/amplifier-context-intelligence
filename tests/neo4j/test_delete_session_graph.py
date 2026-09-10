@@ -273,6 +273,20 @@ async def _build_large_adverse_graph(store: Any) -> tuple[int, str]:
             await store.upsert_edge(ses, ev, {"type": "HAS_EVENT"})
             await store.upsert_edge(ev, "big-agent", {"type": "USED_AGENT"})
             owned += 1  # event (the agent is a boundary concept, NOT owned)
+    # One k-way parallel group written as a transitive tournament (each member
+    # edged to every PRIOR member), exactly how data_layer_2/tool_call.py and
+    # data_layer_3/delegation.py record a parallel batch. A tournament on k
+    # nodes has Theta(2^k) directed paths, so a path-enumerating traversal
+    # would hang here; a frontier BFS costs the k(k-1)/2 edges. k=24 is well
+    # within the 5-30 parallel units mass-change / ten-lane produce by design.
+    k = 24
+    for j in range(k):
+        node = f"big-par-{j}"
+        await store.upsert_node(node, {"labels": ["Event"]})
+        await store.upsert_edge(root, node, {"type": "HAS_EVENT"})
+        for prior in range(j):
+            await store.upsert_edge(node, f"big-par-{prior}", {"type": "CAUSED"})
+        owned += 1  # each parallel-group member is owned
     await store.flush()
     return owned, root
 
