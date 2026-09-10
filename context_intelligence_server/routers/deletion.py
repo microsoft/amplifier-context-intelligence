@@ -67,6 +67,7 @@ def _preview_to_dict(preview: DeletionPreview) -> dict[str, Any]:
         "node_count": preview.node_count,
         "edge_count": preview.edge_count,
         "blob_count": preview.blob_count,
+        "blob_bytes": preview.blob_bytes,
         "created_by": preview.created_by,
         "started_at": _iso(preview.started_at),
         "last_change": _iso(preview.last_change),
@@ -201,7 +202,12 @@ async def delete_session(
     except AmbiguousSessionError as exc:
         raise HTTPException(status_code=409, detail=_AMBIGUOUS_SESSION_DETAIL) from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # The two client-actionable conflicts (still-draining, ambiguous id) are
+        # handled above. Anything reaching here is a server-side failure -- the
+        # graph vanished mid-delete, or a post-delete integrity gate tripped --
+        # and by this point data may already be partly removed. It must NOT be
+        # reported as a retryable 409 "nothing changed"; it is a 500.
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     if result is None:
         raise HTTPException(status_code=404, detail=f"session {session_id!r} not found")
     return _result_to_dict(result)

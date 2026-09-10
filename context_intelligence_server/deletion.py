@@ -19,6 +19,7 @@ from typing import Protocol
 
 from context_intelligence_server.blob_store import BlobStore
 from context_intelligence_server.graph_store import GraphStore
+from context_intelligence_server.services import total_blob_size
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ class DeletionPreview:
     node_count: int
     edge_count: int
     blob_count: int
+    blob_bytes: int
     created_by: str | None
     started_at: datetime | None
     last_change: datetime | None
@@ -117,20 +119,22 @@ class DeletionService:
                 pending.append(sid)
         return pending
 
-    async def _blob_count(self, session_ids: frozenset[str]) -> int:
-        """Return the total number of blobs stored for every session in *session_ids*.
+    async def _blob_stats(self, session_ids: frozenset[str]) -> tuple[int, int]:
+        """Return ``(count, total_bytes)`` for every blob stored across *session_ids*.
 
         The blob store is keyed by session id and already knows every blob it
         holds for a session (``BlobStore.list``), so this asks the blob store
         directly instead of trying to find blob markers hidden inside graph
         node data. This also means a blob is counted even if no node happens
         to reference it -- the blob store is the one place that knows what it
-        is actually holding.
+        is actually holding. ``total_blob_size`` sizes the same URIs so the
+        preview reports both how many blobs and how many bytes a delete frees.
         """
-        total = 0
+        uris: list[str] = []
         for sid in session_ids:
-            total += len(await self._blobs.list(sid))
-        return total
+            uris.extend(await self._blobs.list(sid))
+        total_bytes = await total_blob_size(self._blobs, uris)
+        return len(uris), total_bytes
 
     async def preview(self, session_id: str) -> DeletionPreview | None:
         """Resolve the whole session graph for *session_id* and report what
@@ -143,13 +147,14 @@ class DeletionService:
             return None
 
         pending_sessions = await self._pending_sessions(graph.session_ids)
-        blob_count = await self._blob_count(graph.session_ids)
+        blob_count, blob_bytes = await self._blob_stats(graph.session_ids)
         return DeletionPreview(
             root_id=graph.root_id,
             session_ids=graph.session_ids,
             node_count=graph.node_count,
             edge_count=graph.edge_count,
             blob_count=blob_count,
+            blob_bytes=blob_bytes,
             created_by=graph.created_by,
             started_at=graph.started_at,
             last_change=graph.last_change,
@@ -167,10 +172,10 @@ class DeletionService:
 
         Resolves the graph, enforces the drain precondition (every session in
         the graph must have zero pending queue records) across the WHOLE
-        graph, then deletes in order: graph -> blobs (per session) -> queue
-        artifacts (per session). ``session_ids`` is captured from the
-        resolution BEFORE any delete, so losing the graph node set first does
-        not lose track of what else must be removed.
+        graph, then deletes in order: queue artifacts (per session, the
+        race-free drain gate) -> graph -> blobs (per session). ``session_ids``
+        is captured from the resolution BEFORE any delete, so losing the graph
+        node set first does not lose track of what else must be removed.
 
         Returns ``None`` if *session_id* does not resolve to any known
         session -- no writes occur in that case.
@@ -191,21 +196,31 @@ class DeletionService:
         if pending_sessions:
             raise SessionsPendingError(graph.root_id, pending_sessions)
 
+        # Delete the queue artifacts FIRST. delete_session re-checks "pending"
+        # under each session's file lock -- the only race-free drain gate -- so
+        # running it before the graph/blob deletes means a session that started
+        # draining again after the (lock-free) pre-check above refuses here with
+        # nothing else removed yet. That refusal is the same retryable condition
+        # as the pre-check, surfaced as SessionsPendingError so a still-draining
+        # graph is never left half-deleted with the caller told "nothing changed".
+        queue_sessions_cleaned = 0
+        for sid in session_ids:
+            try:
+                if await self._queue.delete_session(sid):
+                    queue_sessions_cleaned += 1
+            except RuntimeError as exc:
+                raise SessionsPendingError(graph.root_id, [sid]) from exc
+
         graph_result = await self._graph.delete_session_graph(session_id)
         if graph_result is None:
             raise RuntimeError(
                 f"apply: graph for root={graph.root_id!r} vanished between "
-                "resolve and delete -- no writes were attempted"
+                "resolve and delete"
             )
 
         blobs_deleted = 0
         for sid in session_ids:
             blobs_deleted += await self._blobs.delete_session(sid)
-
-        queue_sessions_cleaned = 0
-        for sid in session_ids:
-            if await self._queue.delete_session(sid):
-                queue_sessions_cleaned += 1
 
         result = DeletionResult(
             root_id=graph.root_id,

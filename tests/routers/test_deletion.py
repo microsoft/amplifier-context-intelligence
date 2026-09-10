@@ -37,6 +37,7 @@ def _sample_preview(**overrides: Any) -> DeletionPreview:
         "node_count": 10,
         "edge_count": 5,
         "blob_count": 2,
+        "blob_bytes": 128,
         "created_by": "alice",
         "started_at": datetime(2024, 1, 1, 12, 0, 0),
         "last_change": datetime(2024, 1, 2, 8, 30, 0),
@@ -168,6 +169,7 @@ class TestGetSessionSummary:
             "node_count": 10,
             "edge_count": 5,
             "blob_count": 2,
+            "blob_bytes": 128,
             "created_by": "alice",
             "started_at": "2024-01-01T12:00:00",
             "last_change": "2024-01-02T08:30:00",
@@ -313,11 +315,13 @@ class TestDeleteSession:
         assert detail["retry_after_seconds"] == int(retry_after)
 
     @pytest.mark.anyio
-    async def test_graph_vanished_race_is_a_plain_409(
+    async def test_server_side_failure_is_a_500_not_a_409(
         self, client: httpx.AsyncClient
     ) -> None:
-        """A non-pending RuntimeError (graph vanished between resolve and
-        delete) is still a 409, but NOT retryable -- no Retry-After header."""
+        """A non-pending, non-ambiguous RuntimeError (graph vanished mid-delete,
+        or a post-delete integrity gate) is a server error -- 500, never a
+        retryable 409. By this point data may already be partly removed, so the
+        caller must not be told "nothing changed, retry"."""
         fake = _FakeDeletionService(
             apply_error=RuntimeError("graph vanished between resolve and delete")
         )
@@ -325,7 +329,7 @@ class TestDeleteSession:
 
         response = await client.delete("/sessions/root-1")
 
-        assert response.status_code == 409
+        assert response.status_code == 500
         assert "Retry-After" not in response.headers
         assert "vanished" in response.json()["detail"]
 

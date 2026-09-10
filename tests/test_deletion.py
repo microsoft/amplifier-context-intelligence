@@ -150,6 +150,7 @@ async def test_preview_returns_facts_and_mutates_nothing(
     assert preview.root_id == root
     assert preview.session_ids == frozenset({root, sub1, sub2})
     assert preview.blob_count == len(blob_refs) == 4
+    assert preview.blob_bytes > 0  # summary reports the bytes a delete would free
     assert preview.node_count == 4  # root, sub1, sub2, concept (boundary, included)
     assert preview.edge_count == 3  # root->sub1, sub1->sub2, sub2->concept
     assert preview.subsession_count == 2
@@ -212,6 +213,42 @@ async def test_apply_refuses_and_deletes_nothing_when_pending(
     assert await graph.get_node(sub1) is not None
     assert await blob_store.list(root) == [blob_uri]
     assert queue_manager._log_path(sub1).exists()
+
+
+async def test_apply_refuses_before_touching_graph_when_queue_gate_races(
+    graph: GraphState,
+    blob_store: AsyncDiskBlobStore,
+) -> None:
+    """The lock-free pre-check can pass and the session start draining again
+    before the per-session delete. The queue's own race-free gate then refuses
+    -- and because queue deletion runs FIRST, the graph and blobs are still
+    intact and the caller gets a retryable SessionsPendingError, never a
+    half-deleted graph reported as 'nothing changed'."""
+
+    class _RacingQueue:
+        """Pending==0 to the pre-check, but refuses under the delete gate."""
+
+        async def pending_count(self, session_id: str) -> int:
+            return 0
+
+        async def delete_session(self, session_id: str) -> bool:
+            raise RuntimeError(
+                f"delete_session refused: session={session_id!r} has 1 pending record"
+            )
+
+    root = "race-root"
+    blob_uri = await blob_store.write(root, "k1", {"v": 1})
+    await graph.upsert_node(root, {"labels": ["Session", "RootSession"]})
+
+    service = DeletionService(graph, blob_store, _RacingQueue())
+
+    with pytest.raises(SessionsPendingError) as excinfo:
+        await service.apply(root)
+    assert excinfo.value.pending_sessions == [root]
+
+    # Graph and blob untouched -- the refusal happened before either was deleted.
+    assert await graph.get_node(root) is not None
+    assert await blob_store.list(root) == [blob_uri]
 
 
 # ---------------------------------------------------------------------------
