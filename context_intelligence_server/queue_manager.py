@@ -22,6 +22,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from collections.abc import Coroutine, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -391,14 +392,50 @@ class QueueManager:
         rename, so a reader never observes a torn or partial offset file. No
         ``fsync`` is issued: the offset survives a process crash but not a
         power loss.
+
+        The temp file name is UNIQUE PER CALL. It used to be a fixed
+        ``{session_id}.offset.tmp``, shared by every concurrent committer of the
+        same session, and ``commit`` takes no lock -- so two overlapping commits
+        raced on one path:
+
+            A: write tmp="100"
+            B: write tmp="200"        (clobbers A's bytes)
+            A: os.replace(tmp, final) -> final="200"   <-- A published B's offset
+            B: os.replace(tmp, final) -> FileNotFoundError, tmp is already gone
+
+        INCIDENT 2026-09-10 (team-shared, production): that FileNotFoundError
+        killed drain workers -- ``drain_worker_died session=2c44eb1c-...`` with
+        ``os.replace(tmp, final)`` at the bottom of the traceback. The crash was
+        the VISIBLE half. The silent half is worse: the surviving replace
+        publishes the OTHER caller's offset, so a committer can mark records
+        acknowledged that it never wrote. If the winning offset is the larger
+        one and its owner had not finished its Neo4j write, those records are
+        skipped on the next read -- silent loss, no error anywhere.
+
+        A unique name makes the two commits independent; whichever replaces last
+        wins, and a loser can only ever REWIND the offset (re-processing, which
+        MERGE makes idempotent), never skip forward past unwritten records.
         """
         self._validate_session_id(session_id)
         final = self._offset_path(session_id)
-        tmp = self._dir / f"{session_id}.offset.tmp"
 
         def _commit() -> None:
-            tmp.write_text(str(new_offset), encoding="utf-8")
-            os.replace(tmp, final)
+            # Unique per call -- see the docstring. uuid4 (not pid/tid) because
+            # the collision is between concurrent CALLS, which on a thread pool
+            # can share both.
+            tmp = self._dir / f"{session_id}.offset.{uuid.uuid4().hex}.tmp"
+            try:
+                tmp.write_text(str(new_offset), encoding="utf-8")
+                os.replace(tmp, final)
+            except BaseException:
+                # A unique tmp that never got replaced is garbage that nothing
+                # else will reuse. The old fixed name was self-cleaning by
+                # accident (the next commit overwrote it); this one is not, so
+                # the cleanup has to be explicit or every failed commit leaks a
+                # file into the spool the reclaim paths do not know about.
+                with contextlib.suppress(OSError):
+                    tmp.unlink(missing_ok=True)
+                raise
 
         await asyncio.to_thread(_commit)
 
@@ -1077,9 +1114,20 @@ class QueueManager:
                             total_skipped += 1
                     if pos > committed:
                         final = self._offset_path(key)
-                        tmp = self._dir / f"{key}.offset.tmp"
-                        tmp.write_text(str(pos), encoding="utf-8")
-                        os.replace(tmp, final)
+                        # Unique per call, for the same reason as commit()'s --
+                        # and these two sites can collide with EACH OTHER: since
+                        # PR #99 this reconcile runs in a background task while
+                        # respawned drainers are already committing the same
+                        # keys, so a shared fixed tmp path is reachable from
+                        # both. See commit()'s docstring for the failure mode.
+                        tmp = self._dir / f"{key}.offset.{uuid.uuid4().hex}.tmp"
+                        try:
+                            tmp.write_text(str(pos), encoding="utf-8")
+                            os.replace(tmp, final)
+                        except BaseException:
+                            with contextlib.suppress(OSError):
+                                tmp.unlink(missing_ok=True)
+                            raise
                 except (OSError, ValueError):
                     logger.exception("recovery_reconcile_dead_key_failed key=%s", key)
                     continue
