@@ -63,9 +63,7 @@ async def _neo4j_labels(store: Neo4jGraphStore, node_id: str) -> list[str]:
     return sorted(rows[0]["lbls"]) if rows else []
 
 
-async def _neo4j_edges_to(
-    store: Neo4jGraphStore, dst_id: str
-) -> list[dict[str, str]]:
+async def _neo4j_edges_to(store: Neo4jGraphStore, dst_id: str) -> list[dict[str, str]]:
     """Return all inbound edges to dst_id from Neo4j."""
     rows = await store.execute_query(
         "MATCH (src)-[r]->(dst) "
@@ -117,9 +115,9 @@ class TestForkBeforeStartConcurrentWithParentDrainer:
         ws = f"test-concurrent-{uuid.uuid4().hex[:8]}"
 
         await ensure_neo4j_schema(
-            __import__("neo4j", fromlist=["AsyncGraphDatabase"]).AsyncGraphDatabase.driver(
-                bolt, auth=auth
-            )
+            __import__(
+                "neo4j", fromlist=["AsyncGraphDatabase"]
+            ).AsyncGraphDatabase.driver(bolt, auth=auth)
         )
 
         parent_id = f"parent-{uuid.uuid4().hex[:8]}"
@@ -134,67 +132,76 @@ class TestForkBeforeStartConcurrentWithParentDrainer:
 
         # --- CHILD's drainer resources ---
         child_store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
-        child_services = HookStateService(workspace=ws, graph_store=child_store)
+        # Created up front (construction alone does no I/O) so both are
+        # guaranteed to close in the finally below on every exit path,
+        # including an assertion failure -- this test's whole point is to
+        # sometimes catch the race, so cleanup must not depend on the
+        # assertion passing.
+        try:
+            child_services = HookStateService(workspace=ws, graph_store=child_store)
 
-        delegation_handler = DelegationHandler(parent_services)
-        session_handler_child = SessionHandler(child_services)
+            delegation_handler = DelegationHandler(parent_services)
+            session_handler_child = SessionHandler(child_services)
 
-        # --- PARENT processes delegate:agent_spawned ---
-        async def run_parent() -> None:
-            await delegation_handler(
-                "delegate:agent_spawned",
-                {
-                    "session_id": parent_id,
-                    "parent_session_id": parent_id,
-                    "sub_session_id": child_id,
-                    "agent": "foundation:explorer",
-                    "tool_call_id": tool_call_id,
-                    "timestamp": _ts(0),
-                },
+            # --- PARENT processes delegate:agent_spawned ---
+            async def run_parent() -> None:
+                await delegation_handler(
+                    "delegate:agent_spawned",
+                    {
+                        "session_id": parent_id,
+                        "parent_session_id": parent_id,
+                        "sub_session_id": child_id,
+                        "agent": "foundation:explorer",
+                        "tool_call_id": tool_call_id,
+                        "timestamp": _ts(0),
+                    },
+                )
+                await parent_store.flush()
+
+            # --- CHILD processes session:fork then session:start ---
+            # Real Amplifier ordering: fork uses "parent" key, start uses "parent_id"
+            async def run_child() -> None:
+                # session:fork with "parent" key (NOT "parent_id") — real Amplifier format
+                await session_handler_child(
+                    "session:fork",
+                    {
+                        "session_id": child_id,
+                        "parent": parent_id,  # <-- real Amplifier uses "parent" not "parent_id"
+                        "timestamp": _ts(1),
+                    },
+                )
+                await child_store.flush()
+
+                # session:start with "parent_id" key — real Amplifier format
+                await session_handler_child(
+                    "session:start",
+                    {
+                        "session_id": child_id,
+                        "parent_id": parent_id,  # <-- session:start uses "parent_id"
+                        "timestamp": _ts(2),
+                    },
+                )
+                await child_store.flush()
+
+            # Run PARENT and CHILD concurrently (simulates real concurrent drainers)
+            await asyncio.gather(run_parent(), run_child())
+
+            # --- Verify ---
+            final_labels = await _neo4j_labels(child_store, child_id)
+            terminals = [
+                label
+                for label in final_labels
+                if label in ("RootSession", "SubSession", "ForkedSession")
+            ]
+
+            assert len(terminals) <= 1, (
+                f"DUAL LABEL BUG REPRODUCED: CHILD {child_id} has multiple terminal labels "
+                f"{terminals} in {final_labels}. This is the concurrent drainer race."
             )
-            await parent_store.flush()
 
-        # --- CHILD processes session:fork then session:start ---
-        # Real Amplifier ordering: fork uses "parent" key, start uses "parent_id"
-        async def run_child() -> None:
-            # session:fork with "parent" key (NOT "parent_id") — real Amplifier format
-            await session_handler_child(
-                "session:fork",
-                {
-                    "session_id": child_id,
-                    "parent": parent_id,  # <-- real Amplifier uses "parent" not "parent_id"
-                    "timestamp": _ts(1),
-                },
-            )
-            await child_store.flush()
-
-            # session:start with "parent_id" key — real Amplifier format
-            await session_handler_child(
-                "session:start",
-                {
-                    "session_id": child_id,
-                    "parent_id": parent_id,  # <-- session:start uses "parent_id"
-                    "timestamp": _ts(2),
-                },
-            )
-            await child_store.flush()
-
-        # Run PARENT and CHILD concurrently (simulates real concurrent drainers)
-        await asyncio.gather(run_parent(), run_child())
-
-        # --- Verify ---
-        final_labels = await _neo4j_labels(child_store, child_id)
-        terminals = [
-            label for label in final_labels if label in ("RootSession", "SubSession", "ForkedSession")
-        ]
-
-        assert len(terminals) <= 1, (
-            f"DUAL LABEL BUG REPRODUCED: CHILD {child_id} has multiple terminal labels "
-            f"{terminals} in {final_labels}. This is the concurrent drainer race."
-        )
-
-        await parent_store.close()
-        await child_store.close()
+        finally:
+            await parent_store.close()
+            await child_store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -223,9 +230,9 @@ class TestStartBeforeForkConcurrentWithParentDrainer:
         ws = f"test-start-fork-{uuid.uuid4().hex[:8]}"
 
         await ensure_neo4j_schema(
-            __import__("neo4j", fromlist=["AsyncGraphDatabase"]).AsyncGraphDatabase.driver(
-                bolt, auth=auth
-            )
+            __import__(
+                "neo4j", fromlist=["AsyncGraphDatabase"]
+            ).AsyncGraphDatabase.driver(bolt, auth=auth)
         )
 
         parent_id = f"parent-{uuid.uuid4().hex[:8]}"
@@ -237,62 +244,70 @@ class TestStartBeforeForkConcurrentWithParentDrainer:
         await parent_services.ensure_session_node(parent_id, {})
 
         child_store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
-        child_services = HookStateService(workspace=ws, graph_store=child_store)
 
-        delegation_handler = DelegationHandler(parent_services)
-        session_handler_child = SessionHandler(child_services)
+        # Created up front (construction alone does no I/O); both close in
+        # the finally below on every exit path, including an assertion
+        # failure.
+        try:
+            child_services = HookStateService(workspace=ws, graph_store=child_store)
 
-        async def run_parent() -> None:
-            await delegation_handler(
-                "delegate:agent_spawned",
-                {
-                    "session_id": parent_id,
-                    "parent_session_id": parent_id,
-                    "sub_session_id": child_id,
-                    "agent": "foundation:explorer",
-                    "tool_call_id": tool_call_id,
-                    "timestamp": _ts(0),
-                },
+            delegation_handler = DelegationHandler(parent_services)
+            session_handler_child = SessionHandler(child_services)
+
+            async def run_parent() -> None:
+                await delegation_handler(
+                    "delegate:agent_spawned",
+                    {
+                        "session_id": parent_id,
+                        "parent_session_id": parent_id,
+                        "sub_session_id": child_id,
+                        "agent": "foundation:explorer",
+                        "tool_call_id": tool_call_id,
+                        "timestamp": _ts(0),
+                    },
+                )
+                await parent_store.flush()
+
+            async def run_child() -> None:
+                # session:start FIRST (parent_id key)
+                await session_handler_child(
+                    "session:start",
+                    {
+                        "session_id": child_id,
+                        "parent_id": parent_id,
+                        "timestamp": _ts(1),
+                    },
+                )
+                await child_store.flush()
+
+                # session:fork SECOND (parent key — real Amplifier format)
+                await session_handler_child(
+                    "session:fork",
+                    {
+                        "session_id": child_id,
+                        "parent": parent_id,  # real Amplifier uses "parent" not "parent_id"
+                        "timestamp": _ts(2),
+                    },
+                )
+                await child_store.flush()
+
+            await asyncio.gather(run_parent(), run_child())
+
+            final_labels = await _neo4j_labels(child_store, child_id)
+            terminals = [
+                label
+                for label in final_labels
+                if label in ("RootSession", "SubSession", "ForkedSession")
+            ]
+
+            assert len(terminals) <= 1, (
+                f"DUAL LABEL BUG REPRODUCED: CHILD {child_id} has multiple terminal labels "
+                f"{terminals} in {final_labels}. This is the start-before-fork concurrent race."
             )
-            await parent_store.flush()
 
-        async def run_child() -> None:
-            # session:start FIRST (parent_id key)
-            await session_handler_child(
-                "session:start",
-                {
-                    "session_id": child_id,
-                    "parent_id": parent_id,
-                    "timestamp": _ts(1),
-                },
-            )
-            await child_store.flush()
-
-            # session:fork SECOND (parent key — real Amplifier format)
-            await session_handler_child(
-                "session:fork",
-                {
-                    "session_id": child_id,
-                    "parent": parent_id,  # real Amplifier uses "parent" not "parent_id"
-                    "timestamp": _ts(2),
-                },
-            )
-            await child_store.flush()
-
-        await asyncio.gather(run_parent(), run_child())
-
-        final_labels = await _neo4j_labels(child_store, child_id)
-        terminals = [
-            label for label in final_labels if label in ("RootSession", "SubSession", "ForkedSession")
-        ]
-
-        assert len(terminals) <= 1, (
-            f"DUAL LABEL BUG REPRODUCED: CHILD {child_id} has multiple terminal labels "
-            f"{terminals} in {final_labels}. This is the start-before-fork concurrent race."
-        )
-
-        await parent_store.close()
-        await child_store.close()
+        finally:
+            await parent_store.close()
+            await child_store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -318,28 +333,38 @@ class TestSameBatchForkAndStart:
         child_id = f"child-{uuid.uuid4().hex[:8]}"
 
         store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
-        services = HookStateService(workspace=ws, graph_store=store)
-        handler = SessionHandler(services)
 
-        # Process fork then start in same "batch" (no flush between)
-        await handler(
-            "session:fork",
-            {"session_id": child_id, "parent": parent_id, "timestamp": _ts(1)},
-        )
-        # No flush here — same batch
-        await handler(
-            "session:start",
-            {"session_id": child_id, "parent_id": parent_id, "timestamp": _ts(2)},
-        )
-        await store.flush()
+        # Created up front (construction alone does no I/O); closes in
+        # the finally below on every exit path, including an assertion
+        # failure.
+        try:
+            services = HookStateService(workspace=ws, graph_store=store)
+            handler = SessionHandler(services)
 
-        labels = await _neo4j_labels(store, child_id)
-        terminals = [label for label in labels if label in ("RootSession", "SubSession", "ForkedSession")]
-        assert len(terminals) <= 1, (
-            f"Dual label in same-batch fork→start: {terminals} in {labels}"
-        )
+            # Process fork then start in same "batch" (no flush between)
+            await handler(
+                "session:fork",
+                {"session_id": child_id, "parent": parent_id, "timestamp": _ts(1)},
+            )
+            # No flush here — same batch
+            await handler(
+                "session:start",
+                {"session_id": child_id, "parent_id": parent_id, "timestamp": _ts(2)},
+            )
+            await store.flush()
 
-        await store.close()
+            labels = await _neo4j_labels(store, child_id)
+            terminals = [
+                label
+                for label in labels
+                if label in ("RootSession", "SubSession", "ForkedSession")
+            ]
+            assert len(terminals) <= 1, (
+                f"Dual label in same-batch fork→start: {terminals} in {labels}"
+            )
+
+        finally:
+            await store.close()
 
     async def test_same_batch_start_before_fork(
         self, neo4j_container: dict[str, Any]
@@ -355,28 +380,38 @@ class TestSameBatchForkAndStart:
         child_id = f"child-{uuid.uuid4().hex[:8]}"
 
         store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
-        services = HookStateService(workspace=ws, graph_store=store)
-        handler = SessionHandler(services)
 
-        # Process start then fork in same "batch" (no flush between)
-        await handler(
-            "session:start",
-            {"session_id": child_id, "parent_id": parent_id, "timestamp": _ts(1)},
-        )
-        # No flush here — same batch
-        await handler(
-            "session:fork",
-            {"session_id": child_id, "parent": parent_id, "timestamp": _ts(2)},
-        )
-        await store.flush()
+        # Created up front (construction alone does no I/O); closes in
+        # the finally below on every exit path, including an assertion
+        # failure.
+        try:
+            services = HookStateService(workspace=ws, graph_store=store)
+            handler = SessionHandler(services)
 
-        labels = await _neo4j_labels(store, child_id)
-        terminals = [label for label in labels if label in ("RootSession", "SubSession", "ForkedSession")]
-        assert len(terminals) <= 1, (
-            f"Dual label in same-batch start→fork: {terminals} in {labels}"
-        )
+            # Process start then fork in same "batch" (no flush between)
+            await handler(
+                "session:start",
+                {"session_id": child_id, "parent_id": parent_id, "timestamp": _ts(1)},
+            )
+            # No flush here — same batch
+            await handler(
+                "session:fork",
+                {"session_id": child_id, "parent": parent_id, "timestamp": _ts(2)},
+            )
+            await store.flush()
 
-        await store.close()
+            labels = await _neo4j_labels(store, child_id)
+            terminals = [
+                label
+                for label in labels
+                if label in ("RootSession", "SubSession", "ForkedSession")
+            ]
+            assert len(terminals) <= 1, (
+                f"Dual label in same-batch start→fork: {terminals} in {labels}"
+            )
+
+        finally:
+            await store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -415,49 +450,56 @@ class TestAdversarialConcurrentWrites:
 
         # Ensure schema first
         from neo4j import AsyncGraphDatabase
+
         driver = AsyncGraphDatabase.driver(bolt, auth=auth)
         await ensure_neo4j_schema(driver)
         await driver.close()
 
         # Create bare CHILD node first (as PARENT's drainer would)
         bootstrap = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
-        await bootstrap.upsert_node(child_id, {"labels": ["Session"], "session_id": child_id})
+        await bootstrap.upsert_node(
+            child_id, {"labels": ["Session"], "session_id": child_id}
+        )
         await bootstrap.flush()
         await bootstrap.close()
 
         # Writer 1: session:start path — adds SubSession
         async def write_start() -> None:
             store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
-            services = HookStateService(workspace=ws, graph_store=store)
-            handler = SessionHandler(services)
-            await handler(
-                "session:start",
-                {
-                    "session_id": child_id,
-                    "parent_id": f"parent-{uuid.uuid4().hex[:8]}",
-                    "timestamp": _ts(1),
-                },
-            )
-            await store.flush()
-            await store.close()
+            try:
+                services = HookStateService(workspace=ws, graph_store=store)
+                handler = SessionHandler(services)
+                await handler(
+                    "session:start",
+                    {
+                        "session_id": child_id,
+                        "parent_id": f"parent-{uuid.uuid4().hex[:8]}",
+                        "timestamp": _ts(1),
+                    },
+                )
+                await store.flush()
+            finally:
+                await store.close()
 
         # Writer 2: session:fork path (bare-session branch) — adds ForkedSession
         # This simulates the case where fork ran get_node BEFORE start committed SubSession
         async def write_fork_bare() -> None:
             store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
-            services = HookStateService(workspace=ws, graph_store=store)
-            handler = SessionHandler(services)
-            # session:fork with "parent" key — real Amplifier format (NO "parent_id")
-            await handler(
-                "session:fork",
-                {
-                    "session_id": child_id,
-                    "parent": f"parent-{uuid.uuid4().hex[:8]}",  # "parent" not "parent_id"
-                    "timestamp": _ts(2),
-                },
-            )
-            await store.flush()
-            await store.close()
+            try:
+                services = HookStateService(workspace=ws, graph_store=store)
+                handler = SessionHandler(services)
+                # session:fork with "parent" key — real Amplifier format (NO "parent_id")
+                await handler(
+                    "session:fork",
+                    {
+                        "session_id": child_id,
+                        "parent": f"parent-{uuid.uuid4().hex[:8]}",  # "parent" not "parent_id"
+                        "timestamp": _ts(2),
+                    },
+                )
+                await store.flush()
+            finally:
+                await store.close()
 
         # Both concurrent — this is the race window
         await asyncio.gather(write_start(), write_fork_bare())
