@@ -4,8 +4,8 @@ import asyncio
 import contextlib
 import json
 import logging
-from pathlib import Path
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -858,11 +858,74 @@ async def test_lifespan_creates_and_closes_driver(
             mock_setup_logging.assert_called_once()
             # During lifespan: driver factory must have been called
             mock_driver_factory.assert_called_once()
+            assert (
+                mock_driver_factory.call_args.kwargs["max_transaction_retry_time"]
+                == 30.0
+            )
             # The driver is accessible via app.state
             assert main_module.app.state.neo4j_driver is mock_driver
 
         # After lifespan exits: close() must have been called
         mock_driver.close.assert_awaited_once()
+
+
+async def test_lifespan_stops_registry_before_closing_shared_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The registry drains stores before the lifespan releases their shared driver."""
+    order: list[str] = []
+    mock_driver = MagicMock()
+
+    async def _close_driver() -> None:
+        order.append("driver.close")
+
+    async def _shutdown_registry() -> None:
+        order.append("registry.shutdown")
+
+    mock_driver.close = _close_driver
+    monkeypatch.setattr(main_module.registry, "shutdown", _shutdown_registry)
+
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=AsyncMock(),
+        ),
+    ):
+        async with lifespan(main_module.app):
+            assert main_module.registry._neo4j_driver is mock_driver
+
+    assert order == ["registry.shutdown", "driver.close"]
+
+
+async def test_lifespan_closes_and_unregisters_driver_when_schema_startup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A startup error after driver registration still releases shared infrastructure."""
+    mock_driver = MagicMock()
+    mock_driver.close = AsyncMock()
+
+    with (
+        patch("context_intelligence_server.main.setup_logging"),
+        patch(
+            "context_intelligence_server.main.AsyncGraphDatabase.driver",
+            return_value=mock_driver,
+        ),
+        patch(
+            "context_intelligence_server.main.ensure_neo4j_schema",
+            new=AsyncMock(side_effect=RuntimeError("schema init failed")),
+        ),
+        pytest.raises(RuntimeError, match="schema init failed"),
+    ):
+        async with lifespan(main_module.app):
+            pass
+
+    mock_driver.close.assert_awaited_once()
+    assert main_module.registry._neo4j_driver is None
 
 
 # ---------------------------------------------------------------------------

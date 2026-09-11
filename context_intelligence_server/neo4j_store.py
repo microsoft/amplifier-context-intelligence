@@ -17,7 +17,8 @@ import re
 from datetime import datetime
 from typing import Any, Generator, LiteralString, cast
 
-from neo4j import AsyncGraphDatabase, unit_of_work as _unit_of_work
+from neo4j import AsyncGraphDatabase
+from neo4j import unit_of_work as _unit_of_work
 from neo4j.exceptions import DriverError, Neo4jError
 
 _LOG = logging.getLogger(__name__)
@@ -941,8 +942,9 @@ class Neo4jGraphStore:
         flush_chunk_rows: int = 100,
         flush_chunk_bytes: int = 4_194_304,
         neo4j_lock_timeout: float | None = None,
+        driver: Any | None = None,
     ) -> None:
-        """Initialise the store and create the async Neo4j driver.
+        """Initialise the store with an owned or externally supplied async driver.
 
         Args:
             uri:               Bolt/neo4j URI, e.g. ``bolt://localhost:7687``.
@@ -960,6 +962,8 @@ class Neo4jGraphStore:
                                Also sets ``connection_acquisition_timeout`` on
                                the driver to the same value so pool-exhaustion
                                failures also surface quickly.
+            driver:            Externally owned async driver to reuse. When
+                               omitted, this store creates and owns a driver.
         """
         # Explicit auto-retry budget for transient errors (e.g. deadlocks) so the
         # managed-transaction retry window is deliberate and reviewable rather than
@@ -968,7 +972,12 @@ class Neo4jGraphStore:
         driver_kwargs: dict[str, Any] = {"max_transaction_retry_time": 30.0}
         if neo4j_lock_timeout is not None and neo4j_lock_timeout > 0:
             driver_kwargs["connection_acquisition_timeout"] = neo4j_lock_timeout
-        self._driver = AsyncGraphDatabase.driver(uri, auth=auth, **driver_kwargs)
+        if driver is None:
+            self._driver = AsyncGraphDatabase.driver(uri, auth=auth, **driver_kwargs)
+            self._owns_driver = True
+        else:
+            self._driver = driver
+            self._owns_driver = False
         self._database = database
         self._workspace = workspace
         self._created_by: str | None = None
@@ -1364,11 +1373,12 @@ class Neo4jGraphStore:
                 "Final flush failed during close; buffered writes may be lost"
             )
 
-        # Close the driver, ignoring event-loop mismatch errors
-        try:
-            await self._driver.close()
-        except RuntimeError:
-            pass
+        if self._owns_driver:
+            # Close the driver, ignoring event-loop mismatch errors.
+            try:
+                await self._driver.close()
+            except RuntimeError:
+                pass
 
         self._closed = True
 

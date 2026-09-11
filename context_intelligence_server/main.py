@@ -28,10 +28,6 @@ from context_intelligence_server.auth import BearerTokenMiddleware
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.dashboard import build_status_response
-from context_intelligence_server.routers.queues import router as queues_router
-from context_intelligence_server.routers.skills import SkillRegistry
-from context_intelligence_server.routers.skills import router as skills_router
-from context_intelligence_server.routers.version import router as version_router
 from context_intelligence_server.idempotency import EventIdempotencyCache
 from context_intelligence_server.logging_config import setup_logging
 from context_intelligence_server.models import (
@@ -41,6 +37,10 @@ from context_intelligence_server.models import (
 )
 from context_intelligence_server.neo4j_store import ensure_neo4j_schema
 from context_intelligence_server.registry import SessionRegistry
+from context_intelligence_server.routers.queues import router as queues_router
+from context_intelligence_server.routers.skills import SkillRegistry
+from context_intelligence_server.routers.skills import router as skills_router
+from context_intelligence_server.routers.version import router as version_router
 
 _settings = get_settings()
 
@@ -93,65 +93,77 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application lifespan: configure logging and create shared Neo4j driver."""
     setup_logging()
     logger.info("lifespan_startup: creating Neo4j driver url=%s", _settings.neo4j_url)
+    driver_kwargs: dict[str, Any] = {"max_transaction_retry_time": 30.0}
+    if _settings.neo4j_lock_timeout is not None and _settings.neo4j_lock_timeout > 0:
+        driver_kwargs["connection_acquisition_timeout"] = _settings.neo4j_lock_timeout
     app.state.neo4j_driver = AsyncGraphDatabase.driver(
         _settings.neo4j_url,
         auth=(_settings.neo4j_user, _settings.neo4j_password),
+        **driver_kwargs,
     )
-    # Initialize schema (indexes + uniqueness constraints) BEFORE the server starts
-    # accepting requests.  This ensures the Session uniqueness constraint is active
-    # before any concurrent flush() transactions execute MERGE, which prevents the
-    # duplicate-Session-node race condition observed under concurrent upload load.
-    logger.info(
-        "lifespan_startup: initializing Neo4j schema (indexes + uniqueness constraints)"
-    )
-    await ensure_neo4j_schema(app.state.neo4j_driver)
-    logger.info("lifespan_startup: Neo4j schema initialized")
-    _skills_dir = Path(__file__).parent / "skills"
-    app.state.skill_registry = SkillRegistry()
-    if _skills_dir.exists():
-        app.state.skill_registry.load_from_dir(_skills_dir)
-        logger.info(
-            "lifespan_startup: skill_registry populated count=%d",
-            len(app.state.skill_registry.skill_names),
-        )
-    else:
-        logger.warning(
-            "lifespan_startup: skills directory not found at %s; skill_registry will be empty",
-            _skills_dir,
-        )
-    # Crash recovery (decisions #5/#6): on startup, respawn one drainer per
-    # session that still has an undrained, complete line. The workspace is
-    # parsed from that session's FIRST log line so the respawned worker is
-    # bound to the same workspace it was originally created with.
-    #
-    # Conservation-counter recovery runs FIRST, and its two steps are
-    # order-load-bearing: reconcile MUST precede seed. recovery_reconcile_dead
-    # advances committed offsets past already-dead pending lines so the
-    # dead-letter counts are settled; only then does recovery_seed_counts read
-    # disk to reconstruct the accepted/written baseline. Seeding before
-    # reconciling would leave a residual==1 false DEGRADED. Both run before the
-    # respawn loop so the respawned drainers start from a conserved baseline.
-    await registry.queue_manager.recovery_reconcile_dead()
-    _accepted_seed, _written_seed = await registry.queue_manager.recovery_seed_counts()
-    registry.seed_counters(_accepted_seed, _written_seed)
-    recovered = await registry.queue_manager.recover()
-    respawned = 0
-    for sid in recovered:
-        batch = await registry.queue_manager.read_batch(sid, max_items=1)
-        if not batch.lines:
-            continue
-        if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
-            respawned += 1
-    logger.info(
-        "lifespan_startup: crash recovery respawned %d/%d drainers",
-        respawned,
-        len(recovered),
-    )
+    registry.set_neo4j_driver(app.state.neo4j_driver)
     try:
+        # Initialize schema (indexes + uniqueness constraints) BEFORE the server starts
+        # accepting requests.  This ensures the Session uniqueness constraint is active
+        # before any concurrent flush() transactions execute MERGE, which prevents the
+        # duplicate-Session-node race condition observed under concurrent upload load.
+        logger.info(
+            "lifespan_startup: initializing Neo4j schema (indexes + uniqueness constraints)"
+        )
+        await ensure_neo4j_schema(app.state.neo4j_driver)
+        logger.info("lifespan_startup: Neo4j schema initialized")
+        _skills_dir = Path(__file__).parent / "skills"
+        app.state.skill_registry = SkillRegistry()
+        if _skills_dir.exists():
+            app.state.skill_registry.load_from_dir(_skills_dir)
+            logger.info(
+                "lifespan_startup: skill_registry populated count=%d",
+                len(app.state.skill_registry.skill_names),
+            )
+        else:
+            logger.warning(
+                "lifespan_startup: skills directory not found at %s; skill_registry will be empty",
+                _skills_dir,
+            )
+        # Crash recovery (decisions #5/#6): on startup, respawn one drainer per
+        # session that still has an undrained, complete line. The workspace is
+        # parsed from that session's FIRST log line so the respawned worker is
+        # bound to the same workspace it was originally created with.
+        #
+        # Conservation-counter recovery runs FIRST, and its two steps are
+        # order-load-bearing: reconcile MUST precede seed. recovery_reconcile_dead
+        # advances committed offsets past already-dead pending lines so the
+        # dead-letter counts are settled; only then does recovery_seed_counts read
+        # disk to reconstruct the accepted/written baseline. Seeding before
+        # reconciling would leave a residual==1 false DEGRADED. Both run before the
+        # respawn loop so the respawned drainers start from a conserved baseline.
+        await registry.queue_manager.recovery_reconcile_dead()
+        (
+            _accepted_seed,
+            _written_seed,
+        ) = await registry.queue_manager.recovery_seed_counts()
+        registry.seed_counters(_accepted_seed, _written_seed)
+        recovered = await registry.queue_manager.recover()
+        respawned = 0
+        for sid in recovered:
+            batch = await registry.queue_manager.read_batch(sid, max_items=1)
+            if not batch.lines:
+                continue
+            if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
+                respawned += 1
+        logger.info(
+            "lifespan_startup: crash recovery respawned %d/%d drainers",
+            respawned,
+            len(recovered),
+        )
         yield
     finally:
-        logger.info("lifespan_shutdown: closing Neo4j driver")
-        await app.state.neo4j_driver.close()
+        logger.info("lifespan_shutdown: stopping session drainers")
+        try:
+            await registry.shutdown()
+        finally:
+            logger.info("lifespan_shutdown: closing Neo4j driver")
+            await app.state.neo4j_driver.close()
 
 
 app = FastAPI(

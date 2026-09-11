@@ -34,6 +34,7 @@ class SessionWorker:
     events_processed: int = 0
     started_at: float = field(default_factory=time.time)
     error_count: int = 0
+    graph_closed: bool = False
     # Phase 2 (#278): liveness timestamp — when the flush boundary last
     # completed for this worker. Defaults to creation time (NOT 0.0) so a
     # brand-new worker reads as fresh, not ancient. Stamped in _flush_barrier.
@@ -54,9 +55,10 @@ class CompletedSession:
 
 
 class SessionRegistry:
-    def __init__(self) -> None:
+    def __init__(self, neo4j_driver: Any | None = None) -> None:
         self._workers: dict[str, SessionWorker] = {}
         self._completed: deque[CompletedSession] = deque(maxlen=100)
+        self._neo4j_driver = neo4j_driver
         # Durable-ingest infrastructure, built lazily on first use. The
         # module-level registry singleton is constructed at import time,
         # before the per-test settings patch applies, so we cannot read
@@ -73,6 +75,10 @@ class SessionRegistry:
         self._written_total: int = 0
         self._replayed_total: int = 0
         self._write_retries_total: int = 0
+
+    def set_neo4j_driver(self, driver: Any | None) -> None:
+        """Set the lifespan-owned driver used by newly created session stores."""
+        self._neo4j_driver = driver
 
     def _ensure_infra(self) -> None:
         """Build the shared QueueManager + write semaphore on first use.
@@ -369,7 +375,9 @@ class SessionRegistry:
     ) -> bool:
         """Dispatch each line in the batch; return True if it contained a
         terminal (session:end) event."""
-        from context_intelligence_server.pipeline import TERMINAL_EVENTS  # noqa: PLC0415
+        from context_intelligence_server.pipeline import (
+            TERMINAL_EVENTS,  # noqa: PLC0415
+        )
 
         saw_terminal = False
         for raw in batch.lines:
@@ -473,10 +481,14 @@ class SessionRegistry:
         )
 
     async def _safe_close(self, worker: SessionWorker) -> None:
+        if worker.graph_closed:
+            return
         try:
             await worker.services.graph.close()
         except Exception:
             logger.exception("graph.close failed for session %s", worker.session_id)
+        finally:
+            worker.graph_closed = True
 
     def start_drain(self, worker: SessionWorker) -> None:
         if worker.task is None or worker.task.done():
@@ -504,6 +516,7 @@ class SessionRegistry:
                 flush_chunk_rows=settings.neo4j_flush_chunk_rows,
                 flush_chunk_bytes=settings.neo4j_flush_chunk_bytes,
                 neo4j_lock_timeout=settings.neo4j_lock_timeout,
+                driver=self._neo4j_driver,
             )
             self._workers[session_id] = SessionWorker(
                 session_id=session_id,
@@ -549,6 +562,23 @@ class SessionRegistry:
         worker = self._workers.pop(session_id, None)
         if worker and worker.task and not worker.task.done():
             worker.task.cancel()
+
+    async def shutdown(self) -> None:
+        """Stop active drainers and close their stores before driver shutdown."""
+        workers = list(self._workers.values())
+        active_tasks = [
+            worker.task
+            for worker in workers
+            if worker.task is not None and not worker.task.done()
+        ]
+        for task in active_tasks:
+            task.cancel()
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
+        for worker in workers:
+            await self._safe_close(worker)
+        self._workers.clear()
+        self._neo4j_driver = None
 
     def _deregister(self, session_id: str) -> None:
         """Remove worker from registry WITHOUT cancelling its asyncio task."""

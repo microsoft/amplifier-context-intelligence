@@ -25,7 +25,6 @@ from context_intelligence_server.registry import (
 )
 from context_intelligence_server.services import HookStateService
 
-
 # ---------------------------------------------------------------------------
 # Factory helper
 # ---------------------------------------------------------------------------
@@ -705,6 +704,73 @@ class TestGetOrCreate:
         assert worker is not None
         assert worker.session_id == "session-restore"
         assert isinstance(worker.services, HookStateService)
+
+
+class TestSharedDriverLifecycle:
+    def test_get_or_create_reuses_the_registry_shared_driver(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """New session stores receive one lifespan-provided driver, never private pools."""
+        shared_driver = object()
+        store_kwargs: list[dict[str, object]] = []
+
+        class _Store:
+            def __init__(self, **kwargs: object) -> None:
+                store_kwargs.append(kwargs)
+
+        monkeypatch.setattr(SessionRegistry, "start_drain", lambda self, worker: None)
+        monkeypatch.setattr(registry_module, "Neo4jGraphStore", _Store)
+
+        registry = SessionRegistry(neo4j_driver=shared_driver)
+        registry.get_or_create("session-1", "/workspace/a")
+        registry.get_or_create("session-2", "/workspace/a")
+
+        assert [kwargs["driver"] for kwargs in store_kwargs] == [
+            shared_driver,
+            shared_driver,
+        ]
+
+    async def test_shutdown_cancels_drainers_and_closes_each_store(self) -> None:
+        """Shutdown waits for cancelled drainers, then releases their buffered stores."""
+        registry = SessionRegistry()
+        graph = AsyncMock()
+        worker = SessionWorker(
+            session_id="session-1",
+            workspace="/workspace/a",
+            services=HookStateService(workspace="/workspace/a"),
+        )
+        worker.services.graph = graph  # type: ignore[assignment]
+        worker.task = asyncio.create_task(
+            registry.drain_worker(worker, flush_timeout=10.0)
+        )
+        registry._register_for_test(worker)
+        await asyncio.sleep(0)
+
+        await registry.shutdown()
+
+        assert worker.task.done()
+        graph.close.assert_awaited_once()
+        assert registry.active_count() == 0
+
+    async def test_shutdown_closes_store_when_drainer_never_starts(self) -> None:
+        """Cancellation before a drainer's first await still closes its store."""
+        registry = SessionRegistry()
+        graph = AsyncMock()
+        worker = SessionWorker(
+            session_id="session-not-started",
+            workspace="/workspace/a",
+            services=HookStateService(workspace="/workspace/a"),
+        )
+        worker.services.graph = graph  # type: ignore[assignment]
+        worker.task = asyncio.create_task(
+            registry.drain_worker(worker, flush_timeout=10.0)
+        )
+        registry._register_for_test(worker)
+
+        await registry.shutdown()
+
+        assert worker.task.done()
+        graph.close.assert_awaited_once()
 
 
 class TestProcessOneHandlersAnnotation:
