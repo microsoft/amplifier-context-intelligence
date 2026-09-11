@@ -43,11 +43,11 @@ from typing import Any
 import pytest
 from neo4j import AsyncGraphDatabase
 
-from context_intelligence_server.status import build_status_response
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
 from context_intelligence_server.queue_manager import QueueManager
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.status import build_status_response
 
 pytestmark = pytest.mark.neo4j
 
@@ -218,117 +218,125 @@ async def test_finalization_orphan_surfaces_on_status(
         rows=10_000_000,
         byts=10_000_000_000,
     )
-    services = HookStateService(workspace="orphan-test", graph_store=store)
-    worker = SessionWorker(session_id=sid, workspace="orphan-test", services=services)
-
-    # -----------------------------------------------------------------------
-    # Register and start the drain through the REAL path.
-    # Do NOT use get_or_create — it reads from get_settings() → production.
-    # -----------------------------------------------------------------------
-    registry = SessionRegistry()
-    registry._register_for_test(worker)
-
-    with caplog.at_level(logging.ERROR, logger="context_intelligence_server"):
-        registry.start_drain(worker)
-        # start_drain always sets worker.task; assert here so the type-checker
-        # knows it is not None before passing to asyncio.shield.
-        assert worker.task is not None, "start_drain must create worker.task"
-        # asyncio.shield() prevents the timeout from cancelling worker.task.
-        # The task MUST complete on its own (OOM → return); do NOT cancel it.
-        await asyncio.wait_for(asyncio.shield(worker.task), timeout=90.0)
-
-    # -----------------------------------------------------------------------
-    # Assert orphan post-state (assertions are the proof — do NOT weaken them)
-    # -----------------------------------------------------------------------
-
-    # 1. Drain task completed (not stuck, not cancelled).
-    assert worker.task is not None and worker.task.done(), (
-        "worker.task must be done after the drain exits via OOM early-return"
-    )
-
-    # 2. Worker is still registered (not deregistered — _finalize_session
-    #    returned early without calling _safe_close / _deregister).
-    assert sid in registry._workers, (
-        "worker must still be registered in registry._workers after OOM orphan "
-        "(finalize returned early without deregistering)"
-    )
-
-    # 3. finalize_tail_flush_failed logged — proves the OOM was on the
-    #    finalization path, not the main drain loop.
-    assert "finalize_tail_flush_failed" in caplog.text, (
-        "Expected 'finalize_tail_flush_failed' in registry log after finalization OOM"
-    )
-
-    # 4. OOM error code in log — positively identifies the cause.
-    assert _OOM_CODE in caplog.text, (
-        f"Expected OOM code {_OOM_CODE!r} in caplog — verify that "
-        "_finalize_session uses logger.exception (carries the traceback), "
-        "not plain logger.error without exc_info"
-    )
-
-    # 5. Committed offset is frozen AT session:end's own start (not tail_end):
-    #    the drain commits UP TO session:end, so an unfinalized session stays re-derivable.
-    terminal_start = first_100.records[-1].start
-    post_drain_batch = await qm.read_batch(sid, 1)
-    committed_offset = post_drain_batch.start_offset
-    assert committed_offset == terminal_start, (
-        f"Committed offset {committed_offset} must equal terminal_start "
-        f"{terminal_start} (drain committed first batch UP TO session:end, "
-        "OOM froze the tail -- the offset is parked ON the terminal record "
-        "so an unfinalized session is durably re-derivable)"
-    )
-    assert committed_offset != tail_end, (
-        f"Committed offset {committed_offset} must NOT equal tail_end {tail_end} "
-        "(OOM tail is uncommitted)"
-    )
-
-    # 6. Zero f-* nodes committed.
-    #    The worker's driver is in a post-OOM state; use a FRESH store for the query
-    #    (the worker driver is not in a condition to serve reliable queries).
-    check_store = await _low_retry_store(
-        neo4j_container_capped, rows=500, byts=2_000_000
-    )
+    # Wrapped in try/finally: this is the orphan case where
+    # _finalize_session deliberately does NOT close the store (that's the
+    # whole point of the orphan), so the many assertions below must not be
+    # able to skip this test's own manual teardown of store's driver.
     try:
-        records = await check_store.execute_query(
-            "MATCH (n) WHERE n.node_id STARTS WITH $prefix RETURN count(n) AS cnt",
-            {"prefix": "f-"},
-            workspace="*",
+        services = HookStateService(workspace="orphan-test", graph_store=store)
+        worker = SessionWorker(
+            session_id=sid, workspace="orphan-test", services=services
         )
-        assert records[0]["cnt"] == 0, (
-            f"Expected 0 f-* nodes after OOM finalization, got {records[0]['cnt']} "
-            "(the OOM transaction must have rolled back completely)"
+
+        # -----------------------------------------------------------------------
+        # Register and start the drain through the REAL path.
+        # Do NOT use get_or_create — it reads from get_settings() → production.
+        # -----------------------------------------------------------------------
+        registry = SessionRegistry()
+        registry._register_for_test(worker)
+
+        with caplog.at_level(logging.ERROR, logger="context_intelligence_server"):
+            registry.start_drain(worker)
+            # start_drain always sets worker.task; assert here so the type-checker
+            # knows it is not None before passing to asyncio.shield.
+            assert worker.task is not None, "start_drain must create worker.task"
+            # asyncio.shield() prevents the timeout from cancelling worker.task.
+            # The task MUST complete on its own (OOM → return); do NOT cancel it.
+            await asyncio.wait_for(asyncio.shield(worker.task), timeout=90.0)
+
+        # -----------------------------------------------------------------------
+        # Assert orphan post-state (assertions are the proof — do NOT weaken them)
+        # -----------------------------------------------------------------------
+
+        # 1. Drain task completed (not stuck, not cancelled).
+        assert worker.task is not None and worker.task.done(), (
+            "worker.task must be done after the drain exits via OOM early-return"
         )
+
+        # 2. Worker is still registered (not deregistered — _finalize_session
+        #    returned early without calling _safe_close / _deregister).
+        assert sid in registry._workers, (
+            "worker must still be registered in registry._workers after OOM orphan "
+            "(finalize returned early without deregistering)"
+        )
+
+        # 3. finalize_tail_flush_failed logged — proves the OOM was on the
+        #    finalization path, not the main drain loop.
+        assert "finalize_tail_flush_failed" in caplog.text, (
+            "Expected 'finalize_tail_flush_failed' in registry log after finalization OOM"
+        )
+
+        # 4. OOM error code in log — positively identifies the cause.
+        assert _OOM_CODE in caplog.text, (
+            f"Expected OOM code {_OOM_CODE!r} in caplog — verify that "
+            "_finalize_session uses logger.exception (carries the traceback), "
+            "not plain logger.error without exc_info"
+        )
+
+        # 5. Committed offset is frozen AT session:end's own start (not tail_end):
+        #    the drain commits UP TO session:end, so an unfinalized session stays re-derivable.
+        terminal_start = first_100.records[-1].start
+        post_drain_batch = await qm.read_batch(sid, 1)
+        committed_offset = post_drain_batch.start_offset
+        assert committed_offset == terminal_start, (
+            f"Committed offset {committed_offset} must equal terminal_start "
+            f"{terminal_start} (drain committed first batch UP TO session:end, "
+            "OOM froze the tail -- the offset is parked ON the terminal record "
+            "so an unfinalized session is durably re-derivable)"
+        )
+        assert committed_offset != tail_end, (
+            f"Committed offset {committed_offset} must NOT equal tail_end {tail_end} "
+            "(OOM tail is uncommitted)"
+        )
+
+        # 6. Zero f-* nodes committed.
+        #    The worker's driver is in a post-OOM state; use a FRESH store for the query
+        #    (the worker driver is not in a condition to serve reliable queries).
+        check_store = await _low_retry_store(
+            neo4j_container_capped, rows=500, byts=2_000_000
+        )
+        try:
+            records = await check_store.execute_query(
+                "MATCH (n) WHERE n.node_id STARTS WITH $prefix RETURN count(n) AS cnt",
+                {"prefix": "f-"},
+                workspace="*",
+            )
+            assert records[0]["cnt"] == 0, (
+                f"Expected 0 f-* nodes after OOM finalization, got {records[0]['cnt']} "
+                "(the OOM transaction must have rolled back completely)"
+            )
+        finally:
+            await check_store._driver.close()
+
+        # 7. Worker appears in registry.orphaned_sessions().
+        orphans = registry.orphaned_sessions()
+        assert worker in orphans, (
+            "worker must appear in registry.orphaned_sessions() "
+            "(task done AND still registered = the orphan signal)"
+        )
+
+        # 8. build_status_response reports orphaned_sessions >= 1 AND the
+        #    per-session dict for sid has orphaned: True.
+        status = build_status_response(registry, time.time())
+        assert status["orphaned_sessions"] >= 1, (
+            f"build_status_response must report orphaned_sessions >= 1, "
+            f"got {status['orphaned_sessions']}"
+        )
+        session_dicts = {s["session_id"]: s for s in status["sessions"]}
+        assert sid in session_dicts, (
+            f"Session {sid!r} must appear in status['sessions'] — "
+            "check status_inactive_timeout filter"
+        )
+        assert session_dicts[sid]["orphaned"] is True, (
+            f"status['sessions'] entry for {sid!r} must have orphaned: True, "
+            f"got: {session_dicts[sid]}"
+        )
+
+        # -----------------------------------------------------------------------
+        # Teardown: close the worker's still-open store driver.
+        # _finalize_session returned early without calling _safe_close (which
+        # would have closed the driver via worker.services.graph.close()).
+        # Leaving it open causes an unclosed-resource warning in the test suite.
+        # -----------------------------------------------------------------------
     finally:
-        await check_store._driver.close()
-
-    # 7. Worker appears in registry.orphaned_sessions().
-    orphans = registry.orphaned_sessions()
-    assert worker in orphans, (
-        "worker must appear in registry.orphaned_sessions() "
-        "(task done AND still registered = the orphan signal)"
-    )
-
-    # 8. build_status_response reports orphaned_sessions >= 1 AND the
-    #    per-session dict for sid has orphaned: True.
-    status = build_status_response(registry, time.time())
-    assert status["orphaned_sessions"] >= 1, (
-        f"build_status_response must report orphaned_sessions >= 1, "
-        f"got {status['orphaned_sessions']}"
-    )
-    session_dicts = {s["session_id"]: s for s in status["sessions"]}
-    assert sid in session_dicts, (
-        f"Session {sid!r} must appear in status['sessions'] — "
-        "check status_inactive_timeout filter"
-    )
-    assert session_dicts[sid]["orphaned"] is True, (
-        f"status['sessions'] entry for {sid!r} must have orphaned: True, "
-        f"got: {session_dicts[sid]}"
-    )
-
-    # -----------------------------------------------------------------------
-    # Teardown: close the worker's still-open store driver.
-    # _finalize_session returned early without calling _safe_close (which
-    # would have closed the driver via worker.services.graph.close()).
-    # Leaving it open causes an unclosed-resource warning in the test suite.
-    # -----------------------------------------------------------------------
-    await store._driver.close()
+        await store._driver.close()

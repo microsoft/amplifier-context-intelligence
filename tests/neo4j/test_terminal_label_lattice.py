@@ -84,33 +84,38 @@ class TestLabelAssignmentsPath:
 
         store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
 
-        # Flush 1: add SubSession
-        await store.upsert_node(
-            node_id,
-            {"labels": ["Session", "SubSession", "SST_EVENT"], "session_id": node_id},
-        )
-        await store.flush()
+        try:
+            # Flush 1: add SubSession
+            await store.upsert_node(
+                node_id,
+                {
+                    "labels": ["Session", "SubSession", "SST_EVENT"],
+                    "session_id": node_id,
+                },
+            )
+            await store.flush()
 
-        mid = _terminals(await _labels(store, node_id))
-        assert mid == ["SubSession"], (
-            f"after first flush expected SubSession, got {mid}"
-        )
+            mid = _terminals(await _labels(store, node_id))
+            assert mid == ["SubSession"], (
+                f"after first flush expected SubSession, got {mid}"
+            )
 
-        # Flush 2: add ForkedSession (simulates a concurrent drainer winning)
-        await store.upsert_node(
-            node_id,
-            {
-                "labels": ["Session", "ForkedSession", "SST_EVENT"],
-                "session_id": node_id,
-            },
-        )
-        await store.flush()
+            # Flush 2: add ForkedSession (simulates a concurrent drainer winning)
+            await store.upsert_node(
+                node_id,
+                {
+                    "labels": ["Session", "ForkedSession", "SST_EVENT"],
+                    "session_id": node_id,
+                },
+            )
+            await store.flush()
 
-        final = _terminals(await _labels(store, node_id))
-        assert final == ["ForkedSession"], (
-            f"SubSession→ForkedSession: expected [ForkedSession], got {final}"
-        )
-        await store.close()
+            final = _terminals(await _labels(store, node_id))
+            assert final == ["ForkedSession"], (
+                f"SubSession→ForkedSession: expected [ForkedSession], got {final}"
+            )
+        finally:
+            await store.close()
 
     async def test_forked_then_sub_yields_forked_only(
         self, neo4j_container: dict[str, Any]
@@ -127,27 +132,32 @@ class TestLabelAssignmentsPath:
 
         store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
 
-        await store.upsert_node(
-            node_id,
-            {
-                "labels": ["Session", "ForkedSession", "SST_EVENT"],
-                "session_id": node_id,
-            },
-        )
-        await store.flush()
+        try:
+            await store.upsert_node(
+                node_id,
+                {
+                    "labels": ["Session", "ForkedSession", "SST_EVENT"],
+                    "session_id": node_id,
+                },
+            )
+            await store.flush()
 
-        # Now try to SET SubSession — lattice must strip it immediately
-        await store.upsert_node(
-            node_id,
-            {"labels": ["Session", "SubSession", "SST_EVENT"], "session_id": node_id},
-        )
-        await store.flush()
+            # Now try to SET SubSession — lattice must strip it immediately
+            await store.upsert_node(
+                node_id,
+                {
+                    "labels": ["Session", "SubSession", "SST_EVENT"],
+                    "session_id": node_id,
+                },
+            )
+            await store.flush()
 
-        final = _terminals(await _labels(store, node_id))
-        assert final == ["ForkedSession"], (
-            f"ForkedSession→SubSession: expected [ForkedSession] (Sub stripped), got {final}"
-        )
-        await store.close()
+            final = _terminals(await _labels(store, node_id))
+            assert final == ["ForkedSession"], (
+                f"ForkedSession→SubSession: expected [ForkedSession] (Sub stripped), got {final}"
+            )
+        finally:
+            await store.close()
 
     async def test_root_then_sub_yields_sub_only(
         self, neo4j_container: dict[str, Any]
@@ -164,23 +174,31 @@ class TestLabelAssignmentsPath:
 
         store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
 
-        await store.upsert_node(
-            node_id,
-            {"labels": ["Session", "RootSession", "SST_EVENT"], "session_id": node_id},
-        )
-        await store.flush()
+        try:
+            await store.upsert_node(
+                node_id,
+                {
+                    "labels": ["Session", "RootSession", "SST_EVENT"],
+                    "session_id": node_id,
+                },
+            )
+            await store.flush()
 
-        await store.upsert_node(
-            node_id,
-            {"labels": ["Session", "SubSession", "SST_EVENT"], "session_id": node_id},
-        )
-        await store.flush()
+            await store.upsert_node(
+                node_id,
+                {
+                    "labels": ["Session", "SubSession", "SST_EVENT"],
+                    "session_id": node_id,
+                },
+            )
+            await store.flush()
 
-        final = _terminals(await _labels(store, node_id))
-        assert final == ["SubSession"], (
-            f"RootSession→SubSession: expected [SubSession], got {final}"
-        )
-        await store.close()
+            final = _terminals(await _labels(store, node_id))
+            assert final == ["SubSession"], (
+                f"RootSession→SubSession: expected [SubSession], got {final}"
+            )
+        finally:
+            await store.close()
 
     async def test_non_terminal_labels_untouched(
         self, neo4j_container: dict[str, Any]
@@ -197,21 +215,23 @@ class TestLabelAssignmentsPath:
 
         store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
 
-        await store.upsert_node(
-            node_id,
-            {
-                "labels": ["Session", "SubSession", "SST_EVENT", "MountPlan"],
-                "session_id": node_id,
-            },
-        )
-        await store.flush()
-
-        all_labels = await _labels(store, node_id)
-        for lbl in ("Session", "SST_EVENT", "MountPlan", "SubSession"):
-            assert lbl in all_labels, (
-                f"non-terminal label {lbl!r} was stripped: {all_labels}"
+        try:
+            await store.upsert_node(
+                node_id,
+                {
+                    "labels": ["Session", "SubSession", "SST_EVENT", "MountPlan"],
+                    "session_id": node_id,
+                },
             )
-        await store.close()
+            await store.flush()
+
+            all_labels = await _labels(store, node_id)
+            for lbl in ("Session", "SST_EVENT", "MountPlan", "SubSession"):
+                assert lbl in all_labels, (
+                    f"non-terminal label {lbl!r} was stripped: {all_labels}"
+                )
+        finally:
+            await store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -238,22 +258,28 @@ class TestPatchPath:
 
         store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
 
-        await _create_bare_session(store, node_id)
+        try:
+            await _create_bare_session(store, node_id)
 
-        await store.set_labels(node_id, remove_labels=[], add_labels=["SubSession"])
-        await store.flush()
+            await store.set_labels(node_id, remove_labels=[], add_labels=["SubSession"])
+            await store.flush()
 
-        mid = _terminals(await _labels(store, node_id))
-        assert mid == ["SubSession"], f"after sub patch, expected SubSession, got {mid}"
+            mid = _terminals(await _labels(store, node_id))
+            assert mid == ["SubSession"], (
+                f"after sub patch, expected SubSession, got {mid}"
+            )
 
-        await store.set_labels(node_id, remove_labels=[], add_labels=["ForkedSession"])
-        await store.flush()
+            await store.set_labels(
+                node_id, remove_labels=[], add_labels=["ForkedSession"]
+            )
+            await store.flush()
 
-        final = _terminals(await _labels(store, node_id))
-        assert final == ["ForkedSession"], (
-            f"patch Sub→Forked: expected [ForkedSession], got {final}"
-        )
-        await store.close()
+            final = _terminals(await _labels(store, node_id))
+            assert final == ["ForkedSession"], (
+                f"patch Sub→Forked: expected [ForkedSession], got {final}"
+            )
+        finally:
+            await store.close()
 
     async def test_patch_forked_then_sub_yields_forked_only(
         self, neo4j_container: dict[str, Any]
@@ -270,20 +296,24 @@ class TestPatchPath:
 
         store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
 
-        await _create_bare_session(store, node_id)
+        try:
+            await _create_bare_session(store, node_id)
 
-        await store.set_labels(node_id, remove_labels=[], add_labels=["ForkedSession"])
-        await store.flush()
+            await store.set_labels(
+                node_id, remove_labels=[], add_labels=["ForkedSession"]
+            )
+            await store.flush()
 
-        # Lattice must strip Sub immediately when Forked is already there
-        await store.set_labels(node_id, remove_labels=[], add_labels=["SubSession"])
-        await store.flush()
+            # Lattice must strip Sub immediately when Forked is already there
+            await store.set_labels(node_id, remove_labels=[], add_labels=["SubSession"])
+            await store.flush()
 
-        final = _terminals(await _labels(store, node_id))
-        assert final == ["ForkedSession"], (
-            f"patch Forked→Sub: expected [ForkedSession] (Sub stripped), got {final}"
-        )
-        await store.close()
+            final = _terminals(await _labels(store, node_id))
+            assert final == ["ForkedSession"], (
+                f"patch Forked→Sub: expected [ForkedSession] (Sub stripped), got {final}"
+            )
+        finally:
+            await store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -317,20 +347,24 @@ class TestConcurrentLatticeConvergence:
         """
         # Bootstrap a bare Session node
         bootstrap = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
-        await bootstrap.upsert_node(
-            node_id, {"labels": ["Session"], "session_id": node_id}
-        )
-        await bootstrap.flush()
-        await bootstrap.close()
+        try:
+            await bootstrap.upsert_node(
+                node_id, {"labels": ["Session"], "session_id": node_id}
+            )
+            await bootstrap.flush()
+        finally:
+            await bootstrap.close()
 
         async def write_label(label: str) -> None:
             store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
-            await store.upsert_node(
-                node_id,
-                {"labels": ["Session", label, "SST_EVENT"], "session_id": node_id},
-            )
-            await store.flush()
-            await store.close()
+            try:
+                await store.upsert_node(
+                    node_id,
+                    {"labels": ["Session", label, "SST_EVENT"], "session_id": node_id},
+                )
+                await store.flush()
+            finally:
+                await store.close()
 
         await asyncio.gather(write_label(label_a), write_label(label_b))
 

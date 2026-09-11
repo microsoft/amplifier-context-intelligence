@@ -42,6 +42,7 @@ def _line(event: str, workspace: str, data: dict[str, Any]) -> bytes:
         "utf-8"
     )
 
+
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
@@ -379,56 +380,65 @@ async def test_finalization_path_freezes_then_restart_then_drains(
     # Leg 1: OLD-FREEZE — enormous flush bounds -> single-transaction OOM
     # -----------------------------------------------------------------------
     reg, worker, store, handlers = await _make(rows=10_000_000, byts=10_000_000_000)
-    offset_before = await _committed_offset()  # 0 — nothing committed yet
+    # Wrapped in try/finally: several assertions follow before the close,
+    # and this store's driver must not leak against the capped container on
+    # an assertion failure.
+    try:
+        offset_before = await _committed_offset()  # 0 — nothing committed yet
 
-    with caplog.at_level(logging.ERROR, logger="context_intelligence_server"):
-        await reg._finalize_session(worker, handlers)
+        with caplog.at_level(logging.ERROR, logger="context_intelligence_server"):
+            await reg._finalize_session(worker, handlers)
 
-    # OOM cause must be positively asserted — not weakened to a proxy.
-    assert "finalize_tail_flush_failed" in caplog.text, (
-        "Expected 'finalize_tail_flush_failed' in registry log"
-    )
-    assert _OOM_CODE in caplog.text, (
-        f"Expected OOM code {_OOM_CODE!r} in caplog — verify that "
-        "_finalize_session uses logger.exception (carrying the traceback), "
-        "not plain logger.error without exc_info"
-    )
-    # Worker must remain registered — _finalize_session returned without cleanup.
-    assert reg._workers.get(sid) is not None, (
-        "Worker must still be registered after OOM freeze"
-    )
-    # Committed offset must NOT have advanced — the tail is uncommitted.
-    assert await _committed_offset() == offset_before, (
-        "Committed offset must be frozen (OOM leaves tail uncommitted)"
-    )
-    # Zero f-* nodes were written to Neo4j (the OOM'd transaction rolled back).
-    records = await store.execute_query(
-        "MATCH (n) WHERE n.node_id STARTS WITH $prefix RETURN count(n) AS cnt",
-        {"prefix": "f-"},
-        workspace="*",
-    )
-    assert records[0]["cnt"] == 0, "No f-* nodes should be committed after OOM"
-    await store._driver.close()
+        # OOM cause must be positively asserted — not weakened to a proxy.
+        assert "finalize_tail_flush_failed" in caplog.text, (
+            "Expected 'finalize_tail_flush_failed' in registry log"
+        )
+        assert _OOM_CODE in caplog.text, (
+            f"Expected OOM code {_OOM_CODE!r} in caplog — verify that "
+            "_finalize_session uses logger.exception (carrying the traceback), "
+            "not plain logger.error without exc_info"
+        )
+        # Worker must remain registered — _finalize_session returned without cleanup.
+        assert reg._workers.get(sid) is not None, (
+            "Worker must still be registered after OOM freeze"
+        )
+        # Committed offset must NOT have advanced — the tail is uncommitted.
+        assert await _committed_offset() == offset_before, (
+            "Committed offset must be frozen (OOM leaves tail uncommitted)"
+        )
+        # Zero f-* nodes were written to Neo4j (the OOM'd transaction rolled back).
+        records = await store.execute_query(
+            "MATCH (n) WHERE n.node_id STARTS WITH $prefix RETURN count(n) AS cnt",
+            {"prefix": "f-"},
+            workspace="*",
+        )
+        assert records[0]["cnt"] == 0, "No f-* nodes should be committed after OOM"
+    finally:
+        await store._driver.close()
 
     # -----------------------------------------------------------------------
     # Leg 2: RESTART still old — proves freeze survives a fresh registry start
     # -----------------------------------------------------------------------
     caplog.clear()
     reg2, worker2, store2, handlers2 = await _make(rows=10_000_000, byts=10_000_000_000)
+    # Wrapped in try/finally: several assertions follow before the close,
+    # and this store's driver must not leak against the capped container on
+    # an assertion failure.
+    try:
+        with caplog.at_level(logging.ERROR, logger="context_intelligence_server"):
+            await reg2._finalize_session(worker2, handlers2)
 
-    with caplog.at_level(logging.ERROR, logger="context_intelligence_server"):
-        await reg2._finalize_session(worker2, handlers2)
-
-    assert await _committed_offset() == offset_before, (
-        "Offset must still be frozen after second old-bounds restart"
-    )
-    records2 = await store2.execute_query(
-        "MATCH (n) WHERE n.node_id STARTS WITH $prefix RETURN count(n) AS cnt",
-        {"prefix": "f-"},
-        workspace="*",
-    )
-    assert records2[0]["cnt"] == 0, "No f-* nodes after second OOM attempt"
-    await store2._driver.close()
+        assert await _committed_offset() == offset_before, (
+            "Offset must still be frozen after second old-bounds restart"
+        )
+        records2 = await store2.execute_query(
+            "MATCH (n) WHERE n.node_id STARTS WITH $prefix RETURN count(n) AS cnt",
+            {"prefix": "f-"},
+            workspace="*",
+        )
+        assert records2[0]["cnt"] == 0, "No f-* nodes after second OOM attempt"
+    finally:
+        await store2._driver.close()
 
     # -----------------------------------------------------------------------
     # Leg 3: RESTART FIXED — chunked flush drains in multiple small tx
