@@ -26,6 +26,79 @@ logger = logging.getLogger("context_intelligence_server")
 _DRAIN_MAX_BATCH = 100
 _DRAIN_POLL_INTERVAL = 0.05  # idle poll cadence; bounded by flush_timeout
 
+# --- transient-vs-poison retry policy -------------------------------------
+#
+# INCIDENT 2026-09-09 (production, team-shared): 78,422 healthy events were
+# dead-lettered -- and the offset committed past them -- because a Neo4j
+# connection-pool timeout burned `max_delivery_attempts` and fell into
+# `_handle_exhausted_batch`, which dead-letters line by line.
+#
+# The root cause was that ONE retry budget was spent on two incompatible
+# jobs: quarantining a poison PAYLOAD, and surviving an unavailable
+# DEPENDENCY. They need opposite policies. No number of retries makes a
+# malformed payload valid, and no payload change makes a dead socket answer.
+#
+# So: a failure that the retry could plausibly fix (the database is down,
+# the pool is exhausted, the lock timed out) retries FOREVER with exponential
+# backoff and is never dead-lettered. Only a deterministic per-record failure
+# is dead-letterable.
+#
+# Retrying forever stalls that session's drain and grows its on-disk queue.
+# That is the deliberate trade: a stalled drainer is visible (queue depth,
+# `drain_batch_transient_retry` warnings) and fully recoverable, whereas a
+# dead-letter is silent and permanent.
+_TRANSIENT_BACKOFF_BASE = 0.05  # first retry delay; doubles per attempt
+_TRANSIENT_BACKOFF_CAP = 30.0  # ceiling, so a long outage polls calmly
+_TRANSIENT_LOG_EVERY = 20  # warn every Nth attempt, not every attempt
+
+
+def _is_transient_infra_error(exc: BaseException) -> bool:
+    """True when *exc* is an infrastructure failure a later retry could fix.
+
+    Deliberately an ALLOW-LIST of known-transient types rather than a broad
+    catch: a type nobody has classified falls through to the poison path,
+    which is the pre-existing behaviour. The cost of a wrong answer is
+    asymmetric -- misclassifying transient as poison DESTROYS data silently,
+    misclassifying poison as transient only stalls one session loudly -- so
+    every entry here is a type whose retry is genuinely worth waiting for.
+    """
+    # Imported lazily so registry.py keeps importing without a live driver.
+    from neo4j.exceptions import (
+        ConnectionPoolError,
+        ServiceUnavailable,
+        SessionExpired,
+        TransientError,
+    )
+
+    return isinstance(
+        exc,
+        (
+            # Pool exhaustion/acquisition timeout -- the 2026-09-09 cause.
+            # ConnectionAcquisitionTimeoutError subclasses ConnectionPoolError.
+            ConnectionPoolError,
+            # Database unreachable / failed over / routing table stale.
+            ServiceUnavailable,
+            SessionExpired,
+            # Server-side retryable: deadlock, lock acquisition timeout.
+            TransientError,
+            # Socket- and clock-level failures under the driver.
+            asyncio.TimeoutError,
+            ConnectionError,
+            OSError,
+        ),
+    )
+
+
+class _TransientInfraFailure(Exception):
+    """Internal signal: abort line isolation, the dependency is down.
+
+    Raised inside `_handle_exhausted_batch` when an individual record's
+    failure turns out to be transient. Isolation must stop immediately
+    WITHOUT dead-lettering or committing that record, so the drain loop can
+    go back to retrying it. Never escapes `drain_worker`.
+    """
+
+
 # Bounded retry count for the finalize delete-drained loop; not operator-tunable.
 # No backoff between attempts -- sleeping would widen the race window this closes.
 _FINALIZE_DELETE_ATTEMPTS = 3
@@ -398,6 +471,9 @@ class SessionRegistry:
         poll_interval = min(flush_timeout, _DRAIN_POLL_INTERVAL)
         idle_elapsed = 0.0
         attempts = 0
+        # Separate from `attempts` on purpose: the poison budget is finite and
+        # ends in a dead-letter, the transient one is unbounded and never does.
+        transient_attempts = 0
 
         while True:
             try:
@@ -470,7 +546,37 @@ class SessionRegistry:
                     # else start_drain's store_closed guard refuses it forever.
                     self._deregister(session_id)
                     return
-                except Exception:
+                except Exception as exc:
+                    if _is_transient_infra_error(exc):
+                        # The dependency is down, not the payload. Retrying is
+                        # the whole point -- never spend the poison budget, so
+                        # `_handle_exhausted_batch` is unreachable from here
+                        # and nothing is dead-lettered or committed past.
+                        transient_attempts += 1
+                        self.record_write_retry()
+                        delay = min(
+                            _TRANSIENT_BACKOFF_BASE * (2 ** (transient_attempts - 1)),
+                            _TRANSIENT_BACKOFF_CAP,
+                        )
+                        if (
+                            transient_attempts == 1
+                            or transient_attempts % _TRANSIENT_LOG_EVERY == 0
+                        ):
+                            logger.warning(
+                                "drain_batch_transient_retry session=%s attempt=%d "
+                                "backoff=%.2fs error=%s; events are held in the "
+                                "queue, NOT dead-lettered",
+                                session_id,
+                                transient_attempts,
+                                delay,
+                                exc,
+                                extra={"session_id": session_id},
+                            )
+                        await asyncio.sleep(delay)
+                        continue
+
+                    # Deterministic failure: the pre-existing poison path.
+                    transient_attempts = 0
                     attempts += 1
                     self.record_write_retry()
                     # First failure: WARNING w/ traceback. Middle attempts: DEBUG.
@@ -499,9 +605,36 @@ class SessionRegistry:
                         )
                     if attempts >= self._max_delivery_attempts:
                         # Budget spent: isolate the batch line-by-line and dead-letter.
-                        terminal_seen = await self._handle_exhausted_batch(
-                            worker, batch, handlers
-                        )
+                        try:
+                            terminal_seen = await self._handle_exhausted_batch(
+                                worker, batch, handlers
+                            )
+                        except _TransientInfraFailure as abort:
+                            # The dependency went down PART WAY THROUGH isolation.
+                            # Records already isolated are accounted for; the one
+                            # that hit this was neither dead-lettered nor
+                            # committed. Reset the poison budget and fall back to
+                            # transient retry rather than dead-lettering healthy
+                            # records against a database that simply is not there.
+                            attempts = 0
+                            transient_attempts += 1
+                            delay = min(
+                                _TRANSIENT_BACKOFF_BASE
+                                * (2 ** (transient_attempts - 1)),
+                                _TRANSIENT_BACKOFF_CAP,
+                            )
+                            logger.warning(
+                                "drain_isolation_aborted_transient session=%s "
+                                "attempt=%d backoff=%.2fs error=%s; remaining "
+                                "records held in the queue, NOT dead-lettered",
+                                session_id,
+                                transient_attempts,
+                                delay,
+                                abort.__cause__,
+                                extra={"session_id": session_id},
+                            )
+                            await asyncio.sleep(delay)
+                            continue
                         if terminal_seen:
                             # Mirror the normal terminal branch below: the
                             # session:end record was left uncommitted, so
@@ -632,6 +765,14 @@ class SessionRegistry:
 
         Returns False when the whole batch is isolated without ever
         reaching a terminal record (unchanged behavior: no finalization).
+
+        Raises ``_TransientInfraFailure`` when a record's individual failure
+        is an infrastructure failure rather than a property of that record
+        (see ``_is_transient_infra_error``). Isolation stops there with that
+        record NEITHER dead-lettered NOR committed, and the caller returns to
+        transient retry. Without this, an outage that begins mid-isolation
+        dead-letters every remaining healthy record in the batch -- the
+        2026-09-09 loss mechanism, just one level down.
         """
         qm = self.queue_manager
         session_id = worker.session_id
@@ -668,6 +809,14 @@ class SessionRegistry:
                 await self._flush_barrier(worker)
                 wrote = True
             except Exception as exc:
+                if _is_transient_infra_error(exc):
+                    # NOT this record's fault -- the database is unreachable.
+                    # Dead-lettering here is exactly how 78,422 healthy events
+                    # were destroyed on 2026-09-09. Abort isolation with
+                    # nothing dead-lettered and nothing committed for this
+                    # record; the drain loop retries it.
+                    worker.services.graph.discard_buffer()
+                    raise _TransientInfraFailure(str(exc)) from exc
                 await qm.dead_letter(session_id, rec.raw, str(exc))  # no re-framing
                 logger.warning(
                     "dead_letter session=%s error=%s",
