@@ -8,7 +8,6 @@ token when an API key is configured.
 from __future__ import annotations
 
 import base64
-import json
 import logging
 from typing import Any
 
@@ -100,6 +99,17 @@ async def replay_dead_letters(worker_key: str, request: Request) -> dict[str, An
     original ingest, so ``record_accepted`` is intentionally NOT called here —
     replay only moves a line from dead -> in_queue. Only ``record_replayed`` is
     advanced. An unsafe worker key yields a 400.
+
+    Attribution: each line's ``created_by`` MUST be carried into
+    ``get_or_create``. Neo4j stamps it ``ON CREATE SET``
+    (``neo4j_store.py:183``) — write-once — and replay runs long after the
+    session ended, so the worker has been deregistered and ``get_or_create``
+    takes the CREATE branch. Dropping it here would stamp every recovered
+    node ``NULL`` permanently: the events would be back in the graph but
+    absent from every per-contributor report, while the ``.dead.jsonl`` that
+    proved what happened is purged below. The value is already on the line —
+    ``post_events`` stamps it at ingest (``main.py``) — so this reuses the
+    same total parse the boot-recovery path uses.
     """
     registry = request.app.state.registry
     qm = registry.queue_manager
@@ -110,12 +120,21 @@ async def replay_dead_letters(worker_key: str, request: Request) -> dict[str, An
     if not records:
         return {"worker_key": worker_key, "replayed": 0}
 
+    # Deferred import: main imports this router at module load, so a
+    # top-level import would be circular. By call time main is fully loaded.
+    from context_intelligence_server.main import (
+        _parse_workspace_and_creator,
+    )
+
     replayed = 0
     for record in records:
         raw = _decode_payload(record)
-        obj = json.loads(raw)
-        workspace = obj.get("workspace", "")
-        registry.get_or_create(worker_key, workspace)
+        # Total parse — never raises. A torn line (13 such records existed in
+        # the 2026-09-09 production spool) must still be re-enqueued rather
+        # than aborting the loop and stranding its whole worker key.
+        parsed = _parse_workspace_and_creator(raw)
+        workspace, created_by = parsed if parsed is not None else ("", None)
+        registry.get_or_create(worker_key, workspace, created_by=created_by)
         await qm.append(worker_key, raw)
         replayed += 1
 

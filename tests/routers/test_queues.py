@@ -111,6 +111,101 @@ class TestDeadLetterPurge:
         assert response.status_code == 400
 
 
+class TestDeadLetterReplayPreservesContributor:
+    """Replay MUST carry each line's ``created_by`` into ``get_or_create``.
+
+    INCIDENT 2026-09-09 (production, team-shared): 82,880 events were
+    dead-lettered, 78,422 of them healthy events lost to a transient Neo4j
+    pool timeout. Recovering them means replaying the dead-letter files.
+
+    But ``created_by`` is stamped ``ON CREATE SET`` in Neo4j
+    (``neo4j_store.py:183``) -- WRITE-ONCE. Replay happens long after the
+    session ended, so the worker has been deregistered and ``get_or_create``
+    takes the CREATE branch. Replaying without ``created_by`` therefore
+    stamps every recovered node ``NULL``, permanently: the events are back
+    in the graph but invisible to every per-contributor report, and the
+    ``.dead.jsonl`` that proved what happened has been purged.
+
+    The contributor IS on the queued line -- ``post_events`` stamps
+    ``body_obj["created_by"] = contributor_id`` at ``main.py:1183``. Replay
+    just has to read it back, exactly as the boot-recovery path already does
+    via ``_parse_workspace_and_creator`` (``main.py:113-129``).
+
+    A recovery that silently loses attribution is worse than no recovery:
+    it looks like it worked.
+    """
+
+    @pytest.mark.anyio
+    async def test_replay_passes_created_by_from_the_queued_line(
+        self,
+        client: httpx.AsyncClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The contributor stamped at ingest survives the round trip."""
+        qm = _point_registry_at(tmp_path)
+        await qm.dead_letter(
+            "k1",
+            b'{"workspace": "ws1", "created_by": "sam", "a": 1}\n',
+            "pool-timeout",
+        )
+
+        calls: list[tuple[str, str, str | None]] = []
+        monkeypatch.setattr(
+            registry,
+            "get_or_create",
+            lambda session_id, workspace, created_by=None: calls.append(
+                (session_id, workspace, created_by)
+            ),
+        )
+
+        response = await client.post("/queues/dead-letter/k1/replay")
+        assert response.status_code == 200
+
+        assert calls == [("k1", "ws1", "sam")], (
+            "replay dropped created_by; recovered nodes would be stamped NULL "
+            "by the write-once ON CREATE SET and vanish from per-user reports"
+        )
+
+    @pytest.mark.anyio
+    async def test_replay_survives_an_unparseable_line(
+        self,
+        client: httpx.AsyncClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A torn line is still re-enqueued, not raised over.
+
+        13 of the 82,880 production dead letters are JSON parse errors from
+        torn queue framing. A replay that raises on the first of them aborts
+        mid-loop, leaving the dead-letter file unpurged and its worker key
+        unrecoverable. Parsing here is best-effort: no workspace, no
+        contributor, but the bytes still go back on the log.
+        """
+        qm = _point_registry_at(tmp_path)
+        await qm.dead_letter("k1", b'{"workspace": "ws1", "trunc', "torn-line")
+        await qm.dead_letter(
+            "k1", b'{"workspace": "ws1", "created_by": "sam"}\n', "pool-timeout"
+        )
+
+        calls: list[tuple[str, str, str | None]] = []
+        monkeypatch.setattr(
+            registry,
+            "get_or_create",
+            lambda session_id, workspace, created_by=None: calls.append(
+                (session_id, workspace, created_by)
+            ),
+        )
+
+        response = await client.post("/queues/dead-letter/k1/replay")
+        assert response.status_code == 200
+        assert response.json() == {"worker_key": "k1", "replayed": 2}
+
+        # Both lines re-enqueued; the torn one carries no attribution.
+        assert calls == [("k1", "", None), ("k1", "ws1", "sam")]
+        assert await qm.read_dead_letters("k1") == []
+
+
 class TestDeadLetterReplay:
     """POST /queues/dead-letter/{worker_key}/replay re-enqueues then purges."""
 
@@ -126,11 +221,13 @@ class TestDeadLetterReplay:
         await qm.dead_letter("k1", b'{"workspace": "ws1", "a": 2}\n', "boom-2")
 
         # Stub get_or_create so no real worker/drain task is started.
-        calls: list[tuple[str, str]] = []
+        calls: list[tuple[str, str, str | None]] = []
         monkeypatch.setattr(
             registry,
             "get_or_create",
-            lambda session_id, workspace: calls.append((session_id, workspace)),
+            lambda session_id, workspace, created_by=None: calls.append(
+                (session_id, workspace, created_by)
+            ),
         )
 
         before = registry.pipeline_counters()
@@ -147,7 +244,7 @@ class TestDeadLetterReplay:
         assert await qm.read_dead_letters("k1") == []
 
         # get_or_create was invoked for each replayed record.
-        assert calls == [("k1", "ws1"), ("k1", "ws1")]
+        assert calls == [("k1", "ws1", None), ("k1", "ws1", None)]
 
         # Conservation: replayed advances by 2, accepted is UNCHANGED.
         after = registry.pipeline_counters()
@@ -165,7 +262,7 @@ class TestDeadLetterReplay:
         monkeypatch.setattr(
             registry,
             "get_or_create",
-            lambda session_id, workspace: None,
+            lambda session_id, workspace, created_by=None: None,
         )
 
         before = registry.pipeline_counters()
