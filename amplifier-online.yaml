@@ -40,17 +40,63 @@ services:
     # shared CAE has pull creds for. Pin to the current built tag (built on the
     # approved S360 base per docs/azure-deployment.md); bump this when a newer tag
     # is pushed.
-    image: amplifieronlinecr.azurecr.io/amplifier-context-intelligence-api:1b2a38de8654363a2a090844a30b890e9b3e4f85
+    #
+    # NOT the source of truth for the running image. Deployment happens in CI:
+    # .github/workflows/context-intelligence-api-build-deploy.yaml builds
+    # ghcr.io/<repo>-api:${{ github.sha }} and POSTs it to the provisioner as an
+    # EXPLICIT `image` field alongside this manifest (`--arg image`, line ~119),
+    # and that explicit field WINS over this pin. Proof: the deploy that produced
+    # the currently-running b5434de3... shipped this file still pinned to
+    # 1b2a38de..., and b5434de3 is what runs.
+    #
+    # Repinned 2026-09-11 to the tag actually running, matching the precedent in
+    # 27c9e09 "fix: repin manifest image to actual deployed tag". It is cosmetic
+    # on the CI path, but deploy.sh:36 still calls `amplifier-online up`, where a
+    # stale pin WOULD roll production backwards -- so an accurate pin removes a
+    # latent hazard rather than creating one. Verified as-built 2026-09-11:
+    #   az containerapp show -n context-intelligence-api -g ao-context-intelligence-rg \
+    #     --query properties.template.containers[0].image
+    #   -> ...amplifier-context-intelligence-api:b5434de3417e529948f65886e802ff683418a893
+    image: amplifieronlinecr.azurecr.io/amplifier-context-intelligence-api:b5434de3417e529948f65886e802ff683418a893
     port: 8000  # gunicorn + uvicorn; matches EXPOSE 8000 in the Dockerfile
 
     # Persistent /data — backs the oid→contributor store, durable ingest queues,
     # blobs, and logs. Survives restarts/revision swaps. Single-instance enforced.
     volume:
       mount_path: /data
-      size_gib: 100      # Premium minimum is 100 GiB (billed on provisioned size)
+      # KNOWN, DELIBERATE DRIFT -- do not "fix" this to match the live share.
+      #
+      # As-built on 2026-09-11 the live share is 1024 GiB, not 100:
+      #   az storage share-rm show --storage-account vol7eeflzripgbdq \
+      #     -g ao-context-intelligence-rg -n appdata --expand stats
+      #   -> shareQuota 1024, shareUsageBytes 489,914,491,055 (456.3 GiB, 44.6%)
+      # It was grown out of band and this field was never updated.
+      #
+      # It stays at 100 ANYWAY, because this field is a provisioner INPUT, not a
+      # description of reality, and editing it is classified destructive by our
+      # own runbook -- docs/azure-deployment.md, "The ONLY things that can lose
+      # /data": "Change size_gib or add/change tier | Resize/tier change can
+      # re-provision a new, empty share - no data migration", followed by
+      # "Treat any size_gib/tier edit as potentially destructive."
+      #
+      # That risk is live on every merge: the CI deploy below yq's this whole
+      # file into the provisioner POST, so a size_gib edit ships the moment any
+      # context_intelligence_server/** change lands on main.
+      #
+      # And 100 is empirically safe in place: the currently-running deploy
+      # (b5434de) shipped size_gib: 100 against the already-1024 GiB share and
+      # neither shrank it nor failed --
+      #   git show b5434de3...:amplifier-online.yaml | grep -A2 'volume:'
+      # so the provisioner demonstrably does not reconcile an existing share
+      # downward. Leaving it is the safe path; changing it is an untested resize
+      # on 456 GiB of production data.
+      size_gib: 100
       tier: premium      # Premium_LRS SSD share. Standard Azure Files (SMB) per-op
                          # latency caps the write-heavy queue/blob throughput and
                          # builds a standing write backlog under pressure.
+      # Capacity note: the spool (/data/queues) is only ~2.8 GB of that 456 GiB
+      # per GET /status. The bulk is /data/blobs -- one directory per session,
+      # no pruning. Blob retention is a separate follow-up, not handled here.
 
     env:
       # === Force Entra auth (server DEFAULTS to static — must override) ===
