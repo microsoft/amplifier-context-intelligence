@@ -73,3 +73,38 @@ def test_run_gunicorn_timeouts_respect_settings_override(
     cfg = instances[0].cfg
     assert cfg.timeout == 300
     assert cfg.graceful_timeout == 45
+
+
+# ---------------------------------------------------------------------------
+# gunicorn control socket must stay OFF (fork-deadlock guard, gunicorn #3529)
+# ---------------------------------------------------------------------------
+
+
+def test_run_disables_the_gunicorn_control_socket() -> None:
+    """The `gunicornc` control socket must never be enabled.
+
+    gunicorn 25.1.0 runs that control socket as an asyncio event loop in a
+    DAEMON THREAD inside the arbiter, started immediately before the first
+    os.fork(). A fork landing while that thread is inside a blocking write()
+    on the shared stderr stream leaves the io.BufferedWriter's internal lock
+    held in the child by a thread that does not exist there -- CPython's
+    os.register_at_fork resets logging.Handler locks but not that one -- so
+    the child deadlocks forever on gunicorn's own "Booting worker with pid"
+    log line: no output, no traceback, no exit.
+
+    This is a REGRESSION GUARD, not a style check. The failure it prevents is
+    intermittent and silent (observed twice in CI as an opaque 90s hang), so
+    nothing else in the suite would notice the flag being dropped -- and a
+    gunicorn upgrade past the upstream fix (25.2.0, #3520) does not make the
+    flag redundant: we do not use `gunicornc`, and enabling it also writes a
+    socket file into the working directory.
+    """
+    instances: list[BaseApplication] = []
+
+    def _capture(self: BaseApplication) -> None:
+        instances.append(self)
+
+    with patch.object(BaseApplication, "run", _capture):
+        run()
+
+    assert instances[0].cfg.control_socket_disable is True

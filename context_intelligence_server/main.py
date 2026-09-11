@@ -1329,6 +1329,30 @@ def run() -> None:
                 "timeout": _settings.gunicorn_worker_timeout,
                 "graceful_timeout": _settings.gunicorn_graceful_timeout,
                 "loglevel": _settings.log_level.lower(),
+                # Fork-deadlock guard -- gunicorn #3529 (fixed upstream in
+                # 25.2.0 by #3520; we are pinned to >=23.0.0 and resolve to
+                # 25.1.0, the ONLY affected release).
+                #
+                # 25.1.0 added a `gunicornc` control socket that runs an
+                # asyncio event loop in a DAEMON THREAD inside the arbiter,
+                # on by default, started by Arbiter.start() immediately
+                # before the first os.fork(). If that thread is inside a
+                # blocking write() on the shared stderr stream at the moment
+                # of the fork, the child inherits the io.BufferedWriter's
+                # internal lock already held by a thread that does not exist
+                # in the child. CPython's os.register_at_fork resets
+                # logging.Handler locks but NOT that one, so the child hangs
+                # forever on its very first log call -- gunicorn's own
+                # "Booting worker with pid" (arbiter.py) -- with no output,
+                # no traceback and no exit.
+                #
+                # Seen twice in CI as an opaque 90s hang whose captured
+                # stderr stopped dead after "Control socket listening at".
+                # We do not use `gunicornc`, so disabling it removes the
+                # thread -- and the race -- at the source. Keep this flag
+                # even after a gunicorn upgrade: we have no use for the
+                # control socket, and it writes a socket file into cwd.
+                "control_socket_disable": True,
             }.items():
                 self.cfg.set(key, value)
 
