@@ -2431,3 +2431,255 @@ class TestParseLineWorkingDir:
         ).encode("utf-8")
         _event, _ws, working_dir, _data = SessionRegistry._parse_line(raw)
         assert working_dir is None
+
+
+class TestTransientInfraFailuresAreNeverDeadLettered:
+    """A dependency outage must never be charged to the payload.
+
+    INCIDENT 2026-09-09 (production, team-shared). ``GET /status`` on the
+    shared instance reported ``dead_letter_total: 82,880`` against
+    ``written_total: 116,954``. 78,422 of those dead letters carried the
+    single error string::
+
+        failed to obtain a connection from the pool within 30.0s (timeout)
+
+    Those were healthy events. The Neo4j connection pool was briefly
+    exhausted, the batch burned ``max_delivery_attempts``, and
+    ``_handle_exhausted_batch`` dead-lettered every line AND committed the
+    offset past it -- so they were never retried and never replayed on boot.
+    The clients had already been told ``202``.
+
+    The defect was policy, not mechanics: ONE retry budget served two
+    incompatible jobs -- quarantining a poison PAYLOAD and surviving an
+    unavailable DEPENDENCY. Retrying cannot fix a malformed payload, and no
+    payload change can make a dead socket answer.
+
+    These tests pin the split. They assert on the SPECIFIC forbidden
+    outcome -- data destroyed -- not on liveness.
+    """
+
+    @staticmethod
+    def _pool_timeout() -> Exception:
+        """The exact driver exception the production spool recorded."""
+        from neo4j.exceptions import ConnectionAcquisitionTimeoutError
+
+        return ConnectionAcquisitionTimeoutError(
+            "failed to obtain a connection from the pool within 30.0s (timeout)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_pool_timeout_holds_the_event_and_recovers_it(
+        self, reg_qm: tuple[SessionRegistry, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The 2026-09-09 loss, reproduced: outage then recovery, nothing lost.
+
+        Flush fails with a pool timeout more times than the poison budget
+        allows, then succeeds. Pre-fix, the budget was spent and the line was
+        dead-lettered + committed past. Post-fix it is held in the queue and
+        written when the pool recovers.
+        """
+        reg, qm = reg_qm
+        sid = "s-pool-timeout"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+
+        # Fail well past max_delivery_attempts, then recover.
+        fail_times = reg._max_delivery_attempts + 3
+        calls = {"n": 0}
+
+        async def flaky_flush(*_a: Any, **_kw: Any) -> None:
+            calls["n"] += 1
+            if calls["n"] <= fail_times:
+                raise TestTransientInfraFailuresAreNeverDeadLettered._pool_timeout()
+
+        worker.services.graph.flush = flaky_flush  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        dead: list[tuple[str, bytes, str]] = []
+
+        async def record_dead(key: str, raw: bytes, err: str) -> None:
+            dead.append((key, raw, err))
+
+        qm.dead_letter = record_dead  # type: ignore[method-assign]
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            await qm.append(sid, _line("tool:pre", "/ws", {"session_id": sid}))
+            with caplog.at_level(logging.WARNING, logger="context_intelligence_server"):
+                task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
+                for _ in range(400):
+                    await asyncio.sleep(0.02)
+                    if calls["n"] > fail_times:
+                        break
+                await asyncio.sleep(0.15)  # let the successful commit land
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        assert dead == [], (
+            f"a transient pool timeout dead-lettered {len(dead)} healthy "
+            f"event(s) -- this is the 2026-09-09 mechanism that destroyed "
+            f"78,422 events: {dead[:2]}"
+        )
+        assert any(
+            "drain_batch_transient_retry" in r.getMessage() for r in caplog.records
+        ), "a transient retry must be visible to an operator"
+        # The event survived the outage and was ultimately written.
+        assert calls["n"] > fail_times
+
+    @pytest.mark.asyncio
+    async def test_pool_timeout_does_not_advance_the_committed_offset(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """The offset is what makes the loss PERMANENT -- it must not move.
+
+        Dead-lettering alone is recoverable (the bytes are in .dead.jsonl).
+        Committing past them is what guarantees they are never retried and
+        never picked up by boot recovery.
+        """
+        reg, qm = reg_qm
+        sid = "s-offset-hold"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock(  # type: ignore[method-assign]
+            side_effect=TestTransientInfraFailuresAreNeverDeadLettered._pool_timeout()
+        )
+        reg._register_for_test(worker)
+
+        committed: list[int] = []
+        real_commit = qm.commit
+
+        async def spy_commit(key: str, offset: int) -> None:
+            committed.append(offset)
+            await real_commit(key, offset)
+
+        qm.commit = spy_commit  # type: ignore[method-assign]
+        dead: list[Any] = []
+
+        async def record_dead(key: str, raw: bytes, err: str) -> None:
+            dead.append((key, raw, err))
+
+        qm.dead_letter = record_dead  # type: ignore[method-assign]
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            await qm.append(sid, _line("tool:pre", "/ws", {"session_id": sid}))
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.05))
+            # Far longer than the 5 x 50ms it used to take to exhaust the budget.
+            await asyncio.sleep(1.5)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert dead == [], "transient failure must not dead-letter"
+        assert committed == [], (
+            f"offset advanced to {committed} while the database was "
+            f"unreachable -- the event can never be retried or recovered"
+        )
+        # The line is still on the log, still uncommitted, still replayable.
+        batch = await qm.read_batch(sid, max_items=10)
+        assert len(batch.records) == 1
+
+    @pytest.mark.asyncio
+    async def test_outage_starting_mid_isolation_aborts_without_dead_lettering(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """Line isolation is the second place the same loss can happen.
+
+        A batch can fail for a genuinely poison reason, enter
+        ``_handle_exhausted_batch``, and THEN meet an outage while isolating.
+        Pre-fix, every remaining healthy record in that batch was
+        dead-lettered against a database that simply was not there.
+        """
+        reg, qm = reg_qm
+        sid = "s-isolation-abort"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock(  # type: ignore[method-assign]
+            side_effect=TestTransientInfraFailuresAreNeverDeadLettered._pool_timeout()
+        )
+        reg._register_for_test(worker)
+        qm.dead_letter = AsyncMock()  # type: ignore[method-assign]
+        qm.commit = AsyncMock()  # type: ignore[method-assign]
+
+        healthy = MagicMock()
+        healthy.records = [
+            Record(_line("tool:pre", "/ws", {"session_id": sid}) + b"\n", 0, 80)
+        ]
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            with pytest.raises(registry_module._TransientInfraFailure):
+                await reg._handle_exhausted_batch(worker, healthy, handlers=MagicMock())
+
+        qm.dead_letter.assert_not_awaited()
+        qm.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_genuine_poison_is_still_dead_lettered(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """Guard against over-correction.
+
+        The fix must not turn the dead-letter queue off. A deterministic
+        per-record failure -- the kind no retry can fix -- must still be
+        quarantined, or one bad line stalls its session forever.
+        """
+        reg, qm = reg_qm
+        sid = "s-real-poison"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        reg._register_for_test(worker)
+        qm.dead_letter = AsyncMock()  # type: ignore[method-assign]
+        qm.commit = AsyncMock()  # type: ignore[method-assign]
+
+        # Unparseable bytes: _parse_line raises, which is not transient.
+        poison = MagicMock()
+        poison.records = [Record(b"{ not valid json", 0, 17)]
+
+        await reg._handle_exhausted_batch(worker, poison, handlers=MagicMock())
+
+        qm.dead_letter.assert_awaited()
+        qm.commit.assert_awaited()
+
+    def test_classifier_separates_infra_from_payload(self) -> None:
+        """The allow-list itself, pinned.
+
+        A type nobody has classified must fall through to the poison path
+        (the pre-existing behaviour), because the failure modes are
+        asymmetric: transient-as-poison destroys data silently, whereas
+        poison-as-transient only stalls one session loudly.
+        """
+        from neo4j.exceptions import (
+            ClientError,
+            ConnectionAcquisitionTimeoutError,
+            ServiceUnavailable,
+            SessionExpired,
+            TransientError,
+        )
+
+        is_transient = registry_module._is_transient_infra_error
+
+        # Infrastructure -- retry forever, never dead-letter.
+        assert is_transient(ConnectionAcquisitionTimeoutError("pool"))
+        assert is_transient(ServiceUnavailable("down"))
+        assert is_transient(SessionExpired("failover"))
+        assert is_transient(TransientError("deadlock"))
+        assert is_transient(asyncio.TimeoutError())
+        assert is_transient(OSError("connection reset"))
+
+        # Deterministic -- dead-letterable.
+        assert not is_transient(ValueError("Invalid Neo4j label identifier: 'X-yEvent'"))
+        assert not is_transient(ClientError("bad cypher"))
+        assert not is_transient(json.JSONDecodeError("boom", "{", 0))
+        assert not is_transient(RuntimeError("handler bug"))
