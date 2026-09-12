@@ -92,7 +92,7 @@ from context_intelligence_server.config import get_settings
 from context_intelligence_server.handlers.data_layer_3.delegation import (
     resolve_self_agent,
 )
-from context_intelligence_server.neo4j_store import Neo4jGraphStore
+from context_intelligence_server.neo4j_backend import Neo4jGraphBackend
 
 BATCH_SIZE = 1000
 
@@ -584,17 +584,33 @@ def main() -> int:
 
     settings = get_settings()
     admin = settings.resolve_neo4j_admin()
-    url = args.neo4j_url or admin.url
-    user = args.neo4j_user or admin.username
-    password = args.neo4j_password or admin.password
-    auth = (user, password) if password else admin.auth
+    # CLI overrides are applied to the resolved client config, then the backend
+    # opens the connection. This script does not build a driver of its own --
+    # nothing outside neo4j_backend does.
+    write_config = admin.model_copy(
+        update={
+            "url": args.neo4j_url or admin.url,
+            "username": args.neo4j_user or admin.username,
+            "password": args.neo4j_password or admin.password,
+        }
+    )
+    backend = Neo4jGraphBackend(
+        write_config=write_config,
+        read_config=write_config,
+        max_connection_pool_size=settings.neo4j_max_connection_pool_size,
+        lock_timeout=settings.neo4j_lock_timeout,
+    )
 
-    print(f"Connecting to Neo4j at {url} as {user}\n")
-    store = Neo4jGraphStore(uri=url, auth=auth)
-    try:
-        return asyncio.run(_run(args, store))
-    finally:
-        asyncio.run(store.close())
+    print(f"Connecting to Neo4j at {write_config.url} as {write_config.username}\n")
+
+    async def _main() -> int:
+        await backend.start()
+        try:
+            return await _run(args, backend.admin_store())
+        finally:
+            await backend.aclose()
+
+    return asyncio.run(_main())
 
 
 if __name__ == "__main__":

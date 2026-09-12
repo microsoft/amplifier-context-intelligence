@@ -41,13 +41,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from neo4j import AsyncGraphDatabase
-
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
 from context_intelligence_server.queue_manager import QueueManager
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.status import build_status_response
+from neo4j import AsyncGraphDatabase
 
 pytestmark = pytest.mark.neo4j
 
@@ -92,8 +91,9 @@ async def _low_retry_store(
         A Neo4jGraphStore ready for use against the capped container.
     """
     store = Neo4jGraphStore(
-        uri=container["bolt_url"],
-        auth=(container["user"], container["password"]),
+        driver=AsyncGraphDatabase.driver(
+            container["bolt_url"], auth=(container["user"], container["password"])
+        ),
         workspace="orphan-test",
         flush_chunk_rows=rows,
         flush_chunk_bytes=byts,
@@ -334,9 +334,12 @@ async def test_finalization_orphan_surfaces_on_status(
 
         # -----------------------------------------------------------------------
         # Teardown: close the worker's still-open store driver.
-        # _finalize_session returned early without calling _safe_close (which
-        # would have closed the driver via worker.services.graph.close()).
-        # Leaving it open causes an unclosed-resource warning in the test suite.
+        # store.close() (called via _safe_close) only ever flushes now --
+        # connection ownership belongs to whoever built the driver, which here
+        # is this test. _finalize_session also returned early without calling
+        # _safe_close at all, so nothing flushed the store either; either way,
+        # leaving the driver open causes an unclosed-resource warning in the
+        # test suite.
         # -----------------------------------------------------------------------
     finally:
         await store._driver.close()

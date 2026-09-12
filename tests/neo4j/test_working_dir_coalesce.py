@@ -30,9 +30,8 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from neo4j import GraphDatabase
-
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
+from neo4j import AsyncGraphDatabase, GraphDatabase
 
 pytestmark = pytest.mark.neo4j
 
@@ -74,8 +73,9 @@ def _cleanup_workspace(container: dict[str, Any], workspace: str) -> None:
 
 def _store(container: dict[str, Any], workspace: str) -> Neo4jGraphStore:
     return Neo4jGraphStore(
-        uri=container["bolt_url"],
-        auth=(container["user"], container["password"]),
+        driver=AsyncGraphDatabase.driver(
+            container["bolt_url"], auth=(container["user"], container["password"])
+        ),
         workspace=workspace,
     )
 
@@ -104,6 +104,7 @@ class TestWorkingDirCoalesceGates:
             assert _query_working_dir(neo4j_container, sid, ws) == "/home/user/project"
         finally:
             await store.close()
+            await store._driver.close()
             _cleanup_workspace(neo4j_container, ws)
 
     async def test_second_write_does_not_overwrite(
@@ -145,7 +146,9 @@ class TestWorkingDirCoalesceGates:
             assert _query_working_dir(neo4j_container, sid, ws) == "/original/path"
         finally:
             await first.close()
+            await first._driver.close()
             await second.close()
+            await second._driver.close()
             _cleanup_workspace(neo4j_container, ws)
 
     async def test_row_without_working_dir_does_not_null_existing(
@@ -181,4 +184,5 @@ class TestWorkingDirCoalesceGates:
             assert _query_working_dir(neo4j_container, sid, ws) == "/home/user/project"
         finally:
             await store.close()
+            await store._driver.close()
             _cleanup_workspace(neo4j_container, ws)

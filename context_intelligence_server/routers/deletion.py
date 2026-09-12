@@ -37,8 +37,7 @@ from context_intelligence_server.deletion import (
     DeletionService,
     SessionsPendingError,
 )
-from context_intelligence_server.graph_store import AmbiguousSessionError
-from context_intelligence_server.neo4j_store import Neo4jGraphStore
+from context_intelligence_server.graph_store import AmbiguousSessionError, GraphStore
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +90,7 @@ def _result_to_dict(result: DeletionResult) -> dict[str, Any]:
     }
 
 
-def _build_service(graph_store: Neo4jGraphStore, request: Request) -> DeletionService:
+def _build_service(graph_store: GraphStore, request: Request) -> DeletionService:
     """Assemble a DeletionService from one graph store plus the blob store
     and queue manager every route uses the same way."""
     settings = get_settings()
@@ -102,29 +101,24 @@ def _build_service(graph_store: Neo4jGraphStore, request: Request) -> DeletionSe
 
 async def read_deletion_service(request: Request) -> DeletionService:
     """Build a DeletionService that only reads, through the read-only Neo4j
-    connection (``app.state.neo4j_query_driver``).
+    store the graph backend hands out (``graph_backend.query_store()``).
 
     Used by the summary route. No workspace is supplied here -- the graph
     store looks up which workspace a session id belongs to on its own.
     """
-    graph_store = Neo4jGraphStore(
-        uri="",
-        driver=request.app.state.neo4j_query_driver,
-    )
-    return _build_service(graph_store, request)
+    return _build_service(request.app.state.graph_backend.query_store(), request)
 
 
 async def delete_route_service(request: Request) -> DeletionService:
     """Build the DeletionService the delete route uses.
 
     The delete route always changes stored data, so it always uses the
-    admin Neo4j connection (``app.state.neo4j_driver``) -- unlike the
+    backend's admin store (``graph_backend.admin_store()``) -- unlike the
     summary route, there is no read-only path here any more, because there
     is no more dry run on this route. No workspace is supplied -- the graph
     store looks up which workspace a session id belongs to on its own.
     """
-    graph_store = Neo4jGraphStore(uri="", driver=request.app.state.neo4j_driver)
-    return _build_service(graph_store, request)
+    return _build_service(request.app.state.graph_backend.admin_store(), request)
 
 
 def _caller_id(request: Request) -> str | None:

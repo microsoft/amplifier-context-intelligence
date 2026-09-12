@@ -12,9 +12,8 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from neo4j import AsyncGraphDatabase  # type: ignore[attr-defined]
-
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
+from neo4j import AsyncGraphDatabase  # type: ignore[attr-defined]
 
 pytestmark = pytest.mark.neo4j
 
@@ -32,12 +31,8 @@ async def test_session_a_close_does_not_disrupt_session_b(
     # state between store_a.close() and store_b's still-in-flight write, so
     # its own cleanup must not depend on every assertion passing.
     try:
-        store_a = Neo4jGraphStore(
-            uri=neo4j_container["bolt_url"], driver=shared_driver, workspace="session-a"
-        )
-        store_b = Neo4jGraphStore(
-            uri=neo4j_container["bolt_url"], driver=shared_driver, workspace="session-b"
-        )
+        store_a = Neo4jGraphStore(driver=shared_driver, workspace="session-a")
+        store_b = Neo4jGraphStore(driver=shared_driver, workspace="session-b")
 
         await store_b.upsert_node("node-b", {"label": "Event"})
 

@@ -43,6 +43,7 @@ Non-negotiable guarantees for all conforming implementations:
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
@@ -134,8 +135,27 @@ class GraphStore(Protocol):
 
     @property
     def workspace(self) -> str:
-        """Workspace this store is bound to (set at construction, read-only)."""
+        """Workspace this store scopes writes to.
+
+        Readable AND settable. It was declared read-only, but the ingest path
+        genuinely rebinds it: a store is created before the session's workspace
+        is known from its first event, and ``HookStateService`` assigns it on
+        arrival. Both implementations already had a setter; only the
+        declaration was wrong -- the kind of drift that makes a protocol stop
+        being trusted, and stop being checked.
+        """
         ...
+
+    @workspace.setter
+    def workspace(self, value: str) -> None: ...
+
+    @property
+    def created_by(self) -> str | None:
+        """Authenticated contributor id stamped on writes; ``None`` when unset."""
+        ...
+
+    @created_by.setter
+    def created_by(self, value: str | None) -> None: ...
 
     async def upsert_node(self, node_id: str, data: dict[str, Any]) -> None:
         """Buffer a node upsert.
@@ -242,6 +262,42 @@ class GraphStore(Protocol):
             AmbiguousSessionError: If *session_id* is found in more than one
                 workspace (see ``resolve_session_graph``). Nothing is deleted
                 in that case.
+        """
+        ...
+
+    def remove_edge(self, src_id: str, dst_id: str) -> None:
+        """Drop a buffered edge. No I/O; no-op when the edge is not buffered."""
+        ...
+
+    def buffered_edges(self) -> Iterator[tuple[str, str, dict[str, Any]]]:
+        """Yield ``(src_id, dst_id, data)`` for every not-yet-flushed edge.
+
+        Exists so the ownership checker can find a competing owner edge
+        through the port. It previously probed implementations for a private
+        buffer attribute by name (``_edges`` on one, ``_edge_buffer`` on the
+        other), which meant a rename inside either implementation would have
+        silently disabled ownership enforcement with nothing failing to
+        announce it.
+        """
+        ...
+
+    async def set_labels(
+        self, node_id: str, remove_labels: list[str], add_labels: list[str]
+    ) -> None:
+        """Atomically remove and add labels on a node.
+
+        The only sanctioned way to REMOVE a label -- ``upsert_node`` unions
+        labels and can never take one away. Creates the node with
+        *add_labels* when it does not exist.
+        """
+        ...
+
+    def discard_buffer(self) -> None:
+        """Drop all buffered writes without persisting them.
+
+        MUST NOT perform I/O and MUST NOT raise. The dead-letter primitive:
+        isolates a poison write so it cannot remain resident and re-enter the
+        next flush.
         """
         ...
 

@@ -28,8 +28,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from neo4j import AsyncGraphDatabase
-
 from context_intelligence_server.neo4j_store import (
     Neo4jGraphStore,
     ensure_neo4j_schema,
@@ -37,6 +35,7 @@ from context_intelligence_server.neo4j_store import (
 from context_intelligence_server.queue_manager import QueueManager
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
+from neo4j import AsyncGraphDatabase
 
 pytestmark = pytest.mark.neo4j
 
@@ -116,7 +115,9 @@ async def test_replay_rewrites_through_real_drainer(
 
     # Build a REAL SessionWorker wired to the live container, then register +
     # start its drainer so get_or_create returns THIS worker during replay.
-    store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=WORKSPACE)
+    store = Neo4jGraphStore(
+        driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=WORKSPACE
+    )
     services = HookStateService(workspace=WORKSPACE, graph_store=store)
     worker = SessionWorker(
         session_id=SESSION_ID, workspace=WORKSPACE, services=services
@@ -148,6 +149,8 @@ async def test_replay_rewrites_through_real_drainer(
                 await worker.task
             except asyncio.CancelledError:
                 pass
+        await store.close()
+        await store._driver.close()
 
     # 1. Dead-letter file purged.
     assert await qm.read_dead_letters(SESSION_ID) == []

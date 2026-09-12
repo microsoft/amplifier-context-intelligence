@@ -35,7 +35,7 @@ from typing import Any, LiteralString, cast
 
 import pytest
 from context_intelligence_server.neo4j_store import Neo4jGraphStore, run_repair
-from neo4j import GraphDatabase
+from neo4j import AsyncGraphDatabase, GraphDatabase
 
 pytestmark = pytest.mark.neo4j
 
@@ -119,8 +119,9 @@ async def _flush_one_non_session_node(
     ``_write_batch`` non-Session MERGE.
     """
     store = Neo4jGraphStore(
-        uri=container["bolt_url"],
-        auth=(container["user"], container["password"]),
+        driver=AsyncGraphDatabase.driver(
+            container["bolt_url"], auth=(container["user"], container["password"])
+        ),
         workspace="test",
     )
     try:
@@ -128,6 +129,7 @@ async def _flush_one_non_session_node(
         await store.flush()
     finally:
         await store.close()
+        await store._driver.close()
 
 
 async def test_non_session_node_merge_uses_index_seek_not_allnodesscan(
@@ -187,8 +189,10 @@ async def test_non_session_node_merge_idempotent_no_duplicates(
 
     # Flush 2: SAME node_id, a *different* type label and updated prop.
     store = Neo4jGraphStore(
-        uri=neo4j_container["bolt_url"],
-        auth=(neo4j_container["user"], neo4j_container["password"]),
+        driver=AsyncGraphDatabase.driver(
+            neo4j_container["bolt_url"],
+            auth=(neo4j_container["user"], neo4j_container["password"]),
+        ),
         workspace="test",
     )
     try:
@@ -196,6 +200,7 @@ async def test_non_session_node_merge_idempotent_no_duplicates(
         await store.flush()
     finally:
         await store.close()
+        await store._driver.close()
 
     driver = GraphDatabase.driver(
         neo4j_container["bolt_url"],
@@ -258,8 +263,10 @@ async def test_preexisting_unlabeled_node_not_duplicated_after_backfill(
     # write -- this is now the operator's responsibility, not an automatic
     # cold-start/flush-path side effect.
     store = Neo4jGraphStore(
-        uri=neo4j_container["bolt_url"],
-        auth=(neo4j_container["user"], neo4j_container["password"]),
+        driver=AsyncGraphDatabase.driver(
+            neo4j_container["bolt_url"],
+            auth=(neo4j_container["user"], neo4j_container["password"]),
+        ),
         workspace="test",
     )
     try:
@@ -271,6 +278,7 @@ async def test_preexisting_unlabeled_node_not_duplicated_after_backfill(
         await store.flush()
     finally:
         await store.close()
+        await store._driver.close()
 
     driver = GraphDatabase.driver(
         neo4j_container["bolt_url"],
@@ -447,8 +455,9 @@ except ImportError:  # pragma: no cover - exercised only against unfixed code
 async def _flush_one_edge(container: dict[str, Any], src_id: str, dst_id: str) -> None:
     """Drive one edge (and its two endpoint nodes) through the real flush path."""
     store = Neo4jGraphStore(
-        uri=container["bolt_url"],
-        auth=(container["user"], container["password"]),
+        driver=AsyncGraphDatabase.driver(
+            container["bolt_url"], auth=(container["user"], container["password"])
+        ),
         workspace="test",
     )
     try:
@@ -458,6 +467,7 @@ async def _flush_one_edge(container: dict[str, Any], src_id: str, dst_id: str) -
         await store.flush()
     finally:
         await store.close()
+        await store._driver.close()
 
 
 async def test_get_edge_fallback_does_not_scan_all_relationships(

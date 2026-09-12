@@ -6,10 +6,11 @@ unconditionally on every cold start (duplicate-node dedup + universal
 ``:Node`` label backfill). Those scans are pure dead weight on an
 already-migrated graph but still paid a full graph scan on every boot.
 
-This module is presentation + driver lifecycle only -- the actual
-diagnostic/repair logic lives in ``neo4j_store`` (``diagnose`` /
-``run_repair``), which is also what ``ensure_neo4j_schema`` relies on at
-cold start for its (now cheap, scan-free) schema DDL.
+This module is presentation only. It owns no connection: it starts a graph
+backend, asks it to diagnose or repair, and closes it -- the same object, with
+the same pool bounds, the server itself runs on. Previously this file built a
+driver of its own, which made it a fourth independent construction site whose
+settings could drift from the server's without anything noticing.
 """
 
 from __future__ import annotations
@@ -17,8 +18,7 @@ from __future__ import annotations
 import logging
 
 from context_intelligence_server.config import get_settings
-from context_intelligence_server.main import build_neo4j_driver
-from context_intelligence_server.neo4j_store import diagnose, run_repair
+from context_intelligence_server.neo4j_backend import Neo4jGraphBackend
 
 _LOG = logging.getLogger("context_intelligence_server.doctor")
 
@@ -46,9 +46,9 @@ async def run_doctor(fix: bool) -> int:
     """Diagnose (and optionally repair) Neo4j graph health.
 
     Loads config the same way the server does (``get_settings()``, honoring
-    ``CONFIG_FILE``) and constructs the admin Neo4j driver via the same
-    ``build_neo4j_driver`` helper ``lifespan()`` uses, so the doctor CLI and
-    the running server can never construct the connection differently.
+    ``CONFIG_FILE``) and starts the SAME graph backend the server's lifespan
+    starts, so the doctor CLI and the running server can never connect
+    differently -- there is only one way to connect left.
 
     Args:
         fix: When False, report only (read-only). When True, repair
@@ -57,21 +57,19 @@ async def run_doctor(fix: bool) -> int:
 
     Returns:
         Process exit code: 0 when the graph is healthy (immediately, or
-        after a successful repair); non-zero when Neo4j is unreachable, the
-        graph remains unhealthy (report-only mode), or repair left problems.
+        after a successful repair); non-zero when the graph is unreachable,
+        remains unhealthy (report-only mode), or repair left problems.
     """
-    settings = get_settings()
-    admin = settings.resolve_neo4j_admin()
-    driver = build_neo4j_driver(admin)
+    backend = Neo4jGraphBackend.from_settings(get_settings())
+    await backend.start()
     try:
-        try:
-            await driver.verify_connectivity()
-        except Exception as exc:  # noqa: BLE001
-            print(f"  {_FAIL} Neo4j reachable -- {exc}")
+        health = await backend.health()
+        if not health.write_connected:
+            print(f"  {_FAIL} Neo4j reachable -- {health.url}")
             return 1
         print(f"  {_OK} Neo4j reachable")
 
-        diagnosis = await diagnose(driver)
+        diagnosis = await backend.diagnose()
         _print_diagnosis(diagnosis)
 
         if _is_healthy(diagnosis):
@@ -86,14 +84,14 @@ async def run_doctor(fix: bool) -> int:
             return 1
 
         print("Repairing (dedup + :Node backfill + schema DDL)...")
-        result = await run_repair(driver)
+        result = await backend.repair()
         print(
             f"  {_OK} Repair complete: "
             f"{result['duplicates_removed']} duplicate(s) removed, "
             f"{result['nodes_tagged']} node(s) tagged :Node."
         )
 
-        after = await diagnose(driver)
+        after = await backend.diagnose()
         _print_diagnosis(after)
         if _is_healthy(after):
             print(f"  {_OK} Graph is healthy after repair.")
@@ -101,4 +99,4 @@ async def run_doctor(fix: bool) -> int:
         print(f"  {_FAIL} Graph still has issues after repair -- see counts above.")
         return 1
     finally:
-        await driver.close()
+        await backend.aclose()
