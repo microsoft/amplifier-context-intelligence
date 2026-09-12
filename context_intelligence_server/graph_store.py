@@ -14,13 +14,21 @@ Non-negotiable guarantees for all conforming implementations:
     buffer before hitting the backing store; callers see their own writes
     immediately, even before a flush.
 5.  **Flush semantics** — ``flush`` persists all buffered writes to the backing
-    store atomically (best-effort); after a successful flush, the buffer is
-    cleared.
-6.  **Flush failure isolation** — failures inside ``flush`` MUST NOT propagate
-    as exceptions to event handlers; implementations must swallow or log errors
-    internally.
-7.  **Close calls flush** — ``close`` MUST call ``flush`` before releasing any
-    resources, ensuring no buffered writes are silently discarded.
+    store; after a successful flush, the buffer is cleared.
+6.  **Flush failure RAISES, and restores the buffer** — on failure ``flush``
+    MUST put the un-flushed writes back and re-raise. It must NOT swallow.
+    This is load-bearing: the caller owns a durable queue offset, and the
+    offset must not advance past writes that never landed
+    (``registry._flush_barrier``). An implementation that swallowed here would
+    silently convert a failed write into an acknowledged one.
+7.  **Close calls flush, and is best-effort** — ``close`` MUST call ``flush``
+    first, but MUST NOT raise if that final flush fails: shutdown cannot be
+    derailed by one store. A failed final flush therefore CAN lose that
+    store's in-memory buffer. That is survivable only because the buffer is
+    not the system of record: the durable queue still holds those events with
+    their offset uncommitted, so they replay on the next boot. Callers that do
+    NOT have such a replay owner must flush explicitly and handle the raise
+    themselves rather than relying on ``close``.
 8.  **Dialect enforcement** — ``execute_query`` raises ``ValueError`` when the
     requested dialect is not in ``supported_dialects``.
 9.  **Default workspace scoping** — passing ``workspace=None`` to
@@ -43,6 +51,7 @@ Non-negotiable guarantees for all conforming implementations:
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
@@ -134,8 +143,23 @@ class GraphStore(Protocol):
 
     @property
     def workspace(self) -> str:
-        """Workspace this store is bound to (set at construction, read-only)."""
+        """Workspace this store scopes writes to.
+
+        Readable AND settable: the ingest path rebinds it, because a store is
+        created before its first event reveals the workspace.
+        """
         ...
+
+    @workspace.setter
+    def workspace(self, value: str) -> None: ...
+
+    @property
+    def created_by(self) -> str | None:
+        """Authenticated contributor id stamped on writes; ``None`` when unset."""
+        ...
+
+    @created_by.setter
+    def created_by(self, value: str | None) -> None: ...
 
     async def upsert_node(self, node_id: str, data: dict[str, Any]) -> None:
         """Buffer a node upsert.
@@ -245,20 +269,58 @@ class GraphStore(Protocol):
         """
         ...
 
+    def remove_edge(self, src_id: str, dst_id: str) -> None:
+        """Drop a buffered edge. No I/O; no-op when the edge is not buffered."""
+        ...
+
+    def buffered_edges(self) -> Iterator[tuple[str, str, dict[str, Any]]]:
+        """Yield ``(src_id, dst_id, data)`` for every not-yet-flushed edge.
+
+        Exists so the ownership checker can find a competing owner edge through
+        the port instead of probing a private buffer attribute by name.
+        """
+        ...
+
+    async def set_labels(
+        self, node_id: str, remove_labels: list[str], add_labels: list[str]
+    ) -> None:
+        """Atomically remove and add labels on a node.
+
+        The only sanctioned way to REMOVE a label -- ``upsert_node`` unions
+        labels and can never take one away. Creates the node with
+        *add_labels* when it does not exist.
+        """
+        ...
+
+    def discard_buffer(self) -> None:
+        """Drop all buffered writes without persisting them.
+
+        MUST NOT perform I/O and MUST NOT raise. The dead-letter primitive:
+        isolates a poison write so it cannot remain resident and re-enter the
+        next flush.
+        """
+        ...
+
     async def flush(self) -> None:
         """Persist all buffered writes to the backing store.
 
-        Failure MUST NOT propagate as an exception to event handlers;
-        implementations must handle errors internally (log and swallow).
-        After a successful flush the buffer is cleared.
+        On failure: restore the un-flushed writes to the buffer and RE-RAISE.
+        Do not swallow -- the caller's durable-queue offset must not advance
+        past writes that never landed. After a successful flush the buffer is
+        cleared. (Guarantee 6.)
         """
         ...
 
     async def close(self) -> None:
-        """Release resources held by this store.
+        """Flush, then release whatever this store itself owns.
 
-        MUST call ``flush`` before releasing any resources so that no buffered
-        writes are silently discarded.
+        MUST call ``flush`` first, and MUST NOT raise if that flush fails --
+        shutdown cannot be derailed by one store. See guarantee 7 for what a
+        failed final flush costs and who is expected to absorb it.
+
+        A store never owns its connection, so there is nothing else to release
+        here: connection lifetime belongs to the ``GraphBackend`` that opened
+        it (see ``graph_backend.py``).
         """
         ...
 

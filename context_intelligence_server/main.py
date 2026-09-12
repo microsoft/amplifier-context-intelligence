@@ -10,13 +10,13 @@ import sys
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime
+from datetime import date, datetime
+from datetime import time as _dt_time
 from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
-from neo4j import READ_ACCESS, WRITE_ACCESS
 
 from context_intelligence_server import __version__
 from context_intelligence_server.auth import (
@@ -31,7 +31,7 @@ from context_intelligence_server.authz import (  # noqa: F401 — re-exported fo
     require_write,
 )
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
-from context_intelligence_server.config import Neo4jClientConfig, Settings, get_settings
+from context_intelligence_server.config import Settings, get_settings
 from context_intelligence_server.idempotency import EventIdempotencyCache
 from context_intelligence_server.identity_store import IdentityStore
 from context_intelligence_server.logging_config import setup_logging
@@ -40,11 +40,8 @@ from context_intelligence_server.models import (
     EventRequest,
     EventResponse,
 )
-from context_intelligence_server.neo4j_store import (
-    build_bounded_neo4j_driver,
-    ensure_neo4j_schema,
-    mark_schema_ready,
-)
+from context_intelligence_server.neo4j_backend import Neo4jGraphBackend
+from context_intelligence_server.neo4j_store import mark_schema_ready
 from context_intelligence_server.registry import SessionRegistry
 from context_intelligence_server.routers.admin import router as admin_router
 from context_intelligence_server.routers.deletion import router as deletion_router
@@ -56,26 +53,6 @@ from context_intelligence_server.status import build_status_response
 _settings = get_settings()
 
 logger = logging.getLogger("context_intelligence_server")
-
-
-def _neo4j_access_const(mode: str) -> str:
-    """Map our config string ("READ"/"WRITE") to the driver's access-mode constant."""
-    return READ_ACCESS if mode == "READ" else WRITE_ACCESS
-
-
-def build_neo4j_driver(config: Neo4jClientConfig) -> Any:
-    """Construct the pool-bounded admin AsyncGraphDatabase driver.
-
-    Shared by ``lifespan()`` (the admin driver, on every server boot) and
-    ``doctor.run_doctor()`` (the CLI), so the two entry points can never
-    construct the connection differently. Delegates the actual driver
-    construction to ``build_bounded_neo4j_driver`` so the pool-bounding kwargs
-    have one source of truth, shared with ``SessionRegistry``'s driver.
-    """
-    return build_bounded_neo4j_driver(
-        config,
-        max_connection_pool_size=_settings.neo4j_max_connection_pool_size,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -452,159 +429,155 @@ async def _spool_stats_refresher(app: FastAPI) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Manage application lifespan: configure logging and create shared Neo4j driver."""
-    setup_logging()
-    _admin = _settings.resolve_neo4j_admin()
-    _query = _settings.resolve_neo4j_query()
-    logger.info(
-        "lifespan_startup: creating Neo4j drivers admin_url=%s query_url=%s query_access_mode=%s",
-        _admin.url,
-        _query.url,
-        _query.access_mode,
-    )
-    # Admin (read/write): schema init + all mutation paths. Keep the existing
-    # app.state.neo4j_driver NAME so nothing that reads it silently breaks.
-    # build_neo4j_driver() is the SAME helper doctor.run_doctor() uses, so the
-    # server and the doctor CLI can never construct this connection differently.
-    app.state.neo4j_driver = build_neo4j_driver(_admin)
-    # Cypher-query (read-intent): /cypher + dashboard reads. Bounded through the
-    # same helper as the admin driver so every process-wide pool shares one cap.
-    app.state.neo4j_query_driver = build_bounded_neo4j_driver(
-        _query,
-        max_connection_pool_size=_settings.neo4j_max_connection_pool_size,
-    )
-    # Stash the resolved query access_mode so /cypher opens READ sessions without
-    # re-resolving settings on every request.
-    app.state.neo4j_query_access_mode = _query.access_mode
-    # Initialize schema (indexes + uniqueness constraints) BEFORE the server starts
-    # accepting requests.  This ensures the Session uniqueness constraint is active
-    # before any concurrent flush() transactions execute MERGE, which prevents the
-    # duplicate-Session-node race condition observed under concurrent upload load.
-    logger.info(
-        "lifespan_startup: initializing Neo4j schema (indexes + uniqueness constraints)"
-    )
-    # Cold start FAILS LOUD on schema/data corruption that requires
-    # `doctor --fix` -- an un-migrated graph (duplicate legacy nodes OR
-    # nodes lacking the universal :Node label). Nothing has been written yet
-    # at cold start, so refusing to boot loses no data: this is the safest
-    # possible moment to surface an impossible state as an un-missable
-    # signal rather than a log line someone greps for later. Contrast with
-    # the flush path (Neo4jGraphStore._ensure_schema), which must keep
-    # self-healing and never raise (Salil's blocker -- raising there would
-    # dead-letter real in-flight activity records). fail_on_data_conflict=True
-    # here mirrors run_repair's contract: a :Node constraint data conflict
-    # raises a RuntimeError naming `doctor --fix` instead of being logged
-    # and swallowed.
-    schema_fully_established = await ensure_neo4j_schema(
-        app.state.neo4j_driver, fail_on_data_conflict=True
-    )
-    # Seed the PROCESS-wide schema latch, but ONLY on a fully-established pass.
-    #
-    # fail_on_data_conflict=True makes this call fail closed on a :Node
-    # constraint DATA conflict -- but a CONNECTIVITY failure on any individual
-    # index/constraint is deliberately swallowed and reported through the
-    # return value instead (see ensure_neo4j_schema's docstring). Latching
-    # unconditionally would therefore mark a HALF-BUILT schema as ready and
-    # permanently disable the per-flush self-heal for the whole process --
-    # exactly the "constraint created once, never retried" gap
-    # Neo4jGraphStore._ensure_schema exists to close.
-    #
-    # On the happy path this seed is what stops every per-session store from
-    # re-running the same ~11-statement catalog pass on its first flush -- and,
-    # whenever that pass cannot complete, on EVERY subsequent flush -- competing
-    # for the very bolt pool it needs. See neo4j_store._SCHEMA_READY.
-    if schema_fully_established:
-        mark_schema_ready()
-        logger.info("lifespan_startup: Neo4j schema initialized")
-    else:
-        logger.warning(
-            "lifespan_startup: Neo4j schema NOT fully established (indexes or "
-            "constraints missing); leaving the process-wide latch unset so the "
-            "flush path retries schema init (rate-limited by "
-            "neo4j_store._SCHEMA_RETRY_BACKOFF_SECONDS)."
-        )
-    # NOTE: the O(1) untagged-:Node boot guard that used to sit here has been
-    # REMOVED. It refused to boot when any node lacked the universal :Node
-    # label. Two things made it dead weight:
-    #
-    #   1. Nothing in this service can produce an untagged node. Every
-    #      node-creating statement in neo4j_store is label-scoped -- the node
-    #      MERGE, both edge-endpoint MERGEs, and the session write path all
-    #      MERGE (n:Node {node_id, workspace}).
-    #   2. Since get_node()/get_edge() became :Node-scoped, an untagged node is
-    #      also INVISIBLE to every read. Read and write paths now agree, so a
-    #      stray untagged node is inert dead data, not a correctness hazard --
-    #      and refusing to serve over inert data is disproportionate.
-    #
-    # The capability is not gone: `context-intelligence-server doctor` still
-    # reports untagged nodes via diagnose()/count_untagged_nodes, and
-    # `doctor --fix` still repairs them. Detection moved to the operator path,
-    # where it belongs; it is no longer a boot gate. (Historically this check
-    # was itself an AllNodesScan and caused a 25-30s boot stall until PR #67
-    # made it O(1) -- a second reason not to keep it on the startup path.)
+    """Manage application lifespan: logging, the graph backend, and recovery.
 
-    # Crash recovery runs as a BACKGROUND task -- it MUST NOT gate serving.
-    #
-    # uvicorn runs the ASGI lifespan to completion BEFORE it handles a single
-    # request (uvicorn/server.py: `await self.startup()` then
-    # `await self.main_loop()`), and gunicorn binds the socket before that. So
-    # any work done here is work during which the process ACCEPTS connections
-    # and answers none -- /version and /status included, however cheap they
-    # are. Incident 2026-09-09: a ~5000-file spool on Azure Files kept this
-    # loop busy for 9+ minutes; ACA's tcpSocket probes saw an open port and
-    # reported the replica Healthy while every request timed out at the APIM
-    # gateway (231s), and clients dropped events from full buffers.
-    #
-    # Moving it behind create_task lets startup complete in ~1s, so the HTTP
-    # surface is up regardless of spool size. This is safe because respawn is
-    # idempotent by construction -- see _crash_recovery_topup, which is already
-    # documented as safe to call repeatedly on a LIVE server, and which the
-    # sweep loop has always called against a serving process.
-    app.state.recovery_complete = asyncio.Event()
-    app.state.recovery_error = None
-    _recovery_task: asyncio.Task[None] = asyncio.create_task(_startup_recovery(app))
-    # Background spool-stats refresher (see _spool_stats_refresher): same
-    # create_task/cancel-on-shutdown pattern as _recovery_task above, so
-    # /status's spool block is served from a periodically-refreshed snapshot
-    # instead of scanning the queue directory inline on every request.
-    _spool_stats_task: asyncio.Task[None] = asyncio.create_task(
-        _spool_stats_refresher(app)
-    )
+    Sole owner of the backend -- the only connection-owning object in the
+    process. All startup work runs INSIDE the try whose finally closes it, so a
+    cold start that fails after the connections are open (schema DDL raising on
+    an un-migrated graph is a designed outcome here) still releases them.
+    """
+    setup_logging()
+    backend = Neo4jGraphBackend.from_settings(_settings)
+    # Published for request handlers, which ask it for stores. There is no
+    # app.state driver any more, so no route can acquire one.
+    app.state.graph_backend = backend
+    _recovery_task: asyncio.Task[None] | None = None
+    _spool_stats_task: asyncio.Task[None] | None = None
 
     try:
+        await backend.start()
+        registry.set_graph_backend(backend)
+
+        # Initialize schema (indexes + uniqueness constraints) BEFORE the server
+        # starts accepting requests.  This ensures the Session uniqueness
+        # constraint is active before any concurrent flush() transactions execute
+        # MERGE, which prevents the duplicate-Session-node race condition observed
+        # under concurrent upload load.
+        logger.info(
+            "lifespan_startup: initializing graph schema (indexes + constraints)"
+        )
+        # Cold start FAILS LOUD on schema/data corruption that requires
+        # `doctor --fix` -- an un-migrated graph (duplicate legacy nodes OR
+        # nodes lacking the universal :Node label). Nothing has been written yet
+        # at cold start, so refusing to boot loses no data: this is the safest
+        # possible moment to surface an impossible state as an un-missable
+        # signal rather than a log line someone greps for later. Contrast with
+        # the flush path (Neo4jGraphStore._ensure_schema), which must keep
+        # self-healing and never raise (Salil's blocker -- raising there would
+        # dead-letter real in-flight activity records). fail_on_data_conflict=True
+        # here mirrors run_repair's contract: a :Node constraint data conflict
+        # raises a RuntimeError naming `doctor --fix` instead of being logged
+        # and swallowed. When it does raise, the finally below closes the
+        # backend -- that is the whole reason this call moved inside the try.
+        schema_fully_established = await backend.ensure_schema(
+            fail_on_data_conflict=True
+        )
+        # Seed the PROCESS-wide schema latch, but ONLY on a fully-established pass.
+        #
+        # fail_on_data_conflict=True makes this call fail closed on a :Node
+        # constraint DATA conflict -- but a CONNECTIVITY failure on any individual
+        # index/constraint is deliberately swallowed and reported through the
+        # return value instead (see ensure_neo4j_schema's docstring). Latching
+        # unconditionally would therefore mark a HALF-BUILT schema as ready and
+        # permanently disable the per-flush self-heal for the whole process --
+        # exactly the "constraint created once, never retried" gap
+        # Neo4jGraphStore._ensure_schema exists to close.
+        #
+        # On the happy path this seed is what stops every per-session store from
+        # re-running the same ~11-statement catalog pass on its first flush -- and,
+        # whenever that pass cannot complete, on EVERY subsequent flush -- competing
+        # for the very bolt pool it needs. See neo4j_store._SCHEMA_READY.
+        if schema_fully_established:
+            mark_schema_ready()
+            logger.info("lifespan_startup: Neo4j schema initialized")
+        else:
+            logger.warning(
+                "lifespan_startup: Neo4j schema NOT fully established (indexes or "
+                "constraints missing); leaving the process-wide latch unset so the "
+                "flush path retries schema init (rate-limited by "
+                "neo4j_store._SCHEMA_RETRY_BACKOFF_SECONDS)."
+            )
+        # NOTE: the O(1) untagged-:Node boot guard that used to sit here has been
+        # REMOVED. It refused to boot when any node lacked the universal :Node
+        # label. Two things made it dead weight:
+        #
+        #   1. Nothing in this service can produce an untagged node. Every
+        #      node-creating statement in neo4j_store is label-scoped -- the node
+        #      MERGE, both edge-endpoint MERGEs, and the session write path all
+        #      MERGE (n:Node {node_id, workspace}).
+        #   2. Since get_node()/get_edge() became :Node-scoped, an untagged node is
+        #      also INVISIBLE to every read. Read and write paths now agree, so a
+        #      stray untagged node is inert dead data, not a correctness hazard --
+        #      and refusing to serve over inert data is disproportionate.
+        #
+        # The capability is not gone: `context-intelligence-server doctor` still
+        # reports untagged nodes via diagnose()/count_untagged_nodes, and
+        # `doctor --fix` still repairs them. Detection moved to the operator path,
+        # where it belongs; it is no longer a boot gate. (Historically this check
+        # was itself an AllNodesScan and caused a 25-30s boot stall until PR #67
+        # made it O(1) -- a second reason not to keep it on the startup path.)
+
+        # Crash recovery runs as a BACKGROUND task -- it MUST NOT gate serving.
+        #
+        # uvicorn runs the ASGI lifespan to completion BEFORE it handles a single
+        # request (uvicorn/server.py: `await self.startup()` then
+        # `await self.main_loop()`), and gunicorn binds the socket before that. So
+        # any work done here is work during which the process ACCEPTS connections
+        # and answers none -- /version and /status included, however cheap they
+        # are. Incident 2026-09-09: a ~5000-file spool on Azure Files kept this
+        # loop busy for 9+ minutes; ACA's tcpSocket probes saw an open port and
+        # reported the replica Healthy while every request timed out at the APIM
+        # gateway (231s), and clients dropped events from full buffers.
+        #
+        # Moving it behind create_task lets startup complete in ~1s, so the HTTP
+        # surface is up regardless of spool size. This is safe because respawn is
+        # idempotent by construction -- see _crash_recovery_topup, which is already
+        # documented as safe to call repeatedly on a LIVE server, and which the
+        # sweep loop has always called against a serving process.
+        app.state.recovery_complete = asyncio.Event()
+        app.state.recovery_error = None
+        _recovery_task = asyncio.create_task(_startup_recovery(app))
+        # Background spool-stats refresher (see _spool_stats_refresher): same
+        # create_task/cancel-on-shutdown pattern as _recovery_task above, so
+        # /status's spool block is served from a periodically-refreshed snapshot
+        # instead of scanning the queue directory inline on every request.
+        _spool_stats_task = asyncio.create_task(_spool_stats_refresher(app))
+
         yield
     finally:
-        # Cancel background recovery FIRST: it spawns drainers, and shutdown
-        # below quiesces them. Letting it keep spawning into a shutting-down
-        # registry would race the quiesce and dead-letter healthy events.
-        _recovery_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await _recovery_task
+        # Cancel background recovery FIRST: it spawns drainers, and the
+        # quiesce below stops them. Letting it keep spawning into a
+        # shutting-down registry would race the quiesce and dead-letter
+        # healthy events. Both tasks are Optional because a startup failure
+        # can land in this finally before either was created.
+        if _recovery_task is not None:
+            _recovery_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await _recovery_task
         # Cancel the spool-stats refresher too -- it holds no drainer-related
         # state, but it must not keep touching a queue directory that a
         # shutting-down process may be tearing down around it.
-        _spool_stats_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await _spool_stats_task
+        if _spool_stats_task is not None:
+            _spool_stats_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await _spool_stats_task
         # ORDER IS LOAD-BEARING. Quiesce the drainers FIRST. Every session's
-        # graph store now shares ONE driver, so closing it under a live drainer
-        # is no longer a per-session concern: the drainer's batch fails, it
+        # graph store shares ONE connection pool, so closing it under a live
+        # drainer is not a per-session concern: the drainer's batch fails, it
         # spends its max_delivery_attempts budget in ~250 ms, and
         # _handle_exhausted_batch dead-letters each line AND commits the offset
         # past it -- discarding healthy events that merely happened to be
         # queued at shutdown, with no replay on the next boot. Cancelling first
         # routes each drainer through CancelledError -> _safe_close -> a final
-        # flush while the driver is still open.
+        # flush while the backend is still open.
         logger.info("lifespan_shutdown: quiescing drain workers")
         await registry.shutdown_workers()
-        logger.info("lifespan_shutdown: closing Neo4j drivers")
-        await app.state.neo4j_driver.close()
-        await app.state.neo4j_query_driver.close()
-        # The registry's shared per-session driver is independent of the two
-        # above (its own pool, built from settings.resolve_neo4j_admin() the
-        # first time a session is created) -- close it here too so no bolt
-        # connection outlives the process.
-        await registry.close_neo4j_driver()
+        registry.set_graph_backend(None)
+        # One close, for every pool the process opened. There is no second
+        # owner to forget: the registry never owned a connection, and a store
+        # cannot close one.
+        logger.info("lifespan_shutdown: closing graph backend")
+        await backend.aclose()
 
 
 app = FastAPI(
@@ -1051,17 +1024,17 @@ def __getattr__(name: str) -> Any:
 @app.get("/status")
 async def get_status(request: Request) -> dict[str, Any]:
     response = build_status_response(registry, _start_time)
-    response["neo4j_connected"] = await _check_driver_connected(
-        request.app, "neo4j_driver"
-    )
-    # Also surface the query (read-intent) driver's connectivity, so a
-    # misconfigured cypher_query client shows up here instead of on the
-    # first /cypher call.
-    response["neo4j_query_connected"] = await _check_driver_connected(
-        request.app, "neo4j_query_driver"
-    )
-    response["neo4j_url"] = _settings.resolve_neo4j_admin().url
-    response["neo4j_browser_url"] = _settings.neo4j_browser_url
+    # The backend reports its own health; this endpoint only maps the fields
+    # onto the published wire contract. The `neo4j_*` keys are a PUBLIC
+    # contract and are deliberately unchanged, so the technology name lives at
+    # the edge where it is already promised, and nowhere inward of it.
+    health = await request.app.state.graph_backend.health()
+    response["neo4j_connected"] = health.write_connected
+    # Also surface the read-intent connection's health, so a misconfigured
+    # query client shows up here instead of on the first /cypher call.
+    response["neo4j_query_connected"] = health.read_connected
+    response["neo4j_url"] = health.url
+    response["neo4j_browser_url"] = health.browser_url
     # Aggregate-only conservation metrics. /status is unauthenticated, so
     # this block must NOT carry the per-key table or the dead-letter
     # listing — both are authenticated-only.
@@ -1120,24 +1093,6 @@ async def get_status(request: Request) -> dict[str, Any]:
         ),
     }
     return response
-
-
-async def _check_driver_connected(app_instance: FastAPI, attr_name: str) -> bool:
-    """Check a Neo4j driver's connectivity via verify_connectivity().
-
-    *attr_name* names the app.state attribute holding the driver -- either
-    "neo4j_driver" (admin) or "neo4j_query_driver" (cypher_query). Defensive:
-    returns False (never raises, never 500s /status) when the driver is
-    absent or verify_connectivity() raises for any reason.
-    """
-    driver = getattr(app_instance.state, attr_name, None)
-    if driver is None:
-        return False
-    try:
-        await driver.verify_connectivity()
-        return True
-    except Exception:
-        return False
 
 
 @app.post(
@@ -1205,25 +1160,61 @@ async def get_blob(session_id: str, key: str) -> JSONResponse:
     return JSONResponse(content=content)
 
 
+def _json_default(value: Any) -> str:
+    """JSON fallback for values `json` cannot encode.
+
+    Temporal values render ISO-8601 rather than via ``str()``, whose
+    ``datetime`` form uses a space separator and is not ISO. Everything else
+    falls back to ``str()``, as this endpoint has always done.
+
+    Precision: ``neo4j.time`` carries nanoseconds, Python ``datetime`` only
+    microseconds, so normalisation upstream truncates below a microsecond.
+    Unreachable for data this server wrote (its write path converts FROM a
+    Python ``datetime``); reachable only for rows written by another writer.
+    """
+    if isinstance(value, (datetime, date, _dt_time)):
+        return value.isoformat()
+    return str(value)
+
+
 @app.post("/cypher", dependencies=[Depends(require_read)])
 async def post_cypher(body: CypherRequest, request: Request) -> Response:
-    """Proxy a Cypher query to Neo4j and return the results as JSON."""
-    driver = request.app.state.neo4j_query_driver
-    access_mode = request.app.state.neo4j_query_access_mode
-    params = dict(body.params)
-    if body.workspace is not None and body.workspace != "*":
-        params["workspace"] = body.workspace
-    rows: list[dict] = []
+    """Execute a caller-supplied query through the read-intent graph store.
+
+    This endpoint is unavoidably dialect-shaped: its request body carries a
+    query string, and that is a published contract. What it does NOT have to
+    be is *driver*-shaped. It used to open a driver session and run the query
+    on it directly, which meant the application entrypoint imported neo4j's
+    access-mode constants and knew what a bolt session was -- for one route.
+
+    Now it goes through ``QueryableStore.execute_query``, which already
+    existed and already validated the dialect.
+
+    One consequence had to be handled rather than hand-waved. ``execute_query``
+    normalises the driver's temporal types to Python ``datetime`` -- that is the
+    read-path type boundary doing its job -- and ``str(datetime)`` is NOT
+    ISO-8601: it separates date and time with a space. The old route stringified
+    the DRIVER's temporal type, which renders as ISO. A bare ``default=str``
+    here would therefore have changed a published response format silently,
+    under cover of a refactor. ``_json_default`` keeps it ISO-8601.
+    """
+    store = request.app.state.graph_backend.query_store()
+    # NOT the obvious mapping. An omitted workspace has always meant "inject
+    # nothing", but `execute_query`'s `None` means "scope to the store's OWN
+    # workspace" -- which here would inject workspace="default" into a query
+    # that never asked for it. `"*"` is the value that injects nothing.
+    workspace = body.workspace if body.workspace is not None else "*"
     try:
-        async with driver.session(
-            default_access_mode=_neo4j_access_const(access_mode)
-        ) as session:
-            result = await session.run(body.query, params)
-            async for record in result:
-                rows.append(dict(record))
-        serialized = json.dumps({"results": rows}, default=str)
+        rows = await store.execute_query(
+            body.query,
+            dict(body.params),
+            workspace=workspace,
+        )
+        serialized = json.dumps({"results": rows}, default=_json_default)
         return Response(content=serialized, media_type="application/json")
-    except Exception as exc:  # catch all Neo4j and serialization errors
+    except ValueError as exc:  # unsupported dialect -- a caller error
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001 - storage + serialization errors
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -1261,10 +1252,10 @@ def main(argv: list[str] | None = None) -> None:
         run()
         return
 
-    # Deferred import: doctor.py imports build_neo4j_driver back from this
-    # module, so importing it at module load time (rather than here, inside
-    # main()) would be a circular import at import time. By the time main()
-    # runs, this module has already finished executing top-to-bottom.
+    # Deferred import purely to keep CLI startup cost off the module-load
+    # path; doctor.py no longer imports anything back from this module (it
+    # goes straight to the graph backend), so the circular-import hazard this
+    # comment used to describe is gone.
     from context_intelligence_server import doctor as _doctor
 
     sys.exit(asyncio.run(_doctor.run_doctor(fix=args.fix)))

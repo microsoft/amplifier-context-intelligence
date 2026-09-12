@@ -85,7 +85,10 @@ context_intelligence_server/      # FastAPI ingestion server
 ├── queue_manager.py              # Durable per-session append-log (persist-then-202)
 ├── registry.py                   # Per-session drainers (drain_worker, write semaphore, retry/dead-letter)
 ├── pipeline.py                   # Per-event dispatch spine (invoked by the drainer)
-├── neo4j_store.py                # Managed-transaction Neo4j writes
+├── graph_store.py               # GraphStore/QueryableStore protocols (the store port)
+├── graph_backend.py             # GraphBackend protocol (the connection-owner port)
+├── neo4j_backend.py             # Neo4jGraphBackend — THE only driver owner in the server
+├── neo4j_store.py               # Managed-transaction Neo4j writes (takes an injected driver)
 ├── blob_store.py                 # Async disk blob storage
 ├── handlers/                     # Event handlers (data_layer_1/2/3)
 │   ├── data_layer_1/             # Session/tool-call handlers
@@ -281,6 +284,48 @@ same registry and conversion path; no special-casing needed.
 `_normalize_temporal` converts `neo4j.time.DateTime` → Python `datetime` on read.
 `services.py`, `pipeline.py`, and handlers deal in Python stdlib types only and never import
 or reference `neo4j.time`.
+
+### `neo4j_backend.py` is the connection boundary — ONE driver owner
+
+**`Neo4jGraphBackend` is the only object in the server allowed to open a Neo4j
+connection, and `build_bounded_neo4j_driver` is the only call to
+`AsyncGraphDatabase.driver` anywhere in `context_intelligence_server/.`** Two
+rules keep that true structurally, not by convention:
+
+1. **A store cannot open a connection.** `Neo4jGraphStore.__init__` takes
+   `driver` as a REQUIRED keyword argument and has no branch that builds one.
+   `close()` flushes and stops — it never closes a driver.
+2. **The backend hands out stores, never drivers.** `session_store()` /
+   `admin_store()` / `query_store()` return `GraphStore`/`QueryableStore`. There
+   is deliberately **no** public accessor returning a driver.
+
+Consequences for anyone changing this code:
+
+- Need a graph handle? Ask the backend for a store. Do **not** import `neo4j`
+  outside `neo4j_store.py` / `neo4j_backend.py` — a grep for `from neo4j` in any
+  other module should return nothing, and that grep is the invariant.
+- Need a raw query? Use `QueryableStore.execute_query`. `POST /cypher` goes
+  through it; that is why `main.py` imports no neo4j symbols.
+- Need schema/health/diagnose/repair? They are on the backend
+  (`ensure_schema`, `health`, `diagnose`, `repair`) precisely so the lifespan
+  and the `doctor` CLI never reach for a driver.
+- Lifecycle is the **lifespan's**: `backend.start()` before any store is
+  requested, `registry.set_graph_backend(backend)`, and — inside the same
+  `try:` — all startup work, so a boot that fails part-way still releases its
+  pools in the `finally`. `SessionRegistry` uses the backend and never owns it;
+  its `graph_backend` property **raises** when unbound rather than lazily
+  opening a pool.
+
+**Why this is load-bearing, not style.** Production exhausted its
+1024-descriptor limit at ~1007 bolt sockets because every session built its own
+driver with the driver's default 100-connection pool. Bounding the pool
+(`neo4j_max_connection_pool_size`) only helps while the NUMBER of pools is
+itself bounded — and the number of pools is bounded only if opening one is
+something exactly one object can do. Topology went 1-per-session → 3 → **2**
+(write + read), both bounded.
+
+Full topology: `docs/architecture/README.md` → "Graph backend and Neo4j client
+topology".
 
 ### Setting up / deploying auth (per-user API keys)
 

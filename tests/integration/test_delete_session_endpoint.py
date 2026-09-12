@@ -57,10 +57,8 @@ import httpx
 import pytest
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import Neo4jClientConfig
-from context_intelligence_server.neo4j_store import (
-    Neo4jGraphStore,
-    build_bounded_neo4j_driver,
-)
+from context_intelligence_server.neo4j_backend import Neo4jGraphBackend
+from context_intelligence_server.neo4j_store import Neo4jGraphStore
 from neo4j import AsyncGraphDatabase
 
 # Reuse the real-Neo4j-container fixture from the neo4j test tier. Importing
@@ -109,6 +107,7 @@ class _E2ESettings:
         self.neo4j_flush_chunk_bytes = 4_194_304
         self.neo4j_lock_timeout = 30.0
         self.neo4j_max_connection_pool_size = 50
+        self.neo4j_browser_url = ""
         self._container = container
 
     def resolve_neo4j_admin(self) -> Neo4jClientConfig:
@@ -138,12 +137,13 @@ async def delete_e2e_client(
 
     Patches both places that build settings-derived stores for this feature:
     - registry.get_settings -- used when POST /events spawns a drain worker
-      (its blob store, queue paths, and Neo4j admin driver).
+      (its blob store and queue paths).
     - routers.deletion.get_settings -- used when the summary/delete routes
       build their own blob store.
-    Then builds the two Neo4j drivers the deletion routes read directly off
-    app.state (neo4j_driver for writes, neo4j_query_driver for reads) and
-    points them at the same container.
+    Then builds ONE Neo4jGraphBackend (the only owner of Neo4j connections
+    now) from those same settings, starts it, and binds it both onto the
+    registry (set_graph_backend, mirroring the real lifespan) and onto
+    app.state.graph_backend (what the deletion routes and /status read).
     """
     settings = _E2ESettings(
         neo4j_container,
@@ -154,36 +154,25 @@ async def delete_e2e_client(
     monkeypatch.setattr(registry_module, "get_settings", lambda: settings)
     monkeypatch.setattr(deletion_router_module, "get_settings", lambda: settings)
 
-    # registry.neo4j_driver is a lazily-built module-level singleton; force a
-    # rebuild against the patched settings above instead of reusing whatever
-    # (if anything) a previous test built it as.
-    main_module.registry._neo4j_driver = None
-
-    admin_driver = build_bounded_neo4j_driver(
-        settings.resolve_neo4j_admin(), max_connection_pool_size=50
-    )
-    query_driver = build_bounded_neo4j_driver(
-        settings.resolve_neo4j_query(), max_connection_pool_size=50
-    )
-    monkeypatch.setattr(
-        main_module.app.state, "neo4j_driver", admin_driver, raising=False
-    )
-    monkeypatch.setattr(
-        main_module.app.state, "neo4j_query_driver", query_driver, raising=False
-    )
+    # The registry no longer lazily builds its own driver; bind a freshly
+    # started backend explicitly instead of reusing whatever (if anything) a
+    # previous test bound.
+    backend = Neo4jGraphBackend.from_settings(settings)  # type: ignore[arg-type]
+    await backend.start()
+    main_module.registry.set_graph_backend(backend)
+    monkeypatch.setattr(main_module.app.state, "graph_backend", backend, raising=False)
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=main_module.app), base_url="http://test"
     ) as client:
         yield client
 
-    # Shut down drain workers BEFORE closing the shared driver they use --
+    # Shut down drain workers BEFORE closing the shared backend they use --
     # same ordering the real lifespan() uses (registry.shutdown_workers()
     # docstring explains why the order matters).
     await main_module.registry.shutdown_workers()
-    await admin_driver.close()
-    await query_driver.close()
-    await main_module.registry.close_neo4j_driver()
+    await backend.aclose()
+    main_module.registry.set_graph_backend(None)
 
     # Remove this test's own data so nothing leaks into another test that
     # might reuse the same (session-scoped) Neo4j container.
@@ -289,8 +278,10 @@ async def test_delete_session_endpoint_end_to_end(
     # for why these two pieces are not built through posted events).
     # ------------------------------------------------------------------
     helper_store = Neo4jGraphStore(
-        uri=neo4j_container["bolt_url"],
-        auth=(neo4j_container["user"], neo4j_container["password"]),
+        driver=AsyncGraphDatabase.driver(
+            neo4j_container["bolt_url"],
+            auth=(neo4j_container["user"], neo4j_container["password"]),
+        ),
         workspace=WORKSPACE,
     )
     # Same directory the server's own blob store just wrote the real blobs
@@ -405,3 +396,4 @@ async def test_delete_session_endpoint_end_to_end(
         assert await helper_store.get_edge(OTHER_ROOT, SHARED_AGENT) is not None
     finally:
         await helper_store.close()
+        await helper_store._driver.close()

@@ -77,18 +77,16 @@ except ImportError:  # pragma: no cover - exercised only against unfixed code
 
 
 def _make_store(workspace: str | None = "test-workspace") -> Neo4jGraphStore:
-    """Create a Neo4jGraphStore with a mocked Neo4j driver."""
-    with patch(
-        "context_intelligence_server.neo4j_store.AsyncGraphDatabase"
-    ) as mock_adb:
-        mock_driver = AsyncMock()
-        mock_adb.driver.return_value = mock_driver
-        store = Neo4jGraphStore(
-            uri="bolt://localhost:7687",
-            auth=("neo4j", "password"),
-            workspace=workspace,
-        )
-    return store
+    """Create a Neo4jGraphStore with an injected mock Neo4j driver.
+
+    The store never constructs its own driver -- ``driver`` is a required,
+    keyword-only constructor argument (see neo4j_store.py's module docstring
+    and Neo4jGraphStore.__init__). Connection construction now lives solely
+    in ``neo4j_backend._build_bounded_driver``, so tests inject a mock
+    driver directly rather than patching a driver-construction factory that
+    no longer exists on this module.
+    """
+    return Neo4jGraphStore(driver=AsyncMock(), workspace=workspace)
 
 
 # ---------------------------------------------------------------------------
@@ -1772,20 +1770,13 @@ async def test_discard_buffer_clears_all_buffers_without_flushing():
 
 
 def _make_store_chunked(rows: int, byts: int) -> Neo4jGraphStore:
-    """Create a Neo4jGraphStore with explicit chunk-size knobs."""
-    with patch(
-        "context_intelligence_server.neo4j_store.AsyncGraphDatabase"
-    ) as mock_adb:
-        mock_driver = AsyncMock()
-        mock_adb.driver.return_value = mock_driver
-        store = Neo4jGraphStore(
-            uri="bolt://localhost:7687",
-            auth=("neo4j", "password"),
-            workspace="test",
-            flush_chunk_rows=rows,
-            flush_chunk_bytes=byts,
-        )
-    return store
+    """Create a Neo4jGraphStore with an injected mock driver and explicit chunk-size knobs."""
+    return Neo4jGraphStore(
+        driver=AsyncMock(),
+        workspace="test",
+        flush_chunk_rows=rows,
+        flush_chunk_bytes=byts,
+    )
 
 
 def test_init_stores_chunk_bounds():

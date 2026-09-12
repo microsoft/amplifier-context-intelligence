@@ -19,8 +19,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from neo4j import AsyncGraphDatabase
-
 from context_intelligence_server.neo4j_store import (
     Neo4jGraphStore,
     ensure_neo4j_schema,
@@ -29,6 +27,7 @@ from context_intelligence_server.queue_manager import QueueManager
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.utils import make_node_id
+from neo4j import AsyncGraphDatabase
 
 pytestmark = pytest.mark.neo4j
 
@@ -104,7 +103,10 @@ async def test_concurrent_flush_zero_event_loss(
     bolt = neo4j_container["bolt_url"]
 
     stores = [
-        Neo4jGraphStore(uri=bolt, auth=auth, workspace="test") for _ in range(N_WRITERS)
+        Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace="test"
+        )
+        for _ in range(N_WRITERS)
     ]
     expected_ids: set[str] = set()
 
@@ -151,7 +153,8 @@ async def test_concurrent_flush_zero_event_loss(
         )
     finally:
         for store in stores:
-            await store.close()
+            await store.close()  # flush only -- driver ownership is ours now
+            await store._driver.close()
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +243,9 @@ async def test_durable_drain_multi_writer_zero_loss(
 
     for s in range(n_sessions):
         sid = f"durable-sess-{run}-{s}"
-        store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        store = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
         stores.append(store)
         services = HookStateService(workspace=ws, graph_store=store)
         worker = SessionWorker(session_id=sid, workspace=ws, services=services)
@@ -276,7 +281,9 @@ async def test_durable_drain_multi_writer_zero_loss(
     await asyncio.wait_for(asyncio.gather(*tasks), timeout=60)
 
     # Conservation: every accepted user:prompt :Event node persisted (zero loss).
-    verify = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+    verify = Neo4jGraphStore(
+        driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+    )
     try:
         rows = await verify.execute_query(
             "MATCH (n:Event) WHERE n.node_id IN $ids AND n.workspace = $ws "
@@ -290,8 +297,10 @@ async def test_durable_drain_multi_writer_zero_loss(
         )
     finally:
         await verify.close()
+        await verify._driver.close()
         for store in stores:
             await store.close()  # idempotent — finalize already closed each store
+            await store._driver.close()
 
 
 async def test_durable_poison_isolation_no_contamination(
@@ -332,7 +341,9 @@ async def test_durable_poison_isolation_no_contamination(
     reg._max_delivery_attempts = 2
     qm = reg._queue_manager
 
-    store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+    store = Neo4jGraphStore(
+        driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+    )
     services = HookStateService(workspace=ws, graph_store=store)
     worker = SessionWorker(session_id=sid, workspace=ws, services=services)
     reg._register_for_test(worker)
@@ -405,7 +416,9 @@ async def test_durable_poison_isolation_no_contamination(
     # No contamination: the good lines persisted (good1, good2, session:end are
     # all :Event nodes). The poison's Event node is NOT persisted. Without the
     # discard_buffer calls good2 would also fail and this would be < 2.
-    verify = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+    verify = Neo4jGraphStore(
+        driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+    )
     try:
         rows = await verify.execute_query(
             "MATCH (n:Event) WHERE n.session_id = $sid AND n.workspace = $ws "
@@ -419,4 +432,6 @@ async def test_durable_poison_isolation_no_contamination(
         )
     finally:
         await verify.close()
+        await verify._driver.close()
         await store.close()
+        await store._driver.close()

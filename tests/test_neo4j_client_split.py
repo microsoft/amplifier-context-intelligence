@@ -402,16 +402,26 @@ async def test_two_client_split_runtime_smoke(
     SAME url+credentials.
 
     Approach: PREFERRED (HTTP boot). ``main.py``'s module-level ``_settings``
-    is only read by ``lifespan()`` for the two ``resolve_neo4j_*()`` calls
-    (main.py:146-147) -- swapping it for the duration of this test, then
-    driving the real ``lifespan()`` context manager plus a real HTTP request
-    through ``httpx.ASGITransport``, exercises the actual dual-driver +
-    access-mode code (main.py's ``lifespan`` and ``post_cypher``), not a
-    reimplementation. This mirrors the existing
-    ``test_lifespan_creates_and_closes_driver`` pattern in test_main.py
-    (patch module state, invoke ``lifespan()`` directly) combined with the
-    ``client`` fixture pattern in conftest.py (``httpx.AsyncClient`` +
-    ``ASGITransport``).
+    is only read by ``lifespan()`` -- via ``Neo4jGraphBackend.from_settings``,
+    which calls the two ``resolve_neo4j_*()`` methods (neo4j_backend.py) --
+    swapping it for the duration of this test, then driving the real
+    ``lifespan()`` context manager plus a real HTTP request through
+    ``httpx.ASGITransport``, exercises the actual dual-driver + access-mode
+    code (main.py's ``lifespan`` and ``post_cypher``), not a reimplementation.
+    This mirrors the existing
+    ``test_lifespan_starts_and_closes_the_graph_backend`` pattern in
+    test_main.py (patch module state, invoke ``lifespan()`` directly)
+    combined with the ``client`` fixture pattern in conftest.py
+    (``httpx.AsyncClient`` + ``ASGITransport``).
+
+    Post graph-backend-segregation, there is no ``app.state.neo4j_driver`` /
+    ``neo4j_query_driver`` pair to reach into any more -- both the admin
+    write and the cleanup go through
+    ``app.state.graph_backend.admin_store().execute_query(...)`` (the same
+    ``Neo4jGraphStore`` class the backend hands session stores from, just
+    unscoped -- see neo4j_backend.py's ``admin_store``), with
+    ``workspace="*"`` so the store's own workspace-injection doesn't add an
+    unused param to these workspace-agnostic probe queries.
 
     Steps:
       1. Build a structured ``Settings`` with admin+cypher_query both
@@ -421,12 +431,12 @@ async def test_two_client_split_runtime_smoke(
          manager -- this creates both real drivers and runs
          ``ensure_neo4j_schema`` on the admin driver (proves the admin/WRITE
          path is live).
-      3. Write a tiny probe node via the admin driver (further exercises the
+      3. Write a tiny probe node via the backend's write store (further exercises the
          admin/WRITE path with real data).
       4. POST /cypher (real HTTP round-trip via ASGITransport) reads it back
-         -- proves the request reads ``app.state.neo4j_query_driver`` and
+         -- proves the request reads ``the backend's read store`` and
          opens a READ-mode session against the live instance.
-      5. Clean up the probe node via the admin driver, always, even on
+      5. Clean up the probe node via the backend's write store, always, even on
          failure.
 
     Does NOT assert that a READ session rejects a write (it won't, on
@@ -478,19 +488,26 @@ async def test_two_client_split_runtime_smoke(
 
     async with main_module.lifespan(main_module.app):
         try:
-            # Sanity: lifespan wired the query driver in READ mode.
-            assert main_module.app.state.neo4j_query_access_mode == "READ"
+            # Sanity: lifespan started the backend and wired the query pool
+            # in READ mode -- health() reports both, never a raw driver.
+            health = await main_module.app.state.graph_backend.health()
+            assert health.write_connected is True
+            assert health.read_connected is True
 
-            # Write a tiny probe via the ADMIN (WRITE) driver -- real data,
+            # Write a tiny probe via the ADMIN (WRITE) store -- real data,
             # real write path, same instance as the query client.
-            async with main_module.app.state.neo4j_driver.session() as session:
-                await session.run(
-                    "CREATE (n:__TwoClientRuntimeSmokeProbe__ {value: $value})",
-                    {"value": probe_value},
-                )
+            # workspace="*" disables the store's own workspace injection for
+            # this workspace-agnostic probe query (see graph_store.py #10).
+            admin_store = main_module.app.state.graph_backend.admin_store()
+            await admin_store.execute_query(
+                "CREATE (n:__TwoClientRuntimeSmokeProbe__ {value: $value})",
+                {"value": probe_value},
+                workspace="*",
+            )
 
-            # Read it back through the REAL HTTP /cypher route -- this reads
-            # app.state.neo4j_query_driver and opens a READ-mode session.
+            # Read it back through the REAL HTTP /cypher route -- this goes
+            # through app.state.graph_backend.query_store() and opens a
+            # READ-mode session (see main.py's post_cypher).
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=main_module.app),
                 base_url="http://test",
@@ -503,6 +520,7 @@ async def test_two_client_split_runtime_smoke(
                             "RETURN n.value AS value"
                         ),
                         "params": {"value": probe_value},
+                        "workspace": "*",
                     },
                 )
 
@@ -510,9 +528,10 @@ async def test_two_client_split_runtime_smoke(
             body = response.json()
             assert body["results"] == [{"value": probe_value}]
         finally:
-            # Clean up via the admin (WRITE) driver regardless of outcome.
-            async with main_module.app.state.neo4j_driver.session() as session:
-                await session.run(
-                    "MATCH (n:__TwoClientRuntimeSmokeProbe__) DETACH DELETE n"
-                )
-    # lifespan's own finally block has now closed both drivers.
+            # Clean up via the admin (WRITE) store regardless of outcome.
+            admin_store = main_module.app.state.graph_backend.admin_store()
+            await admin_store.execute_query(
+                "MATCH (n:__TwoClientRuntimeSmokeProbe__) DETACH DELETE n",
+                workspace="*",
+            )
+    # lifespan's own finally block has now closed the backend (both pools).

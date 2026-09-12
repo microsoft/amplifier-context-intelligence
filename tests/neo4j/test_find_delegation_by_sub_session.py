@@ -28,8 +28,8 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
+from neo4j import AsyncGraphDatabase
 
 _DELEGATION_DATA: dict[str, Any] = {
     "labels": ["Delegation", "SST_EVENT"],
@@ -102,8 +102,10 @@ class TestFindDelegationBySubSessionNeo4j:
         """
         # Seed a Delegation with sub_session_id='ss-target' in a DIFFERENT workspace.
         other_store = Neo4jGraphStore(
-            uri=neo4j_container["bolt_url"],
-            auth=(neo4j_container["user"], neo4j_container["password"]),
+            driver=AsyncGraphDatabase.driver(
+                neo4j_container["bolt_url"],
+                auth=(neo4j_container["user"], neo4j_container["password"]),
+            ),
             workspace="other-workspace",
         )
         try:
@@ -113,6 +115,7 @@ class TestFindDelegationBySubSessionNeo4j:
             await other_store.flush()
         finally:
             await other_store.close()
+            await other_store._driver.close()
 
         store = neo4j_services.graph  # workspace == "test", empty buffer
 

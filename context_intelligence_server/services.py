@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import datetime
 from typing import Any
 
@@ -384,6 +384,14 @@ class GraphState:
         No-op if the edge does not exist.
         """
         self._edges.pop((src_id, dst_id), None)
+
+    def buffered_edges(self) -> Iterator[tuple[str, str, dict[str, Any]]]:
+        """Yield ``(src_id, dst_id, data)`` for every edge held in memory.
+
+        This store never flushes, so every edge it holds is a buffered one.
+        """
+        for (src_id, dst_id), data in self._edges.items():
+            yield src_id, dst_id, data
 
     async def set_labels(
         self, node_id: str, remove_labels: list[str], add_labels: list[str]

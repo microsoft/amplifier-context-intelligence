@@ -38,9 +38,8 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from neo4j import GraphDatabase
-
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
+from neo4j import AsyncGraphDatabase, GraphDatabase
 
 pytestmark = pytest.mark.neo4j
 
@@ -132,8 +131,10 @@ class TestGate1AntiSpoof:
         ws = "gate1-antispoof"
         node_id = "g1-spoof-node"
         store = Neo4jGraphStore(
-            uri=neo4j_container["bolt_url"],
-            auth=(neo4j_container["user"], neo4j_container["password"]),
+            driver=AsyncGraphDatabase.driver(
+                neo4j_container["bolt_url"],
+                auth=(neo4j_container["user"], neo4j_container["password"]),
+            ),
             workspace=ws,
         )
         store.created_by = "alice"
@@ -187,22 +188,28 @@ class TestGate2NodeWriteOnce:
         node_id = "g2-node"
 
         store_alice = Neo4jGraphStore(
-            uri=neo4j_container["bolt_url"],
-            auth=(neo4j_container["user"], neo4j_container["password"]),
+            driver=AsyncGraphDatabase.driver(
+                neo4j_container["bolt_url"],
+                auth=(neo4j_container["user"], neo4j_container["password"]),
+            ),
             workspace=ws,
         )
         store_alice.created_by = "alice"
 
         store_bob = Neo4jGraphStore(
-            uri=neo4j_container["bolt_url"],
-            auth=(neo4j_container["user"], neo4j_container["password"]),
+            driver=AsyncGraphDatabase.driver(
+                neo4j_container["bolt_url"],
+                auth=(neo4j_container["user"], neo4j_container["password"]),
+            ),
             workspace=ws,
         )
         store_bob.created_by = "bob"
 
         try:
             # --- First write: alice creates the node ---
-            await store_alice.upsert_node(node_id, {"labels": ["Event"], "name": "first"})
+            await store_alice.upsert_node(
+                node_id, {"labels": ["Event"], "name": "first"}
+            )
             await store_alice.flush()
 
             after_alice = _query_node_created_by(neo4j_container, node_id, ws)
@@ -211,7 +218,9 @@ class TestGate2NodeWriteOnce:
             )
 
             # --- Second write: bob attempts to MERGE the SAME node ---
-            await store_bob.upsert_node(node_id, {"labels": ["Event"], "name": "second"})
+            await store_bob.upsert_node(
+                node_id, {"labels": ["Event"], "name": "second"}
+            )
             await store_bob.flush()
 
             after_bob = _query_node_created_by(neo4j_container, node_id, ws)
@@ -259,15 +268,19 @@ class TestGate2EEdgeWriteOnce:
         # Neither src nor dst is pre-created via upsert_node —
         # the edge flush will MERGE them as bare :Node placeholders.
         store_alice = Neo4jGraphStore(
-            uri=neo4j_container["bolt_url"],
-            auth=(neo4j_container["user"], neo4j_container["password"]),
+            driver=AsyncGraphDatabase.driver(
+                neo4j_container["bolt_url"],
+                auth=(neo4j_container["user"], neo4j_container["password"]),
+            ),
             workspace=ws,
         )
         store_alice.created_by = "alice"
 
         store_bob = Neo4jGraphStore(
-            uri=neo4j_container["bolt_url"],
-            auth=(neo4j_container["user"], neo4j_container["password"]),
+            driver=AsyncGraphDatabase.driver(
+                neo4j_container["bolt_url"],
+                auth=(neo4j_container["user"], neo4j_container["password"]),
+            ),
             workspace=ws,
         )
         store_bob.created_by = "bob"
@@ -339,8 +352,10 @@ class TestGate3DevModeNull:
         dst_id = "g3-dst"
 
         store = Neo4jGraphStore(
-            uri=neo4j_container["bolt_url"],
-            auth=(neo4j_container["user"], neo4j_container["password"]),
+            driver=AsyncGraphDatabase.driver(
+                neo4j_container["bolt_url"],
+                auth=(neo4j_container["user"], neo4j_container["password"]),
+            ),
             workspace=ws,
         )
         # created_by defaults to None (auth disabled)

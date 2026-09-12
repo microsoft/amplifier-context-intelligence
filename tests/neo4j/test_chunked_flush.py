@@ -14,8 +14,8 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
+from neo4j import AsyncGraphDatabase
 
 pytestmark = pytest.mark.neo4j
 
@@ -28,8 +28,9 @@ pytestmark = pytest.mark.neo4j
 def _store(container: dict[str, Any], *, rows: int, byts: int) -> Neo4jGraphStore:
     """Construct a Neo4jGraphStore against the test container with given bounds."""
     return Neo4jGraphStore(
-        uri=container["bolt_url"],
-        auth=(container["user"], container["password"]),
+        driver=AsyncGraphDatabase.driver(
+            container["bolt_url"], auth=(container["user"], container["password"])
+        ),
         workspace="chunk-test",
         flush_chunk_rows=rows,
         flush_chunk_bytes=byts,

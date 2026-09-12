@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import pytest
+from neo4j import AsyncGraphDatabase
 
 pytestmark = pytest.mark.neo4j
 
@@ -215,8 +216,10 @@ class TestResolveSessionGraphNeo4j:
         await _build_graph(store)
 
         other_store = Neo4jGraphStore(
-            uri=neo4j_container["bolt_url"],
-            auth=(neo4j_container["user"], neo4j_container["password"]),
+            driver=AsyncGraphDatabase.driver(
+                neo4j_container["bolt_url"],
+                auth=(neo4j_container["user"], neo4j_container["password"]),
+            ),
             workspace="other-workspace",
         )
         try:
@@ -232,6 +235,7 @@ class TestResolveSessionGraphNeo4j:
             )
         finally:
             await other_store.close()
+            await other_store._driver.close()
 
     async def test_ambiguous_session_id_across_workspaces_raises(
         self, neo4j_services: Any, neo4j_container: dict[str, Any]
@@ -250,8 +254,10 @@ class TestResolveSessionGraphNeo4j:
         await _build_graph(store)
 
         other_store = Neo4jGraphStore(
-            uri=neo4j_container["bolt_url"],
-            auth=(neo4j_container["user"], neo4j_container["password"]),
+            driver=AsyncGraphDatabase.driver(
+                neo4j_container["bolt_url"],
+                auth=(neo4j_container["user"], neo4j_container["password"]),
+            ),
             workspace="other-workspace",
         )
         try:
@@ -272,3 +278,4 @@ class TestResolveSessionGraphNeo4j:
                 await other_store.resolve_session_graph("nf-fam-root")
         finally:
             await other_store.close()
+            await other_store._driver.close()

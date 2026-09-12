@@ -260,44 +260,79 @@ and their typed relationships (`HAS_EVENT`, `EMITTED`, `REFERENCES_BLOB`).
 
 ---
 
-## Neo4j client topology
+## Graph backend and Neo4j client topology
 
-The server connects to Neo4j through **three drivers**, each with a distinct job.
+Everything in the server that touches the graph goes through a **graph backend**:
+one object that owns every connection and hands out stores. `GraphBackend`
+(`graph_backend.py`) is the port; `Neo4jGraphBackend` (`neo4j_backend.py`) is the
+only implementation, and the only place in the server a driver is constructed.
 
-Two are owned by the lifespan. The **admin driver** (`neo4j_driver`) is opened in
-**WRITE** access mode and handles boot-time and operational work: schema creation,
-the untagged-node integrity check, and the `/status` connectivity probe. The
-**cypher_query driver** (`neo4j_query_driver`) is opened in **READ** access mode and
-serves `POST /cypher` reads. Both are created together at startup and closed
-together at shutdown. With legacy flat config (`neo4j_url` / `neo4j_user` /
-`neo4j_password`), both fall back to the same endpoint and shared credentials,
-differing only by access-mode hint; a structured `neo4j:` block lets the read driver
-take a separate credential and/or URL (e.g. a read replica). Their connection health
-is reported independently on `/status` as `neo4j_connected` (admin) and
-`neo4j_query_connected` (cypher_query).
+Two rules make that structural rather than advisory:
 
-The third is the **shared session driver**, owned by `SessionRegistry`, and it is the
-one that carries the **ingest path** — every per-session `Neo4jGraphStore`'s batch
-flushes. It is built lazily on the first session (from the same resolved admin client
-config) with a bounded pool (`neo4j_max_connection_pool_size`, default 50) and
-injected into every store, so a per-session finalize can never close the driver other
-live sessions are still using. Before it existed, each session built and held its own
-unshared driver, which is how bolt connections accumulated until the server's thread
-pool starved. It is closed exactly once, at shutdown, and only *after*
-`SessionRegistry.shutdown_workers()` has quiesced the drain workers — closing it
-under a live drainer makes that drainer exhaust its retry budget and dead-letter
-healthy queued events.
+1. **Only a backend opens a connection.** `Neo4jGraphStore` takes an
+   already-open driver as a REQUIRED keyword argument and has no code path that
+   builds one. A leak cannot be reintroduced by a caller that forgets to
+   inject, because there is nothing to forget.
+2. **A backend hands out stores, never connections.** `session_store()`,
+   `admin_store()` and `query_store()` return `GraphStore`/`QueryableStore`.
+   There is no public accessor that returns a driver, so no consumer can
+   acquire one to hold, pass on, or close out of turn.
 
-Because `/status` probes only the admin and cypher_query drivers,
-`neo4j_connected: true` does **not** by itself mean the ingest path is healthy.
-Ingest health is visible through the pipeline-conservation counters in the `metrics`
-block (`written_total`, `residual`, `degraded`).
+A store's `close()` therefore flushes its buffer and stops -- it never closes a
+driver. Connection lifetime is the backend's, owned by the application lifespan,
+which starts the backend before any store is requested and closes it once at
+shutdown. `doctor` runs the same backend, so the CLI and the server cannot
+connect differently.
 
-> **Note:** the existing `.dot` diagrams (e.g. `05-durable-ingest-queue`) show only
-> the **write path**, and label it as the admin driver — that write path is now the
-> shared session driver. The three-driver split is not yet rendered in any diagram —
-> a dedicated topology diagram is a known follow-up. This prose subsection is the
-> interim reference; no new `.dot` is authored in this pass.
+### The two pools
+
+| Pool | Access mode | Carries |
+|---|---|---|
+| **write** (`neo4j.admin`) | WRITE | schema DDL at boot, every per-session ingest flush, whole-graph deletion |
+| **read** (`neo4j.cypher_query`) | READ | `POST /cypher`, the read-only deletion summary |
+
+Both are built by `build_bounded_neo4j_driver` with a bounded pool
+(`neo4j_max_connection_pool_size`, default 50) and an acquisition budget equal to
+`neo4j_lock_timeout`, so a caller waiting on a saturated pool fails on the same
+budget as one waiting on a blocked transaction instead of parking indefinitely.
+
+With legacy flat config (`neo4j_url` / `neo4j_user` / `neo4j_password`) both fall
+back to the same endpoint and shared credentials, differing only by access-mode
+hint; a structured `neo4j:` block lets the read client take a separate credential
+and/or URL (e.g. a read replica).
+
+### History: why it was three, and why the count matters
+
+Before the backend existed the process opened **three** pools: an admin driver
+and a query driver owned by the lifespan, plus a third the `SessionRegistry`
+built lazily for itself on the first session. The first and third were built from
+the same config, against the same instance, for overlapping work -- the split
+bought nothing and cost a pool that was opened outside any lifespan.
+
+Before *that*, every session built its own unshared driver with the driver's
+default 100-connection pool, released only on a clean finalize. That is how bolt
+connections accumulated until the process exhausted its file-descriptor limit.
+
+The lesson the current shape encodes: bounding a pool only helps while the
+NUMBER of pools is itself bounded, and the number of pools is bounded only if
+opening one is something exactly one object can do.
+
+### Reading `/status`
+
+Connection health is reported on `/status` as `neo4j_connected` (write) and
+`neo4j_query_connected` (read) -- both sourced from `GraphBackend.health()`. The
+response keys keep their `neo4j_` names because they are a published wire
+contract; the technology name survives at the edge, where it is already
+promised, and nowhere inward of it.
+
+`neo4j_connected: true` does **not** by itself mean ingest is healthy -- it means
+the pool answers. Ingest health is visible through the pipeline-conservation
+counters in the `metrics` block (`written_total`, `residual`, `degraded`).
+
+> **Note:** the existing `.dot` diagrams (e.g. `05-durable-ingest-queue`) show
+> only the **write path** and label it as "the admin driver" -- that write path is
+> now the backend's write pool. A dedicated backend/topology diagram is a known
+> follow-up; this prose subsection is the interim reference.
 
 ---
 

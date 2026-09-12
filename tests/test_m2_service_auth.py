@@ -135,55 +135,6 @@ class _MockBlobStore:
         raise FileNotFoundError(f"mock blob store: not found: {uri}")
 
 
-class _MockNeo4jResult:
-    """Async-iterable result mock that yields a fixed list of rows."""
-
-    def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
-        self._rows = list(rows or [])
-        self._index = 0
-
-    def __aiter__(self) -> "_MockNeo4jResult":
-        return self
-
-    async def __anext__(self) -> dict[str, Any]:
-        if self._index >= len(self._rows):
-            raise StopAsyncIteration
-        row = self._rows[self._index]
-        self._index += 1
-        return row
-
-
-class _MockNeo4jSession:
-    """Async context-manager session mock."""
-
-    def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
-        self._rows = rows
-
-    async def run(self, query: str, params: dict[str, Any]) -> _MockNeo4jResult:
-        return _MockNeo4jResult(self._rows)
-
-    async def __aenter__(self) -> "_MockNeo4jSession":
-        return self
-
-    async def __aexit__(self, *args: object) -> None:
-        pass
-
-
-class _MockNeo4jDriver:
-    """Driver mock; delegates to a single _MockNeo4jSession.
-
-    Accepts (and ignores) ``default_access_mode`` so it stays compatible with
-    the two-client split's ``driver.session(default_access_mode=...)`` call
-    in ``post_cypher`` (main.py).
-    """
-
-    def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
-        self._rows = rows
-
-    def session(self, default_access_mode: str | None = None) -> _MockNeo4jSession:
-        return _MockNeo4jSession(self._rows)
-
-
 # ---------------------------------------------------------------------------
 # Module-scoped RSA keypair (generated once, shared across all cap tests)
 # ---------------------------------------------------------------------------
@@ -498,13 +449,20 @@ class TestM2CapabilityDeps:
         private_key, asgi = service_asgi_with_map
         token = _sign_jwt(private_key, _service_claims(roles=["Reader"]))
 
-        # Mock the neo4j QUERY (read-intent) driver on app.state -- /cypher reads
-        # app.state.neo4j_query_driver + neo4j_query_access_mode (two-client
-        # split, doc 12), not the admin neo4j_driver. (raising=False since
-        # lifespan didn't run.)
-        mock_driver = _MockNeo4jDriver(rows=[{"n": {"label": "Session"}}])
-        monkeypatch.setattr(app.state, "neo4j_query_driver", mock_driver, raising=False)
-        monkeypatch.setattr(app.state, "neo4j_query_access_mode", "READ", raising=False)
+        # /cypher goes through app.state.graph_backend.query_store() (see
+        # graph-backend-segregation, main.py's post_cypher) -- there is no
+        # driver/access-mode pair on app.state any more. (raising=False since
+        # lifespan didn't run; the conftest.py default fixture already binds
+        # one, but this test wants specific rows.)
+        from tests.conftest import FakeGraphBackend, FakeQueryableStore  # noqa: PLC0415
+
+        store = FakeQueryableStore(rows=[{"n": {"label": "Session"}}])
+        monkeypatch.setattr(
+            app.state,
+            "graph_backend",
+            FakeGraphBackend(query_store=store),
+            raising=False,
+        )
 
         async with _make_client(asgi) as c:
             resp = await c.post(
@@ -540,12 +498,18 @@ class TestM2CapabilityDeps:
         private_key, asgi = service_asgi_with_map
         token = _sign_jwt(private_key, _service_claims(roles=["Reader"]))
 
-        # Mock the neo4j QUERY (read-intent) driver — /cypher reads
-        # app.state.neo4j_query_driver (two-client split, doc 12). The
-        # "mutation" is accepted by the mock (no real DB).
-        mock_driver = _MockNeo4jDriver(rows=[])
-        monkeypatch.setattr(app.state, "neo4j_query_driver", mock_driver, raising=False)
-        monkeypatch.setattr(app.state, "neo4j_query_access_mode", "READ", raising=False)
+        # /cypher goes through app.state.graph_backend.query_store() (see
+        # graph-backend-segregation, main.py's post_cypher). The "mutation"
+        # is accepted by the fake store (no real DB).
+        from tests.conftest import FakeGraphBackend, FakeQueryableStore  # noqa: PLC0415
+
+        store = FakeQueryableStore(rows=[])
+        monkeypatch.setattr(
+            app.state,
+            "graph_backend",
+            FakeGraphBackend(query_store=store),
+            raising=False,
+        )
 
         # A MUTATING Cypher query — at M2 this is allowed through require_read
         mutating_query = "CREATE (n:M2SoftGapNode {id: 'soft-gap-test'}) RETURN n"

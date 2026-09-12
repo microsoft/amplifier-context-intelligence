@@ -1,140 +1,179 @@
 """Tests for context_intelligence_server.doctor -- the `doctor` / `doctor --fix`
 CLI gesture that replaced the two O(graph-size) migration scans formerly run
 unconditionally at cold start.
+
+Post graph-backend-segregation (PR #109), `run_doctor` owns no connection of
+its own: it builds a `Neo4jGraphBackend` via `Neo4jGraphBackend.from_settings`,
+starts it, drives health/diagnose/repair through it, and closes it in a
+`finally`. These tests patch `Neo4jGraphBackend` in the doctor module with a
+fake backend double so no real config or Neo4j connection is required, and
+assert on the backend's start/aclose/health/diagnose/repair calls instead of
+a raw driver.
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
-
 from context_intelligence_server import doctor as doctor_module
+from context_intelligence_server.graph_backend import BackendHealth
 
 
-def _fake_driver() -> MagicMock:
-    driver = MagicMock()
-    driver.verify_connectivity = AsyncMock(return_value=None)
-    driver.close = AsyncMock(return_value=None)
-    return driver
+class _FakeBackend:
+    """GraphBackend double driving run_doctor's health/diagnose/repair calls.
+
+    ``diagnose`` is a side_effect list so a test can express "before repair"
+    and "after repair" snapshots the same way run_doctor consumes them (one
+    call before repair, a second call after).
+    """
+
+    def __init__(
+        self,
+        *,
+        write_connected: bool = True,
+        read_connected: bool | None = None,
+        diagnose_results: list[dict[str, int]] | None = None,
+        repair_result: dict[str, int] | None = None,
+    ) -> None:
+        self.start = AsyncMock()
+        self.aclose = AsyncMock()
+        self.health = AsyncMock(
+            return_value=BackendHealth(
+                write_connected=write_connected,
+                read_connected=(
+                    write_connected if read_connected is None else read_connected
+                ),
+                url="bolt://fake:7687",
+                browser_url="",
+            )
+        )
+        results = diagnose_results or [{"untagged_nodes": 0, "duplicate_nodes": 0}]
+        self.diagnose = AsyncMock(side_effect=results)
+        self.repair = AsyncMock(
+            return_value=repair_result
+            if repair_result is not None
+            else {"duplicates_removed": 0, "nodes_tagged": 0}
+        )
 
 
-@pytest.fixture(autouse=True)
-def _patch_settings_and_driver():
-    """Every test patches get_settings/build_neo4j_driver so no real config
-    or Neo4j connection is required."""
-    with (
-        patch.object(doctor_module, "get_settings") as mock_get_settings,
-        patch.object(doctor_module, "build_neo4j_driver") as mock_build_driver,
-    ):
-        mock_get_settings.return_value.resolve_neo4j_admin.return_value = "admin-cfg"
-        mock_build_driver.return_value = _fake_driver()
-        yield mock_build_driver.return_value
+@pytest.fixture
+def make_backend():
+    """Factory fixture: patches Neo4jGraphBackend.from_settings to return a
+    caller-configured _FakeBackend, and yields that backend for assertions."""
+
+    def _make(**kwargs: object) -> _FakeBackend:
+        backend = _FakeBackend(**kwargs)  # type: ignore[arg-type]
+        patcher = patch.object(
+            doctor_module.Neo4jGraphBackend, "from_settings", return_value=backend
+        )
+        patcher.start()
+        _make.patchers.append(patcher)  # type: ignore[attr-defined]
+        return backend
+
+    _make.patchers = []  # type: ignore[attr-defined]
+    yield _make
+    for patcher in _make.patchers:  # type: ignore[attr-defined]
+        patcher.stop()
 
 
-async def test_run_doctor_healthy_returns_zero(_patch_settings_and_driver) -> None:
-    driver = _patch_settings_and_driver
-    with patch.object(
-        doctor_module,
-        "diagnose",
-        AsyncMock(return_value={"untagged_nodes": 0, "duplicate_nodes": 0}),
-    ):
-        code = await doctor_module.run_doctor(fix=False)
+async def test_run_doctor_healthy_returns_zero(make_backend) -> None:
+    backend = make_backend(
+        diagnose_results=[{"untagged_nodes": 0, "duplicate_nodes": 0}]
+    )
+
+    code = await doctor_module.run_doctor(fix=False)
 
     assert code == 0
-    driver.close.assert_awaited_once()
+    backend.start.assert_awaited_once()
+    backend.aclose.assert_awaited_once()
 
 
-async def test_run_doctor_unhealthy_report_only_returns_nonzero(
-    _patch_settings_and_driver,
-) -> None:
-    with patch.object(
-        doctor_module,
-        "diagnose",
-        AsyncMock(return_value={"untagged_nodes": 5, "duplicate_nodes": 0}),
-    ):
-        code = await doctor_module.run_doctor(fix=False)
+async def test_run_doctor_unhealthy_report_only_returns_nonzero(make_backend) -> None:
+    make_backend(diagnose_results=[{"untagged_nodes": 5, "duplicate_nodes": 0}])
+
+    code = await doctor_module.run_doctor(fix=False)
 
     assert code != 0
 
 
 async def test_run_doctor_fix_calls_run_repair_and_returns_zero_when_healthy_after(
-    _patch_settings_and_driver,
+    make_backend,
 ) -> None:
-    diagnose_mock = AsyncMock(
-        side_effect=[
+    backend = make_backend(
+        diagnose_results=[
             {"untagged_nodes": 5, "duplicate_nodes": 2},  # before repair
             {"untagged_nodes": 0, "duplicate_nodes": 0},  # after repair
-        ]
+        ],
+        repair_result={"duplicates_removed": 2, "nodes_tagged": 5},
     )
-    repair_mock = AsyncMock(return_value={"duplicates_removed": 2, "nodes_tagged": 5})
-    with (
-        patch.object(doctor_module, "diagnose", diagnose_mock),
-        patch.object(doctor_module, "run_repair", repair_mock),
-    ):
-        code = await doctor_module.run_doctor(fix=True)
+
+    code = await doctor_module.run_doctor(fix=True)
 
     assert code == 0
-    repair_mock.assert_awaited_once()
-    assert diagnose_mock.await_count == 2
+    backend.repair.assert_awaited_once()
+    assert backend.diagnose.await_count == 2
 
 
 async def test_run_doctor_fix_returns_nonzero_when_still_unhealthy_after(
-    _patch_settings_and_driver,
+    make_backend,
 ) -> None:
-    diagnose_mock = AsyncMock(
-        side_effect=[
+    make_backend(
+        diagnose_results=[
             {"untagged_nodes": 5, "duplicate_nodes": 0},
             {"untagged_nodes": 3, "duplicate_nodes": 0},  # repair left residual
-        ]
+        ],
+        repair_result={"duplicates_removed": 0, "nodes_tagged": 2},
     )
-    repair_mock = AsyncMock(return_value={"duplicates_removed": 0, "nodes_tagged": 2})
-    with (
-        patch.object(doctor_module, "diagnose", diagnose_mock),
-        patch.object(doctor_module, "run_repair", repair_mock),
-    ):
-        code = await doctor_module.run_doctor(fix=True)
+
+    code = await doctor_module.run_doctor(fix=True)
 
     assert code != 0
 
 
 async def test_run_doctor_fix_does_not_repair_already_healthy_graph(
-    _patch_settings_and_driver,
+    make_backend,
 ) -> None:
-    """fix=True on an already-healthy graph must not invoke run_repair at all."""
-    diagnose_mock = AsyncMock(return_value={"untagged_nodes": 0, "duplicate_nodes": 0})
-    repair_mock = AsyncMock()
-    with (
-        patch.object(doctor_module, "diagnose", diagnose_mock),
-        patch.object(doctor_module, "run_repair", repair_mock),
-    ):
-        code = await doctor_module.run_doctor(fix=True)
+    """fix=True on an already-healthy graph must not invoke backend.repair() at all."""
+    backend = make_backend(
+        diagnose_results=[{"untagged_nodes": 0, "duplicate_nodes": 0}]
+    )
+
+    code = await doctor_module.run_doctor(fix=True)
 
     assert code == 0
-    repair_mock.assert_not_awaited()
+    backend.repair.assert_not_awaited()
 
 
-async def test_run_doctor_neo4j_unreachable_returns_nonzero(
-    _patch_settings_and_driver,
-) -> None:
-    driver = _patch_settings_and_driver
-    driver.verify_connectivity = AsyncMock(
-        side_effect=RuntimeError("connection refused")
-    )
+async def test_run_doctor_neo4j_unreachable_returns_nonzero(make_backend) -> None:
+    backend = make_backend(write_connected=False)
 
     code = await doctor_module.run_doctor(fix=False)
 
     assert code != 0
-    driver.close.assert_awaited_once()
+    backend.aclose.assert_awaited_once()
 
 
-async def test_run_doctor_closes_driver_even_on_unreachable(
-    _patch_settings_and_driver,
-) -> None:
-    """The driver must be closed (finally-block) even when unreachable."""
-    driver = _patch_settings_and_driver
-    driver.verify_connectivity = AsyncMock(side_effect=RuntimeError("down"))
+async def test_run_doctor_closes_driver_even_on_unreachable(make_backend) -> None:
+    """The backend must be closed (finally-block) even when unreachable."""
+    backend = make_backend(write_connected=False)
 
     await doctor_module.run_doctor(fix=True)
 
-    driver.close.assert_awaited_once()
+    backend.aclose.assert_awaited_once()
+
+
+async def test_run_doctor_read_pool_unreachable_returns_nonzero(make_backend) -> None:
+    """A healthy write pool alone must NOT be reported as a healthy graph.
+
+    The read pool is what /cypher and the session summary run on. Gating only
+    on the write pool would tell an operator the graph is fine while half the
+    read surface was down -- and the doctor exists to be believed.
+    """
+    backend = make_backend(write_connected=True, read_connected=False)
+
+    exit_code = await doctor_module.run_doctor(fix=False)
+
+    assert exit_code == 1
+    backend.diagnose.assert_not_awaited()
+    backend.aclose.assert_awaited_once()

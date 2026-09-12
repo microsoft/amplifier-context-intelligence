@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -14,9 +15,30 @@ import pytest
 
 import context_intelligence_server.main as main_module
 from context_intelligence_server.auth import BearerTokenMiddleware
+from context_intelligence_server.graph_backend import BackendHealth
 from context_intelligence_server.main import app, lifespan, registry
 from context_intelligence_server.models import CypherRequest
-from tests.conftest import MockNeo4jDriver
+from tests.conftest import FakeGraphBackend, FakeQueryableStore
+
+
+@contextlib.contextmanager
+def _patched_backend(fake_backend: FakeGraphBackend | None = None) -> Any:
+    """Patch ``Neo4jGraphBackend.from_settings`` so ``lifespan()`` builds
+    *fake_backend* (a fresh ``FakeGraphBackend`` by default) instead of a
+    real Neo4j-backed one.
+
+    Replaces the old pattern of patching
+    ``neo4j_store.AsyncGraphDatabase.driver`` (driver construction moved to
+    ``neo4j_backend._build_bounded_driver``, and the store no longer
+    builds one at all) plus ``main.ensure_neo4j_schema`` (schema init is now
+    ``backend.ensure_schema``, not a free function main.py imports). Yields
+    the bound fake backend for assertions.
+    """
+    backend = fake_backend if fake_backend is not None else FakeGraphBackend()
+    with patch.object(
+        main_module.Neo4jGraphBackend, "from_settings", lambda settings: backend
+    ):
+        yield backend
 
 
 @pytest.fixture(autouse=True)
@@ -245,12 +267,14 @@ async def test_drain_loop_processes_event(
     durable drain loop reads from the on-disk QueueManager log, so success is
     observed by polling that log to empty rather than worker.queue.join().
     """
-    from context_intelligence_server.neo4j_store import Neo4jGraphStore
-
+    # The default per-session store (see conftest.py's FakeGraphBackend) is
+    # GraphState -- a pure in-memory GraphStore with no driver, so flush()/
+    # close() are already safe no-ops. No Neo4jGraphStore stubbing needed
+    # (pre graph-backend-segregation, the registry built a real
+    # Neo4jGraphStore around a driver here, which is what those patches used
+    # to guard against).
     proc = AsyncMock()
     monkeypatch.setattr("context_intelligence_server.registry.process_event", proc)
-    monkeypatch.setattr(Neo4jGraphStore, "flush", AsyncMock())
-    monkeypatch.setattr(Neo4jGraphStore, "close", AsyncMock())
 
     await client.post(
         "/events",
@@ -377,18 +401,17 @@ async def test_cypher_proxy_returns_results(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """POST /cypher returns 200 with {results: [...]} from Neo4j."""
+    """POST /cypher returns 200 with {results: [...]} from the query store.
+
+    Post graph-backend-segregation, /cypher goes through
+    ``app.state.graph_backend.query_store().execute_query(...)`` -- there is
+    no driver/session on app.state to mock any more (see
+    ``FakeQueryableStore``/``FakeGraphBackend`` in conftest.py).
+    """
     mock_row = {"name": "Alice"}
-    # /cypher reads app.state.neo4j_query_driver (two-client split, doc 12),
-    # not the admin neo4j_driver.
+    store = FakeQueryableStore(rows=[mock_row])
     monkeypatch.setattr(
-        main_module.app.state,
-        "neo4j_query_driver",
-        MockNeo4jDriver(rows=[mock_row]),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        main_module.app.state, "neo4j_query_access_mode", "READ", raising=False
+        main_module.app.state, "graph_backend", FakeGraphBackend(query_store=store)
     )
 
     response = await client.post("/cypher", json={"query": "MATCH (n) RETURN n"})
@@ -398,22 +421,14 @@ async def test_cypher_proxy_returns_results(
     assert data["results"] == [mock_row]
 
 
-async def test_cypher_workspace_injection(
+async def test_cypher_forwards_workspace_and_params_to_store(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """POST /cypher injects workspace into params when workspace is not None or '*'."""
-    captured_params: dict[str, Any] = {}
-    # /cypher reads app.state.neo4j_query_driver (two-client split, doc 12),
-    # not the admin neo4j_driver.
+    """POST /cypher forwards an EXPLICIT workspace and the params verbatim."""
+    store = FakeQueryableStore()
     monkeypatch.setattr(
-        main_module.app.state,
-        "neo4j_query_driver",
-        MockNeo4jDriver(captured=captured_params),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        main_module.app.state, "neo4j_query_access_mode", "READ", raising=False
+        main_module.app.state, "graph_backend", FakeGraphBackend(query_store=store)
     )
 
     await client.post(
@@ -424,58 +439,127 @@ async def test_cypher_workspace_injection(
             "params": {"id": 42},
         },
     )
-    assert captured_params.get("workspace") == "/my/ws"
-    assert (
-        captured_params.get("id") == 42
-    )  # user-supplied param preserved after injection
+    assert len(store.calls) == 1
+    call = store.calls[0]
+    assert call["workspace"] == "/my/ws"
+    assert call["params"] == {"id": 42}
 
 
-async def test_cypher_star_workspace_not_injected(
+async def test_cypher_star_workspace_forwarded_as_is(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """POST /cypher does NOT inject workspace when workspace='*' (cross-workspace)."""
-    captured_params: dict[str, Any] = {}
-    # /cypher reads app.state.neo4j_query_driver (two-client split, doc 12),
-    # not the admin neo4j_driver.
+    """POST /cypher forwards workspace='*' to the store unchanged (cross-workspace).
+
+    The store, not this route, is what decides '*' disables workspace
+    filtering (see graph_store.py's QueryableStore contract).
+    """
+    store = FakeQueryableStore()
     monkeypatch.setattr(
-        main_module.app.state,
-        "neo4j_query_driver",
-        MockNeo4jDriver(captured=captured_params),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        main_module.app.state, "neo4j_query_access_mode", "READ", raising=False
+        main_module.app.state, "graph_backend", FakeGraphBackend(query_store=store)
     )
 
     await client.post(
         "/cypher",
         json={"query": "MATCH (n) RETURN n", "workspace": "*"},
     )
-    assert "workspace" not in captured_params
+    assert store.calls[0]["workspace"] == "*"
 
 
-async def test_cypher_neo4j_error_returns_500(
+async def test_cypher_serializes_temporal_values_as_iso8601(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """POST /cypher returns 500 with error detail when Neo4j raises an exception."""
-    # /cypher reads app.state.neo4j_query_driver (two-client split, doc 12),
-    # not the admin neo4j_driver.
+    """Temporal values must reach the wire as ISO-8601, offset intact.
+
+    Behaviour-preservation guard, and the one that actually caught a
+    regression. The route used to stringify the DRIVER's temporal type, which
+    renders ISO. Going through ``execute_query`` normalises those to Python
+    ``datetime`` first -- and ``str(datetime)`` is NOT ISO: it separates date
+    and time with a SPACE. A bare ``default=str`` therefore silently changed a
+    published response format under cover of a refactor, in a way no status
+    code or JSON key would have revealed. Pin the value, not just the shape.
+    """
+    moment = datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=timezone.utc)
+    store = FakeQueryableStore(rows=[{"started_at": moment}])
     monkeypatch.setattr(
-        main_module.app.state,
-        "neo4j_query_driver",
-        MockNeo4jDriver(exc=RuntimeError("Connection refused")),
-        raising=False,
+        main_module.app.state, "graph_backend", FakeGraphBackend(query_store=store)
     )
+
+    response = await client.post("/cypher", json={"query": "MATCH (n) RETURN n"})
+
+    assert response.status_code == 200
+    serialized = response.json()["results"][0]["started_at"]
+    assert serialized == "2026-01-02T03:04:05.123456+00:00"
+    assert "T" in serialized, "date and time must be ISO-separated, not space-separated"
+
+
+async def test_cypher_omitted_workspace_injects_nothing(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An omitted workspace must reach the store as '*', NOT as None.
+
+    Behaviour-preservation guard for the migration off the raw driver session.
+    This route has always treated an omitted workspace as "inject nothing" --
+    the caller's query runs with only the params it supplied.
+    ``execute_query``'s ``None`` means something different: "scope to the
+    store's OWN workspace", which for this unscoped store would silently
+    inject ``workspace="default"`` into a query that never asked for one, and
+    quietly narrow results a caller expected to be unfiltered. ``"*"`` is the
+    value that means "inject nothing", so that is what an omission maps to.
+    """
+    store = FakeQueryableStore()
     monkeypatch.setattr(
-        main_module.app.state, "neo4j_query_access_mode", "READ", raising=False
+        main_module.app.state, "graph_backend", FakeGraphBackend(query_store=store)
+    )
+
+    await client.post("/cypher", json={"query": "MATCH (n) RETURN n"})
+
+    assert store.calls[0]["workspace"] == "*"
+    assert store.calls[0]["params"] == {}
+
+
+async def test_cypher_store_error_returns_500(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /cypher returns 500 with error detail when the store raises."""
+    store = FakeQueryableStore(exc=RuntimeError("Connection refused"))
+    monkeypatch.setattr(
+        main_module.app.state, "graph_backend", FakeGraphBackend(query_store=store)
     )
 
     response = await client.post("/cypher", json={"query": "MATCH (n) RETURN n"})
     assert response.status_code == 500
     data = response.json()
     assert "Connection refused" in data["detail"]
+
+
+async def test_cypher_store_value_error_returns_400(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /cypher returns 400 (not 500) when the store rejects the dialect.
+
+    NEW behavior introduced by graph-backend-segregation: the endpoint used
+    to catch every exception as a caller-opaque 500. Now that it calls
+    ``QueryableStore.execute_query`` (which raises ``ValueError`` for an
+    unsupported dialect per the GraphStore contract, graph_store.py #8), a
+    ``ValueError`` is mapped to 400 -- a caller error, not a server error.
+    ``CypherRequest`` has no ``dialect`` field of its own (main.py always
+    calls ``execute_query`` with the store's "cypher" default) -- this
+    exercises the mapping directly by having the store itself reject, the
+    same shape a real dialect-rejecting store would raise.
+    """
+    store = FakeQueryableStore(exc=ValueError("Unsupported dialect: 'sparql'"))
+    monkeypatch.setattr(
+        main_module.app.state, "graph_backend", FakeGraphBackend(query_store=store)
+    )
+
+    response = await client.post("/cypher", json={"query": "MATCH (n) RETURN n"})
+    assert response.status_code == 400
+    assert "Unsupported dialect" in response.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
@@ -705,96 +789,82 @@ class TestMainDispatch:
         assert exc_info.value.code == 1
 
 
-async def test_lifespan_creates_and_closes_driver(
+async def test_lifespan_starts_and_closes_the_graph_backend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Lifespan creates BOTH Neo4j drivers (admin + query) at startup and
-    closes BOTH at shutdown (Neo4j two-client split, doc 12)."""
-    mock_driver = MagicMock()
-    mock_driver.close = AsyncMock()
+    """Lifespan starts the graph backend exactly once at startup, publishes
+    it on app.state + the registry, and closes it exactly once at shutdown.
 
+    Post graph-backend-segregation, ``lifespan()`` no longer builds drivers
+    itself -- it asks ``Neo4jGraphBackend.from_settings()`` for a backend and
+    owns ONLY that object's lifecycle (see main.py's lifespan docstring). The
+    driver-count/pool-bounding invariants this test used to assert (two
+    drivers, one factory) now live where the drivers are actually built --
+    ``neo4j_backend._build_bounded_driver`` -- which is out of this
+    migration's scope (tests/test_neo4j_driver_sharing.py).
+    """
     with (
         patch(
             "context_intelligence_server.main.setup_logging",
         ) as mock_setup_logging,
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ) as mock_driver_factory,
+        _patched_backend() as fake_backend,
     ):
         async with lifespan(main_module.app):
             # setup_logging() is called once during startup
             mock_setup_logging.assert_called_once()
-            # During lifespan: driver factory must have been called TWICE --
-            # once for the admin (read/write) client, once for the
-            # cypher_query (read-intent) client.
-            assert mock_driver_factory.call_count == 2
-            # Both drivers are accessible via app.state (same mock object
-            # here since the factory is patched with a single return_value).
-            assert main_module.app.state.neo4j_driver is mock_driver
-            assert main_module.app.state.neo4j_query_driver is mock_driver
-            # The resolved query access_mode is stashed for /cypher.
-            assert main_module.app.state.neo4j_query_access_mode == "READ"
+            assert fake_backend.start_calls == 1
+            assert fake_backend.started is True
+            # Published for request handlers (never a driver -- see
+            # graph_backend.py's module docstring).
+            assert main_module.app.state.graph_backend is fake_backend
+            assert main_module.registry.graph_backend is fake_backend
 
-        # After lifespan exits: close() must have been awaited for BOTH
-        # drivers (admin + query).
-        assert mock_driver.close.await_count == 2
+        # After lifespan exits: aclose() must have been awaited exactly once,
+        # and the registry must be unbound again.
+        assert fake_backend.aclose_calls == 1
+        assert fake_backend.started is False
 
 
-async def test_lifespan_quiesces_drain_workers_before_closing_shared_driver(
+async def test_lifespan_quiesces_drain_workers_before_closing_backend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Shutdown MUST cancel the drain workers before closing the registry's
-    shared Neo4j driver.
+    """Shutdown MUST cancel the drain workers before closing the graph backend.
 
-    Every session's graph store shares one driver now, so closing it under a
-    live drainer is not a per-session concern: the drainer's batch fails, it
-    burns its max_delivery_attempts budget in ~250ms, and
-    _handle_exhausted_batch dead-letters each line AND commits the offset past
-    it -- silently discarding healthy events that merely happened to be queued
-    at shutdown, with no replay on the next boot.
+    Every session's graph store shares the backend's connection now, so
+    closing it under a live drainer is not a per-session concern: the
+    drainer's batch fails, it burns its max_delivery_attempts budget in
+    ~250ms, and _handle_exhausted_batch dead-letters each line AND commits
+    the offset past it -- silently discarding healthy events that merely
+    happened to be queued at shutdown, with no replay on the next boot.
     """
-    mock_driver = MagicMock()
-    mock_driver.close = AsyncMock()
-
     calls: list[str] = []
 
     async def record_shutdown_workers() -> None:
         calls.append("shutdown_workers")
 
-    async def record_close_driver() -> None:
-        calls.append("close_neo4j_driver")
+    async def record_aclose() -> None:
+        calls.append("aclose")
 
     monkeypatch.setattr(
         main_module.registry, "shutdown_workers", record_shutdown_workers
     )
-    monkeypatch.setattr(main_module.registry, "close_neo4j_driver", record_close_driver)
 
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
+        _patched_backend() as fake_backend,
     ):
+        monkeypatch.setattr(fake_backend, "aclose", record_aclose)
         async with lifespan(main_module.app):
             assert calls == []
 
-    assert calls == ["shutdown_workers", "close_neo4j_driver"], (
-        f"drain workers must be quiesced BEFORE the shared driver closes; got {calls}"
+    assert calls == ["shutdown_workers", "aclose"], (
+        f"drain workers must be quiesced BEFORE the graph backend closes; got {calls}"
     )
 
 
 # ---------------------------------------------------------------------------
 # Lifespan crash-recovery + workers==1 guard tests (Phase B2)
 # ---------------------------------------------------------------------------
-
-
-def _patched_lifespan_deps() -> Any:
-    """Return the patch context managers that stub the lifespan's Neo4j deps."""
-    mock_driver = MagicMock()
-    mock_driver.close = AsyncMock()
-    return mock_driver
 
 
 # ---------------------------------------------------------------------------
@@ -841,14 +911,9 @@ async def test_status_and_version_respond_while_recovery_is_still_running(
         AsyncMock(side_effect=_blocked_recovery),
     )
 
-    mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        _patched_backend(),
     ):
         async with lifespan(main_module.app):
             # Recovery is genuinely still running: lifespan already yielded
@@ -900,14 +965,9 @@ async def test_recovery_failure_is_logged_and_does_not_take_down_the_server(
         main_module, "_startup_recovery_body", AsyncMock(side_effect=boom)
     )
 
-    mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        _patched_backend(),
         caplog.at_level(logging.ERROR, logger="context_intelligence_server"),
     ):
         async with lifespan(main_module.app):
@@ -935,7 +995,7 @@ async def test_recovery_task_is_cancelled_on_shutdown() -> None:
     """Shutdown must cancel the background recovery task -- not leave it running.
 
     Recovery spawns drainers and shutdown quiesces them (see
-    ``test_lifespan_quiesces_drain_workers_before_closing_shared_driver``); a
+    ``test_lifespan_quiesces_drain_workers_before_closing_backend``); a
     recovery task that survives lifespan exit would keep racing that
     quiesce, spawning new drainers into a registry that is being torn down
     and risking dead-lettered healthy events.
@@ -945,14 +1005,9 @@ async def test_recovery_task_is_cancelled_on_shutdown() -> None:
     async def _blocked_forever(app: Any) -> None:
         await never_set.wait()
 
-    mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        _patched_backend(),
         patch(
             "context_intelligence_server.main._startup_recovery_body",
             new=AsyncMock(side_effect=_blocked_forever),
@@ -990,14 +1045,9 @@ async def test_startup_recovery_logs_reclaimed_orphans(
         AsyncMock(return_value=(3, 4096)),
     )
 
-    mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        _patched_backend(),
         caplog.at_level(logging.INFO, logger="context_intelligence_server"),
     ):
         async with lifespan(main_module.app):
@@ -1033,14 +1083,9 @@ async def test_startup_recovery_orphan_reclaim_failure_does_not_fail_boot(
         AsyncMock(side_effect=RuntimeError("boom-orphan-reclaim")),
     )
 
-    mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        _patched_backend(),
         caplog.at_level(logging.ERROR, logger="context_intelligence_server"),
     ):
         async with lifespan(main_module.app):
@@ -1105,14 +1150,9 @@ async def test_spool_stats_refresher_task_is_cancelled_on_shutdown() -> None:
     leave it running against a queue directory a shutting-down process may
     be tearing down around it (mirrors
     test_recovery_task_is_cancelled_on_shutdown)."""
-    mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        _patched_backend(),
     ):
         async with lifespan(main_module.app):
             # Let the refresher task actually get scheduled and complete at
@@ -1182,17 +1222,9 @@ async def test_lifespan_recovers_and_respawns_drainers(
         lambda s, w, **kw: spawned.append((s, w)),
     )
 
-    mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch(
-            "context_intelligence_server.main.ensure_neo4j_schema",
-            new=AsyncMock(),
-        ),
+        _patched_backend(),
     ):
         async with lifespan(main_module.app):
             # Recovery now runs in a background task; wait for the one-shot
@@ -1230,17 +1262,9 @@ async def test_lifespan_skips_recovery_for_empty_workspace(
         lambda s, w, **kw: spawned.append((s, w)),
     )
 
-    mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch(
-            "context_intelligence_server.main.ensure_neo4j_schema",
-            new=AsyncMock(),
-        ),
+        _patched_backend(),
     ):
         async with lifespan(main_module.app):
             pass
@@ -1281,14 +1305,9 @@ async def test_lifespan_default_respawns_all_recovered_sessions_unbounded(
     )
     assert main_module._settings.crash_recovery_respawn_limit is None
 
-    mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        _patched_backend(),
     ):
         async with lifespan(main_module.app):
             await asyncio.wait_for(
@@ -1316,14 +1335,9 @@ async def test_lifespan_respawn_cap_defers_remainder_and_logs_warning(
     )
     monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 2)
 
-    mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        _patched_backend(),
         caplog.at_level(logging.WARNING, logger="context_intelligence_server"),
     ):
         async with lifespan(main_module.app):
@@ -1364,14 +1378,9 @@ async def test_lifespan_deferred_sessions_untouched_and_recoverable_next_boot(
     )
     monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 1)
 
-    mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        _patched_backend(),
     ):
         async with lifespan(main_module.app):
             await asyncio.wait_for(
@@ -1407,14 +1416,9 @@ async def test_lifespan_respawn_cap_zero_defers_everything(
     )
     monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 0)
 
-    mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        _patched_backend(),
     ):
         async with lifespan(main_module.app):
             pass
@@ -1477,14 +1481,9 @@ async def test_lifespan_enables_sweep_under_finite_limit(
     )
     monkeypatch.setattr(registry, "get_or_create", lambda *a, **kw: MagicMock())
 
-    mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        _patched_backend(),
         caplog.at_level(logging.INFO, logger="context_intelligence_server"),
     ):
         async with lifespan(main_module.app):
@@ -1511,14 +1510,9 @@ async def test_lifespan_no_sweep_when_limit_unbounded(
     monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", None)
     monkeypatch.setattr(registry, "get_or_create", lambda *a, **kw: MagicMock())
 
-    mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        _patched_backend(),
         caplog.at_level(logging.INFO, logger="context_intelligence_server"),
     ):
         async with lifespan(main_module.app):
@@ -1541,14 +1535,9 @@ async def test_lifespan_no_sweep_when_interval_zero(
     )
     monkeypatch.setattr(registry, "get_or_create", lambda *a, **kw: MagicMock())
 
-    mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch("context_intelligence_server.main.ensure_neo4j_schema", new=AsyncMock()),
+        _patched_backend(),
         caplog.at_level(logging.INFO, logger="context_intelligence_server"),
     ):
         async with lifespan(main_module.app):
@@ -1576,29 +1565,25 @@ async def test_lifespan_no_sweep_when_interval_zero(
 
 
 async def test_lifespan_calls_ensure_schema_with_fail_on_data_conflict() -> None:
-    """Cold start must call ensure_neo4j_schema with fail_on_data_conflict=True
+    """Cold start must call backend.ensure_schema with fail_on_data_conflict=True
     -- boot refuses to proceed on a genuine :Node constraint data conflict
     (duplicate legacy nodes), mirroring run_repair's contract. Safe at cold
-    start (nothing flushed yet); the flush path keeps the opposite default."""
-    mock_driver = _patched_lifespan_deps()
-    mock_ensure_schema = AsyncMock(return_value=True)
+    start (nothing flushed yet); the flush path keeps the opposite default.
+
+    Schema init moved from a free function (``main.ensure_neo4j_schema``)
+    main.py imported to a method on the bound backend
+    (``backend.ensure_schema``, see neo4j_backend.py) -- ``FakeGraphBackend``
+    records every call's kwargs in ``ensure_schema_calls``.
+    """
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch(
-            "context_intelligence_server.main.ensure_neo4j_schema",
-            new=mock_ensure_schema,
-        ),
+        _patched_backend() as fake_backend,
     ):
         async with lifespan(main_module.app):
             pass
 
-    mock_ensure_schema.assert_awaited_once()
-    _args, kwargs = mock_ensure_schema.await_args
-    assert kwargs.get("fail_on_data_conflict") is True, (
+    assert len(fake_backend.ensure_schema_calls) == 1
+    assert fake_backend.ensure_schema_calls[0]["fail_on_data_conflict"] is True, (
         "lifespan must opt into fail_on_data_conflict=True -- cold start "
         "fails loud on a genuine data conflict (that contract now applies "
         "at boot too, not just to run_repair / `doctor --fix`)."
@@ -1606,24 +1591,17 @@ async def test_lifespan_calls_ensure_schema_with_fail_on_data_conflict() -> None
 
 
 async def test_lifespan_raises_on_ensure_schema_data_conflict() -> None:
-    """When ensure_neo4j_schema itself raises (a genuine :Node constraint
+    """When backend.ensure_schema itself raises (a genuine :Node constraint
     data conflict under fail_on_data_conflict=True), lifespan must propagate
     the RuntimeError -- boot refuses to start."""
-    mock_driver = _patched_lifespan_deps()
+    fake_backend = FakeGraphBackend(
+        raise_on_ensure_schema=RuntimeError(
+            "Neo4j :Node constraint data conflict -- run doctor --fix"
+        )
+    )
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch(
-            "context_intelligence_server.main.ensure_neo4j_schema",
-            new=AsyncMock(
-                side_effect=RuntimeError(
-                    "Neo4j :Node constraint data conflict -- run doctor --fix"
-                )
-            ),
-        ),
+        _patched_backend(fake_backend),
         pytest.raises(RuntimeError, match="doctor --fix"),
     ):
         async with lifespan(main_module.app):
@@ -1656,17 +1634,9 @@ async def test_lifespan_does_not_gate_boot_on_untagged_nodes() -> None:
         "doctor operator path now."
     )
 
-    mock_driver = _patched_lifespan_deps()
     with (
         patch("context_intelligence_server.main.setup_logging"),
-        patch(
-            "context_intelligence_server.neo4j_store.AsyncGraphDatabase.driver",
-            return_value=mock_driver,
-        ),
-        patch(
-            "context_intelligence_server.main.ensure_neo4j_schema",
-            new=AsyncMock(return_value=True),
-        ),
+        _patched_backend(),
     ):
         async with lifespan(main_module.app):  # MUST NOT raise
             pass
@@ -1734,7 +1704,14 @@ def test_validate_single_worker_passes_when_effective_is_one(
 
 
 # ---------------------------------------------------------------------------
-# /status neo4j_connected field tests
+# /status neo4j_connected / neo4j_query_connected field tests
+#
+# Post graph-backend-segregation, /status sources BOTH fields from one call:
+# ``await request.app.state.graph_backend.health()`` (a single
+# ``BackendHealth`` with ``write_connected``/``read_connected`` booleans --
+# see graph_backend.py). There is no longer a separate driver object on
+# app.state to mock per field; these tests configure FakeGraphBackend's
+# ``health`` return value instead.
 # ---------------------------------------------------------------------------
 
 
@@ -1742,11 +1719,18 @@ async def test_status_includes_neo4j_connected_true(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """/status includes neo4j_connected: true when driver.verify_connectivity() succeeds."""
-    mock_driver = AsyncMock()
-    mock_driver.verify_connectivity = AsyncMock(return_value=None)
+    """/status includes neo4j_connected: true when the backend reports write_connected."""
     monkeypatch.setattr(
-        main_module.app.state, "neo4j_driver", mock_driver, raising=False
+        main_module.app.state,
+        "graph_backend",
+        FakeGraphBackend(
+            health=BackendHealth(
+                write_connected=True,
+                read_connected=True,
+                url="bolt://fake:7687",
+                browser_url="",
+            )
+        ),
     )
 
     response = await client.get("/status")
@@ -1759,13 +1743,25 @@ async def test_status_includes_neo4j_connected_false_on_error(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """/status includes neo4j_connected: false when driver.verify_connectivity() raises."""
-    mock_driver = AsyncMock()
-    mock_driver.verify_connectivity = AsyncMock(
-        side_effect=Exception("connection refused")
-    )
+    """/status includes neo4j_connected: false when the backend reports write_connected=False.
+
+    ``Neo4jGraphBackend.health()`` never raises (it swallows
+    ``verify_connectivity()`` failures into ``False`` -- see
+    neo4j_backend.py); this is the honest boundary for a /status wiring test:
+    what /status does with an unhealthy report, not how the backend detects
+    one.
+    """
     monkeypatch.setattr(
-        main_module.app.state, "neo4j_driver", mock_driver, raising=False
+        main_module.app.state,
+        "graph_backend",
+        FakeGraphBackend(
+            health=BackendHealth(
+                write_connected=False,
+                read_connected=True,
+                url="bolt://fake:7687",
+                browser_url="",
+            )
+        ),
     )
 
     response = await client.get("/status")
@@ -1774,35 +1770,55 @@ async def test_status_includes_neo4j_connected_false_on_error(
     assert data["neo4j_connected"] is False
 
 
-async def test_status_includes_neo4j_connected_false_when_no_driver(
+async def test_status_raises_when_graph_backend_unbound(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """/status includes neo4j_connected: false when neo4j_driver is not set on app.state."""
-    if hasattr(main_module.app.state, "neo4j_driver"):
-        monkeypatch.delattr(main_module.app.state, "neo4j_driver", raising=False)
+    """/status fails loud when app.state has no graph_backend at all.
 
-    response = await client.get("/status")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["neo4j_connected"] is False
+    NEW behavior, and a deliberate one: the predecessor code defensively
+    read ``getattr(app.state, "neo4j_driver", None)`` and folded "missing"
+    into ``neo4j_connected: false``. Post graph-backend-segregation there is
+    exactly one connection-owning object, bound by the real lifespan before
+    the process ever serves a request (see main.py's ``lifespan``) and
+    required by ``SessionRegistry.graph_backend`` failing loudly when unbound
+    (registry.py: "Failing loudly here is deliberate"). /status matches that
+    posture: reaching it with no bound backend is an operational impossibility
+    in production, not a degraded-but-healthy state to report gracefully.
 
+    ``httpx.ASGITransport`` (the ``client`` fixture) propagates the route's
+    exception directly rather than converting it to a 500 response -- that
+    conversion is uvicorn's job in a real deployment, not the test
+    transport's. So the honest assertion here is the exception itself, not a
+    status code. This test pins that this reachable-only-in-tests scenario
+    now fails loud rather than silently reporting false, subsuming the old
+    "_false_when_no_driver" coverage for both neo4j_connected and
+    neo4j_query_connected (one attribute now serves both fields).
+    """
+    if hasattr(main_module.app.state, "graph_backend"):
+        monkeypatch.delattr(main_module.app.state, "graph_backend", raising=False)
 
-# ---------------------------------------------------------------------------
-# Concern B (council review) -- /status neo4j_query_connected field tests
-# ---------------------------------------------------------------------------
+    with pytest.raises(AttributeError, match="graph_backend"):
+        await client.get("/status")
 
 
 async def test_status_includes_neo4j_query_connected_true(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """/status additively includes neo4j_query_connected: true when the query
-    (read-intent) driver's verify_connectivity() succeeds."""
-    mock_driver = AsyncMock()
-    mock_driver.verify_connectivity = AsyncMock(return_value=None)
+    """/status additively includes neo4j_query_connected: true when the backend
+    reports read_connected."""
     monkeypatch.setattr(
-        main_module.app.state, "neo4j_query_driver", mock_driver, raising=False
+        main_module.app.state,
+        "graph_backend",
+        FakeGraphBackend(
+            health=BackendHealth(
+                write_connected=True,
+                read_connected=True,
+                url="bolt://fake:7687",
+                browser_url="",
+            )
+        ),
     )
 
     response = await client.get("/status")
@@ -1817,31 +1833,21 @@ async def test_status_includes_neo4j_query_connected_false_on_error(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """/status includes neo4j_query_connected: false when the query driver's
-    verify_connectivity() raises -- a misconfigured cypher_query client must
-    surface here, not just on the first /cypher call."""
-    mock_driver = AsyncMock()
-    mock_driver.verify_connectivity = AsyncMock(
-        side_effect=Exception("connection refused")
-    )
+    """/status includes neo4j_query_connected: false when the backend reports
+    read_connected=False -- a misconfigured cypher_query client must surface
+    here, not just on the first /cypher call."""
     monkeypatch.setattr(
-        main_module.app.state, "neo4j_query_driver", mock_driver, raising=False
+        main_module.app.state,
+        "graph_backend",
+        FakeGraphBackend(
+            health=BackendHealth(
+                write_connected=True,
+                read_connected=False,
+                url="bolt://fake:7687",
+                browser_url="",
+            )
+        ),
     )
-
-    response = await client.get("/status")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["neo4j_query_connected"] is False
-
-
-async def test_status_includes_neo4j_query_connected_false_when_no_driver(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """/status includes neo4j_query_connected: false when neo4j_query_driver is
-    not set on app.state (defensive -- must never 500)."""
-    if hasattr(main_module.app.state, "neo4j_query_driver"):
-        monkeypatch.delattr(main_module.app.state, "neo4j_query_driver", raising=False)
 
     response = await client.get("/status")
     assert response.status_code == 200
