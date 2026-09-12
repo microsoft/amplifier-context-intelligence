@@ -1,29 +1,11 @@
 """Connection-ownership invariants for the graph backend.
 
-This suite is the successor to ``test_neo4j_driver_sharing.py``, which proved
-that a *shared* driver was reused instead of one being built per session. That
-property is still proved here, but the design it guarded has been replaced by a
-stronger one, and the tests are written against the stronger claim:
-
-    Exactly one object in the process can open a graph connection, and nothing
-    else can obtain one.
-
-The old suite could only assert that per-session stores *happened* to be given
-a driver (``owns_driver is False``) -- the store retained a code path that built
-its own unbounded pool whenever a caller omitted the argument, so the leak was
-one forgotten keyword away at every construction site. The store no longer has
-that path at all, so the first test below asserts something the old design could
-not: that building a store without an injected connection is impossible.
-
-Covered:
-- A store cannot be constructed without an injected driver (structural).
-- A store's close() never closes the driver (safety for sibling stores).
-- The backend opens exactly two bounded pools, with the documented kwargs.
-- start()/aclose() are idempotent, and a failed start() leaks nothing.
-- The backend hands out stores, never drivers.
-- N sessions through the registry open NO additional pools (the leak proof).
-- A registry with no backend bound fails loud instead of opening a pool.
-- shutdown_workers() quiesces every drainer (the ordering guard for close).
+Successor to ``test_neo4j_driver_sharing.py``. That suite could only assert
+that per-session stores *happened* to be handed a driver (``owns_driver is
+False``); the store still had a path that built its own unbounded pool when a
+caller omitted the argument. This asserts the stronger claim the new design
+allows: exactly one object in the process can open a connection, and nothing
+else can obtain one.
 """
 
 from __future__ import annotations
@@ -67,14 +49,7 @@ def _backend(**overrides) -> Neo4jGraphBackend:
 
 
 def test_store_cannot_be_built_without_an_injected_driver() -> None:
-    """The structural core of the whole design.
-
-    The predecessor of this test asserted ``owns_driver is False`` on a store
-    that had been given a driver -- which proved the injection had happened,
-    not that the alternative was unavailable. The alternative WAS available:
-    omit the argument and the store built its own pool, unbounded, closed only
-    if that particular store was closed. This asserts the alternative is gone.
-    """
+    """The structural core: building a store without a connection is impossible."""
     with pytest.raises(TypeError):
         Neo4jGraphStore()  # type: ignore[call-arg]
 
@@ -125,13 +100,7 @@ def test_backend_satisfies_the_graph_backend_protocol() -> None:
 
 @pytest.mark.asyncio
 async def test_start_opens_exactly_two_bounded_pools() -> None:
-    """One write pool and one read pool -- no more.
-
-    Before this refactor the process opened THREE: the lifespan's admin driver,
-    the lifespan's query driver, and a third the session registry built lazily
-    for itself. The first and third were built from the same config, against
-    the same instance, for overlapping work.
-    """
+    """One write pool and one read pool -- no more (it used to open three)."""
     backend = _backend()
     with patch(
         "context_intelligence_server.neo4j_backend.AsyncGraphDatabase"
@@ -207,12 +176,7 @@ async def test_aclose_before_start_is_safe() -> None:
 
 @pytest.mark.asyncio
 async def test_requesting_a_store_before_start_fails_loud() -> None:
-    """Fail loudly rather than lazily opening a pool nobody agreed to own.
-
-    The registry's predecessor did exactly the opposite: it built a driver on
-    first touch, so any code path that reached it outside the lifespan opened a
-    pool that the lifespan would never close.
-    """
+    """Fail loud rather than lazily opening a pool nobody agreed to own."""
     with pytest.raises(RuntimeError, match="start"):
         _backend().session_store(workspace="ws")
 
@@ -255,14 +219,11 @@ async def test_session_store_binds_workspace_and_contributor() -> None:
 
 @pytest.mark.asyncio
 async def test_read_store_routes_its_direct_queries_as_reads() -> None:
-    """A read store must route EVERY read, not just the ones it opens a session for.
+    """A read store must route EVERY read, not only the ones it opens a session for.
 
-    Handing a store the read pool is not the same as routing its queries as
-    reads, and the gap is invisible from the backend: ``default_access_mode``
-    reaches only sessions the store opens itself, while the graph-resolution
-    paths (session summary) call ``driver.execute_query`` directly -- which the
-    driver defaults to WRITE routing. A read-intent store was still asking for
-    a writer on a user-visible path.
+    The graph-resolution paths call ``driver.execute_query`` directly, which
+    the driver defaults to WRITE routing -- ``default_access_mode`` never
+    reaches them.
     """
     from neo4j import RoutingControl
 
@@ -431,13 +392,7 @@ def _cancel_workers(reg: SessionRegistry) -> None:
 
 @pytest.mark.asyncio
 async def test_n_sessions_open_no_additional_pools() -> None:
-    """The leak proof, restated for the new design.
-
-    The original defect was one driver -- and therefore one pool of up to 100
-    bolt connections -- per ``session_id``, released only on a clean finalize.
-    Sessions now receive stores; opening a pool is not something the session
-    path can do at all.
-    """
+    """The leak proof: the session path cannot open a pool at all."""
     backend = _CountingBackend()
     await backend.start()
     reg = SessionRegistry()
@@ -474,13 +429,7 @@ async def test_repeat_sessions_reuse_their_existing_store() -> None:
 
 
 def test_registry_without_a_backend_fails_loud() -> None:
-    """No backend bound is an error, not an invitation to open a pool.
-
-    This is the test that would have caught the previous design's real hazard:
-    ``registry.neo4j_driver`` lazily built one on first access, so any path
-    that reached the registry outside the lifespan silently opened a pool the
-    lifespan would never close.
-    """
+    """No backend bound is an error, not an invitation to open a pool."""
     reg = SessionRegistry()
     with pytest.raises(RuntimeError, match="graph backend"):
         _ = reg.graph_backend

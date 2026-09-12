@@ -76,10 +76,8 @@ class SessionRegistry:
         self._queue_manager: QueueManager | None = None
         self._write_semaphore: asyncio.Semaphore | None = None
         self._max_delivery_attempts: int = 0
-        # The graph backend every per-session store is obtained from. Bound by
-        # the application lifespan via set_graph_backend(); never constructed
-        # here. This module holds no storage-technology knowledge at all -- it
-        # asks a port for a store and gets one back.
+        # Bound by the application lifespan via set_graph_backend(), never
+        # constructed here -- this module holds no storage-technology knowledge.
         self._graph_backend: GraphBackend | None = None
         # Live conservation counters surfaced via /status (accepted/written/
         # replayed/write_retries) so silently-dropped events are observable.
@@ -125,10 +123,7 @@ class SessionRegistry:
     def graph_backend(self) -> GraphBackend:
         """The bound graph backend. Raises if nothing has bound one.
 
-        Failing loudly here is deliberate. The predecessor of this property
-        lazily built a Neo4j driver on first touch, which meant a code path
-        that reached the registry without going through the lifespan silently
-        opened a pool nobody would close.
+        Fails loud rather than lazily opening a connection nobody agreed to own.
         """
         if self._graph_backend is None:
             raise RuntimeError(

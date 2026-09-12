@@ -5,31 +5,18 @@ other module -- the application entrypoint, the session registry, the deletion
 routes, the doctor CLI -- asks this object for a ``GraphStore`` and never sees
 a driver, a bolt URL, or a credential.
 
-Why it is a module of its own
------------------------------
-``neo4j_store`` is large and is about *one workspace-scoped store*: buffering,
-flushing, Cypher for nodes and edges. Connection ownership is a different
-concern with a different lifetime -- process-wide, not per session -- and
-folding it into the store is precisely what produced the topology this module
-replaces, where a store could quietly build its own pool whenever a caller
-omitted an argument.
+Two pools, matching the two logical clients the configuration defines:
 
-Driver topology
----------------
-Two drivers, matching the two logical clients the configuration defines:
-
-* **write** (``neo4j.admin``) -- schema DDL, per-session ingest flushes, and
-  whole-graph deletion. Previously this was *two* independent pools: the
-  lifespan's admin driver and a second one the session registry built for
-  itself. They were built from the same config, against the same instance, for
-  overlapping work; the split bought nothing and cost a pool.
+* **write** (``neo4j.admin``) -- schema DDL, per-session ingest flushes,
+  whole-graph deletion.
 * **read** (``neo4j.cypher_query``) -- the arbitrary-query endpoint and the
   read-only deletion summary.
 
-Both pools are bounded by ``neo4j_max_connection_pool_size`` and carry an
-acquisition budget equal to ``neo4j_lock_timeout``, so a caller waiting on a
-saturated pool fails on the same budget as a caller waiting on a blocked
-transaction, instead of parking indefinitely.
+Both are bounded by ``neo4j_max_connection_pool_size`` and carry an acquisition
+budget equal to ``neo4j_lock_timeout``, so a caller waiting on a saturated pool
+fails on the same budget as one waiting on a blocked transaction.
+
+Rationale and history: ``docs/architecture/README.md``.
 """
 
 from __future__ import annotations

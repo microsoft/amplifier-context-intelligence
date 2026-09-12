@@ -431,31 +431,21 @@ async def _spool_stats_refresher(app: FastAPI) -> None:
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application lifespan: logging, the graph backend, and recovery.
 
-    The graph backend is the ONLY connection-owning object in the process, and
-    this function is its sole owner: it starts it, hands it to the registry,
-    and closes it. Nothing downstream -- not the registry, not a router, not a
-    handler -- sees a driver.
-
-    All startup work runs INSIDE the try whose finally closes that backend.
-    It used to sit outside, so a cold start that failed after the connections
-    were opened (schema DDL raising on an un-migrated graph is a designed,
-    reachable outcome here) left them open with nothing holding a reference
-    to close them. A failed boot must release what a successful boot would.
+    Sole owner of the backend -- the only connection-owning object in the
+    process. All startup work runs INSIDE the try whose finally closes it, so a
+    cold start that fails after the connections are open (schema DDL raising on
+    an un-migrated graph is a designed outcome here) still releases them.
     """
     setup_logging()
     backend = Neo4jGraphBackend.from_settings(_settings)
-    # Published for request handlers, which ask it for stores. It is the
-    # backend that is shared, never a driver -- there is no app.state driver
-    # any more, and therefore no way for a route to acquire one.
+    # Published for request handlers, which ask it for stores. There is no
+    # app.state driver any more, so no route can acquire one.
     app.state.graph_backend = backend
     _recovery_task: asyncio.Task[None] | None = None
     _spool_stats_task: asyncio.Task[None] | None = None
 
     try:
         await backend.start()
-        # Per-session stores come from here. Previously the registry lazily
-        # built a driver of its own on first session -- a third pool, opened
-        # outside any lifespan, closed only if someone remembered to ask.
         registry.set_graph_backend(backend)
 
         # Initialize schema (indexes + uniqueness constraints) BEFORE the server
@@ -1034,12 +1024,10 @@ def __getattr__(name: str) -> Any:
 @app.get("/status")
 async def get_status(request: Request) -> dict[str, Any]:
     response = build_status_response(registry, _start_time)
-    # The backend reports its own health; this endpoint only renames the
-    # fields onto the published wire contract. The `neo4j_*` response keys are
-    # a PUBLIC contract with existing clients and are deliberately unchanged,
-    # so the technology name survives exactly where it is already promised --
-    # at the edge -- and nowhere inward of it. A different backend would fill
-    # the same keys, which is ugly-but-honest versioning rather than a leak.
+    # The backend reports its own health; this endpoint only maps the fields
+    # onto the published wire contract. The `neo4j_*` keys are a PUBLIC
+    # contract and are deliberately unchanged, so the technology name lives at
+    # the edge where it is already promised, and nowhere inward of it.
     health = await request.app.state.graph_backend.health()
     response["neo4j_connected"] = health.write_connected
     # Also surface the read-intent connection's health, so a misconfigured
@@ -1175,19 +1163,14 @@ async def get_blob(session_id: str, key: str) -> JSONResponse:
 def _json_default(value: Any) -> str:
     """JSON fallback for values `json` cannot encode.
 
-    Temporal values are rendered ISO-8601 (``T`` separator, offset preserved)
-    rather than via ``str()``, whose ``datetime`` form uses a space separator
-    and is not ISO. Everything else falls back to ``str()``, matching what this
-    endpoint has always done for non-JSON-native values.
+    Temporal values render ISO-8601 rather than via ``str()``, whose
+    ``datetime`` form uses a space separator and is not ISO. Everything else
+    falls back to ``str()``, as this endpoint has always done.
 
-    Precision note, stated rather than buried: the driver's ``neo4j.time``
-    types carry nanoseconds and Python's ``datetime`` carries microseconds, so
-    the normalisation upstream of here truncates below a microsecond. That is
-    unreachable for data this server wrote -- every temporal it persists is
-    converted FROM a Python ``datetime`` on the write path
-    (``neo4j_store._convert_temporal_props``), so it never had sub-microsecond
-    precision to lose. It is reachable only for rows written to this graph by
-    something other than this server.
+    Precision: ``neo4j.time`` carries nanoseconds, Python ``datetime`` only
+    microseconds, so normalisation upstream truncates below a microsecond.
+    Unreachable for data this server wrote (its write path converts FROM a
+    Python ``datetime``); reachable only for rows written by another writer.
     """
     if isinstance(value, (datetime, date, _dt_time)):
         return value.isoformat()
@@ -1216,14 +1199,10 @@ async def post_cypher(body: CypherRequest, request: Request) -> Response:
     under cover of a refactor. ``_json_default`` keeps it ISO-8601.
     """
     store = request.app.state.graph_backend.query_store()
-    # Workspace semantics are PRESERVED EXACTLY, and the mapping is not the
-    # obvious one. This endpoint has always treated an omitted workspace as
-    # "inject nothing" -- the caller's query is run with only the params it
-    # supplied. `execute_query`'s `None` means something different: "scope to
-    # the store's OWN workspace", which for this unscoped store would silently
-    # inject workspace="default" into a query that never asked for it. `"*"` is
-    # the value that means "inject nothing", so an omitted workspace maps to
-    # `"*"`, not to `None`.
+    # NOT the obvious mapping. An omitted workspace has always meant "inject
+    # nothing", but `execute_query`'s `None` means "scope to the store's OWN
+    # workspace" -- which here would inject workspace="default" into a query
+    # that never asked for it. `"*"` is the value that injects nothing.
     workspace = body.workspace if body.workspace is not None else "*"
     try:
         rows = await store.execute_query(

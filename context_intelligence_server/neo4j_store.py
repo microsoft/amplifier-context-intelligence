@@ -8,17 +8,10 @@ Canonical workspace naming is used throughout; all scoping is done via the
 ``workspace`` attribute exclusively.
 
 **This module never constructs a driver.** A store is handed an already-open
-driver and never owns its lifetime -- ``close()`` flushes the buffer and stops
-there. Connection ownership belongs to ``neo4j_backend.Neo4jGraphBackend``,
-which is the one place in the server a pool is opened, bounded, and closed.
-The separation is enforced structurally: ``driver`` is a required argument,
-so there is no code path here that can fall back to building one, and no
-caller that can forget to inject one.
-
-That boundary is load-bearing, not cosmetic. When a store could build its own
-driver, every caller that omitted the argument silently minted a fresh
-unbounded pool -- which is exactly how per-session stores once accumulated
-connections until the process ran out of file descriptors.
+one and never owns its lifetime -- ``close()`` flushes the buffer and stops.
+Connection ownership belongs to ``neo4j_backend.Neo4jGraphBackend``. Enforced
+structurally: ``driver`` is a required argument, so there is no fallback path
+here and nothing for a caller to forget.
 """
 
 from __future__ import annotations
@@ -346,19 +339,29 @@ _GRAPH_REL_COUNT_CYPHER = (
 # deleted a 2601-node graph this way. DETACH DELETE on an owned node removes
 # every relationship touching it, including any edge into a surviving
 # :SST_CONCEPT node -- that edge's removal IS the "detach" the design calls for.
+# Keep split across lines: the unindexed-scan guard in
+# tests/test_neo4j_store.py allow-lists these by exact line, and a
+# formatter that collapses them to one line silently trips it.
+# fmt: off
 _GRAPH_DELETE_BATCH_CYPHER = (
     "UNWIND $element_ids AS eid "
     "MATCH (n) WHERE elementId(n) = eid "
     "DETACH DELETE n"
 )
+# fmt: on
 
 # elementId-list existence count -- shared by both post-delete gate checks
 # (owned nodes must be gone, concept nodes must survive).
+# Keep split across lines: the unindexed-scan guard in
+# tests/test_neo4j_store.py allow-lists these by exact line, and a
+# formatter that collapses them to one line silently trips it.
+# fmt: off
 _COUNT_NODES_BY_ELEMENT_ID_CYPHER = (
     "UNWIND $element_ids AS eid "
     "MATCH (n) WHERE elementId(n) = eid "
     "RETURN count(n) AS c"
 )
+# fmt: on
 
 # Row cap per DETACH DELETE batch. elementId strings are tiny, so only the row
 # bound matters in practice; the byte bound is kept generous as a defensive
@@ -1552,19 +1555,15 @@ class Neo4jGraphStore:
     def _read_routing(self) -> dict[str, Any]:
         """Routing kwargs for this store's read queries.
 
-        Handing a store the read pool is NOT the same as routing its queries
-        as reads, and the gap is easy to miss: ``default_access_mode`` reaches
-        only sessions this store opens itself (``execute_query``), while the
-        graph-resolution paths call ``driver.execute_query`` directly -- and
-        the driver defaults THAT to WRITE routing. So a read-intent store was
-        still asking for a writer on the session-summary path.
+        Handing a store the read pool is NOT the same as routing its queries as
+        reads: ``default_access_mode`` reaches only sessions this store opens
+        itself, while the graph-resolution paths call ``driver.execute_query``
+        directly -- which the driver defaults to WRITE routing.
 
-        Only a store configured READ carries routing; a write/admin store
-        emits no routing kwarg at all, exactly as before, so its behaviour is
-        untouched. On a single-instance Community deployment over ``bolt://``
-        routing is a hint with no server-side effect -- this is about the
-        intent being honestly declared at every call, so it still holds if the
-        read client is ever pointed at a replica.
+        Only a READ-configured store carries routing; a write/admin store emits
+        no routing kwarg, exactly as before. Over ``bolt://`` to a single
+        instance routing is a hint with no effect, so this declares the intent
+        at every call for when the read client points at a replica.
         """
         if self._default_access_mode == "READ":
             return {"routing_": RoutingControl.READ}

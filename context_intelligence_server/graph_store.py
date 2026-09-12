@@ -21,13 +21,6 @@ Non-negotiable guarantees for all conforming implementations:
     offset must not advance past writes that never landed
     (``registry._flush_barrier``). An implementation that swallowed here would
     silently convert a failed write into an acknowledged one.
-
-    *This guarantee previously said the exact opposite* ("failures MUST NOT
-    propagate; implementations must swallow or log"), while both shipped
-    implementations raised and every caller depended on them raising. The
-    declaration was the thing that was wrong, not the behaviour — a protocol
-    that lies about its own contract is worse than none, because callers
-    reason from it.
 7.  **Close calls flush, and is best-effort** — ``close`` MUST call ``flush``
     first, but MUST NOT raise if that final flush fails: shutdown cannot be
     derailed by one store. A failed final flush therefore CAN lose that
@@ -152,12 +145,8 @@ class GraphStore(Protocol):
     def workspace(self) -> str:
         """Workspace this store scopes writes to.
 
-        Readable AND settable. It was declared read-only, but the ingest path
-        genuinely rebinds it: a store is created before the session's workspace
-        is known from its first event, and ``HookStateService`` assigns it on
-        arrival. Both implementations already had a setter; only the
-        declaration was wrong -- the kind of drift that makes a protocol stop
-        being trusted, and stop being checked.
+        Readable AND settable: the ingest path rebinds it, because a store is
+        created before its first event reveals the workspace.
         """
         ...
 
@@ -287,12 +276,8 @@ class GraphStore(Protocol):
     def buffered_edges(self) -> Iterator[tuple[str, str, dict[str, Any]]]:
         """Yield ``(src_id, dst_id, data)`` for every not-yet-flushed edge.
 
-        Exists so the ownership checker can find a competing owner edge
-        through the port. It previously probed implementations for a private
-        buffer attribute by name (``_edges`` on one, ``_edge_buffer`` on the
-        other), which meant a rename inside either implementation would have
-        silently disabled ownership enforcement with nothing failing to
-        announce it.
+        Exists so the ownership checker can find a competing owner edge through
+        the port instead of probing a private buffer attribute by name.
         """
         ...
 

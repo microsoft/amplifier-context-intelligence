@@ -29,14 +29,9 @@ def _find_owner_in_buffer(graph: GraphStore, dst_id: str, edge_type: str) -> str
     """Return the src_id of an existing ownership edge of *edge_type* → *dst_id*.
 
     Reads the store's buffered edges through ``GraphStore.buffered_edges()``.
-
-    This used to probe the store for a private buffer attribute by name --
-    ``_edges`` on the in-memory store, ``_edge_buffer`` on the Neo4j one --
-    and return ``None`` when it found neither. That made the failure mode of a
-    rename, or of a third implementation, indistinguishable from "no competing
-    owner exists": ownership enforcement would simply stop happening, quietly
-    and with every test still green. Going through the port turns that into a
-    contract a new implementation has to satisfy to typecheck.
+    Going through the port matters: probing for a private attribute by name made
+    a rename indistinguishable from "no competing owner exists", silently
+    disabling ownership enforcement with every test still green.
 
     Returns the src_id string if found, or ``None`` when no matching edge exists.
     """
