@@ -11,7 +11,14 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
     "uvicorn-worker>=0.4.0",
-    "gunicorn>=23.0.0",
+    # >=25.2.0: in 25.1.0 the new `gunicornc` control socket runs an asyncio
+    # event loop in a daemon thread inside the arbiter, started just before
+    # the first os.fork(). A fork landing mid-write() on stderr leaves the
+    # child holding a dead thread's BufferedWriter lock, so it deadlocks on
+    # gunicorn's own "Booting worker with pid" line -- no output, no exit.
+    # Upstream #3529, fixed in 25.2.0 by #3520. 25.1.0 is the only affected
+    # release, and the old >=23.0.0 floor resolved straight to it.
+    "gunicorn>=25.2.0",
     "pydantic-settings>=2.14.2",
     "neo4j>=5.0",
     "aiofiles>=24.0.0",
