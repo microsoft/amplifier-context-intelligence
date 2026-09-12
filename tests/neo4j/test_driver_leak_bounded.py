@@ -84,7 +84,12 @@ async def test_bolt_connections_stay_bounded_and_release(
     # finally. A leak test that leaks its own connections when it fails is
     # worse than no leak test: it poisons every neo4j test that runs after it,
     # and it fails exactly when something is already wrong.
-    probe_driver = AsyncGraphDatabase.driver(bolt_url, auth=(user, password))
+    # user_agent is LOAD-BEARING, not decoration: it is the ONLY thing that
+    # excludes the probe's own connection from _COUNT_QUERY. Drop it and the
+    # probe counts itself, so after_close reads 1 and the reclaim proof fails.
+    probe_driver = AsyncGraphDatabase.driver(
+        bolt_url, auth=(user, password), user_agent=_PROBE_UA
+    )
     backend = Neo4jGraphBackend.from_settings(settings)
     await backend.start()
     reg = SessionRegistry()

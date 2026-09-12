@@ -32,6 +32,7 @@ class _FakeBackend:
         self,
         *,
         write_connected: bool = True,
+        read_connected: bool | None = None,
         diagnose_results: list[dict[str, int]] | None = None,
         repair_result: dict[str, int] | None = None,
     ) -> None:
@@ -40,7 +41,9 @@ class _FakeBackend:
         self.health = AsyncMock(
             return_value=BackendHealth(
                 write_connected=write_connected,
-                read_connected=write_connected,
+                read_connected=(
+                    write_connected if read_connected is None else read_connected
+                ),
                 url="bolt://fake:7687",
                 browser_url="",
             )
@@ -157,4 +160,20 @@ async def test_run_doctor_closes_driver_even_on_unreachable(make_backend) -> Non
 
     await doctor_module.run_doctor(fix=True)
 
+    backend.aclose.assert_awaited_once()
+
+
+async def test_run_doctor_read_pool_unreachable_returns_nonzero(make_backend) -> None:
+    """A healthy write pool alone must NOT be reported as a healthy graph.
+
+    The read pool is what /cypher and the session summary run on. Gating only
+    on the write pool would tell an operator the graph is fine while half the
+    read surface was down -- and the doctor exists to be believed.
+    """
+    backend = make_backend(write_connected=True, read_connected=False)
+
+    exit_code = await doctor_module.run_doctor(fix=False)
+
+    assert exit_code == 1
+    backend.diagnose.assert_not_awaited()
     backend.aclose.assert_awaited_once()

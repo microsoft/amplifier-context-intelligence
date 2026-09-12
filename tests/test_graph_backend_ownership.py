@@ -254,6 +254,61 @@ async def test_session_store_binds_workspace_and_contributor() -> None:
 
 
 @pytest.mark.asyncio
+async def test_read_store_routes_its_direct_queries_as_reads() -> None:
+    """A read store must route EVERY read, not just the ones it opens a session for.
+
+    Handing a store the read pool is not the same as routing its queries as
+    reads, and the gap is invisible from the backend: ``default_access_mode``
+    reaches only sessions the store opens itself, while the graph-resolution
+    paths (session summary) call ``driver.execute_query`` directly -- which the
+    driver defaults to WRITE routing. A read-intent store was still asking for
+    a writer on a user-visible path.
+    """
+    from neo4j import RoutingControl
+
+    backend = _backend()
+    with patch(
+        "context_intelligence_server.neo4j_backend.AsyncGraphDatabase"
+    ) as mock_adb:
+        mock_adb.driver.return_value = AsyncMock()
+        await backend.start()
+
+    read_store = backend.query_store()
+    assert read_store._read_routing == {"routing_": RoutingControl.READ}  # type: ignore[attr-defined]
+
+    # A write/admin store emits NO routing kwarg -- unchanged from before, so
+    # the ingest and deletion paths keep their existing behaviour exactly.
+    assert backend.admin_store()._read_routing == {}  # type: ignore[attr-defined]
+    assert backend.session_store(workspace="ws")._read_routing == {}  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_read_store_passes_read_routing_to_the_driver() -> None:
+    """End-to-end on the real call: get_node on a read store asks for READ."""
+    from neo4j import RoutingControl
+
+    driver = AsyncMock()
+    driver.execute_query.return_value = MagicMock(records=[])
+    store = Neo4jGraphStore(driver=driver, default_access_mode="READ")
+
+    await store.get_node("some-node")
+
+    assert driver.execute_query.call_args.kwargs["routing_"] is RoutingControl.READ
+
+
+@pytest.mark.asyncio
+async def test_write_store_sends_no_routing_kwarg() -> None:
+    """The ingest path is untouched: no routing kwarg, exactly as before."""
+    driver = AsyncMock()
+    driver.execute_query.return_value = MagicMock(records=[])
+    store = Neo4jGraphStore(driver=driver)
+
+    await store.get_node("some-node")
+
+    assert "routing_" not in driver.execute_query.call_args.kwargs
+
+
+@pytest.mark.asyncio
 async def test_query_store_carries_the_configured_read_intent() -> None:
     """The read client's access_mode reaches the session the store opens.
 

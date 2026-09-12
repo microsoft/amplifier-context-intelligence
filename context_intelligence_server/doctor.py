@@ -63,11 +63,24 @@ async def run_doctor(fix: bool) -> int:
     backend = Neo4jGraphBackend.from_settings(get_settings())
     await backend.start()
     try:
+        # Probe BOTH pools. Reporting only the write pool would let the doctor
+        # print "Neo4j reachable" on a server whose read pool is misconfigured
+        # -- and the read pool is what /cypher and the session summary run on,
+        # so the operator would be told the graph is healthy while half the
+        # read surface was down.
         health = await backend.health()
         if not health.write_connected:
-            print(f"  {_FAIL} Neo4j reachable -- {health.url}")
+            print(f"  {_FAIL} Neo4j reachable (write) -- {health.url}")
             return 1
-        print(f"  {_OK} Neo4j reachable")
+        print(f"  {_OK} Neo4j reachable (write)")
+        if not health.read_connected:
+            print(
+                f"  {_FAIL} Neo4j reachable (read) -- the read client is "
+                "unreachable or misconfigured; /cypher and session summaries "
+                "run on it"
+            )
+            return 1
+        print(f"  {_OK} Neo4j reachable (read)")
 
         diagnosis = await backend.diagnose()
         _print_diagnosis(diagnosis)

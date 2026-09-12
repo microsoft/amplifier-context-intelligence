@@ -32,6 +32,7 @@ from collections.abc import Generator, Iterator
 from datetime import datetime
 from typing import Any, LiteralString, cast
 
+from neo4j import RoutingControl
 from neo4j import unit_of_work as _unit_of_work
 from neo4j.exceptions import DriverError, Neo4jError
 
@@ -1544,6 +1545,32 @@ class Neo4jGraphStore:
         )
 
     # ------------------------------------------------------------------
+    # read-routing intent
+    # ------------------------------------------------------------------
+
+    @property
+    def _read_routing(self) -> dict[str, Any]:
+        """Routing kwargs for this store's read queries.
+
+        Handing a store the read pool is NOT the same as routing its queries
+        as reads, and the gap is easy to miss: ``default_access_mode`` reaches
+        only sessions this store opens itself (``execute_query``), while the
+        graph-resolution paths call ``driver.execute_query`` directly -- and
+        the driver defaults THAT to WRITE routing. So a read-intent store was
+        still asking for a writer on the session-summary path.
+
+        Only a store configured READ carries routing; a write/admin store
+        emits no routing kwarg at all, exactly as before, so its behaviour is
+        untouched. On a single-instance Community deployment over ``bolt://``
+        routing is a hint with no server-side effect -- this is about the
+        intent being honestly declared at every call, so it still holds if the
+        read client is ever pointed at a replica.
+        """
+        if self._default_access_mode == "READ":
+            return {"routing_": RoutingControl.READ}
+        return {}
+
+    # ------------------------------------------------------------------
     # workspace property
     # ------------------------------------------------------------------
 
@@ -1641,6 +1668,7 @@ class Neo4jGraphStore:
                 cast(LiteralString, _NODE_GET_BY_ID_CYPHER),
                 {"node_id": node_id, "workspace": self.workspace},
                 database_=self._database,
+                **self._read_routing,
             )
             records = result.records
             if records:
@@ -1688,6 +1716,7 @@ class Neo4jGraphStore:
                 cast(LiteralString, _DELEGATION_BY_SUB_SESSION_CYPHER),
                 {"sid": sub_session_id, "workspace": workspace},
                 database_=self._database,
+                **self._read_routing,
             )
             records = result.records
             if records:
@@ -1723,6 +1752,7 @@ class Neo4jGraphStore:
                 _ENTRY_SESSION_WORKSPACE_CYPHER,
                 {"session_id": session_id},
                 database_=self._database,
+                **self._read_routing,
             )
         except Neo4jError:
             return None
@@ -1749,6 +1779,7 @@ class Neo4jGraphStore:
             _GRAPH_SEED_ELEMENT_IDS_CYPHER,
             {"session_ids": session_ids, "workspace": workspace},
             database_=self._database,
+            **self._read_routing,
         )
         owned: set[str] = {row["eid"] for row in seed_result.records}
         if not owned:
@@ -1762,6 +1793,7 @@ class Neo4jGraphStore:
                 _GRAPH_EXPAND_HOP_CYPHER,
                 {"frontier": frontier, "workspace": workspace},
                 database_=self._database,
+                **self._read_routing,
             )
             next_frontier: list[str] = []
             for row in hop_result.records:
@@ -1807,6 +1839,7 @@ class Neo4jGraphStore:
                 _GRAPH_RESOLVE_CYPHER,
                 {"session_id": session_id, "workspace": workspace},
                 database_=self._database,
+                **self._read_routing,
             )
         except Neo4jError:
             return None
@@ -1929,6 +1962,7 @@ class Neo4jGraphStore:
             _GRAPH_REL_COUNT_CYPHER,
             {"element_ids": owned_ids},
             database_=self._database,
+            **self._read_routing,
         )
         relationships_deleted = (
             rel_result.records[0]["rel_count"] if rel_result.records else 0
@@ -1946,8 +1980,11 @@ class Neo4jGraphStore:
             _COUNT_NODES_BY_ELEMENT_ID_CYPHER,
             {"element_ids": owned_ids},
             database_=self._database,
+            **self._read_routing,
         )
-        survivor_count = survivor_result.records[0]["c"] if survivor_result.records else 0
+        survivor_count = (
+            survivor_result.records[0]["c"] if survivor_result.records else 0
+        )
         if survivor_count:
             raise RuntimeError(
                 f"delete_session_graph: {survivor_count} owned node(s) survived "
@@ -1960,8 +1997,11 @@ class Neo4jGraphStore:
                 _COUNT_NODES_BY_ELEMENT_ID_CYPHER,
                 {"element_ids": concept_ids},
                 database_=self._database,
+                **self._read_routing,
             )
-            concept_count = concept_result.records[0]["c"] if concept_result.records else 0
+            concept_count = (
+                concept_result.records[0]["c"] if concept_result.records else 0
+            )
             if concept_count != len(concept_ids):
                 raise RuntimeError(
                     f"delete_session_graph: expected {len(concept_ids)} shared "
@@ -1993,6 +2033,7 @@ class Neo4jGraphStore:
                 cast(LiteralString, _EDGE_GET_BY_ENDPOINTS_CYPHER),
                 {"src_id": src_id, "dst_id": dst_id, "workspace": self.workspace},
                 database_=self._database,
+                **self._read_routing,
             )
             records = result.records
             if records:
