@@ -128,6 +128,13 @@ class GraphState:
 
         Labels (``data["labels"]``) are union-merged with any existing labels.
         All other properties are dict-merged (new values win on conflict).
+
+        ``data["status_if_absent"]`` is handled specially: it is applied
+        POPULATE-IF-MISSING (written only when the node does not already carry
+        a ``status``) and is never itself stored as a node property. This is
+        the same semantic the Neo4j-backed store enforces via ``coalesce`` in
+        its Session MERGE -- kept here so both stores agree on one meaning of
+        "non-authoritative status hint".
         """
         if node_id not in self._nodes:
             self._nodes[node_id] = {}
@@ -139,9 +146,21 @@ class GraphState:
             new_labels: set[str] = set(data["labels"])
             existing["labels"] = sorted(existing_labels | new_labels)
 
+        # status_if_absent is a non-authoritative hint from a safety-net writer
+        # (ensure_session_node): apply it ONLY when the node has no status yet,
+        # then discard the key itself -- it is never stored as a node property,
+        # mirroring how "labels" is consumed above rather than copied verbatim.
+        # This is what stops a cross-session stub write (a cold-cache worker
+        # materializing a bare reference to another session) from clobbering a
+        # status already set by that session's own authoritative writer.
+        provisional = data.get("status_if_absent")
+
         for key, value in data.items():
-            if key != "labels":
+            if key not in ("labels", "status_if_absent"):
                 existing[key] = value
+
+        if provisional is not None and not existing.get("status"):
+            existing["status"] = provisional
 
     async def get_node(self, node_id: str) -> dict[str, Any] | None:
         """Return a copy of node data or ``None`` if the node does not exist.
@@ -481,7 +500,22 @@ class HookStateService:
         2. Graph query — call ``graph.get_node(session_id)``.  If the node
            already exists (e.g. from a previous run), repopulate the cache and
            return without overwriting any data.  If the node is absent, create
-           it with labels ``["Session"]`` and ``status = 'running'``.
+           it with labels ``["Session"]``.
+
+        ``status`` is NEVER written authoritatively by this method — in either
+        branch it writes ``status_if_absent = "running"``, applied
+        POPULATE-IF-MISSING by every store (in-process here in ``GraphState``,
+        and again via Neo4j ``coalesce`` at the MERGE), the exact same
+        two-enforcement-point pattern used for ``working_dir``.  The reason:
+        each per-session drain worker owns its own store buffer and its own
+        ``_seen_sessions`` cache, so a CROSS-SESSION reference — a child
+        naming its parent, or a delegation naming its sub-session — always
+        calls this method with a cold cache on a node that may belong to a
+        session already finished.  ``session:end``
+        (``handlers/data_layer_2/session.py``) is the sole authoritative writer
+        of ``status``; if this method wrote ``status`` directly, a stub call
+        arriving after that authoritative write would revert a completed
+        session back to "running" with no reconciliation pass to undo it.
 
         This method is a safety net that creates a minimal session node if it
         doesn't exist.  ``SessionHandler`` is the sole authority on session
@@ -518,7 +552,7 @@ class HookStateService:
             # (e.g. "RootSession") are preserved — this call never strips labels.
             stub_data: dict[str, Any] = {
                 "labels": ["Session"],
-                "status": "running",
+                "status_if_absent": "running",
                 "session_id": session_id,
             }
             # Populate-if-missing backfill. This is the branch a re-import lands
@@ -546,7 +580,7 @@ class HookStateService:
         # IncompleteSession) is assigned via genuine lifecycle enrichment.
         node_data: dict[str, Any] = {
             "labels": ["Session", "StubSession"],
-            "status": "running",
+            "status_if_absent": "running",
             "session_id": session_id,  # explicit property — enables direct query without HAS_EVENT traversal
         }
         # Kernel events carry the wall-clock under data["timestamp"]; older callers
