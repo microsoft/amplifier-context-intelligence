@@ -23,10 +23,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from context_intelligence_server.neo4j_store import Neo4jGraphStore
 from neo4j import AsyncGraphDatabase
 from neo4j.exceptions import TransientError
-
-from context_intelligence_server.neo4j_store import Neo4jGraphStore
 
 pytestmark = pytest.mark.neo4j
 
@@ -76,8 +75,9 @@ async def _low_retry_store(
         A Neo4jGraphStore ready for use against the capped container.
     """
     store = Neo4jGraphStore(
-        uri=container["bolt_url"],
-        auth=(container["user"], container["password"]),
+        driver=AsyncGraphDatabase.driver(
+            container["bolt_url"], auth=(container["user"], container["password"])
+        ),
         workspace="oom-test",
         flush_chunk_rows=rows,
         flush_chunk_bytes=byts,
@@ -466,20 +466,26 @@ async def test_finalization_path_freezes_then_restart_then_drains(
         "Worker must be deregistered after successful _finalize_session"
     )
 
-    # _finalize_session calls _safe_close(worker3) which closes store3's
-    # driver.  Use a fresh connection to count the committed f-* nodes.
-    check_store = await _low_retry_store(
-        neo4j_container_capped, rows=500, byts=2_000_000
-    )
+    # _finalize_session calls _safe_close(worker3), which flushes store3's
+    # buffer but no longer closes its driver (connection ownership is the
+    # backend's concern now, and this test built store3's driver directly) --
+    # close it explicitly so it does not leak. Use a fresh connection to
+    # count the committed f-* nodes.
     try:
-        records3 = await check_store.execute_query(
-            "MATCH (n) WHERE n.node_id STARTS WITH $prefix RETURN count(n) AS cnt",
-            {"prefix": "f-"},
-            workspace="*",
+        check_store = await _low_retry_store(
+            neo4j_container_capped, rows=500, byts=2_000_000
         )
-        assert records3[0]["cnt"] == 100, (
-            f"Expected 100 f-* ToolCall nodes after fixed-bounds drain, "
-            f"got {records3[0]['cnt']}"
-        )
+        try:
+            records3 = await check_store.execute_query(
+                "MATCH (n) WHERE n.node_id STARTS WITH $prefix RETURN count(n) AS cnt",
+                {"prefix": "f-"},
+                workspace="*",
+            )
+            assert records3[0]["cnt"] == 100, (
+                f"Expected 100 f-* ToolCall nodes after fixed-bounds drain, "
+                f"got {records3[0]['cnt']}"
+            )
+        finally:
+            await check_store._driver.close()
     finally:
-        await check_store._driver.close()
+        await store3._driver.close()

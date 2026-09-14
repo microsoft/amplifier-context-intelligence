@@ -12,9 +12,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-
 import context_intelligence_server.registry as registry_module
+import pytest
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.queue_manager import QueueManager, Record
@@ -24,6 +23,8 @@ from context_intelligence_server.registry import (
     SessionWorker,
 )
 from context_intelligence_server.services import HookStateService
+
+from tests.conftest import FakeGraphBackend
 
 # ---------------------------------------------------------------------------
 # Factory helper
@@ -138,6 +139,10 @@ async def registry() -> AsyncGenerator[SessionRegistry, None]:
     the event loop to run).
     """
     reg = SessionRegistry()
+    # get_or_create() now asks a bound GraphBackend for a session store (see
+    # registry.py); a FakeGraphBackend stands in for the real Neo4j one so
+    # these tests never touch a driver.
+    reg.set_graph_backend(FakeGraphBackend())
     yield reg
     # Cancel any drain tasks still running at the end of the test
     for w in list(reg._workers.values()):
@@ -698,11 +703,52 @@ class TestGetOrCreate:
     async def test_get_or_create_creates_worker(self) -> None:
         """get_or_create creates a new worker for an unknown session."""
         reg = SessionRegistry()
+        reg.set_graph_backend(FakeGraphBackend())
         worker = reg.get_or_create("session-restore", "/ws")
 
         assert worker is not None
         assert worker.session_id == "session-restore"
         assert isinstance(worker.services, HookStateService)
+
+
+class TestGraphBackendFailsLoudWhenUnbound:
+    """SessionRegistry.graph_backend (and anything that reads it) must fail
+    loud -- never lazily construct a connection -- when nothing has called
+    set_graph_backend() yet.
+
+    This is the deliberate replacement for the predecessor's lazy driver
+    build on first touch (see registry.py's graph_backend property
+    docstring): a code path that reaches the registry without going through
+    the application lifespan must raise, not silently open a pool nobody
+    will close.
+    """
+
+    def test_graph_backend_property_raises_when_unbound(self) -> None:
+        reg = SessionRegistry()
+
+        with pytest.raises(RuntimeError, match="no graph backend bound"):
+            _ = reg.graph_backend
+
+    def test_get_or_create_raises_when_unbound(self) -> None:
+        """get_or_create surfaces the same fail-loud RuntimeError -- it must
+        not swallow the missing binding and construct a worker regardless."""
+        reg = SessionRegistry()
+
+        with pytest.raises(RuntimeError, match="no graph backend bound"):
+            reg.get_or_create("session-unbound", "/ws")
+
+        assert reg.active_count() == 0
+
+    def test_set_graph_backend_none_unbinds(self) -> None:
+        """Passing None to set_graph_backend explicitly unbinds (shutdown)."""
+        reg = SessionRegistry()
+        reg.set_graph_backend(FakeGraphBackend())
+        assert reg.graph_backend is not None
+
+        reg.set_graph_backend(None)
+
+        with pytest.raises(RuntimeError, match="no graph backend bound"):
+            _ = reg.graph_backend
 
 
 class TestProcessOneHandlersAnnotation:
@@ -1950,32 +1996,41 @@ class TestWrittenCounterWiring:
 
 
 # ---------------------------------------------------------------------------
-# Task 12: flush-chunk bounds threaded from settings into get_or_create
+# Task 12 (post graph-backend-segregation): get_or_create no longer threads
+# flush-chunk bounds into a store constructor itself -- that configuration is
+# now the bound GraphBackend's responsibility (set once at
+# Neo4jGraphBackend construction; see neo4j_backend.Neo4jGraphBackend). The
+# registry's remaining, testable responsibility is delegation: ask the bound
+# backend for a session store scoped to the right workspace/contributor.
 # ---------------------------------------------------------------------------
 
 
-def test_get_or_create_threads_flush_chunk_bounds(monkeypatch) -> None:
-    """get_or_create must pass flush_chunk_rows and flush_chunk_bytes
-    (sourced from Settings) into the Neo4jGraphStore constructor.
+def test_get_or_create_asks_bound_backend_for_session_store(monkeypatch) -> None:
+    """get_or_create must ask the bound GraphBackend for a session-scoped
+    store, passing workspace and created_by through untouched.
 
-    Fails before the fix because Neo4jGraphStore is constructed without
-    those kwargs; passes after the fix at registry.py:441.
+    Chunk/lock-timeout bounds are no longer threaded here at all -- see the
+    module-level note above -- so this replaces the old assertion that
+    get_or_create constructed a Neo4jGraphStore directly.
     """
-    captured: dict[str, object] = {}
+    calls: list[dict[str, object]] = []
+    backend = FakeGraphBackend()
+    original_session_store = backend.session_store
 
-    class _FakeStore:
-        def __init__(self, **kwargs: object) -> None:
-            captured.update(kwargs)
+    def _spy_session_store(*, workspace: str, created_by: str | None = None) -> object:
+        calls.append({"workspace": workspace, "created_by": created_by})
+        return original_session_store(workspace=workspace, created_by=created_by)
+
+    backend.session_store = _spy_session_store  # type: ignore[method-assign]
 
     # Neutralise the drain task so the test stays a pure wiring assertion.
     monkeypatch.setattr(SessionRegistry, "start_drain", lambda self, worker: None)
-    monkeypatch.setattr(registry_module, "Neo4jGraphStore", _FakeStore)
 
     reg = SessionRegistry()
-    reg.get_or_create("sess-1", "ws-1")
+    reg.set_graph_backend(backend)
+    reg.get_or_create("sess-1", "ws-1", created_by="alice")
 
-    assert captured.get("flush_chunk_rows") == 100
-    assert captured.get("flush_chunk_bytes") == 4_194_304
+    assert calls == [{"workspace": "ws-1", "created_by": "alice"}]
 
 
 # ---------------------------------------------------------------------------
@@ -2104,6 +2159,7 @@ class TestDrainerSpawnedLog:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         reg = SessionRegistry()
+        reg.set_graph_backend(FakeGraphBackend())
         sid = "sess-spawn"
 
         with caplog.at_level(logging.INFO, logger="context_intelligence_server"):
@@ -2169,7 +2225,14 @@ class TestSessionFinalizedLog:
 
 
 class TestGetOrCreateCreatedBy:
-    """T20: get_or_create accepts created_by and binds it to the Neo4jGraphStore."""
+    """T20: get_or_create accepts created_by and binds it to the session store
+    obtained from the bound GraphBackend.
+
+    Post graph-backend-segregation, get_or_create no longer constructs a
+    Neo4jGraphStore itself -- it asks ``self.graph_backend.session_store(...)``
+    (see registry.py). A bound FakeGraphBackend stands in for the real
+    backend so these tests never touch ``Neo4jGraphStore`` at all.
+    """
 
     def test_get_or_create_accepts_created_by_kwarg(self) -> None:
         """T20: get_or_create does not raise when called with created_by kwarg."""
@@ -2178,9 +2241,9 @@ class TestGetOrCreateCreatedBy:
         from context_intelligence_server.registry import SessionRegistry
 
         reg = SessionRegistry()
+        reg.set_graph_backend(FakeGraphBackend())
 
         with (
-            patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
             patch(
                 "context_intelligence_server.registry.AsyncDiskBlobStore"
             ) as MockBlob,
@@ -2188,7 +2251,6 @@ class TestGetOrCreateCreatedBy:
                 "context_intelligence_server.registry.HookStateService"
             ) as MockService,
         ):
-            MockStore.return_value = MagicMock()
             MockBlob.return_value = MagicMock()
             mock_svc = MagicMock()
             MockService.return_value = mock_svc
@@ -2209,9 +2271,9 @@ class TestGetOrCreateCreatedBy:
         from context_intelligence_server.registry import SessionRegistry
 
         reg = SessionRegistry()
+        reg.set_graph_backend(FakeGraphBackend())
 
         with (
-            patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
             patch(
                 "context_intelligence_server.registry.AsyncDiskBlobStore"
             ) as MockBlob,
@@ -2219,7 +2281,6 @@ class TestGetOrCreateCreatedBy:
                 "context_intelligence_server.registry.HookStateService"
             ) as MockService,
         ):
-            MockStore.return_value = MagicMock()
             MockBlob.return_value = MagicMock()
             mock_svc = MagicMock()
             MockService.return_value = mock_svc
@@ -2239,7 +2300,8 @@ class TestSessionOwnershipInvariant:
       - log nothing at ERROR when the same (or None) created_by arrives;
       - log an ERROR and preserve the bound id when a different created_by arrives.
 
-    Mocking strategy: patch Neo4jGraphStore / AsyncDiskBlobStore / HookStateService
+    Mocking strategy: bind a FakeGraphBackend (so get_or_create never touches
+    a real Neo4j driver) and patch AsyncDiskBlobStore / HookStateService
     exactly as TestGetOrCreateCreatedBy does.  After the first get_or_create call
     (which stores a worker whose .services is the mock_svc MagicMock), we manually
     set mock_svc.graph.created_by = "alice" to simulate the bound state — the real
@@ -2256,10 +2318,10 @@ class TestSessionOwnershipInvariant:
         from context_intelligence_server.registry import SessionRegistry
 
         reg = SessionRegistry()
+        reg.set_graph_backend(FakeGraphBackend())
 
         with (
             caplog.at_level(logging.ERROR, logger="context_intelligence_server"),
-            patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
             patch(
                 "context_intelligence_server.registry.AsyncDiskBlobStore"
             ) as MockBlob,
@@ -2267,7 +2329,6 @@ class TestSessionOwnershipInvariant:
                 "context_intelligence_server.registry.HookStateService"
             ) as MockService,
         ):
-            MockStore.return_value = MagicMock()
             MockBlob.return_value = MagicMock()
             mock_svc = MagicMock()
             MockService.return_value = mock_svc
@@ -2296,10 +2357,10 @@ class TestSessionOwnershipInvariant:
         from context_intelligence_server.registry import SessionRegistry
 
         reg = SessionRegistry()
+        reg.set_graph_backend(FakeGraphBackend())
 
         with (
             caplog.at_level(logging.ERROR, logger="context_intelligence_server"),
-            patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
             patch(
                 "context_intelligence_server.registry.AsyncDiskBlobStore"
             ) as MockBlob,
@@ -2307,7 +2368,6 @@ class TestSessionOwnershipInvariant:
                 "context_intelligence_server.registry.HookStateService"
             ) as MockService,
         ):
-            MockStore.return_value = MagicMock()
             MockBlob.return_value = MagicMock()
             mock_svc = MagicMock()
             MockService.return_value = mock_svc
@@ -2335,10 +2395,10 @@ class TestSessionOwnershipInvariant:
         from context_intelligence_server.registry import SessionRegistry
 
         reg = SessionRegistry()
+        reg.set_graph_backend(FakeGraphBackend())
 
         with (
             caplog.at_level(logging.ERROR, logger="context_intelligence_server"),
-            patch("context_intelligence_server.registry.Neo4jGraphStore") as MockStore,
             patch(
                 "context_intelligence_server.registry.AsyncDiskBlobStore"
             ) as MockBlob,
@@ -2346,7 +2406,6 @@ class TestSessionOwnershipInvariant:
                 "context_intelligence_server.registry.HookStateService"
             ) as MockService,
         ):
-            MockStore.return_value = MagicMock()
             MockBlob.return_value = MagicMock()
             mock_svc = MagicMock()
             MockService.return_value = mock_svc

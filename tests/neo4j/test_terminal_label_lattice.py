@@ -20,8 +20,8 @@ import uuid
 from typing import Any
 
 import pytest
-
 from context_intelligence_server.neo4j_store import Neo4jGraphStore, ensure_neo4j_schema
+from neo4j import AsyncGraphDatabase
 
 pytestmark = pytest.mark.neo4j
 
@@ -82,7 +82,9 @@ class TestLabelAssignmentsPath:
         await ensure_neo4j_schema(driver)
         await driver.close()
 
-        store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        store = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
 
         try:
             # Flush 1: add SubSession
@@ -116,6 +118,7 @@ class TestLabelAssignmentsPath:
             )
         finally:
             await store.close()
+            await store._driver.close()
 
     async def test_forked_then_sub_yields_forked_only(
         self, neo4j_container: dict[str, Any]
@@ -130,7 +133,9 @@ class TestLabelAssignmentsPath:
         await ensure_neo4j_schema(driver)
         await driver.close()
 
-        store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        store = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
 
         try:
             await store.upsert_node(
@@ -158,6 +163,7 @@ class TestLabelAssignmentsPath:
             )
         finally:
             await store.close()
+            await store._driver.close()
 
     async def test_root_then_sub_yields_sub_only(
         self, neo4j_container: dict[str, Any]
@@ -172,7 +178,9 @@ class TestLabelAssignmentsPath:
         await ensure_neo4j_schema(driver)
         await driver.close()
 
-        store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        store = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
 
         try:
             await store.upsert_node(
@@ -199,6 +207,7 @@ class TestLabelAssignmentsPath:
             )
         finally:
             await store.close()
+            await store._driver.close()
 
     async def test_non_terminal_labels_untouched(
         self, neo4j_container: dict[str, Any]
@@ -213,7 +222,9 @@ class TestLabelAssignmentsPath:
         await ensure_neo4j_schema(driver)
         await driver.close()
 
-        store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        store = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
 
         try:
             await store.upsert_node(
@@ -232,6 +243,7 @@ class TestLabelAssignmentsPath:
                 )
         finally:
             await store.close()
+            await store._driver.close()
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +268,9 @@ class TestPatchPath:
         await ensure_neo4j_schema(driver)
         await driver.close()
 
-        store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        store = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
 
         try:
             await _create_bare_session(store, node_id)
@@ -280,6 +294,7 @@ class TestPatchPath:
             )
         finally:
             await store.close()
+            await store._driver.close()
 
     async def test_patch_forked_then_sub_yields_forked_only(
         self, neo4j_container: dict[str, Any]
@@ -294,7 +309,9 @@ class TestPatchPath:
         await ensure_neo4j_schema(driver)
         await driver.close()
 
-        store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        store = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
 
         try:
             await _create_bare_session(store, node_id)
@@ -314,6 +331,7 @@ class TestPatchPath:
             )
         finally:
             await store.close()
+            await store._driver.close()
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +364,9 @@ class TestConcurrentLatticeConvergence:
         Returns the terminal labels found after both commit.
         """
         # Bootstrap a bare Session node
-        bootstrap = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        bootstrap = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
         try:
             await bootstrap.upsert_node(
                 node_id, {"labels": ["Session"], "session_id": node_id}
@@ -354,9 +374,12 @@ class TestConcurrentLatticeConvergence:
             await bootstrap.flush()
         finally:
             await bootstrap.close()
+            await bootstrap._driver.close()
 
         async def write_label(label: str) -> None:
-            store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+            store = Neo4jGraphStore(
+                driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+            )
             try:
                 await store.upsert_node(
                     node_id,
@@ -365,14 +388,18 @@ class TestConcurrentLatticeConvergence:
                 await store.flush()
             finally:
                 await store.close()
+            await store._driver.close()
 
         await asyncio.gather(write_label(label_a), write_label(label_b))
 
-        verify = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        verify = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
         try:
             return _terminals(await _labels(verify, node_id))
         finally:
             await verify.close()
+            await verify._driver.close()
 
     async def test_concurrent_sub_and_forked_yields_one_terminal(
         self, neo4j_container: dict[str, Any]

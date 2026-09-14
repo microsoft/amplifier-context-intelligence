@@ -46,15 +46,14 @@ import asyncio
 import uuid
 from typing import Any
 
-import pytest
-from neo4j import AsyncGraphDatabase
-from neo4j.exceptions import Neo4jError
-
 import context_intelligence_server.neo4j_store as _cis_store_mod
+import pytest
 from context_intelligence_server.neo4j_store import (
     Neo4jGraphStore,
     ensure_neo4j_schema,
 )
+from neo4j import AsyncGraphDatabase
+from neo4j.exceptions import Neo4jError
 
 pytestmark = pytest.mark.neo4j
 
@@ -92,8 +91,7 @@ async def test_node_chunk_sequence_is_globally_sorted(
     a_id = f"node-a-{run}"
 
     store = Neo4jGraphStore(
-        uri=bolt,
-        auth=auth,
+        driver=AsyncGraphDatabase.driver(bolt, auth=auth),
         workspace=ws,
         flush_chunk_rows=1,
         flush_chunk_bytes=10_000_000,
@@ -164,8 +162,7 @@ async def test_edge_chunk_sequence_is_globally_sorted(
     a_src, a_dst = f"a-src-{run}", f"a-dst-{run}"
 
     store = Neo4jGraphStore(
-        uri=bolt,
-        auth=auth,
+        driver=AsyncGraphDatabase.driver(bolt, auth=auth),
         workspace=ws,
         flush_chunk_rows=1,
         flush_chunk_bytes=10_000_000,
@@ -272,8 +269,7 @@ async def test_blocked_flush_fails_loud_with_finite_timeout(
     # lock_tx now holds the Session uniqueness constraint write lock; NOT committed.
 
     store = Neo4jGraphStore(
-        uri=bolt,
-        auth=auth,
+        driver=AsyncGraphDatabase.driver(bolt, auth=auth),
         workspace=ws,
         flush_chunk_rows=1,
         flush_chunk_bytes=10_000_000,
@@ -372,8 +368,7 @@ async def test_concurrent_overlapping_flush_no_stall(
 
     for i in range(n_stores):
         store = Neo4jGraphStore(
-            uri=bolt,
-            auth=auth,
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth),
             workspace=ws,
             flush_chunk_rows=2,
             flush_chunk_bytes=10_000_000,
@@ -423,7 +418,9 @@ async def test_concurrent_overlapping_flush_no_stall(
         )
 
         # Conservation: every expected Event node is present in Neo4j.
-        verify = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        verify = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
         try:
             rows = await verify.execute_query(
                 "MATCH (n:Event) WHERE n.node_id IN $ids AND n.workspace = $ws "

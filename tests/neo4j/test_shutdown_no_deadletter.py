@@ -1,10 +1,11 @@
 """Behavioral evidence that shutdown does not discard queued events.
 
-The shared Neo4j driver made driver lifetime a cross-session concern: closing
-it while a drain worker is still running is no longer "that session's driver
-going away", it is *every* session's driver going away mid-flight.
+The shared Neo4j backend made connection lifetime a cross-session concern:
+closing it while a drain worker is still running is no longer "that session's
+connection going away", it is *every* session's connection going away
+mid-flight.
 
-A drainer that meets a closed driver fails its batch, spends its
+A drainer that meets a closed connection fails its batch, spends its
 ``max_delivery_attempts`` budget in ~250 ms (5 attempts x the 50 ms
 ``_DRAIN_POLL_INTERVAL`` backoff), and lands in ``_handle_exhausted_batch`` --
 which dead-letters each line AND commits the offset past it. Those are healthy
@@ -13,7 +14,7 @@ dead-lettered they never replay.
 
 This drives real events through the real registry against a live Neo4j and
 asserts the shutdown sequence used by ``lifespan`` (quiesce the drainers, then
-close the shared driver) dead-letters nothing.
+close the graph backend) dead-letters nothing.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from typing import Any
 
 import pytest
 from context_intelligence_server.config import Settings
+from context_intelligence_server.neo4j_backend import Neo4jGraphBackend
 from context_intelligence_server.registry import SessionRegistry
 
 pytestmark = pytest.mark.neo4j
@@ -64,39 +66,52 @@ async def test_shutdown_quiesce_then_close_deadletters_nothing(
         "context_intelligence_server.registry.get_settings", lambda: settings
     )
 
+    # Established before the try so the finally always releases the pools:
+    # this test asserts on a shutdown sequence, so a failure mid-sequence is
+    # exactly the case where cleanup must still happen. aclose() is idempotent,
+    # so the in-test close below and the finally cannot conflict.
+    backend = Neo4jGraphBackend.from_settings(settings)
+    await backend.start()
     reg = SessionRegistry()
-    session_id = "shutdown-session"
-    qm = reg.queue_manager
+    reg.set_graph_backend(backend)
+    try:
+        session_id = "shutdown-session"
+        qm = reg.queue_manager
 
-    dead_lettered: list[str] = []
-    real_dead_letter = qm.dead_letter
+        dead_lettered: list[str] = []
+        real_dead_letter = qm.dead_letter
 
-    async def spy_dead_letter(sid: str, raw: bytes, error: str) -> None:
-        dead_lettered.append(error)
-        await real_dead_letter(sid, raw, error)
+        async def spy_dead_letter(sid: str, raw: bytes, error: str) -> None:
+            dead_lettered.append(error)
+            await real_dead_letter(sid, raw, error)
 
-    monkeypatch.setattr(qm, "dead_letter", spy_dead_letter)
+        monkeypatch.setattr(qm, "dead_letter", spy_dead_letter)
 
-    for i in range(EVENT_COUNT):
-        await qm.append(session_id, _event_line(session_id, i))
+        for i in range(EVENT_COUNT):
+            await qm.append(session_id, _event_line(session_id, i))
 
-    reg.get_or_create(session_id, "/ws")
-    # Let the drainer get into its loop with work still queued behind it.
-    await asyncio.sleep(0.4)
+        reg.get_or_create(session_id, "/ws")
+        # Let the drainer get into its loop with work still queued behind it.
+        await asyncio.sleep(0.4)
 
-    # The lifespan shutdown sequence, in order. Reversing these two lines is the
-    # regression this test exists to catch.
-    await reg.shutdown_workers()
-    await reg.close_neo4j_driver()
+        # The lifespan shutdown sequence, in order. Reversing these two lines is the
+        # regression this test exists to catch.
+        await reg.shutdown_workers()
+        await backend.aclose()
+        reg.set_graph_backend(None)
 
-    # Stay on the loop as the server would during its shutdown window: a
-    # still-live drainer would burn its retry budget and dead-letter here.
-    await asyncio.sleep(2.0)
+        # Stay on the loop as the server would during its shutdown window: a
+        # still-live drainer would burn its retry budget and dead-letter here.
+        await asyncio.sleep(2.0)
 
-    assert dead_lettered == [], (
-        f"{len(dead_lettered)} healthy queued events were dead-lettered during "
-        "shutdown; the drain workers must be quiesced before the shared driver "
-        "closes. First error: "
-        f"{dead_lettered[0] if dead_lettered else ''}"
-    )
-    assert reg._neo4j_driver is None
+        assert dead_lettered == [], (
+            f"{len(dead_lettered)} healthy queued events were dead-lettered during "
+            "shutdown; the drain workers must be quiesced before the graph backend "
+            "closes. First error: "
+            f"{dead_lettered[0] if dead_lettered else ''}"
+        )
+        with pytest.raises(RuntimeError):
+            _ = reg.graph_backend
+    finally:
+        await backend.aclose()
+        reg.set_graph_backend(None)

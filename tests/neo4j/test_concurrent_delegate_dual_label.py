@@ -33,7 +33,6 @@ import uuid
 from typing import Any
 
 import pytest
-
 from context_intelligence_server.handlers.data_layer_2.session import SessionHandler
 from context_intelligence_server.handlers.data_layer_3.delegation import (
     DelegationHandler,
@@ -43,6 +42,7 @@ from context_intelligence_server.neo4j_store import (
     ensure_neo4j_schema,
 )
 from context_intelligence_server.services import HookStateService
+from neo4j import AsyncGraphDatabase
 
 pytestmark = pytest.mark.neo4j
 
@@ -114,24 +114,32 @@ class TestForkBeforeStartConcurrentWithParentDrainer:
         bolt = neo4j_container["bolt_url"]
         ws = f"test-concurrent-{uuid.uuid4().hex[:8]}"
 
-        await ensure_neo4j_schema(
-            __import__(
-                "neo4j", fromlist=["AsyncGraphDatabase"]
-            ).AsyncGraphDatabase.driver(bolt, auth=auth)
-        )
+        # Bind the schema driver so it can be closed. Constructing it inline
+        # discarded the only reference to a real, open bolt pool -- a leak in
+        # any case, and an unconditional one now that a store's close() never
+        # closes a driver.
+        schema_driver = AsyncGraphDatabase.driver(bolt, auth=auth)
+        try:
+            await ensure_neo4j_schema(schema_driver)
+        finally:
+            await schema_driver.close()
 
         parent_id = f"parent-{uuid.uuid4().hex[:8]}"
         child_id = f"child-{uuid.uuid4().hex[:8]}"
         tool_call_id = f"tc-{uuid.uuid4().hex[:8]}"
 
         # --- PARENT's drainer resources ---
-        parent_store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        parent_store = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
         parent_services = HookStateService(workspace=ws, graph_store=parent_store)
         # Pre-seed parent session node (PARENT's drainer would have processed session:start for PARENT)
         await parent_services.ensure_session_node(parent_id, {})
 
         # --- CHILD's drainer resources ---
-        child_store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        child_store = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
         # Created up front (construction alone does no I/O) so both are
         # guaranteed to close in the finally below on every exit path,
         # including an assertion failure -- this test's whole point is to
@@ -201,7 +209,9 @@ class TestForkBeforeStartConcurrentWithParentDrainer:
 
         finally:
             await parent_store.close()
+            await parent_store._driver.close()
             await child_store.close()
+            await child_store._driver.close()
 
 
 # ---------------------------------------------------------------------------
@@ -229,21 +239,29 @@ class TestStartBeforeForkConcurrentWithParentDrainer:
         bolt = neo4j_container["bolt_url"]
         ws = f"test-start-fork-{uuid.uuid4().hex[:8]}"
 
-        await ensure_neo4j_schema(
-            __import__(
-                "neo4j", fromlist=["AsyncGraphDatabase"]
-            ).AsyncGraphDatabase.driver(bolt, auth=auth)
-        )
+        # Bind the schema driver so it can be closed. Constructing it inline
+        # discarded the only reference to a real, open bolt pool -- a leak in
+        # any case, and an unconditional one now that a store's close() never
+        # closes a driver.
+        schema_driver = AsyncGraphDatabase.driver(bolt, auth=auth)
+        try:
+            await ensure_neo4j_schema(schema_driver)
+        finally:
+            await schema_driver.close()
 
         parent_id = f"parent-{uuid.uuid4().hex[:8]}"
         child_id = f"child-{uuid.uuid4().hex[:8]}"
         tool_call_id = f"tc-{uuid.uuid4().hex[:8]}"
 
-        parent_store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        parent_store = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
         parent_services = HookStateService(workspace=ws, graph_store=parent_store)
         await parent_services.ensure_session_node(parent_id, {})
 
-        child_store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        child_store = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
 
         # Created up front (construction alone does no I/O); both close in
         # the finally below on every exit path, including an assertion
@@ -307,7 +325,9 @@ class TestStartBeforeForkConcurrentWithParentDrainer:
 
         finally:
             await parent_store.close()
+            await parent_store._driver.close()
             await child_store.close()
+            await child_store._driver.close()
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +352,9 @@ class TestSameBatchForkAndStart:
         parent_id = f"parent-{uuid.uuid4().hex[:8]}"
         child_id = f"child-{uuid.uuid4().hex[:8]}"
 
-        store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        store = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
 
         # Created up front (construction alone does no I/O); closes in
         # the finally below on every exit path, including an assertion
@@ -365,6 +387,7 @@ class TestSameBatchForkAndStart:
 
         finally:
             await store.close()
+            await store._driver.close()
 
     async def test_same_batch_start_before_fork(
         self, neo4j_container: dict[str, Any]
@@ -379,7 +402,9 @@ class TestSameBatchForkAndStart:
         parent_id = f"parent-{uuid.uuid4().hex[:8]}"
         child_id = f"child-{uuid.uuid4().hex[:8]}"
 
-        store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        store = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
 
         # Created up front (construction alone does no I/O); closes in
         # the finally below on every exit path, including an assertion
@@ -412,6 +437,7 @@ class TestSameBatchForkAndStart:
 
         finally:
             await store.close()
+            await store._driver.close()
 
 
 # ---------------------------------------------------------------------------
@@ -456,16 +482,21 @@ class TestAdversarialConcurrentWrites:
         await driver.close()
 
         # Create bare CHILD node first (as PARENT's drainer would)
-        bootstrap = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        bootstrap = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
         await bootstrap.upsert_node(
             child_id, {"labels": ["Session"], "session_id": child_id}
         )
         await bootstrap.flush()
         await bootstrap.close()
+        await bootstrap._driver.close()
 
         # Writer 1: session:start path — adds SubSession
         async def write_start() -> None:
-            store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+            store = Neo4jGraphStore(
+                driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+            )
             try:
                 services = HookStateService(workspace=ws, graph_store=store)
                 handler = SessionHandler(services)
@@ -480,11 +511,14 @@ class TestAdversarialConcurrentWrites:
                 await store.flush()
             finally:
                 await store.close()
+                await store._driver.close()
 
         # Writer 2: session:fork path (bare-session branch) — adds ForkedSession
         # This simulates the case where fork ran get_node BEFORE start committed SubSession
         async def write_fork_bare() -> None:
-            store = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+            store = Neo4jGraphStore(
+                driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+            )
             try:
                 services = HookStateService(workspace=ws, graph_store=store)
                 handler = SessionHandler(services)
@@ -500,12 +534,15 @@ class TestAdversarialConcurrentWrites:
                 await store.flush()
             finally:
                 await store.close()
+                await store._driver.close()
 
         # Both concurrent — this is the race window
         await asyncio.gather(write_start(), write_fork_bare())
 
         # Check for dual label
-        verify = Neo4jGraphStore(uri=bolt, auth=auth, workspace=ws)
+        verify = Neo4jGraphStore(
+            driver=AsyncGraphDatabase.driver(bolt, auth=auth), workspace=ws
+        )
         try:
             final_labels = await _neo4j_labels(verify, child_id)
             terminals = [
@@ -525,3 +562,4 @@ class TestAdversarialConcurrentWrites:
             )
         finally:
             await verify.close()
+            await verify._driver.close()

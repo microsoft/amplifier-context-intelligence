@@ -8,7 +8,8 @@ type; a second owner evicts the first with a last-writer-wins strategy.
 from __future__ import annotations
 
 import logging
-from typing import Any
+
+from context_intelligence_server.graph_store import GraphStore
 
 logger = logging.getLogger(__name__)
 
@@ -24,24 +25,17 @@ OWNERSHIP_EDGE_TYPES: frozenset[str] = frozenset({"HAS_RUN", "HAS_STEP", "TRIGGE
 # ---------------------------------------------------------------------------
 
 
-def _find_owner_in_buffer(graph: Any, dst_id: str, edge_type: str) -> str | None:
+def _find_owner_in_buffer(graph: GraphStore, dst_id: str, edge_type: str) -> str | None:
     """Return the src_id of an existing ownership edge of *edge_type* → *dst_id*.
 
-    Scans the in-memory edge buffer of *graph*, which may be either:
-    - ``GraphState``     — exposes ``_edges: dict[tuple[str, str], dict]``
-    - ``Neo4jGraphStore``— exposes ``_edge_buffer: dict[tuple, dict]``
+    Reads the store's buffered edges through ``GraphStore.buffered_edges()``.
+    Going through the port matters: probing for a private attribute by name made
+    a rename indistinguishable from "no competing owner exists", silently
+    disabling ownership enforcement with every test still green.
 
     Returns the src_id string if found, or ``None`` when no matching edge exists.
     """
-    # Support both GraphState (_edges) and Neo4jGraphStore (_edge_buffer)
-    if hasattr(graph, "_edges"):
-        buffer = graph._edges
-    elif hasattr(graph, "_edge_buffer"):
-        buffer = graph._edge_buffer
-    else:
-        return None
-
-    for (src_id, d_id), data in buffer.items():
+    for src_id, d_id, data in graph.buffered_edges():
         if d_id == dst_id and data.get("type") == edge_type:
             return src_id
 
@@ -54,7 +48,7 @@ def _find_owner_in_buffer(graph: Any, dst_id: str, edge_type: str) -> str | None
 
 
 async def check_ownership(
-    graph: Any,
+    graph: GraphStore,
     dst_id: str,
     edge_type: str,
     new_src_id: str,

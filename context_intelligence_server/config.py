@@ -798,12 +798,17 @@ class Settings(BaseSettings):
             access_mode="READ",
         )
 
-    # Upper bound on concurrent bolt connections for a driver shared across many
-    # logical callers (the lifespan admin driver, the lifespan query driver, the
-    # registry's shared per-session driver). Well under the server's default
-    # bolt thread-pool size so a driver leak can no longer starve it. The neo4j
-    # driver's own default is 100; 50 is a deliberate reduction, since every
-    # session now shares one pool instead of holding a private one.
+    # Upper bound on concurrent bolt connections per pool. The process opens
+    # exactly TWO, both owned by Neo4jGraphBackend: the write pool (schema DDL,
+    # every per-session ingest flush, whole-graph deletion) and the read pool
+    # (/cypher, the deletion summary). Well under the server's default bolt
+    # thread-pool size, so neither can starve it. The neo4j driver's own default
+    # is 100; 50 is a deliberate reduction, since every session shares the write
+    # pool instead of holding a private one.
+    #
+    # This cap only helps while the NUMBER of pools is itself bounded, which is
+    # why opening one is something exactly one object can do -- see
+    # neo4j_backend.py.
     #
     # No companion max_connection_lifetime knob: the driver already recycles
     # pooled connections at 3600 s by default, so a setting whose default equals

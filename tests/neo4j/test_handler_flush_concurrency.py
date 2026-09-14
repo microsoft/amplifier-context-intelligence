@@ -15,14 +15,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from neo4j import AsyncGraphDatabase
-
 from context_intelligence_server.handlers.data_layer_2.session import SessionHandler
 from context_intelligence_server.neo4j_store import Neo4jGraphStore, ensure_neo4j_schema
 from context_intelligence_server.pipeline import process_event, setup_handlers
 from context_intelligence_server.queue_manager import QueueManager
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
+from neo4j import AsyncGraphDatabase
 
 pytestmark = pytest.mark.neo4j
 
@@ -91,8 +90,9 @@ def _build_registry(queues_dir: Path, *, write_concurrency: int = 8) -> SessionR
 
 def _build_worker(container: dict[str, Any], sid: str) -> SessionWorker:
     store = Neo4jGraphStore(
-        uri=container["bolt_url"],
-        auth=(container["user"], container["password"]),
+        driver=AsyncGraphDatabase.driver(
+            container["bolt_url"], auth=(container["user"], container["password"])
+        ),
         workspace=_WS,
     )
     services = HookStateService(workspace=_WS, graph_store=store)
@@ -199,6 +199,7 @@ async def test_no_flush_outside_write_semaphore(
     reg.start_drain(worker)
     assert worker.task is not None
     await asyncio.wait_for(worker.task, timeout=30.0)
+    await worker.services.graph._driver.close()
 
     assert observations, "no flush was recorded, so the test proves nothing"
     assert all(observations), f"a flush ran with the semaphore unlocked: {observations}"
@@ -232,6 +233,7 @@ async def test_terminal_data_durably_flushed_before_log_deleted(
     reg.start_drain(worker)
     assert worker.task is not None
     await asyncio.wait_for(worker.task, timeout=30.0)
+    await worker.services.graph._driver.close()
 
     # log + offset gone => finalize completed, which only deletes after the
     # tail was drained and flushed.

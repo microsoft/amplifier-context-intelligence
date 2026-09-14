@@ -252,14 +252,17 @@ async def _run_migration_assertions(neo4j_container: dict[str, Any]) -> None:
     # Run the migration via a store's async driver (the real production path) --
     # run_repair is what `context-intelligence-server doctor --fix` invokes.
     store = Neo4jGraphStore(
-        uri=neo4j_container["bolt_url"],
-        auth=(neo4j_container["user"], neo4j_container["password"]),
+        driver=AsyncGraphDatabase.driver(
+            neo4j_container["bolt_url"],
+            auth=(neo4j_container["user"], neo4j_container["password"]),
+        ),
         workspace=_WS,
     )
     try:
         result = await run_repair(store._driver, store._database)
     finally:
         await store.close()
+        await store._driver.close()
 
     assert result["duplicates_removed"] >= 1, (
         "run_repair did not report removing the seeded duplicate 'dup-1' node."
@@ -408,8 +411,10 @@ async def _phase_a_through_d_self_heal(
     _seed_node_constraint_conflict(neo4j_container)
 
     store = Neo4jGraphStore(
-        uri=neo4j_container["bolt_url"],
-        auth=(neo4j_container["user"], neo4j_container["password"]),
+        driver=AsyncGraphDatabase.driver(
+            neo4j_container["bolt_url"],
+            auth=(neo4j_container["user"], neo4j_container["password"]),
+        ),
         workspace=_WS,
     )
     try:
@@ -499,6 +504,7 @@ async def _phase_a_through_d_self_heal(
         )
     finally:
         await store.close()
+        await store._driver.close()
 
 
 async def _phase_e_doctor_contract_fails_closed(

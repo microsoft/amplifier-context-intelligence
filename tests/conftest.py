@@ -17,8 +17,9 @@ import httpx  # noqa: E402
 import pytest  # noqa: E402
 
 
+from context_intelligence_server.graph_backend import BackendHealth  # noqa: E402
 from context_intelligence_server.main import app, registry  # noqa: E402
-from context_intelligence_server.services import HookStateService  # noqa: E402
+from context_intelligence_server.services import GraphState, HookStateService  # noqa: E402
 
 # Guarded import so the suite still COLLECTS against unfixed source (where the
 # process-wide schema latch does not exist yet). Without this, reverting the
@@ -52,75 +53,141 @@ def _reset_neo4j_schema_state() -> Generator[None, None, None]:
 
 
 # ---------------------------------------------------------------------------
-# Shared Neo4j mock helpers (used by POST /cypher tests)
+# Shared GraphBackend test doubles.
+#
+# Post graph-backend-segregation (doc: PR #109 rework), a Neo4j driver is
+# never visible outside neo4j_backend.Neo4jGraphBackend -- SessionRegistry
+# and every route ask a bound GraphBackend for a GraphStore/QueryableStore
+# instead. These doubles satisfy that same seam without a driver:
+#
+# * FakeQueryableStore -- a QueryableStore double for /cypher wiring tests.
+#   Records exactly what POST /cypher forwarded to ``execute_query`` so
+#   tests can assert wiring (query/params/workspace pass-through, error
+#   mapping) without a real Neo4j session.
+# * FakeGraphBackend    -- a GraphBackend double. ``session_store``/
+#   ``admin_store`` hand out ``GraphState`` (the existing in-memory
+#   GraphStore implementation from services.py -- a second, independent
+#   port implementation, not a mock) unless a test needs something else;
+#   ``query_store`` hands out a FakeQueryableStore. Lifecycle calls
+#   (start/aclose/ensure_schema) are counted so lifespan-wiring tests can
+#   assert ordering/arguments without touching a real connection pool.
 # ---------------------------------------------------------------------------
 
 
-class MockNeo4jResult:
-    """Async-iterable result mock that yields a fixed list of rows."""
+class FakeQueryableStore:
+    """QueryableStore test double for /cypher wiring tests.
 
-    def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
-        self._rows = list(rows or [])
-        self._index = 0
+    ``rows``/``exc`` control the (mutually exclusive) outcome of every call.
+    Every call is recorded in ``calls`` so a test can assert on the exact
+    query/params/dialect/workspace the endpoint forwarded.
+    """
 
-    def __aiter__(self) -> "MockNeo4jResult":
-        return self
-
-    async def __anext__(self) -> dict[str, Any]:
-        if self._index >= len(self._rows):
-            raise StopAsyncIteration
-        row = self._rows[self._index]
-        self._index += 1
-        return row
-
-
-class MockNeo4jSession:
-    """Async context-manager session mock; captures params and/or raises exceptions."""
+    supported_dialects = frozenset({"cypher"})
 
     def __init__(
         self,
         rows: list[dict[str, Any]] | None = None,
         exc: Exception | None = None,
-        captured: dict[str, Any] | None = None,
     ) -> None:
-        self._rows = rows
+        self._rows = list(rows or [])
         self._exc = exc
-        self._captured = captured
+        self.calls: list[dict[str, Any]] = []
 
-    async def run(self, query: str, params: dict[str, Any]) -> MockNeo4jResult:
-        if self._captured is not None:
-            self._captured.update(params)
+    async def execute_query(
+        self,
+        query: str,
+        params: dict[str, Any] | None = None,
+        dialect: str = "cypher",
+        workspace: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self.calls.append(
+            {
+                "query": query,
+                "params": dict(params or {}),
+                "dialect": dialect,
+                "workspace": workspace,
+            }
+        )
         if self._exc is not None:
             raise self._exc
-        return MockNeo4jResult(self._rows)
-
-    async def __aenter__(self) -> "MockNeo4jSession":
-        return self
-
-    async def __aexit__(self, *args: object) -> None:
-        pass
+        return list(self._rows)
 
 
-class MockNeo4jDriver:
-    """Driver mock; delegates to a single MockNeo4jSession with the given config.
+class FakeGraphBackend:
+    """In-memory ``GraphBackend`` test double -- no Neo4j driver anywhere.
 
-    Accepts (and ignores) ``default_access_mode`` so it stays compatible with
-    the two-client split's ``driver.session(default_access_mode=...)`` call in
-    ``post_cypher`` (main.py).
+    ``session_store``/``admin_store`` return a fresh ``GraphState`` (an
+    existing, fully-conforming ``GraphStore`` implementation) unless
+    overridden; ``query_store`` returns the configured ``FakeQueryableStore``
+    (a fresh empty one by default). Lifecycle methods count their own calls
+    and can be made to raise, so tests can assert lifespan wiring (start
+    before use, aclose exactly once, ensure_schema's kwargs, error
+    propagation) without any real connection.
     """
 
     def __init__(
         self,
-        rows: list[dict[str, Any]] | None = None,
-        exc: Exception | None = None,
-        captured: dict[str, Any] | None = None,
+        *,
+        query_store: Any = None,
+        health: BackendHealth | None = None,
+        raise_on_start: Exception | None = None,
+        raise_on_ensure_schema: Exception | None = None,
+        schema_established: bool = True,
     ) -> None:
-        self._rows = rows
-        self._exc = exc
-        self._captured = captured
+        self.start_calls = 0
+        self.aclose_calls = 0
+        self.ensure_schema_calls: list[dict[str, Any]] = []
+        self.started = False
+        self._query_store = (
+            query_store if query_store is not None else FakeQueryableStore()
+        )
+        self._health = health
+        self._raise_on_start = raise_on_start
+        self._raise_on_ensure_schema = raise_on_ensure_schema
+        self._schema_established = schema_established
 
-    def session(self, default_access_mode: str | None = None) -> MockNeo4jSession:
-        return MockNeo4jSession(self._rows, self._exc, self._captured)
+    async def start(self) -> None:
+        self.start_calls += 1
+        if self._raise_on_start is not None:
+            raise self._raise_on_start
+        self.started = True
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        self.started = False
+
+    def session_store(self, *, workspace: str, created_by: str | None = None) -> Any:
+        store = GraphState(workspace=workspace)
+        store.created_by = created_by
+        return store
+
+    def admin_store(self) -> Any:
+        return GraphState()
+
+    def query_store(self) -> Any:
+        return self._query_store
+
+    async def ensure_schema(self, *, fail_on_data_conflict: bool = False) -> bool:
+        self.ensure_schema_calls.append({"fail_on_data_conflict": fail_on_data_conflict})
+        if self._raise_on_ensure_schema is not None:
+            raise self._raise_on_ensure_schema
+        return self._schema_established
+
+    async def health(self) -> BackendHealth:
+        if self._health is not None:
+            return self._health
+        return BackendHealth(
+            write_connected=True,
+            read_connected=True,
+            url="bolt://fake:7687",
+            browser_url="",
+        )
+
+    async def diagnose(self) -> dict[str, int]:
+        return {}
+
+    async def repair(self) -> dict[str, int]:
+        return {}
 
 
 @pytest.fixture
@@ -207,6 +274,32 @@ def reset_registry() -> Generator[None, None, None]:
         registry._completed.clear()
     registry._queue_manager = None
     registry._write_semaphore = None
+
+
+@pytest.fixture(autouse=True)
+def _default_graph_backend() -> Generator[None, None, None]:
+    """Bind a fresh FakeGraphBackend for every test, on both seams that need one.
+
+    ``SessionRegistry.get_or_create()`` raises ``RuntimeError`` unless a
+    ``GraphBackend`` has been bound via ``set_graph_backend`` (see
+    registry.py), and ``GET /status`` / ``POST /cypher`` read
+    ``app.state.graph_backend`` directly -- neither is ever set by running
+    the real ``lifespan()``, since most tests exercise routes straight
+    through ``ASGITransport`` without it. Before graph-backend-segregation,
+    the registry built its own driver lazily on first use and no such
+    binding was needed; this fixture is the direct replacement, mirroring
+    what ``lifespan()`` does at boot. Individual tests that care about
+    specific backend behavior (custom health(), cypher rows/errors, etc.)
+    override ``app.state.graph_backend`` and/or call
+    ``registry.set_graph_backend(...)`` themselves.
+    """
+    backend = FakeGraphBackend()
+    app.state.graph_backend = backend
+    registry.set_graph_backend(backend)
+    yield
+    registry.set_graph_backend(None)
+    if hasattr(app.state, "graph_backend"):
+        del app.state.graph_backend
 
 
 @pytest.fixture

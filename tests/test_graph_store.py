@@ -6,6 +6,7 @@ checks correctly accept conforming classes and reject non-conforming ones.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 from context_intelligence_server.graph_store import GraphStore, QueryableStore
@@ -62,6 +63,17 @@ class MinimalGraphStore:
 
     async def delete_session_graph(self, session_id: str) -> Any:
         return None
+
+    def remove_edge(self, src_id: str, dst_id: str) -> None:
+        pass
+
+    def buffered_edges(self) -> Iterator[tuple[str, str, dict[str, Any]]]:
+        return iter(())
+
+    async def set_labels(
+        self, node_id: str, remove_labels: list[str], add_labels: list[str]
+    ) -> None:
+        pass
 
     async def flush(self) -> None:
         pass
@@ -146,6 +158,17 @@ class MinimalQueryableStore:
 
     async def delete_session_graph(self, session_id: str) -> Any:
         return None
+
+    def remove_edge(self, src_id: str, dst_id: str) -> None:
+        pass
+
+    def buffered_edges(self) -> Iterator[tuple[str, str, dict[str, Any]]]:
+        return iter(())
+
+    async def set_labels(
+        self, node_id: str, remove_labels: list[str], add_labels: list[str]
+    ) -> None:
+        pass
 
     async def flush(self) -> None:
         pass

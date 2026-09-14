@@ -23,10 +23,10 @@ from typing import Any
 
 import httpx
 import pytest
-from neo4j import GraphDatabase
-
-from context_intelligence_server.neo4j_store import Neo4jGraphStore
+from context_intelligence_server.config import Neo4jClientConfig
+from context_intelligence_server.neo4j_backend import Neo4jGraphBackend
 from context_intelligence_server.services import HookStateService
+from neo4j import GraphDatabase
 
 
 def _get_free_port() -> int:
@@ -202,19 +202,19 @@ async def neo4j_services(
 ) -> AsyncGenerator[Any, None]:
     """HookStateService backed by the real Neo4j test container.
 
-    Creates a Neo4jGraphStore connected to the test container, wraps it
-    in a HookStateService, and cleans up all data between tests.
+    Builds a ``Neo4jGraphBackend`` connected to the test container, takes a
+    workspace-scoped ``GraphStore`` from it, wraps that in a
+    ``HookStateService``, and cleans up all data between tests.
 
-    An ASYNC generator fixture (not sync): ``Neo4jGraphStore`` lazily builds
-    an ``AsyncGraphDatabase`` driver with its own connection pool, and that
-    driver was never being closed here. Because ``neo4j_container`` is
-    session-scoped and shared by every test in this directory, every test
-    using this (function-scoped) fixture leaked one driver + pool for the
-    remainder of the session -- confirmed by running
-    ``test_driver_leak_bounded.py`` after subsets of the other neo4j test
-    modules: with only ``test_delete_session_graph.py`` (8 uses of this
-    fixture) run first, the leak test's baseline/after_close open-connection
-    counts were 3 instead of 0.
+    An ASYNC generator fixture (not sync): the backend owns a real
+    ``AsyncGraphDatabase`` connection pool, and that pool was never being
+    closed here. Because ``neo4j_container`` is session-scoped and shared by
+    every test in this directory, every test using this (function-scoped)
+    fixture leaked one driver + pool for the remainder of the session --
+    confirmed by running ``test_driver_leak_bounded.py`` after subsets of the
+    other neo4j test modules: with only ``test_delete_session_graph.py`` (8
+    uses of this fixture) run first, the leak test's baseline/after_close
+    open-connection counts were 3 instead of 0.
 
     Using ``async def`` here (rather than a sync generator that fires off
     ``asyncio.run()`` post-yield) matters: by teardown time the test's own
@@ -224,32 +224,54 @@ async def neo4j_services(
     any event-loop-mismatch problem entirely. Every consumer of this fixture
     in this directory is itself an async test, so this is a transparent
     change (confirmed by grep across tests/neo4j/*.py).
+
+    Store ``close()`` no longer closes any driver -- connection ownership
+    belongs entirely to the backend now -- so teardown explicitly flushes the
+    store AND closes the backend, in that order, before wiping test data.
     """
-    graph_store = Neo4jGraphStore(
-        uri=neo4j_container["bolt_url"],
-        auth=(neo4j_container["user"], neo4j_container["password"]),
-        workspace="test",
+    write_config = Neo4jClientConfig(
+        url=neo4j_container["bolt_url"],
+        username=neo4j_container["user"],
+        password=neo4j_container["password"],
+        access_mode="WRITE",
     )
+    read_config = Neo4jClientConfig(
+        url=neo4j_container["bolt_url"],
+        username=neo4j_container["user"],
+        password=neo4j_container["password"],
+        access_mode="READ",
+    )
+    backend = Neo4jGraphBackend(
+        write_config=write_config,
+        read_config=read_config,
+        max_connection_pool_size=10,
+    )
+    await backend.start()
+    graph_store = backend.session_store(workspace="test")
     services = HookStateService(workspace="test", graph_store=graph_store)
 
     try:
         yield services
     finally:
-        # Close this test's own driver first so its pool connections are
+        # Close this test's own backend first so its pool connections are
         # released before the next test (or the leak-bounded test) counts
         # open connections against the shared session container.
         try:
-            await graph_store.close()
+            await graph_store.close()  # flush only -- never closes a driver
         finally:
-            # Clean up all data between tests — synchronous driver for
-            # teardown. Runs even if graph_store.close() itself raised, so
-            # a broken store never leaves data pollution for the next test.
-            driver = GraphDatabase.driver(
-                neo4j_container["bolt_url"],
-                auth=(neo4j_container["user"], neo4j_container["password"]),
-            )
             try:
-                with driver.session() as session:
-                    session.run("MATCH (n) DETACH DELETE n")
+                await backend.aclose()
             finally:
-                driver.close()
+                # Clean up all data between tests -- synchronous driver for
+                # teardown. Runs even if the backend close itself raised, so
+                # a broken store never leaves data pollution for the next
+                # test.
+                driver = GraphDatabase.driver(
+                    neo4j_container["bolt_url"],
+                    auth=(neo4j_container["user"], neo4j_container["password"]),
+                )
+                try:
+                    with driver.session() as session:
+                        session.run("MATCH (n) DETACH DELETE n")
+                finally:
+                    driver.close()

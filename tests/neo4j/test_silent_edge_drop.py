@@ -47,9 +47,8 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from neo4j import GraphDatabase
-
 from context_intelligence_server.neo4j_store import Neo4jGraphStore
+from neo4j import AsyncGraphDatabase, GraphDatabase
 
 pytestmark = pytest.mark.neo4j
 
@@ -145,8 +144,10 @@ async def test_cross_session_edge_with_absent_endpoint_is_never_silent(
     """
     # --- Arrange: commit ONLY the child (dst) endpoint; parent (src) is absent.
     store = Neo4jGraphStore(
-        uri=neo4j_container["bolt_url"],
-        auth=(neo4j_container["user"], neo4j_container["password"]),
+        driver=AsyncGraphDatabase.driver(
+            neo4j_container["bolt_url"],
+            auth=(neo4j_container["user"], neo4j_container["password"]),
+        ),
         workspace=_WS,
     )
     try:
@@ -178,6 +179,7 @@ async def test_cross_session_edge_with_absent_endpoint_is_never_silent(
             raised = exc
     finally:
         await store.close()
+        await store._driver.close()
 
     # --- Assert: never-silent invariant.
     edge_present = _count_has_subsession_into(neo4j_container, _CHILD) > 0
@@ -200,8 +202,10 @@ async def test_edge_with_absent_dst_is_never_silent(
     the ``dst`` endpoint instead of ``src``.  Both must be never-silent.
     """
     store = Neo4jGraphStore(
-        uri=neo4j_container["bolt_url"],
-        auth=(neo4j_container["user"], neo4j_container["password"]),
+        driver=AsyncGraphDatabase.driver(
+            neo4j_container["bolt_url"],
+            auth=(neo4j_container["user"], neo4j_container["password"]),
+        ),
         workspace=_WS,
     )
     try:
@@ -214,6 +218,7 @@ async def test_edge_with_absent_dst_is_never_silent(
             raised = exc
     finally:
         await store.close()
+        await store._driver.close()
 
     edge_present = (
         _count_edge(neo4j_container, "HAS_SUBSESSION", "src-present", "dst-absent") > 0
@@ -228,8 +233,10 @@ async def test_edge_with_both_endpoints_absent_is_never_silent(
 ) -> None:
     """Both endpoints absent must fail loud, never silently drop."""
     store = Neo4jGraphStore(
-        uri=neo4j_container["bolt_url"],
-        auth=(neo4j_container["user"], neo4j_container["password"]),
+        driver=AsyncGraphDatabase.driver(
+            neo4j_container["bolt_url"],
+            auth=(neo4j_container["user"], neo4j_container["password"]),
+        ),
         workspace=_WS,
     )
     try:
@@ -241,6 +248,7 @@ async def test_edge_with_both_endpoints_absent_is_never_silent(
             raised = exc
     finally:
         await store.close()
+        await store._driver.close()
 
     edge_present = (
         _count_edge(neo4j_container, "HAS_SUBSESSION", "ghost-src", "ghost-dst") > 0
@@ -257,8 +265,10 @@ async def test_edge_with_both_endpoints_present_writes_without_raising(
     is raised — the fail-loud net must not break the normal write path.
     """
     store = Neo4jGraphStore(
-        uri=neo4j_container["bolt_url"],
-        auth=(neo4j_container["user"], neo4j_container["password"]),
+        driver=AsyncGraphDatabase.driver(
+            neo4j_container["bolt_url"],
+            auth=(neo4j_container["user"], neo4j_container["password"]),
+        ),
         workspace=_WS,
     )
     try:
@@ -276,6 +286,7 @@ async def test_edge_with_both_endpoints_present_writes_without_raising(
             raised = exc
     finally:
         await store.close()
+        await store._driver.close()
 
     assert raised is None, f"happy-path edge write raised unexpectedly: {raised!r}"
     assert (
