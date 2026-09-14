@@ -149,8 +149,14 @@ python scripts/prime-local-config.py --neo4j-password '<neo4j-password>'
 ```bash
 export AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE="$(pwd)/server-config.yaml"
 uv sync
-uv run uvicorn context_intelligence_server.main:app --host 127.0.0.1 --port 8000
+uv run uvicorn context_intelligence_server.main:asgi_app --host 127.0.0.1 --port 8000
 ```
+
+> **`asgi_app`, not `app`.** `main:app` is the bare FastAPI object with no
+> `BearerTokenMiddleware` — serving it starts the server with authentication
+> silently disabled (anonymous `POST /cypher` and `DELETE /sessions/{id}`,
+> events stamped `created_by: null`). See
+> [local-development.md](docs/local-development.md#3-run-the-server).
 
 Open [http://localhost:8000](http://localhost:8000) to confirm the server is
 running. Configuration resolution is `env > server-config.yaml > built-in

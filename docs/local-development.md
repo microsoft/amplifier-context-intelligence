@@ -124,17 +124,39 @@ Point the server at the generated config and start it with uv:
 ```bash
 export AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE="$(pwd)/server-config.yaml"
 uv sync
-uv run uvicorn context_intelligence_server.main:app --host 127.0.0.1 --port 8000
+uv run uvicorn context_intelligence_server.main:asgi_app --host 127.0.0.1 --port 8000
 ```
+
+> **Serve `main:asgi_app`, never `main:app`.** `app` is the bare FastAPI object,
+> kept for internal use and for tests that exercise un-authed routes.
+> Authentication lives in `BearerTokenMiddleware`, which is applied only by
+> `create_asgi_app()` — reached through `asgi_app`.
+>
+> Serving `main:app` starts a server with **no authentication at all**, and it
+> fails silently: `/status` is healthy and ingestion works. The route-level
+> `require_read`/`require_write` dependencies do not save you — they are
+> *authorization* gates that read `is_service` from scope state, and with no
+> middleware to set it they default to "human / static — always write-capable"
+> (`authz.py`). The result is anonymous access to `POST /cypher` and
+> `DELETE /sessions/{id}`, and every ingested event stamped `created_by: null`.
+>
+> `asgi_app` also enforces the startup guard that refuses to boot when no
+> authentication is configured. `main:app` walks straight past it.
 
 > `uvicorn --reload` is for **local dev only**. For a persistent/shared run, use
 > the installed `context-intelligence-server` entry point (gunicorn + a single
 > UvicornWorker) under a service manager — see
-> [service-setup.md](service-setup.md).
+> [service-setup.md](service-setup.md). That path already uses `asgi_app`.
 
-Verify it's up:
+Verify it's up — and verify auth is actually on:
 ```bash
 curl -s http://127.0.0.1:8000/status
+
+# must be 401, not 200
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/whoami
+
+# must report your contributor id, not null
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/whoami
 ```
 The server is headless (API-only); explore the API at the always-on Swagger UI
 `http://127.0.0.1:8000/docs`.
@@ -171,8 +193,10 @@ Show me the API token once and remind me to save it.
 ```
 Set AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE to the server-config.yaml in
 the repo root, run `uv sync`, then start the server with
-`uv run uvicorn context_intelligence_server.main:app --host 127.0.0.1 --port 8000`.
-Confirm it's healthy by curling http://127.0.0.1:8000/status.
+`uv run uvicorn context_intelligence_server.main:asgi_app --host 127.0.0.1 --port 8000`
+(asgi_app, NOT app — app has no auth middleware). Confirm it's healthy by curling
+http://127.0.0.1:8000/status, and confirm auth is on by checking that
+http://127.0.0.1:8000/whoami returns 401 without a token.
 ```
 
 ---
