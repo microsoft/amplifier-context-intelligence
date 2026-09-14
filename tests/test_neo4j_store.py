@@ -3564,6 +3564,160 @@ class TestWorkingDirCoalesce:
 
 
 # ---------------------------------------------------------------------------
+# status_if_absent: populate-if-missing at the Session MERGE, mirroring
+# working_dir. ensure_session_node never writes status authoritatively; the
+# store applies it only when a node has no status yet.
+# ---------------------------------------------------------------------------
+
+
+class TestStatusIfAbsentCoalesce:
+    """status_if_absent is coalesced, never blind-overwritten, on Session nodes.
+
+    A cross-session stub write (a cold-cache worker materializing a bare
+    reference to another session) must never revert a status already set by
+    that session's own authoritative writer (session:end).
+    """
+
+    def test_build_node_props_excludes_status_if_absent(self) -> None:
+        from context_intelligence_server.neo4j_store import _build_node_props
+
+        props = _build_node_props(
+            {
+                "labels": ["Session"],
+                "status": "completed",
+                "status_if_absent": "running",
+            },
+            "ws-1",
+        )
+        assert "status_if_absent" not in props, (
+            "status_if_absent must NOT ride in row.props — the blind "
+            "`SET n += row.props` would overwrite an existing status, "
+            "defeating populate-if-missing"
+        )
+        assert props["status"] == "completed"
+
+    def test_write_batch_cypher_coalesces_status(self) -> None:
+        import inspect
+
+        from context_intelligence_server import neo4j_store
+
+        source = inspect.getsource(neo4j_store._write_batch)
+        assert "coalesce(n.status, row.status_if_absent)" in source, (
+            "the Session MERGE must coalesce status_if_absent rather than "
+            "overwrite an existing status"
+        )
+
+    def test_status_coalesce_ordered_after_props_set(self) -> None:
+        """The coalesce clause must run AFTER `SET n += row.props` so an
+        authoritative status carried in the same row (e.g. session:end's
+        props.status) is already applied before the coalesce checks it."""
+        import inspect
+
+        from context_intelligence_server import neo4j_store
+
+        source = inspect.getsource(neo4j_store._write_batch)
+        props_set_index = source.index("SET n += row.props")
+        coalesce_index = source.index("coalesce(n.status, row.status_if_absent)")
+        assert props_set_index != -1
+        assert coalesce_index != -1
+        assert props_set_index < coalesce_index, (
+            "SET n += row.props must precede the status coalesce clause"
+        )
+
+    async def test_write_batch_passes_status_if_absent_as_row_key(self) -> None:
+        """The Session row carries status_if_absent as a top-level key, not in props."""
+        from context_intelligence_server.neo4j_store import _write_batch
+
+        captured: list[dict[str, object]] = []
+
+        class _Tx:
+            async def run(self, statement: str, **kwargs: object) -> object:
+                captured.append({"statement": statement, "kwargs": kwargs})
+
+                class _R:
+                    async def consume(self) -> None:
+                        return None
+
+                return _R()
+
+        await _write_batch(
+            _Tx(),
+            {
+                "s1": {
+                    "labels": ["Session"],
+                    "status_if_absent": "running",
+                }
+            },
+            {},
+            [],
+            "ws-1",
+        )
+        session_calls = [c for c in captured if "n:Session" in str(c["statement"])]
+        assert session_calls, "expected a Session MERGE statement"
+        rows = session_calls[0]["kwargs"]["rows"]  # type: ignore[index]
+        assert rows[0]["status_if_absent"] == "running"
+        assert "status_if_absent" not in rows[0]["props"]
+
+    async def test_write_batch_omits_status_if_absent_row_key_when_absent(
+        self,
+    ) -> None:
+        """No status_if_absent on the node => no row key added."""
+        from context_intelligence_server.neo4j_store import _write_batch
+
+        captured: list[dict[str, object]] = []
+
+        class _Tx:
+            async def run(self, statement: str, **kwargs: object) -> object:
+                captured.append({"statement": statement, "kwargs": kwargs})
+
+                class _R:
+                    async def consume(self) -> None:
+                        return None
+
+                return _R()
+
+        await _write_batch(
+            _Tx(),
+            {"s1": {"labels": ["Session"], "status": "completed"}},
+            {},
+            [],
+            "ws-1",
+        )
+        session_calls = [c for c in captured if "n:Session" in str(c["statement"])]
+        rows = session_calls[0]["kwargs"]["rows"]  # type: ignore[index]
+        assert "status_if_absent" not in rows[0]
+
+    async def test_upsert_node_buffer_merge_keeps_authoritative_status_stub_first(
+        self,
+    ) -> None:
+        """Buffering a stub-shaped upsert (status_if_absent) then an
+        end-shaped upsert (status) on ONE node_id leaves the buffer holding
+        BOTH keys — the coalesce at flush time is what resolves precedence,
+        not the buffer merge."""
+        store = _make_store()
+        await store.upsert_node("s1", {"status_if_absent": "running"})
+        await store.upsert_node("s1", {"status": "completed"})
+        result = await store.get_node("s1")
+        assert result is not None
+        assert result["status"] == "completed"
+        assert result["status_if_absent"] == "running"
+
+    async def test_upsert_node_buffer_merge_keeps_authoritative_status_end_first(
+        self,
+    ) -> None:
+        """Same as above, reverse call order — the buffer merge is
+        last-call-wins PER KEY, so order between the two distinct keys never
+        matters; both keys still coexist in the buffer either way."""
+        store = _make_store()
+        await store.upsert_node("s1", {"status": "completed"})
+        await store.upsert_node("s1", {"status_if_absent": "running"})
+        result = await store.get_node("s1")
+        assert result is not None
+        assert result["status"] == "completed"
+        assert result["status_if_absent"] == "running"
+
+
+# ---------------------------------------------------------------------------
 # Wide-query containment: every persisted read must be able to SEEK an index.
 #
 # PR #98 fixed get_node()'s label-free MATCH, which planned as an AllNodesScan

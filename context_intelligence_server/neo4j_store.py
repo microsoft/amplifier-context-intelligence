@@ -1312,7 +1312,8 @@ def _chunk_list(
 def _build_node_props(data: dict[str, Any], workspace: str) -> dict[str, Any]:
     """Assemble the sanitized props dict for a single node row.
 
-    ``labels``, ``created_by``, and ``working_dir`` are excluded from the returned dict:
+    ``labels``, ``created_by``, ``working_dir``, and ``status_if_absent`` are
+    excluded from the returned dict:
     - ``labels`` are applied separately via ``SET n:Label`` statements (not stored as props).
     - ``created_by`` travels ONLY as the ``$created_by`` query param (never a node property)
       so it cannot affect node identity or clobber the ``ON CREATE SET n.created_by`` stamp.
@@ -1320,11 +1321,18 @@ def _build_node_props(data: dict[str, Any], workspace: str) -> dict[str, Any]:
       MERGE can apply ``coalesce(n.working_dir, row.working_dir)`` instead of
       last-write-wins — an already-attributed session is never re-attributed,
       even by a concurrent writer or a replayed batch.
+    - ``status_if_absent`` is held out for the same reason and lifted onto the
+      Session row exactly like ``working_dir`` (see ``_write_batch``), so the
+      MERGE can ``coalesce(n.status, row.status_if_absent)`` instead of
+      overwriting a status a session's own authoritative writer already set.
+      This is applied on SESSION ROWS ONLY — a non-Session row carrying this
+      key simply drops it silently, since only Session nodes have a status
+      MERGE clause to coalesce against.
     """
     raw = {
         k: v
         for k, v in data.items()
-        if k not in ("labels", "created_by", "working_dir")
+        if k not in ("labels", "created_by", "working_dir", "status_if_absent")
     }
     _convert_temporal_props(raw)  # ISO str -> datetime, in place
     props = Neo4jGraphStore._sanitize_properties(raw)
@@ -1374,6 +1382,13 @@ async def _write_batch(
             working_dir_value = data.get("working_dir")
             if working_dir_value:
                 row["working_dir"] = working_dir_value
+            # status_if_absent rides the same way, for the same reason: kept
+            # out of row.props so the MERGE below can coalesce it against an
+            # existing status instead of blindly overwriting one already set
+            # by session:end (the sole authoritative writer of status).
+            status_if_absent_value = data.get("status_if_absent")
+            if status_if_absent_value:
+                row["status_if_absent"] = status_if_absent_value
             session_rows.append(row)
         else:
             other_rows.append(row)
@@ -1408,7 +1423,14 @@ async def _write_batch(
             # never clobber a value an earlier event (or a concurrent writer)
             # already set. Rows without a working_dir carry a null row key, so
             # this degrades to a no-op for them.
-            "SET n.working_dir = coalesce(n.working_dir, row.working_dir)",
+            "SET n.working_dir = coalesce(n.working_dir, row.working_dir) "
+            # Populate-if-missing for status, same rule, applied AFTER
+            # `SET n += row.props` above so an authoritative status carried in
+            # THIS SAME row (e.g. session:end's props.status = "completed")
+            # is already on `n` by the time this coalesce runs and is never
+            # overridden by a stub's status_if_absent. Rows without one carry
+            # a null row key, so this degrades to a no-op for them.
+            "SET n.status = coalesce(n.status, row.status_if_absent)",
             rows=session_rows,
             created_by=created_by,
         )

@@ -94,6 +94,44 @@ async def test_graph_state_upsert_node_merges():
     assert node["age"] == 30
 
 
+async def test_graph_state_status_if_absent_fills_when_missing():
+    """status_if_absent is applied when the node has no status yet."""
+    state = GraphState()
+    await state.upsert_node("n1", {"labels": ["Session"]})
+    await state.upsert_node("n1", {"status_if_absent": "running"})
+    node = await state.get_node("n1")
+    assert node is not None
+    assert node["status"] == "running"
+
+
+async def test_graph_state_status_if_absent_does_not_overwrite_existing_status():
+    """status_if_absent never clobbers a status the node already carries."""
+    state = GraphState()
+    await state.upsert_node("n1", {"labels": ["Session"], "status": "completed"})
+    await state.upsert_node("n1", {"status_if_absent": "running"})
+    node = await state.get_node("n1")
+    assert node is not None
+    assert node["status"] == "completed"
+
+
+async def test_graph_state_status_if_absent_never_stored_as_property():
+    """The raw status_if_absent key is never persisted on the node, either branch."""
+    state = GraphState()
+    await state.upsert_node(
+        "n1", {"labels": ["Session"], "status_if_absent": "running"}
+    )
+    node = await state.get_node("n1")
+    assert node is not None
+    assert "status_if_absent" not in node
+
+    state2 = GraphState()
+    await state2.upsert_node("n2", {"labels": ["Session"], "status": "completed"})
+    await state2.upsert_node("n2", {"status_if_absent": "running"})
+    node2 = await state2.get_node("n2")
+    assert node2 is not None
+    assert "status_if_absent" not in node2
+
+
 async def test_graph_state_upsert_edge_creates():
     """upsert_edge creates an edge retrievable via get_edge."""
     state = GraphState()
@@ -298,6 +336,83 @@ class TestHookStateService:
         node = await svc.graph.get_node("session-set")
         assert node is not None
         assert node["working_dir"] == "/original/path"
+
+    async def test_ensure_session_node_does_not_revert_completed_session(self):
+        """THE regression test: a cross-session stub write must never revert
+        a session's status from 'completed' back to 'running'.
+
+        This reproduces the reported bug: a child session's session:start
+        names its parent, or a delegation names its sub-session, and that
+        reference calls ensure_session_node against a DIFFERENT worker's
+        cold-cache HookStateService on a node that already reached
+        'completed' via its own session:end. The safety-net stub must not
+        clobber it.
+        """
+        svc = HookStateService()
+        # Seed a node already completed by its own session:end.
+        await svc.graph.upsert_node(
+            "parent-1",
+            {"labels": ["Session"], "status": "completed"},
+        )
+        # A DIFFERENT worker (cold _seen_sessions) stubs a cross-session
+        # reference to it (e.g. a child naming this session as its parent).
+        svc2 = HookStateService(graph_store=svc.graph)
+        await svc2.ensure_session_node("parent-1", {})
+        node = await svc.graph.get_node("parent-1")
+        assert node is not None
+        assert node["status"] == "completed"
+
+    async def test_ensure_session_node_sets_running_when_status_absent(self):
+        """A node existing with NO status yet (a bare :Node placeholder) gets
+        'running' filled in by the safety-net stub."""
+        svc = HookStateService()
+        await svc.graph.upsert_node(
+            "session-bare",
+            {"labels": ["Session"], "session_id": "session-bare"},
+        )
+        svc2 = HookStateService(graph_store=svc.graph)
+        await svc2.ensure_session_node("session-bare", {})
+        node = await svc.graph.get_node("session-bare")
+        assert node is not None
+        assert node["status"] == "running"
+
+    async def test_ensure_session_node_creates_running_on_new_node(self):
+        """The create branch (node absent from both cache and graph) still
+        yields status == 'running' — no over-correction into leaving status
+        unset until session:end."""
+        svc = HookStateService()
+        await svc.ensure_session_node(
+            "session-new", {"started_at": "2024-01-01T00:00:00"}
+        )
+        node = await svc.graph.get_node("session-new")
+        assert node is not None
+        assert node["status"] == "running"
+
+    async def test_ensure_session_node_never_persists_status_if_absent_property(
+        self,
+    ):
+        """The raw status_if_absent key must never appear on the node, in
+        either the existing-node branch or the create branch."""
+        svc = HookStateService()
+        # Existing-node branch.
+        await svc.graph.upsert_node(
+            "session-existing",
+            {"labels": ["Session"], "session_id": "session-existing"},
+        )
+        svc2 = HookStateService(graph_store=svc.graph)
+        await svc2.ensure_session_node("session-existing", {})
+        existing_node = await svc.graph.get_node("session-existing")
+        assert existing_node is not None
+        assert "status_if_absent" not in existing_node
+
+        # Create branch.
+        svc3 = HookStateService()
+        await svc3.ensure_session_node(
+            "session-brand-new", {"started_at": "2024-01-01T00:00:00"}
+        )
+        new_node = await svc3.graph.get_node("session-brand-new")
+        assert new_node is not None
+        assert "status_if_absent" not in new_node
 
     async def test_ensure_session_node_is_idempotent(self):
         """ensure_session_node is a no-op when session_id was already processed."""
