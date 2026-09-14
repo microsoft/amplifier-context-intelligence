@@ -141,8 +141,8 @@ docker run -d --name neo4j-ci \
 cp server-config.example.yaml server-config.yaml
 # Edit server-config.yaml with your Neo4j connection details
 
-# 3. Start
-uvicorn context_intelligence_server.main:app --reload
+# 3. Start  (asgi_app, NOT app -- `app` has no auth middleware)
+uvicorn context_intelligence_server.main:asgi_app --reload
 ```
 
 Or use Docker Compose to run everything together:
