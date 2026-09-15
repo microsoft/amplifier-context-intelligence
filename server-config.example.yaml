@@ -155,6 +155,32 @@ log_path:  ~/amplifier-context-intelligence-server-data-store/logs/server.jsonl
 # See docs/operational-hardening.md.
 queues_path: /data/queues          # Durable per-session append-logs; mirrors blob_path
 
+# -----------------------------------------------------------------------------
+# Scoped access control and native recovery (both opt-in)
+# -----------------------------------------------------------------------------
+# `compatibility` preserves the historical data-key behaviour. In `scoped`
+# mode every authenticated contributor needs a grant; writes and reads are
+# deliberately separate capabilities.
+access_control_mode: compatibility
+# contributor_grants:
+#   owner:
+#     all_workspaces: true
+#     capabilities: [live:write, recovery:write, data:read]
+#   contributor-a:
+#     workspaces: [team-shared]
+#     capabilities: [live:write, recovery:write]
+#
+# Recovery accepts only native Context Intelligence event stream records. It is
+# disabled by default and uses a separate durable queue. The guard lease must
+# be an operator-written JSON object: {"allow": true, "expires_at": <epoch>}.
+recovery:
+  enabled: false
+  guard_lease_path: /data/recovery-guard-lease.json
+  receipt_store_path: /data/recovery-receipts.sqlite3
+  claims_store_path: /data/session-claims.sqlite3
+  queues_path: /data/recovery-queues
+  retry_after_seconds: 2
+
 # write_concurrency: max concurrent Neo4j write flushes across all session
 # drainers. Two jobs: starvation guard, AND the cap on peak Neo4j transaction
 # memory during a backlog drain -- exactly what a restart-with-backlog creates.

@@ -888,7 +888,8 @@ class TestPhase4RouteGuard:
 
     Iterates EVERY APIRoute in the app and asserts that any route whose
     methods include a mutating verb (POST/PUT/DELETE/PATCH) is covered by:
-      - require_write or require_read in route.dependencies, OR
+      - require_write, require_recovery_write, or require_read in
+        route.dependencies, OR
       - require_admin in route.dependencies (admin-router routes), OR
       - an entry in _EXEMPT_MUTATING (tiny, commented, justified).
 
@@ -918,14 +919,18 @@ class TestPhase4RouteGuard:
         For each mutating route:
           - /admin/* routes are covered by require_admin (router-level dep).
           - _EXEMPT_MUTATING entries are explicitly excepted (rationale above).
-          - All others: require_write or require_read in route.dependencies.
+          - All others: a route-appropriate capability dependency.
 
         FAILS before the queues.py fix (purge/replay are ungated).  Any future
         unguarded mutating route trips this test with a descriptive message.
         """
         from fastapi.routing import APIRoute  # noqa: PLC0415
 
-        from context_intelligence_server.authz import require_read, require_write  # noqa: PLC0415
+        from context_intelligence_server.authz import (  # noqa: PLC0415
+            require_read,
+            require_recovery_write,
+            require_write,
+        )
         from context_intelligence_server.main import app  # noqa: PLC0415
         from context_intelligence_server.routers.admin import require_admin  # noqa: PLC0415
 
@@ -950,13 +955,17 @@ class TestPhase4RouteGuard:
                 if require_admin in dep_callables:
                     continue
 
-                # Capability-gated: require_write or require_read on this route
-                if require_write in dep_callables or require_read in dep_callables:
+                # Capability-gated: live, recovery, or read access as appropriate.
+                if (
+                    require_write in dep_callables
+                    or require_recovery_write in dep_callables
+                    or require_read in dep_callables
+                ):
                     continue
 
                 unguarded.append(
                     f"  {method.upper()} {route.path}"
-                    f"  — no require_write / require_read / require_admin"
+                    f"  — no capability dependency / require_admin"
                 )
 
         assert not unguarded, (

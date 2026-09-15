@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import (
     BaseSettings,
@@ -297,6 +297,44 @@ class Neo4jConfig(BaseModel):
         return self
 
 
+class ContributorGrant(BaseModel):
+    """Scoped capabilities granted to one authenticated contributor."""
+
+    workspaces: list[str] | None = None
+    all_workspaces: bool = False
+    capabilities: set[Literal["live:write", "recovery:write", "data:read"]]
+
+    @model_validator(mode="after")
+    def _validate_workspace_scope(self) -> "ContributorGrant":
+        if self.all_workspaces == (self.workspaces is not None):
+            raise ValueError(
+                "contributor grant must specify exactly one of all_workspaces or workspaces"
+            )
+        if self.workspaces is not None and (
+            not self.workspaces or any(not value.strip() for value in self.workspaces)
+        ):
+            raise ValueError("contributor grant workspaces must be non-empty strings")
+        return self
+
+
+class RecoveryConfig(BaseModel):
+    """Opt-in native recovery ingress configuration."""
+
+    enabled: bool = False
+    guard_lease_path: str | None = None
+    receipt_store_path: str | None = None
+    claims_store_path: str | None = None
+    queues_path: str | None = None
+    retry_after_seconds: int = 2
+
+    @field_validator("retry_after_seconds")
+    @classmethod
+    def _positive_retry_after(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("recovery.retry_after_seconds must be > 0")
+        return value
+
+
 class Settings(BaseSettings):
     """Application settings for the Context Intelligence Server."""
 
@@ -455,6 +493,50 @@ class Settings(BaseSettings):
     # (In auth_mode=entra it has no effect: EntraResolver.auth_enabled is always
     # True, so the fail-open branch can never fire regardless of this flag.)
     allow_unauthenticated: bool = False
+
+    # Compatibility preserves the historical write-implies-read behaviour.
+    # Scoped deployments must explicitly grant each capability per contributor.
+    access_control_mode: Literal["compatibility", "scoped"] = "compatibility"
+    contributor_grants: dict[str, ContributorGrant] = Field(default_factory=dict)
+    recovery: RecoveryConfig = Field(default_factory=RecoveryConfig)
+
+    @field_validator("contributor_grants")
+    @classmethod
+    def _validate_contributor_grants(
+        cls, grants: dict[str, ContributorGrant]
+    ) -> dict[str, ContributorGrant]:
+        if any(not contributor_id.strip() for contributor_id in grants):
+            raise ValueError("contributor grant ids must be non-empty strings")
+        return grants
+
+    @model_validator(mode="after")
+    def _validate_scoped_access_control(self) -> "Settings":
+        if self.access_control_mode == "scoped" and not self.contributor_grants:
+            raise ValueError(
+                "contributor_grants must not be empty when access_control_mode='scoped'"
+            )
+        return self
+
+    def recovery_paths(self) -> tuple[Path, Path, Path, Path]:
+        """Resolve recovery storage beside the configured writable queue root.
+
+        Defaults deliberately derive from ``queues_path`` rather than a
+        hard-coded container-only location, so scoped tests and host installs
+        do not create `/data` as a side effect of building the ASGI app.
+        """
+        root = Path(self.queues_path)
+        base = root.parent
+        recovery_queue = Path(self.recovery.queues_path or base / "recovery-queues")
+        receipt_store = Path(
+            self.recovery.receipt_store_path or base / "recovery-receipts.sqlite3"
+        )
+        claims_store = Path(
+            self.recovery.claims_store_path or base / "session-claims.sqlite3"
+        )
+        lease = Path(
+            self.recovery.guard_lease_path or base / "recovery-guard-lease.json"
+        )
+        return recovery_queue, receipt_store, claims_store, lease
 
     # azure_client_id / azure_tenant_id: the App Registration coordinates.
     # Both are required when auth_mode="entra".  Empty / whitespace-only
