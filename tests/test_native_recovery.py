@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import time
 from types import SimpleNamespace
@@ -22,6 +23,18 @@ from context_intelligence_server.authz import (
 from context_intelligence_server.config import Settings
 from context_intelligence_server.recovery import RecoveryReceiptStore, lease_allows
 from context_intelligence_server.session_claims import SessionClaimStore
+
+
+def _write_lease(path: object, lease_id: str = "lease-1") -> None:
+    path.write_text(  # type: ignore[union-attr]
+        json.dumps(
+            {
+                "allow": True,
+                "expires_at": time.time() + 10,
+                "lease_id": lease_id,
+            }
+        )
+    )
 
 
 def _request(contributor: str, grant: object) -> Request:
@@ -148,6 +161,47 @@ async def test_session_claim_is_durable_and_non_disclosing(tmp_path: object) -> 
     assert await store.claim("s", "alice", "one")
     assert not await store.claim("s", "bob", "one")
     assert not await store.claim("s", "alice", "two")
+    assert (
+        await store.reserve_recovery("s", "alice", "one", "reservation") == "committed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_reservation_blocks_live_claim_until_exactly_released(
+    tmp_path: object,
+) -> None:
+    store = SessionClaimStore(tmp_path / "claims.sqlite3")  # type: ignore[operator]
+    assert (
+        await store.reserve_recovery("s", "alice", "one", "reservation") == "reserved"
+    )
+    assert not await store.claim("s", "alice", "one")
+    assert await store.get_workspace("s") is None
+    await store.release_recovery("s", "alice", "one", "wrong-reservation")
+    assert not await store.claim("s", "alice", "one")
+    await store.release_recovery("s", "alice", "one", "reservation")
+    assert await store.claim("s", "alice", "one")
+
+
+@pytest.mark.asyncio
+async def test_existing_claim_database_migrates_to_committed_claims(
+    tmp_path: object,
+) -> None:
+    path = tmp_path / "claims.sqlite3"  # type: ignore[operator]
+    with sqlite3.connect(path) as db:
+        db.execute(
+            """CREATE TABLE session_claims (
+                session_id TEXT PRIMARY KEY, contributor_id TEXT NOT NULL,
+                workspace TEXT NOT NULL
+            )"""
+        )
+        db.execute("INSERT INTO session_claims VALUES ('s', 'alice', 'one')")
+
+    store = SessionClaimStore(path)
+    assert await store.claim("s", "alice", "one")
+    with sqlite3.connect(path) as db:
+        assert db.execute(
+            "SELECT reservation_token FROM session_claims WHERE session_id='s'"
+        ).fetchone() == (None,)
 
 
 @pytest.mark.asyncio
@@ -176,6 +230,8 @@ async def test_receipts_are_idempotent_conflict_safe_and_single_pending(
     tmp_path: object,
 ) -> None:
     store = RecoveryReceiptStore(str(tmp_path / "receipts.sqlite3"))  # type: ignore[operator]
+    lease = tmp_path / "lease.json"  # type: ignore[operator]
+    _write_lease(lease)
     origin = {
         "session_id": "s",
         "source_stream_sha256": "a" * 64,
@@ -183,11 +239,14 @@ async def test_receipts_are_idempotent_conflict_safe_and_single_pending(
         "ordinal": 0,
     }
     payload = {"event": "session:start", "data": {"session_id": "s"}}
-    assert await store.admit(origin, "alice", "one", payload) == "accepted"
-    assert await store.admit(origin, "alice", "one", payload) == "duplicate"
-    assert await store.admit(origin, "alice", "one", {"event": "changed"}) == "conflict"
+    assert await store.admit(origin, "alice", "one", payload, lease) == "accepted"
+    assert await store.admit(origin, "alice", "one", payload, lease) == "duplicate"
+    assert (
+        await store.admit(origin, "alice", "one", {"event": "changed"}, lease)
+        == "conflict"
+    )
     second = {**origin, "ordinal": 1, "source_line_sha256": "c" * 64}
-    assert await store.admit(second, "alice", "one", payload) == "busy"
+    assert await store.admit(second, "alice", "one", payload, lease) == "busy"
     await store.mark(origin, "written")
     await store.mark(origin, "enqueued")
     assert (await store.status()) == {"written": 1}
@@ -196,7 +255,12 @@ async def test_receipts_are_idempotent_conflict_safe_and_single_pending(
             "SELECT state, payload FROM recovery_receipts"
         ).fetchone()
     assert (state, stored_payload) == ("written", "")
-    assert await store.admit(second, "alice", "one", payload) == "accepted"
+    _write_lease(lease, "lease-2")
+    assert (
+        await store.admit(origin, "alice", "one", {"event": "changed"}, lease)
+        == "conflict"
+    )
+    assert await store.admit(second, "alice", "one", payload, lease) == "accepted"
 
 
 @pytest.mark.asyncio
@@ -204,6 +268,8 @@ async def test_identical_line_hash_is_valid_at_a_distinct_ordinal(
     tmp_path: object,
 ) -> None:
     store = RecoveryReceiptStore(str(tmp_path / "receipts.sqlite3"))  # type: ignore[operator]
+    lease = tmp_path / "lease.json"  # type: ignore[operator]
+    _write_lease(lease)
     origin = {
         "session_id": "s",
         "source_stream_sha256": "a" * 64,
@@ -211,10 +277,44 @@ async def test_identical_line_hash_is_valid_at_a_distinct_ordinal(
         "ordinal": 0,
     }
     payload = {"event": "session:start", "data": {"session_id": "s"}}
-    assert await store.admit(origin, "alice", "one", payload) == "accepted"
+    assert await store.admit(origin, "alice", "one", payload, lease) == "accepted"
     await store.mark(origin, "written")
+    _write_lease(lease, "lease-2")
     assert (
-        await store.admit({**origin, "ordinal": 1}, "alice", "one", payload)
+        await store.admit({**origin, "ordinal": 1}, "alice", "one", payload, lease)
+        == "accepted"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lease_consumption_is_durable_across_store_restart(
+    tmp_path: object,
+) -> None:
+    path = tmp_path / "receipts.sqlite3"  # type: ignore[operator]
+    lease = tmp_path / "lease.json"  # type: ignore[operator]
+    origin = {
+        "session_id": "s",
+        "source_stream_sha256": "a" * 64,
+        "source_line_sha256": "b" * 64,
+        "ordinal": 0,
+    }
+    payload = {"event": "session:start", "data": {"session_id": "s"}}
+    _write_lease(lease)
+    store = RecoveryReceiptStore(path)
+    assert await store.admit(origin, "alice", "one", payload, lease) == "accepted"
+    await store.mark(origin, "written")
+
+    with sqlite3.connect(path) as db:
+        assert db.execute(
+            "SELECT lease_id FROM recovery_lease_consumptions"
+        ).fetchall() == [("lease-1",)]
+
+    restarted_store = RecoveryReceiptStore(path)
+    second = {**origin, "ordinal": 1, "source_line_sha256": "c" * 64}
+    assert await restarted_store.admit(second, "alice", "one", payload, lease) == "busy"
+    _write_lease(lease, "lease-2")
+    assert (
+        await restarted_store.admit(second, "alice", "one", payload, lease)
         == "accepted"
     )
 
@@ -270,6 +370,8 @@ async def test_outbox_reconciliation_appends_once_after_admission(
         "ordinal": 0,
     }
     receipts = RecoveryReceiptStore(tmp_path / "receipts.sqlite3")  # type: ignore[operator]
+    lease = tmp_path / "lease.json"  # type: ignore[operator]
+    _write_lease(lease)
     assert (
         await receipts.admit(
             origin,
@@ -280,6 +382,7 @@ async def test_outbox_reconciliation_appends_once_after_admission(
                 "workspace": "one",
                 "data": {"session_id": "s", "timestamp": "2026-01-01T00:00:00"},
             },
+            lease,
         )
         == "accepted"
     )
@@ -300,14 +403,89 @@ async def test_outbox_reconciliation_appends_once_after_admission(
 
 
 @pytest.mark.asyncio
-async def test_recovery_route_rejects_missing_lease_then_accepts_and_deduplicates(
+async def test_reconciliation_finalizes_crash_shaped_recovery_reservation(
+    tmp_path: object,
+) -> None:
+    from context_intelligence_server.main import (
+        _reconcile_native_recovery_outbox,
+        _recovery_reservation_token,
+    )
+    from context_intelligence_server.queue_manager import QueueManager
+
+    origin = {
+        "session_id": "s",
+        "source_stream_sha256": "a" * 64,
+        "source_line_sha256": "b" * 64,
+        "ordinal": 0,
+    }
+    receipt = {
+        "origin": origin,
+        "actor": "alice",
+        "workspace": "one",
+        "payload": {
+            "event": "session:start",
+            "workspace": "one",
+            "data": {"session_id": "s", "timestamp": "2026-01-01T00:00:00"},
+        },
+    }
+    claims = SessionClaimStore(tmp_path / "claims.sqlite3")  # type: ignore[operator]
+    assert (
+        await claims.reserve_recovery(
+            "s", "alice", "one", _recovery_reservation_token(origin)
+        )
+        == "reserved"
+    )
+    receipts = RecoveryReceiptStore(tmp_path / "receipts.sqlite3")  # type: ignore[operator]
+    lease = tmp_path / "lease.json"  # type: ignore[operator]
+    _write_lease(lease)
+    assert (
+        await receipts.admit(origin, "alice", "one", receipt["payload"], lease)
+        == "accepted"
+    )
+    registry = SimpleNamespace(
+        queue_manager=QueueManager(tmp_path / "queue"),  # type: ignore[operator]
+        get_or_create=MagicMock(),
+    )
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            access_control_mode="scoped",
+            session_claims=claims,
+            recovery_receipts=receipts,
+            recovery_registry=registry,
+        )
+    )
+
+    await _reconcile_native_recovery_outbox(cast(FastAPI, app))
+
+    with sqlite3.connect(claims.path) as db:
+        assert db.execute(
+            "SELECT reservation_token FROM session_claims WHERE session_id='s'"
+        ).fetchone() == (None,)
+    assert await claims.get_workspace("s") == "one"
+    batch = await registry.queue_manager.read_batch("s", max_items=10)
+    assert len(batch.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_route_rolls_back_rejected_reservations_and_consumes_each_lease(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from context_intelligence_server.main import app, create_asgi_app
 
     lease = tmp_path / "lease.json"  # type: ignore[operator]
     settings = Settings(
-        allow_unauthenticated=True,
+        api_key="recovery-test-key",
+        api_keys_store_path=str(tmp_path / "api-keys.json"),  # type: ignore[operator]
+        access_control_mode="scoped",
+        contributor_grants=cast(
+            Any,
+            {
+                "owner": {
+                    "workspaces": ["one"],
+                    "capabilities": ["recovery:write"],
+                }
+            },
+        ),
         queues_path=str(tmp_path / "live"),  # type: ignore[operator]
         recovery={
             "enabled": True,
@@ -316,7 +494,7 @@ async def test_recovery_route_rejects_missing_lease_then_accepts_and_deduplicate
             "queues_path": str(tmp_path / "recovery-queue"),  # type: ignore[operator]
         },
     )
-    create_asgi_app(settings=settings)
+    asgi_app = create_asgi_app(settings=settings)
     monkeypatch.setattr(app.state.recovery_registry, "get_or_create", MagicMock())
     body = {
         "event": "session:start",
@@ -330,22 +508,66 @@ async def test_recovery_route_rejects_missing_lease_then_accepts_and_deduplicate
         },
     }
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+        transport=httpx.ASGITransport(app=asgi_app),
+        base_url="http://test",
+        headers={"Authorization": "Bearer recovery-test-key"},
     ) as client:
         assert (await client.post("/recovery/events", json=body)).status_code == 429
+        claims = app.state.session_claims
+        assert claims is not None
+        assert await claims.get_workspace("s") is None
         lease.write_text(  # type: ignore[union-attr]
             '{"allow": true, "expires_at": %s}' % (time.time() + 10)
         )
+        assert (await client.post("/recovery/events", json=body)).status_code == 429
+        assert await claims.get_workspace("s") is None
+        assert await claims.claim("s", "live-writer", "one")
+        _write_lease(lease, "conflict-lease")
+        assert (await client.post("/recovery/events", json=body)).status_code == 409
+        with sqlite3.connect(app.state.recovery_receipts.path) as db:
+            assert db.execute(
+                "SELECT count(*) FROM recovery_lease_consumptions"
+            ).fetchone() == (0,)
+        body = {
+            **body,
+            "data": {
+                **body["data"],
+                "session_id": "recovery-session",
+            },
+            "origin": {
+                **body["origin"],
+                "session_id": "recovery-session",
+            },
+        }
+        _write_lease(lease)
         accepted = await client.post("/recovery/events", json=body)
         assert accepted.status_code == 202
         assert accepted.json()["status"] == "queued"
+        assert await claims.get_workspace("recovery-session") == "one"
+        assert not await claims.claim("recovery-session", "live-writer", "one")
+        _write_lease(lease, "lease-2")
         duplicate = await client.post("/recovery/events", json=body)
         assert duplicate.status_code == 202
         assert duplicate.json()["status"] == "duplicate"
+        await app.state.recovery_receipts.mark(body["origin"], "written")
+        second = {
+            **body,
+            "origin": {
+                **body["origin"],
+                "ordinal": 1,
+                "source_line_sha256": "c" * 64,
+            },
+        }
+        _write_lease(lease, "lease-1")
+        assert (await client.post("/recovery/events", json=second)).status_code == 429
+        _write_lease(lease, "lease-2")
+        second_accepted = await client.post("/recovery/events", json=second)
+        assert second_accepted.status_code == 202
+        assert second_accepted.json()["status"] == "queued"
     batch = await app.state.recovery_registry.queue_manager.read_batch(
-        "s", max_items=10
+        "recovery-session", max_items=10
     )
-    assert len(batch.records) == 1
+    assert len(batch.records) == 2
 
 
 @pytest.mark.asyncio
@@ -412,5 +634,9 @@ def test_lease_requires_explicit_unexpired_allow(tmp_path: object) -> None:
     assert not lease_allows(str(path))
     path.write_text('{"allow": true, "expires_at": 0}')  # type: ignore[union-attr]
     assert not lease_allows(str(path))
-    path.write_text('{"allow": true, "expires_at": %s}' % (time.time() + 10))  # type: ignore[union-attr]
+    path.write_text(  # type: ignore[union-attr]
+        '{"allow": true, "expires_at": %s}' % (time.time() + 10)
+    )
+    assert not lease_allows(str(path))
+    _write_lease(path)
     assert lease_allows(str(path))

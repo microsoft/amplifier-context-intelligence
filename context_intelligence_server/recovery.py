@@ -81,6 +81,11 @@ class RecoveryReceiptStore:
                 "CREATE INDEX IF NOT EXISTS recovery_receipts_state_idx "
                 "ON recovery_receipts(state)"
             )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS recovery_lease_consumptions (
+                    lease_id TEXT PRIMARY KEY
+                )"""
+            )
             # The preliminary state name meant "the record was admitted and
             # should be in the spool"; return it to the outbox so a spool
             # scan can safely establish whether it must be appended.
@@ -103,6 +108,7 @@ class RecoveryReceiptStore:
         actor: str,
         workspace: str,
         payload: dict[str, Any],
+        lease_path: str | Path,
     ) -> ReceiptResult:
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(encoded.encode()).hexdigest()
@@ -131,6 +137,16 @@ class RecoveryReceiptStore:
                         "WHERE state IN ('pending_enqueue','enqueued','committed_pending') "
                         "LIMIT 1"
                     ).fetchone():
+                        return "busy"
+                    lease_id = _allowed_lease_id(lease_path)
+                    if lease_id is None:
+                        return "busy"
+                    try:
+                        db.execute(
+                            "INSERT INTO recovery_lease_consumptions(lease_id) VALUES (?)",
+                            (lease_id,),
+                        )
+                    except sqlite3.IntegrityError:
                         return "busy"
                     db.execute(
                         "INSERT INTO recovery_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -238,15 +254,24 @@ class RecoveryReceiptStore:
         return await asyncio.to_thread(_retry)
 
 
-def lease_allows(path: str | Path) -> bool:
-    """A lease is valid only when explicitly allowed and unexpired."""
+def _allowed_lease_id(path: str | Path) -> str | None:
+    """Return the allowed, unexpired lease's opaque identifier, if any."""
     try:
         lease = json.loads(Path(path).read_text("utf-8"))
-        return (
+        if (
             isinstance(lease, dict)
             and lease.get("allow") is True
             and isinstance(lease.get("expires_at"), (int, float))
             and lease["expires_at"] > time.time()
-        )
+            and isinstance(lease.get("lease_id"), str)
+            and lease["lease_id"]
+        ):
+            return lease["lease_id"]
     except (OSError, ValueError, TypeError):
-        return False
+        pass
+    return None
+
+
+def lease_allows(path: str | Path) -> bool:
+    """A lease is valid only when explicitly allowed, identified, and unexpired."""
+    return _allowed_lease_id(path) is not None

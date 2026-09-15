@@ -461,6 +461,9 @@ async def _enqueue_native_recovery_receipt(
     recovery_registry = getattr(app.state, "recovery_registry", None)
     if receipts is None or recovery_registry is None:
         return
+    if not await _finalize_native_recovery_claim(app, receipt):
+        logger.error("native_recovery_claim_unresolved; receipt remains in outbox")
+        return
     origin = receipt["origin"]
     payload = {
         **receipt["payload"],
@@ -488,6 +491,9 @@ async def _reconcile_native_recovery_outbox_unlocked(app: FastAPI) -> None:
     for receipt in await receipts.pending_outbox():
         origin = receipt["origin"]
         state = receipt["state"]
+        if not await _finalize_native_recovery_claim(app, receipt):
+            logger.error("native_recovery_claim_unresolved; receipt remains in outbox")
+            continue
         if state == "committed_pending":
             await receipts.mark(origin, "written")
             continue
@@ -521,21 +527,86 @@ async def _reconcile_native_recovery_outbox(app: FastAPI) -> None:
         await _reconcile_native_recovery_outbox_unlocked(app)
 
 
-async def _admit_native_recovery(app: FastAPI, receipt: dict[str, Any]) -> str:
+async def _admit_native_recovery(
+    app: FastAPI,
+    receipt: dict[str, Any],
+    claims: SessionClaimStore | None = None,
+    release_reservation: bool = False,
+) -> str:
     """Atomically admit and enqueue a current request without an outbox scan."""
     lock = getattr(app.state, "recovery_outbox_lock", None)
     if lock is None:
-        return await _admit_native_recovery_unlocked(app, receipt)
+        return await _admit_native_recovery_unlocked(
+            app, receipt, claims, release_reservation
+        )
     async with lock:
-        return await _admit_native_recovery_unlocked(app, receipt)
+        return await _admit_native_recovery_unlocked(
+            app, receipt, claims, release_reservation
+        )
 
 
-async def _admit_native_recovery_unlocked(app: FastAPI, receipt: dict[str, Any]) -> str:
+def _recovery_reservation_token(origin: dict[str, Any]) -> str:
+    """Derive a stable opaque reservation token from an immutable recovery origin."""
+    encoded = json.dumps(origin, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(b"recovery-reservation:" + encoded).hexdigest()
+
+
+async def _finalize_native_recovery_claim(
+    app: FastAPI,
+    receipt: dict[str, Any],
+    claims: SessionClaimStore | None = None,
+) -> bool:
+    """Commit a matching scoped recovery reservation before any spool append."""
+    if getattr(app.state, "access_control_mode", "compatibility") != "scoped":
+        return True
+    store = claims or await _session_claim_store(app)
+    origin = receipt["origin"]
+    return await store.finalize_recovery(
+        origin["session_id"],
+        receipt["actor"],
+        receipt["workspace"],
+        _recovery_reservation_token(origin),
+    )
+
+
+async def _admit_native_recovery_unlocked(
+    app: FastAPI,
+    receipt: dict[str, Any],
+    claims: SessionClaimStore | None,
+    release_reservation: bool,
+) -> str:
     """Admit and enqueue while the recovery outbox lock is held."""
     receipts = app.state.recovery_receipts
-    admitted = await receipts.admit(
-        receipt["origin"], receipt["actor"], receipt["workspace"], receipt["payload"]
-    )
+    try:
+        admitted = await receipts.admit(
+            receipt["origin"],
+            receipt["actor"],
+            receipt["workspace"],
+            receipt["payload"],
+            app.state.recovery_lease_path,
+        )
+    except Exception:
+        if release_reservation and claims is not None:
+            origin = receipt["origin"]
+            await claims.release_recovery(
+                origin["session_id"],
+                receipt["actor"],
+                receipt["workspace"],
+                _recovery_reservation_token(origin),
+            )
+        raise
+    if admitted in ("busy", "conflict"):
+        if release_reservation and claims is not None:
+            origin = receipt["origin"]
+            await claims.release_recovery(
+                origin["session_id"],
+                receipt["actor"],
+                receipt["workspace"],
+                _recovery_reservation_token(origin),
+            )
+        return admitted
+    if not await _finalize_native_recovery_claim(app, receipt, claims):
+        raise RuntimeError("matching recovery claim could not be finalized")
     if admitted == "accepted":
         await _enqueue_native_recovery_receipt(app, receipt)
     elif admitted == "duplicate":
@@ -1492,12 +1563,6 @@ async def post_recovery_events(
             status_code=429, detail="Recovery unavailable", headers={"Retry-After": "2"}
         )
     config = http_request.app.state.recovery_config
-    if not lease_allows(http_request.app.state.recovery_lease_path):
-        raise HTTPException(
-            status_code=429,
-            detail="Recovery unavailable",
-            headers={"Retry-After": str(config.retry_after_seconds)},
-        )
     contributor_id = http_request.scope.get("state", {}).get("contributor_id")
     require_workspace_access(http_request, request.workspace, "recovery:write")
     session_id = request.data.get("session_id")
@@ -1508,16 +1573,25 @@ async def post_recovery_events(
             status_code=400, detail="Recovery session identity is invalid"
         )
     _validate_data_timestamp(request.data)
-    if getattr(
-        http_request.app.state, "access_control_mode", "compatibility"
-    ) == "scoped" and (
-        not contributor_id
-        or not await (await _session_claim_store(http_request.app)).claim(
-            session_id, contributor_id, request.workspace
-        )
-    ):
-        raise HTTPException(status_code=409, detail="Session conflict")
     origin = request.origin.model_dump()
+    claims: SessionClaimStore | None = None
+    reservation_created = False
+    if (
+        getattr(http_request.app.state, "access_control_mode", "compatibility")
+        == "scoped"
+    ):
+        if not contributor_id:
+            raise HTTPException(status_code=409, detail="Session conflict")
+        claims = await _session_claim_store(http_request.app)
+        reservation = await claims.reserve_recovery(
+            session_id,
+            contributor_id,
+            request.workspace,
+            _recovery_reservation_token(origin),
+        )
+        if reservation == "conflict":
+            raise HTTPException(status_code=409, detail="Session conflict")
+        reservation_created = reservation == "reserved"
     payload = request.model_dump(exclude={"origin"})
     receipt = {
         "origin": origin,
@@ -1525,7 +1599,9 @@ async def post_recovery_events(
         "workspace": request.workspace,
         "payload": payload,
     }
-    admitted = await _admit_native_recovery(http_request.app, receipt)
+    admitted = await _admit_native_recovery(
+        http_request.app, receipt, claims, reservation_created
+    )
     if admitted == "conflict":
         raise HTTPException(status_code=409, detail="Recovery conflict")
     if admitted == "busy":

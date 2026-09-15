@@ -26,6 +26,13 @@ returns `202` with status `duplicate`; a conflicting origin or ordinal returns
 or a missing, malformed, expired, or denying lease returns `429` with
 `Retry-After`.
 
+The operator lease is an object with `allow: true`, a future epoch
+`expires_at`, and a nonempty opaque `lease_id`. Issue a fresh unique
+`lease_id` for every one-record admission. The server consumes that ID
+durably with the receipt, so reusing it returns the same non-disclosing `429`
+outcome even after the original record has been written or the server has
+restarted. Leases without `lease_id` are denied.
+
 In `access_control_mode: scoped`, recovery requires the contributor's
 `recovery:write` capability and workspace grant. Session ownership is claimed
 atomically by contributor and workspace; a conflict is returned as a
