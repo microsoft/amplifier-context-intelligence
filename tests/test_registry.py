@@ -2400,11 +2400,12 @@ class TestParseLineWorkingDir:
                 "data": {"session_id": "s1"},
             }
         ).encode("utf-8")
-        event, workspace, working_dir, data = SessionRegistry._parse_line(raw)
+        event, workspace, working_dir, data, event_identity = SessionRegistry._parse_line(raw)
         assert event == "tool:pre"
         assert workspace == "-ws"
         assert working_dir == "/home/user/project"
         assert data == {"session_id": "s1"}
+        assert event_identity is None
 
     def test_parse_line_working_dir_absent_is_none(self) -> None:
         """A line with no working_dir yields None, not "" — absent != blank."""
@@ -2413,7 +2414,7 @@ class TestParseLineWorkingDir:
         raw = json.dumps(
             {"event": "tool:pre", "workspace": "-ws", "data": {"session_id": "s1"}}
         ).encode("utf-8")
-        _event, _ws, working_dir, _data = SessionRegistry._parse_line(raw)
+        _event, _ws, working_dir, _data, _identity = SessionRegistry._parse_line(raw)
         assert working_dir is None
 
     def test_parse_line_working_dir_empty_string_is_none(self) -> None:
@@ -2429,7 +2430,7 @@ class TestParseLineWorkingDir:
                 "data": {"session_id": "s1"},
             }
         ).encode("utf-8")
-        _event, _ws, working_dir, _data = SessionRegistry._parse_line(raw)
+        _event, _ws, working_dir, _data, _identity = SessionRegistry._parse_line(raw)
         assert working_dir is None
 
 
