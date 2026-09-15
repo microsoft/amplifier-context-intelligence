@@ -172,7 +172,10 @@ access_control_mode: compatibility
 #
 # Recovery accepts only native Context Intelligence event stream records. It is
 # disabled by default and uses a separate durable queue. The guard lease must
-# be an operator-written JSON object: {"allow": true, "expires_at": <epoch>}.
+# be an operator-written JSON object:
+# {"allow": true, "expires_at": <epoch>, "lease_id": "<fresh unique opaque id>"}.
+# Write a fresh unique lease_id for every one-record admission; a lease_id is
+# consumed durably and cannot admit another record.
 recovery:
   enabled: false
   guard_lease_path: /data/recovery-guard-lease.json
