@@ -53,6 +53,33 @@ _AMBIGUOUS_SESSION_DETAIL = (
     "happen and needs to be looked into before it can be resolved"
 )
 
+#: Machine-readable code for "this server looked, and the session is not here".
+#:
+#: A bare 404 cannot carry that meaning. Starlette/FastAPI answer an unmatched
+#: route with ``{"detail": "Not Found"}``, and any proxy or gateway in front of
+#: the server can answer 404 for reasons of its own -- a request that never
+#: reached this handler looks identical to one that did. A caller cannot tell
+#: those apart, so it must not infer absence from the status code.
+#:
+#: Callers that need to attest absence (the delete flow reporting a server
+#: "clean") MUST require this code and treat every other 404 as unverified.
+#: The code is a stable API contract: do not rename it.
+SESSION_NOT_FOUND_CODE = "session_not_found"
+
+
+def _session_not_found(session_id: str) -> HTTPException:
+    """404 that says *this server looked and it is not here* -- structurally
+    distinguishable from a router/proxy 404, whose ``detail`` is a plain string.
+    """
+    return HTTPException(
+        status_code=404,
+        detail={
+            "code": SESSION_NOT_FOUND_CODE,
+            "message": f"session {session_id!r} not found",
+            "session_id": session_id,
+        },
+    )
+
 
 def _iso(value: datetime | None) -> str | None:
     """Turn a datetime into a plain ISO-8601 string, or leave ``None`` as ``None``."""
@@ -157,7 +184,7 @@ async def get_session_summary(
     except AmbiguousSessionError as exc:
         raise HTTPException(status_code=409, detail=_AMBIGUOUS_SESSION_DETAIL) from exc
     if preview is None:
-        raise HTTPException(status_code=404, detail=f"session {session_id!r} not found")
+        raise _session_not_found(session_id)
     return _preview_to_dict(preview)
 
 
@@ -209,5 +236,5 @@ async def delete_session(
         # reported as a retryable 409 "nothing changed"; it is a 500.
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     if result is None:
-        raise HTTPException(status_code=404, detail=f"session {session_id!r} not found")
+        raise _session_not_found(session_id)
     return _result_to_dict(result)
