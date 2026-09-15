@@ -3,8 +3,27 @@
 from __future__ import annotations
 
 import logging
+from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from typing import Any
+
+
+# Persisted only in server-owned queue envelopes.  It is deliberately absent
+# from the EventRequest model: clients do not choose event identity.
+SPOOL_EVENT_IDENTITY = "_ci_event_identity"
+_event_identity: ContextVar[str | None] = ContextVar(
+    "context_intelligence_event_identity", default=None
+)
+
+
+def set_event_identity(identity: str | None) -> Token[str | None]:
+    """Scope a persisted event identity to the current processing task."""
+    return _event_identity.set(identity)
+
+
+def reset_event_identity(token: Token[str | None]) -> None:
+    """Restore the event-identity scope established by ``set_event_identity``."""
+    _event_identity.reset(token)
 
 
 def make_node_id(
@@ -17,6 +36,9 @@ def make_node_id(
 
     Pattern: {session_id}__{safe_event}__{timestamp_ms}
     With disambiguator: {session_id}__{safe_event}__{timestamp_ms}__{disambiguator}
+    While processing a newly accepted, stamped queue record, a final
+    server-owned event-identity suffix is appended.  Direct and historical
+    unscoped callers retain the legacy output exactly.
 
     Colons in *event_name* are replaced with underscores so the ID is safe
     for use as a filename component.  Parses ISO-8601 timestamps (with
@@ -39,6 +61,9 @@ def make_node_id(
     node_id = f"{session_id}__{safe_event}__{epoch_ms}"
     if disambiguator is not None:
         node_id = f"{node_id}__{disambiguator}"
+    event_identity = _event_identity.get()
+    if event_identity is not None:
+        node_id = f"{node_id}__{event_identity}"
     return node_id
 
 

@@ -2,10 +2,12 @@
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 import sys
 import time
 from collections.abc import AsyncGenerator
@@ -52,6 +54,7 @@ from context_intelligence_server.routers.queues import router as queues_router
 from context_intelligence_server.routers.version import router as version_router
 from context_intelligence_server.routers.whoami import router as whoami_router
 from context_intelligence_server.status import build_status_response
+from context_intelligence_server.utils import SPOOL_EVENT_IDENTITY
 
 _settings = get_settings()
 
@@ -634,6 +637,21 @@ idempotency_cache = EventIdempotencyCache()
 # Session-less events are keyed by a per-workspace sentinel stem so that events
 # from distinct workspaces never collide in one durable log.
 _NO_SESSION_PREFIX = "_no_session__"
+_EVENT_IDENTITY_DOMAIN = b"amplifier-context-intelligence:event-identity:v1\x00"
+
+
+def _new_event_identity(idempotency_key: str | None) -> str:
+    """Return a server-owned ID stable for keyed requests, fresh otherwise.
+
+    The value is stored only on the accepted durable envelope. Hashing keeps
+    the raw client idempotency key out of node and blob identifiers.
+    """
+    if idempotency_key:
+        digest = hashlib.sha256(
+            _EVENT_IDENTITY_DOMAIN + idempotency_key.encode("utf-8")
+        ).hexdigest()
+        return f"key-{digest}"
+    return f"new-{secrets.token_hex(16)}"
 
 
 def _workspace_slug(workspace: str) -> str:
@@ -1173,14 +1191,15 @@ async def post_events(
     worker_key = session_id or (_NO_SESSION_PREFIX + _workspace_slug(request.workspace))
     # Spawn (or reuse) the sticky drainer keyed by worker_key.
     registry.get_or_create(worker_key, request.workspace, created_by=contributor_id)
-    # Re-parse the raw validated body bytes, stamp created_by (server-assigned,
-    # unconditional overwrite — kills any client-supplied spoofed value), then
-    # re-serialize compact JSON before persisting to the durable queue.
+    # Re-parse the raw validated body bytes and stamp server-assigned envelope
+    # fields. These unconditional overwrites prevent client spoofing and
+    # survive every drain, retry, and dead-letter replay.
     # IMPORTANT: re-parse raw bytes (not the pydantic model) so client extra
     # fields are preserved. body() is cached by Starlette after the first read.
     body = await http_request.body()
     body_obj = json.loads(body)
     body_obj["created_by"] = contributor_id  # overwrite, never setdefault
+    body_obj[SPOOL_EVENT_IDENTITY] = _new_event_identity(request.idempotency_key)
     body = json.dumps(body_obj, separators=(",", ":")).encode()
     await registry.queue_manager.append(worker_key, body)
     registry.record_accepted()  # count the durably-accepted event

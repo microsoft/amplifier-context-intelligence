@@ -20,6 +20,7 @@ from context_intelligence_server.pipeline import process_event, setup_handlers
 from context_intelligence_server.queue_manager import Batch, QueueManager
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.status import EventRecord, ring_buffer
+from context_intelligence_server.utils import SPOOL_EVENT_IDENTITY
 
 logger = logging.getLogger("context_intelligence_server")
 
@@ -393,6 +394,7 @@ class SessionRegistry:
         handlers: Any,
         *,
         working_dir: str | None = None,
+        event_identity: str | None = None,
     ) -> None:
         """Dispatch one event, update worker stats, and record to the ring buffer.
 
@@ -404,7 +406,14 @@ class SessionRegistry:
         result = "ok"
         error = ""
         try:
-            await process_event(worker, event, data, handlers, working_dir=working_dir)
+            await process_event(
+                worker,
+                event,
+                data,
+                handlers,
+                working_dir=working_dir,
+                event_identity=event_identity,
+            )
             worker.last_event = event
             worker.last_event_time = time.time()
             worker.events_processed += 1
@@ -679,7 +688,9 @@ class SessionRegistry:
                 return
 
     @staticmethod
-    def _parse_line(raw: bytes) -> tuple[str, str, str | None, dict[str, Any]]:
+    def _parse_line(
+        raw: bytes,
+    ) -> tuple[str, str, str | None, dict[str, Any], str | None]:
         """Decode an appended event line (raw EventRequest JSON).
 
         ``working_dir`` is a TOP-LEVEL envelope field (a sibling of
@@ -693,13 +704,18 @@ class SessionRegistry:
 
         Returns ``None`` — never ``""`` — when the line carries no working_dir,
         so "not reported" stays distinguishable from a blank path downstream.
+        The final result is the optional server-owned event identity. Missing
+        markers deliberately keep historical queue and dead-letter records on
+        their legacy node IDs.
         """
         obj = json.loads(raw.decode("utf-8"))
+        event_identity = obj.get(SPOOL_EVENT_IDENTITY)
         return (
             obj["event"],
             obj.get("workspace", ""),
             obj.get("working_dir") or None,
             obj.get("data", {}),
+            event_identity if isinstance(event_identity, str) else None,
         )
 
     async def _process_batch(
@@ -731,9 +747,16 @@ class SessionRegistry:
         terminal_at: int | None = None
         safe_count = 0
         for rec in batch.records:
-            event, _workspace, working_dir, data = self._parse_line(rec.raw)
+            event, _workspace, working_dir, data, event_identity = self._parse_line(
+                rec.raw
+            )
             await self._process_one(
-                worker, event, data, handlers, working_dir=working_dir
+                worker,
+                event,
+                data,
+                handlers,
+                working_dir=working_dir,
+                event_identity=event_identity,
             )
             if terminal_at is None:
                 if event in TERMINAL_EVENTS:
@@ -781,7 +804,9 @@ class SessionRegistry:
         worker.services.graph.discard_buffer()
         for rec in batch.records:
             try:
-                event, _ws, working_dir, data = self._parse_line(rec.raw)
+                event, _ws, working_dir, data, event_identity = self._parse_line(
+                    rec.raw
+                )
             except Exception as exc:
                 # Unparseable: can't be a terminal record -- poison as before.
                 await qm.dead_letter(session_id, rec.raw, str(exc))  # no re-framing
@@ -804,7 +829,12 @@ class SessionRegistry:
             wrote = False
             try:
                 await self._process_one(
-                    worker, event, data, handlers, working_dir=working_dir
+                    worker,
+                    event,
+                    data,
+                    handlers,
+                    working_dir=working_dir,
+                    event_identity=event_identity,
                 )
                 await self._flush_barrier(worker)
                 wrote = True

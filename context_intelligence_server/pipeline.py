@@ -26,7 +26,11 @@ if TYPE_CHECKING:
 from context_intelligence_server.blob_processor import process_event_data
 from context_intelligence_server.handlers.data_layer_1.default import DefaultHandler
 from context_intelligence_server.services import HookStateService
-from context_intelligence_server.utils import make_node_id
+from context_intelligence_server.utils import (
+    make_node_id,
+    reset_event_identity,
+    set_event_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +140,7 @@ async def process_event(
     handlers: PipelineHandlers,
     *,
     working_dir: str | None = None,
+    event_identity: str | None = None,
 ) -> None:
     """Process one event through the always-default + enrichers pipeline.
 
@@ -171,6 +176,7 @@ async def process_event(
     failures.
     """
     session_id: str | None = data.get("session_id") if isinstance(data, dict) else None
+    token = set_event_identity(event_identity)
     try:
         # Step 2 — ensure Session node exists for known sessions
         if session_id:
@@ -222,6 +228,11 @@ async def process_event(
             },
         )
         raise
+    finally:
+        # ContextVars are task-local, but their values must still be reset so a
+        # direct call after success, failure, or cancellation cannot inherit an
+        # unrelated queue record's identity.
+        reset_event_identity(token)
 
     # NOTE (Task 6): process_event no longer self-flushes. The drainer
     # (registry.drain_worker) owns the SINGLE semaphore-gated flush barrier per

@@ -702,7 +702,7 @@ class TestMechanismSpecific:
         mock_finalize.assert_awaited_once()
         pending = await qm.read_batch(sid, 10)
         assert len(pending.records) == 1
-        event, _ws, _wd, _data = reg._parse_line(pending.records[0].raw)
+        event, _ws, _wd, _data, _identity = reg._parse_line(pending.records[0].raw)
         assert event == "session:end"
 
     async def test_recover_reports_a_terminal_but_unfinalized_session(self) -> None:
