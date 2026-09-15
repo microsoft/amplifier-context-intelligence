@@ -175,6 +175,61 @@ class QueueManager:
     def _dead_path(self, session_id: str) -> Path:
         return self._dir / f"{session_id}.dead.jsonl"
 
+    async def contains_recovery_origin(self, origin: dict[str, Any]) -> bool:
+        """Return whether the separate recovery spool already holds *origin*.
+
+        This narrowly scoped scan closes the receipt-to-queue crash window:
+        reconciliation never appends a second line after a crash between append
+        and receipt state update. It is intentionally not used on live ingress.
+        """
+        encoded = json.dumps(origin, sort_keys=True, separators=(",", ":"))
+
+        def _scan() -> bool:
+            for path in self._dir.glob("*.log"):
+                try:
+                    with path.open("rb") as stream:
+                        for raw in stream:
+                            try:
+                                envelope = json.loads(raw)
+                            except (ValueError, UnicodeDecodeError):
+                                continue
+                            candidate = envelope.get("_recovery_origin")
+                            if isinstance(candidate, dict) and json.dumps(
+                                candidate, sort_keys=True, separators=(",", ":")
+                            ) == encoded:
+                                return True
+                except OSError:
+                    continue
+            return False
+
+        return await asyncio.to_thread(_scan)
+
+    async def recovery_origin_is_dead(self, origin: dict[str, Any]) -> bool:
+        """Whether a recovery origin was durably dead-lettered."""
+        encoded = json.dumps(origin, sort_keys=True, separators=(",", ":"))
+
+        def _scan() -> bool:
+            for path in self._dir.glob("*.dead.jsonl"):
+                try:
+                    with path.open("rb") as stream:
+                        for raw in stream:
+                            try:
+                                dead = json.loads(raw)
+                                payload = dead.get("payload")
+                                envelope = json.loads(payload) if payload else {}
+                            except (ValueError, TypeError, UnicodeDecodeError):
+                                continue
+                            candidate = envelope.get("_recovery_origin")
+                            if isinstance(candidate, dict) and json.dumps(
+                                candidate, sort_keys=True, separators=(",", ":")
+                            ) == encoded:
+                                return True
+                except OSError:
+                    continue
+            return False
+
+        return await asyncio.to_thread(_scan)
+
     def _read_committed_offset(self, session_id: str) -> int:
         """Committed byte offset. A missing or empty ``.offset`` reads 0."""
         try:

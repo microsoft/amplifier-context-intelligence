@@ -15,10 +15,27 @@ from fastapi import APIRouter, Depends, HTTPException  # noqa: F401  (HTTPExcept
 from fastapi.requests import Request
 
 from context_intelligence_server.authz import require_read, require_write
+from context_intelligence_server.routers.admin import require_admin
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _require_queue_read_access(request: Request) -> None:
+    """Scoped deployments reserve queue inspection for administrators."""
+    if getattr(request.app.state, "access_control_mode", "compatibility") == "scoped":
+        require_admin(request)
+    else:
+        require_read(request)
+
+
+def _require_queue_mutation_access(request: Request) -> None:
+    """Scoped deployments reserve queue mutation for administrators."""
+    if getattr(request.app.state, "access_control_mode", "compatibility") == "scoped":
+        require_admin(request)
+    else:
+        require_write(request)
 
 
 def _decode_payload(record: dict[str, Any]) -> bytes:
@@ -35,7 +52,10 @@ def _decode_payload(record: dict[str, Any]) -> bytes:
     raise ValueError("dead-letter record missing both 'payload' and 'payload_b64'")
 
 
-@router.get("/queues/dead-letter", dependencies=[Depends(require_read)])
+@router.get(
+    "/queues/dead-letter",
+    dependencies=[Depends(require_read), Depends(_require_queue_read_access)],
+)
 async def list_dead_letters(request: Request) -> dict[str, Any]:
     """List dead-letter queues with per-worker record counts and last error.
 
@@ -64,7 +84,7 @@ async def list_dead_letters(request: Request) -> dict[str, Any]:
 
 @router.post(
     "/queues/dead-letter/{worker_key:path}/purge",
-    dependencies=[Depends(require_write)],
+    dependencies=[Depends(require_write), Depends(_require_queue_mutation_access)],
 )
 async def purge_dead_letters(worker_key: str, request: Request) -> dict[str, Any]:
     """Purge all dead-letter records for ``worker_key``.
@@ -84,7 +104,7 @@ async def purge_dead_letters(worker_key: str, request: Request) -> dict[str, Any
 
 @router.post(
     "/queues/dead-letter/{worker_key:path}/replay",
-    dependencies=[Depends(require_write)],
+    dependencies=[Depends(require_write), Depends(_require_queue_mutation_access)],
 )
 async def replay_dead_letters(worker_key: str, request: Request) -> dict[str, Any]:
     """Re-enqueue every dead-letter record for ``worker_key`` then purge them.

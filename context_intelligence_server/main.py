@@ -27,7 +27,11 @@ from context_intelligence_server.auth import (
 )
 from context_intelligence_server.authz import (  # noqa: F401 — re-exported for tests/routes
     _is_write_capable,
+    require_arbitrary_data_read,
+    require_claimed_session_access,
     require_read,
+    require_recovery_write,
+    require_workspace_access,
     require_write,
 )
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
@@ -39,13 +43,16 @@ from context_intelligence_server.models import (
     CypherRequest,
     EventRequest,
     EventResponse,
+    RecoveryEventRequest,
 )
 from context_intelligence_server.neo4j_store import (
     build_bounded_neo4j_driver,
     ensure_neo4j_schema,
     mark_schema_ready,
 )
-from context_intelligence_server.registry import SessionRegistry
+from context_intelligence_server.registry import LiveFirstFlushGate, SessionRegistry
+from context_intelligence_server.recovery import RecoveryReceiptStore, lease_allows
+from context_intelligence_server.session_claims import SessionClaimStore
 from context_intelligence_server.routers.admin import router as admin_router
 from context_intelligence_server.routers.deletion import router as deletion_router
 from context_intelligence_server.routers.queues import router as queues_router
@@ -415,6 +422,126 @@ async def _startup_recovery_body(app: FastAPI) -> None:
         await _crash_recovery_sweep_loop(_sweep_interval, respawn_limit)
 
 
+async def _resume_native_recovery(app: FastAPI) -> None:
+    """Respawn workers for the separate recovery spool after a process restart."""
+    recovery_registry = getattr(app.state, "recovery_registry", None)
+    if recovery_registry is None:
+        return
+    await _reconcile_native_recovery_outbox(app)
+    for session_id in await recovery_registry.queue_manager.recover():
+        try:
+            batch = await recovery_registry.queue_manager.read_batch(
+                session_id, max_items=1
+            )
+        except (OSError, ValueError):
+            logger.exception(
+                "native_recovery_resume_read_failed session=%s", session_id
+            )
+            continue
+        if batch.lines:
+            _recover_one_session(
+                session_id, batch.lines[0], recovery_registry.get_or_create
+            )
+
+
+async def _enqueue_native_recovery_receipt(
+    app: FastAPI, receipt: dict[str, Any]
+) -> None:
+    """Append one already-admitted receipt, then make its worker eligible to run.
+
+    Callers serialize this with ``recovery_outbox_lock``. Starting the worker
+    only after the durable receipt advances to ``enqueued`` removes the race
+    where a fast worker could mark the receipt written before this path
+    acknowledged the append.
+    """
+    receipts = getattr(app.state, "recovery_receipts", None)
+    recovery_registry = getattr(app.state, "recovery_registry", None)
+    if receipts is None or recovery_registry is None:
+        return
+    origin = receipt["origin"]
+    payload = {
+        **receipt["payload"],
+        "created_by": receipt["actor"],
+        "_recovery_origin": origin,
+    }
+    session_id = payload["data"]["session_id"]
+    await recovery_registry.queue_manager.append(
+        session_id, json.dumps(payload, separators=(",", ":")).encode()
+    )
+    try:
+        await receipts.mark(origin, "enqueued")
+    finally:
+        recovery_registry.get_or_create(
+            session_id, receipt["workspace"], created_by=receipt["actor"]
+        )
+
+
+async def _reconcile_native_recovery_outbox_unlocked(app: FastAPI) -> None:
+    """Repair interrupted recovery admissions while the outbox lock is held."""
+    receipts = getattr(app.state, "recovery_receipts", None)
+    recovery_registry = getattr(app.state, "recovery_registry", None)
+    if receipts is None or recovery_registry is None:
+        return
+    for receipt in await receipts.pending_outbox():
+        origin = receipt["origin"]
+        state = receipt["state"]
+        if state == "committed_pending":
+            await receipts.mark(origin, "written")
+            continue
+        if state == "enqueued":
+            # A successful transition follows the durable append. Startup
+            # resumes workers from the separate spool without a full scan.
+            continue
+        present = await recovery_registry.queue_manager.contains_recovery_origin(origin)
+        if present:
+            await receipts.mark(origin, "enqueued")
+            payload = receipt["payload"]
+            recovery_registry.get_or_create(
+                payload["data"]["session_id"],
+                receipt["workspace"],
+                created_by=receipt["actor"],
+            )
+            continue
+        if await recovery_registry.queue_manager.recovery_origin_is_dead(origin):
+            await receipts.mark(origin, "quarantined")
+            continue
+        await _enqueue_native_recovery_receipt(app, receipt)
+
+
+async def _reconcile_native_recovery_outbox(app: FastAPI) -> None:
+    """Idempotently bridge durable receipt admission into the recovery spool."""
+    lock = getattr(app.state, "recovery_outbox_lock", None)
+    if lock is None:
+        await _reconcile_native_recovery_outbox_unlocked(app)
+        return
+    async with lock:
+        await _reconcile_native_recovery_outbox_unlocked(app)
+
+
+async def _admit_native_recovery(app: FastAPI, receipt: dict[str, Any]) -> str:
+    """Atomically admit and enqueue a current request without an outbox scan."""
+    lock = getattr(app.state, "recovery_outbox_lock", None)
+    if lock is None:
+        return await _admit_native_recovery_unlocked(app, receipt)
+    async with lock:
+        return await _admit_native_recovery_unlocked(app, receipt)
+
+
+async def _admit_native_recovery_unlocked(app: FastAPI, receipt: dict[str, Any]) -> str:
+    """Admit and enqueue while the recovery outbox lock is held."""
+    receipts = app.state.recovery_receipts
+    admitted = await receipts.admit(
+        receipt["origin"], receipt["actor"], receipt["workspace"], receipt["payload"]
+    )
+    if admitted == "accepted":
+        await _enqueue_native_recovery_receipt(app, receipt)
+    elif admitted == "duplicate":
+        # A prior process may have died after receipt admission and before its
+        # spool append. Reconcile only this interrupted path, not each new row.
+        await _reconcile_native_recovery_outbox_unlocked(app)
+    return admitted
+
+
 async def _spool_stats_refresher(app: FastAPI) -> None:
     """Periodically refresh the spool snapshot ``/status`` reads.
 
@@ -563,6 +690,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.recovery_complete = asyncio.Event()
     app.state.recovery_error = None
     _recovery_task: asyncio.Task[None] = asyncio.create_task(_startup_recovery(app))
+    _native_recovery_task: asyncio.Task[None] | None = None
+    if getattr(app.state, "recovery_registry", None) is not None:
+        _native_recovery_task = asyncio.create_task(_resume_native_recovery(app))
     # Background spool-stats refresher (see _spool_stats_refresher): same
     # create_task/cancel-on-shutdown pattern as _recovery_task above, so
     # /status's spool block is served from a periodically-refreshed snapshot
@@ -580,6 +710,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         _recovery_task.cancel()
         with suppress(asyncio.CancelledError):
             await _recovery_task
+        if _native_recovery_task is not None:
+            _native_recovery_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await _native_recovery_task
         # Cancel the spool-stats refresher too -- it holds no drainer-related
         # state, but it must not keep touching a queue directory that a
         # shutting-down process may be tearing down around it.
@@ -597,6 +731,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # flush while the driver is still open.
         logger.info("lifespan_shutdown: quiescing drain workers")
         await registry.shutdown_workers()
+        recovery_registry = getattr(app.state, "recovery_registry", None)
+        if recovery_registry is not None:
+            await recovery_registry.shutdown_workers()
         logger.info("lifespan_shutdown: closing Neo4j drivers")
         await app.state.neo4j_driver.close()
         await app.state.neo4j_query_driver.close()
@@ -605,6 +742,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # first time a session is created) -- close it here too so no bolt
         # connection outlives the process.
         await registry.close_neo4j_driver()
+        if recovery_registry is not None:
+            await recovery_registry.close_neo4j_driver()
 
 
 app = FastAPI(
@@ -780,6 +919,90 @@ def create_asgi_app(
     # Service capability role names for require_write / require_read deps.
     app.state.service_data_role = s.service_data_role
     app.state.reader_role = s.reader_role
+    app.state.access_control_mode = s.access_control_mode
+    app.state.contributor_grants = s.contributor_grants
+    app.state.recovery_enabled = s.recovery.enabled
+    app.state.recovery_paused = False
+    recovery_queue_path, receipt_store_path, claims_store_path, lease_path = (
+        s.recovery_paths()
+    )
+    # Claims are intentionally lazy: merely constructing an ASGI app must not
+    # create recovery-related storage, including in existing test setups.
+    app.state.session_claims = None
+    app.state.session_claims_path = claims_store_path
+    app.state.session_claims_lock = asyncio.Lock()
+    app.state.recovery_receipts = None
+    app.state.recovery_config = s.recovery
+    app.state.recovery_lease_path = lease_path
+    app.state.recovery_registry = None
+    app.state.recovery_outbox_lock = asyncio.Lock()
+    registry.flush_gate = None
+    registry.is_recovery = False
+    registry.drain_batch_size = 100
+    if s.recovery.enabled:
+        flush_gate = LiveFirstFlushGate(s.write_concurrency)
+        registry.flush_gate = flush_gate
+        app.state.recovery_receipts = RecoveryReceiptStore(receipt_store_path)
+        # Recovery has an independent durable spool and workers, but shares
+        # the live registry's one global Neo4j flush cap.
+        recovery_registry = SessionRegistry.for_recovery(
+            queues_path=recovery_queue_path,
+            shared_write_semaphore=registry.write_semaphore,
+            max_delivery_attempts=s.max_delivery_attempts,
+            flush_gate=flush_gate,
+        )
+        app.state.recovery_registry = recovery_registry
+
+        async def _recovery_pre_flush() -> None:
+            # This is checked after every one-record recovery batch. Priority
+            # itself is atomic in LiveFirstFlushGate; this only controls
+            # recovery-specific availability.
+            while app.state.recovery_paused:
+                await asyncio.sleep(0.01)
+            # Capacity can change after ingress. Treat an absent/expired lease as
+            # transient so the record remains durably queued rather than becoming
+            # a dead letter.
+            if not lease_allows(lease_path):
+                raise OSError("recovery lease unavailable")
+
+        recovery_registry.pre_flush = _recovery_pre_flush
+
+        async def _mark_recovery_written(_worker: Any, records: list[Any]) -> None:
+            for record in records:
+                try:
+                    envelope = json.loads(record.raw)
+                    origin = envelope.get("_recovery_origin")
+                    if isinstance(origin, dict):
+                        # This callback runs only after QueueManager.commit for
+                        # this exact record. Failures are isolated by the
+                        # registry post-commit hook and retried by reconciliation.
+                        await app.state.recovery_receipts.mark(
+                            origin, "committed_pending"
+                        )
+                        await app.state.recovery_receipts.mark(origin, "written")
+                except (ValueError, TypeError):
+                    logger.error("recovery receipt completion record was malformed")
+
+        recovery_registry.on_batch_written = _mark_recovery_written
+
+        async def _retry_recovery_receipt_transition() -> None:
+            try:
+                await _reconcile_native_recovery_outbox(app)
+            except Exception:
+                logger.exception("recovery_post_commit_reconciliation_failed")
+
+        recovery_registry.on_post_commit_failure = _retry_recovery_receipt_transition
+
+        async def _mark_recovery_quarantined(_worker: Any, record: Any) -> None:
+            try:
+                envelope = json.loads(record.raw)
+                origin = envelope.get("_recovery_origin")
+                if isinstance(origin, dict):
+                    await app.state.recovery_receipts.mark(origin, "quarantined")
+            except (ValueError, TypeError):
+                logger.error("recovery receipt quarantine record was malformed")
+
+        recovery_registry.on_record_quarantined = _mark_recovery_quarantined
 
     # Compute the admin-key digest for the middleware (static mode only).
     # The middleware checks the bearer token's sha256 against this digest BEFORE
@@ -991,6 +1214,21 @@ def create_asgi_app(
     )
 
 
+async def _session_claim_store(app_instance: FastAPI) -> SessionClaimStore:
+    """Create the scoped claim ledger only when scoped ingress first needs it."""
+    store = getattr(app_instance.state, "session_claims", None)
+    if store is not None:
+        return store
+    async with app_instance.state.session_claims_lock:
+        store = getattr(app_instance.state, "session_claims", None)
+        if store is None:
+            store = await asyncio.to_thread(
+                SessionClaimStore, app_instance.state.session_claims_path
+            )
+            app_instance.state.session_claims = store
+        return store
+
+
 # Module-level ASGI app used by Gunicorn: context_intelligence_server.main:asgi_app
 # The raw `app` is kept for internal use and testing against un-authed routes.
 #
@@ -1157,10 +1395,30 @@ async def post_events(
     # Validate data.timestamp at the ingest boundary (fail loud, not silent dead-letter).
     # Real Amplifier clients always supply this field; 400 only hits malformed payloads.
     _validate_data_timestamp(request.data)
+    require_workspace_access(http_request, request.workspace, "live:write")
+    if (
+        getattr(http_request.app.state, "access_control_mode", "compatibility")
+        == "scoped"
+    ):
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise HTTPException(status_code=400, detail="data.session_id is required")
+        claims = await _session_claim_store(http_request.app)
+        if not contributor_id or not await claims.claim(
+            session_id, contributor_id, request.workspace
+        ):
+            raise HTTPException(status_code=409, detail="Session conflict")
     # Idempotency-cache check + replay stay BEFORE the durable append so a
     # duplicate is rejected without persisting a second log line.
     if request.idempotency_key and not replay:
-        is_new = idempotency_cache.check_and_store(request.idempotency_key)
+        idempotency_key = request.idempotency_key
+        if (
+            getattr(http_request.app.state, "access_control_mode", "compatibility")
+            == "scoped"
+        ):
+            idempotency_key = (
+                f"{contributor_id}\x1f{request.workspace}\x1f{idempotency_key}"
+            )
+        is_new = idempotency_cache.check_and_store(idempotency_key)
         if not is_new:
             logger.info(
                 "event_duplicate_skipped: event=%s session_id=%s",
@@ -1187,15 +1445,93 @@ async def post_events(
     return EventResponse(status="queued", session_id=session_id or None)
 
 
+@app.post(
+    "/recovery/events",
+    status_code=202,
+    response_model=EventResponse,
+    dependencies=[Depends(require_recovery_write)],
+)
+async def post_recovery_events(
+    request: RecoveryEventRequest, http_request: Request
+) -> EventResponse:
+    """Admit one strictly identified native recovery record.
+
+    The origin contains no path and is deliberately never returned or logged.
+    """
+    if not getattr(http_request.app.state, "recovery_enabled", False):
+        raise HTTPException(status_code=404, detail="Not found")
+    if http_request.query_params:
+        raise HTTPException(
+            status_code=400, detail="Recovery replay parameters are not supported"
+        )
+    # Complete any prior durable outbox admission before making a new
+    # availability decision. This is safe without a current lease because it
+    # does not flush graph data; the recovery flush gate still requires one.
+    await _reconcile_native_recovery_outbox(http_request.app)
+    if getattr(http_request.app.state, "recovery_paused", False):
+        raise HTTPException(
+            status_code=429, detail="Recovery unavailable", headers={"Retry-After": "2"}
+        )
+    config = http_request.app.state.recovery_config
+    if not lease_allows(http_request.app.state.recovery_lease_path):
+        raise HTTPException(
+            status_code=429,
+            detail="Recovery unavailable",
+            headers={"Retry-After": str(config.retry_after_seconds)},
+        )
+    contributor_id = http_request.scope.get("state", {}).get("contributor_id")
+    require_workspace_access(http_request, request.workspace, "recovery:write")
+    session_id = request.data.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise HTTPException(status_code=400, detail="data.session_id is required")
+    if request.origin.session_id != session_id:
+        raise HTTPException(
+            status_code=400, detail="Recovery session identity is invalid"
+        )
+    _validate_data_timestamp(request.data)
+    if getattr(
+        http_request.app.state, "access_control_mode", "compatibility"
+    ) == "scoped" and (
+        not contributor_id
+        or not await (await _session_claim_store(http_request.app)).claim(
+            session_id, contributor_id, request.workspace
+        )
+    ):
+        raise HTTPException(status_code=409, detail="Session conflict")
+    origin = request.origin.model_dump()
+    payload = request.model_dump(exclude={"origin"})
+    receipt = {
+        "origin": origin,
+        "actor": contributor_id or "",
+        "workspace": request.workspace,
+        "payload": payload,
+    }
+    admitted = await _admit_native_recovery(http_request.app, receipt)
+    if admitted == "conflict":
+        raise HTTPException(status_code=409, detail="Recovery conflict")
+    if admitted == "busy":
+        raise HTTPException(
+            status_code=429,
+            detail="Recovery unavailable",
+            headers={"Retry-After": str(config.retry_after_seconds)},
+        )
+    if admitted == "duplicate":
+        return EventResponse(status="duplicate", session_id=session_id)
+
+    return EventResponse(status="queued", session_id=session_id)
+
+
 @app.get("/blobs/{session_id}", dependencies=[Depends(require_read)])
-async def list_blobs(session_id: str) -> JSONResponse:
+async def list_blobs(session_id: str, request: Request) -> JSONResponse:
+    await require_claimed_session_access(request, session_id, "data:read")
     blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
     uris = await blob_store.list(session_id)
     return JSONResponse(content={"session_id": session_id, "blobs": uris})
 
 
 @app.get("/blobs/{session_id}/{key}", dependencies=[Depends(require_read)])
-async def get_blob(session_id: str, key: str) -> JSONResponse:
+async def get_blob(session_id: str, key: str, request: Request) -> JSONResponse:
+    await require_claimed_session_access(request, session_id, "data:read")
     blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
     uri = f"ci-blob://{session_id}/{key}"
     try:
@@ -1208,6 +1544,7 @@ async def get_blob(session_id: str, key: str) -> JSONResponse:
 @app.post("/cypher", dependencies=[Depends(require_read)])
 async def post_cypher(body: CypherRequest, request: Request) -> Response:
     """Proxy a Cypher query to Neo4j and return the results as JSON."""
+    require_arbitrary_data_read(request)
     driver = request.app.state.neo4j_query_driver
     access_mode = request.app.state.neo4j_query_access_mode
     params = dict(body.params)

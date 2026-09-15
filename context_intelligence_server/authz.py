@@ -33,6 +33,10 @@ def _is_write_capable(request: Request) -> bool:
     ``is_service`` on scope state before any route handler or dependency runs,
     so the default is never exercised in that path.
     """
+    if getattr(request.app.state, "access_control_mode", "compatibility") == "scoped":
+        if _is_operator(request):
+            return True
+        return _has_capability(request, "live:write")
     state: dict = request.scope.get("state", {})
     if not state.get("is_service", False):
         return True  # human / static — always write-capable, unchanged
@@ -73,6 +77,10 @@ def require_read(request: Request) -> None:
 
     Raises HTTPException(403) when neither condition is met.
     """
+    if getattr(request.app.state, "access_control_mode", "compatibility") == "scoped":
+        if _is_operator(request) or _has_capability(request, "data:read"):
+            return
+        raise HTTPException(status_code=403, detail="Forbidden")
     if _is_write_capable(request):
         return
     state: dict = request.scope.get("state", {})
@@ -87,3 +95,76 @@ def require_read(request: Request) -> None:
             f"or {getattr(request.app.state, 'service_data_role', '')!r} (write)."
         ),
     )
+
+
+def _has_capability(request: Request, capability: str) -> bool:
+    """Check an explicit scoped grant for the resolved contributor."""
+    state: dict = request.scope.get("state", {})
+    contributor_id = state.get("contributor_id")
+    grants = getattr(request.app.state, "contributor_grants", {})
+    grant = grants.get(contributor_id) if contributor_id else None
+    return bool(grant and capability in grant.capabilities)
+
+
+def _is_operator(request: Request) -> bool:
+    """Return whether the request has the server's existing admin authority.
+
+    Scoped contributor grants govern data-plane principals. The separately
+    configured operator credential/role remains able to use the existing
+    operational routes, including queue repair. This does not turn an admin
+    credential into a contributor identity: it still cannot originate an
+    attributed event because the event routes require a contributor id before
+    persistence in scoped mode.
+    """
+    state: dict = request.scope.get("state", {})
+    if state.get("is_admin", False):
+        return True
+    role = getattr(request.app.state, "entra_admin_role", "")
+    return bool(role) and role in state.get("roles", [])
+
+
+def require_recovery_write(request: Request) -> None:
+    if getattr(request.app.state, "access_control_mode", "compatibility") != "scoped":
+        require_write(request)
+        return
+    if not _has_capability(request, "recovery:write"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def require_workspace_access(request: Request, workspace: str, capability: str) -> None:
+    """Enforce a scoped capability and workspace allow-list without disclosure."""
+    if getattr(request.app.state, "access_control_mode", "compatibility") != "scoped":
+        return
+    state: dict = request.scope.get("state", {})
+    grant = getattr(request.app.state, "contributor_grants", {}).get(
+        state.get("contributor_id")
+    )
+    if not grant or capability not in grant.capabilities:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not grant.all_workspaces and workspace not in (grant.workspaces or []):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def require_arbitrary_data_read(request: Request) -> None:
+    """Raw Cypher cannot be safely constrained for a workspace-limited grant."""
+    if getattr(request.app.state, "access_control_mode", "compatibility") != "scoped":
+        return
+    state: dict = request.scope.get("state", {})
+    grant = getattr(request.app.state, "contributor_grants", {}).get(
+        state.get("contributor_id")
+    )
+    if not grant or "data:read" not in grant.capabilities or not grant.all_workspaces:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+async def require_claimed_session_access(
+    request: Request, session_id: str, capability: str
+) -> None:
+    """Authorize a session resource from server-owned claims, or fail closed."""
+    if getattr(request.app.state, "access_control_mode", "compatibility") != "scoped":
+        return
+    claims = getattr(request.app.state, "session_claims", None)
+    workspace = await claims.get_workspace(session_id) if claims is not None else None
+    if workspace is None:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    require_workspace_access(request, workspace, capability)

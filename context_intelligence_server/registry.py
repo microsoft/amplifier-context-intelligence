@@ -1,11 +1,14 @@
 """Session registry — per-session worker management."""
 
 import asyncio
+from contextlib import asynccontextmanager
 import functools
+import inspect
 import json
 import logging
 import time
 from collections import deque
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,7 +20,7 @@ from context_intelligence_server.neo4j_store import (
     build_bounded_neo4j_driver,
 )
 from context_intelligence_server.pipeline import process_event, setup_handlers
-from context_intelligence_server.queue_manager import Batch, QueueManager
+from context_intelligence_server.queue_manager import Batch, QueueManager, Record
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.status import EventRecord, ring_buffer
 
@@ -108,6 +111,40 @@ _FINALIZE_DELETE_ATTEMPTS = 3
 _RESIDUAL_DEGRADED_GRACE = 15.0
 
 
+class LiveFirstFlushGate:
+    """Atomic shared flush scheduler: queued live writers outrank recovery."""
+
+    def __init__(self, capacity: int) -> None:
+        self._capacity = capacity
+        self._active = 0
+        self._live_waiters = 0
+        self._condition = asyncio.Condition()
+
+    @asynccontextmanager
+    async def acquire(self, *, recovery: bool) -> AsyncIterator[None]:
+        async with self._condition:
+            if not recovery:
+                self._live_waiters += 1
+            try:
+                await self._condition.wait_for(
+                    lambda: (
+                        self._active < self._capacity
+                        and (not recovery or self._live_waiters == 0)
+                    )
+                )
+                self._active += 1
+            finally:
+                if not recovery:
+                    self._live_waiters -= 1
+            self._condition.notify_all()
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._active -= 1
+                self._condition.notify_all()
+
+
 @dataclass
 class SessionWorker:
     session_id: str
@@ -166,6 +203,34 @@ class SessionRegistry:
         # Monotonic time the residual first went positive (None = clean).
         # Gates `degraded` so transient clock skew doesn't latch it.
         self._residual_positive_since: float | None = None
+        # Optional internal completion hook used by the separate recovery
+        # spool. It receives the committed batch only after its graph flush.
+        self.on_batch_written: Any | None = None
+        self.on_record_quarantined: Any | None = None
+        self.on_post_commit_failure: Any | None = None
+        self.pre_flush: Any | None = None
+        self.flush_gate: LiveFirstFlushGate | None = None
+        self.is_recovery: bool = False
+        self.drain_batch_size: int = _DRAIN_MAX_BATCH
+
+    @classmethod
+    def for_recovery(
+        cls,
+        *,
+        queues_path: Path,
+        shared_write_semaphore: asyncio.Semaphore,
+        max_delivery_attempts: int,
+        flush_gate: LiveFirstFlushGate,
+    ) -> "SessionRegistry":
+        """Create the separately-spooled, live-prioritized recovery registry."""
+        registry = cls()
+        registry._queue_manager = QueueManager(queues_path)
+        registry._write_semaphore = shared_write_semaphore
+        registry._max_delivery_attempts = max_delivery_attempts
+        registry.flush_gate = flush_gate
+        registry.is_recovery = True
+        registry.drain_batch_size = 1
+        return registry
 
     def _ensure_infra(self) -> None:
         """Build the shared QueueManager + write semaphore on first use.
@@ -441,11 +506,57 @@ class SessionRegistry:
         may happen -- a handler that flushes on its own would write outside the
         semaphore (see ``SessionHandler._handle_end``).
         """
+        if self.flush_gate is not None:
+            async with self.flush_gate.acquire(recovery=self.is_recovery):
+                await self._flush_graph(worker)
+            return
         async with self.write_semaphore:
-            await worker.services.graph.flush()
-            # Stamped here (the one flush boundary) as liveness proof the
-            # drainer reached and finished the write barrier.
-            worker.last_successful_flush = time.time()
+            await self._flush_graph(worker)
+
+    async def _flush_graph(self, worker: SessionWorker) -> None:
+        """Perform one graph flush while the caller holds its scheduler permit."""
+        await worker.services.graph.flush()
+        # Stamped here (the one flush boundary) as liveness proof the drainer
+        # reached and finished the write barrier.
+        worker.last_successful_flush = time.time()
+
+    async def _post_commit(self, worker: SessionWorker, records: list[Record]) -> None:
+        """Best-effort receipt transition after an irreversible queue commit.
+
+        A receipt-store failure is never delivery failure: the record is already
+        committed and must not re-enter handlers or dead-letter processing.
+        Reconciliation retries the transition from durable receipt/queue state.
+        """
+        if self.on_batch_written is None or not records:
+            return
+        try:
+            completed = self.on_batch_written(worker, records)
+            if inspect.isawaitable(completed):
+                await completed
+        except Exception:
+            logger.exception(
+                "post_commit_transition_failed session=%s", worker.session_id
+            )
+            if self.on_post_commit_failure is not None:
+                retry = self.on_post_commit_failure()
+                if inspect.isawaitable(retry):
+                    asyncio.ensure_future(retry)
+
+    async def _post_quarantine(self, worker: SessionWorker, record: Record) -> None:
+        if self.on_record_quarantined is None:
+            return
+        try:
+            completed = self.on_record_quarantined(worker, record)
+            if inspect.isawaitable(completed):
+                await completed
+        except Exception:
+            logger.exception(
+                "quarantine_transition_failed session=%s", worker.session_id
+            )
+            if self.on_post_commit_failure is not None:
+                retry = self.on_post_commit_failure()
+                if inspect.isawaitable(retry):
+                    asyncio.ensure_future(retry)
 
     async def drain_worker(
         self, worker: SessionWorker, flush_timeout: float = 30.0
@@ -477,7 +588,7 @@ class SessionRegistry:
 
         while True:
             try:
-                batch = await qm.read_batch(session_id, max_items=_DRAIN_MAX_BATCH)
+                batch = await qm.read_batch(session_id, max_items=self.drain_batch_size)
 
                 if not batch.records:
                     await asyncio.sleep(poll_interval)
@@ -655,6 +766,10 @@ class SessionRegistry:
                 await qm.commit(session_id, commit_to)
                 counted = len(batch.records) if terminal_at is None else safe_count
                 self.record_written(counted)
+                committed_records = (
+                    batch.records if terminal_at is None else batch.records[:safe_count]
+                )
+                await self._post_commit(worker, committed_records)
                 logger.debug(
                     "batch_committed events=%d offset=%d",
                     counted,
@@ -794,6 +909,7 @@ class SessionRegistry:
                 )
                 worker.services.graph.discard_buffer()
                 await qm.commit(session_id, rec.end)  # queue-produced offset
+                await self._post_quarantine(worker, rec)
                 continue
 
             from context_intelligence_server.pipeline import TERMINAL_EVENTS
@@ -802,6 +918,7 @@ class SessionRegistry:
                 return True
 
             wrote = False
+            quarantined = False
             try:
                 await self._process_one(
                     worker, event, data, handlers, working_dir=working_dir
@@ -818,6 +935,7 @@ class SessionRegistry:
                     worker.services.graph.discard_buffer()
                     raise _TransientInfraFailure(str(exc)) from exc
                 await qm.dead_letter(session_id, rec.raw, str(exc))  # no re-framing
+                quarantined = True
                 logger.warning(
                     "dead_letter session=%s error=%s",
                     session_id,
@@ -832,6 +950,9 @@ class SessionRegistry:
             await qm.commit(session_id, rec.end)  # queue-produced offset
             if wrote:
                 self.record_written(1)
+                await self._post_commit(worker, [rec])
+            elif quarantined:
+                await self._post_quarantine(worker, rec)
         return False
 
     async def _drain_to_eof(self, worker: SessionWorker, handlers: Any) -> bool:
@@ -843,7 +964,7 @@ class SessionRegistry:
         qm = self.queue_manager
         session_id = worker.session_id
         while True:
-            tail = await qm.read_batch(session_id, max_items=_DRAIN_MAX_BATCH)
+            tail = await qm.read_batch(session_id, max_items=self.drain_batch_size)
             if not tail.records:
                 return True
             try:
@@ -854,6 +975,7 @@ class SessionRegistry:
                 return False  # NOT finalized: keep worker alive, tail uncommitted
             await qm.commit(session_id, tail.end_offset)
             self.record_written(len(tail.records))
+            await self._post_commit(worker, tail.records)
             logger.debug(
                 "batch_committed events=%d offset=%d",
                 len(tail.records),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -59,6 +60,35 @@ class EventResponse(BaseModel):
 
     status: str = "queued"
     session_id: str | None = None
+
+
+class NativeRecoveryOrigin(BaseModel):
+    """Opaque identity of one line in a native Context Intelligence stream."""
+
+    session_id: str
+    ordinal: int = Field(ge=0)
+    source_line_sha256: str
+    source_stream_sha256: str
+
+    @field_validator("session_id")
+    @classmethod
+    def nonempty_session_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("origin.session_id must not be empty")
+        return value
+
+    @field_validator("source_line_sha256", "source_stream_sha256")
+    @classmethod
+    def lower_sha256(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("origin hashes must be lowercase SHA-256 hex")
+        return value
+
+
+class RecoveryEventRequest(EventRequest):
+    """An event with an opaque, strict native recovery origin."""
+
+    origin: NativeRecoveryOrigin
 
 
 class StatusResponse(BaseModel):

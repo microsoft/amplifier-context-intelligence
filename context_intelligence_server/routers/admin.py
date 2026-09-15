@@ -165,45 +165,34 @@ def require_admin(request: Request) -> None:
 # ---------------------------------------------------------------------------
 
 
-class IdentityBody(BaseModel):
+class _ContributorIdBody(BaseModel):
+    """Shared contributor-id validation for mutable identity records."""
+
+    id: str
+
+    @field_validator("id")
+    @classmethod
+    def id_must_be_valid(cls, v: str) -> str:
+        """Validate contributor id: non-empty, non-whitespace, bounded, no null bytes (TB-12)."""
+        if not v.strip():
+            raise ValueError("id must be a non-empty, non-whitespace string")
+        if len(v) > _MAX_CONTRIBUTOR_LEN:
+            raise ValueError(
+                f"id must be at most {_MAX_CONTRIBUTOR_LEN} characters (got {len(v)})"
+            )
+        if "\x00" in v:
+            raise ValueError("id must not contain null bytes")
+        return v
+
+
+class IdentityBody(_ContributorIdBody):
     """Body for PUT /admin/identities/{oid}."""
 
-    id: str
     display_name: str | None = None
 
-    @field_validator("id")
-    @classmethod
-    def id_must_be_valid(cls, v: str) -> str:
-        """Validate contributor id: non-empty, non-whitespace, bounded, no null bytes (TB-12)."""
-        if not v.strip():
-            raise ValueError("id must be a non-empty, non-whitespace string")
-        if len(v) > _MAX_CONTRIBUTOR_LEN:
-            raise ValueError(
-                f"id must be at most {_MAX_CONTRIBUTOR_LEN} characters (got {len(v)})"
-            )
-        if "\x00" in v:
-            raise ValueError("id must not contain null bytes")
-        return v
 
-
-class KeyBody(BaseModel):
+class KeyBody(_ContributorIdBody):
     """Body for PUT /admin/keys/{sha256hash}."""
-
-    id: str
-
-    @field_validator("id")
-    @classmethod
-    def id_must_be_valid(cls, v: str) -> str:
-        """Validate contributor id: non-empty, non-whitespace, bounded, no null bytes (TB-12)."""
-        if not v.strip():
-            raise ValueError("id must be a non-empty, non-whitespace string")
-        if len(v) > _MAX_CONTRIBUTOR_LEN:
-            raise ValueError(
-                f"id must be at most {_MAX_CONTRIBUTOR_LEN} characters (got {len(v)})"
-            )
-        if "\x00" in v:
-            raise ValueError("id must not contain null bytes")
-        return v
 
 
 # ---------------------------------------------------------------------------
@@ -544,3 +533,44 @@ def list_keys(
     return {
         "keys": [{"hash": h, "id": record.get("id", "")} for h, record in store.items()]
     }
+
+
+@router.get("/recovery/status")
+async def recovery_status(request: Request) -> dict[str, object]:
+    """Aggregate-only recovery state; receipt identities are never exposed."""
+    if not getattr(request.app.state, "recovery_enabled", False):
+        raise HTTPException(status_code=404, detail="Not found")
+    return {
+        "enabled": True,
+        "paused": bool(getattr(request.app.state, "recovery_paused", False)),
+        "receipts": await request.app.state.recovery_receipts.status(),
+    }
+
+
+@router.post("/recovery/pause")
+async def pause_recovery(request: Request) -> dict[str, bool]:
+    if not getattr(request.app.state, "recovery_enabled", False):
+        raise HTTPException(status_code=404, detail="Not found")
+    request.app.state.recovery_paused = True
+    return {"paused": True}
+
+
+@router.post("/recovery/resume")
+async def resume_recovery(request: Request) -> dict[str, bool]:
+    if not getattr(request.app.state, "recovery_enabled", False):
+        raise HTTPException(status_code=404, detail="Not found")
+    request.app.state.recovery_paused = False
+    return {"paused": False}
+
+
+@router.post("/recovery/retry-quarantined")
+async def retry_quarantined_recovery(request: Request) -> dict[str, int]:
+    if not getattr(request.app.state, "recovery_enabled", False):
+        raise HTTPException(status_code=404, detail="Not found")
+    if not await request.app.state.recovery_receipts.retry_quarantined():
+        return {"retried": 0}
+    # Deferred import avoids the main/router import cycle.
+    from context_intelligence_server.main import _reconcile_native_recovery_outbox
+
+    await _reconcile_native_recovery_outbox(request.app)
+    return {"retried": 1}

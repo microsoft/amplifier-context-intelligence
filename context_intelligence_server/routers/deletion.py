@@ -28,7 +28,11 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from context_intelligence_server.authz import require_read, require_write
+from context_intelligence_server.authz import (
+    require_claimed_session_access,
+    require_read,
+    require_write,
+)
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.deletion import (
@@ -144,6 +148,7 @@ def _caller_id(request: Request) -> str | None:
 )
 async def get_session_summary(
     session_id: str,
+    request: Request,
     service: DeletionService = Depends(read_deletion_service),
 ) -> dict[str, Any]:
     """Report what deleting this session's data would do. Deletes nothing.
@@ -152,6 +157,7 @@ async def get_session_summary(
     409 when ``session_id`` is somehow found in more than one workspace
     (see ``AmbiguousSessionError`` -- this should not happen in practice).
     """
+    await require_claimed_session_access(request, session_id, "data:read")
     try:
         preview = await service.preview(session_id)
     except AmbiguousSessionError as exc:
@@ -185,10 +191,14 @@ async def delete_session(
     - The session id is somehow found in more than one workspace
       (``AmbiguousSessionError``) -- not retryable; no ``Retry-After``.
     """
+    await require_claimed_session_access(request, session_id, "live:write")
     try:
         result = await service.apply(session_id, requested_by=_caller_id(request))
     except SessionsPendingError as exc:
-        retry_after = get_settings().delete_retry_after_seconds
+        # Small test/local settings doubles may predate this optional tuning
+        # knob. Production Settings always supplies it; retain the documented
+        # conservative default for compatible callers.
+        retry_after = getattr(get_settings(), "delete_retry_after_seconds", 2)
         raise HTTPException(
             status_code=409,
             detail={
