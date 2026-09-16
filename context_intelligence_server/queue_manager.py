@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import errno
 import hashlib
 import json
 import logging
@@ -989,12 +990,45 @@ class QueueManager:
             keys.add(dead.name[: -len(".dead.jsonl")])
         return sorted(keys)
 
+    @staticmethod
+    def _exists_or_too_long_is_absent(path: Path) -> bool:
+        """Like ``path.exists()``, but treats ``ENAMETOOLONG`` as "absent".
+
+        A path whose filename exceeds the filesystem's ``NAME_MAX`` could
+        NEVER have been created by any process on this filesystem -- the
+        creating ``open()``/``write()`` would itself have raised
+        ``ENAMETOOLONG`` first. So "this path's name is too long" and "this
+        path does not exist" are the same fact here, not a workaround.
+
+        This matters specifically for the artifacts of an over-budget
+        worker key: ``Path.exists()`` does NOT swallow ``ENAMETOOLONG`` the
+        way it swallows ``ENOENT``/``ENOTDIR``/``EBADF``/``ELOOP`` (see
+        ``pathlib``'s ``_ignore_error``), so calling ``.exists()`` directly
+        on e.g. a 257-byte ``.dead.jsonl`` path raises OSError instead of
+        returning False -- which is exactly the bug this method exists to
+        close (see ``migrate_overlong_keys``). Every other OSError
+        propagates unchanged: only ENAMETOOLONG is a semantically-certain
+        "no" here.
+        """
+        try:
+            return path.exists()
+        except OSError as exc:
+            if exc.errno == errno.ENAMETOOLONG:
+                return False
+            raise
+
     async def _migrate_one_key(self, key: str) -> str:
         """Rename one over-budget key's artifacts onto its folded name.
 
         Returns ``"migrated"``, ``"skipped"`` (folded target already
         exists -- nothing touched), or ``"noop"`` (nothing existed under
         the raw name to move, or the key was not actually over budget).
+
+        Any of the three artifact names may itself exceed ``NAME_MAX``
+        (e.g. ``.dead.jsonl``'s +11 bytes can push a key that fits as a
+        ``.log`` past the limit) -- such a name could never have been
+        created, so it is treated as absent, not as an error. See
+        ``_exists_or_too_long_is_absent``.
         """
         folded = fold_worker_key(key)
         if folded == key:
@@ -1007,10 +1041,18 @@ class QueueManager:
                     (self._offset_path(key), self._offset_path(folded)),
                     (self._dead_path(key), self._dead_path(folded)),
                 )
-                existing = [(src, dst) for src, dst in triples if src.exists()]
+                existing = [
+                    (src, dst)
+                    for src, dst in triples
+                    if self._exists_or_too_long_is_absent(src)
+                ]
                 if not existing:
                     return "noop"
-                collided = [(src, dst) for src, dst in existing if dst.exists()]
+                collided = [
+                    (src, dst)
+                    for src, dst in existing
+                    if self._exists_or_too_long_is_absent(dst)
+                ]
                 if collided:
                     for src, dst in collided:
                         logger.error(
@@ -1035,7 +1077,7 @@ class QueueManager:
                     del self._guards[key]
         return result
 
-    async def migrate_overlong_keys(self) -> tuple[int, int]:
+    async def migrate_overlong_keys(self) -> tuple[int, int, int]:
         """One-shot boot migration: rename existing over-budget-key artifacts.
 
         Before ``fold_worker_key`` existed, a worker key derived straight
@@ -1059,11 +1101,19 @@ class QueueManager:
         name) and changes nothing. Never raises: this is a boot-path pass
         and one bad key must not crash-loop the container.
 
-        Returns ``(migrated, skipped)``. A key is ``skipped`` -- and
-        NOTHING is renamed for it -- when its folded target ALREADY
+        Returns ``(migrated, skipped, failed)``. A key is ``skipped`` --
+        and NOTHING is renamed for it -- when its folded target ALREADY
         EXISTS: this is never merged or overwritten (silent data loss is
         unacceptable), and is instead logged as an ERROR naming both paths
-        for an operator to resolve by hand.
+        for an operator to resolve by hand. A key is ``failed`` when
+        ``_migrate_one_key`` itself raised (e.g. a permissions error, or an
+        ``os.replace`` failure mid-rename): its artifacts remain under the
+        raw, over-budget name and it will keep failing to drain until
+        resolved. ``failed`` is a DISTINCT count from ``skipped`` on
+        purpose -- collapsing every outcome into ``(0, 0)`` would make
+        "nothing to do" and "every key failed to heal" indistinguishable
+        to the boot log and to callers, which is precisely what let this
+        migration silently no-op in production.
         """
         overlong = sorted(
             key
@@ -1072,22 +1122,32 @@ class QueueManager:
         )
         migrated = 0
         skipped = 0
+        failed = 0
         for key in overlong:
             try:
                 result = await self._migrate_one_key(key)
             except (OSError, ValueError):
-                logger.exception("migrate_overlong_keys_key_failed key=%s", key)
+                logger.exception(
+                    "migrate_overlong_keys_key_failed key=%s -- this key's "
+                    "artifacts remain under the raw, over-budget name and "
+                    "will keep failing to drain until this is resolved",
+                    key,
+                )
+                failed += 1
                 continue
             if result == "migrated":
                 migrated += 1
             elif result == "skipped":
                 skipped += 1
-        if migrated or skipped:
+        if migrated or skipped or failed:
             logger.info(
-                "migrate_overlong_keys: migrated=%d skipped=%d", migrated, skipped
+                "migrate_overlong_keys: migrated=%d skipped=%d failed=%d",
+                migrated,
+                skipped,
+                failed,
             )
             self._stats_cache = None
-        return migrated, skipped
+        return migrated, skipped, failed
 
     async def refresh_all_stats(self) -> dict[str, Any]:
         """Scan the spool and refresh the snapshot ``derive_all_stats()`` serves.
