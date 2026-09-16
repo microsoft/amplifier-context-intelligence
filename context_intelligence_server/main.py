@@ -299,16 +299,23 @@ async def _startup_recovery_body(app: FastAPI) -> None:
     # otherwise keep choking commit()/_count_dead forever, even post-fix.
     # Never raises: a boot pass must not crash-loop the container.
     try:
-        _migrated, _skipped = await registry.queue_manager.migrate_overlong_keys()
+        (
+            _migrated,
+            _skipped,
+            _failed,
+        ) = await registry.queue_manager.migrate_overlong_keys()
     except Exception:
         logger.exception("startup_recovery: overlong-key migration failed; continuing")
     else:
-        if _migrated or _skipped:
+        if _migrated or _skipped or _failed:
             logger.info(
                 "startup_recovery: migrated %d overlong worker key(s), "
-                "%d skipped (folded target already existed)",
+                "%d skipped (folded target already existed), %d failed "
+                "(see migrate_overlong_keys_key_failed logs -- these keys "
+                "remain unhealed and will keep failing to drain)",
                 _migrated,
                 _skipped,
+                _failed,
             )
     # Crash recovery: on startup, respawn one drainer per
     # session that still has an undrained, complete line. The workspace is

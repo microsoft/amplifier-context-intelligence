@@ -1623,34 +1623,106 @@ class TestWorkerKeyLengthBudget:
 
 
 class TestMigrateOverlongKeys:
-    async def test_renames_all_three_artifacts_and_is_idempotent(self, qm):
-        raw = _ascii_key(230, tag="migrate")  # over budget; every direct name <=255
+    """Real filesystem-length bands, matching the incident exactly.
+
+    As a raw key's length grows, its three artifact names stop being
+    creatable in a fixed order (longest suffix goes first): ``.dead.jsonl``
+    (+11) can no longer be created once ``len(key) > 244``, ``.offset``
+    (+7) once ``len(key) > 248``, ``.log`` (+4) once ``len(key) > 251``.
+    The PRODUCTION incident band is 245-251 bytes: `.log` (and often
+    `.offset`) exist on disk, but `.dead.jsonl` (and/or `.offset`) do NOT
+    -- and calling ``Path.exists()`` directly on that non-existent,
+    over-``NAME_MAX`` path raises ``OSError`` instead of returning False,
+    which is exactly what made the first version of this migration a
+    silent no-op for precisely the keys the incident is made of.
+
+    ``_ascii_key(230, ...)`` (used elsewhere in this file) sits OUTSIDE
+    every one of these bands -- every artifact name still fits under
+    ``NAME_MAX`` -- so it structurally cannot exercise this bug. Every
+    test below either targets one of the three real bands, or explicitly
+    documents why it doesn't need to.
+    """
+
+    @pytest.mark.parametrize(
+        "raw_length,expect_log,expect_offset,expect_dead",
+        [
+            (230, True, True, True),
+            # PRODUCTION BAND: .dead.jsonl (257 bytes) cannot exist; only
+            # .log (250) and .offset (253) can.
+            (246, True, True, False),
+            # .offset (257) and .dead.jsonl (261) cannot exist; only
+            # .log (254) can.
+            (250, True, False, False),
+        ],
+    )
+    async def test_migrates_whatever_is_actually_creatable_at_this_length(
+        self, qm, raw_length, expect_log, expect_offset, expect_dead
+    ):
+        raw = _ascii_key(raw_length, tag=f"prod-{raw_length}")
         folded = fold_worker_key(raw)
         assert folded != raw
 
-        (qm._dir / f"{raw}.log").write_bytes(b"line-one\n")
-        (qm._dir / f"{raw}.offset").write_text("9", encoding="utf-8")
-        (qm._dir / f"{raw}.dead.jsonl").write_text(
-            '{"ts": 1, "error": "x", "payload": "bad"}\n', encoding="utf-8"
-        )
+        if expect_log:
+            (qm._dir / f"{raw}.log").write_bytes(b"line-one\n")
+        if expect_offset:
+            (qm._dir / f"{raw}.offset").write_text("9", encoding="utf-8")
+        if expect_dead:
+            (qm._dir / f"{raw}.dead.jsonl").write_text(
+                '{"ts": 1, "error": "x", "payload": "bad"}\n', encoding="utf-8"
+            )
 
-        migrated, skipped = await qm.migrate_overlong_keys()
+        migrated, skipped, failed = await qm.migrate_overlong_keys()
 
-        assert (migrated, skipped) == (1, 0)
-        assert not (qm._dir / f"{raw}.log").exists()
-        assert not (qm._dir / f"{raw}.offset").exists()
-        assert not (qm._dir / f"{raw}.dead.jsonl").exists()
-        assert (qm._dir / f"{folded}.log").read_bytes() == b"line-one\n"
-        assert (qm._dir / f"{folded}.offset").read_text(encoding="utf-8") == "9"
-        assert (qm._dir / f"{folded}.dead.jsonl").exists()
+        assert (migrated, skipped, failed) == (1, 0, 0)
 
-        # The session is discoverable and drainable under its folded key.
+        # Nothing under the raw name survives -- checked via a directory
+        # listing (glob/iterdir never stats an entry, so it stays safe even
+        # for a name that could never have existed at all).
+        remaining_names = {p.name for p in qm._dir.iterdir()}
+        assert f"{raw}.log" not in remaining_names
+        assert f"{raw}.offset" not in remaining_names
+        assert f"{raw}.dead.jsonl" not in remaining_names
+
+        assert (f"{folded}.log" in remaining_names) == expect_log
+        assert (f"{folded}.offset" in remaining_names) == expect_offset
+        assert (f"{folded}.dead.jsonl" in remaining_names) == expect_dead
+        if expect_log:
+            assert (qm._dir / f"{folded}.log").read_bytes() == b"line-one\n"
+        if expect_offset:
+            assert (qm._dir / f"{folded}.offset").read_text(encoding="utf-8") == "9"
+
+        # The session is discoverable and fully drainable under its folded
+        # key: append, read, and commit all succeed -- the historical bug
+        # left these keys undrainable forever.
         assert folded in qm._all_worker_keys()
+        # "line-one\n" is 9 bytes -- exactly the seeded offset ("9") when
+        # expect_offset, so that pre-existing line already reads as
+        # committed; only when no offset was seeded (committed defaults to
+        # 0) does it still show up as pending.
+        pre_existing = 1 if (expect_log and not expect_offset) else 0
+        batch = await qm.read_batch(folded, max_items=10)
+        assert len(batch.lines) == pre_existing
+        await qm.append(folded, b"post-migration-event")
+        batch2 = await qm.read_batch(folded, max_items=10)
+        assert batch2.lines[-1] == b"post-migration-event"
+        await qm.commit(folded, batch2.end_offset)
         assert (await qm.read_batch(folded, max_items=10)).lines == []
 
-        # A second run is a no-op.
-        migrated2, skipped2 = await qm.migrate_overlong_keys()
-        assert (migrated2, skipped2) == (0, 0)
+        # A second run is a no-op: nothing left to migrate.
+        assert await qm.migrate_overlong_keys() == (0, 0, 0)
+
+    async def test_length_where_not_even_log_could_ever_exist_is_a_clean_noop(self, qm):
+        """At 253 bytes even ``.log`` (257) exceeds NAME_MAX, so NOTHING
+        for this key could ever have reached disk. No file is seeded --
+        the raw name genuinely cannot exist. A direct call must return
+        ``noop`` without crashing, and since no artifact exists, the key is
+        never even discovered by the outer scan."""
+        raw = _ascii_key(253, tag="unreachable")
+
+        result = await qm._migrate_one_key(raw)
+        assert result == "noop"
+
+        assert await qm.migrate_overlong_keys() == (0, 0, 0)
 
     async def test_collision_skips_and_overwrites_nothing(self, qm, caplog):
         """If the folded target already exists (e.g. a live post-fix append
@@ -1664,15 +1736,64 @@ class TestMigrateOverlongKeys:
         (qm._dir / f"{folded}.log").write_bytes(b"new-post-fix-data\n")
 
         with caplog.at_level(logging.ERROR):
-            migrated, skipped = await qm.migrate_overlong_keys()
+            migrated, skipped, failed = await qm.migrate_overlong_keys()
 
-        assert (migrated, skipped) == (0, 1)
+        assert (migrated, skipped, failed) == (0, 1, 0)
         assert (qm._dir / f"{raw}.log").read_bytes() == b"old-pre-fold-data\n"
         assert (qm._dir / f"{folded}.log").read_bytes() == b"new-post-fix-data\n"
         assert any(
             "migrate_overlong_keys_collision" in r.message for r in caplog.records
         )
 
+    async def test_collision_at_the_production_band(self, qm, caplog):
+        """The collision guard must still work when only SOME artifacts
+        exist (the production band), not just the every-artifact-fits case
+        -- and it must use the same ENAMETOOLONG-safe check on the folded
+        (destination) side too."""
+        raw = _ascii_key(246, tag="collide-prod")  # .dead.jsonl cannot exist here
+        folded = fold_worker_key(raw)
+
+        (qm._dir / f"{raw}.log").write_bytes(b"old-pre-fold-data\n")
+        (qm._dir / f"{folded}.log").write_bytes(b"new-post-fix-data\n")
+
+        with caplog.at_level(logging.ERROR):
+            migrated, skipped, failed = await qm.migrate_overlong_keys()
+
+        assert (migrated, skipped, failed) == (0, 1, 0)
+        assert (qm._dir / f"{raw}.log").read_bytes() == b"old-pre-fold-data\n"
+        assert (qm._dir / f"{folded}.log").read_bytes() == b"new-post-fix-data\n"
+
     async def test_no_overlong_keys_is_a_no_op(self, qm):
         await qm.append("normal-session", b"data")
-        assert await qm.migrate_overlong_keys() == (0, 0)
+        assert await qm.migrate_overlong_keys() == (0, 0, 0)
+
+    async def test_failed_migration_is_counted_and_logged_distinctly_from_skipped(
+        self, qm, monkeypatch, caplog
+    ):
+        """A key whose migration raises mid-rename (e.g. a permissions
+        error) must be counted as ``failed``, NOT silently folded into
+        ``skipped`` or ``migrated`` -- collapsing every outcome into
+        ``(0, 0)`` is exactly what let the production-band bug look like
+        "nothing to do" instead of "this key could not be healed"."""
+        raw = _ascii_key(230, tag="failing")
+        (qm._dir / f"{raw}.log").write_bytes(b"data\n")
+
+        import context_intelligence_server.queue_manager as qm_module
+
+        real_replace = qm_module.os.replace
+
+        def _boom(src, dst):
+            raise PermissionError("simulated: cannot rename on this share")
+
+        monkeypatch.setattr(qm_module.os, "replace", _boom)
+
+        with caplog.at_level(logging.ERROR):
+            migrated, skipped, failed = await qm.migrate_overlong_keys()
+
+        assert (migrated, skipped, failed) == (0, 0, 1)
+        assert any(
+            "migrate_overlong_keys_key_failed" in r.message for r in caplog.records
+        )
+        # Nothing was renamed -- the raw artifact is untouched.
+        monkeypatch.setattr(qm_module.os, "replace", real_replace)
+        assert (qm._dir / f"{raw}.log").read_bytes() == b"data\n"
