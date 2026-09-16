@@ -52,14 +52,15 @@ from context_intelligence_server.neo4j_store import (
     ensure_neo4j_schema,
     mark_schema_ready,
 )
-from context_intelligence_server.registry import LiveFirstFlushGate, SessionRegistry
+from context_intelligence_server.queue_manager import fold_worker_key
 from context_intelligence_server.recovery import RecoveryReceiptStore, lease_allows
-from context_intelligence_server.session_claims import SessionClaimStore
+from context_intelligence_server.registry import LiveFirstFlushGate, SessionRegistry
 from context_intelligence_server.routers.admin import router as admin_router
 from context_intelligence_server.routers.deletion import router as deletion_router
 from context_intelligence_server.routers.queues import router as queues_router
 from context_intelligence_server.routers.version import router as version_router
 from context_intelligence_server.routers.whoami import router as whoami_router
+from context_intelligence_server.session_claims import SessionClaimStore
 from context_intelligence_server.status import build_status_response
 from context_intelligence_server.utils import SPOOL_EVENT_IDENTITY
 
@@ -277,7 +278,7 @@ async def _startup_recovery(app: FastAPI) -> None:
         await _startup_recovery_body(app)
     except asyncio.CancelledError:
         raise  # shutdown -- not a failure, and must propagate
-    except Exception as exc:  # noqa: BLE001 - background task boundary
+    except Exception as exc:
         app.state.recovery_error = repr(exc)
         logger.exception(
             "startup_recovery: FAILED -- conservation counters may be unseeded "
@@ -291,6 +292,24 @@ async def _startup_recovery(app: FastAPI) -> None:
 
 async def _startup_recovery_body(app: FastAPI) -> None:
     """The actual recovery pass. See ``_startup_recovery`` for why it is split."""
+    # Migrate any pre-fold over-budget worker keys onto their folded name
+    # FIRST -- before anything else below reads or writes their files.
+    # Ingest (post_events) has folded every NEW key since this fix shipped,
+    # but a file already written under the raw, over-budget name would
+    # otherwise keep choking commit()/_count_dead forever, even post-fix.
+    # Never raises: a boot pass must not crash-loop the container.
+    try:
+        _migrated, _skipped = await registry.queue_manager.migrate_overlong_keys()
+    except Exception:
+        logger.exception("startup_recovery: overlong-key migration failed; continuing")
+    else:
+        if _migrated or _skipped:
+            logger.info(
+                "startup_recovery: migrated %d overlong worker key(s), "
+                "%d skipped (folded target already existed)",
+                _migrated,
+                _skipped,
+            )
     # Crash recovery: on startup, respawn one drainer per
     # session that still has an undrained, complete line. The workspace is
     # parsed from that session's FIRST log line so the respawned worker is
@@ -385,7 +404,7 @@ async def _startup_recovery_body(app: FastAPI) -> None:
             _reclaimed_keys,
             _reclaimed_bytes,
         ) = await registry.queue_manager.reclaim_drained_orphans()
-    except Exception:  # noqa: BLE001 - disk reclaim must never fail a boot
+    except Exception:
         logger.exception("startup_recovery: orphan reclaim failed; continuing")
     else:
         if _reclaimed_keys:
@@ -471,14 +490,15 @@ async def _enqueue_native_recovery_receipt(
         "_recovery_origin": origin,
     }
     session_id = payload["data"]["session_id"]
+    worker_key = _recovery_worker_key(session_id)
     await recovery_registry.queue_manager.append(
-        session_id, json.dumps(payload, separators=(",", ":")).encode()
+        worker_key, json.dumps(payload, separators=(",", ":")).encode()
     )
     try:
         await receipts.mark(origin, "enqueued")
     finally:
         recovery_registry.get_or_create(
-            session_id, receipt["workspace"], created_by=receipt["actor"]
+            worker_key, receipt["workspace"], created_by=receipt["actor"]
         )
 
 
@@ -506,7 +526,7 @@ async def _reconcile_native_recovery_outbox_unlocked(app: FastAPI) -> None:
             await receipts.mark(origin, "enqueued")
             payload = receipt["payload"]
             recovery_registry.get_or_create(
-                payload["data"]["session_id"],
+                _recovery_worker_key(payload["data"]["session_id"]),
                 receipt["workspace"],
                 created_by=receipt["actor"],
             )
@@ -868,6 +888,36 @@ def _workspace_slug(workspace: str) -> str:
     """Return a filesystem-safe slug for a workspace (session-less log stem)."""
     slug = re.sub(r"[^a-z0-9]+", "-", (workspace or "").lower()).strip("-")
     return slug or "default"
+
+
+def _events_worker_key(session_id: str, workspace: str) -> str:
+    """The single derivation of a live-ingest (``/events``) worker key.
+
+    Empty ``session_id`` maps to a per-workspace sentinel stem so
+    session-less events from distinct workspaces never collide in one log.
+    Always folded through ``fold_worker_key`` -- a raw key (in practice, a
+    deeply-nested sub-agent session id) can exceed the filesystem budget
+    ``queue_manager`` derives its on-disk filenames within; folding bounds
+    it BEFORE it ever reaches the queue. This is the ONLY place `/events`
+    derives a worker key, so ingest and any respawn/reconcile path that
+    re-derives the same key can never drift apart.
+    """
+    raw = session_id or (_NO_SESSION_PREFIX + _workspace_slug(workspace))
+    return fold_worker_key(raw)
+
+
+def _recovery_worker_key(session_id: str) -> str:
+    """The single derivation of a native-recovery (``/recovery/events``) worker key.
+
+    Recovery events always carry a validated, non-empty ``session_id`` (see
+    ``post_recovery_events``), so no sentinel is needed -- only the same
+    length-bounding fold as ``_events_worker_key`` applies. Used by every
+    site that derives a recovery worker key from a receipt
+    (``_enqueue_native_recovery_receipt``,
+    ``_reconcile_native_recovery_outbox_unlocked``) so they can never
+    compute different keys for the same session.
+    """
+    return fold_worker_key(session_id)
 
 
 def _validate_data_timestamp(data: dict[str, Any]) -> None:
@@ -1515,9 +1565,8 @@ async def post_events(
                 session_id,
             )
             return EventResponse(status="duplicate", session_id=session_id or None)
-    # Empty session_id maps to a per-workspace sentinel stem so session-less
-    # events from distinct workspaces never collide in one log.
-    worker_key = session_id or (_NO_SESSION_PREFIX + _workspace_slug(request.workspace))
+    # See _events_worker_key for the sentinel/fold derivation.
+    worker_key = _events_worker_key(session_id, request.workspace)
     # Spawn (or reuse) the sticky drainer keyed by worker_key.
     registry.get_or_create(worker_key, request.workspace, created_by=contributor_id)
     # Re-parse the raw validated body bytes and stamp server-assigned envelope

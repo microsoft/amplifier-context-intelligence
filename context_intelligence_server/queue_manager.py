@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -46,6 +47,84 @@ _T = TypeVar("_T")
 # and loading one into RAM just to count newlines is what drove ~44 GB RSS at
 # startup. 1 MiB balances syscall count against per-scan memory.
 _SCAN_CHUNK_BYTES = 1 << 20
+
+# --- worker-key length budget --------------------------------------------
+#
+# INCIDENT (production): a worker key derived straight from a deeply-nested
+# sub-agent session id could exceed the filesystem's NAME_MAX (255 bytes),
+# because every on-disk artifact's filename is derived from it with NO
+# length bound: ``.log`` (+4), ``.offset`` (+7), ``.dead.jsonl`` (+11), and
+# -- the widest, and the one that actually broke in production --
+# ``commit()``'s per-call temp file ``.offset.<32-hex-uuid>.tmp`` (+44).
+# Once a key crossed that last threshold, ``commit()`` could never again
+# succeed: the committed offset could never advance, drain workers crashed
+# and respawned forever, and each respawn re-dispatched the same batch to
+# Neo4j on every incoming event.
+#
+# ``fold_worker_key`` below closes this: every worker key is bounded to fit
+# under the worst-case suffix BEFORE it ever reaches the filesystem.
+_NAME_MAX = 255
+_MAX_SUFFIX_BYTES = len(".offset.") + 32 + len(".tmp")  # commit()'s tmp suffix: 44
+_MAX_KEY_BYTES = _NAME_MAX - _MAX_SUFFIX_BYTES  # 211
+_FOLD_DIGEST_CHARS = 16
+_FOLD_SEP = "~"
+
+
+def fold_worker_key(key: str) -> str:
+    """Fold *key* to fit under ``_MAX_KEY_BYTES`` UTF-8 bytes, or return it unchanged.
+
+    Every on-disk artifact this module derives (``.log``, ``.offset``,
+    ``.dead.jsonl``, and ``commit()``'s per-call temp file) uses *key* as
+    its filename stem. ``_MAX_KEY_BYTES`` is sized so that even the WIDEST
+    suffix -- ``commit()``'s ``.offset.<32-hex>.tmp`` -- never crosses the
+    filesystem's ``NAME_MAX`` (255 bytes). See the module-level comment
+    above for the incident this closes.
+
+    A key at or under the budget is returned BYTE-IDENTICAL -- this is the
+    back-compat guarantee: every worker key in use today is under this
+    budget, so every existing spool file keeps its name and this function
+    is a no-op for them.
+
+    A key over budget folds to ``<truncated-prefix>~<16-hex-digest>``,
+    sized to land AT ``_MAX_KEY_BYTES`` bytes (exactly, for any prefix that
+    doesn't need multi-byte truncation -- e.g. every ASCII key; a few bytes
+    under when the cut point would otherwise split a codepoint, see below):
+
+    - The digest is the first 16 hex characters of
+      ``sha256(key.encode("utf-8")).hexdigest()``, computed over the WHOLE
+      original key -- so two long keys sharing a common prefix still fold
+      to different names.
+    - The prefix is truncated on a UTF-8 character boundary: a multi-byte
+      codepoint straddling the cut point is dropped WHOLE, never split, so
+      the result is always valid UTF-8 (this is the only case where the
+      folded length lands under, not at, the budget).
+    - Any ``/``, ``\\``, or ``\\0`` surviving into the prefix is replaced
+      with ``_`` -- the same characters ``_validate_session_id`` rejects --
+      so a folded key can never be filesystem-unsafe even when the
+      original (long) key was.
+
+    Deterministic and IDEMPOTENT: a folded key is always <= the budget, so
+    ``fold_worker_key(fold_worker_key(k)) == fold_worker_key(k)`` for every
+    ``k`` -- a respawned drainer, a boot recovery scan, and the original
+    ingest path always compute the same key from the same session_id.
+    """
+    encoded = key.encode("utf-8")
+    if len(encoded) <= _MAX_KEY_BYTES:
+        return key
+    digest = hashlib.sha256(encoded).hexdigest()[:_FOLD_DIGEST_CHARS]
+    suffix = _FOLD_SEP + digest
+    prefix_budget = _MAX_KEY_BYTES - len(suffix.encode("utf-8"))
+    truncated = encoded[:prefix_budget]
+    while truncated:
+        try:
+            prefix = truncated.decode("utf-8")
+            break
+        except UnicodeDecodeError:
+            truncated = truncated[:-1]
+    else:
+        prefix = ""
+    prefix = prefix.replace("/", "_").replace("\\", "_").replace("\0", "_")
+    return prefix + suffix
 
 
 @dataclass(frozen=True)
@@ -194,9 +273,13 @@ class QueueManager:
                             except (ValueError, UnicodeDecodeError):
                                 continue
                             candidate = envelope.get("_recovery_origin")
-                            if isinstance(candidate, dict) and json.dumps(
-                                candidate, sort_keys=True, separators=(",", ":")
-                            ) == encoded:
+                            if (
+                                isinstance(candidate, dict)
+                                and json.dumps(
+                                    candidate, sort_keys=True, separators=(",", ":")
+                                )
+                                == encoded
+                            ):
                                 return True
                 except OSError:
                     continue
@@ -220,9 +303,13 @@ class QueueManager:
                             except (ValueError, TypeError, UnicodeDecodeError):
                                 continue
                             candidate = envelope.get("_recovery_origin")
-                            if isinstance(candidate, dict) and json.dumps(
-                                candidate, sort_keys=True, separators=(",", ":")
-                            ) == encoded:
+                            if (
+                                isinstance(candidate, dict)
+                                and json.dumps(
+                                    candidate, sort_keys=True, separators=(",", ":")
+                                )
+                                == encoded
+                            ):
                                 return True
                 except OSError:
                     continue
@@ -324,6 +411,21 @@ class QueueManager:
             or "\0" in session_id
         ):
             raise ValueError(f"Invalid session_id: {session_id!r}")
+        # Defense in depth: every real caller folds its worker key through
+        # ``fold_worker_key`` before it ever reaches here (see main.py), so
+        # this should never fire in production. It exists for the case a
+        # future/internal caller forgets to fold. MUST be ValueError, never
+        # OSError: ``_is_transient_infra_error`` (registry.py) allow-lists
+        # bare OSError as retry-forever-never-dead-letter, and an OSError
+        # here would misclassify a permanently oversized key as transient,
+        # stalling that session's drain forever instead of failing loud.
+        length = len(session_id.encode("utf-8"))
+        if length > _MAX_KEY_BYTES:
+            raise ValueError(
+                f"session_id too long: {length} bytes (max {_MAX_KEY_BYTES}); "
+                "callers must fold worker keys via fold_worker_key() before "
+                "passing them to QueueManager"
+            )
 
     @contextlib.contextmanager
     def _guard(self, worker_key: str) -> Iterator[_KeyGuard]:
@@ -887,6 +989,106 @@ class QueueManager:
             keys.add(dead.name[: -len(".dead.jsonl")])
         return sorted(keys)
 
+    async def _migrate_one_key(self, key: str) -> str:
+        """Rename one over-budget key's artifacts onto its folded name.
+
+        Returns ``"migrated"``, ``"skipped"`` (folded target already
+        exists -- nothing touched), or ``"noop"`` (nothing existed under
+        the raw name to move, or the key was not actually over budget).
+        """
+        folded = fold_worker_key(key)
+        if folded == key:
+            return "noop"
+
+        def _do_migrate(guard: _KeyGuard) -> str:
+            with guard.file_lock:
+                triples = (
+                    (self._log_path(key), self._log_path(folded)),
+                    (self._offset_path(key), self._offset_path(folded)),
+                    (self._dead_path(key), self._dead_path(folded)),
+                )
+                existing = [(src, dst) for src, dst in triples if src.exists()]
+                if not existing:
+                    return "noop"
+                collided = [(src, dst) for src, dst in existing if dst.exists()]
+                if collided:
+                    for src, dst in collided:
+                        logger.error(
+                            "migrate_overlong_keys_collision src=%s dst=%s "
+                            "(folded target already exists -- skipping this "
+                            "key, nothing renamed or overwritten; resolve "
+                            "by hand)",
+                            src,
+                            dst,
+                        )
+                    return "skipped"
+                for src, dst in existing:
+                    os.replace(src, dst)
+                return "migrated"
+
+        with self._guard(key) as guard:
+            async with guard.admission:
+                result = await _await_uninterrupted(
+                    asyncio.to_thread(_do_migrate, guard)
+                )
+                if guard.waiters == 1 and self._guards.get(key) is guard:
+                    del self._guards[key]
+        return result
+
+    async def migrate_overlong_keys(self) -> tuple[int, int]:
+        """One-shot boot migration: rename existing over-budget-key artifacts.
+
+        Before ``fold_worker_key`` existed, a worker key derived straight
+        from a deeply-nested sub-agent session id could exceed
+        ``_MAX_KEY_BYTES``, and ``.log``/``.offset``/``.dead.jsonl`` files
+        were written under that raw, over-budget name. Ingest now always
+        folds a key before it ever reaches the filesystem (see
+        ``fold_worker_key``), but a file already written under the raw name
+        would otherwise choke ``commit()``/``_count_dead`` forever, even
+        after the fix ships. This pass renames every such file onto its
+        folded name.
+
+        Must run before ``recovery_reconcile_dead``/``recovery_seed_counts``/
+        ``recover()`` -- i.e. first thing in the boot sequence -- so those
+        passes, the stats refresher, and respawned drainers all see the
+        folded name from the start. See ``_startup_recovery_body`` in
+        main.py for the call order.
+
+        Idempotent: a second run finds no key over ``_MAX_KEY_BYTES``
+        (every artifact from the first run is already under its folded
+        name) and changes nothing. Never raises: this is a boot-path pass
+        and one bad key must not crash-loop the container.
+
+        Returns ``(migrated, skipped)``. A key is ``skipped`` -- and
+        NOTHING is renamed for it -- when its folded target ALREADY
+        EXISTS: this is never merged or overwritten (silent data loss is
+        unacceptable), and is instead logged as an ERROR naming both paths
+        for an operator to resolve by hand.
+        """
+        overlong = sorted(
+            key
+            for key in self._all_worker_keys()
+            if len(key.encode("utf-8")) > _MAX_KEY_BYTES
+        )
+        migrated = 0
+        skipped = 0
+        for key in overlong:
+            try:
+                result = await self._migrate_one_key(key)
+            except (OSError, ValueError):
+                logger.exception("migrate_overlong_keys_key_failed key=%s", key)
+                continue
+            if result == "migrated":
+                migrated += 1
+            elif result == "skipped":
+                skipped += 1
+        if migrated or skipped:
+            logger.info(
+                "migrate_overlong_keys: migrated=%d skipped=%d", migrated, skipped
+            )
+            self._stats_cache = None
+        return migrated, skipped
+
     async def refresh_all_stats(self) -> dict[str, Any]:
         """Scan the spool and refresh the snapshot ``derive_all_stats()`` serves.
 
@@ -916,21 +1118,28 @@ class QueueManager:
             in_queue_total = 0
             dead_total = 0
             for worker_key in self._all_worker_keys():
+                # Fault-isolate PER KEY -- the WHOLE per-key body, not just
+                # the offset read. INCIDENT: an over-budget worker key made
+                # `_count_newlines`/`_count_dead` raise OSError (unguarded),
+                # which aborted `_all()` before it returned -- so ONE
+                # poisoned key stopped `_stats_cache` from ever updating
+                # again for EVERY key, and `derive_all_stats()` reported
+                # `stats_available: False` fleet-wide. Mirrors the
+                # established per-key isolation in recover(),
+                # recovery_seed_counts(), active_sessions(), and
+                # refresh_spool_stats() -- skip, don't degrade-and-continue.
                 try:
                     committed = self._read_committed_offset(worker_key)
+                    # Streamed count of complete lines from committed -> EOF:
+                    # numerically equivalent to a full-file count, without
+                    # materialising a possibly multi-GB undrained tail.
+                    in_queue = self._count_newlines(worker_key, committed)
+                    dead = self._count_dead(worker_key)
                 except (OSError, ValueError):
-                    # Must not 500 the health probe: degrade to 0, mirroring
-                    # the missing-file->0 convention in
-                    # _read_committed_offset. No logging here -- /status is
-                    # polled; a persistently-corrupt offset would flood the
-                    # hot path. Visible instead via the aggregate
-                    # `spool.corrupt_offsets` field (see spool_stats()).
-                    committed = 0
-                # Streamed count of complete lines from committed -> EOF:
-                # numerically equivalent to a full-file count, without
-                # materialising a possibly multi-GB undrained tail.
-                in_queue = self._count_newlines(worker_key, committed)
-                dead = self._count_dead(worker_key)
+                    logger.error(
+                        "refresh_all_stats_key_failed worker_key=%s", worker_key
+                    )
+                    continue
                 per_key.append(
                     {"worker_key": worker_key, "in_queue": in_queue, "dead": dead}
                 )
