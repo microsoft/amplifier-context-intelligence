@@ -884,6 +884,56 @@ class TestDurableDrainLoop:
         assert (await qm.read_batch(sid, 10)).lines == []  # offset advanced to EOF
         worker.services.graph.flush.assert_awaited()
 
+    async def test_drain_advances_offset_for_a_folded_long_worker_key(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """A worker key derived from a deeply-nested sub-agent session id
+        used to make EVERY commit() fail (ENAMETOOLONG on the +44-byte tmp
+        suffix), so the offset could never advance: the drainer crashed and
+        respawned forever, re-dispatching the same batch on every event
+        (INCIDENT). Folding the key first (exactly what main.py's ingest
+        path does) makes this session drain and complete normally instead.
+        """
+        from context_intelligence_server.queue_manager import fold_worker_key
+
+        long_session_id = "sub-agent-chain-" + ("segment-" * 40)  # far over budget
+        worker_key = fold_worker_key(long_session_id)
+        assert worker_key != long_session_id  # sanity: this WOULD have broken pre-fix
+
+        reg, qm = reg_qm
+        worker = SessionWorker(
+            session_id=worker_key,
+            workspace="/ws",
+            services=HookStateService(workspace="/ws"),
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ) as mock_process:
+            await qm.append(
+                worker_key,
+                _line("tool:pre", "/ws", {"session_id": long_session_id}),
+            )
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if (await qm.read_batch(worker_key, 10)).lines == []:
+                    break
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        mock_process.assert_awaited()
+        # The committed offset advanced -- the historical bug is that
+        # commit() raised OSError here forever, and the offset stayed 0.
+        assert (await qm.read_batch(worker_key, 10)).lines == []
+        worker.services.graph.flush.assert_awaited()
+
     async def test_offset_not_committed_when_flush_fails(
         self, reg_qm: tuple[SessionRegistry, Any]
     ) -> None:
@@ -2400,7 +2450,9 @@ class TestParseLineWorkingDir:
                 "data": {"session_id": "s1"},
             }
         ).encode("utf-8")
-        event, workspace, working_dir, data, event_identity = SessionRegistry._parse_line(raw)
+        event, workspace, working_dir, data, event_identity = (
+            SessionRegistry._parse_line(raw)
+        )
         assert event == "tool:pre"
         assert workspace == "-ws"
         assert working_dir == "/home/user/project"
@@ -2615,12 +2667,14 @@ class TestTransientInfraFailuresAreNeverDeadLettered:
             Record(_line("tool:pre", "/ws", {"session_id": sid}) + b"\n", 0, 80)
         ]
 
-        with patch(
-            "context_intelligence_server.registry.process_event",
-            new_callable=AsyncMock,
+        with (
+            patch(
+                "context_intelligence_server.registry.process_event",
+                new_callable=AsyncMock,
+            ),
+            pytest.raises(registry_module._TransientInfraFailure),
         ):
-            with pytest.raises(registry_module._TransientInfraFailure):
-                await reg._handle_exhausted_batch(worker, healthy, handlers=MagicMock())
+            await reg._handle_exhausted_batch(worker, healthy, handlers=MagicMock())
 
         qm.dead_letter.assert_not_awaited()
         qm.commit.assert_not_awaited()
@@ -2680,7 +2734,33 @@ class TestTransientInfraFailuresAreNeverDeadLettered:
         assert is_transient(OSError("connection reset"))
 
         # Deterministic -- dead-letterable.
-        assert not is_transient(ValueError("Invalid Neo4j label identifier: 'X-yEvent'"))
+        assert not is_transient(
+            ValueError("Invalid Neo4j label identifier: 'X-yEvent'")
+        )
         assert not is_transient(ClientError("bad cypher"))
         assert not is_transient(json.JSONDecodeError("boom", "{", 0))
         assert not is_transient(RuntimeError("handler bug"))
+
+    def test_over_budget_worker_key_value_error_is_not_transient(self) -> None:
+        """QueueManager._validate_session_id's over-length rejection MUST be
+        classified as poison (dead-letterable), never as transient infra.
+
+        If this were misclassified as transient (e.g. if it were an OSError
+        instead of a ValueError), a permanently-oversized worker key would
+        retry forever and never dead-letter -- a silent, permanent stall
+        strictly worse than the crash-loop it replaces. See
+        queue_manager.py's ``_validate_session_id`` for the raise site this
+        pins.
+        """
+        from context_intelligence_server.queue_manager import (
+            _MAX_KEY_BYTES,
+            QueueManager,
+        )
+
+        is_transient = registry_module._is_transient_infra_error
+
+        too_long = "x" * (_MAX_KEY_BYTES + 1)
+        with pytest.raises(ValueError, match="too long") as excinfo:
+            QueueManager._validate_session_id(too_long)
+
+        assert not is_transient(excinfo.value)
