@@ -18,7 +18,6 @@ import asyncio
 import base64
 import contextlib
 import errno
-import hashlib
 import json
 import logging
 import os
@@ -29,6 +28,8 @@ from collections.abc import Coroutine, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
+
+from context_intelligence_server.utils import fold_name
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +64,14 @@ _SCAN_CHUNK_BYTES = 1 << 20
 # Neo4j on every incoming event.
 #
 # ``fold_worker_key`` below closes this: every worker key is bounded to fit
-# under the worst-case suffix BEFORE it ever reaches the filesystem.
+# under the worst-case suffix BEFORE it ever reaches the filesystem. The
+# actual fold algorithm lives in ``utils.fold_name`` -- shared with
+# ``blob_store.py``, which hits the identical incident shape for its own
+# session-id/blob-key filenames -- parameterised by this module's own
+# worst-case suffix budget.
 _NAME_MAX = 255
 _MAX_SUFFIX_BYTES = len(".offset.") + 32 + len(".tmp")  # commit()'s tmp suffix: 44
 _MAX_KEY_BYTES = _NAME_MAX - _MAX_SUFFIX_BYTES  # 211
-_FOLD_DIGEST_CHARS = 16
-_FOLD_SEP = "~"
 
 
 def fold_worker_key(key: str) -> str:
@@ -89,7 +92,7 @@ def fold_worker_key(key: str) -> str:
     A key over budget folds to ``<truncated-prefix>~<16-hex-digest>``,
     sized to land AT ``_MAX_KEY_BYTES`` bytes (exactly, for any prefix that
     doesn't need multi-byte truncation -- e.g. every ASCII key; a few bytes
-    under when the cut point would otherwise split a codepoint, see below):
+    under when the cut point would otherwise split a codepoint):
 
     - The digest is the first 16 hex characters of
       ``sha256(key.encode("utf-8")).hexdigest()``, computed over the WHOLE
@@ -108,24 +111,10 @@ def fold_worker_key(key: str) -> str:
     ``fold_worker_key(fold_worker_key(k)) == fold_worker_key(k)`` for every
     ``k`` -- a respawned drainer, a boot recovery scan, and the original
     ingest path always compute the same key from the same session_id.
+
+    See ``utils.fold_name`` for the shared algorithm this wraps.
     """
-    encoded = key.encode("utf-8")
-    if len(encoded) <= _MAX_KEY_BYTES:
-        return key
-    digest = hashlib.sha256(encoded).hexdigest()[:_FOLD_DIGEST_CHARS]
-    suffix = _FOLD_SEP + digest
-    prefix_budget = _MAX_KEY_BYTES - len(suffix.encode("utf-8"))
-    truncated = encoded[:prefix_budget]
-    while truncated:
-        try:
-            prefix = truncated.decode("utf-8")
-            break
-        except UnicodeDecodeError:
-            truncated = truncated[:-1]
-    else:
-        prefix = ""
-    prefix = prefix.replace("/", "_").replace("\\", "_").replace("\0", "_")
-    return prefix + suffix
+    return fold_name(key, _MAX_KEY_BYTES)
 
 
 @dataclass(frozen=True)

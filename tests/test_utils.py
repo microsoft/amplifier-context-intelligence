@@ -13,6 +13,7 @@ from context_intelligence_server.protocol import EventHandler, HookResult
 from context_intelligence_server.utils import (
     EventLogContext,
     HandlerLogger,
+    fold_name,
     make_edge_id,
     make_node_id,
 )
@@ -296,3 +297,78 @@ class TestMakeNodeIdDrainerGuard:
         msg = str(exc_info.value)
         assert "my-session" in msg
         assert "llm:request" in msg
+
+
+# ---------------------------------------------------------------------------
+# fold_name -- the shared, budget-parameterised length fold. Used by
+# queue_manager.fold_worker_key (budget 211) and blob_store's session-id
+# (budget 255) / blob-key (budget 242) folding -- both hit the same
+# incident shape (an unbounded identifier overflowing a derived filesystem
+# name) at different budgets, so the algorithm lives here once.
+# ---------------------------------------------------------------------------
+
+
+class TestFoldName:
+    @pytest.mark.parametrize("budget", [211, 242, 255])
+    @pytest.mark.parametrize("length", [0, 1, 100])
+    def test_under_budget_returned_byte_identical(self, budget, length):
+        value = "a" * length
+        assert fold_name(value, budget) == value
+
+    @pytest.mark.parametrize("budget", [211, 242, 255])
+    def test_at_budget_returned_byte_identical(self, budget):
+        value = "a" * budget
+        assert fold_name(value, budget) == value
+
+    @pytest.mark.parametrize("budget", [211, 242, 255])
+    @pytest.mark.parametrize("overshoot", [1, 100, 5000])
+    def test_over_budget_lands_at_exactly_the_budget(self, budget, overshoot):
+        """Every over-budget ASCII value folds to EXACTLY `budget` bytes
+        (ASCII never straddles a UTF-8 multi-byte boundary)."""
+        value = "a" * (budget + overshoot)
+        folded = fold_name(value, budget)
+        assert folded != value
+        assert len(folded.encode("utf-8")) == budget
+
+    @pytest.mark.parametrize("budget", [211, 242, 255])
+    def test_idempotent(self, budget):
+        for value in ("a" * 50, "a" * (budget + 1), "a" * 9000):
+            once = fold_name(value, budget)
+            assert fold_name(once, budget) == once
+
+    @pytest.mark.parametrize("budget", [211, 242, 255])
+    def test_deterministic(self, budget):
+        value = "determinism-" + ("a" * 500)
+        assert fold_name(value, budget) == fold_name(value, budget)
+
+    @pytest.mark.parametrize("budget", [211, 242, 255])
+    def test_shared_prefix_folds_to_different_names(self, budget):
+        """Two long values sharing a 300-byte common prefix must fold to
+        DIFFERENT names -- the digest is computed over the WHOLE value,
+        not just the truncated prefix, so a shared prefix alone can't
+        collide two distinct identifiers onto the same folded name."""
+        shared = "shared-prefix-" + ("p" * 300)
+        value_a = shared + "-tail-a"
+        value_b = shared + "-tail-b"
+        assert fold_name(value_a, budget) != fold_name(value_b, budget)
+
+    @pytest.mark.parametrize("budget", [211, 242, 255])
+    def test_never_exceeds_budget_even_across_a_multibyte_boundary(self, budget):
+        """A value whose UTF-8 encoding puts a multi-byte codepoint
+        straddling the truncation cut point must still fold to valid
+        UTF-8, at or under budget -- never split mid-codepoint (which
+        would raise or corrupt), and never over budget."""
+        for extra_chars in range(1, 12):
+            value = "\u2603" * (100 + extra_chars)  # SNOWMAN, 3 bytes/char
+            folded = fold_name(value, budget)
+            encoded = folded.encode("utf-8")  # raises if not valid UTF-8
+            assert len(encoded) <= budget
+            assert "/" not in folded and "\\" not in folded and "\0" not in folded
+
+    def test_folded_value_never_contains_unsafe_characters(self):
+        """Even if unsafe characters land in the surviving prefix, the
+        fold replaces them -- a folded value can never be
+        filesystem-unsafe."""
+        value = ("a/b\\c\0d" * 50) + ("x" * 200)  # forces truncation mid-prefix
+        folded = fold_name(value, 211)
+        assert "/" not in folded and "\\" not in folded and "\0" not in folded
