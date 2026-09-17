@@ -103,6 +103,16 @@ class _TransientInfraFailure(Exception):
     """
 
 
+class _QueueCommitFailure(Exception):
+    """Internal boundary marker for an acknowledgement failure.
+
+    Delivery failures are retried or isolated because they may belong to a
+    particular payload.  A queue acknowledgement is different: its outcome is
+    ambiguous, so the worker must die and recovery must reconcile the durable
+    offset rather than retrying handlers or quarantining a healthy record.
+    """
+
+
 # Bounded retry count for the finalize delete-drained loop; not operator-tunable.
 # No backoff between attempts -- sleeping would widen the race window this closes.
 _FINALIZE_DELETE_ATTEMPTS = 3
@@ -578,7 +588,15 @@ class SessionRegistry:
         async with self._recovery_write_guard():
             await self._flush_barrier(worker)
             await self._before_commit(worker, records)
-            await self.queue_manager.commit(worker.session_id, commit_to)
+            try:
+                await self.queue_manager.commit(worker.session_id, commit_to)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Keep the recovery pause guard around the acknowledgement,
+                # while allowing callers to keep the established supervision
+                # boundary for ambiguous queue-commit failures.
+                raise _QueueCommitFailure from exc
 
     async def _commit_after_recovery_guard(
         self, worker: SessionWorker, commit_to: int
@@ -725,6 +743,12 @@ class SessionRegistry:
                         else batch.records[:safe_count]
                     )
                     await self._flush_and_commit(worker, committed_records, commit_to)
+                except _QueueCommitFailure as failure:
+                    # An acknowledgement's outcome is ambiguous.  It must
+                    # escape the payload retry/dead-letter policy and be
+                    # handled by the sole drain-worker supervisor.
+                    assert failure.__cause__ is not None
+                    raise failure.__cause__ from None
                 except asyncio.CancelledError:
                     # INFO not ERROR: a cancel here is normally deliberate
                     # (shutdown, idle reap, test teardown), not a failure.
@@ -1027,6 +1051,11 @@ class SessionRegistry:
                 await self._flush_and_commit(worker, [rec], rec.end)
                 wrote = True
                 committed = True
+            except _QueueCommitFailure as failure:
+                # See drain_worker: queue commits are never retried as
+                # delivery failures or converted into a dead letter.
+                assert failure.__cause__ is not None
+                raise failure.__cause__ from None
             except Exception as exc:
                 if _is_transient_infra_error(exc):
                     # NOT this record's fault -- the database is unreachable.
@@ -1078,6 +1107,12 @@ class SessionRegistry:
             try:
                 await self._process_batch(worker, tail, handlers)
                 await self._flush_and_commit(worker, tail.records, tail.end_offset)
+            except _QueueCommitFailure as failure:
+                # Finalization cannot safely turn an ambiguous queue commit
+                # into an orphan: the main supervisor must close and
+                # deregister it for a fresh recovery worker.
+                assert failure.__cause__ is not None
+                raise failure.__cause__ from None
             except Exception:
                 logger.exception("finalize_tail_flush_failed session=%s", session_id)
                 return False  # NOT finalized: keep worker alive, tail uncommitted
