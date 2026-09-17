@@ -155,7 +155,7 @@ async def replay_dead_letters(worker_key: str, request: Request) -> dict[str, An
         parsed = _parse_workspace_and_creator(raw)
         workspace, created_by = parsed if parsed is not None else ("", None)
         registry.get_or_create(worker_key, workspace, created_by=created_by)
-        await qm.append(worker_key, raw)
+        await request.app.state.append_live_record(worker_key, raw)
         replayed += 1
 
     await qm.purge_dead_letters(worker_key)

@@ -22,11 +22,12 @@ import logging
 import os
 import threading
 import time
+import unicodedata
 import uuid
 from collections.abc import Coroutine, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,36 @@ _T = TypeVar("_T")
 # and loading one into RAM just to count newlines is what drove ~44 GB RSS at
 # startup. 1 MiB balances syscall count against per-scan memory.
 _SCAN_CHUNK_BYTES = 1 << 20
+# POSIX NAME_MAX applies to every concrete queue filename, not just the raw
+# session-id stem. ``commit()`` creates the longest one:
+# ``<session_id>.offset.<uuid4().hex>.tmp``. The other names (``.log``,
+# ``.offset``, and ``.dead.jsonl``) are shorter. Keep this derivation next to
+# the filename constructors so changing the temp-name protocol cannot silently
+# reintroduce ENAMETOOLONG after a record has been durably admitted.
+QUEUE_FILENAME_NAME_MAX = 255
+_COMMIT_TEMP_FILENAME_SUFFIX = ".offset." + ("0" * 32) + ".tmp"
+MAX_SESSION_ID_BYTES = QUEUE_FILENAME_NAME_MAX - len(_COMMIT_TEMP_FILENAME_SUFFIX)
+
+
+def is_safe_session_id(session_id: object) -> bool:
+    """Whether *session_id* is safe as one bounded queue filename component."""
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or session_id in {".", ".."}
+        or "/" in session_id
+        or "\\" in session_id
+    ):
+        return False
+    try:
+        if len(session_id.encode("utf-8")) > MAX_SESSION_ID_BYTES:
+            return False
+    except UnicodeEncodeError:
+        return False
+    return not any(
+        ord(char) < 32 or ord(char) == 127 or unicodedata.category(char) == "Cc"
+        for char in session_id
+    )
 
 
 @dataclass(frozen=True)
@@ -175,6 +206,18 @@ class QueueManager:
     def _dead_path(self, session_id: str) -> Path:
         return self._dir / f"{session_id}.dead.jsonl"
 
+    @staticmethod
+    def _matches_recovery_origin(envelope: Any, encoded_origin: str) -> bool:
+        """Return whether a decoded durable envelope has the requested origin."""
+        if not isinstance(envelope, dict):
+            return False
+        candidate = envelope.get("_recovery_origin")
+        return (
+            isinstance(candidate, dict)
+            and json.dumps(candidate, sort_keys=True, separators=(",", ":"))
+            == encoded_origin
+        )
+
     async def contains_recovery_origin(self, origin: dict[str, Any]) -> bool:
         """Return whether the separate recovery spool already holds *origin*.
 
@@ -193,14 +236,47 @@ class QueueManager:
                                 envelope = json.loads(raw)
                             except (ValueError, UnicodeDecodeError):
                                 continue
-                            candidate = envelope.get("_recovery_origin")
-                            if isinstance(candidate, dict) and json.dumps(
-                                candidate, sort_keys=True, separators=(",", ":")
-                            ) == encoded:
+                            if self._matches_recovery_origin(envelope, encoded):
                                 return True
                 except OSError:
                     continue
             return False
+
+        return await asyncio.to_thread(_scan)
+
+    async def recovery_origin_commit_state(
+        self, origin: dict[str, Any]
+    ) -> Literal["queued", "committed"] | None:
+        """Return the durable queue state for one recovery origin.
+
+        A ``committed`` result is an explicit proof that this server's drainer
+        completed its graph-flush barrier before acknowledging the record. It
+        is intentionally distinct from merely finding an ``enqueued`` receipt:
+        a queued record still has to be replayed and must not be terminalized.
+        """
+        encoded = json.dumps(origin, sort_keys=True, separators=(",", ":"))
+
+        def _scan() -> Literal["queued", "committed"] | None:
+            queued = False
+            for path in self._dir.glob("*.log"):
+                try:
+                    committed = self._read_committed_offset(path.stem)
+                    position = 0
+                    with path.open("rb") as stream:
+                        for raw in stream:
+                            end = position + len(raw)
+                            position = end
+                            try:
+                                envelope = json.loads(raw)
+                            except (ValueError, UnicodeDecodeError):
+                                continue
+                            if self._matches_recovery_origin(envelope, encoded):
+                                if end <= committed:
+                                    return "committed"
+                                queued = True
+                except FileNotFoundError:
+                    continue
+            return "queued" if queued else None
 
         return await asyncio.to_thread(_scan)
 
@@ -219,16 +295,37 @@ class QueueManager:
                                 envelope = json.loads(payload) if payload else {}
                             except (ValueError, TypeError, UnicodeDecodeError):
                                 continue
-                            candidate = envelope.get("_recovery_origin")
-                            if isinstance(candidate, dict) and json.dumps(
-                                candidate, sort_keys=True, separators=(",", ":")
-                            ) == encoded:
+                            if self._matches_recovery_origin(envelope, encoded):
                                 return True
                 except OSError:
                     continue
             return False
 
         return await asyncio.to_thread(_scan)
+
+    async def has_pending_records(self) -> bool:
+        """Return whether any complete, uncommitted record exists.
+
+        This deliberately reads the durable queue rather than the asynchronous
+        status snapshot. Callers that need a live-first decision serialize
+        normal append with their admission gate; a read failure is unavailable,
+        never evidence that the queue is empty.
+        """
+
+        def _has_pending() -> bool:
+            try:
+                for key in self._all_worker_keys():
+                    committed = self._read_committed_offset(key)
+                    complete_end = self._complete_data_end(key)
+                    if committed < 0 or committed > complete_end:
+                        return True
+                    if complete_end > committed:
+                        return True
+            except (OSError, ValueError):
+                return True
+            return False
+
+        return await asyncio.to_thread(_has_pending)
 
     def _read_committed_offset(self, session_id: str) -> int:
         """Committed byte offset. A missing or empty ``.offset`` reads 0."""
@@ -317,12 +414,7 @@ class QueueManager:
 
     @staticmethod
     def _validate_session_id(session_id: str) -> None:
-        if (
-            not session_id
-            or "/" in session_id
-            or "\\" in session_id
-            or "\0" in session_id
-        ):
+        if not is_safe_session_id(session_id):
             raise ValueError(f"Invalid session_id: {session_id!r}")
 
     @contextlib.contextmanager

@@ -188,6 +188,10 @@ class SessionRegistry:
         # Durable-ingest infra, built lazily (see _ensure_infra) since the
         # module-level singleton is constructed before test settings patches apply.
         self._queue_manager: QueueManager | None = None
+        # Recovery configuration supplies a separate queue root, but it must
+        # remain only configuration until ASGI lifespan has acquired the
+        # process-wide lock.  _ensure_infra materializes QueueManager lazily.
+        self._configured_queues_path: Path | None = None
         self._write_semaphore: asyncio.Semaphore | None = None
         self._max_delivery_attempts: int = 0
         # Shared, pool-bounded Neo4j driver for every per-session Neo4jGraphStore
@@ -204,12 +208,25 @@ class SessionRegistry:
         # Monotonic time the residual first went positive (None = clean).
         # Gates `degraded` so transient clock skew doesn't latch it.
         self._residual_positive_since: float | None = None
-        # Optional internal completion hook used by the separate recovery
-        # spool. It receives the committed batch only after its graph flush.
+        # Optional internal hooks used by the separate recovery spool.
+        # ``on_batch_flushed`` runs after the graph-flush barrier but before
+        # the irreversible queue acknowledgement; it must succeed or the
+        # record remains replayable. ``on_batch_written`` is retained for
+        # best-effort notifications that are safe after a queue commit.
+        self.on_batch_flushed: Any | None = None
         self.on_batch_written: Any | None = None
+        # Like ``on_batch_flushed``, this terminal receipt transition is
+        # pre-commit.  A failure leaves the dead-lettered queue line replayable
+        # so recovery can reconcile its durable evidence; it must never be a
+        # best-effort notification after the offset has moved.
         self.on_record_quarantined: Any | None = None
         self.on_post_commit_failure: Any | None = None
         self.pre_flush: Any | None = None
+        # Optional context-manager factory for recovery-only graph writes and
+        # their following queue offset commit. It is deliberately separate
+        # from ``flush_gate``: the latter prioritizes live traffic, while this
+        # one lets an administrator atomically pause a recovery drain.
+        self.recovery_write_guard: Any | None = None
         self.flush_gate: LiveFirstFlushGate | None = None
         self.is_recovery: bool = False
         self.drain_batch_size: int = _DRAIN_MAX_BATCH
@@ -225,7 +242,7 @@ class SessionRegistry:
     ) -> "SessionRegistry":
         """Create the separately-spooled, live-prioritized recovery registry."""
         registry = cls()
-        registry._queue_manager = QueueManager(queues_path)
+        registry._configured_queues_path = queues_path
         registry._write_semaphore = shared_write_semaphore
         registry._max_delivery_attempts = max_delivery_attempts
         registry.flush_gate = flush_gate
@@ -241,10 +258,15 @@ class SessionRegistry:
         Idempotent: only the first call constructs; subsequent calls are no-ops.
         """
         if self._queue_manager is None:
-            settings = get_settings()
-            self._queue_manager = QueueManager(queues_dir=Path(settings.queues_path))
-            self._write_semaphore = asyncio.Semaphore(settings.write_concurrency)
-            self._max_delivery_attempts = settings.max_delivery_attempts
+            if self._configured_queues_path is not None:
+                self._queue_manager = QueueManager(self._configured_queues_path)
+            else:
+                settings = get_settings()
+                self._queue_manager = QueueManager(
+                    queues_dir=Path(settings.queues_path)
+                )
+                self._write_semaphore = asyncio.Semaphore(settings.write_concurrency)
+                self._max_delivery_attempts = settings.max_delivery_attempts
 
     @property
     def queue_manager(self) -> QueueManager:
@@ -529,6 +551,42 @@ class SessionRegistry:
         # reached and finished the write barrier.
         worker.last_successful_flush = time.time()
 
+    @asynccontextmanager
+    async def _recovery_write_guard(self) -> AsyncIterator[None]:
+        """Hold the optional recovery-only pause guard across flush and commit."""
+        if not self.is_recovery or self.recovery_write_guard is None:
+            yield
+            return
+        async with self.recovery_write_guard():
+            yield
+
+    async def _flush_and_commit(
+        self, worker: SessionWorker, records: list[Record], commit_to: int
+    ) -> None:
+        """Flush records and acknowledge their offset under the recovery guard.
+
+        The optional pre-flush hook runs immediately before this recovery
+        worker competes for a graph-write slot. Its guard remains held through
+        the dependent receipt transition and queue commit, so an administrator
+        pause cannot return while a recovery graph write or acknowledgement is
+        still in flight.
+        """
+        if self.is_recovery and self.pre_flush is not None:
+            ready = self.pre_flush()
+            if inspect.isawaitable(ready):
+                await ready
+        async with self._recovery_write_guard():
+            await self._flush_barrier(worker)
+            await self._before_commit(worker, records)
+            await self.queue_manager.commit(worker.session_id, commit_to)
+
+    async def _commit_after_recovery_guard(
+        self, worker: SessionWorker, commit_to: int
+    ) -> None:
+        """Commit an isolated/dead-lettered recovery record only when unpaused."""
+        async with self._recovery_write_guard():
+            await self.queue_manager.commit(worker.session_id, commit_to)
+
     async def _post_commit(self, worker: SessionWorker, records: list[Record]) -> None:
         """Best-effort receipt transition after an irreversible queue commit.
 
@@ -551,21 +609,30 @@ class SessionRegistry:
                 if inspect.isawaitable(retry):
                     asyncio.ensure_future(retry)
 
-    async def _post_quarantine(self, worker: SessionWorker, record: Record) -> None:
+    async def _before_commit(
+        self, worker: SessionWorker, records: list[Record]
+    ) -> None:
+        """Persist recovery completion after flush but before queue acknowledgement.
+
+        Unlike ``_post_commit``, failures propagate: advancing an offset when
+        its recovery receipt has not reached a durable terminal state would
+        strand the receipt after a crash. Replaying a record after this hook
+        succeeds is safe because graph writes and terminal receipt marks are
+        idempotent.
+        """
+        if self.on_batch_flushed is None or not records:
+            return
+        completed = self.on_batch_flushed(worker, records)
+        if inspect.isawaitable(completed):
+            await completed
+
+    async def _before_quarantine(self, worker: SessionWorker, record: Record) -> None:
+        """Persist a recovery quarantine transition before acknowledging its line."""
         if self.on_record_quarantined is None:
             return
-        try:
-            completed = self.on_record_quarantined(worker, record)
-            if inspect.isawaitable(completed):
-                await completed
-        except Exception:
-            logger.exception(
-                "quarantine_transition_failed session=%s", worker.session_id
-            )
-            if self.on_post_commit_failure is not None:
-                retry = self.on_post_commit_failure()
-                if inspect.isawaitable(retry):
-                    asyncio.ensure_future(retry)
+        completed = self.on_record_quarantined(worker, record)
+        if inspect.isawaitable(completed):
+            await completed
 
     async def drain_worker(
         self, worker: SessionWorker, flush_timeout: float = 30.0
@@ -651,7 +718,13 @@ class SessionRegistry:
                     safe_count, terminal_at = await self._process_batch(
                         worker, batch, handlers
                     )
-                    await self._flush_barrier(worker)
+                    commit_to = batch.end_offset if terminal_at is None else terminal_at
+                    committed_records = (
+                        batch.records
+                        if terminal_at is None
+                        else batch.records[:safe_count]
+                    )
+                    await self._flush_and_commit(worker, committed_records, commit_to)
                 except asyncio.CancelledError:
                     # INFO not ERROR: a cancel here is normally deliberate
                     # (shutdown, idle reap, test teardown), not a failure.
@@ -771,13 +844,8 @@ class SessionRegistry:
                 attempts = 0
                 # Commit only up to session:end -- leaving it uncommitted makes
                 # "ended but not finalized" durable across a respawn/recover().
-                commit_to = batch.end_offset if terminal_at is None else terminal_at
-                await qm.commit(session_id, commit_to)
                 counted = len(batch.records) if terminal_at is None else safe_count
                 self.record_written(counted)
-                committed_records = (
-                    batch.records if terminal_at is None else batch.records[:safe_count]
-                )
                 await self._post_commit(worker, committed_records)
                 logger.debug(
                     "batch_committed events=%d offset=%d",
@@ -933,8 +1001,10 @@ class SessionRegistry:
                     extra={"session_id": session_id},
                 )
                 worker.services.graph.discard_buffer()
-                await qm.commit(session_id, rec.end)  # queue-produced offset
-                await self._post_quarantine(worker, rec)
+                await self._before_quarantine(worker, rec)
+                await self._commit_after_recovery_guard(
+                    worker, rec.end
+                )  # queue-produced offset
                 continue
 
             from context_intelligence_server.pipeline import TERMINAL_EVENTS
@@ -943,6 +1013,7 @@ class SessionRegistry:
                 return True
 
             wrote = False
+            committed = False
             quarantined = False
             try:
                 await self._process_one(
@@ -953,8 +1024,9 @@ class SessionRegistry:
                     working_dir=working_dir,
                     event_identity=event_identity,
                 )
-                await self._flush_barrier(worker)
+                await self._flush_and_commit(worker, [rec], rec.end)
                 wrote = True
+                committed = True
             except Exception as exc:
                 if _is_transient_infra_error(exc):
                     # NOT this record's fault -- the database is unreachable.
@@ -977,12 +1049,18 @@ class SessionRegistry:
                 # the NEXT record's flush. A successful flush clears the
                 # buffer itself; only the failure path needs this.
                 worker.services.graph.discard_buffer()
-            await qm.commit(session_id, rec.end)  # queue-produced offset
+            if not committed:
+                if quarantined:
+                    await self._before_quarantine(worker, rec)
+                await self._commit_after_recovery_guard(
+                    worker, rec.end
+                )  # queue-produced offset
             if wrote:
                 self.record_written(1)
                 await self._post_commit(worker, [rec])
             elif quarantined:
-                await self._post_quarantine(worker, rec)
+                # Quarantine is already durable before the acknowledgement.
+                pass
         return False
 
     async def _drain_to_eof(self, worker: SessionWorker, handlers: Any) -> bool:
@@ -999,11 +1077,10 @@ class SessionRegistry:
                 return True
             try:
                 await self._process_batch(worker, tail, handlers)
-                await self._flush_barrier(worker)
+                await self._flush_and_commit(worker, tail.records, tail.end_offset)
             except Exception:
                 logger.exception("finalize_tail_flush_failed session=%s", session_id)
                 return False  # NOT finalized: keep worker alive, tail uncommitted
-            await qm.commit(session_id, tail.end_offset)
             self.record_written(len(tail.records))
             await self._post_commit(worker, tail.records)
             logger.debug(

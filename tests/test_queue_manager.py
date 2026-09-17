@@ -114,6 +114,16 @@ async def test_append_does_not_double_newline(qm, tmp_path):
     assert log.read_bytes() == b'{"e":1}\n'
 
 
+async def test_recovery_origin_scans_ignore_non_mapping_json(qm):
+    """Malformed queue lines must not abort recovery reconciliation scans."""
+    await qm.append("s1", b"[]")
+    origin = {"source_handle": "a" * 64, "ordinal": 0, "source_line_sha256": "b" * 64}
+
+    assert not await qm.contains_recovery_origin(origin)
+    assert await qm.recovery_origin_commit_state(origin) is None
+    assert not await qm.recovery_origin_is_dead(origin)
+
+
 @pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])
 async def test_append_rejects_unsafe_session_id(qm, bad_id):
     with pytest.raises(ValueError):
@@ -1114,6 +1124,14 @@ async def test_recovery_seed_counts_unchanged_under_streaming(qm):
 
     assert written == 1  # one committed line, no dead
     assert accepted == 2  # one written + one pending
+
+
+async def test_has_pending_records_treats_out_of_range_offset_as_unavailable(qm):
+    """A valid but impossible offset must not open the recovery admission gate."""
+    await qm.append("s1", b"a")
+    qm._offset_path("s1").write_text("999999", encoding="utf-8")
+
+    assert await qm.has_pending_records()
 
 
 async def test_refresh_spool_stats_empty_directory(qm):

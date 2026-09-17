@@ -551,7 +551,9 @@ async def recovery_status(request: Request) -> dict[str, object]:
 async def pause_recovery(request: Request) -> dict[str, bool]:
     if not getattr(request.app.state, "recovery_enabled", False):
         raise HTTPException(status_code=404, detail="Not found")
-    request.app.state.recovery_paused = True
+    condition = request.app.state.recovery_pause_condition
+    async with condition:
+        request.app.state.recovery_paused = True
     return {"paused": True}
 
 
@@ -559,7 +561,10 @@ async def pause_recovery(request: Request) -> dict[str, bool]:
 async def resume_recovery(request: Request) -> dict[str, bool]:
     if not getattr(request.app.state, "recovery_enabled", False):
         raise HTTPException(status_code=404, detail="Not found")
-    request.app.state.recovery_paused = False
+    condition = request.app.state.recovery_pause_condition
+    async with condition:
+        request.app.state.recovery_paused = False
+        condition.notify_all()
     return {"paused": False}
 
 
