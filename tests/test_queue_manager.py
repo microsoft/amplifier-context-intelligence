@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 
@@ -122,6 +123,22 @@ async def test_recovery_origin_scans_ignore_non_mapping_json(qm):
     assert not await qm.contains_recovery_origin(origin)
     assert await qm.recovery_origin_commit_state(origin) is None
     assert not await qm.recovery_origin_is_dead(origin)
+
+
+async def test_recovery_origin_state_requires_all_matching_records_to_be_committed(qm):
+    """A stale committed copy cannot hide a requeued uncommitted copy."""
+    origin = {"source_handle": "a" * 64, "ordinal": 0, "source_line_sha256": "b" * 64}
+    raw = json.dumps({"_recovery_origin": origin}).encode()
+
+    await qm.append("old", raw)
+    old = await qm.read_batch("old", max_items=1)
+    await qm.commit("old", old.end_offset)
+    await qm.append("retry", raw)
+
+    assert await qm.recovery_origin_commit_state(origin) == "queued"
+    retry = await qm.read_batch("retry", max_items=1)
+    await qm.commit("retry", retry.end_offset)
+    assert await qm.recovery_origin_commit_state(origin) == "committed"
 
 
 @pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])

@@ -982,6 +982,135 @@ async def test_recovery_strips_source_paths_before_permit_and_delivery(
 
 
 @pytest.mark.integration
+async def test_native_recovery_reuses_live_key_identity_without_overwriting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live ingest followed by exact recovery produces one Event and one blob."""
+    from context_intelligence_server.main import (
+        _new_event_identity,
+        _recovery_event_identity,
+        app,
+        create_asgi_app,
+        registry,
+    )
+
+    settings = Settings(
+        api_key=None,
+        api_keys=None,
+        api_keys_store_path=str(tmp_path / "keys.json"),
+        allow_unauthenticated=True,
+        queues_path=str(tmp_path / "live"),
+        recovery=cast(
+            Any,
+            {
+                "enabled": True,
+                "receipt_store_path": str(tmp_path / "receipts.sqlite3"),
+                "queues_path": str(tmp_path / "recovery"),
+            },
+        ),
+    )
+    asgi_app = create_asgi_app(settings=settings)
+    monkeypatch.setattr(registry, "get_or_create", MagicMock())
+    monkeypatch.setattr(app.state.recovery_registry, "get_or_create", MagicMock())
+    timestamp = "2026-01-01T00:00:00+00:00"
+    key = "same-logical-event"
+    live = {
+        "event": "custom:marker",
+        "workspace": "one",
+        "idempotency_key": key,
+        "data": {
+            "session_id": "recovery-session",
+            "timestamp": timestamp,
+            "marker": "original",
+            "debug": {"record": 1},
+        },
+    }
+    recovery = _recovery_body()
+    recovery.update(event="custom:marker", idempotency_key=key)
+    recovery["data"].update(timestamp=timestamp, marker="original", debug={"record": 1})
+
+    blob_store = _RecordingBlobStore()
+    services = HookStateService(workspace="one", blob_store=blob_store)
+    worker = SessionWorker(
+        session_id="recovery-session", workspace="one", services=services
+    )
+    handlers = PipelineHandlers(default=DefaultHandler(services), enrichers=[])
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=asgi_app),
+        base_url="http://test",
+        headers=_source_headers(),
+    ) as client:
+        assert (await client.post("/events", json=live)).status_code == 202
+        # The mocked live registry leaves its durable queue undrained. Commit
+        # that accepted record before requesting recovery admission: live work
+        # must always win over recovery.
+        live_batch = await registry.queue_manager.read_batch("recovery-session", 1)
+        assert len(live_batch.records) == 1
+        live_raw = live_batch.records[0].raw
+        event, _workspace, _working_dir, data, event_identity = (
+            SessionRegistry._parse_line(live_raw)
+        )
+        await process_event(
+            worker, event, data, handlers, event_identity=event_identity
+        )
+        await registry.queue_manager.commit("recovery-session", live_batch.end_offset)
+        assert not await registry.queue_manager.has_pending_records()
+
+        permit = await client.post(
+            "/recovery/admissions", json=_admission_body(recovery)
+        )
+        assert permit.status_code == 201
+        accepted = await client.post(
+            "/recovery/events",
+            json=recovery,
+            headers={"X-Recovery-Permit": permit.json()["permit"]},
+        )
+        assert accepted.status_code == 202
+
+    recovery_batch = await app.state.recovery_registry.queue_manager.read_batch(
+        "recovery-session", 1
+    )
+    assert len(recovery_batch.records) == 1
+    recovery_raw = recovery_batch.records[0].raw
+    identity = _new_event_identity(key)
+    source_fallback = recovery_event_identity(
+        _source_handle(), recovery["origin"]["ordinal"]
+    )
+    assert (
+        _recovery_event_identity(
+            recovery, _source_handle(), recovery["origin"]["ordinal"]
+        )
+        == identity
+    )
+    assert json.loads(live_raw)[SPOOL_EVENT_IDENTITY] == identity
+    assert json.loads(recovery_raw)[SPOOL_EVENT_IDENTITY] == identity
+    assert json.loads(recovery_raw)[SPOOL_EVENT_IDENTITY] != source_fallback
+
+    for raw in (recovery_raw, recovery_raw):
+        event, _workspace, _working_dir, data, event_identity = (
+            SessionRegistry._parse_line(raw)
+        )
+        await process_event(
+            worker, event, data, handlers, event_identity=event_identity
+        )
+
+    event_id = (
+        f"{make_node_id('recovery-session', 'custom:marker', timestamp)}__{identity}"
+    )
+    node = await services.graph.get_node(event_id)
+    assert node is not None
+    assert json.loads(node["data"])["marker"] == "original"
+    event_nodes = [
+        node_id
+        for node_id, props in services.graph._nodes.items()  # type: ignore[attr-defined]
+        if props.get("event_name") == "custom:marker"
+    ]
+    assert event_nodes == [event_id]
+    assert set(blob_store.keys) == {f"{event_id}__debug"}
+
+
+@pytest.mark.integration
 async def test_native_recovery_assigns_stable_identity_to_same_timestamp_records(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1007,11 +1136,12 @@ async def test_native_recovery_assigns_stable_identity_to_same_timestamp_records
     monkeypatch.setattr(app.state.recovery_registry, "get_or_create", MagicMock())
     timestamp = "2026-01-01T00:00:00+00:00"
     first = _recovery_body()
-    first.update(event="custom:marker")
+    first.update(event="custom:marker", idempotency_key="first-same-time-record")
     first["source"]["record_count"] = 2
     first["data"].update(timestamp=timestamp, marker="first", debug={"record": 1})
     second = {
         **first,
+        "idempotency_key": "second-same-time-record",
         "data": {**first["data"], "marker": "second", "debug": {"record": 2}},
         "origin": {
             "ordinal": 1,
@@ -1049,7 +1179,12 @@ async def test_native_recovery_assigns_stable_identity_to_same_timestamp_records
     handlers = PipelineHandlers(default=DefaultHandler(services), enrichers=[])
 
     first_raw, first_end = await admit_and_queue(first)
-    first_identity = recovery_event_identity(_source_handle(), 0)
+    from context_intelligence_server.main import (
+        _new_event_identity,
+        _recovery_event_identity,
+    )
+
+    first_identity = _new_event_identity("first-same-time-record")
     assert json.loads(first_raw)[SPOOL_EVENT_IDENTITY] == first_identity
     event, _workspace, _working_dir, data, identity = SessionRegistry._parse_line(
         first_raw
@@ -1064,7 +1199,7 @@ async def test_native_recovery_assigns_stable_identity_to_same_timestamp_records
     first_event_id = f"{make_node_id('recovery-session', 'custom:marker', timestamp)}__{first_identity}"
 
     second_raw, second_end = await admit_and_queue(second)
-    second_identity = recovery_event_identity(_source_handle(), 1)
+    second_identity = _new_event_identity("second-same-time-record")
     assert json.loads(second_raw)[SPOOL_EVENT_IDENTITY] == second_identity
     event, _workspace, _working_dir, data, identity = SessionRegistry._parse_line(
         second_raw
@@ -1101,6 +1236,11 @@ async def test_native_recovery_assigns_stable_identity_to_same_timestamp_records
         f"{first_event_id}__debug",
         f"{second_event_id}__debug",
     }
+    # A record whose sanitized payload has no usable idempotency key preserves
+    # the source-handle/ordinal fallback rather than collapsing by timestamp.
+    assert _recovery_event_identity({}, _source_handle(), 0) == recovery_event_identity(
+        _source_handle(), 0
+    )
 
 
 @pytest.mark.asyncio
@@ -1895,6 +2035,762 @@ async def test_paused_recovery_queue_waits_before_graph_flush_and_commits_once_a
 
 
 @pytest.mark.asyncio
+async def test_admin_retry_archives_only_matching_dead_letter_and_requeues_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retried receipt ignores its old committed line but preserves audit evidence."""
+    from context_intelligence_server.main import app, create_asgi_app
+    from context_intelligence_server.routers.admin import require_admin
+
+    settings = Settings(
+        api_key=None,
+        api_keys=None,
+        api_keys_store_path=str(tmp_path / "keys.json"),
+        allow_unauthenticated=True,
+        queues_path=str(tmp_path / "live"),
+        recovery=cast(
+            Any,
+            {
+                "enabled": True,
+                "receipt_store_path": str(tmp_path / "receipts.sqlite3"),
+                "queues_path": str(tmp_path / "recovery"),
+            },
+        ),
+    )
+    asgi_app = create_asgi_app(settings=settings)
+    recovery_registry = app.state.recovery_registry
+    queue = recovery_registry.queue_manager
+    monkeypatch.setattr(app.state.registry, "get_or_create", MagicMock())
+    monkeypatch.setattr(recovery_registry, "get_or_create", MagicMock())
+    app.dependency_overrides[require_admin] = lambda: None
+    body = _recovery_body()
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=asgi_app),
+            base_url="http://test",
+            headers=_source_headers(),
+        ) as client:
+            permit = await client.post(
+                "/recovery/admissions", json=_admission_body(body)
+            )
+            assert permit.status_code == 201
+            accepted = await client.post(
+                "/recovery/events",
+                json=body,
+                headers={"X-Recovery-Permit": permit.json()["permit"]},
+            )
+            assert accepted.status_code == 202
+
+            batch = await queue.read_batch("recovery-session", 1)
+            worker = SessionWorker(
+                session_id="recovery-session",
+                workspace="one",
+                services=HookStateService(workspace="one"),
+            )
+            with patch(
+                "context_intelligence_server.registry.process_event",
+                new=AsyncMock(side_effect=ValueError("deterministic poison")),
+            ):
+                await recovery_registry._handle_exhausted_batch(
+                    worker, batch, handlers=MagicMock()
+                )
+            assert await app.state.recovery_receipts.status() == {"quarantined": 1}
+            foreign_origin = {
+                "source_handle": _source_handle(_SECOND_SOURCE_CAPABILITY),
+                "ordinal": 0,
+                "source_line_sha256": "e" * 64,
+            }
+            await queue.dead_letter(
+                "foreign",
+                json.dumps({"_recovery_origin": foreign_origin}).encode(),
+                "other source",
+            )
+
+            # The retry continuation is a recovery admission: buffered live
+            # work denies it under the same durable, serialized gate and must
+            # not create a replacement recovery line or graph write.
+            live_queue = app.state.registry.queue_manager
+            assert (
+                await client.post(
+                    "/events",
+                    json={
+                        "event": "custom:marker",
+                        "workspace": "one",
+                        "data": {
+                            "session_id": "live-session",
+                            "timestamp": "2026-01-01T00:00:00+00:00",
+                        },
+                    },
+                )
+            ).status_code == 202
+            denied = await client.post("/admin/recovery/retry-quarantined")
+            assert denied.json() == {"retried": 0}
+            assert await app.state.recovery_receipts.status() == {"quarantined": 1}
+            assert (await queue.read_batch("recovery-session", 1)).records == []
+            assert (
+                not await queue.recovery_origin_commit_state(
+                    {"source_handle": _source_handle(), **body["origin"]}
+                )
+                == "queued"
+            )
+
+            live_batch = await live_queue.read_batch("live-session", 1)
+            await live_queue.commit("live-session", live_batch.end_offset)
+            retried = await client.post("/admin/recovery/retry-quarantined")
+            assert retried.json() == {"retried": 1}
+            assert (await client.post("/admin/recovery/retry-quarantined")).json() == {
+                "retried": 0
+            }
+
+        replay = await queue.read_batch("recovery-session", 1)
+        assert len(replay.records) == 1
+        assert not await queue.recovery_origin_is_dead(
+            {"source_handle": _source_handle(), **body["origin"]}
+        )
+        assert await queue.recovery_origin_is_dead(foreign_origin)
+        audit = tmp_path / "recovery" / "recovery-session.recovery-retry-audit.jsonl"
+        assert audit.exists()
+        assert len(await app.state.recovery_receipts.pending_outbox()) == 1
+
+        services = HookStateService(workspace="one")
+        worker = SessionWorker(
+            session_id="recovery-session", workspace="one", services=services
+        )
+        event, _workspace, _working_dir, data, identity = SessionRegistry._parse_line(
+            replay.records[0].raw
+        )
+        await process_event(
+            worker,
+            event,
+            data,
+            PipelineHandlers(default=DefaultHandler(services), enrichers=[]),
+            event_identity=identity,
+        )
+        event_node = await services.graph.get_node(
+            f"{make_node_id('recovery-session', body['event'], body['data']['timestamp'])}__{identity}"
+        )
+        assert event_node is not None
+        await app.state.recovery_receipts.mark(
+            body["origin"], "written", source_handle=_source_handle()
+        )
+        await queue.commit("recovery-session", replay.end_offset)
+        assert await app.state.recovery_receipts.status() == {"written": 1}
+        assert (await queue.read_batch("recovery-session", 1)).records == []
+    finally:
+        app.dependency_overrides.pop(require_admin, None)
+
+
+@pytest.mark.asyncio
+async def test_pause_quarantine_holds_selected_record_until_explicit_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A selected paused record cannot flush or rewrite a terminal quarantine."""
+    from context_intelligence_server.main import app, create_asgi_app
+    from context_intelligence_server.registry import SessionWorker
+    from context_intelligence_server.routers.admin import require_admin
+    from context_intelligence_server.services import HookStateService
+
+    settings = Settings(
+        api_key=None,
+        api_keys=None,
+        api_keys_store_path=str(tmp_path / "keys.json"),
+        allow_unauthenticated=True,
+        queues_path=str(tmp_path / "live"),
+        recovery=cast(
+            Any,
+            {
+                "enabled": True,
+                "receipt_store_path": str(tmp_path / "receipts.sqlite3"),
+                "queues_path": str(tmp_path / "recovery"),
+            },
+        ),
+    )
+    asgi_app = create_asgi_app(settings=settings)
+    recovery_registry = app.state.recovery_registry
+    monkeypatch.setattr(recovery_registry, "get_or_create", MagicMock())
+    recovery_registry._process_batch = AsyncMock(return_value=(1, None))
+    app.dependency_overrides[require_admin] = lambda: None
+    body = _recovery_body()
+    selected_before_flush = asyncio.Event()
+    release_pre_flush = asyncio.Event()
+
+    async def hold_before_flush() -> None:
+        selected_before_flush.set()
+        await release_pre_flush.wait()
+
+    recovery_registry.pre_flush = hold_before_flush
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=asgi_app),
+            base_url="http://test",
+            headers=_source_headers(),
+        ) as client:
+            permit = await client.post(
+                "/recovery/admissions", json=_admission_body(body)
+            )
+            assert permit.status_code == 201
+            assert (
+                await client.post(
+                    "/recovery/events",
+                    json=body,
+                    headers={"X-Recovery-Permit": permit.json()["permit"]},
+                )
+            ).status_code == 202
+
+            held_services = HookStateService(workspace="one")
+            held_services.graph = MagicMock()  # type: ignore[assignment]
+            held_services.graph.flush = AsyncMock()
+            held_worker = SessionWorker(
+                session_id="recovery-session",
+                workspace="one",
+                services=held_services,
+            )
+            held_drain = asyncio.create_task(
+                recovery_registry._drain_to_eof(held_worker, MagicMock())
+            )
+            await asyncio.wait_for(selected_before_flush.wait(), timeout=1)
+
+            assert (await client.post("/admin/recovery/pause")).json() == {
+                "paused": True
+            }
+            assert (
+                await client.post(
+                    "/admin/recovery/quarantine-pending",
+                    json={"source_handle": _source_handle(), "ordinal": 0},
+                )
+            ).json() == {"quarantined": 1}
+            assert await app.state.recovery_receipts.status() == {"quarantined": 1}
+
+            release_pre_flush.set()
+            assert (await client.post("/admin/recovery/resume")).json() == {
+                "paused": False
+            }
+            assert not await asyncio.wait_for(held_drain, timeout=1)
+            held_services.graph.flush.assert_not_awaited()
+            held_services.graph.discard_buffer.assert_called_once()
+            assert await app.state.recovery_receipts.status() == {"quarantined": 1}
+
+            retried = await client.post("/admin/recovery/retry-quarantined")
+            assert retried.json() == {"retried": 1}
+
+        replay = await recovery_registry.queue_manager.read_batch("recovery-session", 1)
+        assert len(replay.records) == 1
+        retry_services = HookStateService(workspace="one")
+        retry_services.graph = MagicMock()  # type: ignore[assignment]
+        retry_services.graph.flush = AsyncMock()
+        retry_worker = SessionWorker(
+            session_id="recovery-session", workspace="one", services=retry_services
+        )
+        assert await recovery_registry._drain_to_eof(retry_worker, MagicMock())
+        retry_services.graph.flush.assert_awaited_once()
+        assert await app.state.recovery_receipts.status() == {"written": 1}
+        assert (
+            await recovery_registry.queue_manager.read_batch("recovery-session", 1)
+        ).records == []
+    finally:
+        app.dependency_overrides.pop(require_admin, None)
+
+
+@pytest.mark.asyncio
+async def test_written_receipt_with_uncommitted_raw_record_replays_through_flush(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash after graph flush but before offset commit must be idempotently replayed."""
+    from context_intelligence_server.main import (
+        _enqueue_native_recovery_receipt,
+        app,
+        create_asgi_app,
+    )
+
+    settings = Settings(
+        api_key=None,
+        api_keys=None,
+        api_keys_store_path=str(tmp_path / "keys.json"),
+        allow_unauthenticated=True,
+        queues_path=str(tmp_path / "live"),
+        recovery=cast(
+            Any,
+            {
+                "enabled": True,
+                "receipt_store_path": str(tmp_path / "receipts.sqlite3"),
+                "queues_path": str(tmp_path / "recovery"),
+            },
+        ),
+    )
+    create_asgi_app(settings=settings)
+    recovery_registry = app.state.recovery_registry
+    monkeypatch.setattr(recovery_registry, "get_or_create", MagicMock())
+    body = _recovery_body()
+    source_handle = _source_handle()
+    receipt = {
+        "source_handle": source_handle,
+        "source": body["source"],
+        "origin": body["origin"],
+        "actor": "",
+        "workspace": "one",
+        "payload": _without_recovery_source_paths(
+            {
+                key: value
+                for key, value in body.items()
+                if key not in {"origin", "source"}
+            }
+        ),
+    }
+    assert (
+        await app.state.recovery_receipts.admit_source(
+            source_handle,
+            receipt["source"],
+            receipt["origin"],
+            receipt["actor"],
+            receipt["workspace"],
+            receipt["payload"],
+            require_lease=False,
+        )
+        == "accepted"
+    )
+    await _enqueue_native_recovery_receipt(app, receipt)
+    assert await app.state.recovery_receipts.mark(
+        body["origin"], "written", source_handle=source_handle
+    )
+
+    recovery_registry._process_batch = AsyncMock(return_value=(1, None))
+    worker = SessionWorker(
+        session_id="recovery-session",
+        workspace="one",
+        services=HookStateService(workspace="one"),
+    )
+    worker.services.graph = MagicMock()  # type: ignore[assignment]
+    worker.services.graph.flush = AsyncMock()
+
+    assert await recovery_registry._drain_to_eof(worker, MagicMock())
+    worker.services.graph.flush.assert_awaited_once()
+    assert await app.state.recovery_receipts.status() == {"written": 1}
+    assert (
+        await recovery_registry.queue_manager.read_batch(
+            "recovery-session", max_items=1
+        )
+    ).records == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_enqueue_does_not_start_worker_when_receipt_transition_fails() -> (
+    None
+):
+    """A raw append without a durable enqueued receipt is left for reconciliation."""
+    from context_intelligence_server.main import _enqueue_native_recovery_receipt
+
+    queue_manager = SimpleNamespace(append=AsyncMock())
+    recovery_registry = SimpleNamespace(
+        queue_manager=queue_manager,
+        get_or_create=MagicMock(),
+    )
+    app_instance = SimpleNamespace(
+        state=SimpleNamespace(
+            access_control_mode="compatibility",
+            recovery_receipts=SimpleNamespace(mark=AsyncMock(return_value=False)),
+            recovery_registry=recovery_registry,
+        )
+    )
+    receipt = {
+        "source_handle": _source_handle(),
+        "origin": {"ordinal": 0, "source_line_sha256": "b" * 64},
+        "actor": "",
+        "workspace": "one",
+        "payload": {
+            "event": "custom:marker",
+            "workspace": "one",
+            "data": {
+                "session_id": "recovery-session",
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            },
+        },
+    }
+
+    await _enqueue_native_recovery_receipt(cast(FastAPI, app_instance), receipt)
+
+    queue_manager.append.assert_awaited_once()
+    recovery_registry.get_or_create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_startup_reconciles_retry_pending_bridge_after_admin_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A durable retry_pending bridge resumes rather than permanently blocking recovery."""
+    from context_intelligence_server.main import (
+        _resume_native_recovery,
+        app,
+        create_asgi_app,
+    )
+
+    settings = Settings(
+        api_key=None,
+        api_keys=None,
+        api_keys_store_path=str(tmp_path / "keys.json"),
+        allow_unauthenticated=True,
+        queues_path=str(tmp_path / "live"),
+        recovery=cast(
+            Any,
+            {
+                "enabled": True,
+                "receipt_store_path": str(tmp_path / "receipts.sqlite3"),
+                "queues_path": str(tmp_path / "recovery"),
+            },
+        ),
+    )
+    create_asgi_app(settings=settings)
+    recovery_registry = app.state.recovery_registry
+    spawned = MagicMock()
+    monkeypatch.setattr(recovery_registry, "get_or_create", spawned)
+    body = _recovery_body()
+    source_handle = _source_handle()
+    payload = _without_recovery_source_paths(
+        {key: value for key, value in body.items() if key not in {"origin", "source"}}
+    )
+    assert (
+        await app.state.recovery_receipts.admit_source(
+            source_handle,
+            body["source"],
+            body["origin"],
+            "",
+            "one",
+            payload,
+            require_lease=False,
+        )
+        == "accepted"
+    )
+    assert await app.state.recovery_receipts.mark(
+        body["origin"], "quarantined", source_handle=source_handle
+    )
+    assert await app.state.recovery_receipts.requeue_quarantined(source_handle, 0)
+
+    await _resume_native_recovery(app)
+
+    assert await app.state.recovery_receipts.status() == {"enqueued": 1}
+    assert (
+        len(
+            (
+                await recovery_registry.queue_manager.read_batch(
+                    "recovery-session", max_items=1
+                )
+            ).records
+        )
+        == 1
+    )
+    assert spawned.call_args_list[0].args == ("recovery-session", "one")
+
+
+@pytest.mark.asyncio
+async def test_admin_retry_archive_does_not_hold_live_admission_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow forensic archive cannot delay an unrelated normal /events append."""
+    from context_intelligence_server.main import app, create_asgi_app
+    from context_intelligence_server.routers.admin import require_admin
+
+    settings = Settings(
+        api_key=None,
+        api_keys=None,
+        api_keys_store_path=str(tmp_path / "keys.json"),
+        allow_unauthenticated=True,
+        queues_path=str(tmp_path / "live"),
+        recovery=cast(
+            Any,
+            {
+                "enabled": True,
+                "receipt_store_path": str(tmp_path / "receipts.sqlite3"),
+                "queues_path": str(tmp_path / "recovery"),
+            },
+        ),
+    )
+    asgi_app = create_asgi_app(settings=settings)
+    monkeypatch.setattr(app.state.recovery_registry, "get_or_create", MagicMock())
+    app.dependency_overrides[require_admin] = lambda: None
+    body = _recovery_body()
+    source_handle = _source_handle()
+    payload = _without_recovery_source_paths(
+        {key: value for key, value in body.items() if key not in {"origin", "source"}}
+    )
+    assert (
+        await app.state.recovery_receipts.admit_source(
+            source_handle,
+            body["source"],
+            body["origin"],
+            "",
+            "one",
+            payload,
+            require_lease=False,
+        )
+        == "accepted"
+    )
+    assert await app.state.recovery_receipts.mark(
+        body["origin"], "quarantined", source_handle=source_handle
+    )
+    archive_started = asyncio.Event()
+    release_archive = asyncio.Event()
+
+    async def held_archive(_origin: dict[str, Any]) -> int:
+        archive_started.set()
+        await release_archive.wait()
+        return 0
+
+    monkeypatch.setattr(
+        app.state.recovery_registry.queue_manager,
+        "archive_recovery_dead_letters",
+        held_archive,
+    )
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=asgi_app), base_url="http://test"
+        ) as client:
+            retry_task = asyncio.create_task(
+                client.post("/admin/recovery/retry-quarantined")
+            )
+            await asyncio.wait_for(archive_started.wait(), timeout=1)
+            live = await asyncio.wait_for(
+                client.post(
+                    "/events",
+                    json={
+                        "event": "custom:marker",
+                        "workspace": "one",
+                        "data": {
+                            "session_id": "live-during-archive",
+                            "timestamp": "2026-01-01T00:00:00+00:00",
+                        },
+                    },
+                ),
+                timeout=1,
+            )
+            assert live.status_code == 202
+            release_archive.set()
+            assert (await retry_task).json() == {"retried": 0}
+    finally:
+        app.dependency_overrides.pop(require_admin, None)
+
+
+@pytest.mark.asyncio
+async def test_admin_can_quarantine_named_paused_pending_receipt_and_unblock_successor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pending inspection is opaque; manual quarantine requires pause and frees capacity."""
+    from context_intelligence_server.main import app, create_asgi_app
+    from context_intelligence_server.routers.admin import require_admin
+
+    settings = Settings(
+        api_key=None,
+        api_keys=None,
+        api_keys_store_path=str(tmp_path / "keys.json"),
+        allow_unauthenticated=True,
+        queues_path=str(tmp_path / "live"),
+        recovery=cast(
+            Any,
+            {
+                "enabled": True,
+                "receipt_store_path": str(tmp_path / "receipts.sqlite3"),
+                "queues_path": str(tmp_path / "recovery"),
+            },
+        ),
+    )
+    asgi_app = create_asgi_app(settings=settings)
+    monkeypatch.setattr(app.state.recovery_registry, "get_or_create", MagicMock())
+    app.dependency_overrides[require_admin] = lambda: None
+    body = _recovery_body()
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=asgi_app),
+            base_url="http://test",
+            headers=_source_headers(),
+        ) as client:
+            permit = await client.post(
+                "/recovery/admissions", json=_admission_body(body)
+            )
+            assert (
+                await client.post(
+                    "/recovery/events",
+                    json=body,
+                    headers={"X-Recovery-Permit": permit.json()["permit"]},
+                )
+            ).status_code == 202
+            pending = await client.get("/admin/recovery/pending")
+            assert pending.json() == {
+                "pending": [
+                    {
+                        "source_handle": _source_handle(),
+                        "ordinal": 0,
+                        "state": "enqueued",
+                    }
+                ]
+            }
+            assert (
+                "payload" not in pending.text and "recovery-session" not in pending.text
+            )
+            assert (
+                await client.post(
+                    "/admin/recovery/quarantine-pending",
+                    json={"source_handle": _source_handle(), "ordinal": 0},
+                )
+            ).status_code == 409
+            assert (await client.post("/admin/recovery/pause")).json() == {
+                "paused": True
+            }
+            quarantined = await client.post(
+                "/admin/recovery/quarantine-pending",
+                json={"source_handle": _source_handle(), "ordinal": 0},
+            )
+            assert quarantined.json() == {"quarantined": 1}
+
+        assert await app.state.recovery_receipts.status() == {"quarantined": 1}
+        assert (
+            await app.state.recovery_registry.queue_manager.read_batch(
+                "recovery-session", 1
+            )
+        ).records == []
+        successor = _recovery_body(session_id="successor")
+        successor["source"]["source_stream_sha256"] = "d" * 64
+        successor["source"]["source_sha256"] = "e" * 64
+        assert (
+            await app.state.recovery_receipts.admit_source(
+                _source_handle(_SECOND_SOURCE_CAPABILITY),
+                successor["source"],
+                successor["origin"],
+                "",
+                "one",
+                _without_recovery_source_paths(
+                    {
+                        key: value
+                        for key, value in successor.items()
+                        if key not in {"source", "origin"}
+                    }
+                ),
+                require_lease=False,
+            )
+            == "accepted"
+        )
+    finally:
+        app.dependency_overrides.pop(require_admin, None)
+
+
+@pytest.mark.asyncio
+async def test_pause_quarantine_releases_audited_retry_bridge_for_successor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An audited committed predecessor cannot wedge a retry_pending receipt."""
+    import context_intelligence_server.main as main_module
+    from context_intelligence_server.main import app, create_asgi_app
+    from context_intelligence_server.routers.admin import require_admin
+
+    settings = Settings(
+        api_key=None,
+        api_keys=None,
+        api_keys_store_path=str(tmp_path / "keys.json"),
+        allow_unauthenticated=True,
+        queues_path=str(tmp_path / "live"),
+        recovery=cast(
+            Any,
+            {
+                "enabled": True,
+                "receipt_store_path": str(tmp_path / "receipts.sqlite3"),
+                "queues_path": str(tmp_path / "recovery"),
+            },
+        ),
+    )
+    asgi_app = create_asgi_app(settings=settings)
+    recovery_registry = app.state.recovery_registry
+    queue = recovery_registry.queue_manager
+    monkeypatch.setattr(recovery_registry, "get_or_create", MagicMock())
+    app.dependency_overrides[require_admin] = lambda: None
+    body = _recovery_body()
+    body["working_dir"] = "/synthetic/recovery/source"
+    source_handle = _source_handle()
+    origin = {"source_handle": source_handle, **body["origin"]}
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=asgi_app),
+            base_url="http://test",
+            headers=_source_headers(),
+        ) as client:
+            permit = await client.post(
+                "/recovery/admissions", json=_admission_body(body)
+            )
+            assert permit.status_code == 201
+            assert (
+                await client.post(
+                    "/recovery/events",
+                    json=body,
+                    headers={"X-Recovery-Permit": permit.json()["permit"]},
+                )
+            ).status_code == 202
+
+            batch = await queue.read_batch("recovery-session", max_items=1)
+            worker = SessionWorker(
+                session_id="recovery-session",
+                workspace="one",
+                services=HookStateService(workspace="one"),
+            )
+            with patch(
+                "context_intelligence_server.registry.process_event",
+                new=AsyncMock(side_effect=ValueError("deterministic poison")),
+            ):
+                await recovery_registry._handle_exhausted_batch(
+                    worker, batch, handlers=MagicMock()
+                )
+            assert await queue.recovery_origin_commit_state(origin) == "committed"
+            assert await queue.recovery_origin_is_dead(origin)
+
+            # Simulate an interruption after retry_pending becomes durable but
+            # before the retry bridge can append its replacement raw record.
+            reconcile = AsyncMock()
+            monkeypatch.setattr(
+                main_module, "_reconcile_native_recovery_outbox", reconcile
+            )
+            retried = await client.post("/admin/recovery/retry-quarantined")
+            assert retried.json() == {"retried": 1}
+            assert retried.text == '{"retried":1}'
+            assert await app.state.recovery_receipts.status() == {"retry_pending": 1}
+            assert await queue.recovery_origin_has_retry_audit(origin)
+            reconcile.assert_awaited_once_with(app)
+
+            assert (await client.post("/admin/recovery/pause")).json() == {
+                "paused": True
+            }
+            quarantined = await client.post(
+                "/admin/recovery/quarantine-pending",
+                json={"source_handle": source_handle, "ordinal": 0},
+            )
+            assert quarantined.json() == {"quarantined": 1}
+            assert quarantined.text == '{"quarantined":1}'
+            assert "payload" not in quarantined.text
+            assert "recovery-session" not in quarantined.text
+            assert "/synthetic/recovery/source" not in quarantined.text
+
+        assert await app.state.recovery_receipts.status() == {"quarantined": 1}
+        assert await app.state.recovery_receipts.pending_outbox() == []
+        successor = _recovery_body(session_id="successor")
+        successor["source"]["source_stream_sha256"] = "d" * 64
+        successor["source"]["source_sha256"] = "e" * 64
+        assert (
+            await app.state.recovery_receipts.admit_source(
+                _source_handle(_SECOND_SOURCE_CAPABILITY),
+                successor["source"],
+                successor["origin"],
+                "",
+                "one",
+                _without_recovery_source_paths(
+                    {
+                        key: value
+                        for key, value in successor.items()
+                        if key not in {"source", "origin"}
+                    }
+                ),
+                require_lease=False,
+            )
+            == "accepted"
+        )
+    finally:
+        app.dependency_overrides.pop(require_admin, None)
+
+
+@pytest.mark.asyncio
 async def test_permit_issue_blocks_on_live_queue_until_its_record_drains(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1942,3 +2838,113 @@ async def test_permit_issue_blocks_on_live_queue_until_its_record_drains(
         assert (
             await client.post("/recovery/admissions", json=_admission_body(body))
         ).status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_recovery_retry_class_headers_are_non_disclosing_and_actionable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The public 429 wire shape is stable while retry advice is classified."""
+    from context_intelligence_server.main import app, create_asgi_app
+
+    settings = Settings(
+        api_key=None,
+        api_keys=None,
+        api_keys_store_path=str(tmp_path / "keys.json"),
+        allow_unauthenticated=True,
+        queues_path=str(tmp_path / "live"),
+        recovery=cast(
+            Any,
+            {
+                "enabled": True,
+                "receipt_store_path": str(tmp_path / "receipts.sqlite3"),
+                "queues_path": str(tmp_path / "recovery"),
+            },
+        ),
+    )
+    asgi_app = create_asgi_app(settings=settings)
+    monkeypatch.setattr(app.state.recovery_registry, "get_or_create", MagicMock())
+    body = _recovery_body()
+
+    def assert_unavailable(response: httpx.Response, retry_class: str) -> None:
+        assert response.status_code == 429
+        assert response.json() == {"detail": "Recovery unavailable"}
+        assert response.headers["Retry-After"] == "2"
+        assert response.headers["X-Recovery-Retry-Class"] == retry_class
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=asgi_app),
+        base_url="http://test",
+        headers=_source_headers(),
+    ) as client:
+        malformed_source = await client.post(
+            "/recovery/admissions",
+            json=_admission_body(body),
+            headers={"X-Recovery-Source": "not-a-capability"},
+        )
+        assert_unavailable(malformed_source, "source")
+
+        missing_permit = await client.post("/recovery/events", json=body)
+        assert_unavailable(missing_permit, "renew")
+        unknown_permit = await client.post(
+            "/recovery/events",
+            json=body,
+            headers={"X-Recovery-Permit": _source_capability(19)},
+        )
+        assert_unavailable(unknown_permit, "renew")
+
+        issued = await client.post("/recovery/admissions", json=_admission_body(body))
+        assert issued.status_code == 201
+        permit = issued.json()["permit"]
+        mismatch = await client.post(
+            "/recovery/events",
+            json={**body, "event": "custom:mismatched"},
+            headers={"X-Recovery-Permit": permit},
+        )
+        assert_unavailable(mismatch, "source")
+
+        capacity = await client.post(
+            "/recovery/admissions",
+            json=_admission_body(_recovery_body(session_id="capacity")),
+            headers=_source_headers(source_capability=_SECOND_SOURCE_CAPABILITY),
+        )
+        assert_unavailable(capacity, "global")
+
+        app.state.recovery_paused = True
+        paused = await client.post(
+            "/recovery/events",
+            json=body,
+            headers={"X-Recovery-Permit": permit},
+        )
+        assert_unavailable(paused, "global")
+        app.state.recovery_paused = False
+
+        foreign_body = _recovery_body(session_id="foreign")
+        foreign_payload = _without_recovery_source_paths(
+            {
+                key: value
+                for key, value in foreign_body.items()
+                if key not in {"origin", "source"}
+            }
+        )
+        assert (
+            await app.state.recovery_receipts.admit_source(
+                _source_handle(_SECOND_SOURCE_CAPABILITY),
+                foreign_body["source"],
+                foreign_body["origin"],
+                "other",
+                "one",
+                foreign_payload,
+                require_lease=False,
+            )
+            == "accepted"
+        )
+        foreign = await client.post(
+            "/recovery/events",
+            json=foreign_body,
+            headers={
+                "X-Recovery-Source": _SECOND_SOURCE_CAPABILITY,
+                "X-Recovery-Permit": _source_capability(20),
+            },
+        )
+        assert_unavailable(foreign, "global")

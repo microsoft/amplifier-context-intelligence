@@ -258,6 +258,7 @@ class QueueManager:
 
         def _scan() -> Literal["queued", "committed"] | None:
             queued = False
+            matched = False
             for path in self._dir.glob("*.log"):
                 try:
                     committed = self._read_committed_offset(path.stem)
@@ -271,12 +272,19 @@ class QueueManager:
                             except (ValueError, UnicodeDecodeError):
                                 continue
                             if self._matches_recovery_origin(envelope, encoded):
+                                matched = True
                                 if end <= committed:
-                                    return "committed"
+                                    continue
+                                # One uncommitted match is enough to require
+                                # replay. Historical committed lines for the
+                                # same origin (for example before an operator
+                                # retry) must not hide current raw work.
                                 queued = True
                 except FileNotFoundError:
                     continue
-            return "queued" if queued else None
+            if queued:
+                return "queued"
+            return "committed" if matched else None
 
         return await asyncio.to_thread(_scan)
 
@@ -302,6 +310,93 @@ class QueueManager:
             return False
 
         return await asyncio.to_thread(_scan)
+
+    async def recovery_origin_has_retry_audit(self, origin: dict[str, Any]) -> bool:
+        """Whether a committed origin predates an operator retry.
+
+        Active dead letters are removed before ``retry_pending`` is made
+        durable, but their copied forensic record distinguishes an old
+        committed queue line from a completion of the new delivery attempt.
+        """
+        encoded = json.dumps(origin, sort_keys=True, separators=(",", ":"))
+
+        def _scan() -> bool:
+            for path in self._dir.glob("*.recovery-retry-audit.jsonl"):
+                try:
+                    with path.open("rb") as stream:
+                        for raw in stream:
+                            try:
+                                record = json.loads(raw)
+                                payload = record.get("payload")
+                                envelope = (
+                                    json.loads(payload)
+                                    if isinstance(payload, str)
+                                    else {}
+                                )
+                            except (TypeError, ValueError, UnicodeDecodeError):
+                                continue
+                            if self._matches_recovery_origin(envelope, encoded):
+                                return True
+                except OSError:
+                    continue
+            return False
+
+        return await asyncio.to_thread(_scan)
+
+    async def archive_recovery_dead_letters(self, origin: dict[str, Any]) -> int:
+        """Move matching recovery dead letters to a non-active forensic audit.
+
+        The original dead-letter JSON record is copied verbatim before its
+        active ``*.dead.jsonl`` line is removed.  The audit filename does not
+        match the active dead-letter glob, so recovery reconciliation can
+        safely retry only the selected receipt without treating its historic
+        poison evidence as current terminal state.
+        """
+        encoded = json.dumps(origin, sort_keys=True, separators=(",", ":"))
+
+        def _matches(raw: bytes) -> bool:
+            try:
+                record = json.loads(raw)
+                payload = record.get("payload")
+                envelope = json.loads(payload) if isinstance(payload, str) else {}
+            except (TypeError, ValueError, UnicodeDecodeError):
+                return False
+            return self._matches_recovery_origin(envelope, encoded)
+
+        total = 0
+        for path in self._dir.glob("*.dead.jsonl"):
+            worker_key = path.name[: -len(".dead.jsonl")]
+            self._validate_session_id(worker_key)
+            with self._guard(worker_key) as guard:
+                async with guard.admission:
+
+                    def _archive() -> int:
+                        try:
+                            lines = path.read_bytes().splitlines(keepends=True)
+                        except FileNotFoundError:
+                            return 0
+                        selected = [line for line in lines if _matches(line)]
+                        if not selected:
+                            return 0
+                        audit = self._dir / f"{worker_key}.recovery-retry-audit.jsonl"
+                        # _write_record owns guard.file_lock. Holding it here
+                        # would deadlock its non-reentrant threading.Lock.
+                        self._write_record(guard, audit, b"".join(selected))
+                        remaining = [line for line in lines if not _matches(line)]
+                        temporary = (
+                            self._dir / f".{path.name}.{uuid.uuid4().hex}.retry.tmp"
+                        )
+                        try:
+                            temporary.write_bytes(b"".join(remaining))
+                            os.replace(temporary, path)
+                        except BaseException:
+                            with contextlib.suppress(OSError):
+                                temporary.unlink(missing_ok=True)
+                            raise
+                        return len(selected)
+
+                    total += await _await_uninterrupted(asyncio.to_thread(_archive))
+        return total
 
     async def has_pending_records(self) -> bool:
         """Return whether any complete, uncommitted record exists.

@@ -14,7 +14,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import ValidationError
@@ -145,19 +145,40 @@ class RecoveryBodyLimitMiddleware:
         await self.app(scope, limited_receive, send)
 
 
-def _recovery_unavailable(retry_after_seconds: int) -> HTTPException:
-    """Construct the uniform non-disclosing recovery-capacity response."""
+_RecoveryRetryClass = Literal["global", "renew", "source"]
+_RECOVERY_PERMIT_TOKEN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
+
+
+def _recovery_unavailable(
+    retry_after_seconds: int, retry_class: _RecoveryRetryClass = "global"
+) -> HTTPException:
+    """Construct the uniform non-disclosing recovery-capacity response.
+
+    ``X-Recovery-Retry-Class`` is advisory for new clients.  The existing
+    status, body, and Retry-After header remain the interoperable contract for
+    old clients and intermediaries that omit or strip the new header.
+    """
 
     return HTTPException(
         status_code=429,
         detail="Recovery unavailable",
-        headers={"Retry-After": str(retry_after_seconds)},
+        headers={
+            "Retry-After": str(retry_after_seconds),
+            "X-Recovery-Retry-Class": retry_class,
+        },
     )
 
 
 def _recovery_source_conflict() -> HTTPException:
     """Construct a capability-holder-only, path-free source conflict response."""
     return HTTPException(status_code=409, detail="Recovery source conflict")
+
+
+def _has_recovery_permit_shape(value: str | None) -> bool:
+    """Recognize the opaque 32-byte base64url permit form without decoding it."""
+    return (
+        isinstance(value, str) and _RECOVERY_PERMIT_TOKEN.fullmatch(value) is not None
+    )
 
 
 def _neo4j_access_const(mode: str) -> str:
@@ -567,28 +588,34 @@ async def _enqueue_native_recovery_receipt(
         "created_by": receipt["actor"],
         "_recovery_origin": origin,
     }
-    # Native recovery records do not have a client idempotency key. Stamp the
-    # same server-owned envelope field used by live ingest from their durable
-    # source handle and record ordinal, so identical event/timestamp/session
-    # values cannot overwrite each other and an exact replay remains idempotent.
-    payload[SPOOL_EVENT_IDENTITY] = recovery_event_identity(
-        receipt["source_handle"], receipt["origin"]["ordinal"]
+    # A usable retained key identifies the same logical event as live ingest.
+    # Otherwise source-handle/ordinal preserves distinct same-timestamp records.
+    payload[SPOOL_EVENT_IDENTITY] = _recovery_event_identity(
+        payload, receipt["source_handle"], receipt["origin"]["ordinal"]
     )
     session_id = payload["data"]["session_id"]
     await recovery_registry.queue_manager.append(
         session_id, json.dumps(payload, separators=(",", ":")).encode()
     )
-    try:
-        await receipts.mark(
-            receipt["origin"], "enqueued", source_handle=receipt["source_handle"]
-        )
-    finally:
+    enqueued = await receipts.mark(
+        receipt["origin"], "enqueued", source_handle=receipt["source_handle"]
+    )
+    if enqueued:
         recovery_registry.get_or_create(
             session_id, receipt["workspace"], created_by=receipt["actor"]
         )
+    else:
+        logger.error(
+            "native_recovery_enqueue_transition_failed; raw record remains durable"
+        )
 
 
-async def _reconcile_native_recovery_outbox_unlocked(app: FastAPI) -> None:
+async def _reconcile_native_recovery_outbox_unlocked(
+    app: FastAPI,
+    *,
+    bridge_retry_pending: bool = False,
+    retry_origins_with_audit: frozenset[str] = frozenset(),
+) -> None:
     """Repair interrupted recovery admissions while the outbox lock is held."""
     receipts = getattr(app.state, "recovery_receipts", None)
     recovery_registry = getattr(app.state, "recovery_registry", None)
@@ -613,6 +640,11 @@ async def _reconcile_native_recovery_outbox_unlocked(app: FastAPI) -> None:
             await receipts.mark(
                 receipt["origin"], "written", source_handle=receipt["source_handle"]
             )
+            continue
+        if state == "retry_pending" and not bridge_retry_pending:
+            # A retry continuation is admitted only through the same
+            # RecoveryAdmissionGate critical section as new recovery ingress.
+            # Never let a normal outbox scan bypass live-first.
             continue
         if state == "enqueued":
             queue_state = (
@@ -646,33 +678,192 @@ async def _reconcile_native_recovery_outbox_unlocked(app: FastAPI) -> None:
         queue_state = (
             await recovery_registry.queue_manager.recovery_origin_commit_state(origin)
         )
+        if (
+            state == "retry_pending"
+            and queue_state == "committed"
+            and json.dumps(origin, sort_keys=True, separators=(",", ":"))
+            in retry_origins_with_audit
+        ):
+            # This committed line belongs to the delivery that was
+            # quarantined and then archived, not the current retry bridge.
+            # Treat it as absent so this attempt gets its own raw queue line.
+            queue_state = None
         if queue_state == "committed":
             await receipts.mark(
                 receipt["origin"], "written", source_handle=receipt["source_handle"]
             )
             continue
         if queue_state == "queued":
-            await receipts.mark(
+            enqueued = await receipts.mark(
                 receipt["origin"], "enqueued", source_handle=receipt["source_handle"]
             )
-            payload = receipt["payload"]
-            recovery_registry.get_or_create(
-                payload["data"]["session_id"],
-                receipt["workspace"],
-                created_by=receipt["actor"],
-            )
+            if enqueued:
+                payload = receipt["payload"]
+                recovery_registry.get_or_create(
+                    payload["data"]["session_id"],
+                    receipt["workspace"],
+                    created_by=receipt["actor"],
+                )
+            else:
+                logger.error(
+                    "native_recovery_resume_transition_failed; raw record remains durable"
+                )
             continue
         await _enqueue_native_recovery_receipt(app, receipt)
 
 
 async def _reconcile_native_recovery_outbox(app: FastAPI) -> None:
     """Idempotently bridge durable receipt admission into the recovery spool."""
+    receipts = getattr(app.state, "recovery_receipts", None)
+    admission_gate = getattr(app.state, "recovery_admission_gate", None)
     lock = getattr(app.state, "recovery_outbox_lock", None)
-    if lock is None:
-        await _reconcile_native_recovery_outbox_unlocked(app)
+
+    # Read before the gate so a slow SQLite read/JSON validation never delays a
+    # normal /events append. An admin retry is the only writer of this bridge;
+    # seeing a new bridge after this read merely defers it to the next pass.
+    pending = await receipts.pending_outbox() if receipts is not None else []
+    retry_origins_with_audit: frozenset[str] = frozenset()
+    if receipts is not None and admission_gate is not None:
+        audited_retry_origins: list[str] = []
+        for receipt in pending:
+            if receipt["state"] != "retry_pending":
+                continue
+            origin = {"source_handle": receipt["source_handle"], **receipt["origin"]}
+            if await app.state.recovery_registry.queue_manager.recovery_origin_has_retry_audit(
+                origin
+            ):
+                audited_retry_origins.append(
+                    json.dumps(origin, sort_keys=True, separators=(",", ":"))
+                )
+        retry_origins_with_audit = frozenset(audited_retry_origins)
+
+    async def _reconcile_locked(*, bridge_retry_pending: bool) -> bool:
+        if lock is None:
+            await _reconcile_native_recovery_outbox_unlocked(
+                app,
+                bridge_retry_pending=bridge_retry_pending,
+                retry_origins_with_audit=retry_origins_with_audit,
+            )
+        else:
+            async with lock:
+                await _reconcile_native_recovery_outbox_unlocked(
+                    app,
+                    bridge_retry_pending=bridge_retry_pending,
+                    retry_origins_with_audit=retry_origins_with_audit,
+                )
+        return True
+
+    if admission_gate is not None and any(
+        receipt["state"] == "retry_pending" for receipt in pending
+    ):
+        # Gate then outbox is the only combined order. The availability check
+        # intentionally ignores this retry bridge itself, otherwise the bridge
+        # could never self-heal after a process crash.
+        await admission_gate.run_if_available(
+            lambda: _native_recovery_live_available(app),
+            lambda: _reconcile_locked(bridge_retry_pending=True),
+        )
         return
-    async with lock:
-        await _reconcile_native_recovery_outbox_unlocked(app)
+    await _reconcile_locked(bridge_retry_pending=False)
+
+
+async def _retry_quarantined_native_recovery(app: FastAPI) -> bool:
+    """Retry one quarantined receipt through the normal live-first admission gate."""
+    receipts = getattr(app.state, "recovery_receipts", None)
+    recovery_registry = getattr(app.state, "recovery_registry", None)
+    admission_gate = getattr(app.state, "recovery_admission_gate", None)
+    if receipts is None or recovery_registry is None or admission_gate is None:
+        return False
+
+    admin_lock = app.state.recovery_admin_retry_lock
+    async with admin_lock:
+        receipt = await receipts.next_quarantined()
+        if receipt is None:
+            return False
+        origin = {"source_handle": receipt["source_handle"], **receipt["origin"]}
+        # Copy before active removal. This potentially slow scan deliberately
+        # happens outside the live admission gate, so normal /events appends
+        # retain their short critical section.
+        await recovery_registry.queue_manager.archive_recovery_dead_letters(origin)
+
+        async def _mark_retry_pending() -> bool:
+            return await receipts.requeue_quarantined(
+                receipt["source_handle"], receipt["origin"]["ordinal"]
+            )
+
+        transitioned = await admission_gate.run_if_available(
+            lambda: _native_recovery_live_available(app), _mark_retry_pending
+        )
+        if not transitioned:
+            return False
+
+    # The durable bridge has been made visible. Ordinary reconciliation owns
+    # append/resume and reacquires the standard gate before it handles this
+    # retry, preserving gate -> outbox ordering.
+    await _reconcile_native_recovery_outbox(app)
+    return True
+
+
+async def _quarantine_pending_native_recovery(
+    app: FastAPI, source_handle: str, ordinal: int
+) -> bool:
+    """Dead-letter and terminalize one selected receipt while recovery is paused."""
+    receipts = getattr(app.state, "recovery_receipts", None)
+    recovery_registry = getattr(app.state, "recovery_registry", None)
+    if (
+        receipts is None
+        or recovery_registry is None
+        or not getattr(app.state, "recovery_paused", False)
+    ):
+        return False
+    async with app.state.recovery_outbox_lock:
+        receipt = await receipts.pending_receipt(source_handle, ordinal)
+        if receipt is None:
+            return False
+        origin = {"source_handle": source_handle, **receipt["origin"]}
+        queue = recovery_registry.queue_manager
+        session_id = receipt["payload"]["data"]["session_id"]
+        # A committed offset is a durable graph-flush proof. Do not let a
+        # manual action overwrite that completion with a quarantine, unless
+        # retry audit evidence proves it belongs to the prior delivery that
+        # this retry bridge replaced.
+        if await queue.recovery_origin_commit_state(
+            origin
+        ) == "committed" and not await queue.recovery_origin_has_retry_audit(origin):
+            return False
+        batch = await queue.read_batch(session_id, max_items=1)
+        if batch.records:
+            try:
+                envelope = json.loads(batch.records[0].raw)
+            except (TypeError, ValueError):
+                return False
+            if envelope.get("_recovery_origin") != origin:
+                return False
+            await queue.dead_letter(
+                session_id,
+                batch.records[0].raw,
+                "operator quarantined stuck native recovery receipt",
+            )
+            await receipts.quarantine_pending(source_handle, ordinal)
+            await queue.commit(session_id, batch.end_offset)
+            return True
+        # An outbox record can be stuck before its first queue append. Preserve
+        # its sanitized envelope as dead-letter evidence before terminalizing it.
+        audit_payload = {
+            **sanitize_recovery_payload(receipt["payload"]),
+            "created_by": receipt["actor"],
+            "_recovery_origin": origin,
+            SPOOL_EVENT_IDENTITY: _recovery_event_identity(
+                receipt["payload"], source_handle, ordinal
+            ),
+        }
+        await queue.dead_letter(
+            session_id,
+            json.dumps(audit_payload, separators=(",", ":")).encode(),
+            "operator quarantined stuck native recovery receipt before enqueue",
+        )
+        await receipts.quarantine_pending(source_handle, ordinal)
+        return True
 
 
 async def _admit_native_recovery(
@@ -806,6 +997,20 @@ async def _native_recovery_admission_available(app_instance: FastAPI) -> bool:
         not getattr(app_instance.state, "recovery_paused", False)
         and not receipt_pending
         and not live_pending
+    )
+
+
+async def _native_recovery_live_available(app_instance: FastAPI) -> bool:
+    """Check only live-first availability for an existing retry bridge."""
+    try:
+        live_pending = (
+            await app_instance.state.registry.queue_manager.has_pending_records()
+        )
+    except Exception:
+        logger.exception("native_recovery_live_availability_check_failed")
+        live_pending = True
+    return (
+        not getattr(app_instance.state, "recovery_paused", False) and not live_pending
     )
 
 
@@ -1095,6 +1300,16 @@ def _new_event_identity(idempotency_key: str | None) -> str:
     return f"new-{secrets.token_hex(16)}"
 
 
+def _recovery_event_identity(
+    payload: dict[str, Any], source_handle: str, ordinal: int
+) -> str:
+    """Use live identity for a retained recovery key, source identity otherwise."""
+    idempotency_key = payload.get("idempotency_key")
+    if isinstance(idempotency_key, str) and idempotency_key:
+        return _new_event_identity(idempotency_key)
+    return recovery_event_identity(source_handle, ordinal)
+
+
 def _workspace_slug(workspace: str) -> str:
     """Return a filesystem-safe slug for a workspace (session-less log stem)."""
     slug = re.sub(r"[^a-z0-9]+", "-", (workspace or "").lower()).strip("-")
@@ -1269,6 +1484,7 @@ def create_asgi_app(
     app.state.recovery_admission_gate = None
     app.state.recovery_registry = None
     app.state.recovery_outbox_lock = asyncio.Lock()
+    app.state.recovery_admin_retry_lock = asyncio.Lock()
     app.state.append_live_record = lambda worker_key, body: _append_live_record(
         app, worker_key, body
     )
@@ -1356,6 +1572,42 @@ def create_asgi_app(
                     )
 
         recovery_registry.on_batch_flushed = _mark_recovery_flushed
+
+        async def _ensure_recovery_records_are_flushable(
+            worker: Any, records: list[Any]
+        ) -> None:
+            """Discard selected work terminalized during a recovery pause."""
+            for record in records:
+                try:
+                    origin = json.loads(record.raw).get("_recovery_origin")
+                except (TypeError, ValueError):
+                    origin = None
+                if not (
+                    isinstance(origin, dict)
+                    and isinstance(origin.get("source_handle"), str)
+                    and isinstance(origin.get("ordinal"), int)
+                ):
+                    continue  # Explicit legacy records retain their former path.
+                queue_state = (
+                    await recovery_registry.queue_manager.recovery_origin_commit_state(
+                        origin
+                    )
+                )
+                if (
+                    queue_state != "queued"
+                    or not await app.state.recovery_receipts.is_flushable(
+                        origin["source_handle"], origin["ordinal"]
+                    )
+                ):
+                    # Event handlers only buffer graph work; flush is the sole
+                    # write boundary. Drop that buffer before raising so a
+                    # paused-and-quarantined record cannot write after resume.
+                    worker.services.graph.discard_buffer()
+                    raise RuntimeError(
+                        "recovery record was terminalized before graph flush"
+                    )
+
+        recovery_registry.before_recovery_flush = _ensure_recovery_records_are_flushable
 
         async def _retry_recovery_receipt_transition() -> None:
             try:
@@ -1855,7 +2107,7 @@ async def post_recovery_admission(
     source_handle = source_handle_from_capability(recovery_source)
     if source_handle is None:
         raise _recovery_unavailable(
-            http_request.app.state.recovery_config.retry_after_seconds
+            http_request.app.state.recovery_config.retry_after_seconds, "source"
         )
     request = await _parse_recovery_admission(http_request)
     if http_request.query_params:
@@ -2006,7 +2258,7 @@ async def post_recovery_events(
     if admission_gate is not None:
         source_handle = source_handle_from_capability(recovery_source)
         if source_handle is None or not isinstance(request, RecoveryEventRequest):
-            raise _recovery_unavailable(config.retry_after_seconds)
+            raise _recovery_unavailable(config.retry_after_seconds, "source")
         source = request.source.model_dump()
     else:
         if not isinstance(request, LegacyRecoveryEventRequest):
@@ -2130,6 +2382,16 @@ async def post_recovery_events(
             raise _recovery_source_conflict()
         if permit_result == "existing":
             raise _recovery_unavailable(config.retry_after_seconds)
+        if permit_result == "mismatch":
+            raise _recovery_unavailable(config.retry_after_seconds, "source")
+        if permit_result == "invalid":
+            retry_class: _RecoveryRetryClass = (
+                "renew"
+                if recovery_permit is None
+                or _has_recovery_permit_shape(recovery_permit)
+                else "global"
+            )
+            raise _recovery_unavailable(config.retry_after_seconds, retry_class)
         return await _admit_with_claim(permit_result)
 
 

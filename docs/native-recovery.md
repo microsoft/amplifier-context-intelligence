@@ -91,8 +91,16 @@ is returned as the same non-disclosing `429`. Recovery records use their own
 durable queue and run through the normal event handlers and graph idempotency
 path.
 
-Administrators can view aggregate receipt states, pause or resume recovery,
+Administrators can view aggregate receipt states, inspect pending receipt
+handles/ordinals (never source paths or payloads), pause or resume recovery,
 and return one quarantined record to the recovery queue at
 `/admin/recovery/status`, `/admin/recovery/pause`, `/admin/recovery/resume`,
-and `/admin/recovery/retry-quarantined`. Receipt identities are never
-contributor-visible.
+and `/admin/recovery/retry-quarantined`. Retry first copies that receipt's
+active dead-letter evidence to a recovery retry audit, then re-enqueues the
+exact receipt; it never retries another source's evidence. To unblock a
+receipt-store failure, an administrator first pauses recovery, reads
+`/admin/recovery/pending`, then submits its opaque handle and ordinal to
+`/admin/recovery/quarantine-pending`. That action writes durable dead-letter
+evidence before terminally quarantining the selected receipt. Receipt
+identities are never contributor-visible and these actions remain protected by
+the existing `/admin/*` authorization boundary.
