@@ -33,9 +33,14 @@ PermitResult = Literal[
 ]
 ReceiptClassification = Literal["new", "duplicate", "conflict", "foreign"]
 ReceiptState = Literal[
-    "pending_enqueue", "enqueued", "committed_pending", "written", "quarantined"
+    "pending_enqueue",
+    "retry_pending",
+    "enqueued",
+    "committed_pending",
+    "written",
+    "quarantined",
 ]
-_PENDING = ("pending_enqueue", "enqueued", "committed_pending")
+_PENDING = ("pending_enqueue", "retry_pending", "enqueued", "committed_pending")
 _SOURCE_CAPABILITY_BYTES = 32
 _SOURCE_CAPABILITY_LENGTH = 43
 _SOURCE_HANDLE_DOMAIN = b"context-intelligence/recovery/source-handle/v1\x00"
@@ -314,6 +319,22 @@ class RecoveryAdmissionGate:
         """Serialize a normal durable live append with recovery admission."""
         async with self._lock:
             yield
+
+    async def run_if_available(
+        self,
+        available: Callable[[], Awaitable[bool]],
+        operation: Callable[[], Awaitable[bool]],
+    ) -> bool:
+        """Run a recovery admission continuation at the live-ingest boundary.
+
+        Operator retry is a new delivery attempt, not a permit exemption.  It
+        must therefore share the same lock and durable availability predicate
+        as permit issue/consume and normal live queue appends.
+        """
+        async with self._lock:
+            if not await available():
+                return False
+            return await operation()
 
 
 class RecoveryReceiptStore:
@@ -998,7 +1019,7 @@ class RecoveryReceiptStore:
                         return "conflict"
                     if db.execute(
                         "SELECT 1 FROM recovery_receipts WHERE state IN "
-                        "('pending_enqueue','enqueued','committed_pending') LIMIT 1"
+                        "('pending_enqueue','retry_pending','enqueued','committed_pending') LIMIT 1"
                     ).fetchone():
                         return "busy"
                     if require_lease:
@@ -1082,7 +1103,7 @@ class RecoveryReceiptStore:
                     return bool(
                         db.execute(
                             "SELECT 1 FROM recovery_receipts WHERE state IN "
-                            "('pending_enqueue','enqueued','committed_pending') LIMIT 1"
+                            "('pending_enqueue','retry_pending','enqueued','committed_pending') LIMIT 1"
                         ).fetchone()
                     )
 
@@ -1094,11 +1115,39 @@ class RecoveryReceiptStore:
         state: ReceiptState,
         *,
         source_handle: str | None = None,
-    ) -> None:
+    ) -> bool:
+        """Advance one receipt through an explicit, monotonic state transition.
+
+        In particular, a stale flush completion can never overwrite an
+        operator quarantine.  Retrying is the sole path out of ``quarantined``:
+        ``requeue_quarantined`` first creates a durable ``retry_pending``
+        bridge, from which a later graph flush may complete the receipt.
+        """
         if source_handle is None:
             source_handle, _, origin = self._legacy_context(origin)
 
-        def _mark() -> None:
+        allowed_previous = {
+            "pending_enqueue": ("pending_enqueue", "retry_pending", "enqueued"),
+            "retry_pending": ("retry_pending",),
+            "enqueued": ("pending_enqueue", "retry_pending", "enqueued"),
+            "committed_pending": ("enqueued", "committed_pending"),
+            "written": (
+                "pending_enqueue",
+                "retry_pending",
+                "enqueued",
+                "committed_pending",
+                "written",
+            ),
+            "quarantined": (
+                "pending_enqueue",
+                "retry_pending",
+                "enqueued",
+                "committed_pending",
+                "quarantined",
+            ),
+        }[state]
+
+        def _mark() -> bool:
             with self._lock:
                 self._initialize_locked()
                 with sqlite3.connect(self.path, timeout=30) as db:
@@ -1111,15 +1160,55 @@ class RecoveryReceiptStore:
                         raise RuntimeError(
                             "recovery receipt terminal transition has no durable receipt"
                         )
-                    db.execute(
+                    changed = db.execute(
                         """UPDATE recovery_receipts
                            SET state=?, payload=CASE WHEN ?='written' THEN '' ELSE payload END
                            WHERE source_handle=? AND ordinal=?
-                           AND (state='pending_enqueue' OR ? != 'enqueued')""",
-                        (state, state, source_handle, origin["ordinal"], state),
-                    )
+                           AND state IN ({})""".format(
+                            ",".join("?" for _ in allowed_previous)
+                        ),
+                        (
+                            state,
+                            state,
+                            source_handle,
+                            origin["ordinal"],
+                            *allowed_previous,
+                        ),
+                    ).rowcount
+                    return changed == 1
 
-        await asyncio.to_thread(_mark)
+        return await asyncio.to_thread(_mark)
+
+    async def is_flushable(self, source_handle: str, ordinal: int) -> bool:
+        """Whether a selected v1 record can still be replayed through graph flush.
+
+        An operator may terminalize a selected record while it is deliberately
+        held at the recovery pause boundary.  A stale drainer must then discard
+        its in-memory buffer rather than flush it or rewrite the terminal
+        receipt state after resume.  ``written`` remains eligible here because
+        it can be the durable graph-flush marker left by a crash before the
+        queue offset commit; the caller additionally verifies that its exact
+        raw queue record remains uncommitted.
+        """
+
+        def _read() -> bool:
+            with self._lock:
+                self._initialize_locked()
+                with sqlite3.connect(self.path, timeout=30) as db:
+                    row = db.execute(
+                        """SELECT state FROM recovery_receipts
+                           WHERE source_handle=? AND ordinal=?""",
+                        (source_handle, ordinal),
+                    ).fetchone()
+                    return row is not None and row[0] in {
+                        "pending_enqueue",
+                        "retry_pending",
+                        "enqueued",
+                        "committed_pending",
+                        "written",
+                    }
+
+        return await asyncio.to_thread(_read)
 
     async def pending_outbox(self) -> list[dict[str, Any]]:
         def _read() -> list[dict[str, Any]]:
@@ -1131,23 +1220,36 @@ class RecoveryReceiptStore:
                                   s.descriptor, r.actor, r.workspace, r.payload, r.state
                            FROM recovery_receipts AS r JOIN recovery_sources AS s
                            ON s.source_handle=r.source_handle
-                           WHERE r.state IN ('pending_enqueue','enqueued','committed_pending')
+                           WHERE r.state IN ('pending_enqueue','retry_pending','enqueued','committed_pending')
                            ORDER BY r.rowid"""
                     ).fetchall()
             return [
-                {
-                    "source_handle": row[0],
-                    "source": json.loads(row[3]),
-                    "origin": {"ordinal": row[1], "source_line_sha256": row[2]},
-                    "actor": row[4],
-                    "workspace": row[5],
-                    "payload": json.loads(row[6]),
-                    "state": row[7],
-                }
+                parsed
                 for row in rows
+                if (parsed := self._pending_outbox_row(row)) is not None
             ]
 
         return await asyncio.to_thread(_read)
+
+    @staticmethod
+    def _pending_outbox_row(row: tuple[Any, ...]) -> dict[str, Any] | None:
+        """Parse a pending row defensively; legacy empty payloads stay inert."""
+        try:
+            source = json.loads(row[3])
+            payload = json.loads(row[6])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(source, dict) or not isinstance(payload, dict):
+            return None
+        return {
+            "source_handle": row[0],
+            "source": source,
+            "origin": {"ordinal": row[1], "source_line_sha256": row[2]},
+            "actor": row[4],
+            "workspace": row[5],
+            "payload": payload,
+            "state": row[7],
+        }
 
     async def status(self) -> dict[str, int]:
         def _read() -> dict[str, int]:
@@ -1163,7 +1265,41 @@ class RecoveryReceiptStore:
 
         return await asyncio.to_thread(_read)
 
-    async def retry_quarantined(self) -> bool:
+    async def next_quarantined(self) -> dict[str, Any] | None:
+        """Return the oldest quarantined receipt for internal admin recovery."""
+
+        def _read() -> dict[str, Any] | None:
+            with self._lock:
+                self._initialize_locked()
+                with sqlite3.connect(self.path, timeout=30) as db:
+                    rows = db.execute(
+                        """SELECT source_handle, ordinal, source_line_sha256, actor,
+                                  workspace, payload, state
+                           FROM recovery_receipts WHERE state='quarantined'
+                           ORDER BY rowid"""
+                    ).fetchall()
+                    for row in rows:
+                        try:
+                            payload = json.loads(row[5])
+                        except (TypeError, ValueError):
+                            continue
+                        if not isinstance(payload, dict):
+                            continue
+                        return {
+                            "source_handle": row[0],
+                            "origin": {"ordinal": row[1], "source_line_sha256": row[2]},
+                            "actor": row[3],
+                            "workspace": row[4],
+                            "payload": payload,
+                            "state": row[6],
+                        }
+                    return None
+
+        return await asyncio.to_thread(_read)
+
+    async def requeue_quarantined(self, source_handle: str, ordinal: int) -> bool:
+        """Reset one exact quarantined receipt when no receipt is pending."""
+
         def _retry() -> bool:
             with self._lock:
                 self._initialize_locked()
@@ -1171,22 +1307,86 @@ class RecoveryReceiptStore:
                     db.execute("BEGIN IMMEDIATE")
                     if db.execute(
                         "SELECT 1 FROM recovery_receipts WHERE state IN "
-                        "('pending_enqueue','enqueued','committed_pending') LIMIT 1"
+                        "('pending_enqueue','retry_pending','enqueued','committed_pending') LIMIT 1"
                     ).fetchone():
                         return False
-                    row = db.execute(
-                        "SELECT rowid FROM recovery_receipts WHERE state='quarantined' "
-                        "ORDER BY rowid LIMIT 1"
-                    ).fetchone()
-                    if row is None:
-                        return False
-                    db.execute(
-                        "UPDATE recovery_receipts SET state='pending_enqueue' WHERE rowid=?",
-                        row,
-                    )
-                    return True
+                    changed = db.execute(
+                        """UPDATE recovery_receipts SET state='retry_pending'
+                           WHERE source_handle=? AND ordinal=? AND state='quarantined'""",
+                        (source_handle, ordinal),
+                    ).rowcount
+                    return changed == 1
 
         return await asyncio.to_thread(_retry)
+
+    async def pending_receipts(self) -> list[dict[str, Any]]:
+        """Return admin-safe identifiers/state for outstanding receipts."""
+
+        def _read() -> list[dict[str, Any]]:
+            with self._lock:
+                self._initialize_locked()
+                with sqlite3.connect(self.path, timeout=30) as db:
+                    return [
+                        {"source_handle": row[0], "ordinal": row[1], "state": row[2]}
+                        for row in db.execute(
+                            """SELECT source_handle, ordinal, state
+                               FROM recovery_receipts
+                               WHERE state IN ('pending_enqueue','retry_pending','enqueued','committed_pending')
+                               ORDER BY rowid"""
+                        )
+                    ]
+
+        return await asyncio.to_thread(_read)
+
+    async def pending_receipt(
+        self, source_handle: str, ordinal: int
+    ) -> dict[str, Any] | None:
+        """Return one pending receipt internally; its payload is never routed."""
+
+        def _read() -> dict[str, Any] | None:
+            with self._lock:
+                self._initialize_locked()
+                with sqlite3.connect(self.path, timeout=30) as db:
+                    row = db.execute(
+                        """SELECT source_line_sha256, actor, workspace, payload, state
+                           FROM recovery_receipts
+                           WHERE source_handle=? AND ordinal=?
+                           AND state IN ('pending_enqueue','retry_pending','enqueued','committed_pending')""",
+                        (source_handle, ordinal),
+                    ).fetchone()
+                    if row is None:
+                        return None
+                    try:
+                        payload = json.loads(row[3])
+                    except (TypeError, ValueError):
+                        return None
+                    if not isinstance(payload, dict):
+                        return None
+                    return {
+                        "origin": {"ordinal": ordinal, "source_line_sha256": row[0]},
+                        "actor": row[1],
+                        "workspace": row[2],
+                        "payload": payload,
+                        "state": row[4],
+                    }
+
+        return await asyncio.to_thread(_read)
+
+    async def quarantine_pending(self, source_handle: str, ordinal: int) -> None:
+        """Terminalize one pending receipt after its dead-letter audit is durable."""
+
+        def _quarantine() -> None:
+            with self._lock:
+                self._initialize_locked()
+                with sqlite3.connect(self.path, timeout=30) as db:
+                    db.execute(
+                        """UPDATE recovery_receipts SET state='quarantined'
+                           WHERE source_handle=? AND ordinal=?
+                           AND state IN ('pending_enqueue','retry_pending','enqueued','committed_pending')""",
+                        (source_handle, ordinal),
+                    )
+
+        await asyncio.to_thread(_quarantine)
 
 
 def _allowed_lease_id(path: str | Path | None) -> str | None:

@@ -6,6 +6,7 @@ import functools
 import inspect
 import json
 import logging
+import sqlite3
 import time
 from collections import deque
 from collections.abc import AsyncIterator
@@ -89,6 +90,10 @@ def _is_transient_infra_error(exc: BaseException) -> bool:
             asyncio.TimeoutError,
             ConnectionError,
             OSError,
+            # The recovery receipt ledger is a durable dependency. SQLite
+            # lock/busy/operational failures must hold the queued record for a
+            # later retry, never turn it into payload poison.
+            sqlite3.OperationalError,
         ),
     )
 
@@ -230,6 +235,11 @@ class SessionRegistry:
         # so recovery can reconcile its durable evidence; it must never be a
         # best-effort notification after the offset has moved.
         self.on_record_quarantined: Any | None = None
+        # Called after a recovery record has been dispatched and passed its
+        # pause hold, but immediately before graph flush.  This closes the
+        # selected-record race: an operator can terminalize a paused record
+        # while its drainer holds only buffered graph changes.
+        self.before_recovery_flush: Any | None = None
         self.on_post_commit_failure: Any | None = None
         self.pre_flush: Any | None = None
         # Optional context-manager factory for recovery-only graph writes and
@@ -586,6 +596,15 @@ class SessionRegistry:
             if inspect.isawaitable(ready):
                 await ready
         async with self._recovery_write_guard():
+            # This check belongs *inside* the pause guard.  If pause wins the
+            # hand-off after pre_flush, it can terminalize the selected record
+            # before resume; if the drainer wins, pause waits for this flush.
+            # Checking before the guard would leave a stale enqueued result
+            # that could write after pause/quarantine/resume.
+            if self.is_recovery and self.before_recovery_flush is not None:
+                eligible = self.before_recovery_flush(worker, records)
+                if inspect.isawaitable(eligible):
+                    await eligible
             await self._flush_barrier(worker)
             await self._before_commit(worker, records)
             try:
