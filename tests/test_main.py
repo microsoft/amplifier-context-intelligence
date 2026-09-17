@@ -350,6 +350,59 @@ async def test_get_blob_returns_404_for_missing_blob(
 
 
 # ---------------------------------------------------------------------------
+# Blob routes with a deeply-nested (over-budget) session_id -- the router
+# passes the RAW, long session_id straight through to AsyncDiskBlobStore
+# with no folding of its own; folding happens INSIDE the store. These
+# confirm that placement end-to-end, through the real HTTP layer.
+# ---------------------------------------------------------------------------
+
+
+async def test_list_blobs_works_for_a_300_char_session_id(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /blobs/{session_id} succeeds for a session_id far over NAME_MAX --
+    the route itself does no folding; AsyncDiskBlobStore.list() does."""
+    from context_intelligence_server.blob_store import AsyncDiskBlobStore
+
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    session_id = "sub-agent-chain-" + ("segment-" * 40)  # far over 255 bytes
+
+    store = AsyncDiskBlobStore(root=tmp_path)
+    written_uri = await store.write(session_id, "key1", {"v": 1})
+
+    response = await client.get(f"/blobs/{session_id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["session_id"] == session_id
+    assert data["blobs"] == [written_uri]
+
+
+async def test_get_blob_works_for_a_300_char_session_id(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /blobs/{session_id}/{key} succeeds for a session_id far over
+    NAME_MAX -- the raw, unfolded session_id/key from the URL path is
+    resolved correctly because AsyncDiskBlobStore folds internally."""
+    from context_intelligence_server.blob_store import AsyncDiskBlobStore
+
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    session_id = "sub-agent-chain-" + ("segment-" * 40)  # far over 255 bytes
+    key = "my-key"
+    blob_data = {"foo": "bar", "count": 42}
+
+    store = AsyncDiskBlobStore(root=tmp_path)
+    await store.write(session_id, key, blob_data)
+
+    response = await client.get(f"/blobs/{session_id}/{key}")
+    assert response.status_code == 200
+    assert response.json() == blob_data
+
+
+# ---------------------------------------------------------------------------
 # POST /cypher tests
 # ---------------------------------------------------------------------------
 

@@ -26,7 +26,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from context_intelligence_server.blob_store import AsyncDiskBlobStore, BlobStore
+from context_intelligence_server.blob_store import (
+    _MAX_KEY_BYTES,
+    _MAX_SESSION_ID_BYTES,
+    AsyncDiskBlobStore,
+    BlobStore,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -316,10 +321,13 @@ async def test_write_is_atomic_no_torn_file_on_failure(
     session_id = "sess-atomic"
     key = "k1"
 
-    with patch(
-        "context_intelligence_server.blob_store.os.replace",
-        side_effect=OSError("simulated replace failure"),
-    ), pytest.raises(OSError):
+    with (
+        patch(
+            "context_intelligence_server.blob_store.os.replace",
+            side_effect=OSError("simulated replace failure"),
+        ),
+        pytest.raises(OSError),
+    ):
         await store.write(session_id, key, {"v": 1})
 
     final_path = store.blob_path(session_id, key)
@@ -399,3 +407,135 @@ async def test_size_returns_byte_size_of_written_blob(
 async def test_size_missing_blob_returns_zero(store: AsyncDiskBlobStore) -> None:
     """size() is idempotent-on-missing: returns 0, never raises."""
     assert await store.size("ci-blob://never-existed/missing_key") == 0
+
+
+# ---------------------------------------------------------------------------
+# Length budget -- sibling of the queue worker-key incident. A blob key is
+# f"{node_id}__{field_name}" (blob_processor.py) and node_id embeds the
+# session_id (utils.make_node_id), so for a deeply-nested sub-agent session
+# the blob key is LONGER than the queue's worker key was. write()'s
+# tempfile.mkstemp(prefix=f"{key}.", suffix=".tmp") names a temp file WIDER
+# than the final "{key}.json" -- exactly the "temp name is the real worst
+# case" shape as the queue's commit(). See blob_store.py's module-level
+# comment for the budget derivation (_MAX_KEY_BYTES=242, _MAX_SESSION_ID_
+# BYTES=255).
+# ---------------------------------------------------------------------------
+
+
+class TestBlobStoreLengthBudget:
+    async def test_write_read_round_trip_with_deeply_nested_session_and_long_key(
+        self, store: AsyncDiskBlobStore, tmp_path: Path
+    ) -> None:
+        """A 300-char session_id (deeply-nested sub-agent chain) AND an
+        over-budget key must still round-trip through write/read/list/size,
+        with every filesystem path component staying under NAME_MAX (255)."""
+        session_id = "sub-agent-chain-" + ("segment-" * 40)  # far over 255
+        key = "node-id-with-a-long-session__" + ("field-" * 60)  # far over 242
+        payload = {"raw": "x" * 5000}
+
+        uri = await store.write(session_id, key, payload)
+
+        # Every path component the write actually touched fits under
+        # NAME_MAX. (str(path) round-trips through Path, so encode the
+        # NAME (not the whole path) for each component.)
+        path = store.blob_path(session_id, key)
+        for part in path.parts:
+            assert len(part.encode("utf-8")) <= 255, f"component too long: {part!r}"
+
+        result = await store.read(uri)
+        assert result == payload
+
+        listed = await store.list(session_id)
+        assert listed == [uri]
+
+        size = await store.size(uri)
+        assert size > 0
+
+        # _parse_uri resolves the URI produced by write() -- both folded,
+        # both discoverable.
+        parsed_session_id, parsed_key = store.parse_uri(uri)
+        assert store.blob_path(parsed_session_id, parsed_key) == path
+
+    async def test_folded_path_components_are_exactly_at_budget(
+        self, store: AsyncDiskBlobStore
+    ) -> None:
+        session_id = "s" * 400
+        key = "k" * 400
+        path = store.blob_path(session_id, key)
+        folded_session_id = path.parent.parent.name
+        folded_key = path.stem
+        assert len(folded_session_id.encode("utf-8")) == _MAX_SESSION_ID_BYTES
+        assert len(folded_key.encode("utf-8")) == _MAX_KEY_BYTES
+
+    async def test_write_survives_at_every_historical_boundary(
+        self, store: AsyncDiskBlobStore
+    ) -> None:
+        """At and around the two budgets (session_id / key), write+read
+        must succeed cleanly -- no OSError, no $blob_error path."""
+        for length in (
+            _MAX_KEY_BYTES,
+            _MAX_KEY_BYTES + 1,
+            _MAX_SESSION_ID_BYTES,
+            _MAX_SESSION_ID_BYTES + 1,
+            9000,
+        ):
+            uri = await store.write(f"sess-{length}", "k" * length, {"v": length})
+            assert await store.read(uri) == {"v": length}
+
+    async def test_idempotent_read_of_already_folded_uri(
+        self, store: AsyncDiskBlobStore
+    ) -> None:
+        """_parse_uri yields an already-folded key; _blob_path folds again
+        -- a no-op because fold_name is idempotent. Reading the URI
+        write() returned (already folded) must resolve to the same file a
+        second parse/fold pass would."""
+        long_key = "k" * 1000
+        uri = await store.write("sess-idem", long_key, {"a": 1})
+        # The URI itself must already contain the folded key/session_id --
+        # parsing and re-resolving it is an idempotent no-op.
+        session_id, key = store.parse_uri(uri)
+        path_from_uri = store.blob_path(session_id, key)
+        path_direct = store.blob_path("sess-idem", long_key)
+        assert path_from_uri == path_direct
+        assert await store.read(uri) == {"a": 1}
+
+    async def test_list_recovers_already_folded_key_and_uri_is_readable(
+        self, store: AsyncDiskBlobStore
+    ) -> None:
+        """list() recovers the key from p.stem (already folded) and
+        re-wraps it via _make_uri -- also idempotent. Every URI list()
+        returns must be directly readable."""
+        long_session = "sess-" + ("z" * 500)
+        await store.write(long_session, "k" * 500, {"a": 1})
+        await store.write(long_session, "k2" * 500, {"a": 2})
+
+        uris = await store.list(long_session)
+        assert len(uris) == 2
+        for uri in uris:
+            # Must not raise -- list()'s URIs are directly consumable.
+            await store.read(uri)
+
+    async def test_under_budget_session_and_key_are_byte_identical_back_compat(
+        self, store: AsyncDiskBlobStore, tmp_path: Path
+    ) -> None:
+        """Every blob on the live share today has an under-budget name --
+        the fold must be identity for it, so every existing ci-blob:// URI
+        already in the graph keeps resolving with NO path change."""
+        session_id = "normal-session-abc123"
+        key = "tool_call_01"
+        uri = await store.write(session_id, key, {"v": 1})
+        assert uri == f"ci-blob://{session_id}/{key}"
+        assert store.blob_path(session_id, key) == (
+            tmp_path / session_id / "blobs" / f"{key}.json"
+        )
+
+    async def test_delete_session_removes_a_folded_deeply_nested_session(
+        self, store: AsyncDiskBlobStore
+    ) -> None:
+        long_session = "sess-" + ("q" * 500)
+        uri = await store.write(long_session, "key1", {"v": 1})
+        removed = await store.delete_session(long_session)
+        assert removed == 1
+        assert await store.list(long_session) == []
+        with pytest.raises(FileNotFoundError):
+            await store.read(uri)

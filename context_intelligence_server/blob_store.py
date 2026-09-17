@@ -20,7 +20,38 @@ import tempfile
 from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
+from context_intelligence_server.utils import fold_name
+
 _SCHEME = "ci-blob://"
+
+# --- session-id / blob-key length budgets ---------------------------------
+#
+# INCIDENT (production, sibling of the queue's worker-key incident): a blob
+# key is ``f"{node_id}__{field_name}"`` (blob_processor.py), and node_id
+# embeds the session_id (utils.make_node_id) -- so for a deeply-nested
+# sub-agent session, the blob key is LONGER than the queue's worker key was.
+# ``write()``'s ``tempfile.mkstemp(prefix=f"{key}.", suffix=".tmp")`` names
+# a temp file that is WIDER than the final ``{key}.json`` name -- exactly
+# the "the temp file is the real worst case" shape as the queue's
+# ``commit()``. Once that temp name crossed NAME_MAX (255 bytes),
+# ``write()`` raised OSError, silently replacing the field's data with
+# ``{"$blob_error": ...}`` in the graph (2,313 occurrences/24h in
+# production) -- never a crash, just silent data loss.
+#
+# ``mkstemp``'s random component is documented (and pinned by
+# ``tempfile._RandomNameSequence``'s own docstring: "Each string is eight
+# characters long") to always be exactly 8 characters; verified empirically
+# against this interpreter too. So the temp name is
+# ``{key}.{8 random chars}.tmp`` = key + 1 ("." after key) + 8 + 4 (".tmp").
+_NAME_MAX = 255
+_KEY_TMP_SUFFIX_BYTES = len(".") + 8 + len(".tmp")  # mkstemp's own suffix: 13
+_MAX_KEY_BYTES = _NAME_MAX - _KEY_TMP_SUFFIX_BYTES  # 242
+
+# session_id is a bare directory component (``<root>/<session_id>/blobs/``):
+# nothing ever appends a suffix to the session_id segment itself (mkstemp's
+# temp file lives inside the "blobs" subdirectory, widening the KEY, not the
+# session_id), so its budget is the plain NAME_MAX.
+_MAX_SESSION_ID_BYTES = _NAME_MAX
 
 
 # ---------------------------------------------------------------------------
@@ -106,9 +137,37 @@ class AsyncDiskBlobStore:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _fold_session_id(session_id: str) -> str:
+        """Bound *session_id* to fit as a bare directory component.
+
+        See the module-level comment on ``_MAX_SESSION_ID_BYTES`` for why
+        the plain ``NAME_MAX`` budget is correct here (no suffix is ever
+        appended to the session_id segment itself).
+        """
+        return fold_name(session_id, _MAX_SESSION_ID_BYTES)
+
+    @staticmethod
+    def _fold_key(key: str) -> str:
+        """Bound *key* to fit under ``write()``'s temp-file suffix budget.
+
+        See the module-level comment on ``_MAX_KEY_BYTES`` for the
+        ``tempfile.mkstemp`` suffix this is sized against.
+        """
+        return fold_name(key, _MAX_KEY_BYTES)
+
     def _make_uri(self, session_id: str, key: str) -> str:
-        """Return the canonical ``ci-blob://`` URI for a session/key pair."""
-        return f"{_SCHEME}{session_id}/{key}"
+        """Return the canonical ``ci-blob://`` URI for a session/key pair.
+
+        Both components are folded to their filesystem-safe length BEFORE
+        being embedded in the URI: this URI is what gets persisted into
+        the graph, and ``_blob_path`` (which resolves it back to disk) also
+        folds -- so an unfolded URI here would point at a path no read
+        could ever reach. Folding is idempotent, so calling this with an
+        already-folded session_id/key (e.g. from ``_parse_uri``) is a
+        no-op.
+        """
+        return f"{_SCHEME}{self._fold_session_id(session_id)}/{self._fold_key(key)}"
 
     def _parse_uri(self, uri: str) -> tuple[str, str]:
         """Parse a ``ci-blob://`` URI into ``(session_id, key)``.
@@ -129,9 +188,21 @@ class AsyncDiskBlobStore:
             raise ValueError(f"URI has empty session_id or key: {uri!r}")
         return session_id, key
 
+    def _session_dir(self, session_id: str) -> Path:
+        """Return ``<root>/<folded-session_id>`` -- the shared base every
+        session-scoped path (blob path, list scan, delete) resolves under."""
+        return self._root / self._fold_session_id(session_id)
+
     def _blob_path(self, session_id: str, key: str) -> Path:
-        """Return the filesystem path for a given session/key blob."""
-        return self._root / session_id / "blobs" / f"{key}.json"
+        """Return the filesystem path for a given session/key blob.
+
+        Both *session_id* and *key* are folded here too -- calling this
+        with an already-folded pair (as ``read``/``size``/``dump`` do,
+        via ``_parse_uri``) is an idempotent no-op, but ``write()`` calls
+        this FIRST, before a URI exists, so the fold must happen here
+        independently of ``_make_uri``.
+        """
+        return self._session_dir(session_id) / "blobs" / f"{self._fold_key(key)}.json"
 
     # ------------------------------------------------------------------
     # Public accessors (mirror of internal helpers for external callers)
@@ -160,12 +231,21 @@ class AsyncDiskBlobStore:
             A ``ci-blob://<session_id>/<key>`` URI.
         """
         path = self._blob_path(session_id, key)
+        # Fold explicitly and reuse the SAME value for the mkstemp prefix
+        # below. ``_blob_path`` already folds ``key`` internally to build
+        # ``path``'s stem -- fold_name is deterministic, so re-deriving it
+        # here is guaranteed identical -- but the mkstemp prefix must never
+        # be built from the RAW key: that key can be far longer than the
+        # budget, and the whole point of folding is that the temp file's
+        # name (this module's own widest suffix -- see the module-level
+        # comment on ``_MAX_KEY_BYTES``) never exceeds NAME_MAX.
+        folded_key = self._fold_key(key)
 
         def _write() -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             data = json.dumps(value)
             tmp_fd, tmp_name = tempfile.mkstemp(
-                dir=str(path.parent), prefix=f"{key}.", suffix=".tmp"
+                dir=str(path.parent), prefix=f"{folded_key}.", suffix=".tmp"
             )
             try:
                 with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
@@ -212,8 +292,13 @@ class AsyncDiskBlobStore:
         """Return all blob URIs for *session_id*, sorted lexicographically.
 
         Returns an empty list if the session directory does not exist.
+
+        *session_id* is folded via ``_session_dir`` to locate the
+        directory; ``p.stem`` recovers an ALREADY-folded key (every file
+        on disk is named with its folded key), so the ``_make_uri`` call
+        below folds it again as a no-op -- idempotent, per ``fold_name``.
         """
-        blobs_dir = self._root / session_id / "blobs"
+        blobs_dir = self._session_dir(session_id) / "blobs"
 
         def _list() -> list[str]:
             if not blobs_dir.exists():
@@ -239,10 +324,10 @@ class AsyncDiskBlobStore:
     async def delete_session(self, session_id: str) -> int:
         """Delete all blobs for *session_id* and return the number removed.
 
-        Removes ``<root>/<session_id>/``. Idempotent: a session with no
-        stored blobs returns 0 and is not an error.
+        Removes ``<root>/<folded-session_id>/``. Idempotent: a session
+        with no stored blobs returns 0 and is not an error.
         """
-        session_dir = self._root / session_id
+        session_dir = self._session_dir(session_id)
         blobs_dir = session_dir / "blobs"
 
         def _delete() -> int:
