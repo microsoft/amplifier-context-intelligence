@@ -5,6 +5,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import sqlite3
 import time
 from collections import deque
 from collections.abc import AsyncGenerator
@@ -2400,7 +2401,9 @@ class TestParseLineWorkingDir:
                 "data": {"session_id": "s1"},
             }
         ).encode("utf-8")
-        event, workspace, working_dir, data, event_identity = SessionRegistry._parse_line(raw)
+        event, workspace, working_dir, data, event_identity = (
+            SessionRegistry._parse_line(raw)
+        )
         assert event == "tool:pre"
         assert workspace == "-ws"
         assert working_dir == "/home/user/project"
@@ -2678,9 +2681,12 @@ class TestTransientInfraFailuresAreNeverDeadLettered:
         assert is_transient(TransientError("deadlock"))
         assert is_transient(asyncio.TimeoutError())
         assert is_transient(OSError("connection reset"))
+        assert is_transient(sqlite3.OperationalError("database is locked"))
 
         # Deterministic -- dead-letterable.
-        assert not is_transient(ValueError("Invalid Neo4j label identifier: 'X-yEvent'"))
+        assert not is_transient(
+            ValueError("Invalid Neo4j label identifier: 'X-yEvent'")
+        )
         assert not is_transient(ClientError("bad cypher"))
         assert not is_transient(json.JSONDecodeError("boom", "{", 0))
         assert not is_transient(RuntimeError("handler bug"))

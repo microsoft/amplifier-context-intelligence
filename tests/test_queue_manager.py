@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 
@@ -112,6 +113,32 @@ async def test_append_does_not_double_newline(qm, tmp_path):
     await qm.append("s1", b'{"e":1}\n')
     log = tmp_path / "queues" / "s1.log"
     assert log.read_bytes() == b'{"e":1}\n'
+
+
+async def test_recovery_origin_scans_ignore_non_mapping_json(qm):
+    """Malformed queue lines must not abort recovery reconciliation scans."""
+    await qm.append("s1", b"[]")
+    origin = {"source_handle": "a" * 64, "ordinal": 0, "source_line_sha256": "b" * 64}
+
+    assert not await qm.contains_recovery_origin(origin)
+    assert await qm.recovery_origin_commit_state(origin) is None
+    assert not await qm.recovery_origin_is_dead(origin)
+
+
+async def test_recovery_origin_state_requires_all_matching_records_to_be_committed(qm):
+    """A stale committed copy cannot hide a requeued uncommitted copy."""
+    origin = {"source_handle": "a" * 64, "ordinal": 0, "source_line_sha256": "b" * 64}
+    raw = json.dumps({"_recovery_origin": origin}).encode()
+
+    await qm.append("old", raw)
+    old = await qm.read_batch("old", max_items=1)
+    await qm.commit("old", old.end_offset)
+    await qm.append("retry", raw)
+
+    assert await qm.recovery_origin_commit_state(origin) == "queued"
+    retry = await qm.read_batch("retry", max_items=1)
+    await qm.commit("retry", retry.end_offset)
+    assert await qm.recovery_origin_commit_state(origin) == "committed"
 
 
 @pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])
@@ -1114,6 +1141,14 @@ async def test_recovery_seed_counts_unchanged_under_streaming(qm):
 
     assert written == 1  # one committed line, no dead
     assert accepted == 2  # one written + one pending
+
+
+async def test_has_pending_records_treats_out_of_range_offset_as_unavailable(qm):
+    """A valid but impossible offset must not open the recovery admission gate."""
+    await qm.append("s1", b"a")
+    qm._offset_path("s1").write_text("999999", encoding="utf-8")
+
+    assert await qm.has_pending_records()
 
 
 async def test_refresh_spool_stats_empty_directory(qm):

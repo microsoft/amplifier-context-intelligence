@@ -195,6 +195,27 @@ class KeyBody(_ContributorIdBody):
     """Body for PUT /admin/keys/{sha256hash}."""
 
 
+class RecoveryReceiptBody(BaseModel):
+    """Opaque admin-only identifier for one native recovery receipt."""
+
+    source_handle: str
+    ordinal: int
+
+    @field_validator("source_handle")
+    @classmethod
+    def source_handle_must_be_sha256(cls, value: str) -> str:
+        if not _HASH_RE.fullmatch(value):
+            raise ValueError("source_handle must be lowercase SHA-256 hex")
+        return value
+
+    @field_validator("ordinal")
+    @classmethod
+    def ordinal_must_not_be_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("ordinal must not be negative")
+        return value
+
+
 # ---------------------------------------------------------------------------
 # Path-param validation helpers (TB-10)
 # ---------------------------------------------------------------------------
@@ -551,7 +572,9 @@ async def recovery_status(request: Request) -> dict[str, object]:
 async def pause_recovery(request: Request) -> dict[str, bool]:
     if not getattr(request.app.state, "recovery_enabled", False):
         raise HTTPException(status_code=404, detail="Not found")
-    request.app.state.recovery_paused = True
+    condition = request.app.state.recovery_pause_condition
+    async with condition:
+        request.app.state.recovery_paused = True
     return {"paused": True}
 
 
@@ -559,7 +582,10 @@ async def pause_recovery(request: Request) -> dict[str, bool]:
 async def resume_recovery(request: Request) -> dict[str, bool]:
     if not getattr(request.app.state, "recovery_enabled", False):
         raise HTTPException(status_code=404, detail="Not found")
-    request.app.state.recovery_paused = False
+    condition = request.app.state.recovery_pause_condition
+    async with condition:
+        request.app.state.recovery_paused = False
+        condition.notify_all()
     return {"paused": False}
 
 
@@ -567,10 +593,34 @@ async def resume_recovery(request: Request) -> dict[str, bool]:
 async def retry_quarantined_recovery(request: Request) -> dict[str, int]:
     if not getattr(request.app.state, "recovery_enabled", False):
         raise HTTPException(status_code=404, detail="Not found")
-    if not await request.app.state.recovery_receipts.retry_quarantined():
-        return {"retried": 0}
     # Deferred import avoids the main/router import cycle.
-    from context_intelligence_server.main import _reconcile_native_recovery_outbox
+    from context_intelligence_server.main import _retry_quarantined_native_recovery
 
-    await _reconcile_native_recovery_outbox(request.app)
+    if not await _retry_quarantined_native_recovery(request.app):
+        return {"retried": 0}
     return {"retried": 1}
+
+
+@router.get("/recovery/pending")
+async def pending_recovery_receipts(request: Request) -> dict[str, object]:
+    """List only opaque identifiers/state needed for a safe admin intervention."""
+    if not getattr(request.app.state, "recovery_enabled", False):
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"pending": await request.app.state.recovery_receipts.pending_receipts()}
+
+
+@router.post("/recovery/quarantine-pending")
+async def quarantine_pending_recovery(
+    body: RecoveryReceiptBody, request: Request
+) -> dict[str, int]:
+    """Dead-letter and terminalize one selected receipt while recovery is paused."""
+    if not getattr(request.app.state, "recovery_enabled", False):
+        raise HTTPException(status_code=404, detail="Not found")
+    if not getattr(request.app.state, "recovery_paused", False):
+        raise HTTPException(status_code=409, detail="Recovery must be paused first")
+    from context_intelligence_server.main import _quarantine_pending_native_recovery
+
+    quarantined = await _quarantine_pending_native_recovery(
+        request.app, body.source_handle, body.ordinal
+    )
+    return {"quarantined": int(quarantined)}

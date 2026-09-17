@@ -129,6 +129,13 @@ def require_recovery_write(request: Request) -> None:
         return
     if not _has_capability(request, "recovery:write"):
         raise HTTPException(status_code=403, detail="Forbidden")
+    if getattr(request.app.state, "recovery_permit_required", False):
+        # A recovery capability selects this special recovery protocol; it is
+        # not authority to write events. Keep a recovery-only principal's
+        # failure identical to the ordinary live-write gate before a request
+        # can reach a source descriptor, receipt lookup, or queue. Lease
+        # compatibility deliberately retains its prior authorization behavior.
+        require_write(request)
 
 
 def require_workspace_access(request: Request, workspace: str, capability: str) -> None:
