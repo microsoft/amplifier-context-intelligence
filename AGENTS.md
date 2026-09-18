@@ -453,6 +453,7 @@ with admin"). Runtime runbook: `docs/identity-management.md`.
 - **New API endpoint**: Add a route to `main.py` or a new router under `routers/`.
 - **Configuration**: Add fields to `ServerConfig` in `config.py`. Keep defaults conservative.
 - **Tests**: Every handler should have a unit test in `tests/handlers/`. Integration tests live in `tests/integration/`.
+- **Idle queue workers**: Append notifications belong to `QueueManager`, covering live ingress, recovery and replay alike. Hold the same key guard across clear-before-read and notification wait; never replace that guard while a waiter references it. Signal after a write attempt settles, including cancellation or failure, since readable bytes may remain. Keep notification waits outside dispatch/finalization, preserve periodic stale/trim maintenance, and test both lost-wakeup windows plus cancellation-safe guard cleanup (`tests/test_queue_wakeups.py`). The queue remains crash-durable, not power-loss-durable.
 - **Server process**: Gunicorn runs one `uvicorn_worker.UvicornWorker` (`worker_class` in `main.py` `run()`), from the `uvicorn-worker` package. Do not use the deprecated `uvicorn.workers` module.
 
 Run `uv run pytest tests/ -q` to verify before committing.

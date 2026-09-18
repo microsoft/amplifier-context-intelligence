@@ -25,7 +25,7 @@ import time
 import unicodedata
 import uuid
 from collections.abc import Coroutine, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -141,6 +141,46 @@ class _KeyGuard:
     admission: asyncio.Lock
     file_lock: threading.Lock
     waiters: int = 0
+    append_event: asyncio.Event = field(default_factory=asyncio.Event)
+    append_generation: int = 0
+    deferred_removal: bool = False
+
+
+class _AppendWaiter:
+    """One held guard reference used to wait for an append notification.
+
+    A drainer clears and snapshots before it reads.  An append between that
+    snapshot and ``wait_for_change`` increments the generation, so it cannot
+    be lost even if the Event is cleared by a later read cycle.
+    """
+
+    def __init__(self, guard: _KeyGuard) -> None:
+        self._guard = guard
+
+    def clear_before_read(self) -> int:
+        """Clear the notification and return the append generation to inspect."""
+        self._guard.append_event.clear()
+        return self._guard.append_generation
+
+    async def wait_for_change(
+        self,
+        generation: int,
+        timeout: float | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> bool:
+        """Wait until an append follows *generation* or the deadline expires."""
+        if timeout is not None and deadline is not None:
+            raise ValueError("Specify timeout or deadline, not both")
+        if self._guard.append_generation != generation:
+            return True
+        if deadline is not None:
+            timeout = max(0.0, deadline - time.monotonic())
+        try:
+            await asyncio.wait_for(self._guard.append_event.wait(), timeout)
+        except TimeoutError:
+            return self._guard.append_generation != generation
+        return self._guard.append_generation != generation
 
 
 async def _await_uninterrupted(coro: Coroutine[Any, Any, _T]) -> _T:
@@ -192,9 +232,9 @@ class QueueManager:
         self._spool_cache_at: float = 0.0
         # One _KeyGuard per worker key that has been appended to and
         # not yet finalized-and-deleted. Created lazily by _guard(); removed
-        # ONLY by delete_drained, under the admission lock, gated on identity
-        # AND waiters == 1 (see _guard / delete_drained). No sweeper, no
-        # timer, no refcount map, no eviction on the hot path.
+        # ONLY after a successful deletion, when its identity still matches
+        # and its last holder exits (see _guard / delete_drained). No sweeper,
+        # no timer, no refcount map, no eviction on the hot path.
         self._guards: dict[str, _KeyGuard] = {}
 
     def _log_path(self, session_id: str) -> Path:
@@ -531,6 +571,19 @@ class QueueManager:
             yield guard
         finally:
             guard.waiters -= 1
+            if (
+                guard.deferred_removal
+                and guard.waiters == 0
+                and self._guards.get(worker_key) is guard
+            ):
+                del self._guards[worker_key]
+
+    @contextlib.contextmanager
+    def append_waiter(self, session_id: str) -> Iterator[_AppendWaiter]:
+        """Hold a session guard across clear/read/wait notification handling."""
+        self._validate_session_id(session_id)
+        with self._guard(session_id) as guard:
+            yield _AppendWaiter(guard)
 
     @staticmethod
     def _write_all(fd: int, data: bytes) -> None:
@@ -604,9 +657,21 @@ class QueueManager:
         # after an await would be invisible to it.
         with self._guard(session_id) as guard:
             async with guard.admission:
-                await _await_uninterrupted(
-                    asyncio.to_thread(self._write_record, guard, path, line)
-                )
+                # A prior drain can have deleted this key while an append was
+                # queued on admission. Clear its deferred removal *after*
+                # obtaining admission and before writing, so that append keeps
+                # this exact guard alive.
+                guard.deferred_removal = False
+                try:
+                    await _await_uninterrupted(
+                        asyncio.to_thread(self._write_record, guard, path, line)
+                    )
+                finally:
+                    # A failed append may have terminated a partial line, and
+                    # cancellation can arrive after the write settles. Wake
+                    # conservatively so a durable record is never stranded.
+                    guard.append_generation += 1
+                    guard.append_event.set()
 
     async def read_batch(self, session_id: str, max_items: int) -> Batch:
         self._validate_session_id(session_id)
@@ -733,9 +798,9 @@ class QueueManager:
         stale ``.offset`` (else a recreated log reads past its own end). Keeps
         ``.dead.jsonl``. Idempotent.
 
-        The guard-map entry is dropped only when ``waiters == 1`` and identity
-        matches; otherwise a still-referencing coroutine could later lock a
-        fresh guard over the same file and tear it.
+        A successful deletion marks the guard for removal. The last holder
+        drops it only when this exact guard still owns the map entry, so an
+        active append waiter cannot cause an ABA replacement.
         """
         self._validate_session_id(session_id)
         log = self._log_path(session_id)
@@ -779,13 +844,22 @@ class QueueManager:
 
         with self._guard(session_id) as guard:
             async with guard.admission:
-                ok = await _await_uninterrupted(asyncio.to_thread(_delete, guard))
-                # Still holding admission: apply the three-part removal
-                # condition. waiters == 1 is THIS call itself;
-                # anything higher means another coroutine holds the guard
-                # and removal must be skipped.
-                if ok and guard.waiters == 1 and self._guards.get(session_id) is guard:
-                    del self._guards[session_id]
+                settled_drained = False
+
+                def _settled_delete() -> bool:
+                    nonlocal settled_drained
+                    settled_drained = _delete(guard)
+                    return settled_drained
+
+                try:
+                    ok = await _await_uninterrupted(asyncio.to_thread(_settled_delete))
+                finally:
+                    # _await_uninterrupted re-raises a caller cancellation only
+                    # after the worker thread has settled. Preserve a confirmed
+                    # successful deletion even when that cancellation wins the
+                    # public result, but never mark a retained log.
+                    if settled_drained:
+                        guard.deferred_removal = True
         return ok
 
     async def delete_session(self, session_id: str) -> bool:
@@ -833,10 +907,24 @@ class QueueManager:
 
         with self._guard(session_id) as guard:
             async with guard.admission:
-                removed = await _await_uninterrupted(asyncio.to_thread(_delete, guard))
-                # Same three-part removal condition as delete_drained.
-                if guard.waiters == 1 and self._guards.get(session_id) is guard:
-                    del self._guards[session_id]
+                settled = False
+
+                def _settled_delete() -> bool:
+                    nonlocal settled
+                    removed = _delete(guard)
+                    settled = True
+                    return removed
+
+                try:
+                    removed = await _await_uninterrupted(
+                        asyncio.to_thread(_settled_delete)
+                    )
+                finally:
+                    # A completed session delete is terminal even if its files
+                    # were already absent. Do not mark removal if the durable
+                    # pending-record check or unlink operation failed.
+                    if settled:
+                        guard.deferred_removal = True
         return removed
 
     async def read_dead_letters(self, session_id: str) -> list[dict]:

@@ -29,7 +29,7 @@ from context_intelligence_server.utils import SPOOL_EVENT_IDENTITY
 logger = logging.getLogger("context_intelligence_server")
 
 _DRAIN_MAX_BATCH = 100
-_DRAIN_POLL_INTERVAL = 0.05  # idle poll cadence; bounded by flush_timeout
+_DRAIN_POLL_INTERVAL = 0.05  # deterministic retry cadence; not used while idle
 
 # --- transient-vs-poison retry policy -------------------------------------
 #
@@ -687,13 +687,14 @@ class SessionRegistry:
 
         The queue owns all byte-position math; this registry only chooses
         which offset to commit via `qm.commit`/`qm.dead_letter`. When idle,
-        the drainer polls and reaps the session past the stale timeout.
+        the drainer waits for a queue-owned append notification, performing
+        stale reaping and spool trimming at the flush-timeout cadence.
         """
         handlers = setup_handlers(worker.services)
         qm = self.queue_manager
         session_id = worker.session_id
         poll_interval = min(flush_timeout, _DRAIN_POLL_INTERVAL)
-        idle_elapsed = 0.0
+        maintenance_deadline = time.monotonic() + flush_timeout
         attempts = 0
         # Separate from `attempts` on purpose: the poison budget is finite and
         # ends in a dead-letter, the transient one is unbounded and never does.
@@ -701,13 +702,23 @@ class SessionRegistry:
 
         while True:
             try:
-                batch = await qm.read_batch(session_id, max_items=self.drain_batch_size)
+                # Clear/snapshot before reading while retaining this guard.
+                # An append between the empty read and wait increments the
+                # generation, so it cannot be missed; a concurrent trim cannot
+                # replace the guard under this waiter.
+                with qm.append_waiter(session_id) as append_waiter:
+                    generation = append_waiter.clear_before_read()
+                    batch = await qm.read_batch(
+                        session_id, max_items=self.drain_batch_size
+                    )
+                    if not batch.records:
+                        await append_waiter.wait_for_change(
+                            generation, deadline=maintenance_deadline
+                        )
 
                 if not batch.records:
-                    await asyncio.sleep(poll_interval)
-                    idle_elapsed += poll_interval
-                    if idle_elapsed >= flush_timeout:
-                        idle_elapsed = 0.0
+                    if time.monotonic() >= maintenance_deadline:
+                        maintenance_deadline = time.monotonic() + flush_timeout
                         settings = get_settings()
                         if (
                             worker.last_event_time > 0
@@ -748,7 +759,7 @@ class SessionRegistry:
                             )
                     continue
 
-                idle_elapsed = 0.0
+                maintenance_deadline = time.monotonic() + flush_timeout
 
                 # --- dispatch + durable write barrier, one error path ---
                 try:
