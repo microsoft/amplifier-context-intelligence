@@ -69,10 +69,14 @@ async def test_durable_cleanup_completion_requires_persisted_completed_session(
             non_session_id, {"labels": ["Event"], "status": "completed"}
         )
         await store.flush()
+        assert await store.is_session_durably_completed(buffered_id)
+        assert not await other_store.is_session_durably_completed(completed_id)
         await other_store.upsert_node(
             completed_id, {"labels": ["Session"], "status": "completed"}
         )
+        assert not await other_store.is_session_durably_completed(completed_id)
         await other_store.flush()
+        assert await other_store.is_session_durably_completed(completed_id)
 
         assert await store.is_session_durably_completed(completed_id)
         assert not await store.is_session_durably_completed(running_id)
