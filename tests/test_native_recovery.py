@@ -24,6 +24,7 @@ from context_intelligence_server.authz import (
     require_workspace_access,
 )
 from context_intelligence_server.config import Settings
+from context_intelligence_server.graph_store import DurableCompletionReadError
 from context_intelligence_server.handlers.data_layer_1.default import DefaultHandler
 from context_intelligence_server.pipeline import PipelineHandlers, process_event
 from context_intelligence_server.recovery import (
@@ -2032,6 +2033,192 @@ async def test_paused_recovery_queue_waits_before_graph_flush_and_commits_once_a
         ).records == []
     finally:
         app.dependency_overrides.pop(require_admin, None)
+
+
+class _RecoveryCleanupGraph:
+    """Small graph seam for exercising real recovery receipts and hooks."""
+
+    workspace = "one"
+    created_by = None
+
+    def __init__(self, *, read_error: bool = False) -> None:
+        self.steps: list[str] = []
+        self.read_error = read_error
+
+    async def flush(self) -> None:
+        self.steps.append("flush")
+
+    async def is_session_durably_completed(self, session_id: str) -> bool:
+        self.steps.append("read")
+        if self.read_error:
+            raise DurableCompletionReadError("read unavailable")
+        return True
+
+    def discard_buffer(self) -> None:
+        pass
+
+    async def close(self) -> None:
+        pass
+
+
+async def _enqueue_native_cleanup_receipt(
+    app: Any, session_id: str
+) -> tuple[dict[str, Any], str]:
+    """Create one real receipt then use production outbox reconciliation."""
+    from context_intelligence_server.main import _reconcile_native_recovery_outbox
+
+    source_handle = _source_handle()
+    origin = {
+        "session_id": session_id,
+        "source_stream_sha256": "a" * 64,
+        "source_line_sha256": "b" * 64,
+        "ordinal": 0,
+    }
+    payload = {
+        "event": "cleanup:finally_end",
+        "workspace": "one",
+        "data": {"session_id": session_id},
+    }
+    receipts = app.state.recovery_receipts
+    assert (
+        await receipts.admit_source(
+            source_handle,
+            {
+                "session_id": session_id,
+                "stream_sha256": "a" * 64,
+                "record_count": 1,
+            },
+            origin,
+            "alice",
+            "one",
+            payload,
+            require_lease=False,
+        )
+        == "accepted"
+    )
+    await receipts.mark(origin, "enqueued", source_handle=source_handle)
+    await _reconcile_native_recovery_outbox(app)
+    return origin, source_handle
+
+
+@pytest.mark.asyncio
+async def test_native_recovery_cleanup_marks_receipt_before_commit_then_postcommit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Main's real recovery callbacks preserve cleanup's durable ordering."""
+    from context_intelligence_server.main import app, create_asgi_app
+
+    settings = Settings(
+        allow_unauthenticated=True,
+        queues_path=str(tmp_path / "live"),
+        recovery=cast(
+            Any,
+            {
+                "enabled": True,
+                "permit_required": False,
+                "receipt_store_path": str(tmp_path / "receipts.sqlite3"),
+                "queues_path": str(tmp_path / "recovery"),
+            },
+        ),
+    )
+    create_asgi_app(settings=settings)
+    _write_lease(app.state.recovery_lease_path)
+    registry = app.state.recovery_registry
+    monkeypatch.setattr(registry, "get_or_create", MagicMock())
+    await _enqueue_native_cleanup_receipt(app, "cleanup-recovery")
+    graph = _RecoveryCleanupGraph()
+    worker = SessionWorker(
+        session_id="cleanup-recovery",
+        workspace="one",
+        services=HookStateService(workspace="one"),
+    )
+    worker.services.graph = graph  # type: ignore[assignment]
+    steps = graph.steps
+    receipts = app.state.recovery_receipts
+    original_mark = receipts.mark
+    original_commit = registry.queue_manager.commit
+    original_post_commit = registry._post_commit
+
+    async def mark(*args: Any, **kwargs: Any) -> None:
+        steps.append("receipt")
+        await original_mark(*args, **kwargs)
+
+    async def commit(*args: Any, **kwargs: Any) -> None:
+        steps.append("commit")
+        await original_commit(*args, **kwargs)
+
+    async def post_commit(*args: Any, **kwargs: Any) -> None:
+        steps.append("post")
+        await original_post_commit(*args, **kwargs)
+
+    receipts.mark = mark  # type: ignore[method-assign]
+    registry.queue_manager.commit = commit  # type: ignore[method-assign]
+    registry._post_commit = post_commit  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "context_intelligence_server.registry.process_event", AsyncMock()
+    )
+
+    await asyncio.wait_for(registry.drain_worker(worker), timeout=5)
+
+    assert steps == ["flush", "read", "receipt", "commit", "post"]
+    assert await receipts.status() == {"written": 1}
+
+
+@pytest.mark.asyncio
+async def test_native_recovery_cleanup_read_error_keeps_receipt_and_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A durable completion read failure never writes or quarantines the receipt."""
+    from context_intelligence_server.main import app, create_asgi_app
+
+    settings = Settings(
+        allow_unauthenticated=True,
+        queues_path=str(tmp_path / "live"),
+        max_delivery_attempts=1,
+        recovery=cast(
+            Any,
+            {
+                "enabled": True,
+                "permit_required": False,
+                "receipt_store_path": str(tmp_path / "receipts.sqlite3"),
+                "queues_path": str(tmp_path / "recovery"),
+            },
+        ),
+    )
+    create_asgi_app(settings=settings)
+    _write_lease(app.state.recovery_lease_path)
+    registry = app.state.recovery_registry
+    monkeypatch.setattr(registry, "get_or_create", MagicMock())
+    await _enqueue_native_cleanup_receipt(app, "cleanup-read-error")
+    worker = SessionWorker(
+        session_id="cleanup-read-error",
+        workspace="one",
+        services=HookStateService(workspace="one"),
+    )
+    worker.services.graph = _RecoveryCleanupGraph(read_error=True)  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "context_intelligence_server.registry._TRANSIENT_BACKOFF_CAP", 0.001
+    )
+    monkeypatch.setattr(
+        "context_intelligence_server.registry.process_event", AsyncMock()
+    )
+    task = asyncio.create_task(registry.drain_worker(worker))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert await app.state.recovery_receipts.status() == {"enqueued": 1}
+    assert (
+        len(
+            (
+                await registry.queue_manager.read_batch(
+                    "cleanup-read-error", max_items=10
+                )
+            ).records
+        )
+        == 1
+    )
+    assert await registry.queue_manager.read_dead_letters("cleanup-read-error") == []
 
 
 @pytest.mark.asyncio

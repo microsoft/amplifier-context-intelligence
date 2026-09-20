@@ -171,6 +171,16 @@ class GraphState:
         node = self._nodes.get(node_id)
         return dict(node) if node is not None else None
 
+    async def is_session_durably_completed(self, session_id: str) -> bool:
+        """Return the in-memory store's exact completed Session state."""
+        node = self._nodes.get(session_id)
+        return bool(
+            node is not None
+            and node.get("workspace", self._workspace) == self._workspace
+            and "Session" in node.get("labels", [])
+            and node.get("status") == "completed"
+        )
+
     # ------------------------------------------------------------------
     # Edge operations
     # ------------------------------------------------------------------
@@ -283,9 +293,7 @@ class GraphState:
             stack.extend(outgoing.get(nid, []))
 
         edge_count = sum(
-            1
-            for (src, dst) in self._edges
-            if src in graph_nodes and dst in graph_nodes
+            1 for (src, dst) in self._edges if src in graph_nodes and dst in graph_nodes
         )
 
         root_props = self._nodes.get(root_id) or {}

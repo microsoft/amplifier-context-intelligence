@@ -114,6 +114,31 @@ async def test_graph_state_status_if_absent_does_not_overwrite_existing_status()
     assert node["status"] == "completed"
 
 
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        ({"labels": ["Session"], "status": "completed"}, True),
+        ({"labels": ["Session"], "status": "running"}, False),
+        ({"labels": ["Other"], "status": "completed"}, False),
+        (
+            {
+                "labels": ["Session"],
+                "status": "completed",
+                "workspace": "other-workspace",
+            },
+            False,
+        ),
+    ],
+)
+async def test_graph_state_durable_completion_requires_exact_session_state(
+    data: dict[str, object], expected: bool
+) -> None:
+    state = GraphState(workspace="test-workspace")
+    await state.upsert_node("session-1", data)
+    assert await state.is_session_durably_completed("session-1") is expected
+    assert not await state.is_session_durably_completed("missing")
+
+
 async def test_graph_state_status_if_absent_never_stored_as_property():
     """The raw status_if_absent key is never persisted on the node, either branch."""
     state = GraphState()
@@ -1099,7 +1124,9 @@ class TestGraphStateDeleteSessionGraph:
         await state.delete_session_graph("fam-root")
 
         assert await state.get_node("other-session-xyz::leak") is not None
-        assert await state.get_edge("agent-shared", "other-session-xyz::leak") is not None
+        assert (
+            await state.get_edge("agent-shared", "other-session-xyz::leak") is not None
+        )
 
     async def test_counts_match_deleted_nodes_and_edges(self) -> None:
         state = GraphState()

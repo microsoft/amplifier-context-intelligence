@@ -18,13 +18,18 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from neo4j.exceptions import Neo4jError
+from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
 from context_intelligence_server import neo4j_store as neo4j_store_module
-from context_intelligence_server.graph_store import GraphStore, QueryableStore
+from context_intelligence_server.graph_store import (
+    DurableCompletionReadError,
+    GraphStore,
+    QueryableStore,
+)
 from context_intelligence_server.neo4j_store import (
     Neo4jGraphStore,
     _convert_temporal_props,
@@ -137,6 +142,68 @@ def test_workspace_setter_to_none_resolves_to_default():
     store = _make_store(workspace="initial")
     store.workspace = None  # type: ignore[assignment]
     assert store.workspace == "default"
+
+
+async def test_durable_completion_read_uses_indexed_session_query_and_strict_true() -> (
+    None
+):
+    store = _make_store(workspace="workspace-a")
+    store._driver.execute_query = AsyncMock(
+        return_value=SimpleNamespace(records=[{"completed": True}])
+    )
+
+    assert await store.is_session_durably_completed("session-1") is True
+    query, params = store._driver.execute_query.await_args.args[:2]
+    assert (
+        "MATCH (n:Node:Session {node_id: $session_id, workspace: $workspace})" in query
+    )
+    assert params == {"session_id": "session-1", "workspace": "workspace-a"}
+
+
+async def test_durable_completion_read_bypasses_buffered_completed_value() -> None:
+    store = _make_store()
+    await store.upsert_node("session-1", {"labels": ["Session"], "status": "completed"})
+    store._driver.execute_query = AsyncMock(
+        return_value=SimpleNamespace(records=[{"completed": False}])
+    )
+
+    assert await store.is_session_durably_completed("session-1") is False
+    store._driver.execute_query.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "records",
+    [[], [{"completed": False}], [{"completed": None}], [{"completed": 1}]],
+)
+async def test_durable_completion_read_never_infers_completion(
+    records: list[dict[str, object]],
+) -> None:
+    store = _make_store()
+    store._driver.execute_query = AsyncMock(
+        return_value=SimpleNamespace(records=records)
+    )
+
+    assert await store.is_session_durably_completed("session-1") is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        Neo4jError._hydrate_neo4j(
+            code="Neo.ClientError.Statement.SyntaxError", message="read failure"
+        ),
+        ServiceUnavailable("driver unavailable"),
+    ],
+)
+async def test_durable_completion_read_surfaces_driver_errors(
+    error: Exception,
+) -> None:
+    store = _make_store()
+    store._driver.execute_query = AsyncMock(side_effect=error)
+
+    with pytest.raises(DurableCompletionReadError) as raised:
+        await store.is_session_durably_completed("session-1")
+    assert raised.value.__cause__ is error
 
 
 def test_no_graph_forest_name_in_source():
@@ -3893,6 +3960,10 @@ def test_no_unindexed_scan_patterns_in_neo4j_store_source():
         '"MATCH (n) WHERE elementId(n) = eid "',
         #   (n) is the node just seeked by elementId on the line above.
         '"OPTIONAL MATCH (n)-[r]-() "',
+        # Ruff may fold either elementId seek into one literal; both remain
+        # direct NodeByElementIdSeek operations, not graph scans.
+        '"UNWIND $element_ids AS eid MATCH (n) WHERE elementId(n) = eid DETACH DELETE n"',
+        '"UNWIND $element_ids AS eid MATCH (n) WHERE elementId(n) = eid RETURN count(n) AS c"',
     }
 
     offenders: list[str] = []
