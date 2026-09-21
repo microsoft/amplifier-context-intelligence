@@ -321,6 +321,11 @@ class RecoveryConfig(BaseModel):
     """Opt-in native recovery ingress configuration."""
 
     enabled: bool = False
+    # Server-issued permits are the default whenever recovery is enabled. The
+    # switch exists only for an existing deployment that has not upgraded its
+    # recovery client yet; it deliberately does not weaken the default.
+    permit_required: bool = True
+    permit_ttl_seconds: int = 15
     guard_lease_path: str | None = None
     receipt_store_path: str | None = None
     claims_store_path: str | None = None
@@ -332,6 +337,13 @@ class RecoveryConfig(BaseModel):
     def _positive_retry_after(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("recovery.retry_after_seconds must be > 0")
+        return value
+
+    @field_validator("permit_ttl_seconds")
+    @classmethod
+    def _positive_permit_ttl(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("recovery.permit_ttl_seconds must be > 0")
         return value
 
 
@@ -537,6 +549,72 @@ class Settings(BaseSettings):
             self.recovery.guard_lease_path or base / "recovery-guard-lease.json"
         )
         return recovery_queue, receipt_store, claims_store, lease
+
+    def stateful_root(self) -> Path:
+        """Return the one volume root that the process-instance lock protects.
+
+        The file lock is meaningful only when it covers *every* durable
+        single-writer resource.  The live queue's parent is the implicit root:
+        the default recovery queue, receipt ledger, and claim ledger are all
+        deliberately derived beneath it.  The active identity store is also
+        included whenever this server can seed or mutate it: otherwise two
+        servers with separate queues could still serve different stale views
+        of a shared credential-revocation store.
+
+        An unused default identity-store path is intentionally not included.
+        In static mode with no configured key material and no admin key, there
+        is no store seed or runtime mutation path.  Likewise an Entra store is
+        not mutable when it has neither a seed nor an enabled admin role.
+        This keeps a default, unconfigured server valid without treating an
+        inert path as participating state.
+        """
+        live_queue = Path(self.queues_path).resolve()
+        root = live_queue.parent
+        recovery_queue, receipt_store, claims_store, _lease = self.recovery_paths()
+        protected = [
+            ("live queue", live_queue),
+            ("session claims", claims_store.resolve()),
+        ]
+        if self.recovery.enabled:
+            protected.extend(
+                (
+                    ("recovery queue", recovery_queue.resolve()),
+                    ("recovery receipt ledger", receipt_store.resolve()),
+                )
+            )
+        if self.auth_mode == "static":
+            # Static keys need durable backing only when this process seeds
+            # configured credentials or the admin API can mutate them.
+            if self.build_keystore() or self.resolve_admin_api_key_digest() is not None:
+                protected.append(
+                    ("API-key identity store", Path(self.api_keys_store_path).resolve())
+                )
+        elif (
+            self.entra_admin_role
+            or self.build_identity_map()
+            or self.build_service_identity_map()
+        ):
+            # Entra has one shared runtime-mutable store for user and service
+            # identities. An enabled IdentityAdmin role is sufficient even
+            # when the first identity will be added after startup.
+            protected.append(
+                (
+                    "Entra identity store",
+                    Path(self.entra_identities_store_path).resolve(),
+                )
+            )
+        split = [
+            f"{name}={path}"
+            for name, path in protected
+            if not path.is_relative_to(root)
+        ]
+        if split:
+            rendered = ", ".join(split)
+            raise ValueError(
+                "all mutable server state must be beneath the live queue parent "
+                f"{root}; incompatible paths: {rendered}"
+            )
+        return root
 
     # azure_client_id / azure_tenant_id: the App Registration coordinates.
     # Both are required when auth_mode="entra".  Empty / whitespace-only

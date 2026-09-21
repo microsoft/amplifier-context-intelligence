@@ -5,6 +5,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import sqlite3
 import time
 from collections import deque
 from collections.abc import AsyncGenerator
@@ -2732,6 +2733,7 @@ class TestTransientInfraFailuresAreNeverDeadLettered:
         assert is_transient(TransientError("deadlock"))
         assert is_transient(asyncio.TimeoutError())
         assert is_transient(OSError("connection reset"))
+        assert is_transient(sqlite3.OperationalError("database is locked"))
 
         # Deterministic -- dead-letterable.
         assert not is_transient(

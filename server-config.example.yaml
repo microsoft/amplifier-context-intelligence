@@ -154,6 +154,10 @@ log_path:  ~/amplifier-context-intelligence-server-data-store/logs/server.jsonl
 # memory-heavy operation. Watch it: `du -sh <queues_path>`.
 # See docs/operational-hardening.md.
 queues_path: /data/queues          # Durable per-session append-logs; mirrors blob_path
+# The server acquires one nonblocking writer lock at the parent of queues_path
+# before ASGI startup. When recovery is enabled, recovery.queues_path,
+# recovery.receipt_store_path, and recovery.claims_store_path must all remain
+# under that same parent (normally /data), or startup refuses the split layout.
 
 # -----------------------------------------------------------------------------
 # Scoped access control and native recovery (both opt-in)
@@ -171,13 +175,21 @@ access_control_mode: compatibility
 #     capabilities: [live:write, recovery:write]
 #
 # Recovery accepts only native Context Intelligence event stream records. It is
-# disabled by default and uses a separate durable queue. The guard lease must
-# be an operator-written JSON object:
-# {"allow": true, "expires_at": <epoch>, "lease_id": "<fresh unique opaque id>"}.
-# Write a fresh unique lease_id for every one-record admission; a lease_id is
-# consumed durably and cannot admit another record.
+# disabled by default and uses a separate durable queue. With the default
+# permit_required: true, each native capture needs a distinct random 32-byte
+# base64url source capability. Send it only as X-Recovery-Source with both the
+# source descriptor/origin admission request and the event request; then send
+# the returned one-time X-Recovery-Permit header to POST /recovery/events. The
+# server stores only a domain-separated source handle, never the raw capability
+# or local paths. It checks durable live work atomically at both steps; permits
+# are short-lived and invalidated by a server restart.
+#
+# Existing recovery clients can temporarily retain their lease-file protocol by
+# explicitly setting permit_required: false. New deployments should not do so.
 recovery:
   enabled: false
+  permit_required: true
+  permit_ttl_seconds: 15
   guard_lease_path: /data/recovery-guard-lease.json
   receipt_store_path: /data/recovery-receipts.sqlite3
   claims_store_path: /data/session-claims.sqlite3

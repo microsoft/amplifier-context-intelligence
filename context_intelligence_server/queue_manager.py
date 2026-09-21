@@ -23,11 +23,12 @@ import logging
 import os
 import threading
 import time
+import unicodedata
 import uuid
 from collections.abc import Coroutine, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from context_intelligence_server.utils import fold_name
 
@@ -49,14 +50,73 @@ _T = TypeVar("_T")
 # and loading one into RAM just to count newlines is what drove ~44 GB RSS at
 # startup. 1 MiB balances syscall count against per-scan memory.
 _SCAN_CHUNK_BYTES = 1 << 20
+# POSIX NAME_MAX applies to every concrete queue filename, not just the raw
+# session-id stem. Keep this derivation next to the filename constructors so
+# changing the temp-name protocol cannot silently reintroduce ENAMETOOLONG
+# after a record has been durably admitted.
+QUEUE_FILENAME_NAME_MAX = 255
+
+# EVERY filename suffix this module can append to a worker key. The budget is
+# derived from the WIDEST entry, so adding a constructor here is the only thing
+# needed to keep the bound honest -- and ``test_every_filename_fits_name_max``
+# fails loudly if a new one is added to the code but not to this tuple.
+#
+# This registry exists because it was gotten wrong once, in exactly the way a
+# single hardcoded "the temp file is the longest one" constant invites: the
+# recovery dead-letter archive path below appends
+# ``.<key>.dead.jsonl.<hex>.retry.tmp``, which at a 32-hex nonce is 55 bytes --
+# wider than ``commit()``'s 44. Merged against a 211-byte budget sized for 44
+# it reproduced ``OSError [Errno 36]`` for precisely the deeply-nested sessions
+# the NAME_MAX fix existed to rescue. The nonce is 16 hex (64 bits, ample for a
+# per-call temp name in one directory guarded by an atomic replace) so the
+# widest suffix stays ``commit()``'s and the budget -- and therefore every
+# folded key already on disk -- is UNCHANGED.
+_RECOVERY_RETRY_TMP_NONCE_HEX = 16
+_FILENAME_SUFFIXES = (
+    ".log",
+    ".offset",
+    ".dead.jsonl",
+    ".recovery-retry-audit.jsonl",
+    # commit()'s per-call temp: <key>.offset.<32-hex>.tmp
+    ".offset." + ("0" * 32) + ".tmp",
+    # archive_recovery_dead_letters()'s temp, which wraps the WHOLE dead-letter
+    # filename: .<key>.dead.jsonl.<16-hex>.retry.tmp
+    "." + ".dead.jsonl." + ("0" * _RECOVERY_RETRY_TMP_NONCE_HEX) + ".retry.tmp",
+)
+_COMMIT_TEMP_FILENAME_SUFFIX = ".offset." + ("0" * 32) + ".tmp"
+MAX_SESSION_ID_BYTES = QUEUE_FILENAME_NAME_MAX - max(
+    len(suffix) for suffix in _FILENAME_SUFFIXES
+)
+
+
+def is_safe_session_id(session_id: object) -> bool:
+    """Whether *session_id* is safe as one bounded queue filename component."""
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or session_id in {".", ".."}
+        or "/" in session_id
+        or "\\" in session_id
+    ):
+        return False
+    try:
+        if len(session_id.encode("utf-8")) > MAX_SESSION_ID_BYTES:
+            return False
+    except UnicodeEncodeError:
+        return False
+    return not any(
+        ord(char) < 32 or ord(char) == 127 or unicodedata.category(char) == "Cc"
+        for char in session_id
+    )
+
 
 # --- worker-key length budget --------------------------------------------
 #
 # INCIDENT (production): a worker key derived straight from a deeply-nested
 # sub-agent session id could exceed the filesystem's NAME_MAX (255 bytes),
 # because every on-disk artifact's filename is derived from it with NO
-# length bound: ``.log`` (+4), ``.offset`` (+7), ``.dead.jsonl`` (+11), and
-# -- the widest, and the one that actually broke in production --
+# length bound. Every such suffix is registered in ``_FILENAME_SUFFIXES``
+# above; the widest -- and the one that actually broke in production -- is
 # ``commit()``'s per-call temp file ``.offset.<32-hex-uuid>.tmp`` (+44).
 # Once a key crossed that last threshold, ``commit()`` could never again
 # succeed: the committed offset could never advance, drain workers crashed
@@ -69,9 +129,12 @@ _SCAN_CHUNK_BYTES = 1 << 20
 # ``blob_store.py``, which hits the identical incident shape for its own
 # session-id/blob-key filenames -- parameterised by this module's own
 # worst-case suffix budget.
-_NAME_MAX = 255
-_MAX_SUFFIX_BYTES = len(".offset.") + 32 + len(".tmp")  # commit()'s tmp suffix: 44
-_MAX_KEY_BYTES = _NAME_MAX - _MAX_SUFFIX_BYTES  # 211
+# ONE derivation, shared with ``MAX_SESSION_ID_BYTES``/``is_safe_session_id``
+# above. Two independent constants that happened to agree on 211 is how the
+# accept-policy (fold) and the reject-policy (validate) silently drifted apart.
+_NAME_MAX = QUEUE_FILENAME_NAME_MAX
+_MAX_SUFFIX_BYTES = max(len(suffix) for suffix in _FILENAME_SUFFIXES)  # 44
+_MAX_KEY_BYTES = MAX_SESSION_ID_BYTES  # 211
 
 
 def fold_worker_key(key: str) -> str:
@@ -244,6 +307,18 @@ class QueueManager:
     def _dead_path(self, session_id: str) -> Path:
         return self._dir / f"{session_id}.dead.jsonl"
 
+    @staticmethod
+    def _matches_recovery_origin(envelope: Any, encoded_origin: str) -> bool:
+        """Return whether a decoded durable envelope has the requested origin."""
+        if not isinstance(envelope, dict):
+            return False
+        candidate = envelope.get("_recovery_origin")
+        return (
+            isinstance(candidate, dict)
+            and json.dumps(candidate, sort_keys=True, separators=(",", ":"))
+            == encoded_origin
+        )
+
     async def contains_recovery_origin(self, origin: dict[str, Any]) -> bool:
         """Return whether the separate recovery spool already holds *origin*.
 
@@ -262,18 +337,55 @@ class QueueManager:
                                 envelope = json.loads(raw)
                             except (ValueError, UnicodeDecodeError):
                                 continue
-                            candidate = envelope.get("_recovery_origin")
-                            if (
-                                isinstance(candidate, dict)
-                                and json.dumps(
-                                    candidate, sort_keys=True, separators=(",", ":")
-                                )
-                                == encoded
-                            ):
+                            if self._matches_recovery_origin(envelope, encoded):
                                 return True
                 except OSError:
                     continue
             return False
+
+        return await asyncio.to_thread(_scan)
+
+    async def recovery_origin_commit_state(
+        self, origin: dict[str, Any]
+    ) -> Literal["queued", "committed"] | None:
+        """Return the durable queue state for one recovery origin.
+
+        A ``committed`` result is an explicit proof that this server's drainer
+        completed its graph-flush barrier before acknowledging the record. It
+        is intentionally distinct from merely finding an ``enqueued`` receipt:
+        a queued record still has to be replayed and must not be terminalized.
+        """
+        encoded = json.dumps(origin, sort_keys=True, separators=(",", ":"))
+
+        def _scan() -> Literal["queued", "committed"] | None:
+            queued = False
+            matched = False
+            for path in self._dir.glob("*.log"):
+                try:
+                    committed = self._read_committed_offset(path.stem)
+                    position = 0
+                    with path.open("rb") as stream:
+                        for raw in stream:
+                            end = position + len(raw)
+                            position = end
+                            try:
+                                envelope = json.loads(raw)
+                            except (ValueError, UnicodeDecodeError):
+                                continue
+                            if self._matches_recovery_origin(envelope, encoded):
+                                matched = True
+                                if end <= committed:
+                                    continue
+                                # One uncommitted match is enough to require
+                                # replay. Historical committed lines for the
+                                # same origin (for example before an operator
+                                # retry) must not hide current raw work.
+                                queued = True
+                except FileNotFoundError:
+                    continue
+            if queued:
+                return "queued"
+            return "committed" if matched else None
 
         return await asyncio.to_thread(_scan)
 
@@ -292,20 +404,127 @@ class QueueManager:
                                 envelope = json.loads(payload) if payload else {}
                             except (ValueError, TypeError, UnicodeDecodeError):
                                 continue
-                            candidate = envelope.get("_recovery_origin")
-                            if (
-                                isinstance(candidate, dict)
-                                and json.dumps(
-                                    candidate, sort_keys=True, separators=(",", ":")
-                                )
-                                == encoded
-                            ):
+                            if self._matches_recovery_origin(envelope, encoded):
                                 return True
                 except OSError:
                     continue
             return False
 
         return await asyncio.to_thread(_scan)
+
+    async def recovery_origin_has_retry_audit(self, origin: dict[str, Any]) -> bool:
+        """Whether a committed origin predates an operator retry.
+
+        Active dead letters are removed before ``retry_pending`` is made
+        durable, but their copied forensic record distinguishes an old
+        committed queue line from a completion of the new delivery attempt.
+        """
+        encoded = json.dumps(origin, sort_keys=True, separators=(",", ":"))
+
+        def _scan() -> bool:
+            for path in self._dir.glob("*.recovery-retry-audit.jsonl"):
+                try:
+                    with path.open("rb") as stream:
+                        for raw in stream:
+                            try:
+                                record = json.loads(raw)
+                                payload = record.get("payload")
+                                envelope = (
+                                    json.loads(payload)
+                                    if isinstance(payload, str)
+                                    else {}
+                                )
+                            except (TypeError, ValueError, UnicodeDecodeError):
+                                continue
+                            if self._matches_recovery_origin(envelope, encoded):
+                                return True
+                except OSError:
+                    continue
+            return False
+
+        return await asyncio.to_thread(_scan)
+
+    async def archive_recovery_dead_letters(self, origin: dict[str, Any]) -> int:
+        """Move matching recovery dead letters to a non-active forensic audit.
+
+        The original dead-letter JSON record is copied verbatim before its
+        active ``*.dead.jsonl`` line is removed.  The audit filename does not
+        match the active dead-letter glob, so recovery reconciliation can
+        safely retry only the selected receipt without treating its historic
+        poison evidence as current terminal state.
+        """
+        encoded = json.dumps(origin, sort_keys=True, separators=(",", ":"))
+
+        def _matches(raw: bytes) -> bool:
+            try:
+                record = json.loads(raw)
+                payload = record.get("payload")
+                envelope = json.loads(payload) if isinstance(payload, str) else {}
+            except (TypeError, ValueError, UnicodeDecodeError):
+                return False
+            return self._matches_recovery_origin(envelope, encoded)
+
+        total = 0
+        for path in self._dir.glob("*.dead.jsonl"):
+            worker_key = path.name[: -len(".dead.jsonl")]
+            self._validate_session_id(worker_key)
+            with self._guard(worker_key) as guard:
+                async with guard.admission:
+
+                    def _archive() -> int:
+                        try:
+                            lines = path.read_bytes().splitlines(keepends=True)
+                        except FileNotFoundError:
+                            return 0
+                        selected = [line for line in lines if _matches(line)]
+                        if not selected:
+                            return 0
+                        audit = self._dir / f"{worker_key}.recovery-retry-audit.jsonl"
+                        # _write_record owns guard.file_lock. Holding it here
+                        # would deadlock its non-reentrant threading.Lock.
+                        self._write_record(guard, audit, b"".join(selected))
+                        remaining = [line for line in lines if not _matches(line)]
+                        # Nonce width is load-bearing, not cosmetic: this temp
+                        # wraps the WHOLE dead-letter filename, so it is the
+                        # one suffix that can outgrow commit()'s. Registered in
+                        # _FILENAME_SUFFIXES; keep the two in step.
+                        nonce = uuid.uuid4().hex[:_RECOVERY_RETRY_TMP_NONCE_HEX]
+                        temporary = self._dir / f".{path.name}.{nonce}.retry.tmp"
+                        try:
+                            temporary.write_bytes(b"".join(remaining))
+                            os.replace(temporary, path)
+                        except BaseException:
+                            with contextlib.suppress(OSError):
+                                temporary.unlink(missing_ok=True)
+                            raise
+                        return len(selected)
+
+                    total += await _await_uninterrupted(asyncio.to_thread(_archive))
+        return total
+
+    async def has_pending_records(self) -> bool:
+        """Return whether any complete, uncommitted record exists.
+
+        This deliberately reads the durable queue rather than the asynchronous
+        status snapshot. Callers that need a live-first decision serialize
+        normal append with their admission gate; a read failure is unavailable,
+        never evidence that the queue is empty.
+        """
+
+        def _has_pending() -> bool:
+            try:
+                for key in self._all_worker_keys():
+                    committed = self._read_committed_offset(key)
+                    complete_end = self._complete_data_end(key)
+                    if committed < 0 or committed > complete_end:
+                        return True
+                    if complete_end > committed:
+                        return True
+            except (OSError, ValueError):
+                return True
+            return False
+
+        return await asyncio.to_thread(_has_pending)
 
     def _read_committed_offset(self, session_id: str) -> int:
         """Committed byte offset. A missing or empty ``.offset`` reads 0."""
@@ -394,12 +613,19 @@ class QueueManager:
 
     @staticmethod
     def _validate_session_id(session_id: str) -> None:
-        if (
-            not session_id
-            or "/" in session_id
-            or "\\" in session_id
-            or "\0" in session_id
-        ):
+        # Length FIRST, so an over-budget key gets the specific "too long"
+        # diagnostic naming fold_worker_key() rather than the generic
+        # "Invalid session_id" -- is_safe_session_id() also rejects on length,
+        # and checking it first made this branch unreachable, turning the one
+        # message that tells a caller what to DO into dead code.
+        length = len(session_id.encode("utf-8"))
+        if length > _MAX_KEY_BYTES:
+            raise ValueError(
+                f"session_id too long: {length} bytes (max {_MAX_KEY_BYTES}); "
+                "callers must fold worker keys via fold_worker_key() before "
+                "passing them to QueueManager"
+            )
+        if not is_safe_session_id(session_id):
             raise ValueError(f"Invalid session_id: {session_id!r}")
         # Defense in depth: every real caller folds its worker key through
         # ``fold_worker_key`` before it ever reaches here (see main.py), so
@@ -409,13 +635,6 @@ class QueueManager:
         # bare OSError as retry-forever-never-dead-letter, and an OSError
         # here would misclassify a permanently oversized key as transient,
         # stalling that session's drain forever instead of failing loud.
-        length = len(session_id.encode("utf-8"))
-        if length > _MAX_KEY_BYTES:
-            raise ValueError(
-                f"session_id too long: {length} bytes (max {_MAX_KEY_BYTES}); "
-                "callers must fold worker keys via fold_worker_key() before "
-                "passing them to QueueManager"
-            )
 
     @contextlib.contextmanager
     def _guard(self, worker_key: str) -> Iterator[_KeyGuard]:

@@ -61,7 +61,9 @@ services:
     port: 8000  # gunicorn + uvicorn; matches EXPOSE 8000 in the Dockerfile
 
     # Persistent /data — backs the oid→contributor store, durable ingest queues,
-    # blobs, and logs. Survives restarts/revision swaps. Single-instance enforced.
+    # blobs, and logs. Survives restarts/revision swaps. The web-app-aca volume
+    # contract mechanically caps this service at maxReplicas=1; this is required
+    # because the server has one queue-manager/permit-gate writer per /data path.
     volume:
       mount_path: /data
       # KNOWN, DELIBERATE DRIFT -- do not "fix" this to match the live share.
@@ -146,6 +148,10 @@ services:
       # === Durable /data paths (must live on the mounted volume) ===
       - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_QUEUES_PATH
         value: /data/queues
+      # Required by the durable single-writer protocol. The ASGI lifespan
+      # refuses any other value before drivers or drain workers initialize.
+      - name: WEB_CONCURRENCY
+        value: "1"
       - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH
         value: /data/blobs
       - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_PATH
