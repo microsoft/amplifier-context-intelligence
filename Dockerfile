@@ -15,6 +15,20 @@ FROM mcr.microsoft.com/azurelinux/base/python:3.12
 
 # Pull the latest security patches at build time so we don't have to wait for MS
 # to republish the base image. Every azl3 CVE with a fix lands here.
+#
+# OS_PATCH_EPOCH exists ONLY to bust the build cache for the layer below. Without
+# it this RUN is keyed on its instruction text, which never changes -- so a
+# registry buildcache (`cache-from` in the build-deploy workflow) serves a stale
+# layer and `tdnf update` NEVER EXECUTES. That silently freezes the image at
+# whatever OS snapshot first populated the cache, while the Trivy gate keeps
+# scanning against a fresh vuln DB: a green build goes red with zero code change,
+# and no amount of rebuilding fixes it. Observed 2026-09-21 -- two consecutive
+# main builds failed on 8 HIGH (pcre2 CVE-2026-86145, util-linux CVE-2026-78408/
+# 78410) that `tdnf update` clears outright; `#11 CACHED` in the build log was the
+# whole defect. The workflow passes the UTC date, so the cache is busted once per
+# day rather than per build: the first build of the day absorbs the day's patches
+# (~+2 min) and every later build that day reuses the refreshed layer.
+ARG OS_PATCH_EPOCH
 RUN tdnf -y update && tdnf -y install ca-certificates curl && tdnf -y clean all
 
 WORKDIR /app
