@@ -51,14 +51,42 @@ _T = TypeVar("_T")
 # startup. 1 MiB balances syscall count against per-scan memory.
 _SCAN_CHUNK_BYTES = 1 << 20
 # POSIX NAME_MAX applies to every concrete queue filename, not just the raw
-# session-id stem. ``commit()`` creates the longest one:
-# ``<session_id>.offset.<uuid4().hex>.tmp``. The other names (``.log``,
-# ``.offset``, and ``.dead.jsonl``) are shorter. Keep this derivation next to
-# the filename constructors so changing the temp-name protocol cannot silently
-# reintroduce ENAMETOOLONG after a record has been durably admitted.
+# session-id stem. Keep this derivation next to the filename constructors so
+# changing the temp-name protocol cannot silently reintroduce ENAMETOOLONG
+# after a record has been durably admitted.
 QUEUE_FILENAME_NAME_MAX = 255
+
+# EVERY filename suffix this module can append to a worker key. The budget is
+# derived from the WIDEST entry, so adding a constructor here is the only thing
+# needed to keep the bound honest -- and ``test_every_filename_fits_name_max``
+# fails loudly if a new one is added to the code but not to this tuple.
+#
+# This registry exists because it was gotten wrong once, in exactly the way a
+# single hardcoded "the temp file is the longest one" constant invites: the
+# recovery dead-letter archive path below appends
+# ``.<key>.dead.jsonl.<hex>.retry.tmp``, which at a 32-hex nonce is 55 bytes --
+# wider than ``commit()``'s 44. Merged against a 211-byte budget sized for 44
+# it reproduced ``OSError [Errno 36]`` for precisely the deeply-nested sessions
+# the NAME_MAX fix existed to rescue. The nonce is 16 hex (64 bits, ample for a
+# per-call temp name in one directory guarded by an atomic replace) so the
+# widest suffix stays ``commit()``'s and the budget -- and therefore every
+# folded key already on disk -- is UNCHANGED.
+_RECOVERY_RETRY_TMP_NONCE_HEX = 16
+_FILENAME_SUFFIXES = (
+    ".log",
+    ".offset",
+    ".dead.jsonl",
+    ".recovery-retry-audit.jsonl",
+    # commit()'s per-call temp: <key>.offset.<32-hex>.tmp
+    ".offset." + ("0" * 32) + ".tmp",
+    # archive_recovery_dead_letters()'s temp, which wraps the WHOLE dead-letter
+    # filename: .<key>.dead.jsonl.<16-hex>.retry.tmp
+    "." + ".dead.jsonl." + ("0" * _RECOVERY_RETRY_TMP_NONCE_HEX) + ".retry.tmp",
+)
 _COMMIT_TEMP_FILENAME_SUFFIX = ".offset." + ("0" * 32) + ".tmp"
-MAX_SESSION_ID_BYTES = QUEUE_FILENAME_NAME_MAX - len(_COMMIT_TEMP_FILENAME_SUFFIX)
+MAX_SESSION_ID_BYTES = QUEUE_FILENAME_NAME_MAX - max(
+    len(suffix) for suffix in _FILENAME_SUFFIXES
+)
 
 
 def is_safe_session_id(session_id: object) -> bool:
@@ -81,13 +109,14 @@ def is_safe_session_id(session_id: object) -> bool:
         for char in session_id
     )
 
+
 # --- worker-key length budget --------------------------------------------
 #
 # INCIDENT (production): a worker key derived straight from a deeply-nested
 # sub-agent session id could exceed the filesystem's NAME_MAX (255 bytes),
 # because every on-disk artifact's filename is derived from it with NO
-# length bound: ``.log`` (+4), ``.offset`` (+7), ``.dead.jsonl`` (+11), and
-# -- the widest, and the one that actually broke in production --
+# length bound. Every such suffix is registered in ``_FILENAME_SUFFIXES``
+# above; the widest -- and the one that actually broke in production -- is
 # ``commit()``'s per-call temp file ``.offset.<32-hex-uuid>.tmp`` (+44).
 # Once a key crossed that last threshold, ``commit()`` could never again
 # succeed: the committed offset could never advance, drain workers crashed
@@ -100,9 +129,12 @@ def is_safe_session_id(session_id: object) -> bool:
 # ``blob_store.py``, which hits the identical incident shape for its own
 # session-id/blob-key filenames -- parameterised by this module's own
 # worst-case suffix budget.
-_NAME_MAX = 255
-_MAX_SUFFIX_BYTES = len(".offset.") + 32 + len(".tmp")  # commit()'s tmp suffix: 44
-_MAX_KEY_BYTES = _NAME_MAX - _MAX_SUFFIX_BYTES  # 211
+# ONE derivation, shared with ``MAX_SESSION_ID_BYTES``/``is_safe_session_id``
+# above. Two independent constants that happened to agree on 211 is how the
+# accept-policy (fold) and the reject-policy (validate) silently drifted apart.
+_NAME_MAX = QUEUE_FILENAME_NAME_MAX
+_MAX_SUFFIX_BYTES = max(len(suffix) for suffix in _FILENAME_SUFFIXES)  # 44
+_MAX_KEY_BYTES = MAX_SESSION_ID_BYTES  # 211
 
 
 def fold_worker_key(key: str) -> str:
@@ -452,9 +484,12 @@ class QueueManager:
                         # would deadlock its non-reentrant threading.Lock.
                         self._write_record(guard, audit, b"".join(selected))
                         remaining = [line for line in lines if not _matches(line)]
-                        temporary = (
-                            self._dir / f".{path.name}.{uuid.uuid4().hex}.retry.tmp"
-                        )
+                        # Nonce width is load-bearing, not cosmetic: this temp
+                        # wraps the WHOLE dead-letter filename, so it is the
+                        # one suffix that can outgrow commit()'s. Registered in
+                        # _FILENAME_SUFFIXES; keep the two in step.
+                        nonce = uuid.uuid4().hex[:_RECOVERY_RETRY_TMP_NONCE_HEX]
+                        temporary = self._dir / f".{path.name}.{nonce}.retry.tmp"
                         try:
                             temporary.write_bytes(b"".join(remaining))
                             os.replace(temporary, path)
@@ -578,6 +613,18 @@ class QueueManager:
 
     @staticmethod
     def _validate_session_id(session_id: str) -> None:
+        # Length FIRST, so an over-budget key gets the specific "too long"
+        # diagnostic naming fold_worker_key() rather than the generic
+        # "Invalid session_id" -- is_safe_session_id() also rejects on length,
+        # and checking it first made this branch unreachable, turning the one
+        # message that tells a caller what to DO into dead code.
+        length = len(session_id.encode("utf-8"))
+        if length > _MAX_KEY_BYTES:
+            raise ValueError(
+                f"session_id too long: {length} bytes (max {_MAX_KEY_BYTES}); "
+                "callers must fold worker keys via fold_worker_key() before "
+                "passing them to QueueManager"
+            )
         if not is_safe_session_id(session_id):
             raise ValueError(f"Invalid session_id: {session_id!r}")
         # Defense in depth: every real caller folds its worker key through
@@ -588,13 +635,6 @@ class QueueManager:
         # bare OSError as retry-forever-never-dead-letter, and an OSError
         # here would misclassify a permanently oversized key as transient,
         # stalling that session's drain forever instead of failing loud.
-        length = len(session_id.encode("utf-8"))
-        if length > _MAX_KEY_BYTES:
-            raise ValueError(
-                f"session_id too long: {length} bytes (max {_MAX_KEY_BYTES}); "
-                "callers must fold worker keys via fold_worker_key() before "
-                "passing them to QueueManager"
-            )
 
     @contextlib.contextmanager
     def _guard(self, worker_key: str) -> Iterator[_KeyGuard]:

@@ -10,7 +10,10 @@ import time
 
 import pytest
 from context_intelligence_server.queue_manager import (
+    _FILENAME_SUFFIXES,
     _MAX_KEY_BYTES,
+    MAX_SESSION_ID_BYTES,
+    QUEUE_FILENAME_NAME_MAX,
     Batch,
     QueueManager,
     Record,
@@ -1594,6 +1597,65 @@ class TestFoldWorkerKey:
 
 
 class TestWorkerKeyLengthBudget:
+    def test_budget_is_pinned_because_it_is_on_disk_state(self):
+        """211 is not a tuning knob -- it is the shape of names already written.
+
+        ``fold_worker_key`` emits EXACTLY ``_MAX_KEY_BYTES`` for every
+        over-budget key, and the 6.11.0 boot migration has already renamed
+        production spool artifacts onto those names. Lowering this constant
+        silently re-folds every one of them onto different names on the next
+        boot -- recoverable, but a migration, never a side effect of adding a
+        filename suffix.
+
+        So this pin is deliberately a tripwire, not a tautology: adding a
+        suffix wider than ``commit()``'s 44 bytes shrinks the derived budget
+        and fails HERE, forcing the choice to be made on purpose -- shorten
+        the suffix (free) or accept a re-fold (a migration).
+        """
+        assert MAX_SESSION_ID_BYTES == 211
+        assert _MAX_KEY_BYTES == MAX_SESSION_ID_BYTES
+
+    def test_every_filename_fits_name_max(self):
+        """No suffix this module can append may cross NAME_MAX at a full key.
+
+        The budget is only as good as the suffix it was sized against. When
+        ``archive_recovery_dead_letters`` was added it appended a 55-byte
+        ``.<key>.dead.jsonl.<32-hex>.retry.tmp`` while the budget was sized for
+        ``commit()``'s 44, which put every MAXIMALLY-folded key -- i.e. exactly
+        the deeply-nested sessions the fold exists to rescue -- 11 bytes over
+        the limit and reproduced the original ``OSError [Errno 36]``.
+
+        Asserting the PROPERTY (every constructible filename fits) rather than
+        a specific constant means the next suffix added is caught here instead
+        of in production.
+        """
+        key = "k" * _MAX_KEY_BYTES
+        for suffix in _FILENAME_SUFFIXES:
+            name = f"{key}{suffix}"
+            assert len(name.encode("utf-8")) <= QUEUE_FILENAME_NAME_MAX, (
+                f"{suffix!r} at a full-budget key is "
+                f"{len(name.encode('utf-8'))} bytes, over NAME_MAX "
+                f"({QUEUE_FILENAME_NAME_MAX}). Either shorten the suffix or "
+                f"lower MAX_SESSION_ID_BYTES -- note lowering it re-folds keys "
+                f"already on disk."
+            )
+
+    async def test_recovery_retry_tmp_fits_at_a_full_budget_key(self, qm):
+        """The real constructor, not a reconstruction of it.
+
+        ``test_every_filename_fits_name_max`` checks the registry; this checks
+        that ``archive_recovery_dead_letters`` actually writes a name matching
+        it, so the two cannot drift.
+        """
+        key = fold_worker_key("k-" + "a" * 400)
+        assert len(key.encode("utf-8")) == _MAX_KEY_BYTES
+        origin = {"source_handle": "h", "ordinal": 1}
+        raw = json.dumps({"event": "x", "_recovery_origin": origin}).encode()
+        await qm.append(key, raw)
+        await qm.dead_letter(key, raw, "poison")
+        # Would raise OSError [Errno 36] if the temp name were over-wide.
+        assert await qm.archive_recovery_dead_letters(origin) == 1
+
     @pytest.mark.parametrize(
         "raw_length",
         [_MAX_KEY_BYTES, _MAX_KEY_BYTES + 1, 244, 245, 248, 249, 251, 252, 9000],

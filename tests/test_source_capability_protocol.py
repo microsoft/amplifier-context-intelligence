@@ -589,7 +589,12 @@ async def test_queue_session_id_limit_leaves_room_for_append_and_commit_temp_fil
     await queue.commit(session_id, batch.end_offset)
 
     assert (await queue.read_batch(session_id, max_items=1)).records == []
-    with pytest.raises(ValueError, match="Invalid session_id"):
+    # Still a ValueError (never an OSError -- registry._is_transient_infra_error
+    # allow-lists bare OSError as retry-forever). The message is now the
+    # specific over-budget diagnostic rather than the generic one, because
+    # _validate_session_id checks length before is_safe_session_id: both
+    # reject an over-budget stem, but only one tells the caller to fold.
+    with pytest.raises(ValueError, match="session_id too long"):
         await queue.append(session_id + "x", b'{"event":"test"}')
 
 
