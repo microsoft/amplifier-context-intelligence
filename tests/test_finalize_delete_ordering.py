@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 import pytest
 from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.graph_store import DurableCompletionReadError
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
 
@@ -51,6 +52,9 @@ class _AccumGraph:
         self.closed = False
         self._fail_on_call = fail_on_call
         self._calls = 0
+        self.durably_completed = False
+        self.completion_errors: list[Exception] = []
+        self.steps: list[str] = []
 
     async def flush(self) -> None:
         if not self.buffer:
@@ -60,10 +64,17 @@ class _AccumGraph:
             raise RuntimeError(f"simulated flush failure on call {self._calls}")
         self.flushed |= self.buffer
         self.buffer.clear()
+        self.steps.append("flush")
 
     def discard_buffer(self) -> None:
         self.buffer.clear()
         self.discards += 1
+
+    async def is_session_durably_completed(self, session_id: str) -> bool:
+        self.steps.append("read")
+        if self.completion_errors:
+            raise self.completion_errors.pop(0)
+        return self.durably_completed
 
     async def close(self) -> None:
         self.closed = True
@@ -78,6 +89,8 @@ async def _accumulate(
 ) -> None:
     """Stand-in for ``process_event``: buffers the event name on the fake graph."""
     worker.services.graph.buffer.add(event)
+    if event == "session:end":
+        worker.services.graph.durably_completed = True
 
 
 def _make_worker(sid: str, graph: Any, workspace: str = "/ws") -> SessionWorker:
@@ -517,3 +530,225 @@ async def test_retained_log_is_picked_up_by_a_fresh_drainer() -> None:
         "log ends fully drained -- committed advances to complete_data_end, "
         "proving outcome (B) is real pick-up, not merely asserted"
     )
+
+
+# ---------------------------------------------------------------------------
+# A late cleanup after the original terminal worker has deregistered is a
+# cleanup-only finalization only when durable graph state proves completion.
+# ---------------------------------------------------------------------------
+
+
+async def test_late_cleanup_after_terminal_deregistration_flushes_and_finishes() -> (
+    None
+):
+    reg = SessionRegistry()
+    qm = reg.queue_manager
+    sid = "late-cleanup-after-end"
+    original_graph = _AccumGraph()
+    original = _make_worker(sid, original_graph)
+    reg._register_for_test(original)
+
+    with patch(
+        "context_intelligence_server.registry.process_event", side_effect=_accumulate
+    ):
+        await qm.append(sid, _line("session:end", "/ws", {"session_id": sid}))
+        original_task = _start_supervised(reg, original)
+        await asyncio.wait_for(original_task, timeout=5)
+
+        assert sid not in reg.active_sessions()
+        prior_history = list(reg.completed_sessions())
+        assert len(prior_history) == 1
+
+        cleanup_graph = _AccumGraph()
+        cleanup_graph.durably_completed = True
+        cleanup = _make_worker(sid, cleanup_graph)
+        reg._register_for_test(cleanup)
+        await qm.append(sid, _line("cleanup:finally_end", "/ws", {"session_id": sid}))
+        cleanup_task = _start_supervised(reg, cleanup)
+        await asyncio.wait_for(cleanup_task, timeout=5)
+
+    assert "cleanup:finally_end" in cleanup_graph.flushed
+    assert not (await qm.read_batch(sid, max_items=10)).records
+    assert sid not in reg.active_sessions()
+    assert cleanup.store_closed is True
+    assert reg.completed_sessions() == prior_history
+
+
+async def test_cleanup_only_requires_durable_completed_session() -> None:
+    reg = SessionRegistry()
+    qm = reg.queue_manager
+    sid = "early-cleanup"
+    graph = _AccumGraph()
+    worker = _make_worker(sid, graph)
+    reg._register_for_test(worker)
+
+    with patch(
+        "context_intelligence_server.registry.process_event", side_effect=_accumulate
+    ):
+        await qm.append(sid, _line("cleanup:finally_end", "/ws", {"session_id": sid}))
+        task = _start_supervised(reg, worker)
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if not (await qm.read_batch(sid, max_items=10)).records:
+                break
+        assert sid in reg.active_sessions()
+        assert not worker.store_closed
+        assert reg.completed_sessions() == []
+
+        await qm.append(sid, _line("session:end", "/ws", {"session_id": sid}))
+        await asyncio.wait_for(task, timeout=5)
+
+    assert len(reg.completed_sessions()) == 1
+    assert sid not in reg.active_sessions()
+
+
+async def test_terminal_batch_with_cleanup_never_reads_durable_completion() -> None:
+    reg = SessionRegistry()
+    qm = reg.queue_manager
+    sid = "cleanup-with-terminal"
+    graph = _AccumGraph()
+    graph.completion_errors = [AssertionError("terminal branch must not read")]
+    worker = _make_worker(sid, graph)
+    reg._register_for_test(worker)
+
+    with patch(
+        "context_intelligence_server.registry.process_event", side_effect=_accumulate
+    ):
+        await qm.append(sid, _line("cleanup:finally_end", "/ws", {"session_id": sid}))
+        await qm.append(sid, _line("session:end", "/ws", {"session_id": sid}))
+        await asyncio.wait_for(_start_supervised(reg, worker), timeout=5)
+
+    assert graph.steps == ["flush", "flush"]
+    assert len(reg.completed_sessions()) == 1
+    assert sid not in reg.active_sessions()
+
+
+async def test_cleanup_after_restart_finishes_without_creating_history() -> None:
+    reg = SessionRegistry()
+    qm = reg.queue_manager
+    sid = "restart-cleanup"
+    graph = _AccumGraph()
+    graph.durably_completed = True
+    worker = _make_worker(sid, graph)
+    reg._register_for_test(worker)
+
+    with patch(
+        "context_intelligence_server.registry.process_event", side_effect=_accumulate
+    ):
+        await qm.append(sid, _line("cleanup:finally_end", "/ws", {"session_id": sid}))
+        await asyncio.wait_for(_start_supervised(reg, worker), timeout=5)
+
+    assert reg.completed_sessions() == []
+    assert sid not in reg.active_sessions()
+
+
+async def test_cleanup_finalizer_promotes_a_terminal_event_in_its_tail() -> None:
+    reg = SessionRegistry()
+    qm = reg.queue_manager
+    sid = "cleanup-tail-terminal"
+    graph = _AccumGraph()
+    graph.durably_completed = True
+    worker = _make_worker(sid, graph)
+    reg._register_for_test(worker)
+    original_delete = qm.delete_drained
+    appended = False
+
+    async def delete_drained(session_id: str) -> bool:
+        nonlocal appended
+        if not appended:
+            appended = True
+            await qm.append(sid, _line("session:end", "/ws", {"session_id": sid}))
+        return await original_delete(session_id)
+
+    qm.delete_drained = delete_drained  # type: ignore[method-assign]
+
+    with patch(
+        "context_intelligence_server.registry.process_event", side_effect=_accumulate
+    ):
+        await qm.append(sid, _line("cleanup:finally_end", "/ws", {"session_id": sid}))
+        await asyncio.wait_for(_start_supervised(reg, worker), timeout=5)
+
+    assert len(reg.completed_sessions()) == 1
+    assert sid not in reg.active_sessions()
+
+
+async def test_durable_completion_read_retries_without_poisoning_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reg = SessionRegistry()
+    qm = reg.queue_manager
+    sid = "cleanup-read-retry"
+    graph = _AccumGraph()
+    graph.durably_completed = True
+    graph.completion_errors = [DurableCompletionReadError("read unavailable")] * 3
+    worker = _make_worker(sid, graph)
+    reg._register_for_test(worker)
+    monkeypatch.setattr(
+        "context_intelligence_server.registry._TRANSIENT_BACKOFF_CAP", 0.001
+    )
+
+    with patch(
+        "context_intelligence_server.registry.process_event", side_effect=_accumulate
+    ):
+        await qm.append(sid, _line("cleanup:finally_end", "/ws", {"session_id": sid}))
+        await asyncio.wait_for(_start_supervised(reg, worker), timeout=5)
+
+    assert await qm.read_dead_letters(sid) == []
+    assert not (await qm.read_batch(sid, max_items=10)).records
+    assert reg.pipeline_counters()["write_retries_total"] >= 3
+    assert sid not in reg.active_sessions()
+
+
+async def test_isolation_fallback_commits_durably_completed_cleanup_in_order() -> None:
+    reg = SessionRegistry()
+    reg.is_recovery = True
+    qm = reg.queue_manager
+    reg._max_delivery_attempts = 1
+    sid = "cleanup-isolation"
+    graph = _AccumGraph(fail_on_call=1)
+    graph.durably_completed = True
+    worker = _make_worker(sid, graph)
+    reg._register_for_test(worker)
+    original_commit = qm.commit
+
+    async def commit(session_id: str, offset: int) -> None:
+        graph.steps.append("commit")
+        await original_commit(session_id, offset)
+
+    async def post_commit(_worker: SessionWorker, _records: list[object]) -> None:
+        graph.steps.append("post")
+
+    async def pre_flush() -> None:
+        graph.steps.append("pre_flush")
+
+    async def before_recovery_flush(
+        _worker: SessionWorker, _records: list[object]
+    ) -> None:
+        graph.steps.append("recovery_pre_flush")
+
+    async def before_commit(_worker: SessionWorker, _records: list[object]) -> None:
+        graph.steps.append("pre_commit")
+
+    qm.commit = commit  # type: ignore[method-assign]
+    reg.pre_flush = pre_flush
+    reg.before_recovery_flush = before_recovery_flush
+    reg.on_batch_flushed = before_commit
+    reg.on_batch_written = post_commit
+
+    with patch(
+        "context_intelligence_server.registry.process_event", side_effect=_accumulate
+    ):
+        await qm.append(sid, _line("cleanup:finally_end", "/ws", {"session_id": sid}))
+        await asyncio.wait_for(_start_supervised(reg, worker), timeout=5)
+
+    assert graph.steps[-7:] == [
+        "pre_flush",
+        "recovery_pre_flush",
+        "flush",
+        "read",
+        "pre_commit",
+        "commit",
+        "post",
+    ]
+    assert await qm.read_dead_letters(sid) == []
+    assert sid not in reg.active_sessions()

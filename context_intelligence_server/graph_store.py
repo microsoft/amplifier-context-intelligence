@@ -104,6 +104,14 @@ class AmbiguousSessionError(Exception):
         )
 
 
+class DurableCompletionReadError(Exception):
+    """The durable completion lookup could not reach its backing store.
+
+    A caller must retain the queue record and retry rather than treating an
+    unavailable read as evidence that a session is still running.
+    """
+
+
 @dataclass(frozen=True)
 class GraphDeleteResult:
     """Result of a whole-graph ``delete_session_graph`` call.
@@ -166,6 +174,18 @@ class GraphStore(Protocol):
 
         Returns ``None`` if the edge is not found in either the buffer or the
         backing store.
+        """
+        ...
+
+    async def is_session_durably_completed(self, session_id: str) -> bool:
+        """Return whether this workspace's persisted Session is completed.
+
+        This deliberately bypasses buffer-first reads: it is used only to
+        prove that a cleanup-only worker may finalize after another worker has
+        already completed and deregistered the same session.
+
+        Raises:
+            DurableCompletionReadError: If the backing-store read fails.
         """
         ...
 

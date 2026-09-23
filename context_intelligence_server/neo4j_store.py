@@ -26,6 +26,7 @@ from neo4j.exceptions import DriverError, Neo4jError
 from context_intelligence_server.config import Neo4jClientConfig
 from context_intelligence_server.graph_store import (
     AmbiguousSessionError,
+    DurableCompletionReadError,
     GraphDeleteResult,
     SessionGraph,
 )
@@ -202,6 +203,16 @@ _NODE_MATCH_BY_ID = (
 # while holding its pooled connection for the duration.
 _NODE_GET_BY_ID_CYPHER = (
     f"{_NODE_MATCH_BY_ID} RETURN properties(n) AS props, labels(n) AS lbls"
+)
+
+# This is intentionally separate from get_node(): cleanup finalization needs
+# durable proof from Neo4j, never a buffer-first value or get_node's
+# availability-as-absence error handling. :Node(node_id, workspace) anchors
+# the lookup on the same indexed identity used by ordinary point reads.
+_SESSION_DURABLY_COMPLETED_CYPHER = (
+    f"MATCH (n:{_UNIVERSAL_NODE_LABEL}:Session "
+    "{node_id: $session_id, workspace: $workspace}) "
+    "RETURN n.status = 'completed' AS completed"
 )
 
 # Single-edge read-by-endpoints, anchored on BOTH :Node endpoints so the
@@ -382,17 +393,13 @@ _GRAPH_REL_COUNT_CYPHER = (
 # every relationship touching it, including any edge into a surviving
 # :SST_CONCEPT node -- that edge's removal IS the "detach" the design calls for.
 _GRAPH_DELETE_BATCH_CYPHER = (
-    "UNWIND $element_ids AS eid "
-    "MATCH (n) WHERE elementId(n) = eid "
-    "DETACH DELETE n"
+    "UNWIND $element_ids AS eid MATCH (n) WHERE elementId(n) = eid DETACH DELETE n"
 )
 
 # elementId-list existence count -- shared by both post-delete gate checks
 # (owned nodes must be gone, concept nodes must survive).
 _COUNT_NODES_BY_ELEMENT_ID_CYPHER = (
-    "UNWIND $element_ids AS eid "
-    "MATCH (n) WHERE elementId(n) = eid "
-    "RETURN count(n) AS c"
+    "UNWIND $element_ids AS eid MATCH (n) WHERE elementId(n) = eid RETURN count(n) AS c"
 )
 
 # Row cap per DETACH DELETE batch. elementId strings are tiny, so only the row
@@ -1734,6 +1741,27 @@ class Neo4jGraphStore:
 
         return None
 
+    async def is_session_durably_completed(self, session_id: str) -> bool:
+        """Return only a strict durable ``:Session(status=completed)`` match.
+
+        This must not call ``get_node``: that method may return buffered state
+        and intentionally maps Neo4j read failures to absence for its hot
+        handler path. A cleanup-only finalization needs the opposite behavior.
+        """
+        try:
+            result = await self._driver.execute_query(
+                cast(LiteralString, _SESSION_DURABLY_COMPLETED_CYPHER),
+                {"session_id": session_id, "workspace": self.workspace},
+                database_=self._database,
+            )
+        except (Neo4jError, DriverError) as exc:
+            raise DurableCompletionReadError(
+                f"durable completion read failed for {session_id!r}"
+            ) from exc
+
+        records = result.records
+        return bool(records and records[0]["completed"] is True)
+
     async def find_delegation_by_sub_session(
         self, sub_session_id: str, workspace: str
     ) -> dict[str, Any] | None:
@@ -2024,7 +2052,9 @@ class Neo4jGraphStore:
             {"element_ids": owned_ids},
             database_=self._database,
         )
-        survivor_count = survivor_result.records[0]["c"] if survivor_result.records else 0
+        survivor_count = (
+            survivor_result.records[0]["c"] if survivor_result.records else 0
+        )
         if survivor_count:
             raise RuntimeError(
                 f"delete_session_graph: {survivor_count} owned node(s) survived "
@@ -2038,7 +2068,9 @@ class Neo4jGraphStore:
                 {"element_ids": concept_ids},
                 database_=self._database,
             )
-            concept_count = concept_result.records[0]["c"] if concept_result.records else 0
+            concept_count = (
+                concept_result.records[0]["c"] if concept_result.records else 0
+            )
             if concept_count != len(concept_ids):
                 raise RuntimeError(
                     f"delete_session_graph: expected {len(concept_ids)} shared "

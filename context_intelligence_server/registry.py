@@ -9,13 +9,15 @@ import logging
 import sqlite3
 import time
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import get_settings
+from context_intelligence_server.graph_store import DurableCompletionReadError
 from context_intelligence_server.neo4j_store import (
     Neo4jGraphStore,
     build_bounded_neo4j_driver,
@@ -94,6 +96,9 @@ def _is_transient_infra_error(exc: BaseException) -> bool:
             # lock/busy/operational failures must hold the queued record for a
             # later retry, never turn it into payload poison.
             sqlite3.OperationalError,
+            # A cleanup-only finalization cannot safely decide from a failed
+            # durable completion read, including a driver client error.
+            DurableCompletionReadError,
         ),
     )
 
@@ -125,6 +130,15 @@ _FINALIZE_DELETE_ATTEMPTS = 3
 # Grace period before a positive residual is flagged degraded -- must exceed
 # the stats-cache TTL + poll cadence to avoid false positives from clock skew.
 _RESIDUAL_DEGRADED_GRACE = 15.0
+
+_CLEANUP_EVENT = "cleanup:finally_end"
+
+
+class _FinalizationCause(Enum):
+    """Why a worker may complete its lifecycle."""
+
+    TERMINAL_EVENT = "terminal_event"
+    DURABLY_COMPLETED_CLEANUP = "durably_completed_cleanup"
 
 
 class LiveFirstFlushGate:
@@ -178,6 +192,9 @@ class SessionWorker:
     # Set True by _safe_close, as its FIRST statement. A worker
     # whose store has been closed is never revived — see start_drain.
     store_closed: bool = False
+    # A cleanup-triggered finalizer promotes to the ordinary completion history
+    # path if its EOF drain encounters a real terminal event.
+    terminal_seen_during_finalize: bool = False
 
 
 @dataclass
@@ -544,7 +561,11 @@ class SessionRegistry:
                 )
             )
 
-    async def _flush_barrier(self, worker: SessionWorker) -> None:
+    async def _flush_barrier(
+        self,
+        worker: SessionWorker,
+        after_flush: Callable[[], Awaitable[_FinalizationCause | None]] | None = None,
+    ) -> _FinalizationCause | None:
         """The one Neo4j-write boundary: a semaphore-gated, awaited flush.
 
         The semaphore caps concurrent write transactions across all session
@@ -560,9 +581,14 @@ class SessionRegistry:
         if self.flush_gate is not None:
             async with self.flush_gate.acquire(recovery=self.is_recovery):
                 await self._flush_graph(worker)
-            return
+                if after_flush is not None:
+                    return await after_flush()
+            return None
         async with self.write_semaphore:
             await self._flush_graph(worker)
+            if after_flush is not None:
+                return await after_flush()
+        return None
 
     async def _flush_graph(self, worker: SessionWorker) -> None:
         """Perform one graph flush while the caller holds its scheduler permit."""
@@ -581,8 +607,13 @@ class SessionRegistry:
             yield
 
     async def _flush_and_commit(
-        self, worker: SessionWorker, records: list[Record], commit_to: int
-    ) -> None:
+        self,
+        worker: SessionWorker,
+        records: list[Record],
+        commit_to: int,
+        *,
+        classify_cleanup: bool = True,
+    ) -> _FinalizationCause | None:
         """Flush records and acknowledge their offset under the recovery guard.
 
         The optional pre-flush hook runs immediately before this recovery
@@ -605,7 +636,13 @@ class SessionRegistry:
                 eligible = self.before_recovery_flush(worker, records)
                 if inspect.isawaitable(eligible):
                     await eligible
-            await self._flush_barrier(worker)
+            if classify_cleanup:
+                finalization_cause = await self._flush_barrier(
+                    worker,
+                    lambda: self._classify_durable_cleanup(worker, records),
+                )
+            else:
+                finalization_cause = await self._flush_barrier(worker)
             await self._before_commit(worker, records)
             try:
                 await self.queue_manager.commit(worker.session_id, commit_to)
@@ -616,6 +653,20 @@ class SessionRegistry:
                 # while allowing callers to keep the established supervision
                 # boundary for ambiguous queue-commit failures.
                 raise _QueueCommitFailure from exc
+        return finalization_cause
+
+    async def _classify_durable_cleanup(
+        self, worker: SessionWorker, records: list[Record]
+    ) -> _FinalizationCause | None:
+        """Recognize only cleanup-only work proved completed by durable graph state."""
+        if not records:
+            return None
+        events = [self._parse_line(record.raw)[0] for record in records]
+        if _CLEANUP_EVENT not in events or "session:end" in events:
+            return None
+        if await worker.services.graph.is_session_durably_completed(worker.session_id):
+            return _FinalizationCause.DURABLY_COMPLETED_CLEANUP
+        return None
 
     async def _commit_after_recovery_guard(
         self, worker: SessionWorker, commit_to: int
@@ -772,7 +823,12 @@ class SessionRegistry:
                         if terminal_at is None
                         else batch.records[:safe_count]
                     )
-                    await self._flush_and_commit(worker, committed_records, commit_to)
+                    cleanup_cause = await self._flush_and_commit(
+                        worker,
+                        committed_records,
+                        commit_to,
+                        classify_cleanup=terminal_at is None,
+                    )
                 except _QueueCommitFailure as failure:
                     # An acknowledgement's outcome is ambiguous.  It must
                     # escape the payload retry/dead-letter policy and be
@@ -882,11 +938,13 @@ class SessionRegistry:
                             )
                             await asyncio.sleep(delay)
                             continue
-                        if terminal_seen:
+                        if terminal_seen is not None:
                             # Mirror the normal terminal branch below: the
                             # session:end record was left uncommitted, so
                             # finalize instead of resuming the drain loop.
-                            await self._finalize_session(worker, handlers)
+                            await self._finalize_session(
+                                worker, handlers, cause=terminal_seen
+                            )
                             return
                         attempts = 0
                         continue
@@ -908,8 +966,15 @@ class SessionRegistry:
                     extra={"session_id": session_id},
                 )
 
-                if terminal_at is not None:
-                    await self._finalize_session(worker, handlers)
+                finalization_cause = (
+                    _FinalizationCause.TERMINAL_EVENT
+                    if terminal_at is not None
+                    else cleanup_cause
+                )
+                if finalization_cause is not None:
+                    await self._finalize_session(
+                        worker, handlers, cause=finalization_cause
+                    )
                     return
 
             except asyncio.CancelledError:
@@ -1004,7 +1069,7 @@ class SessionRegistry:
 
     async def _handle_exhausted_batch(
         self, worker: SessionWorker, batch: Batch, handlers: Any
-    ) -> bool:
+    ) -> _FinalizationCause | None:
         """Reprocess a poison batch one line at a time (linear isolation).
 
         Each record is dispatched and flushed individually. A record that
@@ -1040,6 +1105,7 @@ class SessionRegistry:
         # discard so the first isolated record flushes from a clean buffer.
         worker.services.graph.discard_buffer()
         for rec in batch.records:
+            cleanup_cause: _FinalizationCause | None = None
             try:
                 event, _ws, working_dir, data, event_identity = self._parse_line(
                     rec.raw
@@ -1064,7 +1130,7 @@ class SessionRegistry:
             from context_intelligence_server.pipeline import TERMINAL_EVENTS
 
             if event in TERMINAL_EVENTS:
-                return True
+                return _FinalizationCause.TERMINAL_EVENT
 
             wrote = False
             committed = False
@@ -1078,7 +1144,7 @@ class SessionRegistry:
                     working_dir=working_dir,
                     event_identity=event_identity,
                 )
-                await self._flush_and_commit(worker, [rec], rec.end)
+                cleanup_cause = await self._flush_and_commit(worker, [rec], rec.end)
                 wrote = True
                 committed = True
             except _QueueCommitFailure as failure:
@@ -1117,10 +1183,12 @@ class SessionRegistry:
             if wrote:
                 self.record_written(1)
                 await self._post_commit(worker, [rec])
+                if cleanup_cause is not None:
+                    return cleanup_cause
             elif quarantined:
                 # Quarantine is already durable before the acknowledgement.
                 pass
-        return False
+        return None
 
     async def _drain_to_eof(self, worker: SessionWorker, handlers: Any) -> bool:
         """Drain every remaining record for this session up to EOF.
@@ -1135,8 +1203,15 @@ class SessionRegistry:
             if not tail.records:
                 return True
             try:
-                await self._process_batch(worker, tail, handlers)
-                await self._flush_and_commit(worker, tail.records, tail.end_offset)
+                batch_result = await self._process_batch(worker, tail, handlers)
+                if isinstance(batch_result, tuple) and batch_result[1] is not None:
+                    worker.terminal_seen_during_finalize = True
+                await self._flush_and_commit(
+                    worker,
+                    tail.records,
+                    tail.end_offset,
+                    classify_cleanup=False,
+                )
             except _QueueCommitFailure as failure:
                 # Finalization cannot safely turn an ambiguous queue commit
                 # into an orphan: the main supervisor must close and
@@ -1155,8 +1230,14 @@ class SessionRegistry:
                 extra={"session_id": session_id},
             )
 
-    async def _finalize_session(self, worker: SessionWorker, handlers: Any) -> None:
-        """session:end seen: drain to EOF, record CompletedSession, delete
+    async def _finalize_session(
+        self,
+        worker: SessionWorker,
+        handlers: Any,
+        *,
+        cause: _FinalizationCause = _FinalizationCause.TERMINAL_EVENT,
+    ) -> None:
+        """A proven terminal lifecycle seen: drain to EOF, delete
         the drained log, close the graph, then deregister -- in that order.
 
         If the tail flush fails, finalization is aborted (no record/close)
@@ -1179,18 +1260,21 @@ class SessionRegistry:
             )
             return
 
-        ended_at = time.time()
-        self._completed.append(
-            CompletedSession(
-                session_id=session_id,
-                workspace=worker.workspace,
-                started_at=worker.started_at,
-                ended_at=ended_at,
-                events_processed=worker.events_processed,
-                error_count=worker.error_count,
-                duration_seconds=ended_at - worker.started_at,
+        if worker.terminal_seen_during_finalize:
+            cause = _FinalizationCause.TERMINAL_EVENT
+        if cause is _FinalizationCause.TERMINAL_EVENT:
+            ended_at = time.time()
+            self._completed.append(
+                CompletedSession(
+                    session_id=session_id,
+                    workspace=worker.workspace,
+                    started_at=worker.started_at,
+                    ended_at=ended_at,
+                    events_processed=worker.events_processed,
+                    error_count=worker.error_count,
+                    duration_seconds=ended_at - worker.started_at,
+                )
             )
-        )
         # Reclaim disk (keep .dead.jsonl). delete_drained's return is
         # load-bearing: False means an append landed after drain -- retry below.
         for attempt in range(1, _FINALIZE_DELETE_ATTEMPTS + 1):
@@ -1223,6 +1307,23 @@ class SessionRegistry:
                     extra={"session_id": session_id},
                 )
                 return  # late-tail flush failed: same semantics as the first pass
+            if (
+                cause is _FinalizationCause.DURABLY_COMPLETED_CLEANUP
+                and worker.terminal_seen_during_finalize
+            ):
+                cause = _FinalizationCause.TERMINAL_EVENT
+                ended_at = time.time()
+                self._completed.append(
+                    CompletedSession(
+                        session_id=session_id,
+                        workspace=worker.workspace,
+                        started_at=worker.started_at,
+                        ended_at=ended_at,
+                        events_processed=worker.events_processed,
+                        error_count=worker.error_count,
+                        duration_seconds=ended_at - worker.started_at,
+                    )
+                )
         await self._safe_close(worker)
         self._deregister(session_id)  # the LAST act -- no await after this
         logger.info(
