@@ -13,6 +13,7 @@ import re
 import sqlite3
 import stat
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -321,6 +322,50 @@ class Ledger:
             if _identity(st) != self.db_identity:
                 raise RetentionError("Expiry ledger was replaced")
 
+    @staticmethod
+    def _validate_schema(db: sqlite3.Connection) -> None:
+        columns = tuple(row[1] for row in db.execute("PRAGMA table_info(expiry)"))
+        if columns != _COLUMNS:
+            raise RetentionError("Invalid expiry ledger schema (no automatic migration)")
+        db.execute("SELECT uri, dev, ino, size, mtime_ns, ctime_ns, expired_ns, pending FROM expiry LIMIT 1").fetchone()
+
+    def _initialize(self) -> None:
+        """Publish only a closed, validated, durable DB; caller holds root EX lock.
+
+        A crash may leave private initialization files, which readers ignore.
+        Never adopt them or reinterpret an invalid final ledger as a new one.
+        """
+        assert self.fd is not None
+        name = f"{DATABASE}.init-{uuid.uuid4().hex}"
+        fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self.fd)
+        try:
+            self._check()
+            path = self.root.path / METADATA / name
+            db = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True)
+            try:
+                if db.execute("PRAGMA journal_mode=DELETE").fetchone()[0] != "delete":
+                    raise RetentionError("Expiry ledger must use DELETE journal mode")
+                db.execute("PRAGMA synchronous=FULL")
+                db.execute("BEGIN IMMEDIATE")
+                db.execute(
+                    "CREATE TABLE expiry (uri TEXT PRIMARY KEY, dev INTEGER NOT NULL, ino INTEGER NOT NULL, "
+                    "size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL, "
+                    "expired_ns INTEGER NOT NULL, pending INTEGER NOT NULL) WITHOUT ROWID"
+                )
+                self._validate_schema(db)
+                db.commit()
+            finally:
+                db.close()
+            os.fsync(fd)
+            self._check()
+            if _identity(os.stat(name, dir_fd=self.fd, follow_symlinks=False)) != _identity(os.fstat(fd)):
+                raise RetentionError("Expiry ledger initialization file was replaced")
+            os.fsync(self.fd)
+            os.rename(name, DATABASE, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            os.fsync(self.fd)
+        finally:
+            os.close(fd)
+
     def __enter__(self) -> Ledger:
         try:
             if self.writable:
@@ -336,14 +381,13 @@ class Ledger:
                     return self
                 raise
             self._check()
-            new = False
             try:
                 fd = os.open(DATABASE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd)
             except FileNotFoundError:
                 if not self.writable:
                     return self
-                fd = os.open(DATABASE, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self.fd)
-                new = True
+                self._initialize()
+                fd = os.open(DATABASE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd)
             try:
                 st = os.fstat(fd)
                 if not _regular(st):
@@ -358,17 +402,7 @@ class Ledger:
                 if self.db.execute("PRAGMA journal_mode=DELETE").fetchone()[0] != "delete":
                     raise RetentionError("Expiry ledger must use DELETE journal mode")
                 self.db.execute("PRAGMA synchronous=FULL")
-            if new:
-                self.db.execute(
-                    "CREATE TABLE expiry (uri TEXT PRIMARY KEY, dev INTEGER NOT NULL, ino INTEGER NOT NULL, "
-                    "size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL, "
-                    "expired_ns INTEGER NOT NULL, pending INTEGER NOT NULL) WITHOUT ROWID"
-                )
-                self.commit()
-            columns = tuple(row[1] for row in self.db.execute("PRAGMA table_info(expiry)"))
-            if columns != _COLUMNS:
-                raise RetentionError("Invalid expiry ledger schema (no automatic migration)")
-            self.db.execute("SELECT uri, dev, ino, size, mtime_ns, ctime_ns, expired_ns, pending FROM expiry LIMIT 1").fetchone()
+            self._validate_schema(self.db)
             return self
         except BaseException:
             self.__exit__()
@@ -450,11 +484,15 @@ def _unlink(root: Root, ledger: Ledger, item: Candidate, report: Report) -> None
 def _recover(root: Root, ledger: Ledger, report: Report) -> None:
     assert ledger.db is not None
     # Keyset pagination, not OFFSET, and never fetch the full ledger into memory.
+    # An earlier confirmation does not authorize deletion under today's policy.
+    # Exact fingerprint checks in _unlink keep present deletions within the fresh
+    # confirmed preview; immutable records outside this cutoff remain pending.
     after = ""
     while True:
         rows = ledger.db.execute(
             "SELECT uri, dev, ino, size, mtime_ns, ctime_ns FROM expiry "
-            "WHERE pending=1 AND uri>? ORDER BY uri LIMIT ?", (after, BATCH_SIZE)
+            "WHERE pending=1 AND mtime_ns<? AND uri>? ORDER BY uri LIMIT ?",
+            (report.cutoff_ns, after, BATCH_SIZE)
         ).fetchall()
         if not rows:
             break

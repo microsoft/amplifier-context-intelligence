@@ -58,7 +58,10 @@ Device/inode/size/mtime/ctime fingerprints are checked before journaling and aga
 before unlink. No-follow, descriptor-relative checks skip unsafe payload entries;
 unsafe lock/ledger metadata and corrupt ledgers fail loudly. Do not delete the
 ledger: it preserves the distinction between **expired** and **never present**.
-Existing ledger reads are read-only and never migrate it.
+First initialization atomically publishes a fully synced, validated ledger.
+Interrupted private initialization files are ignored, not adopted; an invalid
+existing final ledger still fails loudly. Existing ledger reads are read-only
+and never migrate it.
 If a process crashes during a ledger transaction, SQLite can leave a valid hot
 rollback journal. Read-only preview and tombstone lookups fail loudly rather than
 repairing it. Interactive apply reports that recovery is needed, waits for
@@ -67,8 +70,10 @@ continuing. Declining leaves both the journal and payloads unchanged.
 
 An interrupted apply can leave a readable physical payload plus a pending expiry
 record. A later, confirmed apply can finish deleting it only if the exact
-fingerprint still matches. Changed/restored files remain; physical payloads take
-precedence when read. Apply reports actual deletions, changes, skips and errors;
+fingerprint still matches **and it is strictly older than the current cutoff**,
+so the deletion is included in that apply's fresh preview. A larger age threshold
+leaves newer pending payloads untouched. Changed/restored files remain; physical
+payloads take precedence when read. Apply reports actual deletions, changes, skips and errors;
 errors or changed candidates return nonzero and require inspection, not a claim
 that every previewed file was removed. A later rerun uses a new cutoff.
 

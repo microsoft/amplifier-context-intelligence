@@ -190,15 +190,143 @@ def test_corrupt_ledger_fails_loud_without_unlink(tmp_path):
     assert old.exists() and database.read_bytes() == before
 
 
+def test_existing_empty_ledger_still_fails_closed(tmp_path):
+    old = payload(tmp_path)
+    metadata = tmp_path / r.METADATA
+    metadata.mkdir(mode=0o700)
+    database = metadata / r.DATABASE
+    database.touch(mode=0o600)
+    for operation in (
+        lambda: r.preview(tmp_path, CUTOFF),
+        lambda: r.apply(tmp_path, CUTOFF, lambda _: True),
+        lambda: asyncio.run(AsyncDiskBlobStore(tmp_path).write("session", "new", {})),
+    ):
+        with pytest.raises(r.RetentionError, match="Invalid expiry ledger schema"):
+            operation()
+    assert old.exists() and database.read_bytes() == b""
+    assert not (old.parent / "new.json").exists()
+
+
+@pytest.mark.parametrize("boundary", [
+    "file_created", "sqlite_opened", "schema_created", "schema_committed",
+    "file_synced", "before_publish", "after_publish", "directory_synced",
+])
+def test_first_ledger_publication_process_crash_and_rerun(tmp_path, boundary):
+    old = payload(tmp_path)
+    code = f"""
+import os
+import stat
+from pathlib import Path
+from context_intelligence_server import blob_retention as r
+
+root = Path({str(tmp_path)!r})
+boundary = {boundary!r}
+def crash(at):
+    if boundary == at:
+        os._exit(73)
+
+real_open, real_connect = os.open, r.sqlite3.connect
+real_fsync, real_rename = os.fsync, os.rename
+def opened(name, *args, **kwargs):
+    fd = real_open(name, *args, **kwargs)
+    if (name == r.DATABASE or str(name).startswith(r.DATABASE + ".init-")) and args[0] & os.O_CREAT:
+        crash("file_created")
+    return fd
+class Connection(r.sqlite3.Connection):
+    def execute(self, sql, *args, **kwargs):
+        result = super().execute(sql, *args, **kwargs)
+        if sql.startswith("CREATE TABLE expiry"):
+            crash("schema_created")
+        return result
+    def commit(self):
+        super().commit()
+        crash("schema_committed")
+def connected(*args, **kwargs):
+    db = real_connect(*args, factory=Connection, **kwargs)
+    crash("sqlite_opened")
+    return db
+def synced(fd):
+    real_fsync(fd)
+    st = os.fstat(fd)
+    if stat.S_ISREG(st.st_mode):
+        crash("file_synced")
+    elif (root / r.METADATA / r.DATABASE).exists():
+        crash("directory_synced")
+def renamed(*args, **kwargs):
+    crash("before_publish")
+    real_rename(*args, **kwargs)
+    crash("after_publish")
+os.open, r.sqlite3.connect = opened, connected
+os.fsync, os.rename = synced, renamed
+r.apply(root, {CUTOFF}, lambda _: True)
+"""
+    child = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+    assert child.returncode == 73, child.stderr
+    assert old.exists()
+    metadata = tmp_path / r.METADATA
+    database = metadata / r.DATABASE
+    published = boundary in ("after_publish", "directory_synced")
+    assert database.exists() == published
+    if published:
+        with sqlite3.connect(database) as db:
+            assert tuple(row[1] for row in db.execute("PRAGMA table_info(expiry)")) == r._COLUMNS
+            assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert not (metadata / (r.DATABASE + "-journal")).exists()
+    else:
+        # A zero-byte file or hot journal is harmless under a private temp name.
+        assert list(metadata.glob(r.DATABASE + ".init-*"))
+    before = {p.name: p.read_bytes() for p in metadata.iterdir()}
+    assert r.preview(tmp_path, CUTOFF).files == 1
+    with pytest.raises(r.RetentionError, match="not confirmed"):
+        r.apply(tmp_path, CUTOFF, lambda _: False)
+    assert {p.name: p.read_bytes() for p in metadata.iterdir()} == before
+    store = AsyncDiskBlobStore(tmp_path)
+    assert asyncio.run(store.write("session", "new", {"value": 2})) == "ci-blob://session/new"
+    assert r.apply(tmp_path, CUTOFF, lambda report: report.files == 1).deleted == 1
+    assert not old.exists()
+    assert asyncio.run(store.read("ci-blob://session/new")) == {"value": 2}
+    with pytest.raises(r.BlobExpiredError):
+        asyncio.run(store.read("ci-blob://session/old"))
+    assert r.apply(tmp_path, CUTOFF, lambda report: report.files == 0).deleted == 0
+    # Reruns do not mutate or adopt incomplete initialization remnants.
+    for name, contents in before.items():
+        if name != r.DATABASE:
+            assert (metadata / name).read_bytes() == contents
+
+
+@pytest.mark.parametrize("boundary", ["file", "before_publish", "after_publish"])
+def test_first_ledger_fsync_failure_never_unlinks_and_can_retry(tmp_path, monkeypatch, boundary):
+    old = payload(tmp_path)
+    metadata = tmp_path / r.METADATA
+    database = metadata / r.DATABASE
+    real_fsync = os.fsync
+
+    def refuse(fd):
+        import stat
+        st = os.fstat(fd)
+        if stat.S_ISREG(st.st_mode) and boundary == "file":
+            raise OSError("initialization fsync refused")
+        if metadata.exists() and r._identity(st) == r._identity(metadata.stat()):
+            if database.exists() == (boundary == "after_publish") and boundary != "file":
+                raise OSError("initialization fsync refused")
+        return real_fsync(fd)
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "fsync", refuse)
+        with pytest.raises(OSError, match="initialization fsync refused"):
+            r.apply(tmp_path, CUTOFF, lambda _: True)
+    assert old.exists() and database.exists() == (boundary == "after_publish")
+    assert r.preview(tmp_path, CUTOFF).files == 1
+    assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 1
+    assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 0
+
+
 def test_commit_failure_before_unlink(tmp_path, monkeypatch):
     old = payload(tmp_path)
     real_commit = r.Ledger.commit
-    calls = 0
 
     def refuse(self):
-        nonlocal calls
-        calls += 1
-        if calls == 2:  # schema committed; expiry batch commit is refused
+        if self.db.execute("SELECT 1 FROM expiry WHERE pending=1").fetchone():
             raise sqlite3.OperationalError("simulated disk full")
         return real_commit(self)
 
@@ -248,6 +376,82 @@ def test_interrupted_commit_then_rerun_and_decline_pending(tmp_path, monkeypatch
     result = r.apply(tmp_path, CUTOFF, lambda _: True)
     assert result.deleted == 1 and not old.exists()
     assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 0
+
+
+def test_pending_45d_payload_respects_fresh_90d_confirmation_then_30d(tmp_path):
+    day = r.duration_ns("1d")
+    now = CUTOFF
+    cutoff_30d, cutoff_90d = now - 30 * day, now - 90 * day
+    old = payload(tmp_path, mtime=now - 45 * day)
+    code = f"""
+import os
+from context_intelligence_server import blob_retention as r
+r._unlink = lambda *args: os._exit(73)
+r.apply({str(tmp_path)!r}, {cutoff_30d}, lambda report: report.files == 1)
+"""
+    child = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+    assert child.returncode == 73, child.stderr
+    before_payload = old.read_bytes(), r.fingerprint(old.stat())
+    database = tmp_path / r.METADATA / r.DATABASE
+    before_database = database.read_bytes()
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        row = ledger.db.execute("SELECT * FROM expiry").fetchone()
+        assert row[-1] == 1
+    seen = []
+
+    def confirm_90d(report):
+        seen.append((report.files, report.retained, report.samples))
+        return True
+
+    with pytest.raises(r.RetentionError, match="not confirmed"):
+        r.apply(tmp_path, cutoff_90d, lambda _: False)
+    assert database.read_bytes() == before_database
+    assert (old.read_bytes(), r.fingerprint(old.stat())) == before_payload
+    result = r.apply(tmp_path, cutoff_90d, confirm_90d)
+    assert seen == [(0, 1, [])]
+    assert result.deleted == 0 and result.retained == 1
+    assert (old.read_bytes(), r.fingerprint(old.stat())) == before_payload
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db.execute("SELECT * FROM expiry").fetchone() == row
+    seen.clear()
+
+    def confirm_30d(report):
+        seen.append((report.files, report.retained, report.samples))
+        return True
+
+    assert r.apply(tmp_path, cutoff_30d, confirm_30d).deleted == 1
+    assert seen == [(1, 0, ["ci-blob://session/old"])]
+    assert not old.exists()
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db.execute("SELECT * FROM expiry").fetchone() == (*row[:-1], 0)
+    assert r.apply(tmp_path, cutoff_30d, lambda _: True).deleted == 0
+
+
+@pytest.mark.parametrize("change", ["boundary", "replaced"])
+def test_pending_recovery_keeps_boundary_and_replaced_fingerprints(tmp_path, monkeypatch, change):
+    old = payload(tmp_path)
+    with monkeypatch.context() as m:
+        def interrupt(*args):
+            raise RuntimeError("interrupted")
+        m.setattr(r, "_unlink", interrupt)
+        with pytest.raises(RuntimeError, match="interrupted"):
+            r.apply(tmp_path, CUTOFF, lambda _: True)
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        row = ledger.db.execute("SELECT * FROM expiry").fetchone()
+    if change == "boundary":
+        cutoff = row[4]  # original mtime is exactly the current cutoff
+    else:
+        replacement = old.with_suffix(".tmp")
+        replacement.write_bytes(old.read_bytes())
+        os.utime(replacement, ns=(row[4], row[4]))
+        os.replace(replacement, old)
+        cutoff = CUTOFF
+    before = old.read_bytes(), r.fingerprint(old.stat())
+    result = r.apply(tmp_path, cutoff, lambda _: True)
+    assert result.deleted == 0
+    assert (old.read_bytes(), r.fingerprint(old.stat())) == before
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db.execute("SELECT * FROM expiry").fetchone() == row
 
 
 @pytest.mark.parametrize("when", ["before_journal", "before_unlink"])
