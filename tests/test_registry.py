@@ -1915,7 +1915,12 @@ class TestWrittenCounterWiring:
             task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
             for _ in range(400):
                 await asyncio.sleep(0.01)
-                if (await qm.read_batch(sid, 10)).lines == []:
+                # Queue commit precedes the written counter update; do not
+                # cancel the drainer in that legitimate intermediate state.
+                if (
+                    (await qm.read_batch(sid, 10)).lines == []
+                    and reg.pipeline_counters()["written_total"] == 2
+                ):
                     break
             task.cancel()
             try:
