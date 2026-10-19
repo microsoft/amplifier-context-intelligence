@@ -356,10 +356,230 @@ def test_metadata_fsync_failure_prevents_unlink(tmp_path, monkeypatch):
     assert old.exists()
 
 
+def test_batch_directory_sync_is_deduplicated_and_precedes_completion(tmp_path, monkeypatch):
+    paths = [payload(tmp_path, key=f"old-{i}") for i in range(5)]
+    directory = r._identity(paths[0].parent.stat())
+    events = []
+    real_sync, real_unlink, real_commit = os.fsync, os.unlink, r.Ledger.commit
+    monkeypatch.setattr(r, "BATCH_SIZE", 2)
+
+    def synced(fd):
+        if r._identity(os.fstat(fd)) == directory:
+            events.append("directory-sync")
+        real_sync(fd)
+
+    def unlinked(name, *args, **kwargs):
+        result = real_unlink(name, *args, **kwargs)
+        if str(name).endswith(".json"):
+            events.append("unlink")
+        return result
+
+    def committed(self):
+        if self.db.execute("SELECT 1 FROM expiry WHERE pending=0").fetchone():
+            assert events[-1] in ("directory-sync", "completion")
+            events.append("completion")
+        return real_commit(self)
+
+    monkeypatch.setattr(os, "fsync", synced)
+    monkeypatch.setattr(os, "unlink", unlinked)
+    monkeypatch.setattr(r.Ledger, "commit", committed)
+    assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 5
+    assert events.count("directory-sync") == 3  # one per batch, not per payload
+    assert not any(path.exists() for path in paths)
+
+
+def test_directory_sync_failure_keeps_durable_pending_and_closes_all_fds(tmp_path, monkeypatch):
+    paths = []
+    for session in ("first", "second", "third"):
+        path = tmp_path / session / "blobs" / "old.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{}")
+        os.utime(path, ns=(CUTOFF - 1, CUTOFF - 1))
+        paths.append(path)
+    identities = {r._identity(path.parent.stat()) for path in paths}
+    attempts, duplicates = [], []
+    real_sync, real_dup = os.fsync, os.dup
+
+    def duplicated(fd):
+        result = real_dup(fd)
+        duplicates.append(result)
+        return result
+
+    def fail_second(fd):
+        identity = r._identity(os.fstat(fd))
+        if identity in identities:
+            attempts.append(identity)
+            if len(attempts) == 2:
+                raise OSError("batch directory sync failed")
+        return real_sync(fd)
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "dup", duplicated)
+        m.setattr(os, "fsync", fail_second)
+        with pytest.raises(OSError, match="batch directory sync failed"):
+            r.apply(tmp_path, CUTOFF, lambda _: True)
+    assert len(attempts) == 3  # later directories are still synced
+    for fd in duplicates:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db.execute("SELECT pending FROM expiry").fetchall() == [(1,)] * 3
+    assert not any(path.exists() for path in paths)
+    attempts.clear()
+
+    def record_sync(fd):
+        identity = r._identity(os.fstat(fd))
+        if identity in identities:
+            attempts.append(identity)
+        return real_sync(fd)
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "fsync", record_sync)
+        assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 0
+    assert set(attempts) == identities  # recovered absences synced before commit
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db.execute("SELECT pending FROM expiry").fetchall() == [(0,)] * 3
+
+
+def test_directory_pin_failure_precedes_unlink(tmp_path, monkeypatch):
+    old = payload(tmp_path)
+    with monkeypatch.context() as m:
+        def refuse(fd):
+            raise OSError("no descriptor available")
+        m.setattr(os, "dup", refuse)
+        result = r.apply(tmp_path, CUTOFF, lambda _: True)
+    assert result.deleted == 0 and result.errors == 1 and old.exists()
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db.execute("SELECT pending FROM expiry").fetchone() == (1,)
+    assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 1
+
+
+def test_directory_close_failure_still_drains_other_descriptors(tmp_path, monkeypatch):
+    first = os.open(tmp_path, r._DIR)
+    second = os.open(tmp_path, r._DIR)
+    synced, closed = [], []
+    real_sync, real_close = os.fsync, os.close
+
+    def record_sync(fd):
+        synced.append(fd)
+        return real_sync(fd)
+
+    def fail_first_close(fd):
+        closed.append(fd)
+        real_close(fd)
+        if fd == first:
+            raise OSError("close result uncertain")
+
+    monkeypatch.setattr(os, "fsync", record_sync)
+    monkeypatch.setattr(os, "close", fail_first_close)
+    with pytest.raises(OSError, match="close result uncertain"):
+        with r._sync_dirs() as directories:
+            directories[(1, 1)] = first
+            directories[(1, 2)] = second
+    assert synced == [first, second] and closed == [first, second]
+    for fd in (first, second):
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+def test_directory_descriptors_are_bounded_by_batch(tmp_path, monkeypatch):
+    for i in range(7):
+        path = tmp_path / f"session-{i}" / "blobs" / "old.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{}")
+        os.utime(path, ns=(CUTOFF - 1, CUTOFF - 1))
+    active = set()
+    maximum = 0
+    real_dup, real_close = os.dup, os.close
+
+    def duplicated(fd):
+        nonlocal maximum
+        result = real_dup(fd)
+        active.add(result)
+        maximum = max(maximum, len(active))
+        return result
+
+    def closed(fd):
+        active.discard(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(r, "BATCH_SIZE", 3)
+    monkeypatch.setattr(os, "dup", duplicated)
+    monkeypatch.setattr(os, "close", closed)
+    assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 7
+    assert maximum == 3 and not active
+
+
+def test_checked_batch_restores_checks_and_rejects_replaced_root(tmp_path):
+    original = tmp_path / "root"
+    original.mkdir()
+    with r.Root(original) as root:
+        with pytest.raises(RuntimeError, match="body failed"):
+            with root.checked_batch():
+                raise RuntimeError("body failed")
+        assert not root._inside_checked_batch
+        root.check()
+        with pytest.raises(r.RetentionError, match="root changed"):
+            with root.checked_batch():
+                original.rename(tmp_path / "previous-root")
+                original.mkdir()
+        assert not root._inside_checked_batch
+
+
+def test_checked_batches_keep_root_walks_bounded(tmp_path, monkeypatch):
+    for i in range(10):
+        payload(tmp_path, key=f"old-{i}")
+    real_open = r._open_absolute
+    walks = []
+
+    def counted(path):
+        walks.append(path)
+        return real_open(path)
+
+    monkeypatch.setattr(r, "_open_absolute", counted)
+    assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 10
+    # Preview/session boundaries, initialization and commits still check fully;
+    # individual candidates no longer walk every absolute ancestor repeatedly.
+    assert len(walks) < 50
+
+
+def test_process_crash_after_unlink_recovers_and_syncs_absence(tmp_path, monkeypatch):
+    old = payload(tmp_path)
+    directory = r._identity(old.parent.stat())
+    code = f"""
+import os
+from context_intelligence_server import blob_retention as r
+real_unlink = os.unlink
+def crash(name, *args, **kwargs):
+    real_unlink(name, *args, **kwargs)
+    if name == 'old.json':
+        os._exit(73)
+os.unlink = crash
+r.apply({str(tmp_path)!r}, {CUTOFF}, lambda _: True)
+"""
+    child = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=10)
+    assert child.returncode == 73 and not old.exists()
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db.execute("SELECT pending FROM expiry").fetchone() == (1,)
+    synced = []
+    real_sync = os.fsync
+
+    def record(fd):
+        if r._identity(os.fstat(fd)) == directory:
+            synced.append(fd)
+        return real_sync(fd)
+
+    monkeypatch.setattr(os, "fsync", record)
+    assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 0
+    assert len(synced) == 1
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db.execute("SELECT pending FROM expiry").fetchone() == (0,)
+
+
 def test_interrupted_commit_then_rerun_and_decline_pending(tmp_path, monkeypatch):
     old = payload(tmp_path)
 
-    def crash(*args):
+    def crash(*args, **kwargs):
         raise RuntimeError("interrupted after durable commit")
 
     with monkeypatch.context() as m:
@@ -386,7 +606,7 @@ def test_pending_45d_payload_respects_fresh_90d_confirmation_then_30d(tmp_path):
     code = f"""
 import os
 from context_intelligence_server import blob_retention as r
-r._unlink = lambda *args: os._exit(73)
+r._unlink = lambda *args, **kwargs: os._exit(73)
 r.apply({str(tmp_path)!r}, {cutoff_30d}, lambda report: report.files == 1)
 """
     child = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
@@ -431,7 +651,7 @@ r.apply({str(tmp_path)!r}, {cutoff_30d}, lambda report: report.files == 1)
 def test_pending_recovery_keeps_boundary_and_replaced_fingerprints(tmp_path, monkeypatch, change):
     old = payload(tmp_path)
     with monkeypatch.context() as m:
-        def interrupt(*args):
+        def interrupt(*args, **kwargs):
             raise RuntimeError("interrupted")
         m.setattr(r, "_unlink", interrupt)
         with pytest.raises(RuntimeError, match="interrupted"):
@@ -703,7 +923,7 @@ def test_process_crash_retains_durable_record_then_cli_decline_and_resume(tmp_pa
     code = f"""
 import os
 from context_intelligence_server import blob_retention as r
-r._unlink = lambda *args: os._exit(73)
+r._unlink = lambda *args, **kwargs: os._exit(73)
 r.apply({str(tmp_path)!r}, {CUTOFF}, lambda _: True)
 """
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=10)

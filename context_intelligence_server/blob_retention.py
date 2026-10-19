@@ -108,14 +108,34 @@ class Root:
     def __init__(self, path: Path | str):
         self.path = Path(path).expanduser().resolve(strict=True)
         self.fd = _open_absolute(self.path)
+        self._inside_checked_batch = False
 
     def check(self) -> None:
+        if self._inside_checked_batch:
+            return
         fd = _open_absolute(self.path)
         try:
             if _identity(os.fstat(fd)) != _identity(os.fstat(self.fd)):
                 raise RetentionError("Blob root changed during operation")
         finally:
             os.close(fd)
+
+    @contextmanager
+    def checked_batch(self) -> Iterator[None]:
+        """Exclusive maintenance checks root ancestry at both batch boundaries.
+
+        Descendant no-follow opens and inode checks remain active per file.
+        The cooperative writer lock excludes namespace mutation in the batch.
+        """
+        if self._inside_checked_batch:
+            raise RetentionError("Nested root-maintenance batch")
+        self.check()
+        self._inside_checked_batch = True
+        try:
+            yield
+        finally:
+            self._inside_checked_batch = False
+            self.check()
 
     @contextmanager
     def blobs(self, session: str, *, create: bool = False) -> Iterator[int]:
@@ -455,7 +475,44 @@ def _matches(root: Root, item: Candidate) -> bool:
         return False
 
 
-def _unlink(root: Root, ledger: Ledger, item: Candidate, report: Report) -> None:
+@contextmanager
+def _sync_dirs() -> Iterator[dict[tuple[int, int], int]]:
+    """Pin at most one descriptor per batch directory; sync before DB commit."""
+    directories: dict[tuple[int, int], int] = {}
+    try:
+        yield directories
+    finally:
+        failure: OSError | None = None
+        for fd in directories.values():
+            try:
+                os.fsync(fd)
+            except OSError as exc:
+                failure = failure or exc
+            finally:
+                try:
+                    os.close(fd)
+                except OSError as exc:
+                    # A failed close must not abandon later pinned directories.
+                    # Do not retry: the descriptor may already have been closed.
+                    failure = failure or exc
+        if failure is not None:
+            raise failure
+
+
+def _pin_directory(fd: int, directories: dict[tuple[int, int], int]) -> None:
+    identity = _identity(os.fstat(fd))
+    if identity not in directories:
+        directories[identity] = os.dup(fd)
+
+
+def _unlink(
+    root: Root,
+    ledger: Ledger,
+    item: Candidate,
+    report: Report,
+    *,
+    dirty_dirs: dict[tuple[int, int], int] | None = None,
+) -> None:
     """Never delete an updated/restored inode or a URI with a different record."""
     assert ledger.db is not None
     row = ledger.db.execute("SELECT dev, ino, size, mtime_ns, ctime_ns, pending FROM expiry WHERE uri=?", (item.uri,)).fetchone()
@@ -466,15 +523,27 @@ def _unlink(root: Root, ledger: Ledger, item: Candidate, report: Report) -> None
     try:
         ledger._check()
         with root.blobs(session) as fd:
-            st = os.stat(key + ".json", dir_fd=fd, follow_symlinks=False)
-            if not _regular(st) or fingerprint(st) != item.fp:
-                report.changed += 1
-                return
-            os.unlink(key + ".json", dir_fd=fd)
-            report.deleted += 1
-            os.fsync(fd)
+            try:
+                st = os.stat(key + ".json", dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                # A previous process may have died after unlink but before
+                # syncing this directory. Absence must be durable too.
+                if dirty_dirs is not None:
+                    _pin_directory(fd, dirty_dirs)
+                else:
+                    os.fsync(fd)
+            else:
+                if not _regular(st) or fingerprint(st) != item.fp:
+                    report.changed += 1
+                    return
+                if dirty_dirs is not None:
+                    _pin_directory(fd, dirty_dirs)  # failure must precede unlink
+                os.unlink(key + ".json", dir_fd=fd)
+                report.deleted += 1
+                if dirty_dirs is None:
+                    os.fsync(fd)
     except FileNotFoundError:
-        pass  # already absent after an interrupted apply
+        return  # missing ancestor cannot be synced; conservatively keep pending
     except (OSError, ValueError):
         report.errors += 1
         return
@@ -496,8 +565,13 @@ def _recover(root: Root, ledger: Ledger, report: Report) -> None:
         ).fetchall()
         if not rows:
             break
-        for row in rows:
-            _unlink(root, ledger, Candidate(row[0], tuple(row[1:]), 0), report)
+        with root.checked_batch():
+            with _sync_dirs() as directories:
+                for row in rows:
+                    _unlink(
+                        root, ledger, Candidate(row[0], tuple(row[1:]), 0),
+                        report, dirty_dirs=directories,
+                    )
         ledger.commit()
         after = rows[-1][0]
 
@@ -536,24 +610,24 @@ def apply(
             batch: list[Candidate] = []
 
             def flush() -> None:
-                ready = []
-                for item in batch:
-                    if _matches(root, item):
-                        ready.append(item)
-                    else:
-                        result.changed += 1
-                ledger.journal(ready)
-                for item in ready:
-                    _unlink(root, ledger, item, result)
+                with root.checked_batch():
+                    ready = []
+                    for item in batch:
+                        if ledger.contains(item.uri):
+                            # Never replace a restored URI's tombstone.
+                            result.skipped += 1
+                        elif _matches(root, item):
+                            ready.append(item)
+                        else:
+                            result.changed += 1
+                    ledger.journal(ready)
+                    with _sync_dirs() as directories:
+                        for item in ready:
+                            _unlink(root, ledger, item, result, dirty_dirs=directories)
                 ledger.commit()
                 batch.clear()
 
             for item in candidates(root, cutoff_ns, result):
-                if ledger.contains(item.uri):
-                    # A restored payload remains readable, even if old. Never
-                    # replace its tombstone fingerprint to make it deletable.
-                    result.skipped += 1
-                    continue
                 batch.append(item)
                 if len(batch) == BATCH_SIZE:
                     flush()
