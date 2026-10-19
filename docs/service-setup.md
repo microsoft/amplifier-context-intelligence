@@ -6,6 +6,84 @@ integrated with the Amplifier CLI so sessions are automatically captured.
 
 ---
 
+## Manual blob retention — preview first
+
+```bash
+context-intelligence-server blobs prune --older-than 30d
+# Optional explicit EXISTING blob root:
+context-intelligence-server blobs prune --older-than 30d --blob-root /path/to/blobs
+```
+
+The default age is `30d`. Positive integer units are `s`, `m`, `h`, `d`, and `w`.
+Age means **when the payload was stored**, using filesystem `mtime_ns`, not an
+event timestamp or filename. Only files strictly older than one invocation cutoff
+are eligible; boundary, rewritten, and future-dated files remain. The cutoff is
+printed in `America/Los_Angeles` time. Output includes the canonical root, eligible
+file count, allocated/logical bytes, retained/skipped/error counts, and at most
+five sample URIs. Allocated bytes are an estimate, not guaranteed freed space.
+
+Preview reads metadata only: no payload bodies, graph connection, lock creation,
+ledger creation, or log/manifest writes. It walks the known
+`root/session/blobs/key.json` layout without sorting or collecting the full tree.
+Without `--blob-root`, normal `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_*` environment
+and YAML settings resolve `blob_path`. An explicitly named missing config fails,
+even with `--blob-root`; an absent root fails rather than being created.
+
+**Apply requires a separately authorized maintenance window.**
+
+1. Stop all writers using their service manager. **Old unpatched writers do not
+   honor the retention lock and MUST be stopped before apply.** Do not launch
+   another ad-hoc server to work around the lock.
+2. Run the same command with `--apply`. It acquires a nonblocking exclusive root
+   lock **before** a fresh preview and holds it throughout confirmation/deletion.
+3. Read the preview, then type **`prune`** at the terminal prompt to confirm.
+   Decline, EOF, or noninteractive input deletes nothing. There is no `--yes`.
+4. Restart through the service manager after completion. The command never
+   stops or restarts services itself.
+
+Upgraded workers hold a shared lock from before startup recovery through final
+shutdown. Standalone BlobStore operations also hold a shared lock, including
+threaded operations whose awaiting task is cancelled. Aliases of the same root
+coordinate through its canonical path. Lock conflicts fail without waiting.
+Never unlink `root/.ci-blob-retention.lock`: replacing its inode defeats locking.
+Keep the namespace stable; do not rename roots/session directories or edit
+metadata while applying. Locks are cooperative, not protection against a hostile
+same-user process. This operation requires a local filesystem with working POSIX
+flock, atomic rename/unlink, directory fsync, and SQLite durability semantics.
+
+Only confirmed apply initializes the private `root/.ci-blob-retention/` SQLite
+expiry ledger. Batches of at most 512 URI/fingerprint records commit with
+`synchronous=FULL` and a metadata-directory fsync **before** unlinking.
+Device/inode/size/mtime/ctime fingerprints are checked before journaling and again
+before unlink. No-follow, descriptor-relative checks skip unsafe payload entries;
+unsafe lock/ledger metadata and corrupt ledgers fail loudly. Do not delete the
+ledger: it preserves the distinction between **expired** and **never present**.
+Existing ledger reads are read-only and never migrate it.
+If a process crashes during a ledger transaction, SQLite can leave a valid hot
+rollback journal. Read-only preview and tombstone lookups fail loudly rather than
+repairing it. Interactive apply reports that recovery is needed, waits for
+confirmation, then performs SQLite recovery under the exclusive lock before
+continuing. Declining leaves both the journal and payloads unchanged.
+
+An interrupted apply can leave a readable physical payload plus a pending expiry
+record. A later, confirmed apply can finish deleting it only if the exact
+fingerprint still matches. Changed/restored files remain; physical payloads take
+precedence when read. Apply reports actual deletions, changes, skips and errors;
+errors or changed candidates return nonzero and require inspection, not a claim
+that every previewed file was removed. A later rerun uses a new cutoff.
+
+**What stays:** graph/session metadata, graph blob references, queue artifacts,
+unknown files, and empty session directories. No whole-session deletion occurs.
+An absent expired payload raises `BlobExpiredError`; authenticated HTTP reads
+return `410` with `detail: {"code": "blob_expired", "uri": "ci-blob://..."}`.
+An absent unrecorded URI remains `404`; authentication is unchanged. Replay keeps
+the canonical URI successfully without recreating or refreshing tombstoned
+payloads. Physically restored payloads remain readable, but this command supplies
+no restore feature. Existing clients fail loudly on `410`; v1 adds no client or
+capture changes, automatic scheduling, or deployment.
+
+---
+
 ## Local quickstart — static mode with admin
 
 The fastest path to a **local** server (server v6.0.0): static API-key auth and

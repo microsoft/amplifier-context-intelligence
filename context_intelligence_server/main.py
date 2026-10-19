@@ -38,6 +38,7 @@ from context_intelligence_server.authz import (  # noqa: F401 — re-exported fo
     require_write,
 )
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
+from context_intelligence_server.blob_retention import BlobExpiredError, RootLock
 from context_intelligence_server.config import Neo4jClientConfig, Settings, get_settings
 from context_intelligence_server.idempotency import EventIdempotencyCache
 from context_intelligence_server.identity_store import IdentityStore
@@ -1246,8 +1247,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         raise RuntimeError(str(exc)) from exc
     app.state.server_instance_lock = instance_lock
     try:
-        async with _server_lifespan(app):
-            yield
+        # Worker-local (not the pre-fork gunicorn arbiter): hold until all
+        # drainers and drivers finish shutdown, including startup recovery.
+        with RootLock(settings.blob_path, create_root=True):
+            async with _server_lifespan(app):
+                yield
     finally:
         instance_lock.release()
 
@@ -2410,6 +2414,8 @@ async def get_blob(session_id: str, key: str, request: Request) -> JSONResponse:
     uri = f"ci-blob://{session_id}/{key}"
     try:
         content = await blob_store.read(uri)
+    except BlobExpiredError:
+        raise HTTPException(status_code=410, detail={"code": "blob_expired", "uri": uri})
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Blob not found: {uri}")
     return JSONResponse(content=content)

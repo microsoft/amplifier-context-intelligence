@@ -261,6 +261,20 @@ mirror) — you cannot `docker pull` it either. Do NOT set
 procedures. Only `unrestricted=apoc.*` is needed. This path was validated in an
 isolated environment with the Neo4j container cut off from the internet.
 
+### Manual blob retention safety
+
+`context-intelligence-server blobs prune --older-than 30d` previews storage-mtime
+expiry; `--apply` requires a terminal and explicit `prune` confirmation. No
+automatic scheduling or service restart. Stop old unpatched writers through the
+service manager before apply: they do not honor the new shared/exclusive
+`root/.ci-blob-retention.lock`. Never unlink that lock or the private expiry
+ledger. Upgraded workers hold the shared root lock across their entire lifespan;
+standalone BlobStore operations hold it inside their I/O thread. Preserve
+physical-first reads, `BlobExpiredError` / HTTP 410 `blob_expired`, and replay's
+successful no-rehydrate behavior. Never prune graph/session or queue state.
+Guide: `docs/service-setup.md` → "Manual blob retention — preview first".
+Tests: `uv run pytest tests/test_blob_retention.py tests/test_blob_store.py -q`.
+
 ### Temporal properties are `ZONED DATETIME`
 
 All temporal properties are stored as native Neo4j ZONED DATETIME, not ISO strings.

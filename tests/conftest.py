@@ -138,7 +138,7 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
     _real = _Settings()
 
     class _SettingsProxy:
-        blob_path: str = _real.blob_path
+        blob_path: str = str(tmp_path / "blobs")
         queues_path: str = str(tmp_path / "queues")
         # Redirect identity-store paths so the registry proxy never touches the
         # real /data/identity/ defaults on machines where those files exist.

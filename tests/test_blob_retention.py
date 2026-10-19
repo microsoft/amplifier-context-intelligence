@@ -1,0 +1,633 @@
+"""Retention acceptance tests, exclusively against isolated scratch roots."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+import shlex
+import sqlite3
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+import pytest
+
+from context_intelligence_server import blob_retention as r
+from context_intelligence_server.blob_store import AsyncDiskBlobStore
+
+CUTOFF = 1_700_000_000_000_000_000
+CLI = Path(sys.executable).parent / "context-intelligence-server"
+
+
+def payload(root: Path, key: str = "old", mtime: int = CUTOFF - 1) -> Path:
+    path = root / "session" / "blobs" / f"{key}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"value": 1}')
+    os.utime(path, ns=(mtime, mtime))
+    return path
+
+
+def run_cli(root: Path, *args: str, tty_input: str | None = None, env=None):
+    command = [str(CLI), "blobs", "prune", "--blob-root", str(root), *args]
+    if tty_input is not None:
+        # script owns/reaps its PTY child synchronously. No detached process.
+        command = ["script", "-q", "-e", "-c", shlex.join(command), "/dev/null"]
+    return subprocess.run(command, input=tty_input or "", text=True, capture_output=True,
+                          timeout=10, env=env)
+
+
+@pytest.mark.parametrize("age,seconds", [("1s", 1), ("2m", 120), ("3h", 10800), ("30d", 2592000), ("2w", 1209600)])
+def test_duration(age, seconds):
+    assert r.duration_ns(age) == seconds * 10**9
+
+
+@pytest.mark.parametrize("age", ["0d", "-1d", "1.2d", "30", "d", "1D", "1 d", "01d", "9999999999999999999999999w", "9999999999w"])
+def test_bad_duration(age):
+    with pytest.raises(ValueError):
+        r.duration_ns(age)
+
+
+def test_cutoff_range():
+    with pytest.raises(ValueError):
+        r.cutoff_for(10, now_ns=9)
+    assert r.cutoff_for(1, now_ns=10) == 9
+
+
+def test_preview_boundary_future_event_names_and_no_artifacts(tmp_path, monkeypatch):
+    old = payload(tmp_path, "2099-01-01__raw")
+    payload(tmp_path, "boundary", CUTOFF)
+    payload(tmp_path, "new", CUTOFF + 1)
+    payload(tmp_path, "1900-01-01__raw", CUTOFF + 10**12)
+    before = {p.relative_to(tmp_path): p.lstat() for p in tmp_path.rglob("*")}
+    real_open = os.open
+
+    def no_body(path, *args, **kwargs):
+        assert not str(path).endswith(".json"), "preview opened a blob body"
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", no_body)
+    report = r.preview(tmp_path, CUTOFF)
+    assert report.files == 1 and report.retained == 3
+    assert report.logical_bytes == old.stat().st_size
+    assert report.allocated_bytes == old.stat().st_blocks * 512
+    assert report.samples == ["ci-blob://session/2099-01-01__raw"]
+    assert "America/Los_Angeles" in report.text()
+    after = {p.relative_to(tmp_path): p.lstat() for p in tmp_path.rglob("*")}
+    assert before.keys() == after.keys()
+    assert all(before[p].st_mtime_ns == after[p].st_mtime_ns for p in before)
+    assert not (tmp_path / r.LOCK).exists()
+    assert not (tmp_path / r.METADATA).exists()
+
+
+def test_samples_bounded_and_batches_bounded(tmp_path, monkeypatch):
+    for i in range(1100):
+        payload(tmp_path, str(i))
+    sizes = []
+    journal = r.Ledger.journal
+
+    def tracking(self, batch):
+        sizes.append(len(batch))
+        journal(self, batch)
+
+    monkeypatch.setattr(r.Ledger, "journal", tracking)
+    report = r.apply(tmp_path, CUTOFF, lambda _: True)
+    assert report.deleted == 1100 and report.errors == 0
+    assert sizes == [512, 512, 76]
+    assert len(report.samples) == 5
+    assert (tmp_path / "session" / "blobs").is_dir()
+
+
+def test_apply_preserves_graph_queue_unknowns_and_directories(tmp_path):
+    old = payload(tmp_path)
+    boundary = payload(tmp_path, "boundary", CUTOFF)
+    sentinels = [tmp_path / "graph.db", tmp_path / "session" / "queue.jsonl",
+                 old.parent / "unknown.tmp", old.parent / "nested" / "keep.json"]
+    for path in sentinels:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"sentinel")
+    report = r.apply(tmp_path, CUTOFF, lambda plan: plan.files == 1)
+    assert report.deleted == 1 and not old.exists()
+    assert boundary.exists() and old.parent.is_dir()
+    assert all(p.read_bytes() == b"sentinel" for p in sentinels)
+    assert (tmp_path / r.LOCK).is_file()
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.contains("ci-blob://session/old")
+        assert ledger.db.execute("PRAGMA query_only").fetchone() == (0,)  # mode=ro enforces access
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            ledger.db.execute("DELETE FROM expiry")
+
+
+@pytest.mark.parametrize("answer", [False, None])
+def test_decline_creates_no_ledger(tmp_path, answer):
+    old = payload(tmp_path)
+    with pytest.raises(r.RetentionError, match="not confirmed"):
+        r.apply(tmp_path, CUTOFF, lambda _: answer)
+    assert old.exists() and not (tmp_path / r.METADATA).exists()
+
+
+def test_symlinks_hardlinks_and_unknown_layout_skipped(tmp_path):
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}")
+    old = payload(tmp_path)
+    (tmp_path / "alias-session").symlink_to(old.parent.parent, target_is_directory=True)
+    (old.parent / "link.json").symlink_to(outside)
+    os.link(outside, old.parent / "hardlink.json")
+    (old.parent / "directory.json").mkdir()
+    (tmp_path / "fake-session").mkdir()
+    (tmp_path / "fake-session" / "blobs").symlink_to(old.parent, target_is_directory=True)
+    payload(tmp_path, "bad\nname")
+    result = r.apply(tmp_path, CUTOFF, lambda _: True)
+    assert result.deleted == 1
+    assert result.skipped >= 6
+    assert outside.read_text() == "{}"
+
+
+@pytest.mark.parametrize("uri", [
+    "ci-blob://../key", "ci-blob://session/../escape", "ci-blob://session/..",
+    "ci-blob://session/a\\b", "ci-blob://session/a\nb",
+    "ci-blob://session/%2e%2e", "ci-blob://session/key?query",
+])
+async def test_uri_escape_rejected(tmp_path, uri):
+    store = AsyncDiskBlobStore(tmp_path)
+    with pytest.raises(ValueError):
+        await store.read(uri)
+    with pytest.raises(ValueError):
+        await store.dump(uri, tmp_path / "dump")
+    assert not (tmp_path / r.LOCK).exists()
+
+
+@pytest.mark.parametrize("entry", ["lock", "metadata", "database", "journal"])
+def test_symlinked_metadata_rejected(tmp_path, entry):
+    old = payload(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if entry == "lock":
+        (tmp_path / r.LOCK).symlink_to(outside / "lock")
+    elif entry == "metadata":
+        (tmp_path / r.METADATA).symlink_to(outside, target_is_directory=True)
+    else:
+        metadata = tmp_path / r.METADATA
+        metadata.mkdir(mode=0o700)
+        (metadata / (r.DATABASE if entry == "database" else r.DATABASE + "-journal")).symlink_to(outside / "db")
+    with pytest.raises((OSError, r.RetentionError)):
+        r.apply(tmp_path, CUTOFF, lambda _: True)
+    assert old.exists() and not list(outside.iterdir())
+
+
+def test_corrupt_ledger_fails_loud_without_unlink(tmp_path):
+    old = payload(tmp_path)
+    metadata = tmp_path / r.METADATA
+    metadata.mkdir(mode=0o700)
+    database = metadata / r.DATABASE
+    database.write_bytes(b"not SQLite")
+    before = database.read_bytes()
+    with pytest.raises(sqlite3.DatabaseError):
+        r.preview(tmp_path, CUTOFF)
+    with pytest.raises(sqlite3.DatabaseError):
+        r.apply(tmp_path, CUTOFF, lambda _: True)
+    assert old.exists() and database.read_bytes() == before
+
+
+def test_commit_failure_before_unlink(tmp_path, monkeypatch):
+    old = payload(tmp_path)
+    real_commit = r.Ledger.commit
+    calls = 0
+
+    def refuse(self):
+        nonlocal calls
+        calls += 1
+        if calls == 2:  # schema committed; expiry batch commit is refused
+            raise sqlite3.OperationalError("simulated disk full")
+        return real_commit(self)
+
+    monkeypatch.setattr(r.Ledger, "commit", refuse)
+    with pytest.raises(sqlite3.OperationalError, match="disk full"):
+        r.apply(tmp_path, CUTOFF, lambda _: True)
+    assert old.exists()
+
+
+def test_metadata_fsync_failure_prevents_unlink(tmp_path, monkeypatch):
+    old = payload(tmp_path)
+    real_journal = r.Ledger.journal
+    real_fsync = os.fsync
+
+    def journal(self, batch):
+        def refuse_metadata(fd):
+            if fd == self.fd:
+                raise OSError("metadata fsync refused")
+            return real_fsync(fd)
+        with monkeypatch.context() as m:
+            m.setattr(os, "fsync", refuse_metadata)
+            real_journal(self, batch)
+
+    monkeypatch.setattr(r.Ledger, "journal", journal)
+    with pytest.raises(OSError, match="fsync refused"):
+        r.apply(tmp_path, CUTOFF, lambda _: True)
+    assert old.exists()
+
+
+def test_interrupted_commit_then_rerun_and_decline_pending(tmp_path, monkeypatch):
+    old = payload(tmp_path)
+
+    def crash(*args):
+        raise RuntimeError("interrupted after durable commit")
+
+    with monkeypatch.context() as m:
+        m.setattr(r, "_unlink", crash)
+        with pytest.raises(RuntimeError, match="interrupted"):
+            r.apply(tmp_path, CUTOFF, lambda _: True)
+    assert old.exists()
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.contains("ci-blob://session/old")
+        assert ledger.db.execute("SELECT pending FROM expiry").fetchone() == (1,)
+    with pytest.raises(r.RetentionError):
+        r.apply(tmp_path, CUTOFF, lambda _: False)
+    assert old.exists()
+    result = r.apply(tmp_path, CUTOFF, lambda _: True)
+    assert result.deleted == 1 and not old.exists()
+    assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 0
+
+
+@pytest.mark.parametrize("when", ["before_journal", "before_unlink"])
+def test_changed_fingerprint_retained(tmp_path, monkeypatch, when):
+    old = payload(tmp_path)
+    real_matches = r._matches
+    real_journal = r.Ledger.journal
+
+    def rewrite():
+        old.write_text('{"new": true}')
+        os.utime(old, ns=(CUTOFF + 1, CUTOFF + 1))
+
+    if when == "before_journal":
+        def matches(root, item):
+            rewrite()
+            return real_matches(root, item)
+        monkeypatch.setattr(r, "_matches", matches)
+    else:
+        def journal(self, batch):
+            real_journal(self, batch)
+            rewrite()
+        monkeypatch.setattr(r.Ledger, "journal", journal)
+    result = r.apply(tmp_path, CUTOFF, lambda _: True)
+    assert result.deleted == 0 and result.changed == 1
+    assert old.read_text() == '{"new": true}'
+
+
+def test_replaced_ancestor_detected_before_journal(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    old = payload(root)
+    original = r._matches
+
+    def moved(handle, item):
+        (root / "session").rename(tmp_path / "moved")
+        (root / "session").symlink_to(tmp_path / "moved", target_is_directory=True)
+        return original(handle, item)
+
+    monkeypatch.setattr(r, "_matches", moved)
+    with pytest.raises((OSError, r.RetentionError)):
+        r.apply(root, CUTOFF, lambda _: True)
+    assert (tmp_path / "moved" / "blobs" / old.name).exists()
+
+
+def test_lock_cross_process_alias_coordination_and_release(tmp_path):
+    payload(tmp_path)
+    alias = tmp_path.parent / (tmp_path.name + "-alias")
+    alias.symlink_to(tmp_path, target_is_directory=True)
+    with r.RootLock(tmp_path):
+        result = run_cli(alias, "--apply")
+        assert result.returncode != 0 and "busy" in result.stderr
+    with r.RootLock(alias, exclusive=True):
+        code = (
+            "import asyncio; from context_intelligence_server.blob_store import AsyncDiskBlobStore;"
+            f"asyncio.run(AsyncDiskBlobStore({str(tmp_path)!r}).write('session', 'new', {{}}))"
+        )
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+        assert result.returncode != 0 and "busy" in result.stderr
+    with r.RootLock(tmp_path, exclusive=True):
+        pass
+
+
+async def test_worker_lifespan_refusal_hold_shutdown_and_release(tmp_path, monkeypatch):
+    import context_intelligence_server.main as main
+    from types import SimpleNamespace
+    root = tmp_path / "root"
+    root.mkdir()
+    app = SimpleNamespace(state=SimpleNamespace(
+        settings=SimpleNamespace(blob_path=str(root), stateful_root=lambda: tmp_path / "state")
+    ))
+    entered = []
+
+    @contextlib.asynccontextmanager
+    async def fake_lifespan(app):
+        entered.append(True)
+        yield
+        with pytest.raises(r.RetentionError):
+            with r.RootLock(root, exclusive=True):
+                pass
+
+    monkeypatch.setattr(main, "_server_lifespan", fake_lifespan)
+    with r.RootLock(root, exclusive=True):
+        with pytest.raises(r.RetentionError):
+            async with main.lifespan(app):
+                pytest.fail("worker started during apply")
+    assert not entered
+    async with main.lifespan(app):
+        assert entered
+        result = run_cli(root, "--apply")
+        assert result.returncode != 0 and "busy" in result.stderr
+    with r.RootLock(root, exclusive=True):
+        pass
+
+
+async def test_cancelled_write_holds_lock_until_thread_exits(tmp_path, monkeypatch):
+    import context_intelligence_server.blob_store as module
+    store = AsyncDiskBlobStore(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    original = module.os.replace
+
+    def pause(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module.os, "replace", pause)
+    task = asyncio.create_task(store.write("session", "key", {}))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with pytest.raises(r.RetentionError):
+            with r.RootLock(tmp_path, exclusive=True):
+                pass
+    finally:
+        release.set()
+        # Poll a concrete lock condition rather than assuming the thread ended.
+        for _ in range(100):
+            try:
+                with r.RootLock(tmp_path, exclusive=True):
+                    break
+            except r.RetentionError:
+                await asyncio.sleep(0.01)
+        else:
+            pytest.fail("thread failed to release shared lock")
+
+
+def test_cli_default_preview_and_no_asgi_or_drivers(tmp_path):
+    old = payload(tmp_path)
+    result = run_cli(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "Eligible files: 1" in result.stdout
+    assert old.exists() and not (tmp_path / r.LOCK).exists()
+    code = f"""
+import sys
+from context_intelligence_server.cli import main
+main(['blobs', 'prune', '--blob-root', {str(tmp_path)!r}])
+assert not any(x in sys.modules for x in ['context_intelligence_server.main', 'neo4j', 'fastapi'])
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("answer", ["decline\n", "\x04", "prune\n"])
+def test_cli_real_interactive_confirmation(tmp_path, answer):
+    old = payload(tmp_path)
+    result = run_cli(tmp_path, "--apply", tty_input=answer)
+    if answer == "prune\n":
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not old.exists() and "deleted: 1" in result.stdout
+    else:
+        assert result.returncode != 0
+        assert old.exists() and not (tmp_path / r.METADATA).exists()
+
+
+def test_cli_noninteractive_and_no_yes_bypass(tmp_path):
+    old = payload(tmp_path)
+    result = run_cli(tmp_path, "--apply")
+    assert result.returncode != 0 and "interactive terminal" in result.stderr
+    result = run_cli(tmp_path, "--apply", "--yes")
+    assert result.returncode != 0 and "unrecognized arguments" in result.stderr
+    assert old.exists() and not (tmp_path / r.METADATA).exists()
+
+
+def test_cli_config_resolution_missing_explicit_config_and_root(tmp_path):
+    payload(tmp_path)
+    config = tmp_path / "server.yaml"
+    config.write_text(f"blob_path: {tmp_path}\n")
+    env = {**os.environ, "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE": str(config)}
+    result = subprocess.run([str(CLI), "blobs", "prune"], env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0 and f"Root: {tmp_path}" in result.stdout
+    env["AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH"] = str(tmp_path / "absent")
+    result = subprocess.run([str(CLI), "blobs", "prune"], env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0
+    env["AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE"] = str(tmp_path / "missing.yaml")
+    result = run_cli(tmp_path, env=env)
+    assert result.returncode != 0 and "config file does not exist" in result.stderr
+    assert not (tmp_path / "absent").exists()
+
+
+async def test_expired_read_dump_replay_restore_and_physical_listing(tmp_path):
+    from context_intelligence_server.blob_processor import process_event_data
+    store = AsyncDiskBlobStore(tmp_path)
+    data = {"raw": {"value": 1}}
+    await process_event_data(data, store, "session", "node")
+    uri = data["raw"]["$blob_ref"]
+    path = store.blob_path("session", "node__raw")
+    os.utime(path, ns=(CUTOFF - 1, CUTOFF - 1))
+    assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 1
+    for operation in [store.read(uri), store.dump(uri, tmp_path / "dump")]:
+        with pytest.raises(r.BlobExpiredError) as exc:
+            await operation
+        assert exc.value.uri == uri
+    data = {"raw": {"new": 2}}
+    await process_event_data(data, store, "session", "node")
+    assert data["raw"] == {"$blob_ref": uri} and not path.exists()
+    assert await store.list("session") == []
+    with pytest.raises(FileNotFoundError) as exc:
+        await store.read("ci-blob://session/never")
+    assert not isinstance(exc.value, r.BlobExpiredError)
+    path.write_text('{"restored": true}')
+    assert await store.read(uri) == {"restored": True}
+    dumped = await store.dump(uri, tmp_path / "dump")
+    assert Path(dumped).read_text() == path.read_text()
+    before = path.stat()
+    assert await store.write("session", "node__raw", {"overwrite": "no"}) == uri
+    assert path.stat().st_mtime_ns == before.st_mtime_ns
+    assert await store.read(uri) == {"restored": True}
+    assert await store.list("session") == [uri]
+
+
+async def test_authenticated_http_410_vs_404_and_auth_unchanged(tmp_path, auth_client, monkeypatch):
+    import context_intelligence_server.main as main
+    from types import SimpleNamespace
+    monkeypatch.setattr(main, "_settings", SimpleNamespace(blob_path=str(tmp_path)))
+    payload(tmp_path)
+    r.apply(tmp_path, CUTOFF, lambda _: True)
+    response = await auth_client.get("/blobs/session/old")
+    assert response.status_code == 401
+    headers = {"Authorization": "Bearer test-secret"}
+    response = await auth_client.get("/blobs/session/old", headers=headers)
+    assert response.status_code == 410
+    assert response.json()["detail"] == {"code": "blob_expired", "uri": "ci-blob://session/old"}
+    assert (await auth_client.get("/blobs/session/unknown", headers=headers)).status_code == 404
+
+
+def test_unlink_partial_failure_is_honest_and_cli_nonzero(tmp_path, monkeypatch):
+    old = payload(tmp_path)
+    real_unlink = os.unlink
+
+    def refuse(name, *args, **kwargs):
+        if name == old.name:
+            raise PermissionError("unlink refused")
+        return real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", refuse)
+    report = r.apply(tmp_path, CUTOFF, lambda _: True)
+    assert report.deleted == 0 and report.errors == 1 and old.exists()
+    from context_intelligence_server import cli
+    monkeypatch.setattr(r, "apply", lambda *args: report)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["blobs", "prune", "--blob-root", str(tmp_path), "--apply"])
+    assert exc.value.code == 1
+
+
+def test_process_crash_retains_durable_record_then_cli_decline_and_resume(tmp_path):
+    old = payload(tmp_path)
+    code = f"""
+import os
+from context_intelligence_server import blob_retention as r
+r._unlink = lambda *args: os._exit(73)
+r.apply({str(tmp_path)!r}, {CUTOFF}, lambda _: True)
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=10)
+    assert result.returncode == 73 and old.exists()
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.contains("ci-blob://session/old")
+    result = run_cli(tmp_path, "--apply", tty_input="no\n")
+    assert result.returncode != 0 and old.exists()
+    result = run_cli(tmp_path, "--apply", tty_input="prune\n")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not old.exists() and "deleted: 1" in result.stdout
+
+
+async def test_physical_read_precedes_corrupt_ledger(tmp_path):
+    old = payload(tmp_path)
+    metadata = tmp_path / r.METADATA
+    metadata.mkdir(mode=0o700)
+    (metadata / r.DATABASE).write_bytes(b"corrupt")
+    store = AsyncDiskBlobStore(tmp_path)
+    assert await store.read("ci-blob://session/old") == {"value": 1}
+    assert Path(await store.dump("ci-blob://session/old", tmp_path / "dump")).read_bytes() == old.read_bytes()
+    with pytest.raises(sqlite3.DatabaseError):
+        await store.read("ci-blob://session/missing")
+
+
+async def test_standalone_operations_refuse_symlink_ancestor(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    old = payload(outside)
+    (root / "session").symlink_to(outside / "session", target_is_directory=True)
+    store = AsyncDiskBlobStore(root)
+    for operation in [
+        store.read("ci-blob://session/old"),
+        store.write("session", "old", {"overwrite": True}),
+        store.dump("ci-blob://session/old", root / "dump"),
+        store.list("session"),
+        store.size("ci-blob://session/old"),
+        store.delete_session("session"),
+    ]:
+        with pytest.raises(OSError):
+            await operation
+    assert old.read_text() == '{"value": 1}'
+
+
+def test_changed_apply_result_nonzero(tmp_path, monkeypatch):
+    from context_intelligence_server import cli
+    report = r.Report(str(tmp_path), CUTOFF, changed=1)
+    monkeypatch.setattr(r, "apply", lambda *args: report)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["blobs", "prune", "--blob-root", str(tmp_path), "--apply"])
+    assert exc.value.code == 1
+
+
+@pytest.mark.parametrize("reserved", [r.METADATA, r.LOCK])
+async def test_reserved_sessions_cannot_damage_lock_or_ledger(tmp_path, reserved):
+    old = payload(tmp_path)
+    r.apply(tmp_path, CUTOFF, lambda _: True)
+    database = tmp_path / r.METADATA / r.DATABASE
+    before = database.read_bytes()
+    store = AsyncDiskBlobStore(tmp_path)
+    for operation in [
+        store.write(reserved, "key", {}),
+        store.read(f"ci-blob://{reserved}/key"),
+        store.dump(f"ci-blob://{reserved}/key", tmp_path / "dump"),
+        store.list(reserved),
+        store.size(f"ci-blob://{reserved}/key"),
+        store.delete_session(reserved),
+    ]:
+        with pytest.raises(ValueError):
+            await operation
+    assert database.read_bytes() == before
+    assert await store.write("session", "old", {}) == "ci-blob://session/old"
+    assert not old.exists()
+
+
+@pytest.mark.parametrize("alias", ["same_directory", "directory_symlink", "hardlink", "file_symlink"])
+async def test_dump_never_truncates_source_alias(tmp_path, alias):
+    store = AsyncDiskBlobStore(tmp_path)
+    uri = await store.write("session", "key", {"payload": "preserve"})
+    path = store.blob_path("session", "key")
+    before = path.read_bytes()
+    dest_dir = tmp_path / "dump"
+    if alias == "same_directory":
+        dest_dir = path.parent
+    elif alias == "directory_symlink":
+        dest_dir.symlink_to(path.parent, target_is_directory=True)
+    else:
+        dest_dir.mkdir()
+        if alias == "hardlink":
+            os.link(path, dest_dir / path.name)
+        else:
+            (dest_dir / path.name).symlink_to(path)
+    with pytest.raises(OSError):
+        await store.dump(uri, dest_dir)
+    assert path.read_bytes() == before
+
+
+def test_hot_sqlite_journal_recovered_only_after_confirmation(tmp_path):
+    for i in range(512):
+        payload(tmp_path, str(i) + "x" * 180)
+    r.apply(tmp_path, 0, lambda _: True)  # durably initialize only the schema
+    code = f"""
+import os
+from context_intelligence_server import blob_retention as r
+original = r.Ledger.__enter__
+def small_cache(self):
+    result = original(self)
+    if self.db is not None:
+        self.db.execute("PRAGMA cache_size=1")
+    return result
+r.Ledger.__enter__ = small_cache
+r.Ledger.commit = lambda self: os._exit(73)
+r.apply({str(tmp_path)!r}, {CUTOFF}, lambda _: True)
+"""
+    child = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+    assert child.returncode == 73, child.stderr
+    journal = tmp_path / r.METADATA / (r.DATABASE + "-journal")
+    assert journal.stat().st_size > 0
+    before = {p.name: p.read_bytes() for p in journal.parent.iterdir()}
+    with pytest.raises(sqlite3.OperationalError) as exc:
+        r.preview(tmp_path, CUTOFF)
+    assert exc.value.sqlite_errorcode == sqlite3.SQLITE_READONLY_ROLLBACK
+    seen = []
+    with pytest.raises(r.RetentionError, match="not confirmed"):
+        r.apply(tmp_path, CUTOFF, lambda report: seen.append(report.recovery_required))
+    assert seen == [True]
+    assert {p.name: p.read_bytes() for p in journal.parent.iterdir()} == before
+    result = r.apply(tmp_path, CUTOFF, lambda _: True)
+    assert result.deleted == 512 and result.errors == 0
+    assert not journal.exists()

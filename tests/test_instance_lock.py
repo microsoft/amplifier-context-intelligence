@@ -100,7 +100,7 @@ async def test_direct_asgi_lifespan_refuses_second_server_and_releases(
 ) -> None:
     """Direct uvicorn/gunicorn ASGI loading cannot bypass the writer lock."""
     state_root = tmp_path / "state"
-    settings = SimpleNamespace(stateful_root=lambda: state_root)
+    settings = SimpleNamespace(stateful_root=lambda: state_root, blob_path=str(tmp_path / "blobs"))
     first, second = FastAPI(), FastAPI()
     first.state.settings = settings
     second.state.settings = settings
@@ -130,11 +130,13 @@ async def test_direct_asgi_lifespan_refuses_split_queue_roots_sharing_api_key_st
     key_map = {"a" * 64: {"id": "writer"}}
     first_settings = Settings(
         queues_path=str(first_root / "queues"),
+        blob_path=str(tmp_path / "blobs"),
         api_keys=key_map,
         api_keys_store_path=str(shared_store),
     )
     second_settings = Settings(
         queues_path=str(tmp_path / "second-state" / "queues"),
+        blob_path=str(tmp_path / "blobs"),
         api_keys=key_map,
         api_keys_store_path=str(shared_store),
     )

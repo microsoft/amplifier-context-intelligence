@@ -17,7 +17,6 @@ import pytest
 
 import context_intelligence_server.registry as registry_module
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
-from context_intelligence_server.config import get_settings
 from context_intelligence_server.queue_manager import QueueManager, Record
 from context_intelligence_server.registry import (
     CompletedSession,
@@ -260,7 +259,7 @@ class TestSessionWorkerHasServices:
         """worker.services.blob_store._root matches Settings.blob_path."""
         worker = registry.get_or_create("session-1", "/workspace/test")
 
-        settings = get_settings()
+        settings = registry_module.get_settings()
         blob_store = worker.services.blob_store
         assert isinstance(blob_store, AsyncDiskBlobStore)
         assert blob_store._root == Path(settings.blob_path)

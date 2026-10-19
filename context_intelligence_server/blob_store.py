@@ -16,10 +16,15 @@ import asyncio
 import json
 import os
 import shutil
+import stat
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
+from context_intelligence_server.blob_retention import (
+    BlobExpiredError, RootLock, component, expired, parse_uri,
+)
 _SCHEME = "ci-blob://"
 
 
@@ -116,22 +121,11 @@ class AsyncDiskBlobStore:
         Raises:
             ValueError: If *uri* is not a valid ``ci-blob://`` URI.
         """
-        if not uri.startswith(_SCHEME):
-            raise ValueError(
-                f"Invalid URI scheme — expected '{_SCHEME}...', got: {uri!r}"
-            )
-        remainder = uri[len(_SCHEME) :]
-        # remainder must be "<session_id>/<key>" — both parts non-empty
-        if "/" not in remainder:
-            raise ValueError(f"URI missing key component: {uri!r}")
-        session_id, _, key = remainder.partition("/")
-        if not session_id or not key:
-            raise ValueError(f"URI has empty session_id or key: {uri!r}")
-        return session_id, key
+        return parse_uri(uri)
 
     def _blob_path(self, session_id: str, key: str) -> Path:
         """Return the filesystem path for a given session/key blob."""
-        return self._root / session_id / "blobs" / f"{key}.json"
+        return self._root / component(session_id) / "blobs" / f"{component(key)}.json"
 
     # ------------------------------------------------------------------
     # Public accessors (mirror of internal helpers for external callers)
@@ -159,29 +153,34 @@ class AsyncDiskBlobStore:
         Returns:
             A ``ci-blob://<session_id>/<key>`` URI.
         """
-        path = self._blob_path(session_id, key)
+        self._blob_path(session_id, key)  # validate before touching storage
+        uri = self._make_uri(session_id, key)
 
         def _write() -> None:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            data = json.dumps(value)
-            tmp_fd, tmp_name = tempfile.mkstemp(
-                dir=str(path.parent), prefix=f"{key}.", suffix=".tmp"
-            )
-            try:
-                with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                    f.write(data)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp_name, path)
-            except BaseException:
-                try:
-                    os.unlink(tmp_name)
-                except FileNotFoundError:
-                    pass
-                raise
+            # The lock lives inside the thread: cancelling the awaiting task
+            # cannot release it while an atomic write is still in progress.
+            with RootLock(self._root, create_root=True) as lock:
+                if expired(lock.root, uri):
+                    return  # replay keeps the reference, never rehydrates
+                with lock.root.blobs(session_id, create=True) as fd:
+                    data = json.dumps(value)
+                    tmp_name = f"{key}.{uuid.uuid4().hex}.tmp"
+                    tmp_fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+                    try:
+                        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                            f.write(data)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(tmp_name, f"{key}.json", src_dir_fd=fd, dst_dir_fd=fd)
+                    except BaseException:
+                        try:
+                            os.unlink(tmp_name, dir_fd=fd)
+                        except FileNotFoundError:
+                            pass
+                        raise
 
         await asyncio.to_thread(_write)
-        return self._make_uri(session_id, key)
+        return uri
 
     async def read(self, uri: str) -> dict[str, Any] | list[Any]:
         """Return the blob addressed by *uri*.
@@ -198,13 +197,17 @@ class AsyncDiskBlobStore:
         path = self._blob_path(session_id, key)
 
         def _read() -> dict[str, Any] | list[Any]:
-            try:
-                return cast(
-                    dict[str, Any] | list[Any],
-                    json.loads(path.read_text(encoding="utf-8")),
-                )
-            except FileNotFoundError:
-                raise FileNotFoundError(f"Blob not found: {uri!r} (path: {path})")
+            with RootLock(self._root, create_root=True) as lock:
+                try:
+                    with lock.root.blobs(session_id) as fd:
+                        file_fd = os.open(f"{key}.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                        with os.fdopen(file_fd, "r", encoding="utf-8") as f:
+                            self._check_payload(f.fileno())
+                            return cast(dict[str, Any] | list[Any], json.load(f))
+                except FileNotFoundError:
+                    if expired(lock.root, uri):
+                        raise BlobExpiredError(uri)
+                    raise FileNotFoundError(f"Blob not found: {uri!r} (path: {path})")
 
         return await asyncio.to_thread(_read)
 
@@ -213,26 +216,35 @@ class AsyncDiskBlobStore:
 
         Returns an empty list if the session directory does not exist.
         """
-        blobs_dir = self._root / session_id / "blobs"
+        component(session_id)
 
         def _list() -> list[str]:
-            if not blobs_dir.exists():
-                return []
-            keys = sorted(p.stem for p in blobs_dir.glob("*.json"))
-            return [self._make_uri(session_id, key) for key in keys]
+            with RootLock(self._root, create_root=True) as lock:
+                try:
+                    with lock.root.blobs(session_id) as fd, os.scandir(fd) as entries:
+                        keys = sorted(
+                            component(e.name[:-5]) for e in entries
+                            if e.name.endswith(".json") and e.is_file(follow_symlinks=False)
+                        )
+                        return [self._make_uri(session_id, key) for key in keys]
+                except FileNotFoundError:
+                    return []
 
         return await asyncio.to_thread(_list)
 
     async def size(self, uri: str) -> int:
         """Return the byte size of the blob addressed by *uri*, or 0 if missing."""
         session_id, key = self._parse_uri(uri)
-        path = self._blob_path(session_id, key)
-
         def _size() -> int:
-            try:
-                return path.stat().st_size
-            except FileNotFoundError:
-                return 0
+            with RootLock(self._root, create_root=True) as lock:
+                try:
+                    with lock.root.blobs(session_id) as fd:
+                        st = os.stat(f"{key}.json", dir_fd=fd, follow_symlinks=False)
+                        if not stat.S_ISREG(st.st_mode):
+                            raise ValueError("Unsafe blob payload")
+                        return st.st_size
+                except FileNotFoundError:
+                    return 0
 
         return await asyncio.to_thread(_size)
 
@@ -242,15 +254,17 @@ class AsyncDiskBlobStore:
         Removes ``<root>/<session_id>/``. Idempotent: a session with no
         stored blobs returns 0 and is not an error.
         """
-        session_dir = self._root / session_id
-        blobs_dir = session_dir / "blobs"
+        component(session_id)
 
         def _delete() -> int:
-            if not blobs_dir.exists():
-                return 0
-            count = sum(1 for _ in blobs_dir.glob("*.json"))
-            shutil.rmtree(session_dir)
-            return count
+            with RootLock(self._root, create_root=True) as lock:
+                try:
+                    with lock.root.blobs(session_id) as fd, os.scandir(fd) as entries:
+                        count = sum(1 for e in entries if e.name.endswith(".json") and e.is_file(follow_symlinks=False))
+                    shutil.rmtree(session_id, dir_fd=lock.root.fd)
+                    return count
+                except FileNotFoundError:
+                    return 0
 
         return await asyncio.to_thread(_delete)
 
@@ -270,7 +284,7 @@ class AsyncDiskBlobStore:
             FileNotFoundError: If no blob exists at the resolved path.
         """
         session_id, key = self._parse_uri(uri)
-        src = self._blob_path(session_id, key)
+        self._blob_path(session_id, key)
 
         if dest_dir is None:
             dest_dir_path = Path(tempfile.gettempdir()) / "ci-blobs"
@@ -278,9 +292,35 @@ class AsyncDiskBlobStore:
             dest_dir_path = Path(dest_dir)
 
         def _copy() -> str:
-            if not src.exists():
-                raise FileNotFoundError(f"Blob not found: {uri!r}")
-            dest_dir_path.mkdir(parents=True, exist_ok=True)
-            return str(shutil.copy2(src, dest_dir_path))
+            with RootLock(self._root, create_root=True) as lock:
+                try:
+                    with lock.root.blobs(session_id) as fd:
+                        file_fd = os.open(f"{key}.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                        with os.fdopen(file_fd, "rb") as src:
+                            self._check_payload(src.fileno())
+                            st = os.fstat(src.fileno())
+                            dest_dir_path.mkdir(parents=True, exist_ok=True)
+                            dest = dest_dir_path / f"{key}.json"
+                            # Do not truncate the source if destination is its
+                            # own directory, a symlink alias, or a hardlink.
+                            dest_fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+                            with os.fdopen(dest_fd, "wb") as out:
+                                self._check_payload(out.fileno())
+                                dst = os.fstat(out.fileno())
+                                if (dst.st_dev, dst.st_ino) == (st.st_dev, st.st_ino):
+                                    raise shutil.SameFileError("Blob dump destination is the source payload")
+                                os.ftruncate(out.fileno(), 0)
+                                shutil.copyfileobj(src, out)
+                            os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns))
+                            return str(dest)
+                except FileNotFoundError:
+                    if expired(lock.root, uri):
+                        raise BlobExpiredError(uri)
+                    raise FileNotFoundError(f"Blob not found: {uri!r}")
 
         return await asyncio.to_thread(_copy)
+
+    @staticmethod
+    def _check_payload(fd: int) -> None:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("Unsafe blob payload: not a regular file")
