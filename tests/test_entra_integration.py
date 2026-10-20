@@ -1,13 +1,13 @@
 """T8: Entra-mode integration tests over real HTTP (httpx → asgi_app).
 
-Proves the full auth chain end-to-end without network or real Entra.
-Uses an in-test RSA keypair + stub JWKS client (same pattern as
-test_entra_resolver.py).
+Exercises application policy through the authenticated ASGI wrapper using an
+explicit opaque-token validator. This tier does not prove token authenticity;
+genuine SDK rejection tests belong to test_mise_validation.py.
 
 Coverage:
   AC2/AC9 — valid entra JWT → 202, created_by stamped as mapped contributor
   AC4      — unmapped oid  → 403 HTTP response
-  AC3      — expired / garbage / missing bearer → 401 HTTP response
+  AC3      — validator denial / unknown / missing bearer → 401 HTTP response
   Exempt   — /status passes through without a token
   Regression — existing static auth_client path unbroken
 """
@@ -15,13 +15,15 @@ Coverage:
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
+
+from tests.conftest import ApplicationTokenValidator
 
 # ---------------------------------------------------------------------------
 # Fake constants — NEVER real app-reg ids / oids / tenant ids (§0.3)
@@ -31,73 +33,22 @@ FAKE_TENANT_ID = "ffffeeee-dddd-cccc-bbbb-aaaa99998888"
 FAKE_OID_MAPPED = "11111111-2222-3333-4444-555566667777"  # in identity map
 FAKE_OID_UNMAPPED = "22222222-3333-4444-5555-666677778888"  # NOT in identity map
 FAKE_CONTRIBUTOR = "colombod"
-FAKE_ISSUER = f"https://login.microsoftonline.com/{FAKE_TENANT_ID}/v2.0"
 
 
 # ---------------------------------------------------------------------------
-# Stub JWKS client helpers (mirrors test_entra_resolver.py — no network)
+# Validated application claims
 # ---------------------------------------------------------------------------
-
-
-class _StubSigningKey:
-    """Mimics ``PyJWKClient.get_signing_key_from_jwt(token).key``."""
-
-    def __init__(self, key: Any) -> None:
-        self.key = key
-
-
-class _StubJWKSClient:
-    """JWKS client stub: fetch_data is a no-op; always returns a fixed key."""
-
-    def __init__(self, key: Any) -> None:
-        self._key = _StubSigningKey(key)
-
-    def fetch_data(self) -> None:
-        pass  # eager-prefetch no-op
-
-    def get_signing_key_from_jwt(self, token: str) -> _StubSigningKey:
-        return self._key
-
-    def get_jwk_set(self) -> Any:
-        _k = self._key
-
-        class _FakeJWKSet:
-            keys = [_k]
-
-        return _FakeJWKSet()
-
-
-# ---------------------------------------------------------------------------
-# JWT helpers
-# ---------------------------------------------------------------------------
-
-
-def _sign_jwt(private_key: Any, claims: dict[str, Any]) -> str:
-    """Sign a JWT with the given RSA private key (RS256)."""
-    import jwt as pyjwt  # noqa: PLC0415
-
-    return pyjwt.encode(claims, private_key, algorithm="RS256")
 
 
 def _valid_entra_claims(
     oid: str = FAKE_OID_MAPPED,
-    aud: str | list[str] | None = None,
-    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Return a minimal valid claims dict for integration tests."""
-    now = int(time.time())
-    claims: dict[str, Any] = {
+    """Return claims already accepted by the application validator."""
+    return {
         "oid": oid,
         "tid": FAKE_TENANT_ID,
         "scp": "access_as_user",
-        "aud": aud if aud is not None else FAKE_CLIENT_ID,
-        "iss": FAKE_ISSUER,
-        "exp": now + 3600,
-        "iat": now - 10,
     }
-    if extra:
-        claims.update(extra)
-    return claims
 
 
 # ---------------------------------------------------------------------------
@@ -105,23 +56,14 @@ def _valid_entra_claims(
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
-def rsa_keypair_module() -> tuple[Any, Any]:
-    """Generate a 2048-bit RSA keypair once per module (expensive)."""
-    from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: PLC0415
-
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_key = private_key.public_key()
-    return private_key, public_key
-
-
 @pytest.fixture
 async def entra_auth_client(
-    rsa_keypair_module: tuple[Any, Any],
+    application_validator: ApplicationTokenValidator,
+    tmp_path: Path,
 ) -> AsyncGenerator[httpx.AsyncClient, None]:
     """httpx client backed by a fresh create_asgi_app(auth_mode=entra) instance.
 
-    Uses an in-test RSA keypair + stub JWKS client — no network, no real Entra.
+    Uses explicit validator injection — no SDK, network, or real Entra.
     The identity map binds FAKE_OID_MAPPED → FAKE_CONTRIBUTOR ("colombod").
 
     The fixture creates a *new* BearerTokenMiddleware wrapping the existing
@@ -131,8 +73,6 @@ async def entra_auth_client(
     from context_intelligence_server.config import Settings  # noqa: PLC0415
     from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
-    _, public_key = rsa_keypair_module
-
     entra_settings = Settings(
         auth_mode="entra",
         azure_client_id=FAKE_CLIENT_ID,
@@ -140,11 +80,13 @@ async def entra_auth_client(
         entra_identities={
             FAKE_OID_MAPPED: {"id": FAKE_CONTRIBUTOR},
         },
+        entra_identities_store_path=str(tmp_path / "entra-identities.json"),
+        api_keys_store_path=str(tmp_path / "api-keys.json"),
     )
 
     entra_asgi = create_asgi_app(
         settings=entra_settings,
-        _jwks_client=_StubJWKSClient(public_key),
+        _token_validator=application_validator,
     )
 
     async with httpx.AsyncClient(
@@ -173,10 +115,10 @@ class TestEntraAuthIntegrationOverHTTP:
     async def test_valid_token_stamps_created_by_as_mapped_contributor(
         self,
         entra_auth_client: httpx.AsyncClient,
-        rsa_keypair_module: tuple[Any, Any],
+        application_validator: ApplicationTokenValidator,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """AC2/AC9: valid entra JWT with mapped oid → 202, created_by='colombod'.
+        """AC2/AC9: accepted claims with mapped oid → 202, created_by='colombod'.
 
         Proves the full chain end-to-end:
           Bearer token → BearerTokenMiddleware → EntraResolver → contributor_id
@@ -187,8 +129,7 @@ class TestEntraAuthIntegrationOverHTTP:
         """
         import context_intelligence_server.main as main_module  # noqa: PLC0415
 
-        private_key, _ = rsa_keypair_module
-        token = _sign_jwt(private_key, _valid_entra_claims())
+        token = application_validator.issue(_valid_entra_claims())
 
         # Intercept durable-queue append to capture the stamped bytes.
         captured: list[bytes] = []
@@ -228,6 +169,7 @@ class TestEntraAuthIntegrationOverHTTP:
             f"created_by should be {FAKE_CONTRIBUTOR!r}, "
             f"got {body_obj.get('created_by')!r}"
         )
+        assert application_validator.calls == [(token, "http://test/events", "POST")]
 
     # ------------------------------------------------------------------
     # AC4: unmapped oid → 403 over real HTTP
@@ -236,16 +178,14 @@ class TestEntraAuthIntegrationOverHTTP:
     async def test_unmapped_oid_returns_403_over_http(
         self,
         entra_auth_client: httpx.AsyncClient,
-        rsa_keypair_module: tuple[Any, Any],
+        application_validator: ApplicationTokenValidator,
     ) -> None:
-        """AC4: valid JWT whose oid is NOT in entra_identities → HTTP 403.
+        """AC4: accepted claims whose oid is NOT in entra_identities → HTTP 403.
 
-        bearer_identity_unbound path: token passes crypto validation but the oid
+        bearer_identity_unbound path: validator accepts the handle but the oid
         has no entry in the identity map → 403 (not 401, not 200, not 500).
         """
-        private_key, _ = rsa_keypair_module
-        # Sign a perfectly valid JWT — only the oid is not in the identity map.
-        token = _sign_jwt(private_key, _valid_entra_claims(oid=FAKE_OID_UNMAPPED))
+        token = application_validator.issue(_valid_entra_claims(oid=FAKE_OID_UNMAPPED))
 
         response = await entra_auth_client.post(
             "/events",
@@ -265,18 +205,14 @@ class TestEntraAuthIntegrationOverHTTP:
     # AC3: invalid tokens → 401 over real HTTP (three distinct paths)
     # ------------------------------------------------------------------
 
-    async def test_expired_token_returns_401_over_http(
+    async def test_validator_denied_token_returns_401_over_http(
         self,
         entra_auth_client: httpx.AsyncClient,
-        rsa_keypair_module: tuple[Any, Any],
+        application_validator: ApplicationTokenValidator,
     ) -> None:
-        """AC3 (real-crypto): expired JWT (exp in the past) → HTTP 401."""
-        private_key, _ = rsa_keypair_module
-        now = int(time.time())
-        expired_claims = _valid_entra_claims(
-            extra={"exp": now - 3600, "iat": now - 7200}
-        )
-        token = _sign_jwt(private_key, expired_claims)
+        """Validator denial → HTTP 401; no expiry checks are faked here."""
+        token = application_validator.issue(_valid_entra_claims())
+        application_validator.reject(token)
 
         response = await entra_auth_client.post(
             "/events",
@@ -288,7 +224,7 @@ class TestEntraAuthIntegrationOverHTTP:
             headers={"Authorization": f"Bearer {token}"},
         )
         assert response.status_code == 401, (
-            f"Expected 401 for expired token, got {response.status_code}: "
+            f"Expected 401 for validator denial, got {response.status_code}: "
             f"{response.text}"
         )
 
@@ -296,7 +232,7 @@ class TestEntraAuthIntegrationOverHTTP:
         self,
         entra_auth_client: httpx.AsyncClient,
     ) -> None:
-        """Garbage bearer (not a JWT) → HTTP 401."""
+        """Unknown opaque bearer → HTTP 401."""
         response = await entra_auth_client.post(
             "/events",
             json={

@@ -22,6 +22,8 @@ import httpx
 import pytest
 from gunicorn.app.base import BaseApplication
 
+from tests.conftest import ApplicationTokenValidator
+
 if TYPE_CHECKING:
     from context_intelligence_server.config import Settings
 
@@ -29,34 +31,6 @@ if TYPE_CHECKING:
 FAKE_CLIENT_ID = "aaaabbbb-1111-2222-3333-ccccddddeeee"
 FAKE_TENANT_ID = "ffffeeee-dddd-cccc-bbbb-aaaa99998888"
 FAKE_OID_1 = "11111111-2222-3333-4444-555566667777"
-
-
-# ---------------------------------------------------------------------------
-# Stub JWKS client — no network, construction-time only
-# ---------------------------------------------------------------------------
-
-
-class _StubSigningKey:
-    """Mimics PyJWKClient.get_signing_key_from_jwt(token).key."""
-
-    def __init__(self, key: Any) -> None:
-        self.key = key
-
-
-class _StubJWKSClient:
-    """Stub JWKS client: fetch_data no-op; get_jwk_set returns a non-empty set."""
-
-    def fetch_data(self) -> None:  # noqa: D401
-        pass
-
-    def get_signing_key_from_jwt(self, token: str) -> _StubSigningKey:
-        raise NotImplementedError("Not needed in construction-time tests")
-
-    def get_jwk_set(self) -> Any:
-        class _FakeJWKSet:
-            keys = [object()]  # non-empty — passes the empty-JWKS startup guard
-
-        return _FakeJWKSet()
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +54,9 @@ class TestAuthEnabledProperty:
 
         assert StaticKeyResolver({}).auth_enabled is False
 
-    def test_entra_resolver_auth_enabled_always_true(self) -> None:
+    def test_entra_resolver_auth_enabled_always_true(
+        self, application_validator: ApplicationTokenValidator
+    ) -> None:
         """EntraResolver.auth_enabled is always True — Entra mode is always active."""
         from context_intelligence_server.auth import EntraResolver  # noqa: PLC0415
 
@@ -88,7 +64,7 @@ class TestAuthEnabledProperty:
             FAKE_CLIENT_ID,
             FAKE_TENANT_ID,
             {FAKE_OID_1.lower(): "colombod"},
-            jwks_client=_StubJWKSClient(),
+            validator=application_validator,
         )
         assert resolver.auth_enabled is True
 
@@ -206,7 +182,9 @@ class TestCreateAsgiAppWire:
         )
         assert wrapped.resolver.auth_enabled is True
 
-    def test_entra_mode_builds_entra_resolver(self) -> None:
+    def test_entra_mode_builds_entra_resolver(
+        self, application_validator: ApplicationTokenValidator
+    ) -> None:
         """auth_mode=entra + valid config + stub JWKS → create_asgi_app() returns EntraResolver."""
         from context_intelligence_server.auth import EntraResolver  # noqa: PLC0415
         from context_intelligence_server.config import Settings  # noqa: PLC0415
@@ -218,7 +196,9 @@ class TestCreateAsgiAppWire:
             azure_tenant_id=FAKE_TENANT_ID,
             entra_identities={FAKE_OID_1: {"id": "colombod"}},
         )
-        wrapped = create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+        wrapped = create_asgi_app(
+            settings=settings, _token_validator=application_validator
+        )
 
         assert isinstance(wrapped.resolver, EntraResolver), (
             "auth_mode=entra must wire an EntraResolver"
