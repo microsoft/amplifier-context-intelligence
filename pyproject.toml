@@ -23,7 +23,7 @@ dependencies = [
     "neo4j>=5.0",
     "aiofiles>=24.0.0",
     "pyyaml>=6.0",
-    "pyjwt[crypto]>=2.8.0",
+    "cffi>=1.16.0",
 ]
 
 [project.scripts]

@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 # Runtime base: Microsoft Azure Linux 3.0 (CBL-Mariner). Continuously patched by
 # MS with a fix-only security feed, so a build-time `tdnf update` clears reported
 # CRITICAL/HIGH without suppression lists. Also matches the AzureLinux 3.0 AKS
@@ -29,18 +31,23 @@ FROM mcr.microsoft.com/azurelinux/base/python:3.12
 # day rather than per build: the first build of the day absorbs the day's patches
 # (~+2 min) and every later build that day reuses the refreshed layer.
 ARG OS_PATCH_EPOCH
-RUN tdnf -y update && tdnf -y install ca-certificates curl && tdnf -y clean all
+RUN tdnf -y update && tdnf -y install ca-certificates curl icu && tdnf -y clean all
 
 WORKDIR /app
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-COPY pyproject.toml .
+COPY pyproject.toml requirements-mise.txt .
 COPY context_intelligence_server/ context_intelligence_server/
 COPY docker-entrypoint.sh .
 RUN chmod +x docker-entrypoint.sh
 
-RUN uv pip install --system --no-cache .
+RUN --mount=type=secret,id=cfs_config,target=/run/secrets/cfs.toml,required=true,mode=0400 \
+    --mount=type=secret,id=cfs_token,env=UV_INDEX_CFS_PASSWORD,required=true \
+    UV_INDEX_CFS_USERNAME=cfs uv --config-file /run/secrets/cfs.toml pip install --system --no-cache . && \
+    UV_INDEX_CFS_USERNAME=cfs uv --config-file /run/secrets/cfs.toml pip install --system --no-cache \
+        --no-deps --require-hashes --only-binary=:all: -r requirements-mise.txt && \
+    python3 -c "from importlib.metadata import version; from mise import Mise; assert version('mise') == '2.7.0'; Mise()"
 
 # security: the Azure Linux base ships EOL Python packaging tools (pip/setuptools/
 # wheel) that Qualys SCA (S360) flags. In-place upgrades don't clear the findings
@@ -53,7 +60,9 @@ RUN uv pip install --system --no-cache .
 #   wheel — removed: QID  5007163 (CVE-2026-24049)
 #   setuptools>=79 — patched pkg_resources + vendored jaraco.context: QID 5006986
 #                    (CVE-2026-23949)
-RUN tdnf -y remove python3-pip python3-setuptools python3-wheel && \
+RUN --mount=type=secret,id=cfs_config,target=/run/secrets/cfs.toml,required=true,mode=0400 \
+    --mount=type=secret,id=cfs_token,env=UV_INDEX_CFS_PASSWORD,required=true \
+    tdnf -y remove python3-pip python3-setuptools python3-wheel && \
     rm -rf /usr/lib/python3.12/site-packages/pip \
            /usr/lib/python3.12/site-packages/pip-*.dist-info \
            /usr/lib/python3.12/site-packages/setuptools \
@@ -63,7 +72,7 @@ RUN tdnf -y remove python3-pip python3-setuptools python3-wheel && \
            /usr/lib/python3.12/site-packages/distutils-precedence.pth \
            /usr/lib/python3.12/site-packages/wheel \
            /usr/lib/python3.12/site-packages/wheel-*.dist-info && \
-    uv pip install --system --no-cache "setuptools>=79" && \
+    UV_INDEX_CFS_USERNAME=cfs uv --config-file /run/secrets/cfs.toml pip install --system --no-cache "setuptools>=79" && \
     tdnf -y clean all
 
 EXPOSE 8000
