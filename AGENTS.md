@@ -264,8 +264,8 @@ isolated environment with the Neo4j container cut off from the internet.
 ### Manual blob retention safety
 
 `context-intelligence-server blobs prune --older-than 30d` previews storage-mtime
-expiry; `--apply` requires a terminal and explicit `prune` confirmation. No
-automatic scheduling or service restart. Stop old unpatched writers through the
+expiry; `--apply` requires a terminal and explicit `prune` confirmation. The
+manual command never schedules or restarts services. Stop old unpatched writers through the
 service manager before apply: they do not honor the new shared/exclusive
 `root/.ci-blob-retention.lock`. Never unlink that lock or the private expiry
 ledger. Upgraded workers hold the shared root lock across their entire lifespan;
@@ -289,6 +289,18 @@ rows in memory, not SQL-filtered full scans. Confirmed snapshots checkpoint befo
 deletion; unfinished restart jobs are interrupted, NEVER auto-resumed. Shutdown
 must finish maintenance and drainers/real I/O before releasing external exclusion.
 Tests: `uv run pytest tests/test_online_retention.py tests/test_retention_client.py -q`.
+
+Nightly scheduling is an explicit online-only client opt-in:
+`blobs prune-scheduled --online --older-than 30d --server-url URL --admin-key-file PATH`.
+`--dry-run` previews then cancels only its owned UUID; busy manual jobs are skipped.
+Keep the runner in `retention_scheduler.py`, with the CLI as a thin wrapper.
+Freeze validated identity, start once, check clean confirmed completion, and
+cancel/observe owned work on deadline or interruption; never cancel "current".
+Preserve sanitized JSON receipts, finite work/cleanup budgets, scoped SIGTERM
+handling, and the interactive command's TTY/no-`--yes` guard. No server/schema
+changes, scheduler auto-install, or ingestion stop/restart hooks. User-unit setup:
+`docs/service-setup.md` → "Nightly online pruning — explicit unattended opt-in".
+Tests: `uv run pytest tests/test_retention_scheduler.py tests/test_retention_client.py -q`.
 
 ### Temporal properties are `ZONED DATETIME`
 

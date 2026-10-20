@@ -29,11 +29,23 @@ def main(argv: list[str] | None = None) -> None:
     status.add_argument("job_id", nargs="?")
     cancel = commands.add_parser("prune-cancel", help="Request online cancellation after the active durable batch.")
     cancel.add_argument("job_id")
+    scheduled = commands.add_parser("prune-scheduled", help="Unattended online-only prune with bounded cancellation.")
+    scheduled.add_argument("--online", action="store_true", required=True)
+    scheduled.add_argument("--older-than", required=True)
+    scheduled.add_argument("--server-url", required=True)
+    scheduled.add_argument("--admin-key-file", type=Path)
+    scheduled.add_argument("--dry-run", action="store_true", help="Preview and cancel without starting deletion.")
+    scheduled.add_argument("--max-runtime", type=float, default=3600)
+    scheduled.add_argument("--cancel-timeout", type=float, default=120)
     for command in (prune, status, cancel):
         command.add_argument("--online", action="store_true", help="Use the running server's configured blob root.")
         command.add_argument("--server-url", help="Server base URL; remote credentials require HTTPS.")
         command.add_argument("--admin-key-file", type=Path, help="Private same-owner 0600/0400 raw admin token file.")
     args = parser.parse_args(argv[1:])
+
+    if args.command == "prune-scheduled":
+        _scheduled(args)
+        return
 
     try:
         if args.online:
@@ -72,6 +84,48 @@ def main(argv: list[str] | None = None) -> None:
     except (OSError, ValueError, retention.RetentionError, sqlite3.Error) as exc:
         print(f"Blob prune failed: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
+
+
+def _scheduled(args) -> None:
+    import json
+    import signal
+    from dataclasses import asdict
+
+    from context_intelligence_server.retention_client import RetentionClient, admin_credential, server_url
+    from context_intelligence_server.retention_scheduler import (
+        ScheduledResult, ScheduledTermination, _pacific_now, run_scheduled,
+    )
+
+    previous = signal.getsignal(signal.SIGTERM)
+    terminated = False
+
+    def terminate(signum, frame):
+        nonlocal terminated
+        if not terminated:
+            terminated = True
+            raise ScheduledTermination()
+
+    result = ScheduledResult()
+    try:
+        signal.signal(signal.SIGTERM, terminate)
+        server_url(args.server_url)  # Refuse insecure transport before reading credentials.
+        client = RetentionClient(args.server_url, admin_credential(args.admin_key_file))
+        result = run_scheduled(
+            client, older_than=args.older_than, dry_run=args.dry_run,
+            max_runtime=args.max_runtime, cancel_timeout=args.cancel_timeout,
+        )
+    except ScheduledTermination:
+        result.error_code, result.exit_code = "sigterm", 143
+    except KeyboardInterrupt:
+        result.error_code, result.exit_code = "interrupted", 130
+    except Exception:
+        # Exception strings may contain key-file paths, URLs or server text.
+        result.error_code = "client_setup_failed"
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        result.ended_at = _pacific_now()
+    print(json.dumps(asdict(result), sort_keys=True), flush=True)
+    raise SystemExit(result.exit_code)
 
 
 def _online(args) -> None:

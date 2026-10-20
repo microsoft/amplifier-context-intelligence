@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
+import http.client
+import io
 import ipaddress
 import json
 import os
+import socket
 import stat
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from functools import partial
 from pathlib import Path
 
 
 class ClientError(RuntimeError):
-    pass
+    def __init__(self, *args, status_code: int | None = None):
+        super().__init__(*args)
+        self.status_code = status_code
 
 
 def server_url(value: str) -> str:
@@ -74,13 +80,123 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise ClientError("Admin request redirect refused")
 
 
+def _remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError()
+    return remaining
+
+
+def _connect(address, timeout, source_address, *, deadline):
+    # urllib's default socket.create_connection grants the full timeout to EACH
+    # resolved address. Share one remaining budget across all address attempts.
+    # getaddrinfo is an OS resolver call, not bounded by Python's socket timeout.
+    _remaining(deadline)
+    addresses = socket.getaddrinfo(*address, 0, socket.SOCK_STREAM)
+    error = None
+    for family, kind, protocol, _, sockaddr in addresses:
+        left = _remaining(deadline)
+        sock = None
+        try:
+            sock = socket.socket(family, kind, protocol)
+            sock.settimeout(left)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            if sock is not None:
+                sock.close()
+            error = exc
+    raise error or OSError("No server addresses")
+
+
+class _BudgetReader(io.RawIOBase):
+    """Check the total request budget at every raw read, including headers.
+
+    A socket inactivity timeout alone permits an indefinitely trickling peer.
+    Buffered HTTP parsing must therefore sit ABOVE this raw budget boundary.
+    """
+
+    def __init__(self, sock, deadline):
+        self.sock, self.deadline = sock, deadline
+        self.raw = sock.makefile("rb", buffering=0)
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self.sock.settimeout(_remaining(self.deadline))
+        return self.raw.readinto(buffer)
+
+    def close(self):
+        try:
+            self.raw.close()
+        finally:
+            super().close()
+
+
+class _BudgetSocket:
+    def __init__(self, sock, deadline):
+        self.sock, self.deadline = sock, deadline
+
+    def __getattr__(self, name):
+        return getattr(self.sock, name)
+
+    def makefile(self, mode, buffering=None):
+        if mode != "rb":
+            raise ValueError("Unexpected HTTP stream mode")
+        return io.BufferedReader(_BudgetReader(self.sock, self.deadline))
+
+    def sendall(self, data, *args):
+        self.sock.settimeout(_remaining(self.deadline))
+        return self.sock.sendall(data, *args)
+
+
+class _BudgetConnection:
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.deadline = time.monotonic() + self.timeout
+        self._create_connection = partial(_connect, deadline=self.deadline)
+
+    def connect(self):
+        super().connect()
+        self.sock = _BudgetSocket(self.sock, self.deadline)
+
+
+class _HTTPConnection(_BudgetConnection, http.client.HTTPConnection):
+    pass
+
+
+class _HTTPSConnection(_BudgetConnection, http.client.HTTPSConnection):
+    def connect(self):
+        # Refresh the remaining budget between TCP connect and TLS handshake.
+        # No proxies/tunnels are enabled for these credential-bearing requests.
+        http.client.HTTPConnection.connect(self)
+        self.sock.settimeout(_remaining(self.deadline))
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+        self.sock = _BudgetSocket(self.sock, self.deadline)
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, request):
+        return self.do_open(_HTTPConnection, request)
+
+
+class _HTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, request):
+        return self.do_open(_HTTPSConnection, request, context=self._context)
+
+
 class RetentionClient:
     def __init__(self, url: str, credential: str, *, timeout: float = 10):
         self.url = server_url(url)
         self._credential = credential
         self.timeout = timeout
         # Never inherit ambient proxy settings for an admin credential.
-        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirect(), _HTTPHandler(), _HTTPSHandler(),
+        )
 
     @staticmethod
     def _id(job_id: str) -> str:
@@ -107,7 +223,10 @@ class RetentionClient:
             return result
         except urllib.error.HTTPError as exc:
             exc.close()
-            raise ClientError(f"Admin request failed (HTTP {exc.code}); verify admin authority and current job status") from None
+            raise ClientError(
+                f"Admin request failed (HTTP {exc.code}); verify admin authority and current job status",
+                status_code=exc.code,
+            ) from None
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             raise ClientError(f"Admin request failed ({type(exc).__name__}); remote job may still be running; query prune-status") from None
 

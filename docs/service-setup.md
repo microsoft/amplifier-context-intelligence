@@ -100,8 +100,135 @@ preserve expiry durability. On restart, an unfinished confirmed snapshot becomes
 new preview to recover eligible pending records. Shutdown rejects new jobs,
 finishes an admitted batch, quiesces drainers, waits for actual filesystem
 operations/maintenance-thread exit, and only then releases the lifetime flock.
-No scheduler, automatic prune, service restart, graph/session deletion, or queue
-cleanup is added.
+The online API does not schedule itself or restart ingestion. Graph/session and
+queue state are never pruned. Nightly scheduling is a separate, explicit opt-in
+client command described below.
+
+### Nightly online pruning — explicit unattended opt-in
+
+`blobs prune-scheduled` is the **only unattended apply command**. Existing
+`blobs prune --apply` still requires a real terminal and exact confirmation;
+neither command accepts `--yes`. The scheduled command requires explicit
+`--online`, `--older-than`, and `--server-url`; it cannot select a blob root or
+adopt a job id. It uses the existing online API and credential resolver, not local
+storage access. No server upgrade/restart is needed when that API is installed.
+
+1. **Install a reviewed, pinned client in its own environment.** Replace
+   `<reviewed-client-commit-sha>` with the full reviewed commit, not a branch.
+   Keep this client separate from the ingestion server's installed environment.
+
+   ```bash
+   CLIENT_SHA='<reviewed-client-commit-sha>'
+   uv venv "$HOME/.local/share/ci-retention-client"
+   uv pip install --python "$HOME/.local/share/ci-retention-client/bin/python" \
+     "git+https://github.com/microsoft/amplifier-context-intelligence@${CLIENT_SHA}"
+   ```
+
+2. **Check the exact command with `--dry-run`.** Use an **existing** dedicated
+   admin file (same-owner, regular, mode `0600`/`0400`), not a data key. The file
+   path is safe in argv; the raw credential must never appear there. Substitute
+   your server URL and private file path consistently in the command and unit.
+
+   ```bash
+   "$HOME/.local/share/ci-retention-client/bin/context-intelligence-server" \
+     blobs prune-scheduled --online --older-than 30d \
+     --server-url http://127.0.0.1:8100 \
+     --admin-key-file "$HOME/.config/context-intelligence/retention-admin.key" \
+     --dry-run --max-runtime 3600 --cancel-timeout 120
+   ```
+
+   Dry-run creates a preview, records its estimate, then explicitly cancels **its
+   own** preview and waits for `cancelled`. It never starts deletion or leaves a
+   ready preview intentionally blocking the next night. A pre-existing manual
+   preview/job is skipped, never cancelled or replaced.
+
+3. **Create a user oneshot and timer.** Put this in
+   `~/.config/systemd/user/ci-blob-prune.service`:
+
+   ```ini
+   [Unit]
+   Description=Nightly online blob retention client
+
+   [Service]
+   Type=oneshot
+   ExecStart=%h/.local/share/ci-retention-client/bin/context-intelligence-server blobs prune-scheduled --online --older-than 30d --server-url http://127.0.0.1:8100 --admin-key-file %h/.config/context-intelligence/retention-admin.key --max-runtime 3600 --cancel-timeout 120
+   Restart=no
+   UMask=0077
+   TimeoutStartSec=65min
+   TimeoutStopSec=150s
+   StandardOutput=journal
+   StandardError=journal
+   ```
+
+   Put this in `~/.config/systemd/user/ci-blob-prune.timer`:
+
+   ```ini
+   [Unit]
+   Description=Daily blob retention at 03:00 Pacific
+
+   [Timer]
+   OnCalendar=*-*-* 03:00:00 America/Los_Angeles
+   Persistent=false
+   RandomizedDelaySec=0
+   AccuracySec=1min
+   Unit=ci-blob-prune.service
+
+   [Install]
+   WantedBy=timers.target
+   ```
+
+   There are deliberately no ingestion `Wants`/`Requires`, stop/restart hooks,
+   credential values, or retry policies. systemd's default stop signal is
+   SIGTERM. One service unit cannot overlap itself; the server busy guard also
+   prevents overlapping manual or other-client jobs.
+
+4. **Enable only the timer, after a successful dry-run.** Do **not** start/enable
+   the service to test setup: that would apply retention immediately.
+
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user enable --now ci-blob-prune.timer
+   systemctl --user list-timers ci-blob-prune.timer
+   journalctl --user -u ci-blob-prune.service -n 10 --no-pager
+   ```
+
+   An unattended user timer needs the user's service manager running, usually
+   through an already-authorized linger configuration. The timer follows local
+   Pacific daylight-saving changes. Missed runs are **not caught up** after
+   downtime (`Persistent=false`). Busy skips and failures have no immediate
+   automatic retries; the next opportunity is the next scheduled day.
+
+Each invocation emits one sanitized JSON receipt to stdout (also the journal):
+outcome, exit code, owned UUID, last validated state, confirmation, frozen cutoff,
+counts, cleanup state, fixed error code, and Pacific-offset start/end timestamps.
+No credential, root path, sample URI, or remote error body is printed. Exit zero
+means clean `completed`, observed `dry_run` cancellation, or `skipped_busy`.
+Errors/changed candidates, expired or malformed previews, and failed/interrupted
+jobs are nonzero. HTTP 202 alone never means success.
+
+The client creates at most one preview and starts only that UUID, once. A lost
+start reply is reconciled against that same UUID, never retried. Work has a
+one-hour monotonic budget; timeout, SIGINT, SIGTERM, or monitoring failure requests
+explicit cancellation of the owned job and observes for at most another 120
+seconds. An already admitted durable batch may finish. `cancelling` is **not**
+`cancelled`; `cancel_unconfirmed` is nonzero and retains the owned UUID for
+inspection with `prune-status`/`prune-cancel`. Completion observed after a deadline
+does not turn the failed scheduled run into success.
+
+Each network connect/read uses the remaining request budget, including all
+resolved addresses and trickling HTTP headers/bodies. Python's OS hostname
+resolver (`getaddrinfo`) is not bounded by a socket timeout; a stuck resolver can
+delay the next deadline check. Prefer the numeric loopback URL above for a local
+timer. The service-manager timeouts are the outer process limit; forced
+termination still cannot guarantee remote cancellation.
+
+Stopping/disabling the **timer** only prevents future starts. To stop an active
+client use `systemctl --user stop ci-blob-prune.service`; it sends SIGTERM so the
+client can cancel its owned server job. Stopping the client or timer is not
+itself a server-side job cancellation. SIGKILL, host loss, or network loss can
+prevent cancellation; use a separate explicit `blobs prune-cancel --online
+JOB_UUID` with the same URL/admin credential when needed. Stopping/restarting
+ingestion is a separate service-manager action and is never part of this timer.
 
 ### Offline: maintenance window required
 
@@ -182,7 +309,8 @@ An absent unrecorded URI remains `404`; authentication is unchanged. Replay keep
 the canonical URI successfully without recreating or refreshing tombstoned
 payloads. Physically restored payloads remain readable, but this command supplies
 no restore feature. Existing blob readers fail loudly on `410`; retention adds
-no capture changes, automatic scheduling, or deployment.
+no capture changes or deployment. Scheduling requires the separate explicit
+online-only opt-in above.
 
 ---
 
