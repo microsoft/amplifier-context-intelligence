@@ -165,11 +165,16 @@ class TestBearerTokenMiddlewareResolvesViaResolver:
                 return True
 
             def resolve(
-                self, token: str, *, admin_path: bool = False
+                self,
+                token: str,
+                *,
+                original_uri: str,
+                original_method: str,
+                admin_path: bool = False,
             ) -> tuple[str, list[str], bool] | None:
                 # M2: resolve() now returns (contributor_id, roles, is_service) 3-tuple.
                 # admin_path is accepted for Protocol compatibility (unused here).
-                _ = admin_path
+                _ = admin_path, original_uri, original_method
                 calls.append(token)
                 return ("tracked-user", [], False)
 

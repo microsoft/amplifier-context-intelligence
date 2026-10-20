@@ -39,6 +39,8 @@ from typing import Any
 
 import pytest
 
+from tests.conftest import ApplicationTokenValidator
+
 # ---------------------------------------------------------------------------
 # Fake constants — NEVER real credentials / GUIDs
 # ---------------------------------------------------------------------------
@@ -59,36 +61,6 @@ FAKE_NEW_CONTRIBUTOR = "carol"
 
 FAKE_NEW_OID = "99999999-8888-7777-6666-555544443333"
 FAKE_NEW_CONTRIBUTOR_ENTRA = "david"
-
-
-# ---------------------------------------------------------------------------
-# JWKS stub — no network; satisfies EntraResolver's eager prefetch guard
-# ---------------------------------------------------------------------------
-
-
-class _StubSigningKey:
-    """Mimics PyJWKClient.get_signing_key_from_jwt(token).key."""
-
-    def __init__(self, key: Any = "dummy-key") -> None:
-        self.key = key
-
-
-class _StubJWKSClient:
-    """JWKS client stub: fetch_data is a no-op; returns one non-empty key set."""
-
-    def fetch_data(self) -> None:
-        pass  # satisfies eager-prefetch guard
-
-    def get_signing_key_from_jwt(self, token: str) -> _StubSigningKey:
-        raise NotImplementedError("Identity-map wire tests do not call resolve()")
-
-    def get_jwk_set(self) -> Any:
-        """Return a non-empty JWK set — satisfies the empty-JWKS startup guard."""
-
-        class _FakeJWKSet:
-            keys = [_StubSigningKey()]
-
-        return _FakeJWKSet()
 
 
 # ===========================================================================
@@ -323,7 +295,11 @@ class TestT3StaticWiring:
 
         # The resolver itself can resolve the seeded token (T5: returns tuple)
         middleware = create_asgi_app(settings=settings)
-        result = middleware.resolver.resolve(FAKE_RAW_TOKEN)
+        result = middleware.resolver.resolve(
+            FAKE_RAW_TOKEN,
+            original_uri="http://test/events",
+            original_method="POST",
+        )
         assert result is not None and result[0] == FAKE_CONTRIBUTOR
 
     def test_store_wins_when_file_present(self, tmp_path: Path) -> None:
@@ -369,14 +345,25 @@ class TestT3StaticWiring:
         assert store is not None
 
         # At this point the new token is NOT resolvable
-        assert middleware.resolver.resolve(FAKE_NEW_RAW_TOKEN) is None
+        assert (
+            middleware.resolver.resolve(
+                FAKE_NEW_RAW_TOKEN,
+                original_uri="http://test/events",
+                original_method="POST",
+            )
+            is None
+        )
 
         # Mutate the store: add the new token
         store.put(FAKE_NEW_DIGEST, {"id": FAKE_NEW_CONTRIBUTOR})
 
         # The resolver sees it immediately — no create_asgi_app call, no restart
         # T5 protocol change: resolve() returns (contributor_id, roles) tuple.
-        new_result = middleware.resolver.resolve(FAKE_NEW_RAW_TOKEN)
+        new_result = middleware.resolver.resolve(
+            FAKE_NEW_RAW_TOKEN,
+            original_uri="http://test/events",
+            original_method="POST",
+        )
         assert new_result is not None and new_result[0] == FAKE_NEW_CONTRIBUTOR
 
     def test_resolver_keystore_is_store_flat_dict(self, tmp_path: Path) -> None:
@@ -423,7 +410,7 @@ class TestT3EntraWiring:
             get_entra_identity_store,
         )
 
-        create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+        create_asgi_app(settings=settings, _token_validator=ApplicationTokenValidator())
         store = get_entra_identity_store()
 
         assert store is not None
@@ -444,7 +431,7 @@ class TestT3EntraWiring:
             get_entra_identity_store,
         )
 
-        create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+        create_asgi_app(settings=settings, _token_validator=ApplicationTokenValidator())
         store = get_entra_identity_store()
 
         assert store is not None
@@ -460,6 +447,8 @@ class TestT3EntraWiring:
         We verify via the resolver's internal dict rather than calling resolve() (which
         requires a valid JWT) — the wiring is the same: flat_dict IS _identity_map.
         """
+        from context_intelligence_server.auth import EntraResolver
+
         settings = _make_entra_settings(tmp_path)
 
         from context_intelligence_server.main import (  # noqa: PLC0415
@@ -467,7 +456,10 @@ class TestT3EntraWiring:
             get_entra_identity_store,
         )
 
-        middleware = create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+        middleware = create_asgi_app(
+            settings=settings, _token_validator=ApplicationTokenValidator()
+        )
+        assert isinstance(middleware.resolver, EntraResolver)
         store = get_entra_identity_store()
         assert store is not None
 
@@ -492,7 +484,9 @@ class TestT3EntraWiring:
             get_entra_identity_store,
         )
 
-        middleware = create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+        middleware = create_asgi_app(
+            settings=settings, _token_validator=ApplicationTokenValidator()
+        )
         store = get_entra_identity_store()
         assert store is not None
 
@@ -527,7 +521,9 @@ class TestT3EntraWiring:
             api_keys_store_path=str(tmp_path / "api-keys.json"),
         )
 
-        middleware = create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+        middleware = create_asgi_app(
+            settings=settings, _token_validator=ApplicationTokenValidator()
+        )
         store = get_entra_identity_store()
         assert store is not None
 
@@ -581,7 +577,9 @@ class TestIgnoredServiceIdentitiesWarning:
         settings = self._settings(tmp_path, store_path)
 
         with caplog.at_level("WARNING", logger="context_intelligence_server.main"):
-            create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+            create_asgi_app(
+                settings=settings, _token_validator=ApplicationTokenValidator()
+            )
 
         warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
         matching = [m for m in warnings if "service_identities config lists" in m]
@@ -605,7 +603,9 @@ class TestIgnoredServiceIdentitiesWarning:
         settings = self._settings(tmp_path, store_path)
 
         with caplog.at_level("WARNING", logger="context_intelligence_server.main"):
-            create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+            create_asgi_app(
+                settings=settings, _token_validator=ApplicationTokenValidator()
+            )
 
         warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
         assert not [m for m in warnings if "service_identities config lists" in m]
@@ -645,7 +645,7 @@ class TestT3Accessors:
         )
 
         settings = _make_entra_settings(tmp_path)
-        create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+        create_asgi_app(settings=settings, _token_validator=ApplicationTokenValidator())
 
         assert get_api_key_store() is None
 
@@ -658,7 +658,7 @@ class TestT3Accessors:
         )
 
         settings = _make_entra_settings(tmp_path)
-        create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+        create_asgi_app(settings=settings, _token_validator=ApplicationTokenValidator())
 
         store = get_entra_identity_store()
         assert store is not None

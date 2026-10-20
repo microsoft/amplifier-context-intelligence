@@ -19,8 +19,9 @@ Auth in these tests
 * **Static mode**: real admin key (``admin_api_key``) recognised by the middleware
   as ``is_admin=True``; a seed data key is the pre-existing valid credential;
   the new test key starts unregistered.
-* **Entra mode**: real RS256 JWTs minted with an in-test RSA keypair + stub JWKS
-  client.  Admin token carries ``roles=[\"IdentityAdmin\"]`` AND has an OID in the
+* **Entra mode**: opaque handles issued by an explicit application validator
+  (not evidence of cryptographic authenticity). Admin claims carry
+  ``roles=[\"IdentityAdmin\"]`` AND have an OID in the
   identity map (required by the middleware).  New user token has an OID that is
   NOT in the identity map initially.
 
@@ -47,6 +48,8 @@ from unittest.mock import MagicMock
 
 import httpx
 import pytest
+
+from tests.conftest import ApplicationTokenValidator
 
 # ---------------------------------------------------------------------------
 # Fake constants  (NEVER real credentials, OIDs, or keys — §0.3 of design doc)
@@ -108,66 +111,18 @@ def _event(session_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# RSA keypair fixture — module scope (generated once per module for speed)
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="module")
-def rsa_keypair_e2e() -> tuple[Any, Any]:
-    """Generate a 2048-bit RSA keypair for entra JWT signing (expensive; done once)."""
-    from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: PLC0415
-
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_key = private_key.public_key()
-    return private_key, public_key
-
-
-# ---------------------------------------------------------------------------
-# JWKS stub — no network
-# ---------------------------------------------------------------------------
-
-
-class _StubSigningKey:
-    def __init__(self, key: Any) -> None:
-        self.key = key
-
-
-class _StubJWKSClient:
-    """JWKS stub: fetch_data is a no-op; always returns the in-test RSA public key."""
-
-    def __init__(self, public_key: Any) -> None:
-        self._key = _StubSigningKey(public_key)
-
-    def fetch_data(self) -> None:
-        pass
-
-    def get_signing_key_from_jwt(self, token: str) -> _StubSigningKey:
-        return self._key
-
-    def get_jwk_set(self) -> Any:
-        _k = self._key
-
-        class _FakeJWKSet:
-            keys = [_k]
-
-        return _FakeJWKSet()
-
-
-# ---------------------------------------------------------------------------
-# JWT minting helper
+# Opaque-token helper
 # ---------------------------------------------------------------------------
 
 
 def _mint_entra_token(
-    private_key: Any,
+    validator: ApplicationTokenValidator,
     *,
     oid: str,
     roles: list[str] | None = None,
     scp: str = "access_as_user",
 ) -> str:
-    """Sign a minimal RS256 JWT for use in entra-mode e2e tests."""
-    import jwt as pyjwt  # noqa: PLC0415
-
+    """Issue a handle for already-validated claims used by application policy."""
     now = int(time.time())
     claims: dict[str, Any] = {
         "oid": oid,
@@ -180,7 +135,7 @@ def _mint_entra_token(
     }
     if roles is not None:
         claims["roles"] = roles
-    return pyjwt.encode(claims, private_key, algorithm="RS256")
+    return validator.issue(claims)
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +365,7 @@ class TestEntraModeOnboardOffboard:
     Proof 3: add a new OID at runtime → accepted immediately.
     Proof 4: delete an OID at runtime → rejected immediately.
     Both proofs run against a SINGLE ``create_asgi_app()`` instance.
-    Real RS256 JWTs + stub JWKS; no ``require_admin`` override.
+    Explicit application validator; no ``require_admin`` override.
 
     ``created_by`` is observed via queue-capture (no Neo4j needed).
     """
@@ -419,7 +374,7 @@ class TestEntraModeOnboardOffboard:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        rsa_keypair_e2e: tuple[Any, Any],
+        application_validator: ApplicationTokenValidator,
     ) -> None:
         """Proof 3 (entra): register a new OID at runtime → immediately accepted.
 
@@ -434,21 +389,22 @@ class TestEntraModeOnboardOffboard:
         """
         from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
-        private_key, public_key = rsa_keypair_e2e
         captured: list[bytes] = []
 
         settings = _entra_settings(tmp_path)
         middleware = create_asgi_app(
-            settings=settings, _jwks_client=_StubJWKSClient(public_key)
+            settings=settings, _token_validator=application_validator
         )
         _install_queue_capture(monkeypatch, captured)
 
         # Admin: seeded OID (in map) + IdentityAdmin role → passes middleware + require_admin.
         # New user: FAKE_OID_NEW (NOT in map yet) + no roles.
         admin_token = _mint_entra_token(
-            private_key, oid=FAKE_OID_SEED, roles=[IDENTITY_ADMIN_ROLE]
+            application_validator, oid=FAKE_OID_SEED, roles=[IDENTITY_ADMIN_ROLE]
         )
-        new_user_token = _mint_entra_token(private_key, oid=FAKE_OID_NEW, roles=None)
+        new_user_token = _mint_entra_token(
+            application_validator, oid=FAKE_OID_NEW, roles=None
+        )
 
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=middleware), base_url="http://test"
@@ -500,7 +456,7 @@ class TestEntraModeOnboardOffboard:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        rsa_keypair_e2e: tuple[Any, Any],
+        application_validator: ApplicationTokenValidator,
     ) -> None:
         """Proof 4 (entra): delete an OID at runtime → rejected immediately.
 
@@ -516,21 +472,22 @@ class TestEntraModeOnboardOffboard:
         """
         from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
-        private_key, public_key = rsa_keypair_e2e
         captured: list[bytes] = []
 
         settings = _entra_settings(tmp_path)
         middleware = create_asgi_app(
-            settings=settings, _jwks_client=_StubJWKSClient(public_key)
+            settings=settings, _token_validator=application_validator
         )
         _install_queue_capture(monkeypatch, captured)
 
         # Admin token carries IdentityAdmin role (for the DELETE).
         # Data token for the same OID (no role — proving data auth, not admin).
         admin_token = _mint_entra_token(
-            private_key, oid=FAKE_OID_SEED, roles=[IDENTITY_ADMIN_ROLE]
+            application_validator, oid=FAKE_OID_SEED, roles=[IDENTITY_ADMIN_ROLE]
         )
-        seed_user_token = _mint_entra_token(private_key, oid=FAKE_OID_SEED, roles=None)
+        seed_user_token = _mint_entra_token(
+            application_validator, oid=FAKE_OID_SEED, roles=None
+        )
 
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=middleware), base_url="http://test"
@@ -631,15 +588,14 @@ class TestNegativeMatrix:
     # ── Entra mode ────────────────────────────────────────────────────────────
 
     async def test_entra_no_token_401_on_admin_identities(
-        self, tmp_path: Path, rsa_keypair_e2e: tuple[Any, Any]
+        self, tmp_path: Path, application_validator: ApplicationTokenValidator
     ) -> None:
         """No Authorization header → 401 on GET /admin/identities (entra mode)."""
         from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
-        _, public_key = rsa_keypair_e2e
         middleware = create_asgi_app(
             settings=_entra_settings(tmp_path),
-            _jwks_client=_StubJWKSClient(public_key),
+            _token_validator=application_validator,
         )
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=middleware), base_url="http://test"
@@ -650,18 +606,19 @@ class TestNegativeMatrix:
         )
 
     async def test_entra_non_admin_token_403_on_admin_identities(
-        self, tmp_path: Path, rsa_keypair_e2e: tuple[Any, Any]
+        self, tmp_path: Path, application_validator: ApplicationTokenValidator
     ) -> None:
         """Valid entra token WITHOUT IdentityAdmin role → 403 on GET /admin/identities."""
         from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
-        private_key, public_key = rsa_keypair_e2e
         middleware = create_asgi_app(
             settings=_entra_settings(tmp_path),
-            _jwks_client=_StubJWKSClient(public_key),
+            _token_validator=application_validator,
         )
         # Seeded OID is in the map (passes middleware), but no roles (fails require_admin).
-        non_admin_token = _mint_entra_token(private_key, oid=FAKE_OID_SEED, roles=[])
+        non_admin_token = _mint_entra_token(
+            application_validator, oid=FAKE_OID_SEED, roles=[]
+        )
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=middleware), base_url="http://test"
         ) as c:
@@ -674,18 +631,17 @@ class TestNegativeMatrix:
         )
 
     async def test_entra_wrong_mode_503_on_admin_keys(
-        self, tmp_path: Path, rsa_keypair_e2e: tuple[Any, Any]
+        self, tmp_path: Path, application_validator: ApplicationTokenValidator
     ) -> None:
         """Entra mode: /admin/keys/* → 503 (api-key store not active)."""
         from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
-        private_key, public_key = rsa_keypair_e2e
         middleware = create_asgi_app(
             settings=_entra_settings(tmp_path),
-            _jwks_client=_StubJWKSClient(public_key),
+            _token_validator=application_validator,
         )
         admin_token = _mint_entra_token(
-            private_key, oid=FAKE_OID_SEED, roles=[IDENTITY_ADMIN_ROLE]
+            application_validator, oid=FAKE_OID_SEED, roles=[IDENTITY_ADMIN_ROLE]
         )
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=middleware), base_url="http://test"

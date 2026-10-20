@@ -27,12 +27,12 @@ provenance field. Two authentication modes exist, selected by the single
 | `auth_mode` | Credential | What the server checks |
 |---|---|---|
 | `static` (default) | Pre-shared bearer tokens | `sha256(token)` looked up in the `api_keys` keystore → contributor id |
-| `entra` | Microsoft Entra JWT | RS256 signature (via Entra JWKS) + audience/issuer/tenant/scope, then `oid` → contributor id |
+| `entra` | Microsoft Entra JWT | Genuine Microsoft MISE 2.7.0 authenticates the token; application tenant/scope/role policy and `oid` → contributor mapping follow |
 
 In **entra mode** the chain is:
 
 ```
-az access token  →  server validates the JWT  →  extracts the oid claim
+az access token  →  MISE validates authenticity  →  application checks subject claims
    →  oid → contributor (your entra_identities map)  →  created_by = <contributor>
 ```
 
@@ -45,6 +45,11 @@ for the full dual-path model. The two *auth modes* (`static`/`entra`) remain
 mutually exclusive — exactly one resolver is active at a time. Switching is a
 one-line config change (`auth_mode: static` → `auth_mode: entra`) plus the
 supporting fields below.
+
+Entra mode also requires the genuine internal Microsoft MISE **2.7.0** SDK and
+its Linux x86_64/ICU native prerequisites. The public PyPI package named `mise`
+is not that SDK and must never be substituted. Static-key and admin behavior
+are unchanged.
 
 All config is read by Pydantic Settings (`config.py`): **environment variables**
 (prefix `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_`) take precedence over the **YAML
@@ -65,8 +70,8 @@ config file**, which takes precedence over defaults.
 > than restating it.
 
 In entra mode the server authenticates **two kinds of token** along separate
-paths inside `EntraResolver.resolve()` (`auth.py`). After the shared JWT
-validation (signature / audience / issuer / `tid`, below), a single
+paths inside `EntraResolver.resolve()` (`auth.py`). After shared MISE authenticity
+validation (`mise_validation.py`) and the application's explicit `tid` check, a single
 **discriminator** picks the path from the token's `scp` and `idtyp` claims:
 
 | Token shape | Path | How it is authorized | `created_by` |
@@ -138,17 +143,23 @@ against.
   *value* (`access_as_user`) or, via the SDK, the resource's **`/.default`** form
   (see below). The GUID is plumbing; it never appears in client code or in this doc.
 
-**What the server checks** (every claim below is enforced in `EntraResolver`,
-`auth.py`):
+**Authenticity boundary and configuration.** `MiseTokenValidator` in
+`mise_validation.py` owns token authenticity. It configures one MISE client per
+worker from the existing `azure_client_id` and `azure_tenant_id` settings:
 
 | Check | Value (placeholder) | Code |
 |---|---|---|
-| Signature algorithm | **RS256** only (`alg=none`/HS256 rejected) | `algorithms=["RS256"]` |
-| Signing key | tenant **JWKS**, eager-fetched at startup | `PyJWKClient(.../<AZURE_TENANT_ID>/discovery/v2.0/keys)` |
-| Audience (`aud`) | one of `<AZURE_CLIENT_ID>` **or** `api://<AZURE_CLIENT_ID>` | `audience=[client_id, "api://"+client_id]` |
-| Issuer (`iss`) | `https://login.microsoftonline.com/<AZURE_TENANT_ID>/v2.0` | `issuer=...` |
-| Tenant (`tid`) | must equal `<AZURE_TENANT_ID>` (explicit, defense-in-depth) | `claims["tid"] == tenant_id` |
-| Required claims | `exp`, `iss`, `aud` must be present | `options={"require": ["exp","iss","aud"]}` |
+| Token authenticity | Signature, issuer, and lifetime validation belong to genuine MISE; only a successful result is accepted | `MiseTokenValidator.validate()`, status **200** |
+| Authority | Microsoft Entra, configured tenant | `AzureAd.Instance = "https://login.microsoftonline.com/"`, `TenantId = tenant_id` |
+| Audience (`aud`) | one of `<AZURE_CLIENT_ID>` **or** `api://<AZURE_CLIENT_ID>` | `AzureAd.Audiences = [client_id, "api://"+client_id]` |
+| Tenant (`tid`) | configured tenant only, plus an explicit application check (defense-in-depth) | `AzureAd.ValidTenantIds = [tenant_id]`; `EntraResolver`: `claims.get("tid") == tenant_id` |
+| Token kinds | User and app access tokens | `AzureAd.Protocols.Bearer.TokenTypes.AccessToken`: `UserToken` / `AppToken` |
+| Claims source | Copy successful **subject** claims before the native result is released; never use actor claims for identity | `MiseTokenValidator.validate()` |
+
+The application does not decode the JWT or maintain a separate signature/key
+validator. It passes the bearer and original URI/method derived from the inbound
+ASGI scope to MISE, not caller-supplied forwarding headers. No new auth settings
+or application-side algorithm/issuer overrides are introduced.
 
 The next checks are **path-specific** — selected by the `scp`/`idtyp`
 discriminator (see the model table above):
@@ -257,7 +268,12 @@ resolves:**
 
 ## 2. Operator guide — configure `auth_mode=entra`
 
-**Goal:** zero to a protected server in under 30 minutes.
+**Prerequisite:** Entra mode needs the genuine SDK and native runtime described
+above; the ordinary public project lock does not install MISE. The existing Azure
+Linux production image acquires the private SDK through **CFS only**, using
+required **BuildKit secrets**, without public fallback or persisted feed
+credentials. Acquisition is a protected-main operation, not a PR check; see
+[verification tiers](#5-verification-tiers) for current external blockers.
 
 ### 2.1 Required settings
 
@@ -362,9 +378,12 @@ supported **bootstrap** state (see §2.5.1).
 **`azure_client_id` and `azure_tenant_id` are still REQUIRED** in `auth_mode=entra`.
 Their absence is a hard startup error.
 
-**On success:** the server starts normally and entra auth is active. (No special
-log line — a clean boot means the validators passed. If the effective identity map
-is empty, the server logs a loud bootstrap WARNING; see §2.5.1.)
+**On success:** the server config passes validation and the Entra resolver
+constructs/configures MISE once for the worker. A missing SDK, native-load failure,
+or nonzero configuration result refuses startup with a sanitized
+`MISE initialization failed` error; there is no fallback validator. A clean boot
+is not positive live-token proof. If the effective identity map is empty, the
+server logs the bootstrap WARNING in §2.5.1.
 
 **On misconfiguration**, the server raises and exits with one of these (the message
 names both the env var and the YAML key):
@@ -580,17 +599,18 @@ graph.
   manually correct the already-written `created_by` values in the graph (a data
   operation — there is no automatic backfill).
 
-### 4.2 JWKS / signing-key rotation
+### 4.2 MISE initialization and token validation
 
-The server validates token signatures against Entra's published signing keys
-(JWKS), fetched once **eagerly at startup** (a server with an unreachable JWKS
-endpoint **refuses to start** — fail-closed) and cached thereafter (`PyJWKClient`,
-~5-minute lifespan). Entra rotates signing keys roughly **every 6 weeks**.
+MISE owns token authenticity and signing-key handling. There is no
+application-managed key prefetch or fixed five-minute cache/restart recovery
+contract. Initialization/configuration is eager and fail-closed; it is not
+evidence of a network key fetch or successful live-token validation.
 
-- If a wave of **401s** appears immediately after a key rotation, the cache is
-  briefly stale. **Wait one cache cycle (~5 min) or restart once, cleanly.**
-- **Do not** restart repeatedly in a tight loop — that hammers the JWKS endpoint and
-  doesn't speed recovery. One clean restart refreshes the keys.
+Each authenticated request validates again. A MISE rejection or adapter/native
+failure becomes a sanitized **401**, never cached authorization or a fallback
+validator. Only a successful MISE result supplies claims to the existing Entra
+tenant/scope/role/identity-map policy. The adapter does not return or log native
+diagnostics or raw bearers.
 
 ### 4.3 Reading auth logs
 
@@ -633,16 +653,56 @@ legibly instead of as a bare `Invalid isoformat string: ''`.
 
 ---
 
+## 5. Verification tiers
+
+- **Credential-free application tests:** explicit opaque-token validators test
+  Entra authorization, HTTP status dispatch, live-map onboarding/offboarding,
+  static/admin behavior, and `created_by`. Adapter doubles separately exercise
+  configuration, result ownership, and sanitized failures. Neither proves
+  genuine SDK token authenticity.
+
+  ```bash
+  uv sync --locked --dev
+  uv run --locked pytest tests/ -q -m "not neo4j and not integration and not mise"
+  uv run --locked pytest tests/test_mise_validation.py -q -m "not mise"
+  ```
+
+- **Genuine Linux MISE/native tier:** only with the approved internal MISE 2.7.0
+  distribution installed on Linux x86_64 with ICU:
+
+  ```bash
+  uv run --no-sync pytest tests/test_mise_validation.py -q -m mise
+  ```
+
+  Missing prerequisites fail rather than skip. This test proves native
+  initialization/configuration and malformed-token rejection, not acceptance of
+  a live Entra token. The protected-main production image gate likewise fails
+  closed before deployment on acquisition/native-smoke failure; its presence is
+  not evidence of a successful CFS image build.
+- **Positive live-token/deployed proof:** requires authorized deployment traffic
+  and telemetry for the actual service. Application fakes, native malformed-token
+  rejection, and PR checks do not establish this proof or S360 clearance.
+
+**Current external blockers:** protected production CFS identity/feed/federation
+configuration is not provisioned; compliant ordinary-PR feed authentication does
+not exist under current OIDC policy (ordinary PR OIDC is prohibited). Ordinary PR
+checks therefore remain credential-free and exclude genuine `mise`; do not
+substitute a public package or temporary credentials.
+
+---
+
 ## Reference — accurate to the code
 
 - Config fields & validators: `context_intelligence_server/config.py`
   (`auth_mode`, `azure_client_id`, `azure_tenant_id`, `entra_identities`,
   `service_identities`, `service_data_role`, `reader_role`, `entra_admin_role`,
   `allow_unauthenticated`, `build_identity_map()`, `build_service_identity_map()`).
-- JWT validation: `context_intelligence_server/auth.py` (`EntraResolver`) — RS256
-  pinned, audience `[<client_id>, api://<client_id>]`, issuer
-  `https://login.microsoftonline.com/<tenant_id>/v2.0`, explicit `tid`; then the
-  **dual-path discriminator** on `scp`/`idtyp`:
+- Token authenticity: `context_intelligence_server/mise_validation.py`
+  (`MiseTokenValidator`) — genuine MISE 2.7.0 with the configured tenant and
+  audiences `[<client_id>, api://<client_id>]`; only successful subject claims
+  cross this boundary.
+- Entra policy: `context_intelligence_server/auth.py` (`EntraResolver`) —
+  explicit `tid`, then the **dual-path discriminator** on `scp`/`idtyp`:
   - **User** (`scp` present): `scp` must contain `access_as_user`, `oid` →
     contributor; **403** when the `oid` is unbound.
   - **Service** (`scp` absent): `roles` must contain `Contributor`/`Reader`/

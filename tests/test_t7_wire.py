@@ -15,42 +15,22 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
+import httpx
 import pytest
+from gunicorn.app.base import BaseApplication
+
+from tests.conftest import ApplicationTokenValidator
+
+if TYPE_CHECKING:
+    from context_intelligence_server.config import Settings
 
 # Fake constants — NEVER real app-reg IDs or oids (§0.3)
 FAKE_CLIENT_ID = "aaaabbbb-1111-2222-3333-ccccddddeeee"
 FAKE_TENANT_ID = "ffffeeee-dddd-cccc-bbbb-aaaa99998888"
 FAKE_OID_1 = "11111111-2222-3333-4444-555566667777"
-
-
-# ---------------------------------------------------------------------------
-# Stub JWKS client — no network, construction-time only
-# ---------------------------------------------------------------------------
-
-
-class _StubSigningKey:
-    """Mimics PyJWKClient.get_signing_key_from_jwt(token).key."""
-
-    def __init__(self, key: Any) -> None:
-        self.key = key
-
-
-class _StubJWKSClient:
-    """Stub JWKS client: fetch_data no-op; get_jwk_set returns a non-empty set."""
-
-    def fetch_data(self) -> None:  # noqa: D401
-        pass
-
-    def get_signing_key_from_jwt(self, token: str) -> _StubSigningKey:
-        raise NotImplementedError("Not needed in construction-time tests")
-
-    def get_jwk_set(self) -> Any:
-        class _FakeJWKSet:
-            keys = [object()]  # non-empty — passes the empty-JWKS startup guard
-
-        return _FakeJWKSet()
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +54,9 @@ class TestAuthEnabledProperty:
 
         assert StaticKeyResolver({}).auth_enabled is False
 
-    def test_entra_resolver_auth_enabled_always_true(self) -> None:
+    def test_entra_resolver_auth_enabled_always_true(
+        self, application_validator: ApplicationTokenValidator
+    ) -> None:
         """EntraResolver.auth_enabled is always True — Entra mode is always active."""
         from context_intelligence_server.auth import EntraResolver  # noqa: PLC0415
 
@@ -82,7 +64,7 @@ class TestAuthEnabledProperty:
             FAKE_CLIENT_ID,
             FAKE_TENANT_ID,
             {FAKE_OID_1.lower(): "colombod"},
-            jwks_client=_StubJWKSClient(),
+            validator=application_validator,
         )
         assert resolver.auth_enabled is True
 
@@ -200,7 +182,9 @@ class TestCreateAsgiAppWire:
         )
         assert wrapped.resolver.auth_enabled is True
 
-    def test_entra_mode_builds_entra_resolver(self) -> None:
+    def test_entra_mode_builds_entra_resolver(
+        self, application_validator: ApplicationTokenValidator
+    ) -> None:
         """auth_mode=entra + valid config + stub JWKS → create_asgi_app() returns EntraResolver."""
         from context_intelligence_server.auth import EntraResolver  # noqa: PLC0415
         from context_intelligence_server.config import Settings  # noqa: PLC0415
@@ -212,7 +196,9 @@ class TestCreateAsgiAppWire:
             azure_tenant_id=FAKE_TENANT_ID,
             entra_identities={FAKE_OID_1: {"id": "colombod"}},
         )
-        wrapped = create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+        wrapped = create_asgi_app(
+            settings=settings, _token_validator=application_validator
+        )
 
         assert isinstance(wrapped.resolver, EntraResolver), (
             "auth_mode=entra must wire an EntraResolver"
@@ -376,3 +362,592 @@ class TestEntraModeConfigValidation:
                 entra_identities={},
                 # azure_client_id omitted → still a startup error
             )
+
+
+class _RequestTokenValidator:
+    """Application-boundary double, not evidence of cryptographic validation."""
+
+    def __init__(
+        self,
+        failure: Exception | None = None,
+        *,
+        claims: dict[str, Any] | None = None,
+    ) -> None:
+        self.failure = failure
+        self.calls: list[tuple[str, str, str]] = []
+        self.claims = (
+            claims
+            if claims is not None
+            else {
+                "tid": FAKE_TENANT_ID,
+                "oid": FAKE_OID_1,
+                "scp": "access_as_user",
+                "roles": ["IdentityAdmin"],
+            }
+        )
+
+    def validate(
+        self, bearer: str, *, original_uri: str, original_method: str
+    ) -> dict[str, Any]:
+        self.calls.append((bearer, original_uri, original_method))
+        if self.failure is not None:
+            raise self.failure
+        return dict(self.claims)
+
+
+def _token_validator_settings(tmp_path: Path) -> Settings:
+    from context_intelligence_server.config import Settings
+
+    return Settings(
+        auth_mode="entra",
+        allow_unauthenticated=False,
+        azure_client_id=FAKE_CLIENT_ID,
+        azure_tenant_id=FAKE_TENANT_ID,
+        entra_identities={FAKE_OID_1: {"id": "mapped-contributor"}},
+        entra_identities_store_path=str(tmp_path / "entra-identities.json"),
+    )
+
+
+class TestTokenValidatorRequestContext:
+    @pytest.mark.parametrize(
+        ("scheme", "host", "server", "path", "raw_path", "query", "method", "uri"),
+        [
+            (
+                "https",
+                b"ingest.example:8443",
+                ("internal.example", 8000),
+                "/events",
+                b"/events",
+                b"trace=a%2Fb&trace=2",
+                "POST",
+                "https://ingest.example:8443/events?trace=a%2Fb&trace=2",
+            ),
+            (
+                "http",
+                b"ingest.example",
+                ("internal.example", 8000),
+                "/events",
+                b"/events",
+                b"empty=&q=a+b",
+                "DELETE",
+                "http://ingest.example/events?empty=&q=a+b",
+            ),
+            (
+                "https",
+                b"[2001:db8::1]:8443",
+                ("internal.example", 8000),
+                "/blobs/a/b c",
+                b"/blobs/a%2Fb%20c",
+                b"q=%2B",
+                "PATCH",
+                "https://[2001:db8::1]:8443/blobs/a%2Fb%20c?q=%2B",
+            ),
+            (
+                "http",
+                None,
+                ("scope-server.example", 9080),
+                "/events",
+                None,
+                b"source=scope",
+                "PUT",
+                "http://scope-server.example:9080/events?source=scope",
+            ),
+        ],
+        ids=[
+            "https-host-port-query",
+            "http-method",
+            "encoded-path-ipv6",
+            "scope-server",
+        ],
+    )
+    async def test_middleware_forwards_inbound_uri_and_method(
+        self,
+        scheme: str,
+        host: bytes | None,
+        server: tuple[str, int],
+        path: str,
+        raw_path: bytes | None,
+        query: bytes,
+        method: str,
+        uri: str,
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        from context_intelligence_server.auth import BearerTokenMiddleware
+
+        calls: list[tuple[str, str, str, bool]] = []
+
+        class ContextResolver:
+            auth_enabled = True
+
+            def resolve(
+                self,
+                token: str,
+                *,
+                original_uri: str,
+                original_method: str,
+                admin_path: bool = False,
+            ) -> tuple[str, list[str], bool]:
+                calls.append((token, original_uri, original_method, admin_path))
+                return ("context-contributor", [], False)
+
+        app = AsyncMock()
+        middleware = BearerTokenMiddleware(app, resolver=ContextResolver())
+        scope: dict[str, Any] = {
+            "type": "http",
+            "scheme": scheme,
+            "server": server,
+            "path": path,
+            "method": method,
+            "query_string": query,
+            "headers": [
+                (b"authorization", b"Bearer opaque.raw+bearer/=="),
+                (b"original-uri", b"https://forged.example/ignored"),
+                (b"x-original-uri", b"https://forged.example/ignored"),
+                (b"x-original-method", b"HEAD"),
+                (b"x-forwarded-host", b"forged.example"),
+                (b"x-forwarded-proto", b"https"),
+            ],
+        }
+        if host is not None:
+            scope["headers"].append((b"host", host))
+        if raw_path is not None:
+            scope["raw_path"] = raw_path
+        receive, send = AsyncMock(), AsyncMock()
+
+        await middleware(scope, receive, send)
+
+        assert scope.get("state", {}).get("contributor_id") == "context-contributor"
+        assert calls == [("opaque.raw+bearer/==", uri, method, False)]
+        app.assert_awaited_once_with(scope, receive, send)
+
+
+class TestTokenValidatorFactory:
+    async def test_injected_validator_revalidates_after_live_store_deletion(
+        self, tmp_path: Path
+    ) -> None:
+        from context_intelligence_server.main import (
+            create_asgi_app,
+            get_entra_identity_store,
+        )
+
+        validator = _RequestTokenValidator()
+        wrapped = create_asgi_app(
+            settings=_token_validator_settings(tmp_path), _token_validator=validator
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=wrapped),
+            base_url="https://ingest.example:8443",
+        ) as client:
+            headers = {"Authorization": "Bearer opaque.raw+bearer/=="}
+            accepted = await client.get("/whoami?trace=a%2Fb", headers=headers)
+            assert accepted.status_code == 200
+            assert accepted.json() == {"contributor_id": "mapped-contributor"}
+            store = get_entra_identity_store()
+            assert store is not None
+            store.delete(FAKE_OID_1.lower())
+            denied = await client.get("/whoami?trace=a%2Fb", headers=headers)
+
+        assert denied.status_code == 403
+        expected_call = (
+            "opaque.raw+bearer/==",
+            "https://ingest.example:8443/whoami?trace=a%2Fb",
+            "GET",
+        )
+        assert validator.calls == [expected_call, expected_call]
+
+    @pytest.mark.parametrize("path", ["/whoami", "/admin/identities"])
+    @pytest.mark.parametrize(
+        "unexpected", [False, True], ids=["validation", "unexpected"]
+    )
+    async def test_validation_error_response_and_logs_are_sanitized(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        path: str,
+        unexpected: bool,
+    ) -> None:
+        import logging
+
+        from context_intelligence_server.main import create_asgi_app
+        from context_intelligence_server.mise_validation import TokenValidationError
+
+        failure_type = RuntimeError if unexpected else TokenValidationError
+        validator = _RequestTokenValidator(
+            failure_type("native diagnostics containing opaque.raw+bearer/==")
+        )
+        settings = _token_validator_settings(tmp_path)
+        settings.entra_identities = {}
+        wrapped = create_asgi_app(settings=settings, _token_validator=validator)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=wrapped),
+            base_url="https://ingest.example",
+        ) as client:
+            with caplog.at_level(
+                logging.INFO, logger="context_intelligence_server.auth"
+            ):
+                response = await client.get(
+                    path, headers={"Authorization": "Bearer opaque.raw+bearer/=="}
+                )
+
+        assert response.status_code == 401
+        assert response.json() == {"detail": "Missing or invalid bearer token"}
+        assert "opaque.raw+bearer/==" not in caplog.text
+        assert "native diagnostics" not in caplog.text
+        assert validator.calls == [
+            ("opaque.raw+bearer/==", f"https://ingest.example{path}", "GET")
+        ]
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            ImportError("MISE initialization failed"),
+            OSError("MISE initialization failed"),
+            RuntimeError("MISE initialization failed"),
+        ],
+        ids=["import", "native", "configuration"],
+    )
+    def test_entra_factory_propagates_validator_construction_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception
+    ) -> None:
+        from context_intelligence_server import auth
+        from context_intelligence_server.main import create_asgi_app
+
+        def refuse_start(client_id: str, tenant_id: str) -> None:
+            assert (client_id, tenant_id) == (FAKE_CLIENT_ID, FAKE_TENANT_ID)
+            raise failure
+
+        def refuse_network(*args: Any, **kwargs: Any) -> None:
+            raise AssertionError("Unexpected legacy JWKS network access")
+
+        monkeypatch.setattr(auth, "MiseTokenValidator", refuse_start, raising=False)
+        monkeypatch.setattr("urllib.request.urlopen", refuse_network)
+        with pytest.raises(
+            type(failure), match="^MISE initialization failed$"
+        ) as denied:
+            create_asgi_app(settings=_token_validator_settings(tmp_path))
+
+        assert denied.value is failure
+
+    def test_real_adapter_import_failure_refuses_startup_without_diagnostics(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from context_intelligence_server import mise_validation
+        from context_intelligence_server.main import create_asgi_app
+
+        def refuse_import(name: str) -> Any:
+            assert name == "mise"
+            raise ModuleNotFoundError("sensitive native import diagnostics")
+
+        def refuse_network(*args: Any, **kwargs: Any) -> None:
+            raise AssertionError("Unexpected legacy JWKS network access")
+
+        monkeypatch.setattr(mise_validation, "import_module", refuse_import)
+        monkeypatch.setattr("urllib.request.urlopen", refuse_network)
+        with pytest.raises(
+            RuntimeError, match="^MISE initialization failed$"
+        ) as denied:
+            create_asgi_app(settings=_token_validator_settings(tmp_path))
+
+        assert denied.value.__suppress_context__ is True
+        assert "sensitive native import diagnostics" not in caplog.text
+
+    async def test_serving_entrypoint_loads_authenticated_asgi_wrapper(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from context_intelligence_server import main as main_module
+        from context_intelligence_server.auth import BearerTokenMiddleware
+
+        settings = _token_validator_settings(tmp_path)
+        validator = _RequestTokenValidator()
+        factory = main_module.create_asgi_app
+
+        def build_app() -> BearerTokenMiddleware:
+            return factory(settings=settings, _token_validator=validator)
+
+        served: list[object] = []
+
+        def load_without_listening(server: BaseApplication) -> None:
+            served.append(server.load())
+
+        monkeypatch.setenv("WEB_CONCURRENCY", "1")
+        monkeypatch.setattr(main_module, "_settings", settings)
+        monkeypatch.setattr(main_module, "_asgi_app", None)
+        monkeypatch.setattr(main_module, "create_asgi_app", build_app)
+        monkeypatch.setattr(BaseApplication, "run", load_without_listening)
+
+        main_module.main(["serve"])
+
+        assert len(served) == 1
+        wrapped = served[0]
+        assert wrapped is main_module.asgi_app
+        assert isinstance(wrapped, BearerTokenMiddleware)
+        assert wrapped.app is main_module.app
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=wrapped),
+            base_url="https://ingest.example",
+        ) as client:
+            assert (await client.get("/whoami")).status_code == 401
+            response = await client.get(
+                "/whoami", headers={"Authorization": "Bearer opaque.raw+bearer/=="}
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {"contributor_id": "mapped-contributor"}
+        assert validator.calls == [
+            ("opaque.raw+bearer/==", "https://ingest.example/whoami", "GET")
+        ]
+
+
+class TestTokenValidatorSingletonRoles:
+    """Scalar MISE claims must preserve existing policy, not prove authenticity."""
+
+    @pytest.mark.parametrize(
+        ("role", "write_status"), [("Reader", 403), ("Contributor", 202)]
+    )
+    async def test_service_singleton_role_preserves_read_and_write_capabilities(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        role: str,
+        write_status: int,
+    ) -> None:
+        from context_intelligence_server import main as main_module
+
+        validator = _RequestTokenValidator(
+            claims={"tid": FAKE_TENANT_ID, "oid": FAKE_OID_1, "roles": role}
+        )
+        wrapped = main_module.create_asgi_app(
+            settings=_token_validator_settings(tmp_path), _token_validator=validator
+        )
+        # Keep persistence real; suppress only the drainer that would contact Neo4j.
+        monkeypatch.setattr(
+            main_module.registry, "get_or_create", lambda *args, **kwargs: None
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=wrapped),
+            base_url="https://ingest.example",
+            headers={"Authorization": "Bearer opaque-bearer"},
+        ) as client:
+            read = await client.get("/whoami")
+            assert read.status_code == 200
+            assert read.json() == {"contributor_id": "mapped-contributor"}
+            write = await client.post(
+                "/events",
+                json={
+                    "event": "tool_use",
+                    "workspace": "/ws",
+                    "data": {
+                        "session_id": "singleton-role-session",
+                        "timestamp": "2026-10-20T00:00:00+00:00",
+                    },
+                },
+            )
+
+        assert write.status_code == write_status
+        assert validator.calls == [
+            ("opaque-bearer", "https://ingest.example/whoami", "GET"),
+            ("opaque-bearer", "https://ingest.example/events", "POST"),
+        ]
+
+    @pytest.mark.parametrize("is_service", [False, True], ids=["delegated", "service"])
+    async def test_singleton_identity_admin_reaches_admin_route(
+        self, tmp_path: Path, is_service: bool
+    ) -> None:
+        from context_intelligence_server.main import create_asgi_app
+
+        claims: dict[str, Any] = {
+            "tid": FAKE_TENANT_ID,
+            "oid": FAKE_OID_1,
+            "roles": "IdentityAdmin",
+        }
+        settings = _token_validator_settings(tmp_path)
+        if not is_service:
+            claims["scp"] = "access_as_user"
+            settings.entra_identities = {}  # Delegated bootstrap stays map-exempt.
+        validator = _RequestTokenValidator(claims=claims)
+        wrapped = create_asgi_app(settings=settings, _token_validator=validator)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=wrapped),
+            base_url="https://ingest.example",
+        ) as client:
+            response = await client.get(
+                "/admin/identities",
+                headers={"Authorization": "Bearer opaque-bearer"},
+            )
+
+        assert response.status_code == 200
+        assert "identities" in response.json()
+        assert validator.calls == [
+            ("opaque-bearer", "https://ingest.example/admin/identities", "GET")
+        ]
+
+
+class TestTokenValidatorUriComponents:
+    @pytest.mark.parametrize(
+        ("scope_fields", "host", "uri"),
+        [
+            pytest.param(
+                {
+                    "path": "/blobs/a?b",
+                    "raw_path": b"/blobs/a%3Fb",
+                    "query_string": b"q=one%3Ftwo&dup=1&dup=2",
+                },
+                b"ingest.example:8443",
+                "https://ingest.example:8443/blobs/a%3Fb?q=one%3Ftwo&dup=1&dup=2",
+                id="encoded-question",
+            ),
+            pytest.param(
+                {
+                    "path": "/blobs/a#b",
+                    "raw_path": b"/blobs/a%23b",
+                    "query_string": b"q=%23keep&empty=",
+                },
+                b"ingest.example:8443",
+                "https://ingest.example:8443/blobs/a%23b?q=%23keep&empty=",
+                id="encoded-fragment",
+            ),
+            pytest.param(
+                {
+                    "path": "/blobs/a?b#c d%/",
+                    "raw_path": b"/blobs/a%3fb%23c%20d%25%2F",
+                    "query_string": b"q=a%2fb&literal=%2523",
+                },
+                b"ingest.example",
+                "https://ingest.example/blobs/a%3fb%23c%20d%25%2F?q=a%2fb&literal=%2523",
+                id="raw-escapes-not-reparsed",
+            ),
+            pytest.param(
+                {
+                    "path": "/blobs/a?b#c d%/café",
+                    "query_string": b"q=keep%2F&dup=1&dup=2",
+                },
+                b"ingest.example",
+                "https://ingest.example/blobs/a%3Fb%23c%20d%25/caf%C3%A9?q=keep%2F&dup=1&dup=2",
+                id="raw-path-absent",
+            ),
+            pytest.param(
+                {
+                    "path": "/blobs/a?b#c d%/café",
+                    "raw_path": None,
+                    "query_string": b"q=keep%2F&dup=1&dup=2",
+                },
+                b"ingest.example",
+                "https://ingest.example/blobs/a%3Fb%23c%20d%25/caf%C3%A9?q=keep%2F&dup=1&dup=2",
+                id="raw-path-none",
+            ),
+            pytest.param(
+                {"path": "/blobs/!$&'()*+,;=:@ test"},
+                b"ingest.example",
+                "https://ingest.example/blobs/!$&'()*+,;=:@%20test",
+                id="decoded-path-pchars",
+            ),
+            pytest.param(
+                {"server": None},
+                b"Ingest.Example:443",
+                "https://Ingest.Example:443/events",
+                id="host-preserved-with-explicit-default-port",
+            ),
+            pytest.param(
+                {"scheme": "http", "server": ("scope-server.example", 80)},
+                None,
+                "http://scope-server.example/events",
+                id="http-default-port",
+            ),
+            pytest.param(
+                {"server": ("scope-server.example", 443)},
+                None,
+                "https://scope-server.example/events",
+                id="https-default-port",
+            ),
+            pytest.param(
+                {"scheme": "http", "server": ("scope-server.example", 443)},
+                None,
+                "http://scope-server.example:443/events",
+                id="http-non-default-port",
+            ),
+            pytest.param(
+                {"server": ("scope-server.example", 80)},
+                None,
+                "https://scope-server.example:80/events",
+                id="https-non-default-port",
+            ),
+            pytest.param(
+                {"server": ("2001:db8::1", 443)},
+                None,
+                "https://[2001:db8::1]/events",
+                id="ipv6-default-port",
+            ),
+            pytest.param(
+                {"server": ("2001:db8::1", 8443)},
+                None,
+                "https://[2001:db8::1]:8443/events",
+                id="ipv6-non-default-port",
+            ),
+            pytest.param(
+                {"server": ("2001:db8::1", None), "raw_path": None},
+                None,
+                "https://[2001:db8::1]/events",
+                id="ipv6-no-port",
+            ),
+            pytest.param(
+                {"server": ("[2001:db8::1]", 8443)},
+                None,
+                "https://[2001:db8::1]:8443/events",
+                id="ipv6-already-bracketed",
+            ),
+            pytest.param(
+                {"server": ("192.0.2.4", None)},
+                None,
+                "https://192.0.2.4/events",
+                id="server-no-port",
+            ),
+        ],
+    )
+    async def test_validator_receives_exact_scope_components(
+        self, scope_fields: dict[str, Any], host: bytes | None, uri: str
+    ) -> None:
+        from unittest.mock import AsyncMock
+
+        from context_intelligence_server.auth import (
+            BearerTokenMiddleware,
+            EntraResolver,
+        )
+
+        validator = _RequestTokenValidator()
+        resolver = EntraResolver(
+            FAKE_CLIENT_ID,
+            FAKE_TENANT_ID,
+            {FAKE_OID_1.lower(): "mapped-contributor"},
+            validator=validator,
+        )
+        app = AsyncMock()
+        wrapped = BearerTokenMiddleware(app, resolver=resolver)
+        scope: dict[str, Any] = {
+            "type": "http",
+            "scheme": "https",
+            "server": ("backend.example", 8000),
+            "method": "PATCH",
+            "path": "/events",
+            "query_string": b"",
+            "headers": [
+                (b"authorization", b"Bearer opaque.raw+bearer/=="),
+                (b"original-uri", b"https://forged.example/ignored"),
+                (b"x-original-uri", b"https://forged.example/ignored"),
+                (b"x-forwarded-host", b"forged.example"),
+                (b"x-forwarded-proto", b"http"),
+            ],
+        }
+        scope.update(scope_fields)
+        if host is not None:
+            scope["headers"].append((b"host", host))
+        receive, send = AsyncMock(), AsyncMock()
+
+        await wrapped(scope, receive, send)
+
+        assert validator.calls == [("opaque.raw+bearer/==", uri, "PATCH")]
+        assert scope.get("state", {}).get("contributor_id") == "mapped-contributor"
+        app.assert_awaited_once_with(scope, receive, send)

@@ -13,8 +13,9 @@ httpx → ASGITransport.  Covers all nine §7 CAP rows:
   CAP-cypher-soft  — service Reader → POST /cypher (MUTATING query) → 2xx
                      SOFT-M2: soft gap hardens to 403 at M3 via read-only Neo4j DB user.
 
-Pattern: RSA keypair (module-scoped), stub JWKS client, create_asgi_app with
-service role names configured.  Token shape follows the discriminator logic in
+Pattern: explicit opaque-token application validator, create_asgi_app with
+service role names configured. This is policy evidence, not authenticity
+evidence (the genuine tier lives in test_mise_validation.py). Claims follow the discriminator in
 auth.py EntraResolver.resolve(): human tokens have scp="access_as_user" (user
 branch, is_service=False); service tokens omit scp (service branch, is_service=True).
 """
@@ -30,6 +31,8 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from tests.conftest import ApplicationTokenValidator
+
 # ---------------------------------------------------------------------------
 # Fake constants
 # ---------------------------------------------------------------------------
@@ -43,43 +46,8 @@ FAKE_ISSUER = f"https://login.microsoftonline.com/{FAKE_TENANT_ID}/v2.0"
 
 
 # ---------------------------------------------------------------------------
-# Stub JWKS client (no network)
+# Application claims
 # ---------------------------------------------------------------------------
-
-
-class _StubSigningKey:
-    def __init__(self, key: Any) -> None:
-        self.key = key
-
-
-class _StubJWKSClient:
-    def __init__(self, key: Any) -> None:
-        self._key = _StubSigningKey(key)
-
-    def fetch_data(self) -> None:
-        pass
-
-    def get_signing_key_from_jwt(self, token: str) -> _StubSigningKey:
-        return self._key
-
-    def get_jwk_set(self) -> Any:
-        _k = self._key
-
-        class _FakeJWKSet:
-            keys = [_k]
-
-        return _FakeJWKSet()
-
-
-# ---------------------------------------------------------------------------
-# JWT helpers
-# ---------------------------------------------------------------------------
-
-
-def _sign_jwt(private_key: Any, claims: dict[str, Any]) -> str:
-    import jwt as pyjwt  # noqa: PLC0415
-
-    return pyjwt.encode(claims, private_key, algorithm="RS256")
 
 
 def _human_claims(
@@ -185,41 +153,24 @@ class _MockNeo4jDriver:
 
 
 # ---------------------------------------------------------------------------
-# Module-scoped RSA keypair (generated once, shared across all cap tests)
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="module")
-def rsa_keypair_cap() -> tuple[Any, Any]:
-    """Generate a 2048-bit RSA keypair once per module (expensive)."""
-    from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: PLC0415
-
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_key = private_key.public_key()
-    return private_key, public_key
-
-
-# ---------------------------------------------------------------------------
 # Fixture: service-configured entra ASGI app
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
 async def service_asgi(
-    rsa_keypair_cap: tuple[Any, Any],
+    application_validator: ApplicationTokenValidator,
     tmp_path: Any,
 ) -> AsyncGenerator[tuple[Any, Any], None]:
     """Create a fresh create_asgi_app configured with M2 service roles.
 
-    Returns (private_key, asgi_app) so tests can sign tokens and make requests.
+    Returns (validator, asgi_app) so tests can issue handles and make requests.
     Roles: service_data_role="Contributor", reader_role="Reader",
            entra_admin_role="IdentityAdmin".
     Identity map: FAKE_OID_HUMAN → FAKE_CONTRIBUTOR_HUMAN.
     """
     from context_intelligence_server.config import Settings  # noqa: PLC0415
     from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
-
-    private_key, public_key = rsa_keypair_cap
 
     settings = Settings(
         auth_mode="entra",
@@ -237,9 +188,9 @@ async def service_asgi(
 
     asgi = create_asgi_app(
         settings=settings,
-        _jwks_client=_StubJWKSClient(public_key),
+        _token_validator=application_validator,
     )
-    yield private_key, asgi
+    yield application_validator, asgi
 
 
 # ---------------------------------------------------------------------------
@@ -263,8 +214,7 @@ class TestM2CapabilityDeps:
     """§7 CAP-* route-level capability tests.
 
     All tests use the service_asgi fixture which creates a fresh ASGI app
-    with service roles configured.  Tokens are signed with the module-scoped
-    RSA keypair and validated by the stub JWKS client.
+    with service roles configured and an explicit application validator.
     """
 
     # -- CAP-HW: human principal → POST /events → 2xx ----------------------
@@ -277,8 +227,8 @@ class TestM2CapabilityDeps:
         """CAP-HW: human (is_service=False) → POST /events → 2xx regardless of roles."""
         import context_intelligence_server.main as main_module  # noqa: PLC0415
 
-        private_key, asgi = service_asgi
-        token = _sign_jwt(private_key, _human_claims())
+        validator, asgi = service_asgi
+        token = validator.issue(_human_claims())
 
         monkeypatch.setattr(
             main_module.registry, "get_or_create", lambda *a, **kw: MagicMock()
@@ -317,8 +267,8 @@ class TestM2CapabilityDeps:
         """
         import context_intelligence_server.main as main_module  # noqa: PLC0415
 
-        private_key, asgi = service_asgi_with_map
-        token = _sign_jwt(private_key, _service_claims(roles=["Contributor"]))
+        validator, asgi = service_asgi_with_map
+        token = validator.issue(_service_claims(roles=["Contributor"]))
 
         monkeypatch.setattr(
             main_module.registry, "get_or_create", lambda *a, **kw: MagicMock()
@@ -349,8 +299,8 @@ class TestM2CapabilityDeps:
         service_asgi: tuple[Any, Any],
     ) -> None:
         """CAP-SR-w: service Reader → POST /events → 403 (require_write fails)."""
-        private_key, asgi = service_asgi
-        token = _sign_jwt(private_key, _service_claims(roles=["Reader"]))
+        validator, asgi = service_asgi
+        token = validator.issue(_service_claims(roles=["Reader"]))
 
         async with _make_client(asgi) as c:
             resp = await c.post(
@@ -382,8 +332,8 @@ class TestM2CapabilityDeps:
         """
         import context_intelligence_server.main as main_module  # noqa: PLC0415
 
-        private_key, asgi = service_asgi_with_map
-        token = _sign_jwt(private_key, _service_claims(roles=["Reader"]))
+        validator, asgi = service_asgi_with_map
+        token = validator.issue(_service_claims(roles=["Reader"]))
 
         monkeypatch.setattr(main_module, "AsyncDiskBlobStore", _MockBlobStore)
 
@@ -403,8 +353,8 @@ class TestM2CapabilityDeps:
         service_asgi: tuple[Any, Any],
     ) -> None:
         """CAP-SADM-w: service IdentityAdmin (no Contributor) → POST /events → 403."""
-        private_key, asgi = service_asgi
-        token = _sign_jwt(private_key, _service_claims(roles=["IdentityAdmin"]))
+        validator, asgi = service_asgi
+        token = validator.issue(_service_claims(roles=["IdentityAdmin"]))
 
         async with _make_client(asgi) as c:
             resp = await c.post(
@@ -437,8 +387,8 @@ class TestM2CapabilityDeps:
         No change to admin.py needed (Q4 / §1.4). Uses service_asgi_with_map
         (mapped oid) -- see CAP-SC docstring.
         """
-        private_key, asgi = service_asgi_with_map
-        token = _sign_jwt(private_key, _service_claims(roles=["IdentityAdmin"]))
+        validator, asgi = service_asgi_with_map
+        token = validator.issue(_service_claims(roles=["IdentityAdmin"]))
 
         async with _make_client(asgi) as c:
             resp = await c.get(
@@ -465,8 +415,8 @@ class TestM2CapabilityDeps:
         """
         import context_intelligence_server.main as main_module  # noqa: PLC0415
 
-        private_key, asgi = service_asgi_with_map
-        token = _sign_jwt(private_key, _service_claims(roles=["Contributor"]))
+        validator, asgi = service_asgi_with_map
+        token = validator.issue(_service_claims(roles=["Contributor"]))
 
         monkeypatch.setattr(main_module, "AsyncDiskBlobStore", _MockBlobStore)
 
@@ -495,8 +445,8 @@ class TestM2CapabilityDeps:
         """
         from context_intelligence_server.main import app  # noqa: PLC0415
 
-        private_key, asgi = service_asgi_with_map
-        token = _sign_jwt(private_key, _service_claims(roles=["Reader"]))
+        validator, asgi = service_asgi_with_map
+        token = validator.issue(_service_claims(roles=["Reader"]))
 
         # Mock the neo4j QUERY (read-intent) driver on app.state -- /cypher reads
         # app.state.neo4j_query_driver + neo4j_query_access_mode (two-client
@@ -537,8 +487,8 @@ class TestM2CapabilityDeps:
         """
         from context_intelligence_server.main import app  # noqa: PLC0415
 
-        private_key, asgi = service_asgi_with_map
-        token = _sign_jwt(private_key, _service_claims(roles=["Reader"]))
+        validator, asgi = service_asgi_with_map
+        token = validator.issue(_service_claims(roles=["Reader"]))
 
         # Mock the neo4j QUERY (read-intent) driver — /cypher reads
         # app.state.neo4j_query_driver (two-client split, doc 12). The
@@ -587,7 +537,7 @@ _FAKE_SERVICE_FRIENDLY_NAME = "my-automation-service"
 
 @pytest.fixture
 async def service_asgi_with_map(
-    rsa_keypair_cap: tuple[Any, Any],
+    application_validator: ApplicationTokenValidator,
     tmp_path: Any,
 ) -> AsyncGenerator[tuple[Any, Any], None]:
     """ASGI app with service_identities: FAKE_OID_SERVICE → _FAKE_SERVICE_FRIENDLY_NAME.
@@ -598,8 +548,6 @@ async def service_asgi_with_map(
     """
     from context_intelligence_server.config import Settings  # noqa: PLC0415
     from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
-
-    private_key, public_key = rsa_keypair_cap
 
     settings = Settings(
         auth_mode="entra",
@@ -618,8 +566,8 @@ async def service_asgi_with_map(
         api_keys_store_path=str(tmp_path / "api-keys-map.json"),
     )
 
-    asgi = create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient(public_key))
-    yield private_key, asgi
+    asgi = create_asgi_app(settings=settings, _token_validator=application_validator)
+    yield application_validator, asgi
 
 
 # ---------------------------------------------------------------------------
@@ -632,7 +580,7 @@ class TestBootDisjointnessInvariant:
 
     def test_overlapping_oid_raises_runtime_error(
         self,
-        rsa_keypair_cap: tuple[Any, Any],
+        application_validator: ApplicationTokenValidator,
         tmp_path: Any,
     ) -> None:
         """B4: oid in both maps → RuntimeError naming the oid at boot.
@@ -642,8 +590,6 @@ class TestBootDisjointnessInvariant:
         """
         from context_intelligence_server.config import Settings  # noqa: PLC0415
         from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
-
-        _, public_key = rsa_keypair_cap
 
         settings = Settings(
             auth_mode="entra",
@@ -656,18 +602,16 @@ class TestBootDisjointnessInvariant:
         )
 
         with pytest.raises(RuntimeError, match=_OVERLAP_OID):
-            create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient(public_key))
+            create_asgi_app(settings=settings, _token_validator=application_validator)
 
     def test_disjoint_config_boots_cleanly(
         self,
-        rsa_keypair_cap: tuple[Any, Any],
+        application_validator: ApplicationTokenValidator,
         tmp_path: Any,
     ) -> None:
         """B4 negative: disjoint entra + service oids → create_asgi_app succeeds."""
         from context_intelligence_server.config import Settings  # noqa: PLC0415
         from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
-
-        _, public_key = rsa_keypair_cap
 
         settings = Settings(
             auth_mode="entra",
@@ -683,11 +627,11 @@ class TestBootDisjointnessInvariant:
         )
 
         # Must not raise — disjoint config is valid
-        create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient(public_key))
+        create_asgi_app(settings=settings, _token_validator=application_validator)
 
     def test_empty_service_identities_boots_without_error(
         self,
-        rsa_keypair_cap: tuple[Any, Any],
+        application_validator: ApplicationTokenValidator,
         tmp_path: Any,
     ) -> None:
         """service_identities={} boots cleanly (bootstrap state, not a startup error).
@@ -699,8 +643,6 @@ class TestBootDisjointnessInvariant:
         """
         from context_intelligence_server.config import Settings  # noqa: PLC0415
         from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
-
-        _, public_key = rsa_keypair_cap
 
         settings = Settings(
             auth_mode="entra",
@@ -714,7 +656,7 @@ class TestBootDisjointnessInvariant:
 
         # Must not raise -- an explicit empty service_identities map is a
         # supported bootstrap state.
-        create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient(public_key))
+        create_asgi_app(settings=settings, _token_validator=application_validator)
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +710,7 @@ class TestStatusAdditiveFields:
 class TestP3VerticalSlice:
     """P3: offline end-to-end proof of the full service-auth pipe.
 
-    Uses real RS256 tokens, the stub JWKS client, and httpx ASGITransport.
+    Uses opaque handles, the application validator, and httpx ASGITransport.
     Captures queue-append bytes to assert the final created_by value.
     """
 
@@ -785,9 +727,9 @@ class TestP3VerticalSlice:
         """
         import context_intelligence_server.main as main_module  # noqa: PLC0415
 
-        private_key, asgi = service_asgi
-        token = _sign_jwt(
-            private_key, _service_claims(roles=["Contributor"], appid=FAKE_APPID)
+        validator, asgi = service_asgi
+        token = validator.issue(
+            _service_claims(roles=["Contributor"], appid=FAKE_APPID)
         )
 
         captured: list[bytes] = []
@@ -835,9 +777,9 @@ class TestP3VerticalSlice:
         """
         import context_intelligence_server.main as main_module  # noqa: PLC0415
 
-        private_key, asgi = service_asgi_with_map
-        token = _sign_jwt(
-            private_key, _service_claims(roles=["Contributor"], appid=FAKE_APPID)
+        validator, asgi = service_asgi_with_map
+        token = validator.issue(
+            _service_claims(roles=["Contributor"], appid=FAKE_APPID)
         )
 
         captured: list[bytes] = []
@@ -1033,9 +975,9 @@ class TestM2MessageContent:
         User-advocate: the message must NAME the rejected service principal
         (appid) and the required App Roles so the operator knows what to assign.
         """
-        private_key, asgi = service_asgi
+        validator, asgi = service_asgi
         # _service_claims uses FAKE_APPID as default appid
-        token = _sign_jwt(private_key, _service_claims(roles=[]))
+        token = validator.issue(_service_claims(roles=[]))
 
         async with _make_client(asgi) as c:
             resp = await c.post(
@@ -1080,8 +1022,8 @@ class TestM2MessageContent:
         Uses service_asgi_with_map (mapped oid) so the resolver itself succeeds
         (an unmapped oid now 403s before require_write ever runs).
         """
-        private_key, asgi = service_asgi_with_map
-        token = _sign_jwt(private_key, _service_claims(roles=["Reader"]))
+        validator, asgi = service_asgi_with_map
+        token = validator.issue(_service_claims(roles=["Reader"]))
 
         async with _make_client(asgi) as c:
             resp = await c.post(
@@ -1114,8 +1056,8 @@ class TestM2MessageContent:
         Uses service_asgi_with_map (mapped oid) so the resolver itself succeeds
         (an unmapped oid now 403s before require_read ever runs).
         """
-        private_key, asgi = service_asgi_with_map
-        token = _sign_jwt(private_key, _service_claims(roles=["IdentityAdmin"]))
+        validator, asgi = service_asgi_with_map
+        token = validator.issue(_service_claims(roles=["IdentityAdmin"]))
 
         async with _make_client(asgi) as c:
             resp = await c.get(
