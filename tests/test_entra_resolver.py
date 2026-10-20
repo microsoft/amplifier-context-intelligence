@@ -1609,3 +1609,226 @@ class TestM2ServiceBranchEdgeCases:
             f"roles='Contributor' (bare string) must normalize to [] and → 403, "
             f"got status={err.status_code}, reason={err.reason!r}"
         )
+
+
+class _ClaimTokenValidator:
+    """Application-boundary double; does not validate cryptographic authenticity."""
+
+    def __init__(
+        self, claims: dict[str, Any], failure: Exception | None = None
+    ) -> None:
+        self.claims = claims
+        self.failure = failure
+        self.calls: list[tuple[str, str, str]] = []
+
+    def validate(
+        self, bearer: str, *, original_uri: str, original_method: str
+    ) -> dict[str, Any]:
+        self.calls.append((bearer, original_uri, original_method))
+        if self.failure is not None:
+            raise self.failure
+        return dict(self.claims)
+
+
+class TestEntraResolverTokenValidator:
+    @pytest.mark.parametrize("is_service", [False, True], ids=["delegated", "service"])
+    def test_revalidates_same_token_against_live_identity_map(
+        self, is_service: bool
+    ) -> None:
+        from context_intelligence_server.auth import AuthError, EntraResolver
+
+        identities: dict[str, str] = {}
+        claims = _valid_claims()
+        roles = ["Contributor"] if is_service else ["IdentityAdmin"]
+        claims["roles"] = roles
+        if is_service:
+            del claims["scp"]
+            claims["idtyp"] = " App "
+        validator = _ClaimTokenValidator(claims)
+        resolver = EntraResolver(
+            FAKE_CLIENT_ID,
+            FAKE_TENANT_ID,
+            identities,
+            service_identity_map=identities,
+            service_data_role="Contributor",
+            validator=validator,
+        )
+        identities[FAKE_OID_1.lower()] = "mapped-contributor"
+        uri = "https://ingest.example:8443/whoami?trace=a%2Fb&trace=2"
+
+        assert resolver.resolve(
+            "opaque.raw+bearer/==", original_uri=uri, original_method="GET"
+        ) == (
+            "mapped-contributor",
+            roles,
+            is_service,
+        )
+        del identities[FAKE_OID_1.lower()]
+        with pytest.raises(AuthError) as denied:
+            resolver.resolve(
+                "opaque.raw+bearer/==", original_uri=uri, original_method="GET"
+            )
+
+        assert denied.value.status_code == 403
+        expected_call = ("opaque.raw+bearer/==", uri, "GET")
+        assert validator.calls == [expected_call, expected_call]
+
+    @pytest.mark.parametrize("admin_path", [False, True], ids=["data", "admin"])
+    def test_validation_failure_is_sanitized_401_even_on_admin_path(
+        self, admin_path: bool
+    ) -> None:
+        from context_intelligence_server.auth import AuthError, EntraResolver
+        from context_intelligence_server.mise_validation import TokenValidationError
+
+        validator = _ClaimTokenValidator(
+            _valid_claims(),
+            TokenValidationError("native diagnostics containing opaque.raw+bearer/=="),
+        )
+        resolver = EntraResolver(
+            FAKE_CLIENT_ID, FAKE_TENANT_ID, {}, validator=validator
+        )
+
+        with pytest.raises(AuthError) as denied:
+            resolver.resolve(
+                "opaque.raw+bearer/==",
+                admin_path=admin_path,
+                original_uri="https://ingest.example/admin/identities",
+                original_method="GET",
+            )
+
+        assert denied.value.status_code == 401
+        assert denied.value.reason == "Missing or invalid bearer token"
+        assert denied.value.__suppress_context__ is True
+        assert len(validator.calls) == 1
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"tid": "other-tenant"},
+            {"scp": "openid profile"},
+            {"idtyp": " App "},
+            {"oid": None},
+        ],
+        ids=["tenant", "scope", "ambiguous-app", "missing-oid"],
+    )
+    def test_validated_claims_still_enforce_existing_user_checks(
+        self, overrides: dict[str, Any]
+    ) -> None:
+        from context_intelligence_server.auth import AuthError, EntraResolver
+
+        claims = _valid_claims()
+        claims.update(overrides)
+        validator = _ClaimTokenValidator(claims)
+        resolver = EntraResolver(
+            FAKE_CLIENT_ID,
+            FAKE_TENANT_ID,
+            dict(FAKE_IDENTITY_MAP),
+            validator=validator,
+        )
+
+        with pytest.raises(AuthError) as denied:
+            resolver.resolve(
+                "opaque-bearer",
+                original_uri="https://ingest.example/events",
+                original_method="POST",
+            )
+
+        assert denied.value.status_code == 401
+        assert len(validator.calls) == 1
+
+    def test_static_resolver_ignores_request_context(self) -> None:
+        import hashlib
+
+        from context_intelligence_server.auth import StaticKeyResolver
+
+        digest = hashlib.sha256(b"static-context-token").hexdigest()
+        resolver = StaticKeyResolver({digest: "static-contributor"})
+        assert resolver.resolve(
+            "static-context-token",
+            original_uri="https://ingest.example/whoami?source=test",
+            original_method="GET",
+        ) == ("static-contributor", [], False)
+
+
+class TestEntraResolverRoleClaimCompatibility:
+    @pytest.mark.parametrize("is_service", [False, True], ids=["delegated", "service"])
+    def test_repeated_roles_keep_their_order(self, is_service: bool) -> None:
+        from context_intelligence_server.auth import EntraResolver
+
+        claims = _valid_claims()
+        claims["roles"] = ["IdentityAdmin", "Reader", "Contributor", "Reader"]
+        if is_service:
+            del claims["scp"]
+        identities = {FAKE_OID_1.lower(): "mapped-contributor"}
+        resolver = EntraResolver(
+            FAKE_CLIENT_ID,
+            FAKE_TENANT_ID,
+            identities,
+            service_identity_map=identities,
+            service_data_role="Contributor",
+            reader_role="Reader",
+            entra_admin_role="IdentityAdmin",
+            validator=_ClaimTokenValidator(claims),
+        )
+
+        assert resolver.resolve(
+            "opaque-bearer",
+            original_uri="https://ingest.example/whoami",
+            original_method="GET",
+        ) == (
+            "mapped-contributor",
+            ["IdentityAdmin", "Reader", "Contributor", "Reader"],
+            is_service,
+        )
+
+    @pytest.mark.parametrize(
+        "role_claims",
+        [
+            {},
+            {"roles": None},
+            {"roles": 42},
+            {"roles": ("Contributor",)},
+            {"roles": {"Contributor": True}},
+            {"roles": [None, 42]},
+            {"roles": ""},
+            {"roles": "reader"},
+            {"roles": "Reader Contributor"},
+        ],
+        ids=[
+            "absent",
+            "null",
+            "integer",
+            "tuple",
+            "mapping",
+            "non-string-list",
+            "empty-string",
+            "wrong-case",
+            "not-space-separated",
+        ],
+    )
+    def test_missing_or_malformed_roles_stay_unprivileged(
+        self, role_claims: dict[str, Any]
+    ) -> None:
+        from context_intelligence_server.auth import AuthError, EntraResolver
+
+        claims = {"tid": FAKE_TENANT_ID, "oid": FAKE_OID_1, **role_claims}
+        identities = {FAKE_OID_1.lower(): "mapped-contributor"}
+        resolver = EntraResolver(
+            FAKE_CLIENT_ID,
+            FAKE_TENANT_ID,
+            identities,
+            service_identity_map=identities,
+            service_data_role="Contributor",
+            reader_role="Reader",
+            entra_admin_role="IdentityAdmin",
+            validator=_ClaimTokenValidator(claims),
+        )
+
+        with pytest.raises(AuthError) as denied:
+            resolver.resolve(
+                "opaque-bearer",
+                original_uri="https://ingest.example/whoami",
+                original_method="GET",
+            )
+
+        assert denied.value.status_code == 403

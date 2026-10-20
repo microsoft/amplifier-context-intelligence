@@ -41,6 +41,7 @@ from context_intelligence_server.config import Neo4jClientConfig, Settings, get_
 from context_intelligence_server.idempotency import EventIdempotencyCache
 from context_intelligence_server.identity_store import IdentityStore
 from context_intelligence_server.logging_config import setup_logging
+from context_intelligence_server.mise_validation import TokenValidator
 from context_intelligence_server.models import (
     CypherRequest,
     EventRequest,
@@ -1007,7 +1008,7 @@ def _assert_neo4j_clients_explicit(settings: Settings) -> None:
 def create_asgi_app(
     settings: Settings | None = None,
     *,
-    _jwks_client: Any = None,
+    _token_validator: TokenValidator | None = None,
 ) -> BearerTokenMiddleware:
     """Return the ASGI app wrapped with auth middleware.
 
@@ -1017,11 +1018,11 @@ def create_asgi_app(
     from tests to exercise specific configurations without touching the live
     cached settings.
 
-    *_jwks_client* is an injectable JWKS client used **only** when
+    *_token_validator* is an application token validator used **only** when
     ``auth_mode="entra"`` — intended for tests that need to construct an
     :class:`~context_intelligence_server.auth.EntraResolver` without making
-    real network calls.  Production deployments leave it as ``None``; the
-    resolver builds a real ``PyJWKClient`` internally.
+    real SDK calls. Production deployments leave it as ``None``; the
+    resolver constructs the genuine ``MiseTokenValidator`` once at startup.
 
     Startup behavior on an EMPTY store:
         An empty keystore (static) or empty identity map (entra) does NOT
@@ -1250,8 +1251,8 @@ def create_asgi_app(
                 f"the overlap before restarting."
             )
 
-        # EntraResolver raises RuntimeError at construction if the JWKS
-        # prefetch fails (eager fail-closed by design).
+        # EntraResolver propagates MISE initialization failure at construction
+        # (eager fail-closed by design).
         # Pass entra_store.flat_dict (the LIVE dict) as BOTH maps so the
         # resolver sees any put()/delete() made by /admin immediately on
         # either path, no restart required.
@@ -1264,7 +1265,7 @@ def create_asgi_app(
             service_data_role=s.service_data_role,
             reader_role=s.reader_role,
             entra_admin_role=s.entra_admin_role,
-            jwks_client=_jwks_client,
+            validator=_token_validator,
         )
         # Entra mode does not use admin_api_key_digest (admin via roles claim).
         admin_api_key_digest = None
