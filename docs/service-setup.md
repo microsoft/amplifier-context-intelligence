@@ -8,6 +8,103 @@ integrated with the Amplifier CLI so sessions are automatically captured.
 
 ## Manual blob retention — preview first
 
+### Online: keep ingestion available
+
+```bash
+context-intelligence-server blobs prune --online --older-than 30d
+# Confirm the returned ready preview, using its printed UUID:
+context-intelligence-server blobs prune --online --job-id JOB_UUID --apply
+```
+
+To request a fresh preview and confirm it in one invocation when no job is
+current, use `blobs prune --online --older-than 30d --apply`.
+
+Online mode uses only the running server's configured blob root. It needs a
+**raw admin credential**, never a data key. Use `ADMIN_API_KEY`, the existing
+`AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY` environment variable, a raw
+`admin_api_key` in supported server settings, or `--admin-key-file /private/token`.
+A digest-only `admin_api_key_sha256` config cannot recover the raw bearer token.
+The file must be same-owner, regular, not symlinked or hardlinked, mode `0600` or
+`0400`, at most 8192 bytes. Do not pass tokens on the command line. This command
+does not create an admin credential or change authentication.
+
+Use `--server-url https://server.example.com` for a remote server. The default is
+loopback HTTP on the configured server port. Plain HTTP credentials are allowed
+only for loopback addresses/`localhost`; remote credentials require HTTPS.
+Redirects and ambient HTTP proxies are not used.
+
+1. Preview starts a server-owned background scan and polls for up to 120 seconds.
+   Status remains available during a slow scan. Preview writes no metadata,
+   reads no payload bodies, and does not touch graph or queue state.
+2. Read the **live estimate**, not an immutable file manifest. The server freezes
+   the cutoff and preview start time. Apply rescans that cutoff; new, replaced,
+   or changed files after preview are retained using `ctime_ns` plus exact
+   device/inode/size/mtime/ctime checks. Backward clock movement fails the job.
+3. For `--apply`, type exactly **`prune`** at a real terminal. There is no `--yes`.
+   Declining cancels the preview and deletes nothing. A ready preview expires
+   after 15 minutes. One current job is allowed per canonical root; cancel it
+   before requesting a replacement.
+4. Apply runs in the **server background**. Disconnecting or interrupting the
+   client does **not** cancel confirmed work. Use these commands to inspect,
+   cancel after the current durable batch, or confirm the same preview after a
+   long scan:
+
+   ```bash
+   context-intelligence-server blobs prune-status --online JOB_UUID
+   context-intelligence-server blobs prune-cancel --online JOB_UUID
+   context-intelligence-server blobs prune --online --job-id JOB_UUID --apply
+   ```
+
+Repeat `--server-url`/`--admin-key-file` with these commands when needed. Cached
+status includes root, cutoff, counts/errors, phase, scan windows, recovery rows,
+and at most five sample URIs. States are `previewing`, `ready`, `running`,
+`cancelling`, `completed`, `cancelled`, `failed`, and `interrupted`. Counts during
+apply describe the rescan and actual deletion; they need not equal the preview.
+
+The admin API uses the existing admin guard: `POST /admin/blobs/prune`
+with `{"older_than":"30d"}`, `GET /admin/blobs/prune[/{uuid}]`,
+`POST /admin/blobs/prune/{uuid}/start` with `{"confirmation":"prune"}`, and
+`POST /admin/blobs/prune/{uuid}/cancel`. HTTP cannot choose roots or cutoffs.
+Busy/stale starts return `409`; unknown current ids return `404`.
+
+**Coordination boundary:** online mode requires the single server worker and a
+64-bit Linux local filesystem with working Linux directory cookies, POSIX flock,
+atomic rename/unlink, directory fsync, and SQLite durability. Reopened directory
+cookies are not portable to macOS; use offline pruning there. Live scans may
+omit/revisit entries changed concurrently; they are estimates, not snapshot
+completeness guarantees. No filesystem descriptor/lease spans an async yield.
+
+All BlobStore instances in the **server process**, including HTTP-created stores
+and canonical aliases, use FIFO shared cohorts/exclusive batches. Ordinary
+read/write/list/size/dump take shared leases. Whole-session filesystem deletion
+takes an exclusive lease only after graph/queue work; no graph/queue lock is held
+by pruning. Maintenance has its own single-thread executor, not the ordinary
+filesystem pool. Scan windows inspect at most 512 entries with a cooperative
+10 ms target. Apply uses at most 32 candidates per batch and yields at least
+50 ms between batches. A slow filesystem call/fsync can exceed these targets.
+Recovery pages seek by URI primary key, inspect at most 512 rows including
+nonpending rows, and filter in memory; the eight-column ledger is not migrated,
+reindexed, loaded in full, or switched to WAL.
+
+This process-local lease does **not** coordinate a separate writer process.
+Stop any external/old writers through their service manager before online apply.
+There is no standalone writer bypass. The lifetime shared external flock remains
+held between batches, so the offline exclusive CLI still refuses while the server
+is running. Online mode never upgrades that flock.
+
+After confirmation, the server durably writes one versioned current-job snapshot
+in the private expiry directory **before** deletion and checkpoints between
+batches. Journal-before-unlink and pinned-directory fsync-before-completion
+preserve expiry durability. On restart, an unfinished confirmed snapshot becomes
+`interrupted`; deletion **never** resumes automatically. Request and confirm a
+new preview to recover eligible pending records. Shutdown rejects new jobs,
+finishes an admitted batch, quiesces drainers, waits for actual filesystem
+operations/maintenance-thread exit, and only then releases the lifetime flock.
+No scheduler, automatic prune, service restart, graph/session deletion, or queue
+cleanup is added.
+
+### Offline: maintenance window required
+
 ```bash
 context-intelligence-server blobs prune --older-than 30d
 # Optional explicit EXISTING blob root:
@@ -84,8 +181,8 @@ return `410` with `detail: {"code": "blob_expired", "uri": "ci-blob://..."}`.
 An absent unrecorded URI remains `404`; authentication is unchanged. Replay keeps
 the canonical URI successfully without recreating or refreshing tombstoned
 payloads. Physically restored payloads remain readable, but this command supplies
-no restore feature. Existing clients fail loudly on `410`; v1 adds no client or
-capture changes, automatic scheduling, or deployment.
+no restore feature. Existing blob readers fail loudly on `410`; retention adds
+no capture changes, automatic scheduling, or deployment.
 
 ---
 

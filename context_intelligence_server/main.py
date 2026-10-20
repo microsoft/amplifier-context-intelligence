@@ -38,7 +38,8 @@ from context_intelligence_server.authz import (  # noqa: F401 — re-exported fo
     require_write,
 )
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
-from context_intelligence_server.blob_retention import BlobExpiredError, RootLock
+from context_intelligence_server.blob_retention import BlobExpiredError
+from context_intelligence_server.retention_service import RetentionService
 from context_intelligence_server.config import Neo4jClientConfig, Settings, get_settings
 from context_intelligence_server.idempotency import EventIdempotencyCache
 from context_intelligence_server.identity_store import IdentityStore
@@ -1249,9 +1250,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     try:
         # Worker-local (not the pre-fork gunicorn arbiter): hold until all
         # drainers and drivers finish shutdown, including startup recovery.
-        with RootLock(settings.blob_path, create_root=True):
+        service = await RetentionService.open(settings.blob_path)
+        app.state.retention_service = service
+        try:
             async with _server_lifespan(app):
-                yield
+                try:
+                    yield
+                finally:
+                    # Stop maintenance before quiescing drainers, but retain the
+                    # lifetime flock until their final writes and real I/O exit.
+                    await service.stop()
+        finally:
+            await service.close()
     finally:
         instance_lock.release()
 

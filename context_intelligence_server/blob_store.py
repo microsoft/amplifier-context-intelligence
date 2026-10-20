@@ -12,7 +12,6 @@ loop non-blocking.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import shutil
@@ -25,6 +24,7 @@ from typing import Any, Protocol, cast, runtime_checkable
 from context_intelligence_server.blob_retention import (
     BlobExpiredError, RootLock, component, expired, parse_uri,
 )
+from context_intelligence_server.blob_coordination import filesystem
 _SCHEME = "ci-blob://"
 
 
@@ -179,7 +179,7 @@ class AsyncDiskBlobStore:
                             pass
                         raise
 
-        await asyncio.to_thread(_write)
+        await filesystem(self._root, _write)
         return uri
 
     async def read(self, uri: str) -> dict[str, Any] | list[Any]:
@@ -209,7 +209,7 @@ class AsyncDiskBlobStore:
                         raise BlobExpiredError(uri)
                     raise FileNotFoundError(f"Blob not found: {uri!r} (path: {path})")
 
-        return await asyncio.to_thread(_read)
+        return await filesystem(self._root, _read)
 
     async def list(self, session_id: str) -> list[str]:
         """Return all blob URIs for *session_id*, sorted lexicographically.
@@ -230,7 +230,7 @@ class AsyncDiskBlobStore:
                 except FileNotFoundError:
                     return []
 
-        return await asyncio.to_thread(_list)
+        return await filesystem(self._root, _list)
 
     async def size(self, uri: str) -> int:
         """Return the byte size of the blob addressed by *uri*, or 0 if missing."""
@@ -246,7 +246,7 @@ class AsyncDiskBlobStore:
                 except FileNotFoundError:
                     return 0
 
-        return await asyncio.to_thread(_size)
+        return await filesystem(self._root, _size)
 
     async def delete_session(self, session_id: str) -> int:
         """Delete all blobs for *session_id* and return the number removed.
@@ -266,7 +266,7 @@ class AsyncDiskBlobStore:
                 except FileNotFoundError:
                     return 0
 
-        return await asyncio.to_thread(_delete)
+        return await filesystem(self._root, _delete, exclusive=True)
 
     async def dump(self, uri: str, dest_dir: Path | str | None = None) -> str:
         """Copy the blob file addressed by *uri* to *dest_dir*.
@@ -318,7 +318,7 @@ class AsyncDiskBlobStore:
                         raise BlobExpiredError(uri)
                     raise FileNotFoundError(f"Blob not found: {uri!r}")
 
-        return await asyncio.to_thread(_copy)
+        return await filesystem(self._root, _copy)
 
     @staticmethod
     def _check_payload(fd: int) -> None:

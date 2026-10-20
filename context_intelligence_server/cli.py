@@ -24,9 +24,27 @@ def main(argv: list[str] | None = None) -> None:
     prune.add_argument("--older-than", default="30d", help="Positive integer s/m/h/d/w (default: 30d).")
     prune.add_argument("--blob-root", type=Path, help="Existing blob root; otherwise use existing settings.")
     prune.add_argument("--apply", action="store_true", help="Lock writers out and ask for interactive confirmation.")
+    prune.add_argument("--job-id", help="Online only: inspect/confirm this existing preview instead of creating another.")
+    status = commands.add_parser("prune-status", help="Read cached online job status.")
+    status.add_argument("job_id", nargs="?")
+    cancel = commands.add_parser("prune-cancel", help="Request online cancellation after the active durable batch.")
+    cancel.add_argument("job_id")
+    for command in (prune, status, cancel):
+        command.add_argument("--online", action="store_true", help="Use the running server's configured blob root.")
+        command.add_argument("--server-url", help="Server base URL; remote credentials require HTTPS.")
+        command.add_argument("--admin-key-file", type=Path, help="Private same-owner 0600/0400 raw admin token file.")
     args = parser.parse_args(argv[1:])
 
     try:
+        if args.online:
+            if getattr(args, "blob_root", None) is not None:
+                parser.error("--blob-root cannot be used with --online; only the server's configured root is allowed")
+            _online(args)
+            return
+        if args.command != "prune":
+            parser.error("prune-status and prune-cancel require --online")
+        if args.server_url or args.admin_key_file or args.job_id:
+            parser.error("--server-url, --admin-key-file and --job-id require --online")
         cutoff = retention.cutoff_for(retention.duration_ns(args.older_than))
         config = os.environ.get("AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE")
         if config is not None and (not config or not Path(config).is_file()):
@@ -53,6 +71,69 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(1)
     except (OSError, ValueError, retention.RetentionError, sqlite3.Error) as exc:
         print(f"Blob prune failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+
+def _online(args) -> None:
+    from context_intelligence_server.retention_client import (
+        ClientError, RetentionClient, admin_credential,
+    )
+    from context_intelligence_server.blob_retention import Report, duration_ns
+
+    try:
+        settings = None
+        if not args.server_url or not (
+            args.admin_key_file or os.environ.get("ADMIN_API_KEY")
+            or os.environ.get("AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY")
+        ):
+            from context_intelligence_server.config import get_settings
+            settings = get_settings()
+        url = args.server_url or f"http://127.0.0.1:{settings.server_port}"
+        # Validate transport before resolving credentials.
+        from context_intelligence_server.retention_client import server_url
+        server_url(url)
+        client = RetentionClient(url, admin_credential(args.admin_key_file, settings))
+        if args.command == "prune-status":
+            job = client.status(args.job_id)
+        elif args.command == "prune-cancel":
+            job = client.cancel(args.job_id)
+        else:
+            duration_ns(args.older_than)
+            job = client.status(args.job_id) if args.job_id else client.preview(args.older_than)
+            print(f"Preview job: {job['id']} (server runs scan in background)", flush=True)
+            job = client.wait_preview(job)
+        print(f"Job: {job['id']}\nState: {job['state']}\n{Report(**job['report']).text()}", flush=True)
+        if job.get("error"):
+            print(f"Job error: {job['error']}", file=sys.stderr)
+        if args.command == "prune" and args.apply and job["state"] == "ready":
+            print("Live estimate, not an immutable manifest. Apply rescans the same cutoff; "
+                  "new or changed files are retained. Graph and queue state are kept.", flush=True)
+            if not sys.stdin.isatty():
+                raise ClientError("Apply requires an interactive terminal; no --yes bypass")
+            try:
+                confirmed = input("Type 'prune' to expire these payloads: ") == "prune"
+            except EOFError:
+                confirmed = False
+            if not confirmed:
+                client.cancel(job["id"])
+                print("Prune not confirmed; preview cancelled, no payloads deleted.")
+                return
+            job = client.start(job["id"], "prune")
+            print(f"Apply accepted: {job['id']}; runs in the server background. "
+                  "Disconnecting does NOT cancel it.", flush=True)
+        print(f"Status: context-intelligence-server blobs prune-status --online {job['id']} "
+              f"--server-url {url}\nCancel: context-intelligence-server blobs prune-cancel --online "
+              f"{job['id']} --server-url {url}", flush=True)
+        if args.command == "prune" and job["state"] in {"previewing", "ready"}:
+            print(f"Confirm this same preview when ready: context-intelligence-server blobs prune --online "
+                  f"--job-id {job['id']} --apply --server-url {url}", flush=True)
+        if job["state"] in {"failed", "interrupted"} or job["report"]["errors"]:
+            raise SystemExit(1)
+    except KeyboardInterrupt:
+        print("Client interrupted. Remote work is NOT automatically cancelled; use prune-status/prune-cancel.", file=sys.stderr)
+        raise SystemExit(130) from None
+    except (ClientError, OSError, ValueError) as exc:
+        print(f"Online blob prune failed: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
 
 

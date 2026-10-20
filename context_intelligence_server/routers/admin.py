@@ -35,12 +35,15 @@ from __future__ import annotations
 
 import logging
 import re
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from context_intelligence_server.config import _ALL_ZEROS_GUID, _GUID_RE
 from context_intelligence_server.identity_store import IdentityStore
+from context_intelligence_server.blob_retention import duration_ns
+from context_intelligence_server.retention_service import JobConflict, JobNotFound, RetentionService
 
 # ---------------------------------------------------------------------------
 # Validation constants
@@ -370,6 +373,64 @@ router = APIRouter(
     dependencies=[Depends(require_admin)],
     include_in_schema=False,
 )
+
+
+class PruneBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    older_than: str = Field(max_length=32)
+
+    @field_validator("older_than")
+    @classmethod
+    def valid_age(cls, value: str) -> str:
+        duration_ns(value)
+        return value
+
+
+class PruneStartBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    confirmation: str = Field(max_length=16)
+
+
+def _retention(request: Request) -> RetentionService:
+    service = getattr(request.app.state, "retention_service", None)
+    if service is None:
+        raise HTTPException(503, "Online retention is not running")
+    return service
+
+
+async def _prune_call(operation):
+    try:
+        return await operation
+    except JobNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except JobConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.post("/blobs/prune", status_code=202)
+async def preview_blobs(body: PruneBody, request: Request) -> dict:
+    return await _prune_call(_retention(request).preview(body.older_than))
+
+
+@router.get("/blobs/prune")
+@router.get("/blobs/prune/{job_id}")
+async def blob_prune_status(request: Request, job_id: UUID | None = None) -> dict:
+    try:
+        return _retention(request).status(str(job_id) if job_id is not None else None)
+    except JobNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.post("/blobs/prune/{job_id}/start", status_code=202)
+async def start_blob_prune(job_id: UUID, body: PruneStartBody, request: Request) -> dict:
+    return await _prune_call(_retention(request).start(str(job_id), body.confirmation))
+
+
+@router.post("/blobs/prune/{job_id}/cancel", status_code=202)
+async def cancel_blob_prune(job_id: UUID, request: Request) -> dict:
+    return await _prune_call(_retention(request).cancel(str(job_id)))
 
 
 # --- Entra identities -------------------------------------------------------

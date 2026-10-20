@@ -8,10 +8,12 @@ protect against unsafe on-disk entries, not a hostile process with our own uid.
 from __future__ import annotations
 
 import fcntl
+import ctypes
 import os
 import re
 import sqlite3
 import stat
+import sys
 import time
 import uuid
 from contextlib import contextmanager
@@ -634,3 +636,198 @@ def apply(
             if batch:
                 flush()
         return result
+
+
+@dataclass
+class ScanCursor:
+    """Only directory cookies and identities; never open fds or a tree-sized list."""
+
+    root_identity: tuple[int, int] | None = None
+    root_cookie: int = 0
+    session: str | None = None
+    session_cookie: int = 0
+    blobs_identity: tuple[int, int] | None = None
+    done: bool = False
+
+
+@contextmanager
+def _directory_entries(fd: int, cookie: int) -> Iterator[Iterator[tuple[str, int]]]:
+    """Linux 64-bit directory cookies, qualified by live-scan tests.
+
+    POSIX telldir cookies are NOT portable across reopened DIR streams (notably
+    on macOS). Linux glibc uses the filesystem's offset directly. Refuse other
+    ABIs rather than silently skip entries. No DIR or descriptor escapes a window.
+    Cookies provide a live estimate under mutations, not snapshot completeness.
+    """
+    if sys.platform != "linux" or ctypes.sizeof(ctypes.c_void_p) != 8:
+        raise RetentionError("Online bounded directory scans require 64-bit Linux; use offline prune")
+
+    class Dirent(ctypes.Structure):
+        _fields_ = [
+            ("ino", ctypes.c_ulong), ("off", ctypes.c_long),
+            ("reclen", ctypes.c_ushort), ("type", ctypes.c_ubyte),
+            ("name", ctypes.c_char * 256),
+        ]
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.fdopendir.argtypes, libc.fdopendir.restype = [ctypes.c_int], ctypes.c_void_p
+    libc.readdir.argtypes, libc.readdir.restype = [ctypes.c_void_p], ctypes.POINTER(Dirent)
+    libc.seekdir.argtypes, libc.seekdir.restype = [ctypes.c_void_p, ctypes.c_long], None
+    libc.telldir.argtypes, libc.telldir.restype = [ctypes.c_void_p], ctypes.c_long
+    libc.closedir.argtypes, libc.closedir.restype = [ctypes.c_void_p], ctypes.c_int
+    owned = os.open(".", _DIR, dir_fd=fd)
+    stream = libc.fdopendir(owned)
+    if not stream:
+        os.close(owned)
+        raise OSError(ctypes.get_errno(), "fdopendir failed")
+    try:
+        libc.seekdir(stream, cookie)
+
+        def entries() -> Iterator[tuple[str, int]]:
+            while True:
+                ctypes.set_errno(0)
+                entry = libc.readdir(stream)
+                if not entry:
+                    if error := ctypes.get_errno():
+                        raise OSError(error, "readdir failed")
+                    return
+                name = os.fsdecode(entry.contents.name)
+                yield name, libc.telldir(stream)
+
+        yield entries()
+    finally:
+        if libc.closedir(stream) != 0:
+            raise OSError(ctypes.get_errno(), "closedir failed")
+
+
+def scan_window(
+    path: Path, cursor: ScanCursor, report: Report, preview_started_ns: int,
+    *, max_entries: int = 512, budget_ns: int = 10_000_000,
+    max_candidates: int = 32,
+) -> list[Candidate]:
+    """Caller holds a process-local shared lease; all resources close on return."""
+    items: list[Candidate] = []
+    inspected = 0
+    started = time.monotonic_ns()
+
+    def full() -> bool:
+        return (inspected >= max_entries or len(items) >= max_candidates
+                or (inspected > 0 and time.monotonic_ns() - started >= budget_ns))
+
+    with Root(path) as root:
+        identity = _identity(os.fstat(root.fd))
+        if cursor.root_identity is not None and cursor.root_identity != identity:
+            raise RetentionError("Blob root changed between scan windows")
+        cursor.root_identity = identity
+        while not cursor.done and not full():
+            if cursor.session is None:
+                with _directory_entries(root.fd, cursor.root_cookie) as entries:
+                    for name, cookie in entries:
+                        inspected += 1
+                        cursor.root_cookie = cookie
+                        if name not in (".", "..", LOCK, METADATA):
+                            try:
+                                component(name)
+                                st = os.stat(name, dir_fd=root.fd, follow_symlinks=False)
+                                if stat.S_ISDIR(st.st_mode):
+                                    cursor.session = name
+                                    cursor.session_cookie = 0
+                                    cursor.blobs_identity = None
+                                    break
+                                report.skipped += 1
+                            except (ValueError, FileNotFoundError):
+                                report.skipped += 1
+                        if full():
+                            return items
+                    else:
+                        cursor.done = True
+                if cursor.session is None or full():
+                    continue
+            try:
+                with root.blobs(cursor.session) as fd:
+                    identity = _identity(os.fstat(fd))
+                    if cursor.blobs_identity is not None and identity != cursor.blobs_identity:
+                        report.changed += 1
+                        cursor.session = None
+                        continue
+                    cursor.blobs_identity = identity
+                    with _directory_entries(fd, cursor.session_cookie) as entries:
+                        for name, cookie in entries:
+                            inspected += 1
+                            cursor.session_cookie = cookie
+                            if name not in (".", ".."):
+                                try:
+                                    if not name.endswith(".json"):
+                                        report.skipped += 1
+                                    else:
+                                        key = component(name[:-5])
+                                        st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                                        if not _regular(st):
+                                            report.skipped += 1
+                                        elif st.st_mtime_ns >= report.cutoff_ns or st.st_ctime_ns > preview_started_ns:
+                                            report.retained += 1
+                                        else:
+                                            item = Candidate(f"ci-blob://{cursor.session}/{key}", fingerprint(st), st.st_blocks * 512)
+                                            items.append(item)
+                                            report.files += 1
+                                            report.logical_bytes += st.st_size
+                                            report.allocated_bytes += item.allocated
+                                            if len(report.samples) < 5:
+                                                report.samples.append(item.uri)
+                                except (ValueError, FileNotFoundError):
+                                    report.skipped += 1
+                                except OSError:
+                                    report.errors += 1
+                            if full():
+                                return items
+                        cursor.session = None
+            except (FileNotFoundError, NotADirectoryError):
+                report.skipped += 1
+                cursor.session = None
+            except OSError:
+                # ELOOP and unsafe directories are skipped, never followed.
+                report.errors += 1
+                cursor.session = None
+    return items
+
+
+def recovery_page(path: Path, after: str, cutoff_ns: int, preview_started_ns: int) -> tuple[str, list[Candidate], int]:
+    """At most 512 PRIMARY KEY rows, including NONpending rows, under SH lease."""
+    with Root(path) as root, Ledger(root) as ledger:
+        if ledger.db is None:
+            return after, [], 0
+        rows = ledger.db.execute(
+            "SELECT uri, dev, ino, size, mtime_ns, ctime_ns, pending FROM expiry "
+            "WHERE uri>? ORDER BY uri LIMIT 512", (after,),
+        ).fetchall()
+        return (
+            rows[-1][0] if rows else after,
+            [Candidate(row[0], tuple(row[1:6]), 0) for row in rows
+             if row[6] and row[4] < cutoff_ns and row[5] <= preview_started_ns],
+            len(rows),
+        )
+
+
+def apply_batch(path: Path, items: list[Candidate], report: Report, *, recovery: bool = False) -> None:
+    """Caller holds EX in-process lease, never an upgraded flock."""
+    if len(items) > 64:
+        raise RetentionError("Online batch exceeds 64 candidates")
+    with Root(path) as root, root.checked_batch(), Ledger(root, writable=True) as ledger:
+        ready = []
+        for item in items:
+            if item.fp[3] >= report.cutoff_ns:
+                raise RetentionError("Candidate exceeds frozen cutoff")
+            if recovery:
+                ready.append(item)
+            elif ledger.contains(item.uri):
+                report.skipped += 1
+            elif _matches(root, item):
+                ready.append(item)
+            else:
+                report.changed += 1
+        if not recovery:
+            ledger.journal(ready)
+        with _sync_dirs() as directories:
+            for item in ready:
+                _unlink(root, ledger, item, report, dirty_dirs=directories)
+        ledger.commit()

@@ -275,6 +275,21 @@ successful no-rehydrate behavior. Never prune graph/session or queue state.
 Guide: `docs/service-setup.md` → "Manual blob retention — preview first".
 Tests: `uv run pytest tests/test_blob_retention.py tests/test_blob_store.py -q`.
 
+Online retention uses `blobs prune --online --older-than 30d [--apply]`, existing
+admin authority, and only the configured root. Long previews can be confirmed
+with `--job-id UUID --apply`; status/cancel commands never scan storage. All
+BlobStore instances MUST use the canonical-root FIFO thread coordinator; acquire
+leases inside real I/O threads and keep admitted work protected after await
+cancellation. Keep online EX batches bounded (32 candidates, ceiling 64), yield
+50 ms between batches, and use the dedicated maintenance executor. Never upgrade
+the lifetime shared flock or allow separate-process writers to bypass it. Online
+scan cookies require 64-bit Linux; offline mode stays portable. No descriptor or
+lease crosses a scan yield, and recovery pages filter at most 512 PRIMARY KEY
+rows in memory, not SQL-filtered full scans. Confirmed snapshots checkpoint before
+deletion; unfinished restart jobs are interrupted, NEVER auto-resumed. Shutdown
+must finish maintenance and drainers/real I/O before releasing external exclusion.
+Tests: `uv run pytest tests/test_online_retention.py tests/test_retention_client.py -q`.
+
 ### Temporal properties are `ZONED DATETIME`
 
 All temporal properties are stored as native Neo4j ZONED DATETIME, not ISO strings.
