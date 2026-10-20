@@ -700,6 +700,8 @@ class SessionRegistry:
         # ends in a dead-letter, the transient one is unbounded and never does.
         transient_attempts = 0
 
+        batch: Batch | None = None
+        committed_records: list[Record] | None = None
         while True:
             try:
                 # Clear/snapshot before reading while retaining this guard.
@@ -923,6 +925,10 @@ class SessionRegistry:
                 await self._safe_close(worker)
                 self._deregister(session_id)  # See the note above.
                 return
+            finally:
+                # Iteration ownership ends before the next read or idle await.
+                batch = None
+                committed_records = None
 
     @staticmethod
     def _parse_line(

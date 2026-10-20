@@ -3,14 +3,17 @@
 import asyncio
 import contextlib
 import dataclasses
+import gc
 import json
 import logging
 import sqlite3
 import time
+import weakref
 from collections import deque
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,6 +27,400 @@ from context_intelligence_server.registry import (
     SessionWorker,
 )
 from context_intelligence_server.services import HookStateService
+
+
+class _RetentionQueue(QueueManager):
+    """Observe only queue-created Records; never keep payloads or call histories."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.observed: list[tuple[weakref.ReferenceType[Record], int]] = []
+        self.idle: dict[str, asyncio.Event] = {}
+        self.trace: list[str] = []
+        self.read_ready = asyncio.Event()
+        self.read_ready.set()
+
+    async def read_batch(self, session_id: str, max_items: int):
+        await self.read_ready.wait()
+        batch = await super().read_batch(session_id, max_items)
+        self.observed.extend((weakref.ref(r), len(r.raw)) for r in batch.records)
+        if not batch.records:
+            # Runs after read_batch returns and the drainer enters its idle await.
+            asyncio.get_running_loop().call_soon(self.idle[session_id].set)
+        return batch
+
+    async def commit(self, session_id: str, new_offset: int) -> None:
+        self.trace.append("commit")
+        await super().commit(session_id, new_offset)
+
+    def live_count(self) -> int:
+        gc.collect()
+        return sum(ref() is not None for ref, _ in self.observed)
+
+
+def _retention_worker(reg, qm, sid, monkeypatch):
+    """Real drain/parse/queue path; scalar-only handler and graph test doubles."""
+    async def flush():
+        qm.trace.append("flush")
+
+    async def close():
+        qm.trace.append("close")
+
+    async def dispatch(worker, event, data, handlers, **kwargs):
+        qm.trace.append("dispatch")
+
+    monkeypatch.setattr(registry_module, "setup_handlers", lambda services: {})
+    monkeypatch.setattr(reg, "_process_one", dispatch)
+    reg._queue_manager = qm
+    reg._write_semaphore = asyncio.Semaphore(4)
+    reg._max_delivery_attempts = 2
+    worker = SessionWorker(
+        session_id=sid, workspace="/ws",
+        services=SimpleNamespace(graph=SimpleNamespace(
+            flush=flush, close=close, discard_buffer=lambda: None,
+        )),
+    )
+    reg._register_for_test(worker)
+    qm.idle[sid] = asyncio.Event()
+    return worker
+
+
+async def _append_retention_records(qm, sid, generation=0, events=None):
+    for index, event in enumerate(events or ["tool:pre"] * 3):
+        await qm.append(sid, _line(event, "/ws", {
+            "session_id": sid,
+            "payload": f"{sid}:{generation}:{index}:" + chr(65 + index) * (1 << 20),
+        }))
+
+
+@pytest.mark.parametrize("worker_count", [1, 4])
+async def test_idle_payload_retention(tmp_path, monkeypatch, worker_count):
+    """An alive idle worker owns no completed Record, including repeated batches."""
+    qm = _RetentionQueue(tmp_path / "retention")
+    reg = SessionRegistry()
+    workers = [_retention_worker(reg, qm, f"idle-{i}", monkeypatch)
+               for i in range(worker_count)]
+    tasks = []
+    try:
+        for worker in workers:
+            await _append_retention_records(qm, worker.session_id)
+            tasks.append(asyncio.create_task(reg.drain_worker(worker, flush_timeout=60)))
+        for generation in range(2):
+            for worker in workers:
+                await asyncio.wait_for(qm.idle[worker.session_id].wait(), 5)
+                assert await qm.pending_count(worker.session_id) == 0
+            assert all(not task.done() for task in tasks)
+            assert len(qm.observed) == worker_count * 3 * (generation + 1)
+            assert all(size > (1 << 20) for _, size in qm.observed)
+            assert qm.live_count() == 0, "completed Records retained by alive idle drainers"
+            if generation == 0:
+                # Do not let an awakened worker split the next seeded batch
+                # while its three real append operations are still in progress.
+                qm.read_ready.clear()
+                for worker in workers:
+                    qm.idle[worker.session_id].clear()
+                    await _append_retention_records(qm, worker.session_id, generation=1)
+                qm.read_ready.set()
+        assert qm.trace.count("dispatch") == worker_count * 6
+        assert qm.trace.count("commit") == worker_count * 2
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(*tasks), 5)
+
+
+async def test_idle_payload_callback_owner(tmp_path, monkeypatch):
+    """Keep in-flight payloads, and rebind rather than mutate a callback's list."""
+    qm = _RetentionQueue(tmp_path / "callback-owner")
+    reg = SessionRegistry()
+    worker = _retention_worker(reg, qm, "callback", monkeypatch)
+    entered, release = asyncio.Event(), asyncio.Event()
+    owned = []
+
+    async def receipt(worker, records):
+        owned.append(records)
+        entered.set()
+        await release.wait()
+        assert len(records) == 3
+        assert all(len(record.raw) > (1 << 20) for record in records)
+
+    reg.on_batch_written = receipt
+    await _append_retention_records(qm, worker.session_id)
+    task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=60))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert not task.done()
+        assert qm.live_count() == 3
+        release.set()
+        await asyncio.wait_for(qm.idle[worker.session_id].wait(), 5)
+        assert not task.done()
+        assert len(owned[0]) == 3
+        assert qm.live_count() == 3  # Intentional external owner, not a leak.
+        owned.clear()
+        assert qm.live_count() == 0, "drainer retained callback records after owner release"
+    finally:
+        task.cancel()
+        await asyncio.wait_for(task, 5)
+
+
+@pytest.mark.parametrize("fault", [
+    "transient", "deterministic", "poison", "isolation_abort",
+    "notification", "read_error", "cancel_flush", "terminal",
+])
+async def test_payload_lifetime_faults(tmp_path, monkeypatch, fault):
+    """Exercise real retry, isolation, finalization and supervision with real offsets."""
+    qm = _RetentionQueue(tmp_path / "faults")
+    reg = SessionRegistry()
+    worker = _retention_worker(reg, qm, "fault", monkeypatch)
+    entered, release = asyncio.Event(), asyncio.Event()
+    flushes = 0
+    notifications = []
+    # Captured LogRecord tracebacks are intentional external owners of failed batches.
+    monkeypatch.setattr(registry_module.logger, "disabled", True)
+    monkeypatch.setattr(registry_module, "_DRAIN_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(registry_module, "_TRANSIENT_BACKOFF_BASE", 0.001)
+
+    async def flush():
+        nonlocal flushes
+        flushes += 1
+        qm.trace.append("flush")
+        if flushes == 1:
+            entered.set()
+            await release.wait()
+        if fault == "poison" or (
+            fault in ("deterministic", "isolation_abort") and flushes <= 2
+        ):
+            # deterministic: one failed batch, then succeed on the next.
+            if fault != "deterministic" or flushes == 1:
+                raise ValueError("synthetic deterministic graph failure")
+        if (fault == "transient" and flushes == 1) or (
+            fault == "isolation_abort" and flushes == 3
+        ):
+            raise ConnectionError("synthetic transient graph failure")
+
+    async def notify(worker, records):
+        notifications.append(len(records))
+        qm.trace.append("notify")
+        if fault == "notification":
+            raise RuntimeError("synthetic notification failure")
+
+    original_read = qm.read_batch
+    reads = 0
+
+    async def fail_read(sid, max_items):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            assert qm.live_count() == 0, "prior iteration payload survived until next read"
+            raise OSError("synthetic next-read failure")
+        return await original_read(sid, max_items)
+
+    worker.services.graph.flush = flush
+    reg.on_batch_written = notify
+    if fault == "read_error":
+        monkeypatch.setattr(qm, "read_batch", fail_read)
+    events = ["tool:pre", "session:end", "tool:post"] if fault == "terminal" else None
+    await _append_retention_records(qm, worker.session_id, events=events)
+    reg.start_drain(worker)
+    task = worker.task
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert qm.live_count() == 3
+        assert await QueueManager.pending_count(qm, worker.session_id) == 3
+        assert "commit" not in qm.trace
+        if fault == "cancel_flush":
+            task.cancel()
+        release.set()
+        if fault in ("terminal", "cancel_flush", "read_error"):
+            if fault == "read_error":
+                with pytest.raises(OSError, match="synthetic next-read"):
+                    await asyncio.wait_for(asyncio.shield(task), 5)
+            else:
+                await asyncio.wait_for(asyncio.shield(task), 5)
+            # Done callback supervises exceptions and owns its close task.
+            checkpoint = asyncio.Event()
+            asyncio.get_running_loop().call_soon(checkpoint.set)
+            await asyncio.wait_for(checkpoint.wait(), 5)
+            if reg._close_tasks:
+                await asyncio.wait_for(asyncio.gather(*list(reg._close_tasks)), 5)
+            assert worker.store_closed and reg.active_count() == 0
+        else:
+            await asyncio.wait_for(qm.idle[worker.session_id].wait(), 5)
+            assert not task.done()
+        assert qm.live_count() == 0
+        fresh = QueueManager(tmp_path / "faults")
+        assert await fresh.pending_count(worker.session_id) == (
+            3 if fault == "cancel_flush" else 0
+        )
+        dead = await fresh.read_dead_letters(worker.session_id)
+        assert len(dead) == (3 if fault == "poison" else 0)
+        if fault == "terminal":
+            assert notifications == [1, 2]  # Prefix then genuine finalizer tail.
+            assert qm.trace.count("dispatch") == 5
+            assert len(reg.completed_sessions()) == 1
+        elif fault in ("notification", "read_error"):
+            assert notifications == [3]
+            assert qm.trace.count("dispatch") == 3
+            assert qm.trace.index("flush") < qm.trace.index("commit")
+            assert qm.trace.index("commit") < qm.trace.index("notify")
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.wait_for(task, 5)
+
+async def test_payload_commit_effect_then_raise(tmp_path, monkeypatch):
+    """An irreversible queue commit still goes to supervision, never poison retry."""
+    from context_intelligence_server.recovery import RecoveryReceiptStore
+
+    qm = _RetentionQueue(tmp_path / "commit-effect")
+    reg = SessionRegistry()
+    worker = _retention_worker(reg, qm, "boundary", monkeypatch)
+    monkeypatch.setattr(registry_module.logger, "disabled", True)
+    origin = {"session_id": "boundary", "source_stream_sha256": "a" * 64,
+              "source_line_sha256": "b" * 64, "ordinal": 0}
+    receipts = RecoveryReceiptStore(tmp_path / "receipts.sqlite3")
+    lease = tmp_path / "lease.json"
+    lease.write_text(json.dumps({
+        "allow": True, "expires_at": time.time() + 60, "lease_id": "synthetic-lease",
+    }))
+    assert await receipts.admit(origin, "test", "/ws", {
+        "event": "tool:pre", "data": {"session_id": "boundary"},
+    }, lease) == "accepted"
+    await receipts.mark(origin, "enqueued")
+    original_commit = qm.commit
+
+    async def commit_effect(sid, offset):
+        await original_commit(sid, offset)
+        raise OSError("synthetic commit took effect then raised")
+
+    async def receipt(worker, records):
+        qm.trace.append("notify")
+        await receipts.mark(origin, "written")
+
+    monkeypatch.setattr(qm, "commit", commit_effect)
+    reg.on_batch_written = receipt
+    await _append_retention_records(qm, "boundary", events=["tool:pre"])
+    reg.start_drain(worker)
+    task = worker.task
+    with pytest.raises(OSError, match="took effect"):
+        await asyncio.wait_for(asyncio.shield(task), 5)
+    checkpoint = asyncio.Event()
+    asyncio.get_running_loop().call_soon(checkpoint.set)
+    await asyncio.wait_for(checkpoint.wait(), 5)
+    if reg._close_tasks:
+        await asyncio.wait_for(asyncio.gather(*list(reg._close_tasks)), 5)
+    assert worker.store_closed and reg.active_count() == 0
+    assert qm.trace.count("dispatch") == 1
+    assert "notify" not in qm.trace
+    assert await QueueManager(tmp_path / "commit-effect").pending_count("boundary") == 0
+    # Notification follows commit, so this failure leaves the receipt enqueued.
+    assert await RecoveryReceiptStore(tmp_path / "receipts.sqlite3").status() == {"enqueued": 1}
+    assert await qm.read_dead_letters("boundary") == []
+
+
+@pytest.mark.parametrize("denial", ["provisional", "alias"])
+async def test_startup_scoped_probe_releases_payloads(tmp_path, monkeypatch, denial):
+    """Scoped startup rejects unsafe bindings and releases every probe before idle."""
+    import context_intelligence_server.main as main
+    from context_intelligence_server.queue_manager import fold_worker_key
+    from context_intelligence_server.session_claims import SessionClaimStore
+
+    root = tmp_path / "scoped-startup"
+    qm = _RetentionQueue(root)
+    reg = SessionRegistry()
+    reg._queue_manager = qm
+    claims = SessionClaimStore(tmp_path / "claims.sqlite3")
+    blocked_original = "a-blocked-" * 60
+    allowed_original = "z-allowed-" * 60
+    blocked_key = fold_worker_key(blocked_original)
+    allowed_key = fold_worker_key(allowed_original)
+    assert await claims.claim(allowed_original, "owner", "/ws")
+    if denial == "provisional":
+        assert await claims.reserve_recovery(
+            blocked_original, "owner", "/ws", "token"
+        ) == "reserved"
+    else:
+        # Same owner/workspace is insufficient: the folded alias is another original.
+        assert await claims.claim(blocked_key, "owner", "/ws")
+    assert not await claims.storage_identity_matches(blocked_original)
+    assert await claims.storage_identity_matches(allowed_original)
+    for key, original in (
+        (blocked_key, blocked_original), (allowed_key, allowed_original)
+    ):
+        await qm.append(key, json.dumps({
+            "event": "tool:pre", "workspace": "/ws", "created_by": "owner",
+            "data": {"session_id": original, "payload": "x" * (1 << 20)},
+        }).encode())
+    expected_keys = [blocked_key, allowed_key]
+    assert await qm.recover() == expected_keys
+    spawned, probed, reclaim_live, sweep_live = [], [], [], []
+    original_read, original_reclaim = qm.read_batch, qm.reclaim_drained_orphans
+    sweep_entered, park = asyncio.Event(), asyncio.Event()
+
+    def get_or_create(sid, workspace, *, created_by=None):
+        spawned.append((sid, workspace, created_by))
+
+    async def read(sid, max_items):
+        assert qm.live_count() == 0, "previous startup probe survived into next read"
+        probed.append(sid)
+        batch = await original_read(sid, max_items)
+        # Release the completed to_thread Future's ownership before measuring startup.
+        checkpoint = asyncio.Event()
+        asyncio.get_running_loop().call_soon(checkpoint.set)
+        await asyncio.wait_for(checkpoint.wait(), 5)
+        return batch
+
+    async def reclaim():
+        reclaim_live.append(qm.live_count())
+        return await original_reclaim()
+
+    async def sweep(interval, limit):
+        assert interval == 1 and limit == 2
+        sweep_live.append(qm.live_count())
+        sweep_entered.set()
+        await park.wait()
+
+    monkeypatch.setattr(reg, "get_or_create", get_or_create)
+    monkeypatch.setattr(qm, "read_batch", read)
+    monkeypatch.setattr(qm, "reclaim_drained_orphans", reclaim)
+    monkeypatch.setattr(main, "registry", reg)
+    monkeypatch.setattr(main, "_settings", SimpleNamespace(
+        crash_recovery_respawn_limit=2, crash_recovery_sweep_interval_seconds=1,
+    ))
+    monkeypatch.setattr(main, "_crash_recovery_sweep_loop", sweep)
+    test_app = SimpleNamespace(state=SimpleNamespace(
+        access_control_mode="scoped", session_claims=claims,
+        recovery_complete=asyncio.Event(),
+    ))
+    task = asyncio.create_task(main._startup_recovery_body(test_app))
+    try:
+        await asyncio.wait_for(sweep_entered.wait(), 5)
+        assert not task.done(), "measure the still-live startup coroutine"
+        assert test_app.state.recovery_complete.is_set()
+        assert spawned == [(allowed_key, "/ws", "owner")]
+        assert probed == expected_keys
+        assert len(qm.observed) == 2
+        assert all(size > (1 << 20) for _, size in qm.observed)
+        assert reclaim_live == [0]
+        assert sweep_live == [0]
+        assert qm.live_count() == 0
+        assert reg._accepted_total == 2 and reg._written_total == 0
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+
+    fresh = QueueManager(root)
+    assert await fresh.recover() == expected_keys
+    for key, original in (
+        (blocked_key, blocked_original), (allowed_key, allowed_original)
+    ):
+        assert await fresh.pending_count(key) == 1
+        data = json.loads((await fresh.read_batch(key, 1)).lines[0])
+        assert data["data"]["session_id"] == original
+        assert data["created_by"] == "owner"
+        assert await fresh.read_dead_letters(key) == []
+
 
 # ---------------------------------------------------------------------------
 # Factory helper
@@ -1934,14 +2331,27 @@ class TestWrittenCounterWiring:
 
         assert reg.pipeline_counters()["write_retries_total"] >= 1
 
+    @pytest.mark.parametrize("commit_return_delay", [0.0, 0.05])
     async def test_exhausted_batch_per_line_success_increments_written(
-        self, reg_qm: tuple[SessionRegistry, Any]
+        self,
+        reg_qm: tuple[SessionRegistry, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        commit_return_delay: float,
     ) -> None:
         """During linear poison isolation, each line that flushes successfully
         increments written_total by 1; the dead-lettered poison line does not.
         For [good1, poison, good2] -> written_total == 2."""
         reg, qm = reg_qm
         sid = "wcw-exhausted"
+
+        original_commit = qm.commit
+
+        async def _commit(session_id: str, new_offset: int) -> None:
+            await original_commit(session_id, new_offset)
+            # The offset is visible before commit returns to the drainer.
+            await asyncio.sleep(commit_return_delay)
+
+        monkeypatch.setattr(qm, "commit", _commit)
 
         fake = _AccumBufferGraph()
         worker = SessionWorker(
@@ -1963,22 +2373,23 @@ class TestWrittenCounterWiring:
             await qm.append(sid, _line("poison", "/ws", {"session_id": sid}))
             await qm.append(sid, _line("good2", "/ws", {"session_id": sid}))
             task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
-            for _ in range(400):
-                await asyncio.sleep(0.01)
-                # Queue commit precedes the written counter update; do not
-                # cancel the drainer in that legitimate intermediate state.
-                if (
-                    (await qm.read_batch(sid, 10)).lines == []
-                    and reg.pipeline_counters()["written_total"] == 2
-                ):
-                    break
-            task.cancel()
             try:
-                await task
-            except asyncio.CancelledError:
-                pass
+                for _ in range(400):
+                    await asyncio.sleep(0.01)
+                    # An empty queue can precede the final counter update.
+                    if reg.pipeline_counters()["written_total"] == 2:
+                        break
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
         assert reg.pipeline_counters()["written_total"] == 2
+        assert (await qm.read_batch(sid, 10)).lines == []
+        assert fake.flushed == ["good1", "good2"]
+        dead = await qm.read_dead_letters(sid)
+        assert len(dead) == 1
+        assert json.loads(dead[0]["payload"])["event"] == "poison"
 
     async def test_finalize_tail_commit_increments_written(
         self, reg_qm: tuple[SessionRegistry, Any]
