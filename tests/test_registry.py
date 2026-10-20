@@ -1934,14 +1934,27 @@ class TestWrittenCounterWiring:
 
         assert reg.pipeline_counters()["write_retries_total"] >= 1
 
+    @pytest.mark.parametrize("commit_return_delay", [0.0, 0.05])
     async def test_exhausted_batch_per_line_success_increments_written(
-        self, reg_qm: tuple[SessionRegistry, Any]
+        self,
+        reg_qm: tuple[SessionRegistry, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        commit_return_delay: float,
     ) -> None:
         """During linear poison isolation, each line that flushes successfully
         increments written_total by 1; the dead-lettered poison line does not.
         For [good1, poison, good2] -> written_total == 2."""
         reg, qm = reg_qm
         sid = "wcw-exhausted"
+
+        original_commit = qm.commit
+
+        async def _commit(session_id: str, new_offset: int) -> None:
+            await original_commit(session_id, new_offset)
+            # The offset is visible before commit returns to the drainer.
+            await asyncio.sleep(commit_return_delay)
+
+        monkeypatch.setattr(qm, "commit", _commit)
 
         fake = _AccumBufferGraph()
         worker = SessionWorker(
@@ -1963,17 +1976,23 @@ class TestWrittenCounterWiring:
             await qm.append(sid, _line("poison", "/ws", {"session_id": sid}))
             await qm.append(sid, _line("good2", "/ws", {"session_id": sid}))
             task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
-            for _ in range(400):
-                await asyncio.sleep(0.01)
-                if (await qm.read_batch(sid, 10)).lines == []:
-                    break
-            task.cancel()
             try:
-                await task
-            except asyncio.CancelledError:
-                pass
+                for _ in range(400):
+                    await asyncio.sleep(0.01)
+                    # An empty queue can precede the final counter update.
+                    if reg.pipeline_counters()["written_total"] == 2:
+                        break
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
         assert reg.pipeline_counters()["written_total"] == 2
+        assert (await qm.read_batch(sid, 10)).lines == []
+        assert fake.flushed == ["good1", "good2"]
+        dead = await qm.read_dead_letters(sid)
+        assert len(dead) == 1
+        assert json.loads(dead[0]["payload"])["event"] == "poison"
 
     async def test_finalize_tail_commit_increments_written(
         self, reg_qm: tuple[SessionRegistry, Any]
