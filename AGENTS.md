@@ -263,6 +263,19 @@ isolated environment with the Neo4j container cut off from the internet.
 
 ### Manual blob retention safety
 
+Scoped claims bind both blob-session and queue-worker physical names to the
+original session in the existing claim database. Reuse the storage folding
+helpers; never authorize a canonical blob URI by exact-literal claim lookup.
+Backfill includes provisional reservations and marks collisions ambiguous
+(NULL binding), without guessing from disk or graph contents. Claim/reservation
+admission and recovery dispatch must fail closed on conflicting bindings.
+Summary and deletion preflight every resolved original session through the
+request-bound storage guard before reading or mutating blob/queue storage;
+authorizing only the requested root does not protect ambiguous descendants.
+Graph/session identities remain original, and blob authorization still applies
+workspace/capability grants, not owner-only access. Regression checks:
+`tests/test_storage_bindings.py` and `tests/test_retention_name_integration.py`.
+
 `context-intelligence-server blobs prune --older-than 30d` previews storage-mtime
 expiry; `--apply` requires a terminal and explicit `prune` confirmation. The
 manual command never schedules or restarts services. Stop old unpatched writers through the

@@ -10,6 +10,15 @@ on:
       - 'context_intelligence_server/**'
       - 'pyproject.toml'
       - 'uv.lock'
+  # Nightly OS-patch refresh. The image floats its Azure Linux base and runs
+  # `tdnf update` at build time, but that layer is cache-keyed on its instruction
+  # text, so without a periodic cache bust it stops absorbing patches while the
+  # Trivy gate keeps scanning against a fresh vuln DB -- main goes red with no
+  # code change. This run pays the rebuild unattended and republishes
+  # :buildcache, so the day's merges stay fast AND current. A new CVE with no
+  # available fix surfaces here at 03:00 UTC instead of ambushing the next merge.
+  schedule:
+    - cron: '0 3 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -47,6 +56,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # UTC date, not run id: busting per-run would rebuild the OS layer (and
+      # every layer after it, including `uv pip install`) on every single merge.
+      # Per-day means the first build of the day pays ~+2 min and the rest of the
+      # day's builds hit the refreshed cache. See Dockerfile ARG OS_PATCH_EPOCH.
+      - name: Compute OS patch epoch (daily cache bust)
+        id: epoch
+        run: echo "day=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push Docker image
         id: push
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
@@ -54,14 +71,22 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          build-args: |
+            OS_PATCH_EPOCH=${{ steps.epoch.outputs.day }}
           tags: |
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
             ${{ env.IMAGE_NAME }}:latest
           cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
 
+      # Pinned to a SHA like every other action here, so Dependabot's existing
+      # github-actions group proposes upgrades on a reviewable schedule instead of
+      # this workflow silently tracking upstream master. NOTE: pinning the ACTION
+      # does not pin Trivy's vulnerability DB -- that is still fetched fresh at
+      # run time, by design. Currency of the image, not of the action, is what
+      # keeps this gate green.
       - name: Scan image for vulnerabilities
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: "${{ env.IMAGE_NAME }}:${{ github.sha }}"
           format: "table"
@@ -83,6 +108,9 @@ jobs:
 
   deploy:
     needs: build
+    # The nightly run exists to refresh the image and the buildcache, NOT to ship
+    # unattended at 03:00. Deploys stay tied to a merge or an explicit manual run.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: production

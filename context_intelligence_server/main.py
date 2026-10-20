@@ -31,6 +31,7 @@ from context_intelligence_server.auth import (
 from context_intelligence_server.authz import (  # noqa: F401 — re-exported for tests/routes
     _is_write_capable,
     require_arbitrary_data_read,
+    require_claimed_blob_access,
     require_claimed_session_access,
     require_read,
     require_recovery_write,
@@ -64,6 +65,7 @@ from context_intelligence_server.neo4j_store import (
     ensure_neo4j_schema,
     mark_schema_ready,
 )
+from context_intelligence_server.queue_manager import fold_worker_key
 from context_intelligence_server.registry import LiveFirstFlushGate, SessionRegistry
 from context_intelligence_server.recovery import (
     PermitResult,
@@ -338,7 +340,9 @@ async def _crash_recovery_topup(respawn_limit: int | None) -> int:
         # get_or_create, whether or not a drainer already existed (get_or_create
         # is idempotent). So this count is "sessions dispatched this pass", an
         # upper bound on newly-spawned drainers -- fine for an INFO log.
-        if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
+        if await _scoped_queue_binding_matches(app, sid, batch.lines[0]) and _recover_one_session(
+            sid, batch.lines[0], registry.get_or_create
+        ):
             respawned += 1
     return respawned
 
@@ -392,7 +396,7 @@ async def _startup_recovery(app: FastAPI) -> None:
         await _startup_recovery_body(app)
     except asyncio.CancelledError:
         raise  # shutdown -- not a failure, and must propagate
-    except Exception as exc:  # noqa: BLE001 - background task boundary
+    except Exception as exc:
         app.state.recovery_error = repr(exc)
         logger.exception(
             "startup_recovery: FAILED -- conservation counters may be unseeded "
@@ -406,6 +410,31 @@ async def _startup_recovery(app: FastAPI) -> None:
 
 async def _startup_recovery_body(app: FastAPI) -> None:
     """The actual recovery pass. See ``_startup_recovery`` for why it is split."""
+    # Migrate any pre-fold over-budget worker keys onto their folded name
+    # FIRST -- before anything else below reads or writes their files.
+    # Ingest (post_events) has folded every NEW key since this fix shipped,
+    # but a file already written under the raw, over-budget name would
+    # otherwise keep choking commit()/_count_dead forever, even post-fix.
+    # Never raises: a boot pass must not crash-loop the container.
+    try:
+        (
+            _migrated,
+            _skipped,
+            _failed,
+        ) = await registry.queue_manager.migrate_overlong_keys()
+    except Exception:
+        logger.exception("startup_recovery: overlong-key migration failed; continuing")
+    else:
+        if _migrated or _skipped or _failed:
+            logger.info(
+                "startup_recovery: migrated %d overlong worker key(s), "
+                "%d skipped (folded target already existed), %d failed "
+                "(see migrate_overlong_keys_key_failed logs -- these keys "
+                "remain unhealed and will keep failing to drain)",
+                _migrated,
+                _skipped,
+                _failed,
+            )
     # Crash recovery: on startup, respawn one drainer per
     # session that still has an undrained, complete line. The workspace is
     # parsed from that session's FIRST log line so the respawned worker is
@@ -460,7 +489,9 @@ async def _startup_recovery_body(app: FastAPI) -> None:
         batch = await registry.queue_manager.read_batch(sid, max_items=1)
         if not batch.lines:
             continue
-        if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
+        if await _scoped_queue_binding_matches(app, sid, batch.lines[0]) and _recover_one_session(
+            sid, batch.lines[0], registry.get_or_create
+        ):
             respawned += 1
     if deferred_count:
         # WARNING, not INFO, on purpose: a deferred backlog must never be a
@@ -500,7 +531,7 @@ async def _startup_recovery_body(app: FastAPI) -> None:
             _reclaimed_keys,
             _reclaimed_bytes,
         ) = await registry.queue_manager.reclaim_drained_orphans()
-    except Exception:  # noqa: BLE001 - disk reclaim must never fail a boot
+    except Exception:
         logger.exception("startup_recovery: orphan reclaim failed; continuing")
     else:
         if _reclaimed_keys:
@@ -545,6 +576,9 @@ async def _resume_native_recovery(app: FastAPI) -> None:
     recovery_registry = getattr(app.state, "recovery_registry", None)
     if recovery_registry is None:
         return
+    # This spool is separate from live ingest's boot migration. Rename only
+    # physical keys; receipt origins and payload session identities stay intact.
+    await recovery_registry.queue_manager.migrate_overlong_keys()
     await _reconcile_native_recovery_outbox(app)
     for session_id in await recovery_registry.queue_manager.recover():
         try:
@@ -556,7 +590,9 @@ async def _resume_native_recovery(app: FastAPI) -> None:
                 "native_recovery_resume_read_failed session=%s", session_id
             )
             continue
-        if batch.lines:
+        if batch.lines and await _scoped_queue_binding_matches(
+            app, session_id, batch.lines[0]
+        ):
             _recover_one_session(
                 session_id, batch.lines[0], recovery_registry.get_or_create
             )
@@ -596,15 +632,16 @@ async def _enqueue_native_recovery_receipt(
         payload, receipt["source_handle"], receipt["origin"]["ordinal"]
     )
     session_id = payload["data"]["session_id"]
+    worker_key = _recovery_worker_key(session_id)
     await recovery_registry.queue_manager.append(
-        session_id, json.dumps(payload, separators=(",", ":")).encode()
+        worker_key, json.dumps(payload, separators=(",", ":")).encode()
     )
     enqueued = await receipts.mark(
         receipt["origin"], "enqueued", source_handle=receipt["source_handle"]
     )
     if enqueued:
         recovery_registry.get_or_create(
-            session_id, receipt["workspace"], created_by=receipt["actor"]
+            worker_key, receipt["workspace"], created_by=receipt["actor"]
         )
     else:
         logger.error(
@@ -702,7 +739,7 @@ async def _reconcile_native_recovery_outbox_unlocked(
             if enqueued:
                 payload = receipt["payload"]
                 recovery_registry.get_or_create(
-                    payload["data"]["session_id"],
+                    _recovery_worker_key(payload["data"]["session_id"]),
                     receipt["workspace"],
                     created_by=receipt["actor"],
                 )
@@ -1330,6 +1367,36 @@ def _workspace_slug(workspace: str) -> str:
     return slug or "default"
 
 
+def _events_worker_key(session_id: str, workspace: str) -> str:
+    """The single derivation of a live-ingest (``/events``) worker key.
+
+    Empty ``session_id`` maps to a per-workspace sentinel stem so
+    session-less events from distinct workspaces never collide in one log.
+    Always folded through ``fold_worker_key`` -- a raw key (in practice, a
+    deeply-nested sub-agent session id) can exceed the filesystem budget
+    ``queue_manager`` derives its on-disk filenames within; folding bounds
+    it BEFORE it ever reaches the queue. This is the ONLY place `/events`
+    derives a worker key, so ingest and any respawn/reconcile path that
+    re-derives the same key can never drift apart.
+    """
+    raw = session_id or (_NO_SESSION_PREFIX + _workspace_slug(workspace))
+    return fold_worker_key(raw)
+
+
+def _recovery_worker_key(session_id: str) -> str:
+    """The single derivation of a native-recovery (``/recovery/events``) worker key.
+
+    Recovery events always carry a validated, non-empty ``session_id`` (see
+    ``post_recovery_events``), so no sentinel is needed -- only the same
+    length-bounding fold as ``_events_worker_key`` applies. Used by every
+    site that derives a recovery worker key from a receipt
+    (``_enqueue_native_recovery_receipt``,
+    ``_reconcile_native_recovery_outbox_unlocked``) so they can never
+    compute different keys for the same session.
+    """
+    return fold_worker_key(session_id)
+
+
 def _validate_data_timestamp(data: dict[str, Any]) -> None:
     """Raise HTTPException(400) if data['timestamp'] is missing, empty, or not ISO-8601.
 
@@ -1884,6 +1951,26 @@ async def _session_claim_store(app_instance: FastAPI) -> SessionClaimStore:
         return store
 
 
+async def _scoped_queue_binding_matches(
+    app_instance: FastAPI, worker_key: str, first_line: bytes
+) -> bool:
+    """Never dispatch a historical scoped spool through a physical alias."""
+    if getattr(app_instance.state, "access_control_mode", "compatibility") != "scoped":
+        return True
+    try:
+        payload = json.loads(first_line)
+        original = payload["data"]["session_id"]
+        if not isinstance(original, str) or fold_worker_key(original) != worker_key:
+            return False
+    except (ValueError, TypeError, KeyError):
+        return False
+    claims = await _session_claim_store(app_instance)
+    matched = await claims.storage_identity_matches(original)
+    if not matched:
+        logger.error("scoped_recovery_storage_binding_blocked")
+    return matched
+
+
 # Module-level ASGI app used by Gunicorn: context_intelligence_server.main:asgi_app
 # The raw `app` is kept for internal use and testing against un-authed routes.
 #
@@ -2081,9 +2168,8 @@ async def post_events(
                 session_id,
             )
             return EventResponse(status="duplicate", session_id=session_id or None)
-    # Empty session_id maps to a per-workspace sentinel stem so session-less
-    # events from distinct workspaces never collide in one log.
-    worker_key = session_id or (_NO_SESSION_PREFIX + _workspace_slug(request.workspace))
+    # See _events_worker_key for the sentinel/fold derivation.
+    worker_key = _events_worker_key(session_id, request.workspace)
     # Spawn (or reuse) the sticky drainer keyed by worker_key.
     registry.get_or_create(worker_key, request.workspace, created_by=contributor_id)
     # Re-parse the raw validated body bytes and stamp server-assigned envelope
@@ -2411,7 +2497,9 @@ async def post_recovery_events(
 
 @app.get("/blobs/{session_id}", dependencies=[Depends(require_read)])
 async def list_blobs(session_id: str, request: Request) -> JSONResponse:
-    await require_claimed_session_access(request, session_id, "data:read")
+    if getattr(request.app.state, "access_control_mode", "compatibility") == "scoped":
+        await _session_claim_store(request.app)
+    await require_claimed_blob_access(request, session_id, "data:read")
     blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
     uris = await blob_store.list(session_id)
     return JSONResponse(content={"session_id": session_id, "blobs": uris})
@@ -2419,13 +2507,15 @@ async def list_blobs(session_id: str, request: Request) -> JSONResponse:
 
 @app.get("/blobs/{session_id}/{key}", dependencies=[Depends(require_read)])
 async def get_blob(session_id: str, key: str, request: Request) -> JSONResponse:
-    await require_claimed_session_access(request, session_id, "data:read")
+    if getattr(request.app.state, "access_control_mode", "compatibility") == "scoped":
+        await _session_claim_store(request.app)
+    await require_claimed_blob_access(request, session_id, "data:read")
     blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
     uri = f"ci-blob://{session_id}/{key}"
     try:
         content = await blob_store.read(uri)
-    except BlobExpiredError:
-        raise HTTPException(status_code=410, detail={"code": "blob_expired", "uri": uri})
+    except BlobExpiredError as exc:
+        raise HTTPException(status_code=410, detail={"code": "blob_expired", "uri": exc.uri})
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Blob not found: {uri}")
     return JSONResponse(content=content)

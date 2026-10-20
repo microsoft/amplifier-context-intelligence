@@ -751,17 +751,19 @@ async def test_live_first_gate_prioritizes_waiting_live_flushes() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("access_mode", ["compatibility", "scoped"])
 async def test_startup_resumes_queued_native_recovery_worker(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, access_mode: str,
 ) -> None:
     from context_intelligence_server.main import _resume_native_recovery, app
 
     worker_registry = SimpleNamespace(
         queue_manager=SimpleNamespace(
+            migrate_overlong_keys=AsyncMock(return_value=(0, 0, 0)),
             recover=AsyncMock(return_value=["s"]),
             read_batch=AsyncMock(
                 return_value=SimpleNamespace(
-                    lines=[b'{"workspace":"one","created_by":"alice"}']
+                    lines=[b'{"workspace":"one","created_by":"alice","data":{"session_id":"s"}}']
                 )
             ),
         ),
@@ -769,9 +771,14 @@ async def test_startup_resumes_queued_native_recovery_worker(
     )
     monkeypatch.setattr(app.state, "recovery_registry", worker_registry)
     monkeypatch.setattr(app.state, "recovery_receipts", None)
+    monkeypatch.setattr(app.state, "access_control_mode", access_mode)
+    claims = SessionClaimStore(tmp_path / "claims.sqlite3")
+    assert await claims.claim("s", "alice", "one")
+    monkeypatch.setattr(app.state, "session_claims", claims)
 
     await _resume_native_recovery(app)
 
+    worker_registry.queue_manager.migrate_overlong_keys.assert_awaited_once_with()
     worker_registry.get_or_create.assert_called_once_with(
         "s", "one", created_by="alice"
     )

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from typing import Any
-
 
 # Persisted only in server-owned queue envelopes.  It is deliberately absent
 # from the EventRequest model: clients do not choose event identity.
@@ -14,6 +14,71 @@ SPOOL_EVENT_IDENTITY = "_ci_event_identity"
 _event_identity: ContextVar[str | None] = ContextVar(
     "context_intelligence_event_identity", default=None
 )
+
+# --- shared byte-length folding -------------------------------------------
+#
+# Two independent identifier families derive filesystem names with no
+# length bound: QueueManager's worker keys (queue_manager.py's
+# fold_worker_key) and AsyncDiskBlobStore's session ids / blob keys
+# (blob_store.py). Both hit the SAME underlying incident shape -- a
+# deeply-nested sub-agent session id makes a derived name exceed the
+# filesystem's NAME_MAX (255 bytes) -- so the folding algorithm lives here
+# ONCE, parameterised by the caller's own worst-case suffix budget.
+_FOLD_DIGEST_CHARS = 16
+_FOLD_SEP = "~"
+
+
+def fold_name(value: str, max_bytes: int) -> str:
+    """Fold *value* to fit within *max_bytes* UTF-8 bytes, or return it unchanged.
+
+    A value at or under the budget is returned BYTE-IDENTICAL -- this is
+    the back-compat guarantee for every caller: an identifier already in
+    use today (queue worker key, blob session id, blob key) is under its
+    budget, so every existing on-disk name keeps working and this function
+    is a no-op for it.
+
+    A value over budget folds to ``<truncated-prefix>~<16-hex-digest>``,
+    sized to land AT *max_bytes* bytes (exactly, for any prefix that
+    doesn't need multi-byte truncation -- e.g. every ASCII value; a few
+    bytes under when the cut point would otherwise split a codepoint, see
+    below):
+
+    - The digest is the first 16 hex characters of
+      ``sha256(value.encode("utf-8")).hexdigest()``, computed over the
+      WHOLE original value -- so two long values sharing a common prefix
+      still fold to different names.
+    - The prefix is truncated on a UTF-8 character boundary: a multi-byte
+      codepoint straddling the cut point is dropped WHOLE, never split, so
+      the result is always valid UTF-8 (this is the only case where the
+      folded length lands under, not at, the budget).
+    - Any ``/``, ``\\``, or ``\\0`` surviving into the prefix is replaced
+      with ``_`` -- the characters every caller here rejects as unsafe --
+      so a folded value can never be filesystem-unsafe even when the
+      original (long) value was.
+
+    Deterministic and IDEMPOTENT: a folded value is always <= the budget,
+    so ``fold_name(fold_name(v, n), n) == fold_name(v, n)`` for every
+    ``v``/``n`` -- a respawned drainer, a boot recovery scan, a blob
+    write, and a blob read of an already-folded URI all compute the same
+    name from the same input.
+    """
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    digest = hashlib.sha256(encoded).hexdigest()[:_FOLD_DIGEST_CHARS]
+    suffix = _FOLD_SEP + digest
+    prefix_budget = max_bytes - len(suffix.encode("utf-8"))
+    truncated = encoded[:prefix_budget]
+    while truncated:
+        try:
+            prefix = truncated.decode("utf-8")
+            break
+        except UnicodeDecodeError:
+            truncated = truncated[:-1]
+    else:
+        prefix = ""
+    prefix = prefix.replace("/", "_").replace("\\", "_").replace("\0", "_")
+    return prefix + suffix
 
 
 def set_event_identity(identity: str | None) -> Token[str | None]:

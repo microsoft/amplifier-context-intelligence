@@ -19,17 +19,18 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-
 from context_intelligence_server.blob_processor import (
     BLOB_FIELDS,
     _lift_raw_fields,
     process_event_data,
 )
-
+from context_intelligence_server.blob_store import AsyncDiskBlobStore
+from context_intelligence_server.utils import make_node_id
 
 # ---------------------------------------------------------------------------
 # 1. BLOB_FIELDS constant
@@ -305,3 +306,55 @@ async def test_blob_write_failure_logs_warning(
     assert "messages" in caplog.text
     assert "node-xyz" in caplog.text
     assert "disk full" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# 16. ACCEPTANCE TEST for the 2,313 blob_offload_failed warnings/24h incident.
+#
+# A deeply-nested sub-agent session id makes node_id = make_node_id(...)
+# embed that session_id, so the blob key f"{node_id}__{field_name}"
+# (this module's own key format) is LONGER than the queue's worker key
+# was for the sibling incident. Against a REAL AsyncDiskBlobStore (not a
+# mock), this used to raise OSError inside write() at the mkstemp step and
+# get caught here, replacing the field with {"$blob_error": ...} -- silent
+# data loss, never a crash. With blob_store's fold applied at the path/URI
+# boundary, the same field now offloads to a real, readable blob.
+# ---------------------------------------------------------------------------
+
+
+async def test_large_field_on_deeply_nested_session_offloads_to_real_blob(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The acceptance test: a deeply-nested sub-agent session's large field
+    must offload to a REAL blob store -- not fall back to $blob_error."""
+    import logging
+
+    # Mirrors a real chained sub-agent session id shape, long enough that
+    # the resulting blob key (node_id + "__raw") exceeds the store's
+    # _MAX_KEY_BYTES (242) budget on its own -- not just the session_id.
+    session_id = "root-session-id-" + "_sub-agent-" * 40 + "-final-leaf-session-segment"
+    node_id = make_node_id(session_id, "tool:call", "2026-01-01T00:00:00Z")
+    assert len(f"{node_id}__raw".encode()) > 242, (
+        "test fixture must exceed the blob key budget to be a real regression test"
+    )
+    # A realistic large payload -- exactly the shape that used to get
+    # replaced with a placeholder in the graph.
+    data: dict[str, Any] = {"raw": {"content": "x" * 20_000}}
+
+    blob_store = AsyncDiskBlobStore(root=tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        await process_event_data(data, blob_store, session_id, node_id)
+
+    # The acceptance criterion: no $blob_error placeholder, no warning log.
+    assert "$blob_error" not in data["raw"]
+    assert "blob_offload_failed" not in caplog.text
+
+    assert "$blob_ref" in data["raw"]
+    uri = data["raw"]["$blob_ref"]
+    assert uri.startswith("ci-blob://")
+
+    # The blob is REAL and readable -- not just a URI string.
+    stored = await blob_store.read(uri)
+    assert stored == {"content": "x" * 20_000}

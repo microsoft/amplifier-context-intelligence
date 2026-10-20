@@ -122,13 +122,29 @@ def _result_to_dict(result: DeletionResult) -> dict[str, Any]:
     }
 
 
-def _build_service(graph_store: Neo4jGraphStore, request: Request) -> DeletionService:
+def _build_service(
+    graph_store: Neo4jGraphStore, request: Request, capability: str
+) -> DeletionService:
     """Assemble a DeletionService from one graph store plus the blob store
     and queue manager every route uses the same way."""
     settings = get_settings()
     blob_store = AsyncDiskBlobStore(root=settings.blob_path)
     queue_manager = request.app.state.registry.queue_manager
-    return DeletionService(graph_store, blob_store, queue_manager)
+
+    async def guard_storage(session_ids: frozenset[str]) -> None:
+        # Resolving a root authorizes neither a descendant's workspace nor its
+        # physical aliases. Preflight the entire original-ID set before any I/O.
+        for session_id in sorted(session_ids):
+            await require_claimed_session_access(request, session_id, capability)
+
+    return DeletionService(
+        graph_store, blob_store, queue_manager,
+        storage_guard=(
+            guard_storage
+            if getattr(request.app.state, "access_control_mode", "compatibility") == "scoped"
+            else None
+        ),
+    )
 
 
 async def read_deletion_service(request: Request) -> DeletionService:
@@ -142,7 +158,7 @@ async def read_deletion_service(request: Request) -> DeletionService:
         uri="",
         driver=request.app.state.neo4j_query_driver,
     )
-    return _build_service(graph_store, request)
+    return _build_service(graph_store, request, "data:read")
 
 
 async def delete_route_service(request: Request) -> DeletionService:
@@ -155,7 +171,7 @@ async def delete_route_service(request: Request) -> DeletionService:
     store looks up which workspace a session id belongs to on its own.
     """
     graph_store = Neo4jGraphStore(uri="", driver=request.app.state.neo4j_driver)
-    return _build_service(graph_store, request)
+    return _build_service(graph_store, request, "live:write")
 
 
 def _caller_id(request: Request) -> str | None:
