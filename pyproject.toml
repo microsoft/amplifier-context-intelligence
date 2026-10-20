@@ -41,6 +41,7 @@ testpaths = ["tests"]
 markers = [
     "neo4j: marks tests as requiring a live Neo4j container (deselect with -m 'not neo4j')",
     "integration: marks tests that exercise live async drain-workers or the full HTTP pipeline (deselect with -m 'not integration')",
+    "mise: requires the genuine MISE 2.7.0 package and Linux x86_64 with ICU (deselect with -m 'not mise')",
 ]
 timeout = 30
 
