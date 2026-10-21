@@ -2746,9 +2746,13 @@ async def test_pause_quarantine_releases_audited_retry_bridge_for_successor(
 
             # Simulate an interruption after retry_pending becomes durable but
             # before the retry bridge can append its replacement raw record.
+            # The retry already holds the quarantine/retry lock, so it bridges
+            # through the under-lock form (the lock is not reentrant).
             reconcile = AsyncMock()
             monkeypatch.setattr(
-                main_module, "_reconcile_native_recovery_outbox", reconcile
+                main_module,
+                "_reconcile_native_recovery_outbox_under_quarantine_lock",
+                reconcile,
             )
             retried = await client.post("/admin/recovery/retry-quarantined")
             assert retried.json() == {"retried": 1}

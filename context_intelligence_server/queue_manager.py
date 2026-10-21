@@ -374,10 +374,14 @@ class QueueManager:
     ) -> Literal["queued", "committed"] | None:
         """Return the durable queue state for one recovery origin.
 
-        A ``committed`` result is an explicit proof that this server's drainer
-        completed its graph-flush barrier before acknowledging the record. It
-        is intentionally distinct from merely finding an ``enqueued`` receipt:
-        a queued record still has to be replayed and must not be terminalized.
+        A ``committed`` result proves only that the record was CONSUMED: the
+        drainer acknowledged it. It does not by itself prove a graph flush,
+        because quarantining a poison record also acknowledges it without one.
+        Whether the delivery succeeded is decided by the quarantine/retry
+        evidence the caller holds for the record, not by this offset alone.
+        It is intentionally distinct from merely finding an ``enqueued``
+        receipt: a queued record still has to be replayed and must not be
+        terminalized.
         """
         encoded = json.dumps(origin, sort_keys=True, separators=(",", ":"))
 
@@ -980,7 +984,10 @@ class QueueManager:
                     tmp.unlink(missing_ok=True)
                 raise
 
-        await asyncio.to_thread(_commit)
+        # Like append/dead_letter: a cancelled caller must not observe the ack
+        # as settled while the rename thread is still running. Callers that
+        # serialize quarantine + ack against retry rely on this.
+        await _await_uninterrupted(asyncio.to_thread(_commit))
 
     async def dead_letter(self, session_id: str, raw: bytes, error: str) -> None:
         """Append one dead-letter record for an unprocessable batch line.
