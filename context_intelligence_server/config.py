@@ -550,6 +550,57 @@ class Settings(BaseSettings):
         )
         return recovery_queue, receipt_store, claims_store, lease
 
+    def _identity_store_and_mutability(self) -> tuple[Path, bool]:
+        """Return the current mode's identity store path and whether this server
+        can seed or mutate it (configured seeds or an enabled admin capability).
+
+        Pure configuration: no filesystem access.  ``~`` is expanded.
+        """
+        if self.auth_mode == "static":
+            return (
+                Path(self.api_keys_store_path).expanduser(),
+                bool(
+                    self.build_keystore()
+                    or self.resolve_admin_api_key_digest() is not None
+                ),
+            )
+        return (
+            Path(self.entra_identities_store_path).expanduser(),
+            bool(
+                self.entra_admin_role
+                or self.build_identity_map()
+                or self.build_service_identity_map()
+            ),
+        )
+
+    def active_identity_store_path(self) -> Path | None:
+        """Return the identity store this process must own, or ``None``.
+
+        Used by identity initialization (a worker thread), never by early
+        synchronous boot.  The store is *active* when this server can seed or
+        mutate it, **or when the file already exists**: an existing store is
+        read and enforced regardless of seeds, so it is locked like any other.
+
+        Only genuine absence (``FileNotFoundError``) means "absent".  A path
+        that cannot be inspected raises ``ValueError`` (identity then reports
+        unavailable) instead of silently disabling protection; a dangling
+        symlink counts as present.  An unselected, absent path is never
+        created, locked, or loaded.
+        """
+        path, mutable = self._identity_store_and_mutability()
+        if mutable:
+            return path
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ValueError(
+                f"identity store path {path} cannot be inspected ({exc!r}); "
+                "refusing to treat it as absent"
+            ) from exc
+        return path
+
     def stateful_root(self) -> Path:
         """Return the one volume root that the process-instance lock protects.
 
@@ -561,12 +612,12 @@ class Settings(BaseSettings):
         servers with separate queues could still serve different stale views
         of a shared credential-revocation store.
 
-        An unused default identity-store path is intentionally not included.
-        In static mode with no configured key material and no admin key, there
-        is no store seed or runtime mutation path.  Likewise an Entra store is
-        not mutable when it has neither a seed nor an enabled admin role.
-        This keeps a default, unconfigured server valid without treating an
-        inert path as participating state.
+        This runs synchronously during early boot, so it is configuration-only:
+        it never inspects the identity file.  A configured (seeded or
+        admin-mutable) store outside the queue parent is a hard configuration
+        error.  Whether an *existing* unseeded store is owned, and by whom, is
+        decided later by identity initialization under the identity lock, where
+        any failure leaves the server up with identity unavailable.
         """
         live_queue = Path(self.queues_path).resolve()
         root = live_queue.parent
@@ -582,27 +633,14 @@ class Settings(BaseSettings):
                     ("recovery receipt ledger", receipt_store.resolve()),
                 )
             )
-        if self.auth_mode == "static":
-            # Static keys need durable backing only when this process seeds
-            # configured credentials or the admin API can mutate them.
-            if self.build_keystore() or self.resolve_admin_api_key_digest() is not None:
-                protected.append(
-                    ("API-key identity store", Path(self.api_keys_store_path).resolve())
-                )
-        elif (
-            self.entra_admin_role
-            or self.build_identity_map()
-            or self.build_service_identity_map()
-        ):
-            # Entra has one shared runtime-mutable store for user and service
-            # identities. An enabled IdentityAdmin role is sufficient even
-            # when the first identity will be added after startup.
-            protected.append(
-                (
-                    "Entra identity store",
-                    Path(self.entra_identities_store_path).resolve(),
-                )
+        identity_store, identity_mutable = self._identity_store_and_mutability()
+        if identity_mutable:
+            label = (
+                "API-key identity store"
+                if self.auth_mode == "static"
+                else "Entra identity store"
             )
+            protected.append((label, identity_store.resolve()))
         split = [
             f"{name}={path}"
             for name, path in protected

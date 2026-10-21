@@ -299,7 +299,10 @@ the lifetime shared flock or allow separate-process writers to bypass it. Online
 scan cookies require 64-bit Linux; offline mode stays portable. No descriptor or
 lease crosses a scan yield, and recovery pages filter at most 512 PRIMARY KEY
 rows in memory, not SQL-filtered full scans. Confirmed snapshots checkpoint before
-deletion; unfinished restart jobs are interrupted, NEVER auto-resumed. Shutdown
+deletion; unfinished restart jobs are interrupted, NEVER auto-resumed. Public `completed` only after the
+final `_save` fully succeeds (stay `running`/`finalizing` until then); a post-replace
+directory fsync failure reports `failed` yet a reopen may still read the replaced
+terminal snapshot, an uncertain outcome that is not a durability guarantee. Shutdown
 must finish maintenance and drainers/real I/O before releasing external exclusion.
 Tests: `uv run pytest tests/test_online_retention.py tests/test_retention_client.py -q`.
 
@@ -390,9 +393,7 @@ Auth model facts (the canonical statement of "which tokens are accepted" lives i
   no redeploy needed),
   `service_data_role` (default `Contributor`), `reader_role` (default `Reader`).
   Env prefix `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_`.
-- **Fail-closed:** misconfig (missing field / empty or malformed `entra_identities`)
-  is a HARD startup error. `allow_unauthenticated` defaults to `false`; a server
-  with no auth configured refuses to start.
+- **Fail-closed:** malformed identity-store data remains a loud load failure; expected store I/O failure leaves the listener available but protected, with identity-dependent auth/admin requests returning `503` rather than accepting stale credentials. `allow_unauthenticated` defaults to `false`.
 - **401** = bad/expired/wrong-audience/missing/ambiguous token; **403** = valid
   token lacking authorization — a user or service principal whose `oid` is
   unmapped, or a service token with no qualifying App Role (the 403 body names
@@ -411,18 +412,9 @@ Canonical guide: `docs/entra-auth-setup.md` (operator + developer + ops runbook)
 Both auth modes can add/remove identities **at runtime, no restart**, via the
 `/admin/*` router (`routers/admin.py`). Facts:
 
-- Each map is an **in-process live dict** backed by a durable JSON file on `/data`
-  (`api_keys_store_path` / `entra_identities_store_path`, in `config.py`). The
-  resolver holds the dict **by reference**, so a `/admin` `PUT`/`DELETE` is visible
-  on the next request. **No cache, no TTL** — safe because the pilot runs a
-  **single replica** (the in-process map is the source of truth).
-- `entra_identities_store_path` backs **both** user and service identities —
-  one shared store, disjoint oid space. There is deliberately no
-  separate `/admin/services` endpoint; service identities are managed through
-  `PUT`/`DELETE`/`GET /admin/identities`.
-- `IdentityStore` (`identity_store.py`) commits **write-file-then-swap-memory**
-  (atomic file replace first, then memory) and **fails closed** on a corrupt file
-  (empty map + loud log, never a crash-loop).
+- Identity stores load once during app-factory setup; lifespan starts their bounded background I/O worker without blocking listener startup. `/status` reports cached `auth.identity_ready` and `identity_reason` (`initializing`, `store_unavailable`, or `null`). Expected store failure keeps status/listener available but protected auth and identity-admin requests return `503`, never stale credentials; corrupt data remains fail-closed and loud.
+- Use one stable canonical identity-store path and nonblocking exclusive sidecar ownership, selected even when unseeded; it prevents stale auth across roots. Hold ownership until shutdown has settled real I/O. The configured private storage directory is trusted and locks are cooperative advisory locks: never manually unlink the sidecar or impose new chmod/UID profiles.
+- `entra_identities_store_path` backs **both** user and service identities — one shared store, disjoint oid space; there is no separate `/admin/services` endpoint. Mutations remain write-file-then-swap-memory.
 - **Admin authority** is separate from data auth: static mode uses a dedicated
   `admin_api_key` (recognized by the middleware, not in the data keystore); entra
   mode uses the App Role named by `entra_admin_role` (default `IdentityAdmin`) in
@@ -457,9 +449,7 @@ Use `./deploy.sh --no-seed` for a deploy-only run.
 cannot be supplied through `up` itself. The map lives in an **uncommitted,
 git-ignored** local file (`scripts/entra-identities.local.json`, from
 `scripts/entra-identities.example.json`) and is applied over the admin API
-(`PUT /admin/identities/{oid}`) right after `up`. The server fails closed on an
-empty `entra_identities` map, so this onboarding is required before it serves on a
-fresh volume.
+(`PUT /admin/identities/{oid}`) right after `up`. Identity-store I/O initializes in the background; until the store is ready, protected auth/admin requests return `503` and `/status` reports the cached identity readiness reason.
 
 Under the hood the seeder can also be run alone (`./scripts/seed-entra-identities.sh
 --check` for a dry run) — see `docs/azure-deployment.md`.
@@ -507,7 +497,7 @@ with admin"). Runtime runbook: `docs/identity-management.md`.
 - **New API endpoint**: Add a route to `main.py` or a new router under `routers/`.
 - **Configuration**: Add fields to `ServerConfig` in `config.py`. Keep defaults conservative.
 - **Tests**: Every handler should have a unit test in `tests/handlers/`. Integration tests live in `tests/integration/`.
-- **Idle queue workers**: Append notifications belong to `QueueManager`, covering live ingress, recovery and replay alike. Hold the same key guard across clear-before-read and notification wait; never replace that guard while a waiter references it. Signal after a write attempt settles, including cancellation or failure, since readable bytes may remain. Keep notification waits outside dispatch/finalization, preserve periodic stale/trim maintenance, and test both lost-wakeup windows plus cancellation-safe guard cleanup (`tests/test_queue_wakeups.py`). The queue remains crash-durable, not power-loss-durable.
+- **Idle queue workers**: Append notifications belong to `QueueManager`, covering live ingress, recovery and replay alike. Hold the same key guard across clear-before-read and notification wait; never replace that guard while a waiter references it. Signal after a write attempt settles, including cancellation or failure, since readable bytes may remain. Keep notification waits outside dispatch/finalization, preserve periodic stale/trim maintenance, and test both lost-wakeup windows plus cancellation-safe guard cleanup (`tests/test_queue_wakeups.py`). The queue remains crash-durable, not power-loss-durable. Recovery eligibility includes the full batch, including terminal events; acquire locks in the documented order, and retry leases only after proof of a real flush, failing closed on corrupt retry audit.
 - **Server process**: Gunicorn runs one `uvicorn_worker.UvicornWorker` (`worker_class` in `main.py` `run()`), from the `uvicorn-worker` package. Do not use the deprecated `uvicorn.workers` module.
 
 Run `uv run pytest tests/ -q` to verify before committing.

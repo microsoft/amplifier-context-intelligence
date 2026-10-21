@@ -61,6 +61,15 @@ and at most five sample URIs. States are `previewing`, `ready`, `running`,
 `cancelling`, `completed`, `cancelled`, `failed`, and `interrupted`. Counts during
 apply describe the rescan and actual deletion; they need not equal the preview.
 
+A confirmed job reports `completed` (or `cancelled`/`failed`) only after its final
+checkpoint has fully succeeded. While that last save is in flight, status stays
+`running` with phase `finalizing`, and cancelling during that window does not
+change the outcome. If the final save fails, the job reports `failed`. One narrow
+case is ambiguous: when the directory fsync that follows the final snapshot
+replace fails, the replaced terminal snapshot may still be readable after a
+restart or reopen. That is valid because deletion had already finished, but it
+reflects an uncertain fsync outcome and is not a durability guarantee.
+
 The admin API uses the existing admin guard: `POST /admin/blobs/prune`
 with `{"older_than":"30d"}`, `GET /admin/blobs/prune[/{uuid}]`,
 `POST /admin/blobs/prune/{uuid}/start` with `{"confirmation":"prune"}`, and

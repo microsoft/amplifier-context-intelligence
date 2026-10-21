@@ -13,6 +13,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
@@ -24,8 +25,10 @@ from context_intelligence_server.blob_coordination import (
     Coordinator, coordinator_for, filesystem, wait_filesystem,
 )
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
+from context_intelligence_server.retention_client import ClientError, RetentionClient
+from context_intelligence_server.retention_scheduler import run_scheduled
 from context_intelligence_server.retention_service import (
-    JobConflict, JobNotFound, RetentionService, SNAPSHOT,
+    JobConflict, JobNotFound, RetentionService, SNAPSHOT, TERMINAL,
 )
 from context_intelligence_server.routers.admin import router
 
@@ -50,6 +53,13 @@ async def ready(service):
     await service.task
     assert service.status()["state"] == "ready", service.status()
     return job["id"]
+
+
+async def finish(service) -> None:
+    """Await the service's current job task."""
+    task = service.task
+    assert task is not None
+    await task
 
 
 def external_lock(root):
@@ -499,31 +509,307 @@ async def test_admin_auth_validation_and_status_during_slow_scan(tmp_path, monke
         await service.close()
 
 
+def _final_save_in_flight(service) -> bool:
+    """True while the job's LAST checkpoint runs (old code: terminal state; new: finalizing)."""
+    job = service.job
+    return job["state"] in TERMINAL or job.get("phase") in {"finalizing", "finished"}
+
+
+def _hold_final_save(service, monkeypatch, *, fail: bool = False):
+    """Wrap the zero-arg ``_save``; pause/fail only the final checkpoint.
+
+    Public state is captured at the instant the final checkpoint is in flight.
+    """
+    entered, release = threading.Event(), threading.Event()
+    seen: dict = {}
+    save = service._save
+
+    def wrapped():
+        if _final_save_in_flight(service):
+            seen["state"], seen["phase"] = service.job["state"], service.job.get("phase")
+            entered.set()
+            assert release.wait(5)
+            if fail:
+                raise OSError("injected final checkpoint failure")
+        save()
+        if _final_save_in_flight(service):
+            seen["durable"] = json.loads((service.path / r.METADATA / SNAPSHOT).read_text())["state"]
+            seen["public_after_save"] = service.job["state"]
+
+    monkeypatch.setattr(service, "_save", wrapped)
+    return entered, release, seen
+
+
 async def test_final_checkpoint_blocks_replacement_preview(tmp_path, monkeypatch):
     payload(tmp_path)
     service = await RetentionService.open(tmp_path)
-    entered, release = threading.Event(), threading.Event()
-    save = service._save
-
-    def held_final_checkpoint():
-        if service.job["state"] == "completed":
-            entered.set()
-            assert release.wait(5)
-        save()
-
-    monkeypatch.setattr(service, "_save", held_final_checkpoint)
+    entered, release, _seen = _hold_final_save(service, monkeypatch)
     try:
         job = await ready(service)
         await service.start(job, "prune")
         await until(entered.is_set)
-        assert service.status()["state"] == "completed" and not service.task.done()
+        status = service.status()
+        assert status["state"] == "running" and status["phase"] == "finalizing", status
+        assert not service.task.done()
         with pytest.raises(JobConflict):
             await service.preview("30d")
         assert service.status()["id"] == job
         release.set()
         await service.task
+        assert service.status()["state"] == "completed"
         new = await ready(service)
         assert new != job and service.status()["state"] == "ready"
+    finally:
+        release.set()
+        await service.close()
+
+
+async def test_terminal_state_is_durable_before_it_is_public(tmp_path, monkeypatch):
+    payload(tmp_path)
+    service = await RetentionService.open(tmp_path)
+    entered, release, seen = _hold_final_save(service, monkeypatch)
+    try:
+        job = await ready(service)
+        await service.start(job, "prune")
+        await until(entered.is_set)
+        release.set()
+        await finish(service)
+        assert seen["durable"] == "completed", seen
+        assert seen["public_after_save"] == "running", seen
+        assert service.status()["state"] == "completed"
+    finally:
+        release.set()
+        await service.close()
+
+
+async def test_final_checkpoint_failure_is_failed_and_never_observed_completed(
+    tmp_path, monkeypatch
+):
+    payload(tmp_path)
+    service = await RetentionService.open(tmp_path)
+    entered, release, seen = _hold_final_save(service, monkeypatch, fail=True)
+    observed: list[str] = []
+
+    async def poll():
+        while True:
+            if service.job is not None:
+                observed.append(service.status()["state"])
+            await asyncio.sleep(0.001)
+
+    poller = None
+    try:
+        job = await ready(service)
+        poller = asyncio.create_task(poll())
+        await service.start(job, "prune")
+        await until(entered.is_set)
+        assert seen["state"] == "running", seen
+        release.set()
+        await finish(service)
+        status = service.status()
+        assert status["state"] == "failed" and status["error"].startswith(
+            "Checkpoint failed"
+        ), status
+        assert "completed" not in observed, observed
+        assert (
+            json.loads((tmp_path / r.METADATA / SNAPSHOT).read_text())["state"]
+            != "completed"
+        )
+    finally:
+        release.set()
+        if poller is not None:
+            poller.cancel()
+        await service.close()
+
+
+async def test_directory_fsync_failure_after_final_replace_is_ambiguous_not_certified(
+    tmp_path, monkeypatch
+):
+    """Characterization of observed behavior (green on arrival; no production change).
+
+    Contract: the LIVE state becomes completed only after _save fully succeeds, so a
+    failure of the directory fsync that follows the final os.replace reports failed.
+    The replaced terminal checkpoint may nevertheless be visible to a later read or
+    reopen. That outcome is valid: deletion had already finished. It is an uncertain
+    fsync outcome, NOT a durability certification, and both readings are allowed.
+    """
+    old = payload(tmp_path)
+    service = await RetentionService.open(tmp_path)
+    real_replace, real_fsync = os.replace, os.fsync
+    hit = {"replaced": False, "failed": False}
+
+    def replace(src, dst, **kwargs):
+        real_replace(src, dst, **kwargs)
+        if dst == SNAPSHOT and _final_save_in_flight(service):
+            hit["replaced"] = True
+
+    def fsync(fd):
+        # The first fsync after the final snapshot replace is the directory fsync.
+        if hit["replaced"] and not hit["failed"]:
+            hit["failed"] = True
+            raise OSError("injected directory fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "fsync", fsync)
+    observed: list[str] = []
+
+    async def poll():
+        while True:
+            if service.job is not None:
+                observed.append(service.status()["state"])
+            await asyncio.sleep(0.001)
+
+    poller = None
+    reopened = None
+    try:
+        job = await ready(service)
+        poller = asyncio.create_task(poll())
+        await service.start(job, "prune")
+        await finish(service)
+        # the real post-replace path ran
+        assert hit == {"replaced": True, "failed": True}, hit
+        status = service.status()
+        assert status["state"] == "failed" and status["error"].startswith(
+            "Checkpoint failed"
+        ), status
+        assert "completed" not in observed, observed
+        assert not old.exists(), "deletion finished before the ambiguous checkpoint"
+        on_disk = json.loads((tmp_path / r.METADATA / SNAPSHOT).read_text())["state"]
+        # replaced terminal checkpoint is readable
+        assert on_disk == "completed", on_disk
+        await service.close()
+        reopened = await RetentionService.open(tmp_path)
+        assert reopened.status()["state"] == "completed", reopened.status()
+    finally:
+        if poller is not None:
+            poller.cancel()
+        monkeypatch.undo()
+        await service.close()
+        if reopened is not None:
+            await reopened.close()
+
+
+async def test_cancel_during_finalizing_does_not_change_outcome(tmp_path, monkeypatch):
+    payload(tmp_path)
+    service = await RetentionService.open(tmp_path)
+    entered, release, _seen = _hold_final_save(service, monkeypatch)
+    try:
+        job = await ready(service)
+        await service.start(job, "prune")
+        await until(entered.is_set)
+        status = await service.cancel(job)
+        assert status["state"] == "running" and status["phase"] == "finalizing", status
+        assert not service.cancel_requested.is_set()
+        release.set()
+        await finish(service)
+        assert service.status()["state"] == "completed"
+    finally:
+        release.set()
+        await service.close()
+
+
+async def test_service_opens_fresh_tilde_root(tmp_path, monkeypatch):
+    home, cwd = tmp_path / "home", tmp_path / "cwd"
+    home.mkdir()
+    cwd.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(cwd)
+    service = await RetentionService.open("~/fresh-blobs")
+    try:
+        assert service.path == (home / "fresh-blobs").resolve()
+        assert (home / "fresh-blobs" / r.LOCK).is_file()
+        assert list(cwd.iterdir()) == [], "a literal './~' directory must never be created"
+    finally:
+        await service.close()
+
+
+class _SchedulerClient:
+    """Sync RetentionClient stand-in that drives a real service on the test loop."""
+
+    timeout = 5.0
+
+    def __init__(self, service, loop):
+        self.service, self.loop = service, loop
+
+    def _call(self, coro):
+        try:
+            return asyncio.run_coroutine_threadsafe(coro, self.loop).result(10)
+        except JobNotFound as exc:
+            raise ClientError(str(exc), status_code=404) from None
+        except JobConflict as exc:
+            raise ClientError(str(exc), status_code=409) from None
+
+    def status(self, job_id=None):
+        try:
+            return self.service.status(job_id)
+        except JobNotFound as exc:
+            raise ClientError(str(exc), status_code=404) from None
+
+    def preview(self, older_than):
+        return self._call(self.service.preview(older_than))
+
+    def start(self, job_id, confirmation):
+        return self._call(self.service.start(job_id, confirmation))
+
+    def cancel(self, job_id):
+        return self._call(self.service.cancel(job_id))
+
+
+async def test_scheduler_waits_for_final_checkpoint(tmp_path, monkeypatch):
+    payload(tmp_path)
+    service = await RetentionService.open(tmp_path)
+    entered, release, _ = _hold_final_save(service, monkeypatch)
+    try:
+        client = _SchedulerClient(service, asyncio.get_running_loop())
+        run = asyncio.create_task(
+            asyncio.to_thread(
+                run_scheduled,
+                cast(RetentionClient, client),
+                older_than="30d",
+                poll_interval=0.02,
+                max_runtime=30,
+            )
+        )
+        await until(entered.is_set, timeout=10)
+        # several polls while the final checkpoint is in flight
+        await asyncio.sleep(0.3)
+        assert not run.done(), (
+            "scheduler must not report success before the final checkpoint"
+        )
+        release.set()
+        result = await run
+        assert result.outcome == "completed" and result.exit_code == 0, result
+        assert (
+            json.loads((tmp_path / r.METADATA / SNAPSHOT).read_text())["state"]
+            == "completed"
+        )
+    finally:
+        release.set()
+        await service.close()
+
+
+async def test_scheduler_nonzero_when_final_checkpoint_fails(tmp_path, monkeypatch):
+    payload(tmp_path)
+    service = await RetentionService.open(tmp_path)
+    entered, release, _ = _hold_final_save(service, monkeypatch, fail=True)
+    try:
+        client = _SchedulerClient(service, asyncio.get_running_loop())
+        run = asyncio.create_task(
+            asyncio.to_thread(
+                run_scheduled,
+                cast(RetentionClient, client),
+                older_than="30d",
+                poll_interval=0.02,
+                max_runtime=30,
+            )
+        )
+        await until(entered.is_set, timeout=10)
+        await asyncio.sleep(0.3)
+        assert not run.done()
+        release.set()
+        result = await run
+        assert result.exit_code != 0 and result.outcome != "completed", result
+        assert service.status()["state"] == "failed"
     finally:
         release.set()
         await service.close()
@@ -658,7 +944,9 @@ async def test_real_http_events_graph_and_new_blobs_remain_available(tmp_path, m
     monkeypatch.setattr(main.app.state, "auth_mode", "static", raising=False)
     monkeypatch.setattr(main.app.state, "admin_api_key_configured", True, raising=False)
     monkeypatch.setattr(main.app.state, "neo4j_query_driver", MockNeo4jDriver(rows=[{"n": 1}]), raising=False)
-    monkeypatch.setattr(main.app.state, "neo4j_query_access_mode", "READ", raising=False)
+    monkeypatch.setattr(
+        main.app.state, "neo4j_query_access_mode", "READ", raising=False
+    )
     flushed = AsyncMock()
     monkeypatch.setattr(Neo4jGraphStore, "flush", flushed)
     monkeypatch.setattr(Neo4jGraphStore, "close", AsyncMock())
@@ -667,7 +955,9 @@ async def test_real_http_events_graph_and_new_blobs_remain_available(tmp_path, m
     async def fake_graph_dispatch(*args, **kwargs):
         # Exercise the real blob store that ordinary ingestion uses. The graph
         # itself is disposable/fake here; manager owns real Neo4j qualification.
-        uri = await AsyncDiskBlobStore(root).write("ingest", str(len(dispatched)), {"value": 1})
+        uri = await AsyncDiskBlobStore(root).write(
+            "ingest", str(len(dispatched)), {"value": 1}
+        )
         dispatched.append(uri)
 
     monkeypatch.setattr("context_intelligence_server.registry.process_event", fake_graph_dispatch)
@@ -679,7 +969,9 @@ async def test_real_http_events_graph_and_new_blobs_remain_available(tmp_path, m
     try:
         admin = {"Authorization": "Bearer fixture-admin"}
         data = {"Authorization": "Bearer fixture-data"}
-        response = await client.post("/admin/blobs/prune", json={"older_than": "30d"}, headers=admin)
+        response = await client.post(
+            "/admin/blobs/prune", json={"older_than": "30d"}, headers=admin
+        )
         assert response.status_code == 202
         job = response.json()["id"]
         await service.task
@@ -689,7 +981,10 @@ async def test_real_http_events_graph_and_new_blobs_remain_available(tmp_path, m
         while not service.task.done():
             reply = await client.post("/events", json={
                 "event": "tool:pre", "workspace": "/fixture",
-                "data": {"session_id": "ingest", "timestamp": "2024-01-01T00:00:00+00:00"},
+                "data": {
+                    "session_id": "ingest",
+                    "timestamp": "2024-01-01T00:00:00+00:00",
+                },
             }, headers=data)
             assert reply.status_code == 202
             graph = await client.post("/cypher", json={"query": "RETURN 1 AS n"}, headers=data)

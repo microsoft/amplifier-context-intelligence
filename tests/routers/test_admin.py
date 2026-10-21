@@ -391,7 +391,11 @@ class TestKeyCRUD:
         )
         from context_intelligence_server.routers.admin import require_admin  # noqa: PLC0415
 
-        settings = _make_static_settings(tmp_path, with_key=False)
+        # An admin key makes the store mutable (selected), so the server owns
+        # it; an unselected store has no mutation path and refuses writes.
+        settings = _make_static_settings(tmp_path, with_key=False).model_copy(
+            update={"admin_api_key_sha256": FAKE_TOKEN_DIGEST}
+        )
         middleware = create_asgi_app(settings=settings)
         app.dependency_overrides[require_admin] = lambda: None
         try:

@@ -39,7 +39,8 @@ class RetentionService:
     """
 
     def __init__(self, path: Path | str):
-        self.path = Path(path)
+        # Canonical before creation, so coordinator, lock and snapshot root agree.
+        self.path = Path(path).expanduser().resolve()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="blob-maintenance")
         self.guard = asyncio.Lock()
         self.job: dict | None = None
@@ -48,6 +49,8 @@ class RetentionService:
         self.cancel_requested = threading.Event()
         self.accepting = True
         self.closed = False
+        # Terminal outcome written to the durable snapshot BEFORE it becomes public.
+        self._terminal: dict | None = None
         self._lifetime: r.RootLock | None = None
         self._coordinator = None
         self._ready_deadline = 0.0
@@ -152,7 +155,7 @@ class RetentionService:
     def _save(self) -> None:
         """Atomic, durable ONE snapshot; called only for confirmed jobs under EX."""
         assert self.job is not None and self.job["confirmed"]
-        saved = {**self.job, "report": asdict(self.report)}
+        saved = {**self.job, **(self._terminal or {}), "report": asdict(self.report)}
         body = json.dumps(saved, separators=(",", ":")).encode()
         with r.Root(self.path) as root:
             try:
@@ -295,44 +298,66 @@ class RetentionService:
             # Consent precedes metadata; checkpoint precedes ledger recovery/unlink.
             await self._work(self._save, exclusive=True)
             self.report = r.Report(str(self.path), self.job["cutoff_ns"])
+
             # Writable open recovers a genuine hot rollback journal only here.
             def initialize_ledger() -> None:
                 with r.Root(self.path) as root, r.Ledger(root, writable=True):
                     pass
+
             await self._work(initialize_ledger, exclusive=True)
             self.job["phase"] = "recovery"
             after = ""
             while not self.cancel_requested.is_set():
                 self._clock()
-                after, items, count = await self._work(lambda: r.recovery_page(
-                    self.path, after, self.job["cutoff_ns"], self.job["preview_started_ns"],
-                ))
+                after, items, count = await self._work(
+                    lambda: r.recovery_page(
+                        self.path,
+                        after,
+                        self.job["cutoff_ns"],
+                        self.job["preview_started_ns"],
+                    )
+                )
                 self.job["recovery_rows"] += count
                 for offset in range(0, len(items), 32):
                     if self.cancel_requested.is_set():
                         break
-                    await self._batch(items[offset:offset + 32], recovery=True)
+                    await self._batch(items[offset : offset + 32], recovery=True)
                 if count < 512:
                     break
                 await asyncio.sleep(0.001)
             self.job["phase"] = "scan"
             await self._scan(applying=True)
             self._clock()
-            self.job["state"] = "cancelled" if self.cancel_requested.is_set() else "completed"
-            self.job["phase"] = "finished"
+            outcome = {
+                "state": "cancelled" if self.cancel_requested.is_set() else "completed",
+                "phase": "finished",
+            }
         except Exception as exc:
-            self.job["state"] = "failed"
-            self.job["error"] = self._error(exc)
+            outcome = {"state": "failed", "error": self._error(exc)}
+        # Clients may acknowledge a terminal state, so it becomes public only after
+        # its durable checkpoint: stay running (finalizing) while the save is in flight.
+        job = self.job
+        assert job is not None
+        outcome.setdefault("phase", job["phase"])
+        job["phase"] = "finalizing"
+        self._terminal = outcome
         try:
             await self._work(self._save, exclusive=True)
         except Exception as exc:
-            self.job["state"] = "failed"
-            self.job["error"] = f"Checkpoint failed: {self._error(exc)}"
+            outcome = {
+                **outcome,
+                "state": "failed",
+                "error": f"Checkpoint failed: {self._error(exc)}",
+            }
+        finally:
+            self._terminal = None
+        job.update(outcome)
 
     async def cancel(self, job_id: str) -> dict:
         async with self.guard:
             self.status(job_id)
-            if self.job["state"] not in TERMINAL:
+            # The outcome is already decided while its final checkpoint is in flight.
+            if self.job["state"] not in TERMINAL and self._terminal is None:
                 self.cancel_requested.set()
                 if self.job["state"] == "ready":
                     self.job["state"] = "cancelled"

@@ -677,11 +677,13 @@ async def quarantine_pending_recovery(
     """Dead-letter and terminalize one selected receipt while recovery is paused."""
     if not getattr(request.app.state, "recovery_enabled", False):
         raise HTTPException(status_code=404, detail="Not found")
-    if not getattr(request.app.state, "recovery_paused", False):
-        raise HTTPException(status_code=409, detail="Recovery must be paused first")
     from context_intelligence_server.main import _quarantine_pending_native_recovery
 
-    quarantined = await _quarantine_pending_native_recovery(
+    # The paused check is made inside the helper while it holds the pause
+    # condition; a check here would be stale by the time quarantine ran.
+    outcome = await _quarantine_pending_native_recovery(
         request.app, body.source_handle, body.ordinal
     )
-    return {"quarantined": int(quarantined)}
+    if outcome == "not_paused":
+        raise HTTPException(status_code=409, detail="Recovery must be paused first")
+    return {"quarantined": int(outcome == "quarantined")}

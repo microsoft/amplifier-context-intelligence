@@ -21,6 +21,7 @@ import errno
 import json
 import logging
 import os
+import re
 import threading
 import time
 import unicodedata
@@ -146,6 +147,21 @@ def fold_worker_key(key: str) -> str:
     See ``utils.fold_name`` for the shared algorithm this wraps.
     """
     return fold_name(key, _MAX_KEY_BYTES)
+
+
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
+
+
+class RecoveryReceiptError(ValueError):
+    """Durable recovery evidence cannot be trusted as proof either way.
+
+    Raised when a dead-letter or retry-audit record is structurally invalid, or
+    when a retry has no valid audit to separate it from an earlier committed
+    delivery.  Callers treat it as "unknown": stop, leave the receipt pending,
+    never mark it written.  It is a plain ``ValueError`` subtype, deliberately
+    not a framework: the existing ``ValueError`` handling for corrupt durable
+    state (for example a malformed offset file) already applies to it.
+    """
 
 
 @dataclass(frozen=True)
@@ -397,28 +413,148 @@ class QueueManager:
 
         return await asyncio.to_thread(_scan)
 
+    @staticmethod
+    def _is_valid_recovery_origin(candidate: Any) -> bool:
+        """Whether *candidate* is a complete origin this server could have written.
+
+        Two shapes exist: the v1 origin ``{source_handle, ordinal,
+        source_line_sha256}`` and the pre-v1 public origin that lease mode still
+        reads, ``{session_id, ordinal, source_line_sha256,
+        source_stream_sha256}`` (``LegacyNativeRecoveryOrigin``).  Digests are
+        lowercase SHA-256 hex, as the request models require.
+        """
+        if not isinstance(candidate, dict):
+            return False
+        ordinal = candidate.get("ordinal")
+        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 0:
+            return False
+
+        def _digest(value: Any) -> bool:
+            return isinstance(value, str) and _SHA256_HEX.fullmatch(value) is not None
+
+        if not _digest(candidate.get("source_line_sha256")):
+            return False
+        if "source_handle" in candidate:
+            return _digest(candidate["source_handle"])
+        session_id = candidate.get("session_id")
+        return (
+            isinstance(session_id, str)
+            and session_id.strip() != ""
+            and _digest(candidate.get("source_stream_sha256"))
+        )
+
+    @staticmethod
+    def _complete_lines(data: bytes) -> tuple[list[bytes], bytes]:
+        """Split *data* into newline-terminated records and an unterminated tail.
+
+        By the queue's framing rule a record is complete only once its newline
+        is written; an unterminated tail is an in-flight or crashed append, not
+        a record, and is neither evidence nor corruption.  Blank lines carry
+        nothing and are dropped.
+        """
+        *lines, tail = data.split(b"\n")
+        return [line + b"\n" for line in lines if line.strip()], tail
+
+    @staticmethod
+    def _decode_dead_letter(raw: bytes, path: Path) -> dict[str, Any] | None:
+        """Decode one dead-letter (or audit) record into its JSON envelope.
+
+        Returns the envelope dict, which may legitimately carry no recovery
+        origin (a dead-lettered non-recovery event), or ``None`` for a binary
+        ``payload_b64`` record, which cannot hold a JSON origin.  Anything that
+        is structurally not a dead-letter record raises
+        ``RecoveryReceiptError``: such a line might have held the origin being
+        asked about, so it must never be read as "no match".
+        """
+        corrupt = RecoveryReceiptError(f"corrupt dead-letter record in {path.name}")
+        try:
+            record = json.loads(raw)
+            if not isinstance(record, dict):
+                raise corrupt
+            payload = record.get("payload")
+            if isinstance(payload, str):
+                envelope = json.loads(payload)
+                if not isinstance(envelope, dict):
+                    raise corrupt
+                return envelope
+        except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError
+            if exc is corrupt:
+                raise
+            raise corrupt from exc
+        if isinstance(record.get("payload_b64"), str):
+            return None
+        raise corrupt
+
+    def _evidence_files(self, suffix: str) -> list[Path]:
+        """List evidence files, failing closed when the directory is unreadable.
+
+        ``Path.glob`` silently yields nothing for a directory it cannot read,
+        which would turn an access error into "no evidence".
+        """
+        try:
+            with os.scandir(self._dir) as entries:
+                return sorted(
+                    self._dir / e.name for e in entries if e.name.endswith(suffix)
+                )
+        except FileNotFoundError:
+            return []  # no queue directory, so nothing was ever written
+
+    def _read_evidence(self, path: Path) -> Iterator[bytes]:
+        """Stream the complete records of one evidence file.
+
+        Same framing as ``_complete_lines`` (an unterminated tail is not a
+        record, blank lines are dropped) without holding the file in memory.  A
+        file that vanished holds no evidence; any other read error propagates.
+        """
+        try:
+            stream = path.open("rb")
+        except FileNotFoundError:
+            return
+        with stream:
+            for raw in stream:
+                if not raw.endswith(b"\n"):
+                    return
+                if raw.strip():
+                    yield raw
+
     async def recovery_origin_is_dead(self, origin: dict[str, Any]) -> bool:
-        """Whether a recovery origin was durably dead-lettered."""
+        """Whether a recovery origin was durably dead-lettered.
+
+        Fails closed: an unreadable dead-letter file raises ``OSError`` and a
+        structurally corrupt record raises ``RecoveryReceiptError``.  A corrupt
+        line is never skipped, because it may be the very record that proves
+        this origin was quarantined.  Valid dead letters that carry no matching
+        origin (including non-recovery events) are simply not a match.
+        """
         encoded = json.dumps(origin, sort_keys=True, separators=(",", ":"))
 
         def _scan() -> bool:
-            for path in self._dir.glob("*.dead.jsonl"):
-                try:
-                    with path.open("rb") as stream:
-                        for raw in stream:
-                            try:
-                                dead = json.loads(raw)
-                                payload = dead.get("payload")
-                                envelope = json.loads(payload) if payload else {}
-                            except (ValueError, TypeError, UnicodeDecodeError):
-                                continue
-                            if self._matches_recovery_origin(envelope, encoded):
-                                return True
-                except OSError:
-                    continue
+            for path in self._evidence_files(".dead.jsonl"):
+                for raw in self._read_evidence(path):
+                    envelope = self._decode_dead_letter(raw, path)
+                    if envelope is not None and self._matches_recovery_origin(
+                        envelope, encoded
+                    ):
+                        return True
             return False
 
         return await asyncio.to_thread(_scan)
+
+    def _retry_audit_envelope(self, raw: bytes, path: Path) -> dict[str, Any]:
+        """Decode one retry-audit record; it must prove a complete origin.
+
+        An audit record is a copied dead-letter record whose envelope matched an
+        origin, so it always carries a valid ``_recovery_origin``.  Valid JSON
+        without one proves nothing and is corruption, not "not a match".
+        """
+        envelope = self._decode_dead_letter(raw, path)
+        if envelope is None or not self._is_valid_recovery_origin(
+            envelope.get("_recovery_origin")
+        ):
+            raise RecoveryReceiptError(
+                f"retry audit record in {path.name} has no valid origin"
+            )
+        return envelope
 
     async def recovery_origin_has_retry_audit(self, origin: dict[str, Any]) -> bool:
         """Whether a committed origin predates an operator retry.
@@ -426,28 +562,24 @@ class QueueManager:
         Active dead letters are removed before ``retry_pending`` is made
         durable, but their copied forensic record distinguishes an old
         committed queue line from a completion of the new delivery attempt.
+
+        ``False`` means the evidence is *absent*: no audit file exists, or every
+        audit record was read and none matches.  Callers must still not read
+        ``False`` as proof of anything: a retry with no audit cannot be told
+        apart from an old committed delivery.  The answer fails closed: an audit
+        that cannot be listed or read raises ``OSError`` (for example
+        ``PermissionError``), and a record that is not a dead-letter record with
+        a valid recovery origin raises ``RecoveryReceiptError``.  A file that
+        vanishes between listing and reading holds no evidence.
         """
         encoded = json.dumps(origin, sort_keys=True, separators=(",", ":"))
 
         def _scan() -> bool:
-            for path in self._dir.glob("*.recovery-retry-audit.jsonl"):
-                try:
-                    with path.open("rb") as stream:
-                        for raw in stream:
-                            try:
-                                record = json.loads(raw)
-                                payload = record.get("payload")
-                                envelope = (
-                                    json.loads(payload)
-                                    if isinstance(payload, str)
-                                    else {}
-                                )
-                            except (TypeError, ValueError, UnicodeDecodeError):
-                                continue
-                            if self._matches_recovery_origin(envelope, encoded):
-                                return True
-                except OSError:
-                    continue
+            for path in self._evidence_files(".recovery-retry-audit.jsonl"):
+                for raw in self._read_evidence(path):
+                    envelope = self._retry_audit_envelope(raw, path)
+                    if self._matches_recovery_origin(envelope, encoded):
+                        return True
             return False
 
         return await asyncio.to_thread(_scan)
@@ -460,43 +592,53 @@ class QueueManager:
         match the active dead-letter glob, so recovery reconciliation can
         safely retry only the selected receipt without treating its historic
         poison evidence as current terminal state.
+
+        Every active dead-letter file is validated before any is changed, so a
+        corrupt record anywhere raises ``RecoveryReceiptError`` and leaves all
+        evidence exactly as it was.  Skipping it would archive nothing for an
+        origin whose record is the corrupt one, leaving a retry with no audit.
         """
         encoded = json.dumps(origin, sort_keys=True, separators=(",", ":"))
 
-        def _matches(raw: bytes) -> bool:
-            try:
-                record = json.loads(raw)
-                payload = record.get("payload")
-                envelope = json.loads(payload) if isinstance(payload, str) else {}
-            except (TypeError, ValueError, UnicodeDecodeError):
-                return False
-            return self._matches_recovery_origin(envelope, encoded)
+        def _matches(raw: bytes, path: Path) -> bool:
+            envelope = self._decode_dead_letter(raw, path)
+            return envelope is not None and self._matches_recovery_origin(
+                envelope, encoded
+            )
+
+        def _validate_all() -> list[Path]:
+            files = self._evidence_files(".dead.jsonl")
+            for path in files:
+                for raw in self._read_evidence(path):
+                    _matches(raw, path)
+            return files
 
         total = 0
-        for path in self._dir.glob("*.dead.jsonl"):
+        for path in await asyncio.to_thread(_validate_all):
             worker_key = path.name[: -len(".dead.jsonl")]
             self._validate_session_id(worker_key)
             with self._guard(worker_key) as guard:
                 async with guard.admission:
 
-                    def _archive() -> int:
+                    def _archive(path: Path = path, worker_key: str = worker_key) -> int:
                         try:
-                            lines = path.read_bytes().splitlines(keepends=True)
+                            data = path.read_bytes()
                         except FileNotFoundError:
                             return 0
-                        selected = [line for line in lines if _matches(line)]
+                        lines, tail = self._complete_lines(data)
+                        selected = [line for line in lines if _matches(line, path)]
                         if not selected:
                             return 0
                         audit = self._dir / f"{worker_key}.recovery-retry-audit.jsonl"
                         # _write_record owns guard.file_lock. Holding it here
                         # would deadlock its non-reentrant threading.Lock.
                         self._write_record(guard, audit, b"".join(selected))
-                        remaining = [line for line in lines if not _matches(line)]
+                        remaining = [line for line in lines if not _matches(line, path)]
                         temporary = (
                             self._dir / f"{worker_key}.{uuid.uuid4().hex}.tmp"
                         )
                         try:
-                            temporary.write_bytes(b"".join(remaining))
+                            temporary.write_bytes(b"".join(remaining) + tail)
                             os.replace(temporary, path)
                         except BaseException:
                             with contextlib.suppress(OSError):
