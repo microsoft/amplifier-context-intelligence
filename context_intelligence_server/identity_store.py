@@ -43,6 +43,10 @@ served credential cache, and refuse every further operation until an orderly
   failed.  Disk may be ahead of memory and nothing is rolled back; the caller
   gets an error (never success) and the old cache is not served.
 
+A managed store also never converts an I/O failure into credentials: an
+ordinary ``OSError`` reading the file, or writing the first-boot seed, clears the
+served cache and propagates (corrupt CONTENT stays the loud empty-map fallback).
+
 A failure BEFORE the rename took effect is a certain rollback: memory and disk
 are unchanged, the store stays healthy, and the plain ``OSError`` propagates.
 
@@ -152,6 +156,15 @@ class IdentityStore:
             return False
         return True
 
+    @property
+    def failure_detected(self) -> bool:
+        """True once a runtime failure (ownership loss, uncertain commit) latched.
+
+        A plain cached flag set by ``_latch``: reading it does no I/O, so
+        ``/status`` can publish a detected failure without probing the store.
+        """
+        return self._ownership_failed
+
     def exists(self) -> bool:
         """Whether the store file exists (ownership-verified when managed)."""
         with self._op_lock:
@@ -165,6 +178,9 @@ class IdentityStore:
 
         Missing file → empty dict (normal first boot, no log).
         Corrupt / non-dict → empty dict + LOUD error log, never raise.
+        Ordinary I/O error (``OSError``): unmanaged → empty dict + loud log; a
+        MANAGED store clears its cache and raises, because an unreadable file is
+        not an empty credential map.
         """
         with self._op_lock:
             self._load_locked()
@@ -180,7 +196,9 @@ class IdentityStore:
                 self._rebuild_flat()
                 return
             raw = json.loads(text)
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        except IdentityStoreOwnershipError:
+            raise
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             logger.error(
                 "identity_store.load CORRUPT FILE path=%s error=%r — "
                 "failing CLOSED to empty map.  Re-populate via /admin API.",
@@ -189,6 +207,30 @@ class IdentityStore:
             )
             self._data = {}
             self._rebuild_flat()
+            return
+        except OSError as exc:
+            # An I/O error says nothing about the file's content: for a managed
+            # store it is NOT "no credentials".  Drop the served cache and
+            # propagate so identity init latches unavailable (503) instead of
+            # reporting ready with an empty map that an admin write could then
+            # persist over the real file.  Unmanaged stores keep the old
+            # lenient fallback.
+            self._data = {}
+            self._rebuild_flat()
+            if self._managed:
+                logger.error(
+                    "identity_store.load READ FAILED path=%s error=%r — "
+                    "identity unavailable.",
+                    self.path,
+                    exc,
+                )
+                raise
+            logger.error(
+                "identity_store.load CORRUPT FILE path=%s error=%r — "
+                "failing CLOSED to empty map.  Re-populate via /admin API.",
+                self.path,
+                exc,
+            )
             return
 
         if not isinstance(raw, dict):
@@ -249,12 +291,14 @@ class IdentityStore:
         method is designed for startup initialization from durable config.  It:
 
         1. Tries an atomic write of *data* to the store file.
-        2. Whether or not the write succeeds, updates ``_data`` and ``flat_dict``
-           in-place (the data came from config, which is itself durable; a restart
-           would re-seed from config again, so memory-ahead-of-disk is safe here).
+        2. UNMANAGED stores only: whether or not the write succeeds, updates
+           ``_data`` and ``flat_dict`` in-place (the data came from config, which
+           is itself durable; a restart would re-seed from config again, so
+           memory-ahead-of-disk is safe for a store that owns no lock).
 
-        A warning is logged if the write fails so an operator knows the store file
-        was not written (e.g., ``/data`` not yet mounted at startup).
+        A warning is logged if an unmanaged write fails so an operator knows the
+        store file was not written.  A MANAGED store propagates the write error
+        and leaves memory untouched, so identity init reports unavailable.
         """
         with self._op_lock:
             self._seed_locked(data)
@@ -267,6 +311,10 @@ class IdentityStore:
             # Lost/unsafe ownership must never degrade to "memory only".
             raise
         except Exception as exc:
+            if self._managed:
+                # Never serve credentials that were not persisted: memory must
+                # not get ahead of disk under ownership.  Nothing was updated.
+                raise
             logger.warning(
                 "identity_store.seed: could not write seed to %s: %r "
                 "— in-memory map is live but the file is not yet persisted.  "

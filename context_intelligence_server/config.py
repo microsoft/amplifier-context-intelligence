@@ -606,11 +606,15 @@ class Settings(BaseSettings):
 
         The file lock is meaningful only when it covers *every* durable
         single-writer resource.  The live queue's parent is the implicit root:
-        the default recovery queue, receipt ledger, and claim ledger are all
-        deliberately derived beneath it.  The active identity store is also
-        included whenever this server can seed or mutate it: otherwise two
-        servers with separate queues could still serve different stale views
-        of a shared credential-revocation store.
+        the live queue, session-claim ledger, recovery queue and receipt ledger
+        must each be a DIRECT child of it (the defaults already are).  A deeper
+        spelling such as ``<root>/nested/recovery`` is refused: another server
+        rooted at ``<root>/nested`` could name the same resource yet take a
+        different root lock, so two writers would drain it independently.
+        Direct children make every contender of a shared resource resolve to the
+        same canonical root, hence the same lock.  The active identity store is
+        also included whenever this server can seed or mutate it, and may stay
+        a descendant of the root because it has its own per-store lock.
 
         This runs synchronously during early boot, so it is configuration-only:
         it never inspects the identity file.  A configured (seeded or
@@ -634,23 +638,21 @@ class Settings(BaseSettings):
                 )
             )
         identity_store, identity_mutable = self._identity_store_and_mutability()
-        if identity_mutable:
-            label = (
-                "API-key identity store"
-                if self.auth_mode == "static"
-                else "Entra identity store"
-            )
-            protected.append((label, identity_store.resolve()))
-        split = [
-            f"{name}={path}"
-            for name, path in protected
-            if not path.is_relative_to(root)
-        ]
+        label = (
+            "API-key identity store"
+            if self.auth_mode == "static"
+            else "Entra identity store"
+        )
+        split = [f"{name}={path}" for name, path in protected if path.parent != root]
+        if identity_mutable and not identity_store.resolve().is_relative_to(root):
+            split.append(f"{label}={identity_store.resolve()}")
         if split:
             rendered = ", ".join(split)
             raise ValueError(
                 "all mutable server state must be beneath the live queue parent "
-                f"{root}; incompatible paths: {rendered}"
+                f"{root}, with queues and ledgers as its direct children so one "
+                "root lock covers every shared resource; incompatible paths: "
+                f"{rendered}"
             )
         return root
 

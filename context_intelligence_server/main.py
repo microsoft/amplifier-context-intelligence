@@ -1463,6 +1463,22 @@ def _set_identity_state(
         state.identity_state = new_state
 
 
+def _publish_identity_failure(app: FastAPI) -> None:
+    """Mirror an ALREADY-latched store failure into the cached readiness record.
+
+    Reads only the store's cached flag (no I/O, no ``healthy()``), and acts only
+    on the current ready state, so ``/status`` never predicts a failure and a
+    stale generation or an initializing/unavailable record is left untouched.
+    """
+    store = _identity_store_of(app)
+    if (
+        store is not None
+        and store.failure_detected
+        and getattr(app.state, "identity_state", None) == "ready"
+    ):
+        _set_identity_state(app, "unavailable")
+
+
 def _identity_store_of(app: FastAPI) -> IdentityStore | None:
     # IdentityStore defines __len__, so an empty store is falsy: test for None.
     store = getattr(app.state, "entra_identity_store", None)
@@ -2169,7 +2185,10 @@ def create_asgi_app(
         if getattr(state, "identity_ready_token", None) is not _gate_token:
             return False
         if getattr(state, "identity_store_owned", False):
-            return active_identity_store.healthy()
+            if active_identity_store.healthy():
+                return True
+            _publish_identity_failure(app)  # a latched failure reaches /status
+            return False
         return True
 
     identity_gate: Callable[[], bool] = _identity_ready
@@ -2308,6 +2327,7 @@ async def get_status(request: Request) -> dict[str, Any]:
     # Cached identity readiness (initializing | ready | unavailable): plain
     # attribute reads, no I/O and no exception paths, so status keeps answering
     # while identity initializes or is unavailable.  No identity wiring == ready.
+    _publish_identity_failure(request.app)  # reads the latched flag only
     _identity = getattr(request.app.state, "identity_state", "ready")
     response["identity_ready"] = _identity == "ready"
     response["identity_reason"] = _IDENTITY_REASONS.get(_identity)

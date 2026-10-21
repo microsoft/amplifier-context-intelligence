@@ -821,6 +821,26 @@ def _directory_fsync_fault() -> Any:
     return patch("context_intelligence_server.instance_lock.os.fsync", fault)
 
 
+async def _assert_status_unavailable(wrapper: Any) -> None:
+    """/status advertises the latched failure and leaks no credentials."""
+    status = await _get_json(wrapper, "/status")
+    assert status["identity_ready"] is False
+    assert status["identity_reason"] == "store_unavailable"
+    rendered = json.dumps(status)
+    for secret in (TOKEN, DIGEST, ADMIN_TOKEN, ADMIN_DIGEST):
+        assert secret not in rendered
+
+
+def _status_must_not_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After a failure is latched, /status may only read cached state."""
+
+    def boom(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("/status probed the store instead of the cached flag")
+
+    monkeypatch.setattr(IdentityStore, "healthy", boom)
+    monkeypatch.setattr(IdentityStoreLock, "assert_owned", boom)
+
+
 def _store_for(mode: str) -> IdentityStore:
     state = main_module.app.state
     return state.api_key_store if mode == "static" else state.entra_identity_store
@@ -880,6 +900,8 @@ async def test_post_replace_fsync_failure_over_http_does_not_claim_success(
                 )
             assert resp.status_code >= 500  # never a 200 "deleted"
             assert DIGEST not in json.loads(store_path.read_text(encoding="utf-8"))
+            # /status reports it NOW, with no protected request in between.
+            await _assert_status_unavailable(wrapper)
             after = await c.get("/whoami", headers={"Authorization": f"Bearer {TOKEN}"})
             assert after.status_code == 503
 
@@ -1353,3 +1375,196 @@ async def test_successful_init_with_an_empty_map_is_ready_with_normal_401(
         status = await _get_json(wrapper, "/status")
         assert status["identity_ready"] is True and status["identity_reason"] is None
         assert await _status(wrapper, "/whoami", "unknown-token") == 401  # onboarding
+
+
+# ---------------------------------------------------------------------------
+# r4332085777 / r4332085805: managed store I/O failures never become an empty
+# or memory-only credential map.  Corrupt CONTENT stays a loud fail-closed empty
+# map (control); only ordinary I/O errors on the managed path propagate, so the
+# one-shot identity init latches "unavailable" (listener and /status stay up).
+# ---------------------------------------------------------------------------
+
+
+def _managed_read_fault(store_name: str) -> Any:
+    """Fail ONLY the read-only open of the store file (the managed read)."""
+    real_open = os.open
+
+    def fault(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if path == store_name and (flags & os.O_ACCMODE) == os.O_RDONLY:
+            raise OSError(errno.EIO, "synthetic managed read failure")
+        return real_open(path, flags, *args, **kwargs)
+
+    return patch("context_intelligence_server.instance_lock.os.open", fault)
+
+
+def _pre_replace_write_fault(kind: str) -> Any:
+    """Fail the managed seed write strictly BEFORE the atomic replace."""
+    real_open, real_fsync = os.open, os.fsync
+
+    def open_fault(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if kind == "enospc_create" and flags & os.O_CREAT and ".tmp" in str(path):
+            raise OSError(errno.ENOSPC, "synthetic no space left on device")
+        return real_open(path, flags, *args, **kwargs)
+
+    def fsync_fault(fd: int) -> None:
+        if kind == "fsync" and not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "synthetic pre-replace fsync failure")
+        real_fsync(fd)
+
+    stack = patch("context_intelligence_server.instance_lock.os.open", open_fault)
+    stack2 = patch("context_intelligence_server.instance_lock.os.fsync", fsync_fault)
+
+    @asynccontextmanager
+    async def both() -> AsyncGenerator[None, None]:
+        with stack, stack2:
+            yield
+
+    return both()
+
+
+async def _assert_protected_503(wrapper: Any, mode: str) -> None:
+    """The identity gate runs before auth, so any bearer token answers 503."""
+    _key, token = _probe_credentials(mode)
+    assert await _status(wrapper, "/whoami", token) == 503
+    path = f"/admin/keys/{DIGEST}" if mode == "static" else f"/admin/identities/{OID}"
+    transport = httpx.ASGITransport(app=wrapper, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        admin = await c.delete(path, headers={"Authorization": f"Bearer {ADMIN_TOKEN}"})
+    assert admin.status_code == 503
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["static", "entra"])
+async def test_managed_read_error_leaves_identity_unavailable_and_file_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """An EIO reading an EXISTING managed store is not 'no credentials'."""
+    state = tmp_path / "state"
+    state.mkdir()
+    store_path = state / STORE_NAMES[mode]
+    key, _token = _probe_credentials(mode)
+    store_path.write_text(json.dumps({key: {"id": "writer"}}), encoding="utf-8")
+    before = store_path.read_bytes()
+    wrapper = _make_app(_settings(state, mode, store_path, admin=True))
+    calls = _count_init_calls(monkeypatch)
+    with _managed_read_fault(store_path.name):
+        async with main_module.lifespan(main_module.app):
+            await main_module.app.state.identity_init_task
+            status = await _get_json(wrapper, "/status")  # listener stays up
+            assert status["identity_ready"] is False
+            assert status["identity_reason"] == "store_unavailable"
+            assert _store_for(mode).flat_dict == {}
+            await _assert_protected_503(wrapper, mode)
+            await asyncio.sleep(0.2)  # no retry / heal loop
+            assert calls == [1]
+    assert store_path.read_bytes() == before  # never overwritten from empty
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["static", "entra"])
+async def test_corrupt_json_store_is_still_a_ready_loud_empty_map(
+    tmp_path: Path, mode: str
+) -> None:
+    """Control: corrupt CONTENT keeps the documented fail-closed empty map."""
+    state = tmp_path / "state"
+    state.mkdir()
+    store_path = state / STORE_NAMES[mode]
+    store_path.write_text("{not json", encoding="utf-8")
+    wrapper = _make_app(_settings(state, mode, store_path))
+    async with _serving():
+        status = await _get_json(wrapper, "/status")
+        assert status["identity_ready"] is True
+        assert _store_for(mode).flat_dict == {}
+    assert store_path.read_text(encoding="utf-8") == "{not json"
+
+
+def test_managed_load_error_clears_the_cache_and_propagates(tmp_path: Path) -> None:
+    store_path = tmp_path / "id" / "api-keys.json"
+    lock = IdentityStoreLock(store_path)
+    lock.acquire()
+    store = IdentityStore(store_path, managed=True)
+    store.attach(lock)
+    try:
+        store.seed({DIGEST: {"id": "writer"}})
+        assert store.flat_dict == {DIGEST: "writer"}
+        with _managed_read_fault(store_path.name), pytest.raises(OSError):
+            store.load()
+        assert store.flat_dict == {}  # a stale cache is never served after EIO
+    finally:
+        store.stop()
+        lock.release()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["enospc_create", "fsync"])
+@pytest.mark.parametrize("mode", ["static", "entra"])
+async def test_managed_seed_write_failure_leaves_identity_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, kind: str
+) -> None:
+    """A seed that cannot be persisted is not served from memory only."""
+    state = tmp_path / "state"
+    store_path = state / STORE_NAMES[mode]
+    wrapper = _make_app(_settings(state, mode, store_path, admin=True))
+    calls = _count_init_calls(monkeypatch)
+    async with (
+        _pre_replace_write_fault(kind),
+        main_module.lifespan(main_module.app),
+    ):
+        await main_module.app.state.identity_init_task
+        status = await _get_json(wrapper, "/status")  # listener stays up
+        assert status["identity_ready"] is False
+        assert status["identity_reason"] == "store_unavailable"
+        assert _store_for(mode).flat_dict == {}  # not live in memory
+        await _assert_protected_503(wrapper, mode)
+        await asyncio.sleep(0.2)  # one write attempt, no retry
+        assert calls == [1]
+    assert not store_path.exists()  # no credential file was left behind
+    assert [p.name for p in state.glob(".*.tmp")] == []  # no torn temp file
+
+
+# ---------------------------------------------------------------------------
+# r4335610828: a failure the store has LATCHED at runtime (ownership loss or an
+# uncertain commit) is published to the cached /status readiness.  /status reads
+# the already-latched flag; it never probes the store.  Nothing is predicted:
+# before any failure is detected, status stays ready.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["static", "entra"])
+async def test_ownership_loss_seen_by_the_gate_is_published_to_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    store_path = tmp_path / "state" / STORE_NAMES[mode]
+    wrapper = _make_app(_settings(tmp_path / "state", mode, store_path))
+    sidecar = store_path.with_name(store_path.name + ".lock")
+    _key, token = _probe_credentials(mode)
+    async with _serving():
+        status = await _get_json(wrapper, "/status")
+        assert status["identity_ready"] is True and status["identity_reason"] is None
+        sidecar.rename(sidecar.with_name(sidecar.name + ".moved"))
+        sidecar.write_bytes(b"")  # the sidecar is replaced by a different inode
+        # Not yet observed: status never probes, so it does not predict a failure.
+        assert (await _get_json(wrapper, "/status"))["identity_ready"] is True
+        assert await _status(wrapper, "/whoami", token) == 503  # the gate detects it
+        with monkeypatch.context() as spy:
+            _status_must_not_probe(spy)
+            await _assert_status_unavailable(wrapper)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["static", "entra"])
+async def test_uncertain_commit_is_published_to_status_without_a_protected_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    store_path = tmp_path / "state" / STORE_NAMES[mode]
+    wrapper = _make_app(_settings(tmp_path / "state", mode, store_path))
+    key, _token = _probe_credentials(mode)
+    async with _serving():
+        status = await _get_json(wrapper, "/status")
+        assert status["identity_ready"] is True and status["identity_reason"] is None
+        with _directory_fsync_fault(), pytest.raises(IdentityStoreOwnershipError):
+            _store_for(mode).delete(key)  # replaced on disk, durability unknown
+        with monkeypatch.context() as spy:  # no protected request happened yet
+            _status_must_not_probe(spy)
+            await _assert_status_unavailable(wrapper)

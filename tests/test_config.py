@@ -1,8 +1,12 @@
 """Tests for package configuration and metadata."""
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from context_intelligence_server.config import Settings
 
 
 def test_settings_defaults():
@@ -195,6 +199,121 @@ def test_stateful_root_rejects_active_entra_store_outside_live_state_volume(
 
     with pytest.raises(ValueError, match="Entra identity store"):
         settings.stateful_root()
+
+
+# --- r4332085728: shared queue/ledger resources must hang directly off one root.
+# A resource nested under a deeper directory is containment-valid for one server
+# and root-valid for another, so two servers can drain it under different locks.
+
+
+def _recovery_settings(
+    live: Path,
+    *,
+    queues_path: Path | None = None,
+    receipt_store_path: Path | None = None,
+    claims_store_path: Path | None = None,
+) -> "Settings":
+    from context_intelligence_server.config import RecoveryConfig, Settings
+
+    def _opt(path: Path | None) -> str | None:
+        return None if path is None else str(path)
+
+    return Settings(
+        queues_path=str(live),
+        recovery=RecoveryConfig(
+            enabled=True,
+            queues_path=_opt(queues_path),
+            receipt_store_path=_opt(receipt_store_path),
+            claims_store_path=_opt(claims_store_path),
+        ),
+    )
+
+
+def test_stateful_root_rejects_the_nested_shared_recovery_queue_layout(
+    tmp_path: Path,
+) -> None:
+    """Thread counterexample: /state/live + /state/nested/recovery."""
+    state = tmp_path / "state"
+    settings = _recovery_settings(
+        state / "live", queues_path=state / "nested" / "recovery"
+    )
+
+    with pytest.raises(ValueError, match="direct children") as raised:
+        settings.stateful_root()
+    assert "recovery queue" in str(raised.value)
+
+
+def test_stateful_root_allows_the_nested_server_that_owns_its_own_children(
+    tmp_path: Path,
+) -> None:
+    """Server B roots at /state/nested and keeps every resource beside its queue."""
+    nested = tmp_path / "state" / "nested"
+    settings = _recovery_settings(nested / "live", queues_path=nested / "recovery")
+
+    assert settings.stateful_root() == nested.resolve()
+
+
+@pytest.mark.parametrize("field", ["receipt_store_path", "claims_store_path"])
+def test_stateful_root_rejects_nested_shared_ledgers(
+    tmp_path: Path, field: str
+) -> None:
+    """A shared SQLite ledger below a deeper directory is refused, not half-locked."""
+    state = tmp_path / "state"
+    settings = _recovery_settings(
+        state / "live", **{field: state / "nested" / "ledger.sqlite3"}
+    )
+
+    with pytest.raises(ValueError, match="direct children"):
+        settings.stateful_root()
+
+
+def test_swapped_live_and_recovery_queues_share_one_root_lock(tmp_path: Path) -> None:
+    """Swapping live/recovery between two servers still yields one canonical root."""
+    state = tmp_path / "state"
+    first = _recovery_settings(state / "live", queues_path=state / "recovery")
+    second = _recovery_settings(state / "recovery", queues_path=state / "live")
+
+    assert first.stateful_root() == second.stateful_root() == state.resolve()
+
+
+def test_shared_receipt_ledger_locks_the_same_canonical_root(tmp_path: Path) -> None:
+    """Two servers naming the same ledger resolve to the same root, never two."""
+    state = tmp_path / "state"
+    ledger = state / "receipts.sqlite3"
+    first = _recovery_settings(state / "live-a", receipt_store_path=ledger)
+    second = _recovery_settings(state / "live-b", receipt_store_path=ledger)
+
+    assert first.stateful_root() == second.stateful_root() == state.resolve()
+    # A contender rooted deeper cannot name that same ledger.
+    deeper = _recovery_settings(state / "sub" / "live", receipt_store_path=ledger)
+    with pytest.raises(ValueError, match="direct children"):
+        deeper.stateful_root()
+
+
+def test_canonical_alias_of_the_root_resolves_to_the_same_root(tmp_path: Path) -> None:
+    """A symlinked spelling of the state volume is the same root, not a new one."""
+    state = tmp_path / "state"
+    state.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(state, target_is_directory=True)
+    real = _recovery_settings(state / "live", queues_path=state / "recovery")
+    via_alias = _recovery_settings(alias / "live", queues_path=state / "recovery")
+
+    assert real.stateful_root() == via_alias.stateful_root() == state.resolve()
+
+
+def test_identity_store_may_remain_a_descendant_of_the_root(tmp_path: Path) -> None:
+    """Identity stores keep their own per-store lock, so descendants stay valid."""
+    from context_intelligence_server.config import Settings
+
+    state = tmp_path / "state"
+    settings = Settings(
+        queues_path=str(state / "queues"),
+        api_keys={"a" * 64: {"id": "writer"}},
+        api_keys_store_path=str(state / "deep" / "er" / "api-keys.json"),
+    )
+
+    assert settings.stateful_root() == state.resolve()
 
 
 def test_crash_recovery_sweep_interval_defaults_to_300():
