@@ -147,10 +147,17 @@ async def test_direct_asgi_lifespan_refuses_second_server_and_releases(
 
 
 @pytest.mark.asyncio
-async def test_direct_asgi_lifespan_refuses_split_queue_roots_sharing_api_key_store(
+async def test_direct_asgi_lifespan_admits_split_queue_roots_sharing_api_key_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Lifespan validates the active identity store before taking either lock."""
+    """The ROOT lock no longer couples to the identity store (r4336046216).
+
+    Two servers with unrelated queue roots both pass the root-lock stage even
+    when they name one mutable identity store.  The shared store is protected by
+    its own IdentityStoreLock during identity initialization; this bare app has
+    no identity wiring, so that gate is exercised in
+    ``test_identity_store_ownership.py`` (cross-root refusal tests), not here.
+    """
     from context_intelligence_server.config import Settings
 
     first_root = tmp_path / "first-state"
@@ -164,7 +171,7 @@ async def test_direct_asgi_lifespan_refuses_split_queue_roots_sharing_api_key_st
     )
     second_settings = Settings(
         queues_path=str(tmp_path / "second-state" / "queues"),
-        blob_path=str(tmp_path / "blobs"),
+        blob_path=str(tmp_path / "second-blobs"),
         api_keys=key_map,
         api_keys_store_path=str(shared_store),
     )
@@ -173,13 +180,11 @@ async def test_direct_asgi_lifespan_refuses_split_queue_roots_sharing_api_key_st
     second.state.settings = second_settings
     monkeypatch.setattr(main_module, "_server_lifespan", _empty_server_lifespan)
 
-    async with main_module.lifespan(first):
-        with pytest.raises(
-            RuntimeError,
-            match="invalid durable state-root configuration: .*API-key identity store",
-        ):
-            async with main_module.lifespan(second):
-                raise AssertionError("the split identity-store lifespan must not start")
+    async with main_module.lifespan(first), main_module.lifespan(second):
+        # Different roots take different root locks: neither is refused here.
+        assert first.state.server_instance_lock.path != (
+            second.state.server_instance_lock.path
+        )
 
 
 def test_run_refuses_multiworker_before_acquiring_instance_lock(

@@ -162,28 +162,34 @@ def test_stateful_root_covers_an_active_api_key_identity_store(tmp_path: Path) -
     assert settings.stateful_root() == state_root.resolve()
 
 
-def test_stateful_root_rejects_active_api_key_store_outside_live_state_volume(
+def test_stateful_root_accepts_active_api_key_store_outside_live_state_volume(
     tmp_path: Path,
 ) -> None:
-    """A separately rooted server cannot share a mutable API-key store."""
+    """Identity ownership is the per-store lock's job (r4336046216).
+
+    A mutable API-key store outside the queue root is a supported layout, and
+    the configured path is never relocated by computing the root.
+    """
     from context_intelligence_server.config import Settings
 
+    store = tmp_path / "identity-volume" / "api-keys.json"
     settings = Settings(
         queues_path=str(tmp_path / "queue-volume" / "queues"),
         api_keys={"a" * 64: {"id": "writer"}},
-        api_keys_store_path=str(tmp_path / "identity-volume" / "api-keys.json"),
+        api_keys_store_path=str(store),
     )
 
-    with pytest.raises(ValueError, match="API-key identity store"):
-        settings.stateful_root()
+    assert settings.stateful_root() == (tmp_path / "queue-volume").resolve()
+    assert settings.api_keys_store_path == str(store)
 
 
-def test_stateful_root_rejects_active_entra_store_outside_live_state_volume(
+def test_stateful_root_accepts_active_entra_store_outside_live_state_volume(
     tmp_path: Path,
 ) -> None:
-    """The same root rule applies to Entra's runtime-mutable identity map."""
+    """The same holds for Entra's runtime-mutable identity map."""
     from context_intelligence_server.config import Settings
 
+    store = tmp_path / "identity-volume" / "entra-identities.json"
     settings = Settings(
         auth_mode="entra",
         azure_client_id="client-id",
@@ -192,13 +198,65 @@ def test_stateful_root_rejects_active_entra_store_outside_live_state_volume(
         entra_identities={
             "12345678-1234-1234-1234-123456789abc": {"id": "writer"},
         },
-        entra_identities_store_path=str(
-            tmp_path / "identity-volume" / "entra-identities.json"
-        ),
+        entra_identities_store_path=str(store),
     )
 
-    with pytest.raises(ValueError, match="Entra identity store"):
-        settings.stateful_root()
+    assert settings.stateful_root() == (tmp_path / "queue-volume").resolve()
+    assert settings.entra_identities_store_path == str(store)
+
+
+_DIGEST = "b" * 64
+_OID = "12345678-1234-1234-1234-123456789abc"
+_ENTRA = {"auth_mode": "entra", "azure_client_id": "c", "azure_tenant_id": "t"}
+
+# Every authenticated configuration that makes the identity store mutable while
+# leaving queues_path and the identity paths at their DEFAULTS.  The default
+# queue root is /data and the default store lives under the user's home, so the
+# store is NOT beneath the root -- this must still start (r4336046216).
+_DEFAULT_LAYOUT_CASES = {
+    "static-legacy-api_key": {"api_key": "legacy-token"},
+    "static-api_keys-map": {"api_keys": {_DIGEST: {"id": "writer"}}},
+    "static-admin-sha256": {"admin_api_key_sha256": _DIGEST},
+    "static-admin-legacy": {"admin_api_key": "legacy-admin-token"},
+    "entra-admin-role-default": dict(_ENTRA),
+    "entra-user-map": {**_ENTRA, "entra_identities": {_OID: {"id": "writer"}}},
+    "entra-service-map": {**_ENTRA, "service_identities": {_OID: {"id": "svc"}}},
+}
+
+
+@pytest.mark.parametrize("recovery_enabled", [False, True])
+@pytest.mark.parametrize("case", sorted(_DEFAULT_LAYOUT_CASES))
+def test_stateful_root_accepts_the_default_layout_with_a_mutable_identity_store(
+    case: str, recovery_enabled: bool
+) -> None:
+    """Defaults + any authenticated config must not abort startup.
+
+    Pure configuration: nothing here creates /data or touches the home dir.
+    """
+    from context_intelligence_server.config import RecoveryConfig, Settings
+
+    settings = Settings(
+        **_DEFAULT_LAYOUT_CASES[case],
+        recovery=RecoveryConfig(enabled=recovery_enabled),
+    )
+    store, mutable = settings._identity_store_and_mutability()
+    queue_root = Path(settings.queues_path).resolve().parent
+    assert mutable, "the case must exercise a mutable identity store"
+    assert not store.resolve().is_relative_to(queue_root), (
+        "the default identity store must sit outside the queue root"
+    )
+
+    assert settings.stateful_root() == queue_root
+
+    # Paths are never relocated or rewritten by computing the root.
+    assert settings.queues_path == "/data/queues"
+    default_store = (
+        settings.api_keys_store_path
+        if settings.auth_mode == "static"
+        else settings.entra_identities_store_path
+    )
+    assert Path(default_store).expanduser() == store
+    assert default_store.endswith(("api-keys.json", "entra-identities.json"))
 
 
 # --- r4332085728: shared queue/ledger resources must hang directly off one root.

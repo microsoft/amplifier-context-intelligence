@@ -81,7 +81,7 @@ async def test_cancelled_append_after_write_wakes_waiter(
     with qm.append_waiter("session") as waiter:
         generation = waiter.clear_before_read()
         append = asyncio.create_task(qm.append("session", b"first"))
-        await asyncio.wait_for(asyncio.to_thread(wrote.wait), timeout=1.0)
+        assert await asyncio.to_thread(wrote.wait, 1.0)
         append.cancel()
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -137,7 +137,7 @@ async def test_cancelled_settled_delete_defers_removal_until_last_holder_release
 
     with qm.append_waiter("session"):
         delete = asyncio.create_task(getattr(qm, delete_method)("session"))
-        await asyncio.wait_for(asyncio.to_thread(unlinked_offset.wait), timeout=1.0)
+        assert await asyncio.to_thread(unlinked_offset.wait, 1.0)
         delete.cancel()
         release_delete.set()
         with pytest.raises(asyncio.CancelledError):
