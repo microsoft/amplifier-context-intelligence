@@ -539,3 +539,19 @@ class TestBlobStoreLengthBudget:
         assert await store.list(long_session) == []
         with pytest.raises(FileNotFoundError):
             await store.read(uri)
+
+
+# --- Tilde-prefixed roots (Copilot r4329246656) ---------------------------------
+
+
+async def test_store_write_read_under_fresh_tilde_root(tmp_path, monkeypatch):
+    home, cwd = tmp_path / "home", tmp_path / "cwd"
+    home.mkdir()
+    cwd.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(cwd)
+    store = AsyncDiskBlobStore("~/fresh-blobs")
+    uri = await store.write("session", "key", {"v": 1})
+    assert await store.read(uri) == {"v": 1}
+    assert (home / "fresh-blobs" / "session" / "blobs" / "key.json").is_file()
+    assert list(cwd.iterdir()) == [], "a literal './~' directory must never be created"

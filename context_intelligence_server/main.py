@@ -9,8 +9,9 @@ import os
 import re
 import secrets
 import sys
+import threading
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +46,8 @@ from context_intelligence_server.config import Neo4jClientConfig, Settings, get_
 from context_intelligence_server.idempotency import EventIdempotencyCache
 from context_intelligence_server.identity_store import IdentityStore
 from context_intelligence_server.instance_lock import (
+    IdentityStoreLock,
+    IdentityStoreOwnershipError,
     InstanceLockUnavailable,
     ServerInstanceLock,
 )
@@ -654,8 +657,26 @@ async def _reconcile_native_recovery_outbox_unlocked(
     *,
     bridge_retry_pending: bool = False,
     retry_origins_with_audit: frozenset[str] = frozenset(),
+    retry_origins_captured: frozenset[str] = frozenset(),
 ) -> None:
-    """Repair interrupted recovery admissions while the outbox lock is held."""
+    """Repair interrupted recovery admissions while the outbox lock is held.
+
+    ``retry_origins_captured`` is the set of retry-pending origins the caller
+    observed (and computed ``retry_origins_with_audit`` for) before taking the
+    outbox lock.  A retry bridge is made only for those origins: one that
+    became pending after that snapshot has no audit evidence here, so its old
+    committed queue line could be mistaken for the new delivery.
+
+    Invariant: a committed queue line is the *previous* delivery's, and is never
+    proof that a retry was written, unless a valid retry audit says so.  A
+    retry-pending receipt whose queue line is committed and whose audit is
+    absent or invalid is left pending and reported with ``RecoveryReceiptError``;
+    an operator repairs the evidence and the next pass appends a fresh,
+    idempotent delivery.  Dead-letter evidence that cannot be read as proof is
+    treated the same way, never as "not dead".
+    """
+    from context_intelligence_server.queue_manager import RecoveryReceiptError
+
     receipts = getattr(app.state, "recovery_receipts", None)
     recovery_registry = getattr(app.state, "recovery_registry", None)
     if receipts is None or recovery_registry is None:
@@ -680,10 +701,15 @@ async def _reconcile_native_recovery_outbox_unlocked(
                 receipt["origin"], "written", source_handle=receipt["source_handle"]
             )
             continue
-        if state == "retry_pending" and not bridge_retry_pending:
-            # A retry continuation is admitted only through the same
-            # RecoveryAdmissionGate critical section as new recovery ingress.
-            # Never let a normal outbox scan bypass live-first.
+        if state == "retry_pending" and not (
+            bridge_retry_pending
+            and json.dumps(origin, sort_keys=True, separators=(",", ":"))
+            in retry_origins_captured
+        ):
+            # A retry continuation is admitted only through the live-first
+            # admission check (the permit gate, or the live-availability
+            # predicate in lease mode), and only for origins captured with
+            # their audit evidence.  Never let a normal outbox scan bypass it.
             continue
         if state == "enqueued":
             queue_state = (
@@ -717,12 +743,21 @@ async def _reconcile_native_recovery_outbox_unlocked(
         queue_state = (
             await recovery_registry.queue_manager.recovery_origin_commit_state(origin)
         )
-        if (
-            state == "retry_pending"
-            and queue_state == "committed"
-            and json.dumps(origin, sort_keys=True, separators=(",", ":"))
-            in retry_origins_with_audit
-        ):
+        if state == "retry_pending" and queue_state == "committed":
+            if (
+                json.dumps(origin, sort_keys=True, separators=(",", ":"))
+                not in retry_origins_with_audit
+            ):
+                # Without a valid retry audit this committed line cannot be
+                # told apart from the delivery that was quarantined.  Marking
+                # it written would acknowledge a retry that never flushed.
+                logger.error(
+                    "native_recovery_retry_without_audit; receipt remains pending"
+                )
+                raise RecoveryReceiptError(
+                    "retry is pending and its queue line is committed, but no "
+                    "valid retry audit proves that line is the prior delivery"
+                )
             # This committed line belongs to the delivery that was
             # quarantined and then archived, not the current retry bridge.
             # Treat it as absent so this attempt gets its own raw queue line.
@@ -760,21 +795,28 @@ async def _reconcile_native_recovery_outbox(app: FastAPI) -> None:
     # Read before the gate so a slow SQLite read/JSON validation never delays a
     # normal /events append. An admin retry is the only writer of this bridge;
     # seeing a new bridge after this read merely defers it to the next pass.
+    # Both admission modes (permit and legacy lease) share this snapshot: it
+    # decides whether a bridge is attempted and which retry origins carry
+    # audit evidence, so a stale committed line is never read as new delivery.
     pending = await receipts.pending_outbox() if receipts is not None else []
+    retry_origins_captured: frozenset[str] = frozenset()
     retry_origins_with_audit: frozenset[str] = frozenset()
-    if receipts is not None and admission_gate is not None:
+    if receipts is not None:
+        captured: list[str] = []
         audited_retry_origins: list[str] = []
         for receipt in pending:
             if receipt["state"] != "retry_pending":
                 continue
             origin = {"source_handle": receipt["source_handle"], **receipt["origin"]}
+            encoded = json.dumps(origin, sort_keys=True, separators=(",", ":"))
+            captured.append(encoded)
             if await app.state.recovery_registry.queue_manager.recovery_origin_has_retry_audit(
                 origin
             ):
-                audited_retry_origins.append(
-                    json.dumps(origin, sort_keys=True, separators=(",", ":"))
-                )
+                audited_retry_origins.append(encoded)
+        retry_origins_captured = frozenset(captured)
         retry_origins_with_audit = frozenset(audited_retry_origins)
+    has_retry_pending = bool(retry_origins_captured)
 
     async def _reconcile_locked(*, bridge_retry_pending: bool) -> bool:
         if lock is None:
@@ -782,6 +824,7 @@ async def _reconcile_native_recovery_outbox(app: FastAPI) -> None:
                 app,
                 bridge_retry_pending=bridge_retry_pending,
                 retry_origins_with_audit=retry_origins_with_audit,
+                retry_origins_captured=retry_origins_captured,
             )
         else:
             async with lock:
@@ -789,12 +832,11 @@ async def _reconcile_native_recovery_outbox(app: FastAPI) -> None:
                     app,
                     bridge_retry_pending=bridge_retry_pending,
                     retry_origins_with_audit=retry_origins_with_audit,
+                    retry_origins_captured=retry_origins_captured,
                 )
         return True
 
-    if admission_gate is not None and any(
-        receipt["state"] == "retry_pending" for receipt in pending
-    ):
+    if has_retry_pending and admission_gate is not None:
         # Gate then outbox is the only combined order. The availability check
         # intentionally ignores this retry bridge itself, otherwise the bridge
         # could never self-heal after a process crash.
@@ -803,7 +845,12 @@ async def _reconcile_native_recovery_outbox(app: FastAPI) -> None:
             lambda: _reconcile_locked(bridge_retry_pending=True),
         )
         return
-    await _reconcile_locked(bridge_retry_pending=False)
+    # Legacy lease mode has no permit gate, so retry follows the same
+    # live-first predicate directly: a paused recovery or pending live work
+    # leaves the retry bridge unbridged (still durable) until a later pass.
+    # Receipts that need no bridge are still reconciled either way.
+    bridge = has_retry_pending and await _native_recovery_live_available(app)
+    await _reconcile_locked(bridge_retry_pending=bridge)
 
 
 async def _retry_quarantined_native_recovery(app: FastAPI) -> bool:
@@ -811,7 +858,7 @@ async def _retry_quarantined_native_recovery(app: FastAPI) -> bool:
     receipts = getattr(app.state, "recovery_receipts", None)
     recovery_registry = getattr(app.state, "recovery_registry", None)
     admission_gate = getattr(app.state, "recovery_admission_gate", None)
-    if receipts is None or recovery_registry is None or admission_gate is None:
+    if receipts is None or recovery_registry is None:
         return False
 
     admin_lock = app.state.recovery_admin_retry_lock
@@ -830,9 +877,18 @@ async def _retry_quarantined_native_recovery(app: FastAPI) -> bool:
                 receipt["source_handle"], receipt["origin"]["ordinal"]
             )
 
-        transitioned = await admission_gate.run_if_available(
-            lambda: _native_recovery_live_available(app), _mark_retry_pending
-        )
+        if admission_gate is None:
+            # Legacy lease mode: no permit gate to serialize with, but the same
+            # live-first/pause predicate still governs the retry. Lease
+            # freshness stays enforced at ingress and flush, as before.
+            transitioned = (
+                await _native_recovery_live_available(app)
+                and await _mark_retry_pending()
+            )
+        else:
+            transitioned = await admission_gate.run_if_available(
+                lambda: _native_recovery_live_available(app), _mark_retry_pending
+            )
         if not transitioned:
             return False
 
@@ -845,64 +901,89 @@ async def _retry_quarantined_native_recovery(app: FastAPI) -> bool:
 
 async def _quarantine_pending_native_recovery(
     app: FastAPI, source_handle: str, ordinal: int
-) -> bool:
-    """Dead-letter and terminalize one selected receipt while recovery is paused."""
+) -> Literal["quarantined", "none", "not_paused"]:
+    """Dead-letter and terminalize one selected receipt while recovery is paused.
+
+    The recovery pause condition is held from the authoritative paused check
+    through the final queue commit.  Resume takes the same condition, so it can
+    only return once the selected receipt is terminal; a drainer waiting on
+    resume then finds it ineligible instead of flushing it.  Lock order is
+    pause condition -> outbox lock.  Nothing that holds the outbox lock may
+    await the pause condition.
+
+    Returns ``"not_paused"`` when recovery is not paused (nothing changed),
+    ``"none"`` when no eligible pending receipt was quarantined, and
+    ``"quarantined"`` when the receipt was dead-lettered and terminalized.
+    """
     receipts = getattr(app.state, "recovery_receipts", None)
     recovery_registry = getattr(app.state, "recovery_registry", None)
-    if (
-        receipts is None
-        or recovery_registry is None
-        or not getattr(app.state, "recovery_paused", False)
-    ):
+    if receipts is None or recovery_registry is None:
+        return "none"
+    async with app.state.recovery_pause_condition:
+        if not getattr(app.state, "recovery_paused", False):
+            return "not_paused"
+        async with app.state.recovery_outbox_lock:
+            if await _quarantine_selected_receipt_locked(
+                recovery_registry, receipts, source_handle, ordinal
+            ):
+                return "quarantined"
+            return "none"
+
+
+async def _quarantine_selected_receipt_locked(
+    recovery_registry: Any,
+    receipts: Any,
+    source_handle: str,
+    ordinal: int,
+) -> bool:
+    """Quarantine one pending receipt; the caller holds condition and outbox."""
+    receipt = await receipts.pending_receipt(source_handle, ordinal)
+    if receipt is None:
         return False
-    async with app.state.recovery_outbox_lock:
-        receipt = await receipts.pending_receipt(source_handle, ordinal)
-        if receipt is None:
+    origin = {"source_handle": source_handle, **receipt["origin"]}
+    queue = recovery_registry.queue_manager
+    session_id = receipt["payload"]["data"]["session_id"]
+    # A committed offset is a durable graph-flush proof. Do not let a
+    # manual action overwrite that completion with a quarantine, unless
+    # retry audit evidence proves it belongs to the prior delivery that
+    # this retry bridge replaced.
+    if await queue.recovery_origin_commit_state(
+        origin
+    ) == "committed" and not await queue.recovery_origin_has_retry_audit(origin):
+        return False
+    batch = await queue.read_batch(session_id, max_items=1)
+    if batch.records:
+        try:
+            envelope = json.loads(batch.records[0].raw)
+        except (TypeError, ValueError):
             return False
-        origin = {"source_handle": source_handle, **receipt["origin"]}
-        queue = recovery_registry.queue_manager
-        session_id = receipt["payload"]["data"]["session_id"]
-        # A committed offset is a durable graph-flush proof. Do not let a
-        # manual action overwrite that completion with a quarantine, unless
-        # retry audit evidence proves it belongs to the prior delivery that
-        # this retry bridge replaced.
-        if await queue.recovery_origin_commit_state(
-            origin
-        ) == "committed" and not await queue.recovery_origin_has_retry_audit(origin):
+        if envelope.get("_recovery_origin") != origin:
             return False
-        batch = await queue.read_batch(session_id, max_items=1)
-        if batch.records:
-            try:
-                envelope = json.loads(batch.records[0].raw)
-            except (TypeError, ValueError):
-                return False
-            if envelope.get("_recovery_origin") != origin:
-                return False
-            await queue.dead_letter(
-                session_id,
-                batch.records[0].raw,
-                "operator quarantined stuck native recovery receipt",
-            )
-            await receipts.quarantine_pending(source_handle, ordinal)
-            await queue.commit(session_id, batch.end_offset)
-            return True
-        # An outbox record can be stuck before its first queue append. Preserve
-        # its sanitized envelope as dead-letter evidence before terminalizing it.
-        audit_payload = {
-            **sanitize_recovery_payload(receipt["payload"]),
-            "created_by": receipt["actor"],
-            "_recovery_origin": origin,
-            SPOOL_EVENT_IDENTITY: _recovery_event_identity(
-                receipt["payload"], source_handle, ordinal
-            ),
-        }
         await queue.dead_letter(
             session_id,
-            json.dumps(audit_payload, separators=(",", ":")).encode(),
-            "operator quarantined stuck native recovery receipt before enqueue",
+            batch.records[0].raw,
+            "operator quarantined stuck native recovery receipt",
         )
         await receipts.quarantine_pending(source_handle, ordinal)
+        await queue.commit(session_id, batch.end_offset)
         return True
+    # An outbox record can be stuck before its first queue append. Preserve
+    # its sanitized envelope as dead-letter evidence before terminalizing it.
+    audit_payload = {
+        **sanitize_recovery_payload(receipt["payload"]),
+        "created_by": receipt["actor"],
+        "_recovery_origin": origin,
+        SPOOL_EVENT_IDENTITY: _recovery_event_identity(
+            receipt["payload"], source_handle, ordinal
+        ),
+    }
+    await queue.dead_letter(
+        session_id,
+        json.dumps(audit_payload, separators=(",", ":")).encode(),
+        "operator quarantined stuck native recovery receipt before enqueue",
+    )
+    await receipts.quarantine_pending(source_handle, ordinal)
+    return True
 
 
 async def _admit_native_recovery(
@@ -1270,6 +1351,255 @@ async def _server_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             await recovery_registry.close_neo4j_driver()
 
 
+def _initialize_identity_store(
+    app: FastAPI, s: Any, store: IdentityStore, *, owned: bool
+) -> None:
+    """Load (and on first boot seed) the store when OWNED; always log status.
+
+    An unselected store (``owned`` False) performs no file I/O at all: there is
+    nothing to seed and no mutation path, but the empty-map startup warnings
+    still fire so an operator sees the fail-closed bootstrap state.
+    """
+    if owned:
+        store.load()
+    if s.auth_mode == "entra":
+        config_entra_map = s.build_identity_map()
+        config_service_map = s.build_service_identity_map()
+        if owned and not store.exists():
+            # First boot: seed from config -- ONE shared store serves both user
+            # and service oids (the factory enforced disjoint key spaces).
+            rich_seed: dict[str, dict[str, str]] = {
+                oid: {"id": cid}
+                for oid, cid in (
+                    *config_entra_map.items(),
+                    *config_service_map.items(),
+                )
+            }
+            if rich_seed:
+                store.seed(rich_seed)
+        if not store.flat_dict:
+            logger.warning(
+                "entra identity map is EMPTY at startup (0 bound oids) — server "
+                "is UP and serving, but every delegated (human) token will "
+                "receive 403 until identities are onboarded. Bind the first user "
+                "with an IdentityAdmin-role token via PUT /admin/identities/{oid} "
+                "(store=%s). This is expected on a fresh /data volume.",
+                s.entra_identities_store_path,
+            )
+        # service_identities is a FIRST-BOOT seed only: name the ignored oids
+        # so the wrong lever is obvious at boot.
+        ignored = sorted(
+            oid for oid in config_service_map if oid not in store.flat_dict
+        )
+        if ignored:
+            logger.warning(
+                "service_identities config lists %d oid(s) that are NOT in the "
+                "identity store and are being IGNORED: %r. service_identities "
+                "seeds the store on FIRST BOOT ONLY and store=%s already exists, "
+                "so config changes after the first boot have no effect and these "
+                "principals will receive 403. Add them at runtime with an "
+                "IdentityAdmin-role token via PUT /admin/identities/{oid} — no "
+                "redeploy required.",
+                len(ignored),
+                ignored,
+                s.entra_identities_store_path,
+            )
+    else:
+        if owned and not store.exists():
+            # First boot: seed from config (flat digest map -> rich format).
+            config_ks = s.build_keystore()
+            if config_ks:
+                store.seed({digest: {"id": cid} for digest, cid in config_ks.items()})
+        if not store.flat_dict:
+            if s.resolve_admin_api_key_digest() is not None:
+                logger.warning(
+                    "static keystore is EMPTY at startup (0 bound keys) — server "
+                    "is UP but fail-CLOSED; every request will 401 until keys are "
+                    "onboarded. Add the first key with the admin token via "
+                    "PUT /admin/keys/{sha256hash} (store=%s). Expected on a fresh "
+                    "/data volume.",
+                    s.api_keys_store_path,
+                )
+            else:
+                logger.warning(
+                    "static keystore is EMPTY at startup (0 bound keys) AND no "
+                    "admin_api_key/admin_api_key_sha256 is configured — server is "
+                    "UP but fail-CLOSED and CANNOT be bootstrapped at runtime (the "
+                    "/admin API is unreachable without an admin key: it 401s at "
+                    "the middleware before require_admin runs). Set "
+                    "admin_api_key/admin_api_key_sha256 to enable runtime "
+                    "onboarding, or add api_keys in config and restart. (store=%s)",
+                    s.api_keys_store_path,
+                )
+    resolver = getattr(app.state, "identity_resolver", None)
+    if s.allow_unauthenticated and resolver is not None and not resolver.auth_enabled:
+        logger.warning(
+            "allow_unauthenticated=True AND no credentials configured — the "
+            "server is WIDE OPEN: EVERY request is admitted UNAUTHENTICATED. "
+            "This opt-out is for TEST/DEV ONLY and must NEVER be set in "
+            "production. Configure api_key/api_keys (static) or entra_identities "
+            "(entra) and unset allow_unauthenticated to enforce authentication."
+        )
+
+
+# Identity readiness is one cached record on ``app.state``: ``identity_state`` is
+# "initializing" (closed, the initial state of every factory wrapper), "ready",
+# or "unavailable".  ``/status`` and the auth gate only read it.  The lock makes
+# a worker thread's "ready" lose cleanly against a shutdown that already began.
+_identity_state_lock = threading.Lock()
+_IDENTITY_REASONS = {"initializing": "initializing", "unavailable": "store_unavailable"}
+
+
+def _set_identity_state(
+    app: FastAPI, new_state: str, *, ready_token: Any = None, owned: bool = False
+) -> None:
+    with _identity_state_lock:
+        state = app.state
+        if new_state == "ready" and getattr(state, "identity_closing", False):
+            new_state = "unavailable"  # shutdown began first: never reopen
+        is_ready = new_state == "ready"
+        state.identity_ready_token = ready_token if is_ready else None
+        state.identity_store_owned = owned and is_ready
+        state.identity_state = new_state
+
+
+def _identity_store_of(app: FastAPI) -> IdentityStore | None:
+    # IdentityStore defines __len__, so an empty store is falsy: test for None.
+    store = getattr(app.state, "entra_identity_store", None)
+    if store is None:
+        store = getattr(app.state, "api_key_store", None)
+    return store
+
+
+def _release_identity(store: IdentityStore, lock: IdentityStoreLock | None) -> None:
+    """Drop a (possibly partial) ownership: clear the served map, free the lock."""
+    try:
+        store.stop()
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def _start_identity_ownership(
+    app: FastAPI, s: Any
+) -> tuple[IdentityStore, IdentityStoreLock | None] | None:
+    """Select, lock, load and seed the identity store.  Runs ONCE, in a thread.
+
+    Expected identity failures (a selection ``ValueError``, ``OSError``, an
+    ownership error) are logged privately and leave identity "unavailable": the
+    server stays up, authenticated and mutating requests answer 503, and the
+    served map is cleared with any partially taken lock released.  Nothing is
+    retried.  Any other exception is a programming error: it is NOT swallowed
+    here (partial state is still released) and surfaces on the task, where the
+    done-callback records identity unavailable.
+    """
+    store = _identity_store_of(app)
+    if store is None:
+        return None  # no identity wiring on this app
+    state = app.state
+    try:
+        selected = s.active_identity_store_path()
+    except ValueError as exc:
+        logger.error("identity store selection failed; identity unavailable: %s", exc)
+        _set_identity_state(app, "unavailable")
+        return None
+    lock: IdentityStoreLock | None = None
+    try:
+        if selected is not None:
+            lock = IdentityStoreLock(store.path)
+            lock.acquire()
+            store.attach(lock)
+        _initialize_identity_store(app, s, store, owned=lock is not None)
+    except (OSError, IdentityStoreOwnershipError) as exc:
+        _release_identity(store, lock)
+        logger.error(
+            "identity store initialization failed; identity unavailable: %r", exc
+        )
+        _set_identity_state(app, "unavailable")
+        return None
+    except BaseException:
+        _release_identity(store, lock)
+        raise
+    _set_identity_state(
+        app,
+        "ready",
+        ready_token=getattr(state, "identity_config_token", None),
+        owned=lock is not None,
+    )
+    return store, lock
+
+
+def _stop_identity_ownership(
+    app: FastAPI, owned: tuple[IdentityStore, IdentityStoreLock | None] | None
+) -> None:
+    """Close readiness first, then stop operations, clear the cache, release."""
+    with _identity_state_lock:
+        app.state.identity_closing = True
+    _set_identity_state(app, "unavailable")
+    if owned is not None:
+        _release_identity(*owned)
+
+
+def _identity_init_done(app: FastAPI, task: asyncio.Task[Any]) -> None:
+    """Always observe the init task so its exception is never left unretrieved."""
+    if task.cancelled():
+        _set_identity_state(app, "unavailable")
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "identity initialization failed unexpectedly; identity unavailable: %r",
+            exc,
+            exc_info=exc,
+        )
+        _set_identity_state(app, "unavailable")
+
+
+@asynccontextmanager
+async def _identity_lifespan(app: FastAPI, s: Any) -> AsyncGenerator[None, None]:
+    """Start identity init in a worker thread; never wait for it.
+
+    The server (listener, health, status) comes up immediately.  Shutdown closes
+    readiness first, then waits for the init thread to really finish -- it is
+    doing blocking I/O and cannot be killed, so a hung filesystem can delay
+    shutdown and no finite OS guarantee is claimed here -- and only then clears
+    the store and releases the identity lock (the root lock is released last by
+    ``lifespan``).
+    """
+    state = app.state
+    if _identity_store_of(app) is None:
+        yield
+        return
+    if getattr(state, "identity_lifespan_active", False):
+        raise RuntimeError("an application lifespan already owns the identity store")
+    state.identity_lifespan_active = True
+    with _identity_state_lock:
+        state.identity_closing = False
+    _set_identity_state(app, "initializing")
+    task = asyncio.create_task(asyncio.to_thread(_start_identity_ownership, app, s))
+    task.add_done_callback(lambda finished: _identity_init_done(app, finished))
+    state.identity_init_task = task
+    cancelled: asyncio.CancelledError | None = None
+    try:
+        yield
+    finally:
+        with _identity_state_lock:
+            state.identity_closing = True
+        _set_identity_state(app, "unavailable")
+        while not task.done():
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError as exc:  # keep settling the thread
+                cancelled = exc
+        owned = None if task.cancelled() or task.exception() else task.result()
+        try:
+            _stop_identity_ownership(app, owned)
+        finally:
+            state.identity_lifespan_active = False
+        if cancelled is not None:
+            raise cancelled
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Acquire the single-writer lock before initializing any server workers."""
@@ -1285,20 +1615,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         raise RuntimeError(str(exc)) from exc
     app.state.server_instance_lock = instance_lock
     try:
-        # Worker-local (not the pre-fork gunicorn arbiter): hold until all
-        # drainers and drivers finish shutdown, including startup recovery.
-        service = await RetentionService.open(settings.blob_path)
-        app.state.retention_service = service
-        try:
-            async with _server_lifespan(app):
-                try:
-                    yield
-                finally:
-                    # Stop maintenance before quiescing drainers, but retain the
-                    # lifetime flock until their final writes and real I/O exit.
-                    await service.stop()
-        finally:
-            await service.close()
+        # Lock order: queue-root lock -> identity-store lock -> load/seed ->
+        # server lifespan.  Teardown reverses it: identity operations stop and
+        # the cache clears before the identity lock, then the root lock, go.
+        async with _identity_lifespan(app, settings):
+            # Worker-local (not the pre-fork gunicorn arbiter): hold until all
+            # drainers and drivers finish shutdown, including startup recovery.
+            service = await RetentionService.open(settings.blob_path)
+            app.state.retention_service = service
+            try:
+                async with _server_lifespan(app):
+                    try:
+                        yield
+                    finally:
+                        # Stop maintenance before quiescing drainers, but retain
+                        # the lifetime flock until their final writes and real
+                        # I/O exit.
+                        await service.stop()
+            finally:
+                await service.close()
     finally:
         instance_lock.release()
 
@@ -1514,6 +1849,14 @@ def create_asgi_app(
     _assert_admin_not_exempt()
 
     s = settings if settings is not None else _settings
+    # The ASGI app and its identity wiring are a process singleton.  Replacing
+    # them while a lifespan owns the identity store would swap the store/gate
+    # under live traffic, so refuse BEFORE mutating any state.
+    if getattr(app.state, "identity_lifespan_active", False):
+        raise RuntimeError(
+            "create_asgi_app() cannot replace identity wiring while the "
+            "application lifespan owns the identity store"
+        )
     _assert_neo4j_clients_explicit(s)
     # The ASGI lifespan must use the same settings object passed to this
     # factory.  Direct uvicorn/gunicorn imports therefore validate and lock the
@@ -1751,73 +2094,19 @@ def create_asgi_app(
             'sys.argv[1].encode()).hexdigest())" "<token>"'
         )
 
+    # The factory only CONSTRUCTS identity objects: no identity file is read,
+    # seeded, or written here.  Loading and seeding happen in
+    # ``_identity_lifespan`` under exclusive store ownership, and the
+    # middleware's identity gate keeps every request at 503 until then.
     if s.auth_mode == "entra":
-        # Build and load the entra identity store.
-        entra_store = IdentityStore(Path(s.entra_identities_store_path))
-        entra_store.load()
-        _config_entra_map = s.build_identity_map()
-        _config_service_map = s.build_service_identity_map()
-        if not entra_store.path.exists():
-            # First boot: seed in-process map from config -- ONE shared store
-            # serves both user and service oids (disjoint key spaces make sharing
-            # safe; the disjointness check below enforces that the two config
-            # maps never name the same oid).
-            rich_seed: dict[str, dict[str, str]] = {
-                oid: {"id": cid}
-                for oid, cid in (
-                    *_config_entra_map.items(),
-                    *_config_service_map.items(),
-                )
-            }
-            if rich_seed:
-                entra_store.seed(rich_seed)
-        _entra_identity_store = entra_store
-        app.state.entra_identity_store = entra_store
-
-        # Bootstrap visibility: announce an EMPTY identity map loudly at startup.
-        # This is a SUPPORTED state, not an error — the server is up and serving.
-        # Delegated (human) tokens will 403 until an IdentityAdmin role-holder
-        # binds the first oid via PUT /admin/identities/{oid}. Without this line
-        # an empty map would be silent and look like a misconfiguration.
-        if not entra_store.flat_dict:
-            logger.warning(
-                "entra identity map is EMPTY at startup (0 bound oids) — server "
-                "is UP and serving, but every delegated (human) token will "
-                "receive 403 until identities are onboarded. Bind the first user "
-                "with an IdentityAdmin-role token via PUT /admin/identities/{oid} "
-                "(store=%s). This is expected on a fresh /data volume.",
-                s.entra_identities_store_path,
-            )
-
-        # service_identities is a FIRST-BOOT seed only: once the store file
-        # exists, config is never re-read into it. An operator who sets
-        # SERVICE_IDENTITIES on an already-deployed server would otherwise get
-        # no signal at all — the only symptom is a 403 on the service token,
-        # whose message points at the administrator, not at the ignored config.
-        # Name the ignored oids here so the wrong lever is obvious at boot.
-        _ignored_service_oids = sorted(
-            oid for oid in _config_service_map if oid not in entra_store.flat_dict
+        entra_store = IdentityStore(
+            Path(s.entra_identities_store_path).expanduser(), managed=True
         )
-        if _ignored_service_oids:
-            logger.warning(
-                "service_identities config lists %d oid(s) that are NOT in the "
-                "identity store and are being IGNORED: %r. service_identities "
-                "seeds the store on FIRST BOOT ONLY and store=%s already exists, "
-                "so config changes after the first boot have no effect and these "
-                "principals will receive 403. Add them at runtime with an "
-                "IdentityAdmin-role token via PUT /admin/identities/{oid} — no "
-                "redeploy required.",
-                len(_ignored_service_oids),
-                _ignored_service_oids,
-                s.entra_identities_store_path,
-            )
-
         # Boot disjointness invariant — each oid must belong to exactly one
-        # identity source.  Checked against the two CONFIG maps, not the
-        # store's flat_dict: one shared store now holds user and service oids
-        # alike, so the store itself can no longer show the overlap.  This
-        # prevents a same-oid-in-both misconfiguration at startup.
-        _overlap = set(_config_entra_map) & set(_config_service_map)
+        # identity source.  Checked against the two CONFIG maps: one shared
+        # store holds user and service oids alike, so the store itself can no
+        # longer show the overlap.
+        _overlap = set(s.build_identity_map()) & set(s.build_service_identity_map())
         if _overlap:
             raise RuntimeError(
                 f"Boot invariant violated: oid(s) {sorted(_overlap)!r} appear "
@@ -1825,12 +2114,14 @@ def create_asgi_app(
                 f"belong to exactly one identity source. Fix the config to remove "
                 f"the overlap before restarting."
             )
-
+        _entra_identity_store = entra_store
+        app.state.entra_identity_store = entra_store
         # EntraResolver raises RuntimeError at construction if the JWKS
         # prefetch fails (eager fail-closed by design).
         # Pass entra_store.flat_dict (the LIVE dict) as BOTH maps so the
         # resolver sees any put()/delete() made by /admin immediately on
-        # either path, no restart required.
+        # either path, no restart required.  The dict is filled by the
+        # lifespan once the store is owned.
         resolver: StaticKeyResolver | EntraResolver = EntraResolver(
             s.azure_client_id,  # type: ignore[arg-type]  — validated non-None by config
             s.azure_tenant_id,  # type: ignore[arg-type]  — validated non-None by config
@@ -1844,62 +2135,44 @@ def create_asgi_app(
         )
         # Entra mode does not use admin_api_key_digest (admin via roles claim).
         admin_api_key_digest = None
+        active_identity_store = entra_store
     else:
-        # Build and load the API-key store.
-        key_store = IdentityStore(Path(s.api_keys_store_path))
-        key_store.load()
-        if not key_store.path.exists():
-            # First boot: seed from config.  Converts the flat
-            # {sha256_hex -> contributor_id} from build_keystore() to the
-            # rich {sha256_hex -> {"id": contributor_id}} format.
-            config_ks = s.build_keystore()
-            if config_ks:
-                rich_seed = {digest: {"id": cid} for digest, cid in config_ks.items()}
-                key_store.seed(rich_seed)
+        key_store = IdentityStore(
+            Path(s.api_keys_store_path).expanduser(), managed=True
+        )
         _api_key_store = key_store
         app.state.api_key_store = key_store
-
-        # Bootstrap visibility: announce an EMPTY keystore loudly at startup.
-        # This is a SUPPORTED state (fail-CLOSED, not fail-open) — the server
-        # is up and serving, but every request 401s until keys are onboarded.
-        if not key_store.flat_dict:
-            if s.resolve_admin_api_key_digest() is not None:
-                logger.warning(
-                    "static keystore is EMPTY at startup (0 bound keys) — server "
-                    "is UP but fail-CLOSED; every request will 401 until keys are "
-                    "onboarded. Add the first key with the admin token via "
-                    "PUT /admin/keys/{sha256hash} (store=%s). Expected on a fresh "
-                    "/data volume.",
-                    s.api_keys_store_path,
-                )
-            else:
-                logger.warning(
-                    "static keystore is EMPTY at startup (0 bound keys) AND no "
-                    "admin_api_key/admin_api_key_sha256 is configured — server is "
-                    "UP but fail-CLOSED and CANNOT be bootstrapped at runtime (the "
-                    "/admin API is unreachable without an admin key: every token "
-                    "401s at the middleware before require_admin runs). Set "
-                    "admin_api_key/admin_api_key_sha256 to enable runtime "
-                    "onboarding, or add api_keys in config and restart. (store=%s)",
-                    s.api_keys_store_path,
-                )
-
         # Pass key_store.flat_dict (the LIVE dict) so the resolver sees any
         # put()/delete() made by /admin immediately, no restart required.
         resolver = StaticKeyResolver(key_store.flat_dict)
+        active_identity_store = key_store
 
-    # Wide-open warning: fires ONLY on the explicit allow_unauthenticated
-    # opt-out combined with no credentials configured. An empty keystore/map
-    # ALONE does not trigger this and does not refuse to start — it boots
-    # fail-closed instead (see the empty-map/keystore warnings above).
-    if s.allow_unauthenticated and not resolver.auth_enabled:
-        logger.warning(
-            "allow_unauthenticated=True AND no credentials configured — the "
-            "server is WIDE OPEN: EVERY request is admitted UNAUTHENTICATED. "
-            "This opt-out is for TEST/DEV ONLY and must NEVER be set in "
-            "production. Configure api_key/api_keys (static) or entra_identities "
-            "(entra) and unset allow_unauthenticated to enforce authentication."
-        )
+    app.state.identity_resolver = resolver
+    # Generation + readiness gate on EVERY wrapper.  The token ties the wrapper
+    # to THIS factory call: once a later call replaces the shared app state this
+    # wrapper is obsolete and answers 503 to everything except the public status
+    # paths.  Readiness starts CLOSED; the lifespan's one-shot identity init
+    # opens it for the live generation ("ready"), or leaves it unavailable.
+    _gate_token = object()
+    app.state.identity_config_token = _gate_token
+    app.state.identity_ready_token = None
+    app.state.identity_store_owned = False
+    app.state.identity_closing = False
+    app.state.identity_state = "initializing"
+
+    def _identity_ready() -> bool:
+        state = app.state
+        if getattr(state, "identity_config_token", None) is not _gate_token:
+            return False  # obsolete generation
+        if getattr(state, "identity_state", "initializing") != "ready":
+            return False  # initializing, unavailable, or shutting down
+        if getattr(state, "identity_ready_token", None) is not _gate_token:
+            return False
+        if getattr(state, "identity_store_owned", False):
+            return active_identity_store.healthy()
+        return True
+
+    identity_gate: Callable[[], bool] = _identity_ready
 
     # Log admin capability status for operator visibility.
     if s.auth_mode == "static":
@@ -1933,6 +2206,7 @@ def create_asgi_app(
         exempt_paths=_EXEMPT_PATHS,
         admin_api_key_digest=admin_api_key_digest,
         allow_unauthenticated=s.allow_unauthenticated,
+        identity_gate=identity_gate,
     )
 
 
@@ -2031,6 +2305,12 @@ def __getattr__(name: str) -> Any:
 @app.get("/status")
 async def get_status(request: Request) -> dict[str, Any]:
     response = build_status_response(registry, _start_time)
+    # Cached identity readiness (initializing | ready | unavailable): plain
+    # attribute reads, no I/O and no exception paths, so status keeps answering
+    # while identity initializes or is unavailable.  No identity wiring == ready.
+    _identity = getattr(request.app.state, "identity_state", "ready")
+    response["identity_ready"] = _identity == "ready"
+    response["identity_reason"] = _IDENTITY_REASONS.get(_identity)
     response["neo4j_connected"] = await _check_driver_connected(
         request.app, "neo4j_driver"
     )

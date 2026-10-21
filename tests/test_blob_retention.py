@@ -1055,3 +1055,75 @@ r.apply({str(tmp_path)!r}, {CUTOFF}, lambda _: True)
     result = r.apply(tmp_path, CUTOFF, lambda _: True)
     assert result.deleted == 512 and result.errors == 0
     assert not journal.exists()
+
+
+# --- Tilde-prefixed roots (Copilot r4329246656) ---------------------------------
+
+
+def _tilde_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    """Isolated HOME and a *different* cwd, so a stray literal ``~`` is detectable."""
+    home, cwd = tmp_path / "home", tmp_path / "cwd"
+    home.mkdir()
+    cwd.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(cwd)
+    return home, cwd
+
+
+def test_rootlock_expands_tilde_before_creating_fresh_root(tmp_path, monkeypatch):
+    home, cwd = _tilde_env(tmp_path, monkeypatch)
+    with r.RootLock("~/fresh-blobs", create_root=True) as lock:
+        assert lock.root.path == (home / "fresh-blobs").resolve()
+    assert (home / "fresh-blobs" / r.LOCK).is_file()
+    assert list(cwd.iterdir()) == [], "a literal './~' directory must never be created"
+
+
+def test_rootlock_existing_expanded_root_control(tmp_path, monkeypatch):
+    """Control: an already-existing expanded root opens (true pre- and post-fix)."""
+    home, _cwd = _tilde_env(tmp_path, monkeypatch)
+    (home / "existing").mkdir()
+    with r.RootLock("~/existing", create_root=True) as lock:
+        assert lock.root.path == (home / "existing").resolve()
+
+
+def test_rootlock_existing_expanded_root_leaves_no_literal_tilde_dir(
+    tmp_path, monkeypatch
+):
+    home, cwd = _tilde_env(tmp_path, monkeypatch)
+    (home / "existing").mkdir()
+    with r.RootLock("~/existing", create_root=True):
+        pass
+    assert list(cwd.iterdir()) == [], "a literal './~' directory must never be created"
+
+
+async def test_worker_lifespan_fresh_tilde_blob_root(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from typing import cast
+
+    from fastapi import FastAPI
+
+    from context_intelligence_server import main
+
+    home, cwd = _tilde_env(tmp_path, monkeypatch)
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            settings=SimpleNamespace(
+                blob_path="~/fresh-blobs", stateful_root=lambda: tmp_path / "state"
+            )
+        )
+    )
+    entered = []
+
+    @contextlib.asynccontextmanager
+    async def fake_lifespan(app):
+        entered.append(True)
+        yield
+
+    monkeypatch.setattr(main, "_server_lifespan", fake_lifespan)
+    async with main.lifespan(cast(FastAPI, app)):
+        assert entered
+        assert app.state.retention_service.path == (home / "fresh-blobs").resolve()
+    assert (home / "fresh-blobs" / r.LOCK).is_file()
+    assert list(cwd.iterdir()) == [], (
+        "startup must not create a literal './~' directory"
+    )

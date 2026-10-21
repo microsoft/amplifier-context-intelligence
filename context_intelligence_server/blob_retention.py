@@ -187,7 +187,9 @@ class RootLock:
     """Independent open-file description; no process-global lock cache."""
 
     def __init__(self, path: Path | str, *, exclusive: bool = False, create_root: bool = False):
-        self.path = Path(path)
+        # Expand before any mkdir: Root() expands too, so creating the literal path
+        # would leave a stray './~' and then fail to open the real directory.
+        self.path = Path(path).expanduser()
         self.exclusive = exclusive
         self.create_root = create_root
         self.root: Root

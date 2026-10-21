@@ -581,9 +581,22 @@ class SessionRegistry:
             yield
 
     async def _flush_and_commit(
-        self, worker: SessionWorker, records: list[Record], commit_to: int
+        self,
+        worker: SessionWorker,
+        records: list[Record],
+        commit_to: int,
+        eligibility_records: list[Record] | None = None,
     ) -> None:
         """Flush records and acknowledge their offset under the recovery guard.
+
+        ``records`` are the records whose receipts are completed and whose
+        offset is acknowledged.  ``eligibility_records`` is the full batch that
+        was dispatched into the graph buffer; it is what the recovery
+        eligibility hook inspects.  They differ when a batch reaches
+        ``session:end``: the terminal record is buffered (and therefore flushed)
+        but left unacknowledged, so judging eligibility on ``records`` alone
+        would let a quarantined terminal record reach the graph.  ``None``
+        means every dispatched record is also acknowledged.
 
         The optional pre-flush hook runs immediately before this recovery
         worker competes for a graph-write slot. Its guard remains held through
@@ -602,7 +615,10 @@ class SessionRegistry:
             # Checking before the guard would leave a stale enqueued result
             # that could write after pause/quarantine/resume.
             if self.is_recovery and self.before_recovery_flush is not None:
-                eligible = self.before_recovery_flush(worker, records)
+                eligible = self.before_recovery_flush(
+                    worker,
+                    records if eligibility_records is None else eligibility_records,
+                )
                 if inspect.isawaitable(eligible):
                     await eligible
             await self._flush_barrier(worker)
@@ -772,7 +788,12 @@ class SessionRegistry:
                         if terminal_at is None
                         else batch.records[:safe_count]
                     )
-                    await self._flush_and_commit(worker, committed_records, commit_to)
+                    await self._flush_and_commit(
+                        worker,
+                        committed_records,
+                        commit_to,
+                        eligibility_records=batch.records,
+                    )
                 except _QueueCommitFailure as failure:
                     # An acknowledgement's outcome is ambiguous.  It must
                     # escape the payload retry/dead-letter policy and be

@@ -613,6 +613,17 @@ async def _auth_client(
 class TestAuthMiddleware:
     """Bearer token middleware integration tests against the real app."""
 
+    @pytest.fixture(autouse=True)
+    def _no_drainer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """These tests exercise auth, not draining.
+
+        Without this, an accepted POST /events spawns a real drainer whose graph
+        reads/flush go to the default ``neo4j://neo4j:7687``; the drainer can
+        outlive the test and stall the loop teardown on retries (the 30s
+        pytest-timeout ERROR).  The durable append still runs for real.
+        """
+        monkeypatch.setattr(main_module.registry, "start_drain", lambda worker: None)
+
     async def test_status_accessible_without_token(self) -> None:
         """/status is always accessible through middleware, even when api_key is set."""
         async with _auth_client() as c:
@@ -651,6 +662,11 @@ class TestAuthMiddleware:
                 headers={"Authorization": "Bearer test-secret"},
             )
         assert response.status_code == 202
+        # Positive proof the 202 means "durably queued": with no drainer the
+        # record stays in the on-disk log, so this is deterministic.
+        key = main_module._events_worker_key("s1", "/ws")
+        batch = await main_module.registry.queue_manager.read_batch(key, max_items=10)
+        assert len(batch.records) == 1
 
     async def test_cypher_returns_401_without_token(self) -> None:
         """POST /cypher returns 401 when api_key is configured and no token sent."""
