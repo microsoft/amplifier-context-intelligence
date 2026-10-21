@@ -1568,3 +1568,141 @@ async def test_uncertain_commit_is_published_to_status_without_a_protected_reque
         with monkeypatch.context() as spy:  # no protected request happened yet
             _status_must_not_probe(spy)
             await _assert_status_unavailable(wrapper)
+
+
+# ---------------------------------------------------------------------------
+# r4336046216: the identity store need not sit beneath the queue root.
+#
+# The default queue root is /data while the default identity store lives under
+# the user's home, so root containment would reject the supported default layout.
+# Ownership is the per-store IdentityStoreLock's job, taken before any load/seed.
+# ---------------------------------------------------------------------------
+
+FOREIGN_TOKEN = "foreign-seed-token-0001"  # synthetic
+FOREIGN_DIGEST = hashlib.sha256(FOREIGN_TOKEN.encode()).hexdigest()
+FOREIGN_OID = "99999999-8888-7777-6666-555555555555"
+
+
+def _foreign_settings(root: Path, mode: str, store: Path) -> Settings:
+    """Settings seeded with a credential the existing store does NOT contain."""
+    common: dict[str, Any] = {
+        "queues_path": str(root / "queues"),
+        "blob_path": str(root / "blobs"),
+        "allow_unauthenticated": False,
+    }
+    if mode == "static":
+        return Settings(
+            auth_mode="static",
+            api_keys={FOREIGN_DIGEST: {"id": "intruder"}},
+            api_keys_store_path=str(store),
+            **common,
+        )
+    return Settings(
+        auth_mode="entra",
+        azure_client_id=CLIENT_ID,
+        azure_tenant_id=TENANT_ID,
+        entra_identities={FOREIGN_OID: {"id": "intruder"}},
+        entra_admin_role="",
+        entra_identities_store_path=str(store),
+        **common,
+    )
+
+
+def _child_start_foreign_seed(mode: str, root: str, store: str, out: Any) -> None:
+    """Spawned process: a SEEDED server on its own root, naming a shared store."""
+    import asyncio as aio
+
+    import context_intelligence_server.main as m
+
+    m._server_lifespan = _no_server_lifespan  # type: ignore[assignment]
+    settings = _foreign_settings(Path(root), mode, Path(store))
+
+    async def run() -> None:
+        m.create_asgi_app(settings=settings, _jwks_client=_StubJWKS())
+        try:
+            async with m.lifespan(m.app):
+                task = getattr(m.app.state, "identity_init_task", None)
+                if task is not None:
+                    await task
+                out.put(("started", getattr(m.app.state, "identity_state", "unknown")))
+        except RuntimeError as exc:
+            out.put(("refused", str(exc)))
+
+    aio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["static", "entra"])
+def test_seeded_second_server_on_an_unrelated_root_starts_with_identity_unavailable(
+    tmp_path: Path, mode: str
+) -> None:
+    """Previously a SEEDED second server was refused at config time (no /status).
+
+    Now it comes up like an unseeded one: listener and /status are available,
+    identity is unavailable, and it neither loads nor seeds the shared store.
+    """
+    store = tmp_path / "first" / "identity" / STORE_NAMES[mode]
+    first_settings = _settings(tmp_path / "first", mode, store)
+
+    async def run() -> None:
+        wrapper = _make_app(first_settings)
+        async with _serving():
+            before = store.read_bytes()
+            ctx = multiprocessing.get_context("spawn")
+            out = ctx.Queue()
+            child = ctx.Process(
+                target=_child_start_foreign_seed,
+                args=(mode, str(tmp_path / "second"), str(store), out),
+            )
+            child.start()
+            child.join(timeout=60)
+            assert child.exitcode == 0
+            assert out.get(timeout=5) == ("started", "unavailable")
+            assert store.read_bytes() == before  # second never loaded or seeded
+            assert FOREIGN_DIGEST.encode() not in before
+            assert FOREIGN_OID.encode() not in before
+            if mode == "static":
+                assert await _status(wrapper, "/whoami", TOKEN) == 200
+                assert await _status(wrapper, "/whoami", FOREIGN_TOKEN) == 401
+
+    asyncio.run(run())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["static", "entra"])
+async def test_existing_credentials_outside_the_queue_root_survive_a_different_seed(
+    tmp_path: Path, mode: str
+) -> None:
+    """Upgrade path: the existing store stays where it is and its bytes win.
+
+    The queue root is under tmp ``state``; the store sits in a separate
+    home-like directory (the default-layout shape).  Startup must not abort,
+    must not relocate or rewrite the file, and a DIFFERENT configured seed must
+    not be merged over the credentials that already exist.
+    """
+    store = tmp_path / "home" / ".local" / "share" / "ci-server" / "identity"
+    store = store / STORE_NAMES[mode]
+    store.parent.mkdir(parents=True)
+    existing_key = DIGEST if mode == "static" else OID
+    store.write_text(json.dumps({existing_key: {"id": "legacy"}}), encoding="utf-8")
+    before = store.read_bytes()
+
+    settings = _foreign_settings(tmp_path / "state", mode, store)
+    assert not store.resolve().is_relative_to((tmp_path / "state").resolve())
+    wrapper = _make_app(settings)
+
+    async with _serving():
+        assert main_module.app.state.identity_state == "ready"
+        assert (await _get_json(wrapper, "/status"))["identity_ready"] is True
+        assert _store_for(mode).flat_dict == {existing_key: "legacy"}
+        if mode == "static":
+            assert await _status(wrapper, "/whoami", TOKEN) == 200  # existing wins
+            # The different configured seed was never merged over the existing file.
+            assert await _status(wrapper, "/whoami", FOREIGN_TOKEN) == 401
+
+    assert store.read_bytes() == before  # never rewritten
+    configured = (
+        settings.api_keys_store_path
+        if mode == "static"
+        else settings.entra_identities_store_path
+    )
+    assert configured == str(store)  # never relocated

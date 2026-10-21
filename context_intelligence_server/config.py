@@ -612,16 +612,18 @@ class Settings(BaseSettings):
         rooted at ``<root>/nested`` could name the same resource yet take a
         different root lock, so two writers would drain it independently.
         Direct children make every contender of a shared resource resolve to the
-        same canonical root, hence the same lock.  The active identity store is
-        also included whenever this server can seed or mutate it, and may stay
-        a descendant of the root because it has its own per-store lock.
+        same canonical root, hence the same lock.
 
-        This runs synchronously during early boot, so it is configuration-only:
-        it never inspects the identity file.  A configured (seeded or
-        admin-mutable) store outside the queue parent is a hard configuration
-        error.  Whether an *existing* unseeded store is owned, and by whom, is
-        decided later by identity initialization under the identity lock, where
-        any failure leaves the server up with identity unavailable.
+        The identity store is deliberately NOT part of this root.  It is guarded
+        by its own canonical per-store ``IdentityStoreLock`` (taken during
+        identity initialization, before any load or seed), which is independent
+        of the queue root.  The default store lives under the user's data dir
+        while the default queue root is ``/data``, so requiring containment here
+        would reject the supported default layout for every authenticated
+        configuration.
+
+        This runs synchronously during early boot, so it is configuration-only
+        and never inspects the identity file.
         """
         live_queue = Path(self.queues_path).resolve()
         root = live_queue.parent
@@ -637,15 +639,7 @@ class Settings(BaseSettings):
                     ("recovery receipt ledger", receipt_store.resolve()),
                 )
             )
-        identity_store, identity_mutable = self._identity_store_and_mutability()
-        label = (
-            "API-key identity store"
-            if self.auth_mode == "static"
-            else "Entra identity store"
-        )
         split = [f"{name}={path}" for name, path in protected if path.parent != root]
-        if identity_mutable and not identity_store.resolve().is_relative_to(root):
-            split.append(f"{label}={identity_store.resolve()}")
         if split:
             rendered = ", ".join(split)
             raise ValueError(
