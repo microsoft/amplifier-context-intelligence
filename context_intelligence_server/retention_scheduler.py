@@ -166,13 +166,19 @@ def run_scheduled(
         until = time.monotonic() + cancel_timeout
         result.cleanup_state = "unconfirmed"
         job = None
+        acknowledged = False
         while time.monotonic() < until:
             try:
-                if job is None:
+                if job is None or (
+                    not acknowledged
+                    and job["state"] in {"previewing", "ready", "running"}
+                ):
                     try:
                         job = observe(call(client.cancel, owned.id, until=until))
+                        acknowledged = True
                     except ClientError:
-                        # The cancel reply can be lost too. Observe only this UUID.
+                        # The request or its reply can be lost. Observe only this UUID;
+                        # if it is still active, cancel is retried within this deadline.
                         job = observe(call(client.status, owned.id, until=until))
                 remaining(until)
                 if job["state"] in TERMINAL:

@@ -869,6 +869,99 @@ async def test_persisted_invalid_pending_receipt_is_scrubbed_quarantined_and_doe
 
 
 @pytest.mark.asyncio
+async def test_admin_retry_leaves_scrubbed_receipt_quarantined_and_recovery_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scrubbed (session_id removed) receipt is not replayable: admin retry
+    must leave it quarantined, never archive or mark it retry_pending, and a
+    later valid recovery admission must stay available."""
+    from context_intelligence_server.main import (
+        _retry_quarantined_native_recovery,
+        app,
+        create_asgi_app,
+    )
+
+    receipt_path = tmp_path / "receipts.sqlite3"
+    settings = Settings(
+        api_key=None,
+        api_keys=None,
+        api_keys_store_path=str(tmp_path / "keys.json"),
+        allow_unauthenticated=True,
+        queues_path=str(tmp_path / "live"),
+        recovery=cast(
+            Any,
+            {
+                "enabled": True,
+                "receipt_store_path": str(receipt_path),
+                "queues_path": str(tmp_path / "recovery"),
+            },
+        ),
+    )
+    create_asgi_app(settings=settings)
+    monkeypatch.setattr(app.state.recovery_registry, "get_or_create", MagicMock())
+    unsafe_session_id = _session_id_at_queue_filename_limit() + "x"
+    old_handle = source_handle_from_capability(_capability(20))
+    assert old_handle
+    seeded = RecoveryReceiptStore(receipt_path)
+    assert (
+        await seeded.admit_source(
+            old_handle,
+            _source("old-safe-session"),
+            _origin(),
+            "",
+            "one",
+            _payload("old-safe-session"),
+            require_lease=False,
+        )
+        == "accepted"
+    )
+    with sqlite3.connect(receipt_path) as db:
+        db.execute(
+            "UPDATE recovery_sources SET descriptor=? WHERE source_handle=?",
+            (json.dumps(_source(unsafe_session_id)), old_handle),
+        )
+        db.execute(
+            "UPDATE recovery_receipts SET payload=? WHERE source_handle=?",
+            (json.dumps(_payload(unsafe_session_id)), old_handle),
+        )
+    # A fresh store models startup: the scrub quarantines and strips session_id.
+    app.state.recovery_receipts = RecoveryReceiptStore(receipt_path)
+    receipts = app.state.recovery_receipts
+    assert await receipts.status() == {"quarantined": 1}
+
+    queue = app.state.recovery_registry.queue_manager
+    archived: list[dict[str, Any]] = []
+
+    async def archive_spy(requested: dict[str, Any]) -> int:
+        archived.append(requested)
+        return 0
+
+    monkeypatch.setattr(queue, "archive_recovery_dead_letters", archive_spy)
+
+    assert await _retry_quarantined_native_recovery(app) is False
+
+    assert archived == []  # no evidence archived for a non-replayable receipt
+    assert await receipts.status() == {"quarantined": 1}  # no retry_pending
+    assert await receipts.has_pending() is False
+
+    valid_handle = source_handle_from_capability(_capability(21))
+    assert valid_handle
+    assert (
+        await receipts.admit_source(
+            valid_handle,
+            _source("new-safe-session"),
+            _origin(),
+            "",
+            "one",
+            _payload("new-safe-session"),
+            require_lease=False,
+        )
+        == "accepted"
+    )
+    assert len(await receipts.pending_outbox()) == 1
+
+
+@pytest.mark.asyncio
 async def test_live_enqueue_wins_and_only_one_pending_recovery_holds() -> None:
     live_pending = False
 

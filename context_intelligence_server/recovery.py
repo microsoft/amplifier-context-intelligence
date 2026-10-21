@@ -1285,6 +1285,13 @@ class RecoveryReceiptStore:
                             continue
                         if not isinstance(payload, dict):
                             continue
+                        # A startup scrub strips an unsafe session_id; such a
+                        # receipt cannot be replayed, so it stays quarantined.
+                        data = payload.get("data")
+                        if not isinstance(data, dict) or not is_safe_session_id(
+                            data.get("session_id")
+                        ):
+                            continue
                         return {
                             "source_handle": row[0],
                             "origin": {"ordinal": row[1], "source_line_sha256": row[2]},
