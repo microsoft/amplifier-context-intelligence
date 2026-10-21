@@ -110,6 +110,7 @@ def test_recovery_registry_defers_queue_initialization_until_lifespan(
         shared_write_semaphore=asyncio.Semaphore(1),
         max_delivery_attempts=1,
         flush_gate=LiveFirstFlushGate(1),
+        quarantine_retry_lock=asyncio.Lock(),
     )
 
     assert registry._queue_manager is None

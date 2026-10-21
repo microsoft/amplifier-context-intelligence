@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, nullcontext, suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -68,7 +68,10 @@ from context_intelligence_server.neo4j_store import (
     ensure_neo4j_schema,
     mark_schema_ready,
 )
-from context_intelligence_server.queue_manager import fold_worker_key
+from context_intelligence_server.queue_manager import (
+    _await_uninterrupted,
+    fold_worker_key,
+)
 from context_intelligence_server.registry import LiveFirstFlushGate, SessionRegistry
 from context_intelligence_server.recovery import (
     PermitResult,
@@ -661,6 +664,14 @@ async def _reconcile_native_recovery_outbox_unlocked(
 ) -> None:
     """Repair interrupted recovery admissions while the outbox lock is held.
 
+    Precondition: the caller holds ``recovery_outbox_lock``.  Every production
+    caller also holds ``recovery_quarantine_retry_lock``, taken first:
+    reconciliation, the operator retry, operator quarantine and event admission
+    (whose duplicate repair reaches this through ``_admit_native_recovery``).
+    ``bridge_retry_pending=False`` (as in that duplicate repair) is a policy
+    choice about which receipts to bridge, not a concurrency guarantee: the
+    shared lock is what keeps a retry from interleaving with it.
+
     ``retry_origins_captured`` is the set of retry-pending origins the caller
     observed (and computed ``retry_origins_with_audit`` for) before taking the
     outbox lock.  A retry bridge is made only for those origins: one that
@@ -718,10 +729,15 @@ async def _reconcile_native_recovery_outbox_unlocked(
                 )
             )
             if queue_state == "committed":
-                # This is an explicit queue proof, not an inference from the
-                # receipt state: QueueManager.commit is reached only after the
-                # graph-flush barrier. It repairs receipts made by the former
-                # commit-then-terminalize ordering.
+                # A committed offset proves only that this line was consumed,
+                # not that it was flushed: a quarantine acknowledges its line
+                # without any flush.  It is safe to read as a write here only
+                # because quarantine+acknowledgement and retry are serialized by
+                # ``recovery_quarantine_retry_lock`` (a retry never reuses a
+                # line whose old acknowledgement is still in flight) and
+                # because dead-letter evidence was checked first above.  It
+                # repairs receipts made by the former commit-then-terminalize
+                # ordering.
                 await receipts.mark(
                     receipt["origin"],
                     "written",
@@ -787,7 +803,30 @@ async def _reconcile_native_recovery_outbox_unlocked(
 
 
 async def _reconcile_native_recovery_outbox(app: FastAPI) -> None:
-    """Idempotently bridge durable receipt admission into the recovery spool."""
+    """Idempotently bridge durable receipt admission into the recovery spool.
+
+    Takes ``recovery_quarantine_retry_lock`` first, so the evidence snapshots
+    below cannot predate a poison quarantine + acknowledgement or an operator
+    retry that is in flight.  A caller that already holds that lock must call
+    ``_reconcile_native_recovery_outbox_under_quarantine_lock`` instead: the
+    lock is not reentrant.  Nothing holding the lock, the admission gate or the
+    outbox lock may call this function.
+    """
+    quarantine_lock = getattr(app.state, "recovery_quarantine_retry_lock", None)
+    async with quarantine_lock or nullcontext():
+        await _await_uninterrupted(
+            _reconcile_native_recovery_outbox_under_quarantine_lock(app)
+        )
+
+
+async def _reconcile_native_recovery_outbox_under_quarantine_lock(
+    app: FastAPI,
+) -> None:
+    """Reconcile the outbox; the caller holds ``recovery_quarantine_retry_lock``.
+
+    The receipt/audit snapshots are taken here, under that lock, then the
+    admission gate (permit mode) and the outbox lock are taken in that order.
+    """
     receipts = getattr(app.state, "recovery_receipts", None)
     admission_gate = getattr(app.state, "recovery_admission_gate", None)
     lock = getattr(app.state, "recovery_outbox_lock", None)
@@ -854,12 +893,32 @@ async def _reconcile_native_recovery_outbox(app: FastAPI) -> None:
 
 
 async def _retry_quarantined_native_recovery(app: FastAPI) -> bool:
-    """Retry one quarantined receipt through the normal live-first admission gate."""
+    """Retry one quarantined receipt through the normal live-first admission gate.
+
+    The whole operation (selection, fence, archive, reset and bridge) holds
+    ``recovery_quarantine_retry_lock`` and is awaited uninterrupted, so it can
+    neither interleave with a poison drainer's quarantine + acknowledgement nor
+    be left half-applied by a cancelled request.  The lock is held through the
+    bridge (the queue append), not through graph flush or worker completion.
+    """
     receipts = getattr(app.state, "recovery_receipts", None)
     recovery_registry = getattr(app.state, "recovery_registry", None)
-    admission_gate = getattr(app.state, "recovery_admission_gate", None)
     if receipts is None or recovery_registry is None:
         return False
+    quarantine_lock = getattr(app.state, "recovery_quarantine_retry_lock", None)
+    async with quarantine_lock or nullcontext():
+        return await _await_uninterrupted(
+            _retry_quarantined_native_recovery_under_quarantine_lock(app)
+        )
+
+
+async def _retry_quarantined_native_recovery_under_quarantine_lock(
+    app: FastAPI,
+) -> bool:
+    """Retry one quarantined receipt; the caller holds the quarantine/retry lock."""
+    receipts = app.state.recovery_receipts
+    recovery_registry = app.state.recovery_registry
+    admission_gate = getattr(app.state, "recovery_admission_gate", None)
 
     admin_lock = app.state.recovery_admin_retry_lock
     async with admin_lock:
@@ -867,6 +926,20 @@ async def _retry_quarantined_native_recovery(app: FastAPI) -> bool:
         if receipt is None:
             return False
         origin = {"source_handle": receipt["source_handle"], **receipt["origin"]}
+        # Fence: a quarantined delivery whose old line is still queued (its
+        # acknowledgement failed, or the process died between the receipt
+        # transition and the offset rename) must not be archived or reset.
+        # Reusing that line would let its late acknowledgement read as a
+        # completed retry.  Leave evidence and payload untouched; the line is
+        # replayed and re-quarantined on its own, after which retry is allowed.
+        if (
+            await recovery_registry.queue_manager.recovery_origin_commit_state(origin)
+            == "queued"
+        ):
+            logger.warning(
+                "native_recovery_retry_refused; quarantined delivery is still queued"
+            )
+            return False
         # Copy before active removal. This potentially slow scan deliberately
         # happens outside the live admission gate, so normal /events appends
         # retain their short critical section.
@@ -894,8 +967,9 @@ async def _retry_quarantined_native_recovery(app: FastAPI) -> bool:
 
     # The durable bridge has been made visible. Ordinary reconciliation owns
     # append/resume and reacquires the standard gate before it handles this
-    # retry, preserving gate -> outbox ordering.
-    await _reconcile_native_recovery_outbox(app)
+    # retry, preserving gate -> outbox ordering.  The quarantine/retry lock is
+    # already held, so call the under-lock form (the lock is not reentrant).
+    await _reconcile_native_recovery_outbox_under_quarantine_lock(app)
     return True
 
 
@@ -908,8 +982,8 @@ async def _quarantine_pending_native_recovery(
     through the final queue commit.  Resume takes the same condition, so it can
     only return once the selected receipt is terminal; a drainer waiting on
     resume then finds it ineligible instead of flushing it.  Lock order is
-    pause condition -> outbox lock.  Nothing that holds the outbox lock may
-    await the pause condition.
+    pause condition -> quarantine/retry lock -> outbox lock.  Nothing that
+    holds either of those locks may await the pause condition.
 
     Returns ``"not_paused"`` when recovery is not paused (nothing changed),
     ``"none"`` when no eligible pending receipt was quarantined, and
@@ -919,12 +993,17 @@ async def _quarantine_pending_native_recovery(
     recovery_registry = getattr(app.state, "recovery_registry", None)
     if receipts is None or recovery_registry is None:
         return "none"
+    quarantine_lock = getattr(app.state, "recovery_quarantine_retry_lock", None)
     async with app.state.recovery_pause_condition:
         if not getattr(app.state, "recovery_paused", False):
             return "not_paused"
-        async with app.state.recovery_outbox_lock:
-            if await _quarantine_selected_receipt_locked(
-                recovery_registry, receipts, source_handle, ordinal
+        async with quarantine_lock or nullcontext(), app.state.recovery_outbox_lock:
+            # Settled: cancellation must not abandon a half-applied
+            # dead-letter / receipt / acknowledgement while locks are held.
+            if await _await_uninterrupted(
+                _quarantine_selected_receipt_locked(
+                    recovery_registry, receipts, source_handle, ordinal
+                )
             ):
                 return "quarantined"
             return "none"
@@ -936,17 +1015,22 @@ async def _quarantine_selected_receipt_locked(
     source_handle: str,
     ordinal: int,
 ) -> bool:
-    """Quarantine one pending receipt; the caller holds condition and outbox."""
+    """Quarantine one pending receipt.
+
+    The caller holds the pause condition, the quarantine/retry lock and the
+    outbox lock.
+    """
     receipt = await receipts.pending_receipt(source_handle, ordinal)
     if receipt is None:
         return False
     origin = {"source_handle": source_handle, **receipt["origin"]}
     queue = recovery_registry.queue_manager
     session_id = receipt["payload"]["data"]["session_id"]
-    # A committed offset is a durable graph-flush proof. Do not let a
-    # manual action overwrite that completion with a quarantine, unless
-    # retry audit evidence proves it belongs to the prior delivery that
-    # this retry bridge replaced.
+    # A committed offset only says the line was consumed; the quarantine,
+    # retry audit and receipt state say what happened to the delivery.  Do not
+    # let a manual action overwrite a consumed delivery's completion with a
+    # quarantine, unless retry audit evidence proves it belongs to the prior
+    # delivery that this retry bridge replaced.
     if await queue.recovery_origin_commit_state(
         origin
     ) == "committed" and not await queue.recovery_origin_has_retry_audit(origin):
@@ -992,7 +1076,12 @@ async def _admit_native_recovery(
     claims: SessionClaimStore | None = None,
     release_reservation: bool = False,
 ) -> str:
-    """Atomically admit and enqueue a current request without an outbox scan."""
+    """Atomically admit and enqueue a current request.
+
+    The caller holds ``recovery_quarantine_retry_lock``; this takes the outbox
+    lock (shared -> gate -> outbox) and must never take the shared lock itself.
+    A duplicate outcome runs the interrupted-append repair scan below.
+    """
     lock = getattr(app.state, "recovery_outbox_lock", None)
     if lock is None:
         return await _admit_native_recovery_unlocked(
@@ -1050,7 +1139,7 @@ async def _admit_native_recovery_unlocked(
     claims: SessionClaimStore | None,
     release_reservation: bool,
 ) -> str:
-    """Admit and enqueue while the recovery outbox lock is held."""
+    """Admit and enqueue while the shared lock and the outbox lock are held."""
     receipts = app.state.recovery_receipts
     try:
         admitted = await receipts.admit_source(
@@ -1088,6 +1177,8 @@ async def _admit_native_recovery_unlocked(
     elif admitted == "duplicate":
         # A prior process may have died after receipt admission and before its
         # spool append. Reconcile only this interrupted path, not each new row.
+        # This runs under both the shared lock (held by the caller) and the
+        # outbox lock (held here).
         await _reconcile_native_recovery_outbox_unlocked(app)
     return admitted
 
@@ -1925,6 +2016,14 @@ def create_asgi_app(
     app.state.recovery_registry = None
     app.state.recovery_outbox_lock = asyncio.Lock()
     app.state.recovery_admin_retry_lock = asyncio.Lock()
+    # Serializes a poison record's quarantine receipt + queue acknowledgement
+    # with operator retry, reconciliation, operator quarantine and recovery
+    # event admission. The recovery registry holds this very object (see
+    # ``SessionRegistry.for_recovery``).
+    # Lock order: pause condition -> this lock -> admission gate / outbox lock;
+    # this lock -> admin retry lock. Nothing holding this lock, the gate or the
+    # outbox lock may await the pause condition.
+    app.state.recovery_quarantine_retry_lock = asyncio.Lock()
     app.state.append_live_record = lambda worker_key, body: _append_live_record(
         app, worker_key, body
     )
@@ -1942,6 +2041,7 @@ def create_asgi_app(
             shared_write_semaphore=registry.write_semaphore,
             max_delivery_attempts=s.max_delivery_attempts,
             flush_gate=flush_gate,
+            quarantine_retry_lock=app.state.recovery_quarantine_retry_lock,
         )
         app.state.recovery_registry = recovery_registry
         if s.recovery.permit_required:
@@ -2755,44 +2855,57 @@ async def post_recovery_events(
             return EventResponse(status="duplicate", session_id=session_id)
         return EventResponse(status="queued", session_id=session_id)
 
-    if admission_gate is None:
-        existing = await _receipt_state()
-        if existing == "duplicate":
-            return EventResponse(status="duplicate", session_id=session_id)
-        if existing == "conflict":
-            raise _recovery_source_conflict()
-        return await _admit_with_claim("accepted")
-    binding = admission_gate.binding(
-        source_handle,
-        source_descriptor_digest(source),
-        origin,
-        actor,
-        request.workspace,
-        payload_sha256,
-    )
-    async with admission_gate.consume(
-        recovery_permit,
-        binding,
-        lambda: _native_recovery_admission_available(http_request.app),
-        _receipt_state,
-    ) as permit_result:
-        if permit_result == "duplicate":
-            return EventResponse(status="duplicate", session_id=session_id)
-        if permit_result == "conflict":
-            raise _recovery_source_conflict()
-        if permit_result == "existing":
-            raise _recovery_unavailable(config.retry_after_seconds)
-        if permit_result == "mismatch":
-            raise _recovery_unavailable(config.retry_after_seconds, "source")
-        if permit_result == "invalid":
-            retry_class: _RecoveryRetryClass = (
-                "renew"
-                if recovery_permit is None
-                or _has_recovery_permit_shape(recovery_permit)
-                else "global"
-            )
-            raise _recovery_unavailable(config.retry_after_seconds, retry_class)
-        return await _admit_with_claim(permit_result)
+    async def _admit_current_request() -> EventResponse:
+        if admission_gate is None:
+            existing = await _receipt_state()
+            if existing == "duplicate":
+                return EventResponse(status="duplicate", session_id=session_id)
+            if existing == "conflict":
+                raise _recovery_source_conflict()
+            return await _admit_with_claim("accepted")
+        binding = admission_gate.binding(
+            source_handle,
+            source_descriptor_digest(source),
+            origin,
+            actor,
+            request.workspace,
+            payload_sha256,
+        )
+        async with admission_gate.consume(
+            recovery_permit,
+            binding,
+            lambda: _native_recovery_admission_available(http_request.app),
+            _receipt_state,
+        ) as permit_result:
+            if permit_result == "duplicate":
+                return EventResponse(status="duplicate", session_id=session_id)
+            if permit_result == "conflict":
+                raise _recovery_source_conflict()
+            if permit_result == "existing":
+                raise _recovery_unavailable(config.retry_after_seconds)
+            if permit_result == "mismatch":
+                raise _recovery_unavailable(config.retry_after_seconds, "source")
+            if permit_result == "invalid":
+                retry_class: _RecoveryRetryClass = (
+                    "renew"
+                    if recovery_permit is None
+                    or _has_recovery_permit_shape(recovery_permit)
+                    else "global"
+                )
+                raise _recovery_unavailable(config.retry_after_seconds, retry_class)
+            return await _admit_with_claim(permit_result)
+
+    # Classification, permit consumption, claim, receipt, queue append and the
+    # duplicate repair all run under the shared quarantine/retry lock, taken
+    # BEFORE the admission gate and the outbox lock (their order is
+    # shared -> gate -> outbox).  A second submission can therefore not classify
+    # ``new`` before a first one's duplicate repair has run, and a retry cannot
+    # interleave with either.  The initial reconcile above stays outside: it
+    # takes this lock itself.  Settled uninterrupted so a cancelled request
+    # cannot release the lock with the receipt/queue work half-applied; worker
+    # flush and completion are not under the lock.
+    async with http_request.app.state.recovery_quarantine_retry_lock:
+        return await _await_uninterrupted(_admit_current_request())
 
 
 @app.get("/blobs/{session_id}", dependencies=[Depends(require_read)])

@@ -365,12 +365,18 @@ class _TracingLock(asyncio.Lock):
 
 
 def _install_lock_tracing(app: Any) -> list[tuple[str, str, tuple[str, ...]]]:
-    """Swap the pause condition's lock and the outbox lock for tracing locks."""
+    """Swap the pause condition's lock, the quarantine/retry lock and the outbox
+    lock for tracing locks.  The recovery registry holds the quarantine/retry
+    lock object directly, so it is re-pointed too.
+    """
     log: list[tuple[str, str, tuple[str, ...]]] = []
     held: dict = {}
     app.state.recovery_pause_condition = asyncio.Condition(
         _TracingLock("condition", log, held)
     )
+    shared = _TracingLock("shared", log, held)
+    app.state.recovery_quarantine_retry_lock = shared
+    app.state.recovery_registry.quarantine_retry_lock = shared
     app.state.recovery_outbox_lock = _TracingLock("outbox", log, held)
     return log
 
@@ -378,8 +384,13 @@ def _install_lock_tracing(app: Any) -> list[tuple[str, str, tuple[str, ...]]]:
 def _order_violations(
     log: list[tuple[str, str, tuple[str, ...]]],
 ) -> list[tuple[str, str, tuple[str, ...]]]:
-    """Any acquisition of the condition by a task already holding the outbox."""
-    return [entry for entry in log if entry[1] == "condition" and "outbox" in entry[2]]
+    """Any acquisition of the condition by a task already holding the outbox or
+    the quarantine/retry lock."""
+    return [
+        entry
+        for entry in log
+        if entry[1] == "condition" and ({"outbox", "shared"} & set(entry[2]))
+    ]
 
 
 @pytest.mark.asyncio
@@ -402,6 +413,12 @@ async def test_lock_tracer_flags_outbox_then_condition() -> None:
         pass
     assert _order_violations(log) == []
     assert ("acquire", "outbox", ("condition",)) in log
+
+    log.clear()
+    shared = _TracingLock("shared", log, held)
+    async with shared, condition:
+        pass
+    assert _order_violations(log) == [("acquire", "condition", ("shared",))]
 
 
 @pytest.mark.asyncio
@@ -454,8 +471,11 @@ async def test_recovery_lock_acquisition_order_is_condition_before_outbox(
 
     assert _order_violations(log) == [], log
     # Non-vacuous: both orders' prerequisites were actually exercised.
-    assert ("acquire", "outbox", ("condition",)) in log, log  # quarantine
+    # quarantine: condition -> shared -> outbox, in that order
+    assert ("acquire", "outbox", ("condition", "shared")) in log, log
     assert ("acquire", "outbox", ()) in log, log  # admission / reconcile
+    assert ("acquire", "shared", ("condition",)) in log, log  # quarantine
+    assert ("acquire", "shared", ()) in log, log  # reconcile
     assert ("acquire", "condition", ()) in log, log  # pause / flush guard
 
 

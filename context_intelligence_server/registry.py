@@ -21,7 +21,12 @@ from context_intelligence_server.neo4j_store import (
     build_bounded_neo4j_driver,
 )
 from context_intelligence_server.pipeline import process_event, setup_handlers
-from context_intelligence_server.queue_manager import Batch, QueueManager, Record
+from context_intelligence_server.queue_manager import (
+    Batch,
+    QueueManager,
+    Record,
+    _await_uninterrupted,
+)
 from context_intelligence_server.services import HookStateService
 from context_intelligence_server.status import EventRecord, ring_buffer
 from context_intelligence_server.utils import SPOOL_EVENT_IDENTITY
@@ -248,6 +253,11 @@ class SessionRegistry:
         # one lets an administrator atomically pause a recovery drain.
         self.recovery_write_guard: Any | None = None
         self.flush_gate: LiveFirstFlushGate | None = None
+        # Recovery-only: the app-wide lock that serializes a poison record's
+        # quarantine receipt + queue acknowledgement against an operator retry,
+        # reconciliation and operator quarantine.  ``None`` (the live registry)
+        # means no such serialization is needed.
+        self.quarantine_retry_lock: asyncio.Lock | None = None
         self.is_recovery: bool = False
         self.drain_batch_size: int = _DRAIN_MAX_BATCH
 
@@ -259,13 +269,21 @@ class SessionRegistry:
         shared_write_semaphore: asyncio.Semaphore,
         max_delivery_attempts: int,
         flush_gate: LiveFirstFlushGate,
+        quarantine_retry_lock: asyncio.Lock,
     ) -> "SessionRegistry":
-        """Create the separately-spooled, live-prioritized recovery registry."""
+        """Create the separately-spooled, live-prioritized recovery registry.
+
+        ``quarantine_retry_lock`` must be the very lock the application uses
+        for operator retry, reconciliation and operator quarantine
+        (``app.state.recovery_quarantine_retry_lock``): sharing one object is
+        what serializes this registry's quarantine + acknowledgement with them.
+        """
         registry = cls()
         registry._configured_queues_path = queues_path
         registry._write_semaphore = shared_write_semaphore
         registry._max_delivery_attempts = max_delivery_attempts
         registry.flush_gate = flush_gate
+        registry.quarantine_retry_lock = quarantine_retry_lock
         registry.is_recovery = True
         registry.drain_batch_size = 1
         return registry
@@ -633,12 +651,40 @@ class SessionRegistry:
                 # boundary for ambiguous queue-commit failures.
                 raise _QueueCommitFailure from exc
 
-    async def _commit_after_recovery_guard(
-        self, worker: SessionWorker, commit_to: int
+    async def _quarantine_and_commit(
+        self, worker: SessionWorker, record: Record
     ) -> None:
-        """Commit an isolated/dead-lettered recovery record only when unpaused."""
+        """Publish a recovery quarantine and acknowledge its queue line as one unit.
+
+        The dead letter is already durable.  The receipt turns ``quarantined``
+        (operator-visible) and the old line's offset is then committed; an
+        operator retry must observe either neither or both, never the receipt
+        alone, or it would reuse the still-queued old line and the late
+        acknowledgement would read as proof that the retry was written.
+
+        Lock order is pause guard -> ``quarantine_retry_lock``.  Under the
+        lock the pair is awaited uninterrupted, so cancelling this drainer
+        (shutdown, idle reap) neither releases the lock with the rename still
+        in flight nor orphans the receipt's SQLite thread.  Receipt and
+        acknowledgement errors propagate to supervision unchanged.  Without a
+        lock (the live registry) the pair simply runs under the pause guard.
+        """
         async with self._recovery_write_guard():
-            await self.queue_manager.commit(worker.session_id, commit_to)
+            lock = self.quarantine_retry_lock
+            if lock is None:
+                await self._publish_quarantine_then_ack(worker, record)
+                return
+            async with lock:
+                await _await_uninterrupted(
+                    self._publish_quarantine_then_ack(worker, record)
+                )
+
+    async def _publish_quarantine_then_ack(
+        self, worker: SessionWorker, record: Record
+    ) -> None:
+        """Receipt first, then the offset: a crash between them replays the line."""
+        await self._before_quarantine(worker, record)
+        await self.queue_manager.commit(worker.session_id, record.end)
 
     async def _post_commit(self, worker: SessionWorker, records: list[Record]) -> None:
         """Best-effort receipt transition after an irreversible queue commit.
@@ -1076,10 +1122,7 @@ class SessionRegistry:
                     extra={"session_id": session_id},
                 )
                 worker.services.graph.discard_buffer()
-                await self._before_quarantine(worker, rec)
-                await self._commit_after_recovery_guard(
-                    worker, rec.end
-                )  # queue-produced offset
+                await self._quarantine_and_commit(worker, rec)
                 continue
 
             from context_intelligence_server.pipeline import TERMINAL_EVENTS
@@ -1130,11 +1173,9 @@ class SessionRegistry:
                 # buffer itself; only the failure path needs this.
                 worker.services.graph.discard_buffer()
             if not committed:
-                if quarantined:
-                    await self._before_quarantine(worker, rec)
-                await self._commit_after_recovery_guard(
-                    worker, rec.end
-                )  # queue-produced offset
+                # Only a quarantined record gets here: every other failure
+                # above raised.
+                await self._quarantine_and_commit(worker, rec)
             if wrote:
                 self.record_written(1)
                 await self._post_commit(worker, [rec])

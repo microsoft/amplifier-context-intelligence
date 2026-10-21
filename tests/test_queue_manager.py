@@ -364,6 +364,178 @@ async def test_commit_cleans_up_tmp_when_replace_fails(qm, tmp_path, monkeypatch
     assert list(qdir.glob("*.tmp")) == []
 
 
+# ---------------------------------------------------------------------------
+# commit(): cancellation must not outlive the offset rename. The ack is the
+# durable half of "this record was consumed"; a caller that holds a lock around
+# commit() (quarantine + ack vs. admin retry) relies on commit() not returning
+# or raising -- cancellation included -- while the rename thread is in flight.
+# asyncio.to_thread cannot interrupt the OS thread, so a plain await would let
+# CancelledError surface early.
+# ---------------------------------------------------------------------------
+
+_BARRIER_TIMEOUT_S = 5.0
+
+
+def _hold_offset_rename(monkeypatch, *, fail: bool):
+    """Block the real ``os.replace`` of ``s1``'s offset tmp file on a barrier.
+
+    Returns ``(entered, release, replaced)`` threading events: ``entered`` is
+    set once the commit thread is inside the rename, the test sets ``release``
+    to let it proceed, and ``replaced`` is set only after a real rename has
+    completed (never when ``fail`` makes the rename raise instead).
+    """
+    import os
+    from pathlib import Path
+
+    real_replace = os.replace
+    entered = threading.Event()
+    release = threading.Event()
+    replaced = threading.Event()
+
+    def held_replace(src, dst, *args, **kwargs):
+        if not Path(src).name.startswith("s1.offset."):
+            return real_replace(src, dst, *args, **kwargs)
+        entered.set()
+        assert release.wait(timeout=_BARRIER_TIMEOUT_S), (
+            "rename barrier was never released -- test is broken, "
+            "not the production code"
+        )
+        if fail:
+            raise OSError("simulated delayed replace failure")
+        result = real_replace(src, dst, *args, **kwargs)
+        replaced.set()
+        return result
+
+    monkeypatch.setattr(os, "replace", held_replace)
+    return entered, release, replaced
+
+
+async def _yield_to_loop(times: int = 10) -> None:
+    """Let the event loop run every already-scheduled callback (no timers)."""
+    for _ in range(times):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("cancel_count", [1, 3])
+async def test_commit_cancel_waits_for_the_offset_rename_to_land(
+    qm, tmp_path, monkeypatch, cancel_count
+):
+    """Cancelling commit() while its thread sits inside ``os.replace`` must not
+    surface ``CancelledError`` until the rename has landed: at that moment the
+    offset is durable and no tmp file is left. Repeated cancels change nothing.
+
+    Catches: ``commit`` ending in a bare ``await asyncio.to_thread(_commit)``,
+    where the task is cancelled immediately while the offset is still unwritten
+    (the delayed-old-ack race: quarantine's ack could land after retry ran).
+    """
+    qdir = tmp_path / "queues"
+    entered, release, replaced = _hold_offset_rename(monkeypatch, fail=False)
+
+    task = asyncio.ensure_future(qm.commit("s1", 7))
+    observed: dict[str, object] = {}
+    try:
+        assert await asyncio.to_thread(entered.wait, _BARRIER_TIMEOUT_S), (
+            "commit never reached os.replace"
+        )
+
+        for _ in range(cancel_count):
+            task.cancel()
+            await _yield_to_loop()
+
+        assert not task.done(), (
+            "commit() surfaced cancellation while its offset rename was still in flight"
+        )
+        assert not (qdir / "s1.offset").exists()
+
+        release.set()
+        try:
+            await task
+        except asyncio.CancelledError:
+            # State at the instant the caller observes the cancellation.
+            offset = qdir / "s1.offset"
+            observed["offset"] = offset.read_text("utf-8") if offset.exists() else None
+            observed["tmp"] = sorted(p.name for p in qdir.glob("*.tmp"))
+            observed["replaced"] = replaced.is_set()
+            raise
+    except asyncio.CancelledError:
+        pass
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert task.cancelled(), "the caller's cancellation must still be delivered"
+    assert observed == {"offset": "7", "tmp": [], "replaced": True}, observed
+    assert qm._read_committed_offset("s1") == 7
+
+
+async def test_commit_cancel_during_failing_rename_cleans_up_before_cancelling(
+    qm, tmp_path, monkeypatch
+):
+    """If the held rename then FAILS, the unique tmp file is still unlinked
+    before the cancellation surfaces, and no offset is published.
+
+    Catches: a bare ``to_thread`` await letting the caller observe the cancel
+    while the thread's failure cleanup (``tmp.unlink``) has not yet run, which
+    leaks a ``*.tmp`` into the spool; and a regression that lets the rename's
+    ``OSError`` replace the caller's ``CancelledError`` (teardown must win).
+    """
+    qdir = tmp_path / "queues"
+    entered, release, replaced = _hold_offset_rename(monkeypatch, fail=True)
+
+    task = asyncio.ensure_future(qm.commit("s1", 9))
+    observed: dict[str, object] = {}
+    try:
+        assert await asyncio.to_thread(entered.wait, _BARRIER_TIMEOUT_S), (
+            "commit never reached os.replace"
+        )
+
+        task.cancel()
+        await _yield_to_loop()
+        assert not task.done(), (
+            "commit() surfaced cancellation while its offset rename was still in flight"
+        )
+
+        release.set()
+        try:
+            await task
+        except asyncio.CancelledError:
+            observed["tmp"] = sorted(p.name for p in qdir.glob("*.tmp"))
+            observed["offset_exists"] = (qdir / "s1.offset").exists()
+            raise
+    except asyncio.CancelledError:
+        pass
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert task.cancelled(), "CancelledError must win over the rename's OSError"
+    assert observed == {"tmp": [], "offset_exists": False}, observed
+    assert not replaced.is_set()
+
+
+async def test_commit_delayed_rename_failure_still_raises_without_cancel(
+    qm, tmp_path, monkeypatch
+):
+    """With no cancellation, a delayed rename failure still propagates its
+    ``OSError`` and still cleans up the tmp file (error semantics preserved).
+    """
+    qdir = tmp_path / "queues"
+    entered, release, _ = _hold_offset_rename(monkeypatch, fail=True)
+
+    task = asyncio.ensure_future(qm.commit("s1", 11))
+    try:
+        assert await asyncio.to_thread(entered.wait, _BARRIER_TIMEOUT_S)
+        release.set()
+        with pytest.raises(OSError, match="simulated delayed replace failure"):
+            await task
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert list(qdir.glob("*.tmp")) == []
+    assert not (qdir / "s1.offset").exists()
+
+
 async def test_commit_concurrency_at_scale_no_raise_no_leak(qm, tmp_path):
     """50 concurrent commit() calls for the same session: none raise, the
     final offset is one of the submitted values, and no tmp files survive.
