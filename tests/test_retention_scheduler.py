@@ -413,6 +413,28 @@ def test_lost_cancel_reply_reconciles_owned_job_only():
     assert client.calls[-1][1] == (result.job_id,)
 
 
+@pytest.mark.parametrize("state", ["previewing", "ready", "running"])
+def test_lost_cancel_request_is_retried_for_owned_job(state, clock):
+    client = Fake()
+
+    def lost_request(c):
+        # The request never reaches the server: the job is untouched and still active.
+        c.job["state"] = state
+        c.job["confirmed"] = state == "running"
+        c.keep_running = True
+        raise ClientError("lost request")
+
+    client.faults["cancel"].append(lost_request)
+    result = run(client, dry_run=True, cancel_timeout=1)
+    cancels = [args for name, args, _ in client.calls if name == "cancel"]
+    assert cancels == [(result.job_id,), (result.job_id,)]
+    assert all(args == (result.job_id,) for name, args, _ in client.calls[2:])
+    owned_job = client.job
+    assert owned_job is not None
+    assert result.cleanup_state == "cancelled" and owned_job["state"] == "cancelled"
+    assert names(client)[-1] == "cancel" and clock.now <= 101.0
+
+
 def test_completed_after_deadline_not_reported_as_clean_success(clock):
     client = Fake()
 
