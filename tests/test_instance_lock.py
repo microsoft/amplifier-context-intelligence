@@ -70,6 +70,34 @@ def test_releasing_server_instance_lock_allows_a_new_owner(tmp_path: Path) -> No
     assert result.get(timeout=1) is True
 
 
+def test_two_servers_sharing_a_recovery_queue_contend_on_one_root_lock(
+    tmp_path: Path,
+) -> None:
+    """r4332085728: both contenders of a shared resource lock the SAME root.
+
+    Each server keeps its own live queue but names the one shared recovery
+    queue.  Their validated roots are identical, so the existing nonblocking
+    flock admits one and refuses the other; releasing lets the second enter.
+    """
+    from context_intelligence_server.config import RecoveryConfig, Settings
+
+    state = tmp_path / "state"
+    recovery = RecoveryConfig(enabled=True, queues_path=str(state / "recovery"))
+    first_settings = Settings(queues_path=str(state / "live-a"), recovery=recovery)
+    second_settings = Settings(queues_path=str(state / "live-b"), recovery=recovery)
+
+    first = ServerInstanceLock(first_settings.stateful_root())
+    second = ServerInstanceLock(second_settings.stateful_root())
+    first.acquire()
+    try:
+        with pytest.raises(InstanceLockUnavailable):
+            second.acquire()
+    finally:
+        first.release()
+    second.acquire()
+    second.release()
+
+
 def test_recovery_registry_defers_queue_initialization_until_lifespan(
     tmp_path: Path,
 ) -> None:

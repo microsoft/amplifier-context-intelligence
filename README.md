@@ -310,8 +310,9 @@ simple because the pilot runs a **single replica and single worker**
 process to go stale. Every ASGI launcher takes a nonblocking exclusive lock during
 lifespan startup at `<queues_path parent>/.context-intelligence-server.lock`, before
 drivers or workers initialize, and refuses a second writer for the same shared state
-volume. With recovery enabled, its queue, receipt ledger, and claim ledger must all
-be below that same parent; split roots are rejected rather than partially locked. A future read-tier
+volume. With recovery enabled, its queue, receipt ledger, and claim ledger must each be a
+direct child of that same parent; split or nested layouts are rejected rather than
+partially locked. A future read-tier
 (M3) that adds replicas would introduce a short TTL/poll re-read; that does not exist
 today.
 

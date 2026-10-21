@@ -156,8 +156,9 @@ log_path:  ~/amplifier-context-intelligence-server-data-store/logs/server.jsonl
 queues_path: /data/queues          # Durable per-session append-logs; mirrors blob_path
 # The server acquires one nonblocking writer lock at the parent of queues_path
 # before ASGI startup. When recovery is enabled, recovery.queues_path,
-# recovery.receipt_store_path, and recovery.claims_store_path must all remain
-# under that same parent (normally /data), or startup refuses the split layout.
+# recovery.receipt_store_path, and recovery.claims_store_path must each be a
+# direct child of that same parent (normally /data), or startup refuses the
+# split or nested layout.
 
 # -----------------------------------------------------------------------------
 # Scoped access control and native recovery (both opt-in)
