@@ -129,6 +129,13 @@ def require_recovery_write(request: Request) -> None:
         return
     if not _has_capability(request, "recovery:write"):
         raise HTTPException(status_code=403, detail="Forbidden")
+    if getattr(request.app.state, "recovery_permit_required", False):
+        # A recovery capability selects this special recovery protocol; it is
+        # not authority to write events. Keep a recovery-only principal's
+        # failure identical to the ordinary live-write gate before a request
+        # can reach a source descriptor, receipt lookup, or queue. Lease
+        # compatibility deliberately retains its prior authorization behavior.
+        require_write(request)
 
 
 def require_workspace_access(request: Request, workspace: str, capability: str) -> None:
@@ -165,6 +172,19 @@ async def require_claimed_session_access(
         return
     claims = getattr(request.app.state, "session_claims", None)
     workspace = await claims.get_workspace(session_id) if claims is not None else None
+    if workspace is None or not await claims.storage_identity_matches(session_id):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    require_workspace_access(request, workspace, capability)
+
+
+async def require_claimed_blob_access(
+    request: Request, session_id: str, capability: str
+) -> None:
+    """Resolve physical blob aliases, then apply the unchanged workspace policy."""
+    if getattr(request.app.state, "access_control_mode", "compatibility") != "scoped":
+        return
+    claims = getattr(request.app.state, "session_claims", None)
+    workspace = await claims.get_blob_workspace(session_id) if claims else None
     if workspace is None:
         raise HTTPException(status_code=403, detail="Forbidden")
     require_workspace_access(request, workspace, capability)

@@ -20,7 +20,13 @@ async def get_version(request: Request) -> dict[str, object]:
         JSON object with a single ``version`` key, e.g. ``{"version": "2.0.0"}``.
     """
     recovery_enabled = bool(getattr(request.app.state, "recovery_enabled", False))
+    permit_enabled = bool(getattr(request.app.state, "recovery_permit_required", False))
+    capabilities: list[str] = []
+    if permit_enabled:
+        capabilities.append("native-recovery-source-v1")
+    elif recovery_enabled:
+        capabilities.append("native-recovery-lease-compatibility")
     return {
         "version": SERVER_VERSION,
-        "capabilities": ["native-recovery"] if recovery_enabled else [],
+        "capabilities": capabilities,
     }

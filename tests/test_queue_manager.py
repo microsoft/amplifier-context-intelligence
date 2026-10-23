@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -115,6 +116,32 @@ async def test_append_does_not_double_newline(qm, tmp_path):
     await qm.append("s1", b'{"e":1}\n')
     log = tmp_path / "queues" / "s1.log"
     assert log.read_bytes() == b'{"e":1}\n'
+
+
+async def test_recovery_origin_scans_ignore_non_mapping_json(qm):
+    """Malformed queue lines must not abort recovery reconciliation scans."""
+    await qm.append("s1", b"[]")
+    origin = {"source_handle": "a" * 64, "ordinal": 0, "source_line_sha256": "b" * 64}
+
+    assert not await qm.contains_recovery_origin(origin)
+    assert await qm.recovery_origin_commit_state(origin) is None
+    assert not await qm.recovery_origin_is_dead(origin)
+
+
+async def test_recovery_origin_state_requires_all_matching_records_to_be_committed(qm):
+    """A stale committed copy cannot hide a requeued uncommitted copy."""
+    origin = {"source_handle": "a" * 64, "ordinal": 0, "source_line_sha256": "b" * 64}
+    raw = json.dumps({"_recovery_origin": origin}).encode()
+
+    await qm.append("old", raw)
+    old = await qm.read_batch("old", max_items=1)
+    await qm.commit("old", old.end_offset)
+    await qm.append("retry", raw)
+
+    assert await qm.recovery_origin_commit_state(origin) == "queued"
+    retry = await qm.read_batch("retry", max_items=1)
+    await qm.commit("retry", retry.end_offset)
+    assert await qm.recovery_origin_commit_state(origin) == "committed"
 
 
 @pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])
@@ -335,6 +362,178 @@ async def test_commit_cleans_up_tmp_when_replace_fails(qm, tmp_path, monkeypatch
 
     qdir = tmp_path / "queues"
     assert list(qdir.glob("*.tmp")) == []
+
+
+# ---------------------------------------------------------------------------
+# commit(): cancellation must not outlive the offset rename. The ack is the
+# durable half of "this record was consumed"; a caller that holds a lock around
+# commit() (quarantine + ack vs. admin retry) relies on commit() not returning
+# or raising -- cancellation included -- while the rename thread is in flight.
+# asyncio.to_thread cannot interrupt the OS thread, so a plain await would let
+# CancelledError surface early.
+# ---------------------------------------------------------------------------
+
+_BARRIER_TIMEOUT_S = 5.0
+
+
+def _hold_offset_rename(monkeypatch, *, fail: bool):
+    """Block the real ``os.replace`` of ``s1``'s offset tmp file on a barrier.
+
+    Returns ``(entered, release, replaced)`` threading events: ``entered`` is
+    set once the commit thread is inside the rename, the test sets ``release``
+    to let it proceed, and ``replaced`` is set only after a real rename has
+    completed (never when ``fail`` makes the rename raise instead).
+    """
+    import os
+    from pathlib import Path
+
+    real_replace = os.replace
+    entered = threading.Event()
+    release = threading.Event()
+    replaced = threading.Event()
+
+    def held_replace(src, dst, *args, **kwargs):
+        if not Path(src).name.startswith("s1.offset."):
+            return real_replace(src, dst, *args, **kwargs)
+        entered.set()
+        assert release.wait(timeout=_BARRIER_TIMEOUT_S), (
+            "rename barrier was never released -- test is broken, "
+            "not the production code"
+        )
+        if fail:
+            raise OSError("simulated delayed replace failure")
+        result = real_replace(src, dst, *args, **kwargs)
+        replaced.set()
+        return result
+
+    monkeypatch.setattr(os, "replace", held_replace)
+    return entered, release, replaced
+
+
+async def _yield_to_loop(times: int = 10) -> None:
+    """Let the event loop run every already-scheduled callback (no timers)."""
+    for _ in range(times):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("cancel_count", [1, 3])
+async def test_commit_cancel_waits_for_the_offset_rename_to_land(
+    qm, tmp_path, monkeypatch, cancel_count
+):
+    """Cancelling commit() while its thread sits inside ``os.replace`` must not
+    surface ``CancelledError`` until the rename has landed: at that moment the
+    offset is durable and no tmp file is left. Repeated cancels change nothing.
+
+    Catches: ``commit`` ending in a bare ``await asyncio.to_thread(_commit)``,
+    where the task is cancelled immediately while the offset is still unwritten
+    (the delayed-old-ack race: quarantine's ack could land after retry ran).
+    """
+    qdir = tmp_path / "queues"
+    entered, release, replaced = _hold_offset_rename(monkeypatch, fail=False)
+
+    task = asyncio.ensure_future(qm.commit("s1", 7))
+    observed: dict[str, object] = {}
+    try:
+        assert await asyncio.to_thread(entered.wait, _BARRIER_TIMEOUT_S), (
+            "commit never reached os.replace"
+        )
+
+        for _ in range(cancel_count):
+            task.cancel()
+            await _yield_to_loop()
+
+        assert not task.done(), (
+            "commit() surfaced cancellation while its offset rename was still in flight"
+        )
+        assert not (qdir / "s1.offset").exists()
+
+        release.set()
+        try:
+            await task
+        except asyncio.CancelledError:
+            # State at the instant the caller observes the cancellation.
+            offset = qdir / "s1.offset"
+            observed["offset"] = offset.read_text("utf-8") if offset.exists() else None
+            observed["tmp"] = sorted(p.name for p in qdir.glob("*.tmp"))
+            observed["replaced"] = replaced.is_set()
+            raise
+    except asyncio.CancelledError:
+        pass
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert task.cancelled(), "the caller's cancellation must still be delivered"
+    assert observed == {"offset": "7", "tmp": [], "replaced": True}, observed
+    assert qm._read_committed_offset("s1") == 7
+
+
+async def test_commit_cancel_during_failing_rename_cleans_up_before_cancelling(
+    qm, tmp_path, monkeypatch
+):
+    """If the held rename then FAILS, the unique tmp file is still unlinked
+    before the cancellation surfaces, and no offset is published.
+
+    Catches: a bare ``to_thread`` await letting the caller observe the cancel
+    while the thread's failure cleanup (``tmp.unlink``) has not yet run, which
+    leaks a ``*.tmp`` into the spool; and a regression that lets the rename's
+    ``OSError`` replace the caller's ``CancelledError`` (teardown must win).
+    """
+    qdir = tmp_path / "queues"
+    entered, release, replaced = _hold_offset_rename(monkeypatch, fail=True)
+
+    task = asyncio.ensure_future(qm.commit("s1", 9))
+    observed: dict[str, object] = {}
+    try:
+        assert await asyncio.to_thread(entered.wait, _BARRIER_TIMEOUT_S), (
+            "commit never reached os.replace"
+        )
+
+        task.cancel()
+        await _yield_to_loop()
+        assert not task.done(), (
+            "commit() surfaced cancellation while its offset rename was still in flight"
+        )
+
+        release.set()
+        try:
+            await task
+        except asyncio.CancelledError:
+            observed["tmp"] = sorted(p.name for p in qdir.glob("*.tmp"))
+            observed["offset_exists"] = (qdir / "s1.offset").exists()
+            raise
+    except asyncio.CancelledError:
+        pass
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert task.cancelled(), "CancelledError must win over the rename's OSError"
+    assert observed == {"tmp": [], "offset_exists": False}, observed
+    assert not replaced.is_set()
+
+
+async def test_commit_delayed_rename_failure_still_raises_without_cancel(
+    qm, tmp_path, monkeypatch
+):
+    """With no cancellation, a delayed rename failure still propagates its
+    ``OSError`` and still cleans up the tmp file (error semantics preserved).
+    """
+    qdir = tmp_path / "queues"
+    entered, release, _ = _hold_offset_rename(monkeypatch, fail=True)
+
+    task = asyncio.ensure_future(qm.commit("s1", 11))
+    try:
+        assert await asyncio.to_thread(entered.wait, _BARRIER_TIMEOUT_S)
+        release.set()
+        with pytest.raises(OSError, match="simulated delayed replace failure"):
+            await task
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert list(qdir.glob("*.tmp")) == []
+    assert not (qdir / "s1.offset").exists()
 
 
 async def test_commit_concurrency_at_scale_no_raise_no_leak(qm, tmp_path):
@@ -1117,6 +1316,104 @@ async def test_recovery_seed_counts_unchanged_under_streaming(qm):
 
     assert written == 1  # one committed line, no dead
     assert accepted == 2  # one written + one pending
+
+
+async def test_has_pending_records_treats_out_of_range_offset_as_unavailable(qm):
+    """A valid but impossible offset must not open the recovery admission gate."""
+    await qm.append("s1", b"a")
+    qm._offset_path("s1").write_text("999999", encoding="utf-8")
+
+    assert await qm.has_pending_records()
+
+
+def _restore_mode(path, mode=0o700):
+    import os
+
+    os.chmod(path, mode)
+
+
+async def test_has_pending_records_real_queue_states(qm):
+    """Empty is False, pending is True, fully committed and dead-only keep old semantics."""
+    assert await qm.has_pending_records() is False
+
+    await qm.append("s1", b"a")
+    assert await qm.has_pending_records() is True
+
+    batch = await qm.read_batch("s1", 1)
+    await qm.commit("s1", batch.end_offset)
+    assert await qm.has_pending_records() is False
+
+    (qm._dir / "dead-only.dead.jsonl").write_bytes(b'{"x":1}\n')
+    assert await qm.has_pending_records() is False
+
+
+async def test_has_pending_records_real_unreadable_dir_is_unavailable(qm):
+    """A real non-root EACCES enumeration failure must fail closed (True)."""
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission bits; not real EACCES proof")
+    await qm.append("s1", b"a")
+    batch = await qm.read_batch("s1", 1)
+    await qm.commit("s1", batch.end_offset)
+    os.chmod(qm._dir, 0o300)  # write+search, no read: cannot enumerate
+    try:
+        assert await qm.has_pending_records() is True
+    finally:
+        _restore_mode(qm._dir)
+
+
+async def test_has_pending_records_deleted_initialized_dir_is_unavailable(qm):
+    import shutil
+
+    shutil.rmtree(qm._dir)
+    assert await qm.has_pending_records() is True
+
+
+async def test_has_pending_records_dir_replaced_by_file_is_unavailable(qm):
+    import shutil
+
+    shutil.rmtree(qm._dir)
+    qm._dir.write_text("not a directory", encoding="utf-8")
+    assert await qm.has_pending_records() is True
+
+
+async def test_has_pending_records_injected_scandir_eio_is_unavailable(qm, monkeypatch):
+    import errno
+    import os
+
+    def boom(*_a, **_k):
+        raise OSError(errno.EIO, "injected EIO")
+
+    monkeypatch.setattr(os, "scandir", boom)
+    assert await qm.has_pending_records() is True
+
+
+def test_pending_worker_keys_exact_suffixes_sorted_dedup_no_file_filter(qm):
+    (qm._dir / "b.log").write_bytes(b"")
+    (qm._dir / "a.log").write_bytes(b"")
+    (qm._dir / "a.dead.jsonl").write_bytes(b"")
+    (qm._dir / "c.dead.jsonl").write_bytes(b"")
+    (qm._dir / "d.offset").write_bytes(b"")
+    (qm._dir / "e.log.tmp").write_bytes(b"")
+    (qm._dir / "dirkey.log").mkdir()  # no is_file filter: a directory still counts
+    assert qm._pending_worker_keys() == ["a", "b", "c", "dirkey"]
+
+
+async def test_lenient_startup_callers_still_tolerate_unreadable_dir(qm):
+    """_all_worker_keys stays lenient: unreadable dir yields no keys, no raise."""
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission bits")
+    await qm.append("s1", b"a")
+    os.chmod(qm._dir, 0o300)
+    try:
+        assert qm._all_worker_keys() == []
+        await qm.reclaim_drained_orphans()
+        await qm.recovery_seed_counts()
+    finally:
+        _restore_mode(qm._dir)
 
 
 async def test_refresh_spool_stats_empty_directory(qm):

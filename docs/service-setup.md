@@ -6,6 +6,323 @@ integrated with the Amplifier CLI so sessions are automatically captured.
 
 ---
 
+## Manual blob retention — preview first
+
+### Online: keep ingestion available
+
+```bash
+context-intelligence-server blobs prune --online --older-than 30d
+# Confirm the returned ready preview, using its printed UUID:
+context-intelligence-server blobs prune --online --job-id JOB_UUID --apply
+```
+
+To request a fresh preview and confirm it in one invocation when no job is
+current, use `blobs prune --online --older-than 30d --apply`.
+
+Online mode uses only the running server's configured blob root. It needs a
+**raw admin credential**, never a data key. Use `ADMIN_API_KEY`, the existing
+`AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY` environment variable, a raw
+`admin_api_key` in supported server settings, or `--admin-key-file /private/token`.
+A digest-only `admin_api_key_sha256` config cannot recover the raw bearer token.
+The file must be same-owner, regular, not symlinked or hardlinked, mode `0600` or
+`0400`, at most 8192 bytes. Do not pass tokens on the command line. This command
+does not create an admin credential or change authentication.
+
+Use `--server-url https://server.example.com` for a remote server. The default is
+loopback HTTP on the configured server port. Plain HTTP credentials are allowed
+only for loopback addresses/`localhost`; remote credentials require HTTPS.
+Redirects and ambient HTTP proxies are not used.
+
+1. Preview starts a server-owned background scan and polls for up to 120 seconds.
+   Status remains available during a slow scan. Preview writes no metadata,
+   reads no payload bodies, and does not touch graph or queue state.
+2. Read the **live estimate**, not an immutable file manifest. The server freezes
+   the cutoff and preview start time. Apply rescans that cutoff; new, replaced,
+   or changed files after preview are retained using `ctime_ns` plus exact
+   device/inode/size/mtime/ctime checks. Backward clock movement fails the job.
+3. For `--apply`, type exactly **`prune`** at a real terminal. There is no `--yes`.
+   Declining cancels the preview and deletes nothing. A ready preview expires
+   after 15 minutes. One current job is allowed per canonical root; cancel it
+   before requesting a replacement.
+4. Apply runs in the **server background**. Disconnecting or interrupting the
+   client does **not** cancel confirmed work. Use these commands to inspect,
+   cancel after the current durable batch, or confirm the same preview after a
+   long scan:
+
+   ```bash
+   context-intelligence-server blobs prune-status --online JOB_UUID
+   context-intelligence-server blobs prune-cancel --online JOB_UUID
+   context-intelligence-server blobs prune --online --job-id JOB_UUID --apply
+   ```
+
+Repeat `--server-url`/`--admin-key-file` with these commands when needed. Cached
+status includes root, cutoff, counts/errors, phase, scan windows, recovery rows,
+and at most five sample URIs. States are `previewing`, `ready`, `running`,
+`cancelling`, `completed`, `cancelled`, `failed`, and `interrupted`. Counts during
+apply describe the rescan and actual deletion; they need not equal the preview.
+
+A confirmed job reports `completed` (or `cancelled`/`failed`) only after its final
+checkpoint has fully succeeded. While that last save is in flight, status stays
+`running` with phase `finalizing`, and cancelling during that window does not
+change the outcome. If the final save fails, the job reports `failed`. One narrow
+case is ambiguous: when the directory fsync that follows the final snapshot
+replace fails, the replaced terminal snapshot may still be readable after a
+restart or reopen. That is valid because deletion had already finished, but it
+reflects an uncertain fsync outcome and is not a durability guarantee.
+
+The admin API uses the existing admin guard: `POST /admin/blobs/prune`
+with `{"older_than":"30d"}`, `GET /admin/blobs/prune[/{uuid}]`,
+`POST /admin/blobs/prune/{uuid}/start` with `{"confirmation":"prune"}`, and
+`POST /admin/blobs/prune/{uuid}/cancel`. HTTP cannot choose roots or cutoffs.
+Busy/stale starts return `409`; unknown current ids return `404`.
+
+**Coordination boundary:** online mode requires the single server worker and a
+64-bit Linux local filesystem with working Linux directory cookies, POSIX flock,
+atomic rename/unlink, directory fsync, and SQLite durability. Reopened directory
+cookies are not portable to macOS; use offline pruning there. Live scans may
+omit/revisit entries changed concurrently; they are estimates, not snapshot
+completeness guarantees. No filesystem descriptor/lease spans an async yield.
+
+All BlobStore instances in the **server process**, including HTTP-created stores
+and canonical aliases, use FIFO shared cohorts/exclusive batches. Ordinary
+read/write/list/size/dump take shared leases. Whole-session filesystem deletion
+takes an exclusive lease only after graph/queue work; no graph/queue lock is held
+by pruning. Maintenance has its own single-thread executor, not the ordinary
+filesystem pool. Scan windows inspect at most 512 entries with a cooperative
+10 ms target. Apply uses at most 32 candidates per batch and yields at least
+50 ms between batches. A slow filesystem call/fsync can exceed these targets.
+Recovery pages seek by URI primary key, inspect at most 512 rows including
+nonpending rows, and filter in memory; the eight-column ledger is not migrated,
+reindexed, loaded in full, or switched to WAL.
+
+This process-local lease does **not** coordinate a separate writer process.
+Stop any external/old writers through their service manager before online apply.
+There is no standalone writer bypass. The lifetime shared external flock remains
+held between batches, so the offline exclusive CLI still refuses while the server
+is running. Online mode never upgrades that flock.
+
+After confirmation, the server durably writes one versioned current-job snapshot
+in the private expiry directory **before** deletion and checkpoints between
+batches. Journal-before-unlink and pinned-directory fsync-before-completion
+preserve expiry durability. On restart, an unfinished confirmed snapshot becomes
+`interrupted`; deletion **never** resumes automatically. Request and confirm a
+new preview to recover eligible pending records. Shutdown rejects new jobs,
+finishes an admitted batch, quiesces drainers, waits for actual filesystem
+operations/maintenance-thread exit, and only then releases the lifetime flock.
+The online API does not schedule itself or restart ingestion. Graph/session and
+queue state are never pruned. Nightly scheduling is a separate, explicit opt-in
+client command described below.
+
+### Nightly online pruning — explicit unattended opt-in
+
+`blobs prune-scheduled` is the **only unattended apply command**. Existing
+`blobs prune --apply` still requires a real terminal and exact confirmation;
+neither command accepts `--yes`. The scheduled command requires explicit
+`--online`, `--older-than`, and `--server-url`; it cannot select a blob root or
+adopt a job id. It uses the existing online API and credential resolver, not local
+storage access. No server upgrade/restart is needed when that API is installed.
+
+1. **Install a reviewed, pinned client in its own environment.** Replace
+   `<reviewed-client-commit-sha>` with the full reviewed commit, not a branch.
+   Keep this client separate from the ingestion server's installed environment.
+
+   ```bash
+   CLIENT_SHA='<reviewed-client-commit-sha>'
+   uv venv "$HOME/.local/share/ci-retention-client"
+   uv pip install --python "$HOME/.local/share/ci-retention-client/bin/python" \
+     "git+https://github.com/microsoft/amplifier-context-intelligence@${CLIENT_SHA}"
+   ```
+
+2. **Check the exact command with `--dry-run`.** Use an **existing** dedicated
+   admin file (same-owner, regular, mode `0600`/`0400`), not a data key. The file
+   path is safe in argv; the raw credential must never appear there. Substitute
+   your server URL and private file path consistently in the command and unit.
+
+   ```bash
+   "$HOME/.local/share/ci-retention-client/bin/context-intelligence-server" \
+     blobs prune-scheduled --online --older-than 30d \
+     --server-url http://127.0.0.1:8100 \
+     --admin-key-file "$HOME/.config/context-intelligence/retention-admin.key" \
+     --dry-run --max-runtime 3600 --cancel-timeout 120
+   ```
+
+   Dry-run creates a preview, records its estimate, then explicitly cancels **its
+   own** preview and waits for `cancelled`. It never starts deletion or leaves a
+   ready preview intentionally blocking the next night. A pre-existing manual
+   preview/job is skipped, never cancelled or replaced.
+
+3. **Create a user oneshot and timer.** Put this in
+   `~/.config/systemd/user/ci-blob-prune.service`:
+
+   ```ini
+   [Unit]
+   Description=Nightly online blob retention client
+
+   [Service]
+   Type=oneshot
+   ExecStart=%h/.local/share/ci-retention-client/bin/context-intelligence-server blobs prune-scheduled --online --older-than 30d --server-url http://127.0.0.1:8100 --admin-key-file %h/.config/context-intelligence/retention-admin.key --max-runtime 3600 --cancel-timeout 120
+   Restart=no
+   UMask=0077
+   TimeoutStartSec=65min
+   TimeoutStopSec=150s
+   StandardOutput=journal
+   StandardError=journal
+   ```
+
+   Put this in `~/.config/systemd/user/ci-blob-prune.timer`:
+
+   ```ini
+   [Unit]
+   Description=Daily blob retention at 03:00 Pacific
+
+   [Timer]
+   OnCalendar=*-*-* 03:00:00 America/Los_Angeles
+   Persistent=false
+   RandomizedDelaySec=0
+   AccuracySec=1min
+   Unit=ci-blob-prune.service
+
+   [Install]
+   WantedBy=timers.target
+   ```
+
+   There are deliberately no ingestion `Wants`/`Requires`, stop/restart hooks,
+   credential values, or retry policies. systemd's default stop signal is
+   SIGTERM. One service unit cannot overlap itself; the server busy guard also
+   prevents overlapping manual or other-client jobs.
+
+4. **Enable only the timer, after a successful dry-run.** Do **not** start/enable
+   the service to test setup: that would apply retention immediately.
+
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user enable --now ci-blob-prune.timer
+   systemctl --user list-timers ci-blob-prune.timer
+   journalctl --user -u ci-blob-prune.service -n 10 --no-pager
+   ```
+
+   An unattended user timer needs the user's service manager running, usually
+   through an already-authorized linger configuration. The timer follows local
+   Pacific daylight-saving changes. Missed runs are **not caught up** after
+   downtime (`Persistent=false`). Busy skips and failures have no immediate
+   automatic retries; the next opportunity is the next scheduled day.
+
+Each invocation emits one sanitized JSON receipt to stdout (also the journal):
+outcome, exit code, owned UUID, last validated state, confirmation, frozen cutoff,
+counts, cleanup state, fixed error code, and Pacific-offset start/end timestamps.
+No credential, root path, sample URI, or remote error body is printed. Exit zero
+means clean `completed`, observed `dry_run` cancellation, or `skipped_busy`.
+Errors/changed candidates, expired or malformed previews, and failed/interrupted
+jobs are nonzero. HTTP 202 alone never means success.
+
+The client creates at most one preview and starts only that UUID, once. A lost
+start reply is reconciled against that same UUID, never retried. Work has a
+one-hour monotonic budget; timeout, SIGINT, SIGTERM, or monitoring failure requests
+explicit cancellation of the owned job and observes for at most another 120
+seconds. An already admitted durable batch may finish. `cancelling` is **not**
+`cancelled`; `cancel_unconfirmed` is nonzero and retains the owned UUID for
+inspection with `prune-status`/`prune-cancel`. Completion observed after a deadline
+does not turn the failed scheduled run into success.
+
+Each network connect/read uses the remaining request budget, including all
+resolved addresses and trickling HTTP headers/bodies. Python's OS hostname
+resolver (`getaddrinfo`) is not bounded by a socket timeout; a stuck resolver can
+delay the next deadline check. Prefer the numeric loopback URL above for a local
+timer. The service-manager timeouts are the outer process limit; forced
+termination still cannot guarantee remote cancellation.
+
+Stopping/disabling the **timer** only prevents future starts. To stop an active
+client use `systemctl --user stop ci-blob-prune.service`; it sends SIGTERM so the
+client can cancel its owned server job. Stopping the client or timer is not
+itself a server-side job cancellation. SIGKILL, host loss, or network loss can
+prevent cancellation; use a separate explicit `blobs prune-cancel --online
+JOB_UUID` with the same URL/admin credential when needed. Stopping/restarting
+ingestion is a separate service-manager action and is never part of this timer.
+
+### Offline: maintenance window required
+
+```bash
+context-intelligence-server blobs prune --older-than 30d
+# Optional explicit EXISTING blob root:
+context-intelligence-server blobs prune --older-than 30d --blob-root /path/to/blobs
+```
+
+The default age is `30d`. Positive integer units are `s`, `m`, `h`, `d`, and `w`.
+Age means **when the payload was stored**, using filesystem `mtime_ns`, not an
+event timestamp or filename. Only files strictly older than one invocation cutoff
+are eligible; boundary, rewritten, and future-dated files remain. The cutoff is
+printed in `America/Los_Angeles` time. Output includes the canonical root, eligible
+file count, allocated/logical bytes, retained/skipped/error counts, and at most
+five sample URIs. Allocated bytes are an estimate, not guaranteed freed space.
+
+Preview reads metadata only: no payload bodies, graph connection, lock creation,
+ledger creation, or log/manifest writes. It walks the known
+`root/session/blobs/key.json` layout without sorting or collecting the full tree.
+Without `--blob-root`, normal `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_*` environment
+and YAML settings resolve `blob_path`. An explicitly named missing config fails,
+even with `--blob-root`; an absent root fails rather than being created.
+
+**Apply requires a separately authorized maintenance window.**
+
+1. Stop all writers using their service manager. **Old unpatched writers do not
+   honor the retention lock and MUST be stopped before apply.** Do not launch
+   another ad-hoc server to work around the lock.
+2. Run the same command with `--apply`. It acquires a nonblocking exclusive root
+   lock **before** a fresh preview and holds it throughout confirmation/deletion.
+3. Read the preview, then type **`prune`** at the terminal prompt to confirm.
+   Decline, EOF, or noninteractive input deletes nothing. There is no `--yes`.
+4. Restart through the service manager after completion. The command never
+   stops or restarts services itself.
+
+Upgraded workers hold a shared lock from before startup recovery through final
+shutdown. Standalone BlobStore operations also hold a shared lock, including
+threaded operations whose awaiting task is cancelled. Aliases of the same root
+coordinate through its canonical path. Lock conflicts fail without waiting.
+Never unlink `root/.ci-blob-retention.lock`: replacing its inode defeats locking.
+Keep the namespace stable; do not rename roots/session directories or edit
+metadata while applying. Locks are cooperative, not protection against a hostile
+same-user process. This operation requires a local filesystem with working POSIX
+flock, atomic rename/unlink, directory fsync, and SQLite durability semantics.
+
+Only confirmed apply initializes the private `root/.ci-blob-retention/` SQLite
+expiry ledger. Batches of at most 512 URI/fingerprint records commit with
+`synchronous=FULL` and a metadata-directory fsync **before** unlinking.
+Device/inode/size/mtime/ctime fingerprints are checked before journaling and again
+before unlink. No-follow, descriptor-relative checks skip unsafe payload entries;
+unsafe lock/ledger metadata and corrupt ledgers fail loudly. Do not delete the
+ledger: it preserves the distinction between **expired** and **never present**.
+First initialization atomically publishes a fully synced, validated ledger.
+Interrupted private initialization files are ignored, not adopted; an invalid
+existing final ledger still fails loudly. Existing ledger reads are read-only
+and never migrate it.
+If a process crashes during a ledger transaction, SQLite can leave a valid hot
+rollback journal. Read-only preview and tombstone lookups fail loudly rather than
+repairing it. Interactive apply reports that recovery is needed, waits for
+confirmation, then performs SQLite recovery under the exclusive lock before
+continuing. Declining leaves both the journal and payloads unchanged.
+
+An interrupted apply can leave a readable physical payload plus a pending expiry
+record. A later, confirmed apply can finish deleting it only if the exact
+fingerprint still matches **and it is strictly older than the current cutoff**,
+so the deletion is included in that apply's fresh preview. A larger age threshold
+leaves newer pending payloads untouched. Changed/restored files remain; physical
+payloads take precedence when read. Apply reports actual deletions, changes, skips and errors;
+errors or changed candidates return nonzero and require inspection, not a claim
+that every previewed file was removed. A later rerun uses a new cutoff.
+
+**What stays:** graph/session metadata, graph blob references, queue artifacts,
+unknown files, and empty session directories. No whole-session deletion occurs.
+An absent expired payload raises `BlobExpiredError`; authenticated HTTP reads
+return `410` with `detail: {"code": "blob_expired", "uri": "ci-blob://..."}`.
+An absent unrecorded URI remains `404`; authentication is unchanged. Replay keeps
+the canonical URI successfully without recreating or refreshing tombstoned
+payloads. Physically restored payloads remain readable, but this command supplies
+no restore feature. Existing blob readers fail loudly on `410`; retention adds
+no capture changes or deployment. Scheduling requires the separate explicit
+online-only opt-in above.
+
+---
+
 ## Local quickstart — static mode with admin
 
 The fastest path to a **local** server (server v6.0.0): static API-key auth and

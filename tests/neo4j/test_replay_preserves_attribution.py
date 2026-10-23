@@ -129,7 +129,11 @@ async def test_replayed_dead_letters_keep_their_contributor(
 
     from context_intelligence_server.routers.queues import replay_dead_letters
 
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(registry=reg)))
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(registry=reg, append_live_record=qm.append)
+        )
+    )
     result = await replay_dead_letters(session_id, request)  # type: ignore[arg-type]
     assert result["replayed"] == 5
     assert await qm.read_dead_letters(session_id) == []

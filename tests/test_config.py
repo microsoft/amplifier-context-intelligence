@@ -1,8 +1,12 @@
 """Tests for package configuration and metadata."""
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from context_intelligence_server.config import Settings
 
 
 def test_settings_defaults():
@@ -82,6 +86,292 @@ def test_crash_recovery_respawn_limit_defaults_to_unbounded():
 
     s = Settings()
     assert s.crash_recovery_respawn_limit is None
+
+
+def test_native_recovery_permits_are_defaulted_on_and_validate_ttl():
+    from context_intelligence_server.config import RecoveryConfig
+
+    assert RecoveryConfig().permit_required
+    assert RecoveryConfig().permit_ttl_seconds == 15
+    with pytest.raises(ValueError, match="permit_ttl_seconds"):
+        RecoveryConfig(permit_ttl_seconds=0)
+
+
+def test_stateful_root_covers_live_recovery_receipt_and_claim_storage(
+    tmp_path: Path,
+) -> None:
+    """The single-server lock is rooted above every active durable state store."""
+    from context_intelligence_server.config import Settings
+
+    settings = Settings(
+        queues_path=str(tmp_path / "state" / "live"),
+        access_control_mode="scoped",
+        contributor_grants={
+            "writer": {
+                "all_workspaces": True,
+                "capabilities": ["live:write", "recovery:write"],
+            }
+        },
+        recovery={
+            "enabled": True,
+            "queues_path": str(tmp_path / "state" / "recovery"),
+            "receipt_store_path": str(tmp_path / "state" / "receipts.sqlite3"),
+            "claims_store_path": str(tmp_path / "state" / "claims.sqlite3"),
+        },
+    )
+
+    assert settings.stateful_root() == (tmp_path / "state").resolve()
+
+
+def test_stateful_root_rejects_recovery_storage_outside_live_state_volume(
+    tmp_path: Path,
+) -> None:
+    """A single lock must not silently protect only a subset of durable state."""
+    from context_intelligence_server.config import Settings
+
+    settings = Settings(
+        queues_path=str(tmp_path / "one" / "live"),
+        recovery={
+            "enabled": True,
+            "queues_path": str(tmp_path / "two" / "recovery"),
+        },
+    )
+
+    with pytest.raises(ValueError, match="all mutable server state"):
+        settings.stateful_root()
+
+
+def test_default_stateful_root_is_coherent_without_a_mutable_identity_store() -> None:
+    """An unconfigured static server has no identity-store writer to protect."""
+    from context_intelligence_server.config import Settings
+
+    assert Settings().stateful_root() == Path("/data")
+
+
+def test_stateful_root_covers_an_active_api_key_identity_store(tmp_path: Path) -> None:
+    """Configured static keys must share the queue root with their store."""
+    from context_intelligence_server.config import Settings
+
+    state_root = tmp_path / "state"
+    settings = Settings(
+        queues_path=str(state_root / "queues"),
+        api_keys={"a" * 64: {"id": "writer"}},
+        api_keys_store_path=str(state_root / "identity" / "api-keys.json"),
+    )
+
+    assert settings.stateful_root() == state_root.resolve()
+
+
+def test_stateful_root_accepts_active_api_key_store_outside_live_state_volume(
+    tmp_path: Path,
+) -> None:
+    """Identity ownership is the per-store lock's job (r4336046216).
+
+    A mutable API-key store outside the queue root is a supported layout, and
+    the configured path is never relocated by computing the root.
+    """
+    from context_intelligence_server.config import Settings
+
+    store = tmp_path / "identity-volume" / "api-keys.json"
+    settings = Settings(
+        queues_path=str(tmp_path / "queue-volume" / "queues"),
+        api_keys={"a" * 64: {"id": "writer"}},
+        api_keys_store_path=str(store),
+    )
+
+    assert settings.stateful_root() == (tmp_path / "queue-volume").resolve()
+    assert settings.api_keys_store_path == str(store)
+
+
+def test_stateful_root_accepts_active_entra_store_outside_live_state_volume(
+    tmp_path: Path,
+) -> None:
+    """The same holds for Entra's runtime-mutable identity map."""
+    from context_intelligence_server.config import Settings
+
+    store = tmp_path / "identity-volume" / "entra-identities.json"
+    settings = Settings(
+        auth_mode="entra",
+        azure_client_id="client-id",
+        azure_tenant_id="tenant-id",
+        queues_path=str(tmp_path / "queue-volume" / "queues"),
+        entra_identities={
+            "12345678-1234-1234-1234-123456789abc": {"id": "writer"},
+        },
+        entra_identities_store_path=str(store),
+    )
+
+    assert settings.stateful_root() == (tmp_path / "queue-volume").resolve()
+    assert settings.entra_identities_store_path == str(store)
+
+
+_DIGEST = "b" * 64
+_OID = "12345678-1234-1234-1234-123456789abc"
+_ENTRA = {"auth_mode": "entra", "azure_client_id": "c", "azure_tenant_id": "t"}
+
+# Every authenticated configuration that makes the identity store mutable while
+# leaving queues_path and the identity paths at their DEFAULTS.  The default
+# queue root is /data and the default store lives under the user's home, so the
+# store is NOT beneath the root -- this must still start (r4336046216).
+_DEFAULT_LAYOUT_CASES = {
+    "static-legacy-api_key": {"api_key": "legacy-token"},
+    "static-api_keys-map": {"api_keys": {_DIGEST: {"id": "writer"}}},
+    "static-admin-sha256": {"admin_api_key_sha256": _DIGEST},
+    "static-admin-legacy": {"admin_api_key": "legacy-admin-token"},
+    "entra-admin-role-default": dict(_ENTRA),
+    "entra-user-map": {**_ENTRA, "entra_identities": {_OID: {"id": "writer"}}},
+    "entra-service-map": {**_ENTRA, "service_identities": {_OID: {"id": "svc"}}},
+}
+
+
+@pytest.mark.parametrize("recovery_enabled", [False, True])
+@pytest.mark.parametrize("case", sorted(_DEFAULT_LAYOUT_CASES))
+def test_stateful_root_accepts_the_default_layout_with_a_mutable_identity_store(
+    case: str, recovery_enabled: bool
+) -> None:
+    """Defaults + any authenticated config must not abort startup.
+
+    Pure configuration: nothing here creates /data or touches the home dir.
+    """
+    from context_intelligence_server.config import RecoveryConfig, Settings
+
+    settings = Settings(
+        **_DEFAULT_LAYOUT_CASES[case],
+        recovery=RecoveryConfig(enabled=recovery_enabled),
+    )
+    store, mutable = settings._identity_store_and_mutability()
+    queue_root = Path(settings.queues_path).resolve().parent
+    assert mutable, "the case must exercise a mutable identity store"
+    assert not store.resolve().is_relative_to(queue_root), (
+        "the default identity store must sit outside the queue root"
+    )
+
+    assert settings.stateful_root() == queue_root
+
+    # Paths are never relocated or rewritten by computing the root.
+    assert settings.queues_path == "/data/queues"
+    default_store = (
+        settings.api_keys_store_path
+        if settings.auth_mode == "static"
+        else settings.entra_identities_store_path
+    )
+    assert Path(default_store).expanduser() == store
+    assert default_store.endswith(("api-keys.json", "entra-identities.json"))
+
+
+# --- r4332085728: shared queue/ledger resources must hang directly off one root.
+# A resource nested under a deeper directory is containment-valid for one server
+# and root-valid for another, so two servers can drain it under different locks.
+
+
+def _recovery_settings(
+    live: Path,
+    *,
+    queues_path: Path | None = None,
+    receipt_store_path: Path | None = None,
+    claims_store_path: Path | None = None,
+) -> "Settings":
+    from context_intelligence_server.config import RecoveryConfig, Settings
+
+    def _opt(path: Path | None) -> str | None:
+        return None if path is None else str(path)
+
+    return Settings(
+        queues_path=str(live),
+        recovery=RecoveryConfig(
+            enabled=True,
+            queues_path=_opt(queues_path),
+            receipt_store_path=_opt(receipt_store_path),
+            claims_store_path=_opt(claims_store_path),
+        ),
+    )
+
+
+def test_stateful_root_rejects_the_nested_shared_recovery_queue_layout(
+    tmp_path: Path,
+) -> None:
+    """Thread counterexample: /state/live + /state/nested/recovery."""
+    state = tmp_path / "state"
+    settings = _recovery_settings(
+        state / "live", queues_path=state / "nested" / "recovery"
+    )
+
+    with pytest.raises(ValueError, match="direct children") as raised:
+        settings.stateful_root()
+    assert "recovery queue" in str(raised.value)
+
+
+def test_stateful_root_allows_the_nested_server_that_owns_its_own_children(
+    tmp_path: Path,
+) -> None:
+    """Server B roots at /state/nested and keeps every resource beside its queue."""
+    nested = tmp_path / "state" / "nested"
+    settings = _recovery_settings(nested / "live", queues_path=nested / "recovery")
+
+    assert settings.stateful_root() == nested.resolve()
+
+
+@pytest.mark.parametrize("field", ["receipt_store_path", "claims_store_path"])
+def test_stateful_root_rejects_nested_shared_ledgers(
+    tmp_path: Path, field: str
+) -> None:
+    """A shared SQLite ledger below a deeper directory is refused, not half-locked."""
+    state = tmp_path / "state"
+    settings = _recovery_settings(
+        state / "live", **{field: state / "nested" / "ledger.sqlite3"}
+    )
+
+    with pytest.raises(ValueError, match="direct children"):
+        settings.stateful_root()
+
+
+def test_swapped_live_and_recovery_queues_share_one_root_lock(tmp_path: Path) -> None:
+    """Swapping live/recovery between two servers still yields one canonical root."""
+    state = tmp_path / "state"
+    first = _recovery_settings(state / "live", queues_path=state / "recovery")
+    second = _recovery_settings(state / "recovery", queues_path=state / "live")
+
+    assert first.stateful_root() == second.stateful_root() == state.resolve()
+
+
+def test_shared_receipt_ledger_locks_the_same_canonical_root(tmp_path: Path) -> None:
+    """Two servers naming the same ledger resolve to the same root, never two."""
+    state = tmp_path / "state"
+    ledger = state / "receipts.sqlite3"
+    first = _recovery_settings(state / "live-a", receipt_store_path=ledger)
+    second = _recovery_settings(state / "live-b", receipt_store_path=ledger)
+
+    assert first.stateful_root() == second.stateful_root() == state.resolve()
+    # A contender rooted deeper cannot name that same ledger.
+    deeper = _recovery_settings(state / "sub" / "live", receipt_store_path=ledger)
+    with pytest.raises(ValueError, match="direct children"):
+        deeper.stateful_root()
+
+
+def test_canonical_alias_of_the_root_resolves_to_the_same_root(tmp_path: Path) -> None:
+    """A symlinked spelling of the state volume is the same root, not a new one."""
+    state = tmp_path / "state"
+    state.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(state, target_is_directory=True)
+    real = _recovery_settings(state / "live", queues_path=state / "recovery")
+    via_alias = _recovery_settings(alias / "live", queues_path=state / "recovery")
+
+    assert real.stateful_root() == via_alias.stateful_root() == state.resolve()
+
+
+def test_identity_store_may_remain_a_descendant_of_the_root(tmp_path: Path) -> None:
+    """Identity stores keep their own per-store lock, so descendants stay valid."""
+    from context_intelligence_server.config import Settings
+
+    state = tmp_path / "state"
+    settings = Settings(
+        queues_path=str(state / "queues"),
+        api_keys={"a" * 64: {"id": "writer"}},
+        api_keys_store_path=str(state / "deep" / "er" / "api-keys.json"),
+    )
+
+    assert settings.stateful_root() == state.resolve()
 
 
 def test_crash_recovery_sweep_interval_defaults_to_300():

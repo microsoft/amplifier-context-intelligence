@@ -13,66 +13,16 @@ See [README.md](README.md) for full setup instructions.
 
 ---
 
-## Current Work: Documentation & Setup Cleanup
+## Container and Documentation Guidance
 
-We are cleaning up this repo's **documentation and setup instructions** so the
-server + Neo4j run locally **without Docker Compose**, with API keys primed for
-local runs. Scope is intentionally narrow — do this and nothing else.
-
-### KEEP (do NOT remove)
-
-- **`Dockerfile` (the server image).** This is the shipping-product container and
-  it is **S360-compliant** via PR #50 (`payneio` — "adopt Azure Linux base +
-  remove EOL packaging tools to clear S360 SCA findings",
-  https://github.com/microsoft/amplifier-context-intelligence/pull/50). Do NOT
-  drop the instructions Amplifier uses to build this container.
-  - **Why it must stay on the approved base** (`mcr.microsoft.com/azurelinux/base/python:...`):
-    the service is scanned by **S360** (Microsoft security compliance) via
-    **Qualys SCA**. Non-approved bases (e.g. Docker Hub `python:*-slim`) and the
-    EOL `pip`/`setuptools`/`wheel` rpms they ship get flagged as CVE findings.
-    Azure Linux is continuously patched via a fix-only feed, so CRITICAL/HIGH
-    clear at build time **without suppression lists**, and the base matches the
-    Azure Linux 3.0 AKS nodes this runs on.
-  - **The full rationale + the remediation pattern to preserve** (remove EOL rpms
-    rather than in-place upgrade; `tdnf update` at build time) live in
-    **`docs/azure-deployment.md` → "Container base image policy (S360 / SCA
-    compliance)"**. Read it before editing the `Dockerfile`.
-  - **Do NOT create new containers on non-approved bases.** This is exactly why
-    Neo4j is a script, not a `neo4j.Dockerfile` — its Docker Hub base would fail
-    S360. Any future container must use an approved MCR Azure Linux base.
-- **`.dockerignore` and `docker-entrypoint.sh`** — both support the server
-  `Dockerfile` build/first-run; they stay with it.
-- **Test containers** — `tests/neo4j/` fixtures and the `docker` dev-dependency
-  spin up throwaway Neo4j for tests. Keeping containers for testing is fine.
-
-### REMOVE
-
-- **`docker-compose.yml` + `docker-compose.airgap.yml`** — the Compose stack
-  hasn't been used in ages. Delete.
-- **`neo4j.Dockerfile`** — we run Neo4j ourselves, so we need a **script, not a
-  container image**. (Its `neo4j:*-community` base is also not an approved base,
-  so it would trip S360 anyway.) Replace with a run/setup script.
-- **`start.sh`** — it only wraps `docker compose up`. Delete once Compose is gone.
-
-### ADD (the real gaps)
-
-- **A script to run Neo4j locally** (install/launch Neo4j 5.x + APOC, `bolt://`
-  auth) — replacing what `neo4j.Dockerfile`/Compose did.
-- **Local credential + API-key priming** — replicate what the container first-run
-  bootstrap generated (Neo4j password + API token + sha256 digest +
-  `server-config.yaml`) for a non-Docker run.
-- **"Ask Amplifier to spin it up" prompts** in the setup instructions.
-
-### Boundaries
-
-- **No additional work** beyond documentation and setup cleanup. Do not refactor
-  server code or change behavior. (Code defaults that assume Compose — e.g.
-  `neo4j_url = neo4j://neo4j:7687`, `/data/...` storage paths — are
-  **documented-around**, not changed.)
-- **Planning docs go in the workspace-root `docs/`** (one level up from this
-  repo), never in this repo's `docs/`.
-- **This repo's `docs/` is product documentation only** — it ships with the
-  server. Keep it that way.
+- The shipping server `Dockerfile` uses an approved MCR Azure Linux base to meet
+  S360 / Qualys SCA requirements. Do not switch it to an unapproved base or add
+  production containers on unapproved bases; test containers are fine.
+- Preserve `.dockerignore` and `docker-entrypoint.sh` with the server image build
+  and first-run flow. Before editing the `Dockerfile`, read
+  `docs/azure-deployment.md` → "Container base image policy (S360 / SCA compliance)".
+- `docs/` contains product documentation only. Put plans and fix designs in the
+  workspace-root `docs/`, not in this repository's `docs/`.
 
 ---
 
@@ -261,6 +211,77 @@ mirror) — you cannot `docker pull` it either. Do NOT set
 procedures. Only `unrestricted=apoc.*` is needed. This path was validated in an
 isolated environment with the Neo4j container cut off from the internet.
 
+### Manual blob retention safety
+
+Scoped claims bind both blob-session and queue-worker physical names to the
+original session in the existing claim database. Reuse the storage folding
+helpers; never authorize a canonical blob URI by exact-literal claim lookup.
+Backfill includes provisional reservations and marks collisions ambiguous
+(NULL binding), without guessing from disk or graph contents. Claim/reservation
+admission and recovery dispatch must fail closed on conflicting bindings.
+Summary and deletion preflight every resolved original session through the
+request-bound storage guard before reading or mutating blob/queue storage;
+authorizing only the requested root does not protect ambiguous descendants.
+Graph/session identities remain original, and blob authorization still applies
+workspace/capability grants, not owner-only access. Regression checks:
+`tests/test_storage_bindings.py` and `tests/test_retention_name_integration.py`.
+
+`context-intelligence-server blobs prune --older-than 30d` previews storage-mtime
+expiry; `--apply` requires a terminal and explicit `prune` confirmation. The
+manual command never schedules or restarts services. Stop old unpatched writers through the
+service manager before apply: they do not honor the new shared/exclusive
+`root/.ci-blob-retention.lock`. Never unlink that lock or the private expiry
+ledger. Upgraded workers hold the shared root lock across their entire lifespan;
+standalone BlobStore operations hold it inside their I/O thread. Preserve
+physical-first reads, `BlobExpiredError` / HTTP 410 `blob_expired`, and replay's
+successful no-rehydrate behavior. Never prune graph/session or queue state.
+Guide: `docs/service-setup.md` → "Manual blob retention — preview first".
+Tests: `uv run pytest tests/test_blob_retention.py tests/test_blob_store.py -q`.
+
+Online retention uses `blobs prune --online --older-than 30d [--apply]`, existing
+admin authority, and only the configured root. Long previews can be confirmed
+with `--job-id UUID --apply`; status/cancel commands never scan storage. All
+BlobStore instances MUST use the canonical-root FIFO thread coordinator; acquire
+leases inside real I/O threads and keep admitted work protected after await
+cancellation. Keep online EX batches bounded (32 candidates, ceiling 64), yield
+50 ms between batches, and use the dedicated maintenance executor. Never upgrade
+the lifetime shared flock or allow separate-process writers to bypass it. Online
+scan cookies require 64-bit Linux; offline mode stays portable. No descriptor or
+lease crosses a scan yield, and recovery pages filter at most 512 PRIMARY KEY
+rows in memory, not SQL-filtered full scans. Confirmed snapshots checkpoint before
+deletion; unfinished restart jobs are interrupted, NEVER auto-resumed. Public `completed` only after the
+final `_save` fully succeeds (stay `running`/`finalizing` until then); a post-replace
+directory fsync failure reports `failed` yet a reopen may still read the replaced
+terminal snapshot, an uncertain outcome that is not a durability guarantee. Shutdown
+must finish maintenance and drainers/real I/O before releasing external exclusion.
+Tests: `uv run pytest tests/test_online_retention.py tests/test_retention_client.py -q`.
+
+Nightly scheduling is an explicit online-only client opt-in:
+`blobs prune-scheduled --online --older-than 30d --server-url URL --admin-key-file PATH`.
+`--dry-run` previews then cancels only its owned UUID; busy manual jobs are skipped.
+Keep the runner in `retention_scheduler.py`, with the CLI as a thin wrapper.
+Freeze validated identity, start once, check clean confirmed completion, and
+cancel/observe owned work on deadline or interruption; never cancel "current".
+Preserve sanitized JSON receipts, finite work/cleanup budgets, scoped SIGTERM
+handling, and the interactive command's TTY/no-`--yes` guard. No server/schema
+changes, scheduler auto-install, or ingestion stop/restart hooks. User-unit setup:
+`docs/service-setup.md` → "Nightly online pruning — explicit unattended opt-in".
+Tests: `uv run pytest tests/test_retention_scheduler.py tests/test_retention_client.py -q`.
+
+### Blob migration and startup recovery invariants
+
+- Parse blob URI paths as components without URL-decoding literal `%`, `?`, or `#`; retain structural, unsafe-component, metadata, and symlink guards.
+- A receipt `working_dir` scrub alone is not grounds for unsafe quarantine; refresh its digest and rebuild against the current DB. Legacy/v1 origin matching uses canonical source handle, ordinal, and line SHA without rewriting the old spool.
+- Both receipt DB rebuild paths preserve the existing ordinary file mode before payload copy; do not impose a fresh-DB mode policy or UID-folder rule.
+- Reject malformed or active foreign-root retention snapshots; ignore valid terminal foreign-root history while preserving expiry DB state.
+- Startup recovery skips invalid legacy keys before applying the cap and isolates per-key `OSError`/`ValueError` so other keys continue.
+- On shutdown, an abandoned recovery worker must discard its buffered events before graph close, so quarantined/paused data cannot flush; eligible queued work stays durable for replay. Preserve the live worker's final flush unchanged.
+- Live-backlog admission must treat strict `scandir` failures (`EACCES`, `ENOTDIR`, `EIO`, or a missing initialized directory) as unavailable and block recovery. Keep the separate startup scan lenient.
+- Blob-key migration: ordinary two-part `ci-blob://<session>/<name>` keys keep their historical `.json` paths; unsafe logical keys map to `ci-blob://<session>/~ci-key-v1/<full-domain-SHA256>` and flat `~ci-key-v1~<digest>.blob` filenames.
+- Keep mapped keys structurally disjoint from ordinary raw keys (three URI parts and `.blob` suffix); never URL-decode. Do not change graph/session/node IDs.
+- On POSIX, read a legacy literal-backslash `.json` path exactly first (never follow symlinks), then try its mapped address only after `FileNotFoundError`. Check legacy expiry before mapping on writes; expired data must not be rehydrated.
+- Listing, sizing, dump, retention (offline/online), and session deletion must recognize exact ordinary, mapped, and legacy-backslash forms. Mapped HTTP reads retain the same exact-claims authorization; do not add catch-all access.
+
 ### Temporal properties are `ZONED DATETIME`
 
 All temporal properties are stored as native Neo4j ZONED DATETIME, not ISO strings.
@@ -336,9 +357,7 @@ Auth model facts (the canonical statement of "which tokens are accepted" lives i
   no redeploy needed),
   `service_data_role` (default `Contributor`), `reader_role` (default `Reader`).
   Env prefix `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_`.
-- **Fail-closed:** misconfig (missing field / empty or malformed `entra_identities`)
-  is a HARD startup error. `allow_unauthenticated` defaults to `false`; a server
-  with no auth configured refuses to start.
+- **Fail-closed:** malformed identity-store data remains a loud load failure; expected store I/O failure leaves the listener available but protected, with identity-dependent auth/admin requests returning `503` rather than accepting stale credentials. `allow_unauthenticated` defaults to `false`.
 - **401** = bad/expired/wrong-audience/missing/ambiguous token; **403** = valid
   token lacking authorization — a user or service principal whose `oid` is
   unmapped, or a service token with no qualifying App Role (the 403 body names
@@ -357,18 +376,9 @@ Canonical guide: `docs/entra-auth-setup.md` (operator + developer + ops runbook)
 Both auth modes can add/remove identities **at runtime, no restart**, via the
 `/admin/*` router (`routers/admin.py`). Facts:
 
-- Each map is an **in-process live dict** backed by a durable JSON file on `/data`
-  (`api_keys_store_path` / `entra_identities_store_path`, in `config.py`). The
-  resolver holds the dict **by reference**, so a `/admin` `PUT`/`DELETE` is visible
-  on the next request. **No cache, no TTL** — safe because the pilot runs a
-  **single replica** (the in-process map is the source of truth).
-- `entra_identities_store_path` backs **both** user and service identities —
-  one shared store, disjoint oid space. There is deliberately no
-  separate `/admin/services` endpoint; service identities are managed through
-  `PUT`/`DELETE`/`GET /admin/identities`.
-- `IdentityStore` (`identity_store.py`) commits **write-file-then-swap-memory**
-  (atomic file replace first, then memory) and **fails closed** on a corrupt file
-  (empty map + loud log, never a crash-loop).
+- Identity stores load once during app-factory setup; lifespan starts their bounded background I/O worker without blocking listener startup. `/status` reports cached `auth.identity_ready` and `identity_reason` (`initializing`, `store_unavailable`, or `null`). Expected store failure keeps status/listener available but protected auth and identity-admin requests return `503`, never stale credentials; corrupt data remains fail-closed and loud.
+- Use one stable canonical identity-store path and nonblocking exclusive sidecar ownership, selected even when unseeded; it prevents stale auth across roots. Hold ownership until shutdown has settled real I/O. The configured private storage directory is trusted and locks are cooperative advisory locks: never manually unlink the sidecar or impose new chmod/UID profiles. Keep the live queue, claim ledger, recovery queue and receipt ledger as direct children of the live queue's parent (the identity store is NOT part of that root and may live anywhere, e.g. the default `~/.local/share/ci-server/identity/` beside the default `/data` queue root; only its own lock guards it, and it is never relocated or migrated), so every contender of a shared resource takes the same root lock; a bad layout is a startup config error. On a managed store, an ordinary I/O error reading the file or persisting the first-boot seed must propagate (identity unavailable, `/status` up), never become an empty or memory-only credential map; only corrupt content stays the loud empty-map fallback.
+- `entra_identities_store_path` backs **both** user and service identities — one shared store, disjoint oid space; there is no separate `/admin/services` endpoint. Mutations remain write-file-then-swap-memory.
 - **Admin authority** is separate from data auth: static mode uses a dedicated
   `admin_api_key` (recognized by the middleware, not in the data keystore); entra
   mode uses the App Role named by `entra_admin_role` (default `IdentityAdmin`) in
@@ -403,9 +413,7 @@ Use `./deploy.sh --no-seed` for a deploy-only run.
 cannot be supplied through `up` itself. The map lives in an **uncommitted,
 git-ignored** local file (`scripts/entra-identities.local.json`, from
 `scripts/entra-identities.example.json`) and is applied over the admin API
-(`PUT /admin/identities/{oid}`) right after `up`. The server fails closed on an
-empty `entra_identities` map, so this onboarding is required before it serves on a
-fresh volume.
+(`PUT /admin/identities/{oid}`) right after `up`. Identity-store I/O initializes in the background; until the store is ready, protected auth/admin requests return `503` and `/status` reports the cached identity readiness reason.
 
 Under the hood the seeder can also be run alone (`./scripts/seed-entra-identities.sh
 --check` for a dry run) — see `docs/azure-deployment.md`.
@@ -453,6 +461,8 @@ with admin"). Runtime runbook: `docs/identity-management.md`.
 - **New API endpoint**: Add a route to `main.py` or a new router under `routers/`.
 - **Configuration**: Add fields to `ServerConfig` in `config.py`. Keep defaults conservative.
 - **Tests**: Every handler should have a unit test in `tests/handlers/`. Integration tests live in `tests/integration/`.
+- Durable append-framing regression fixtures are generated deterministically in `tests/test_durable_append_framing.py`; they must be self-contained and must not depend on external ancestor-capture seed files. These synthetic fixtures are not production captures, and the framing tests should run without seed-related skips.
+- **Idle queue workers**: Append notifications belong to `QueueManager`, covering live ingress, recovery and replay alike. Hold the same key guard across clear-before-read and notification wait; never replace that guard while a waiter references it. Signal after a write attempt settles, including cancellation or failure, since readable bytes may remain. Keep notification waits outside dispatch/finalization, preserve periodic stale/trim maintenance, and test both lost-wakeup windows plus cancellation-safe guard cleanup (`tests/test_queue_wakeups.py`). The queue remains crash-durable, not power-loss-durable. Recovery eligibility includes the full batch, including terminal events; acquire locks in the documented order, and retry leases only after proof of a real flush, failing closed on corrupt retry audit.
 - **Server process**: Gunicorn runs one `uvicorn_worker.UvicornWorker` (`worker_class` in `main.py` `run()`), from the `uvicorn-worker` package. Do not use the deprecated `uvicorn.workers` module.
 
 Run `uv run pytest tests/ -q` to verify before committing.

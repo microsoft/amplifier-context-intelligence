@@ -1,57 +1,68 @@
 """AsyncDiskBlobStore — async, disk-backed blob storage with ci-blob:// URIs.
 
 Disk layout:
-    <root>/<session-id>/blobs/<key>.json
+    <root>/<session-id>/blobs/<name>.json                    ordinary names
+    <root>/<session-id>/blobs/~ci-key-v1~<64 hex>.blob       separator/control names
 
 URI scheme:
-    ci-blob://<session-id>/<key>
+    ci-blob://<session-id>/<name>
+    ci-blob://<session-id>/~ci-key-v1/<64 hex>
 
-All filesystem I/O is wrapped with ``asyncio.to_thread`` to keep the event
-loop non-blocking.
+The logical-name -> physical-name map lives in ``blob_keys``; this module only
+does I/O.  All filesystem I/O is wrapped with ``asyncio.to_thread`` to keep the
+event loop non-blocking.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
+import secrets
 import shutil
+import stat
 import tempfile
 from pathlib import Path
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, NoReturn, Protocol, cast, runtime_checkable
 
+from context_intelligence_server.blob_coordination import filesystem
+from context_intelligence_server.blob_keys import (
+    MAPPED_MARKER,
+    MAX_KEY_BYTES,
+    MAX_SESSION_BYTES,
+    BlobAddress,
+    address_from_filename,
+    component,
+    exact_address,
+    legacy_address,
+    parse_address,
+    read_candidates,
+    write_address,
+)
+from context_intelligence_server.blob_retention import (
+    BlobExpiredError,
+    Root,
+    RootLock,
+    expired,
+)
 from context_intelligence_server.utils import fold_name
 
 _SCHEME = "ci-blob://"
 
 # --- session-id / blob-key length budgets ---------------------------------
 #
-# INCIDENT (production, sibling of the queue's worker-key incident): a blob
-# key is ``f"{node_id}__{field_name}"`` (blob_processor.py), and node_id
-# embeds the session_id (utils.make_node_id) -- so for a deeply-nested
-# sub-agent session, the blob key is LONGER than the queue's worker key was.
-# ``write()``'s ``tempfile.mkstemp(prefix=f"{key}.", suffix=".tmp")`` names
-# a temp file that is WIDER than the final ``{key}.json`` name -- exactly
-# the "the temp file is the real worst case" shape as the queue's
-# ``commit()``. Once that temp name crossed NAME_MAX (255 bytes),
-# ``write()`` raised OSError, silently replacing the field's data with
-# ``{"$blob_error": ...}`` in the graph (2,313 occurrences/24h in
-# production) -- never a crash, just silent data loss.
+# INCIDENT (production): a blob key is ``f"{node_id}__{field_name}"``
+# (blob_processor.py) and node_id embeds the session_id, so for a deeply
+# nested sub-agent session the key can exceed the filesystem's NAME_MAX (255
+# bytes) once a temp-file suffix is added.  ``write()`` then raised OSError and
+# the field was silently replaced by ``{"$blob_error": ...}`` in the graph.
 #
-# ``mkstemp``'s random component is documented (and pinned by
-# ``tempfile._RandomNameSequence``'s own docstring: "Each string is eight
-# characters long") to always be exactly 8 characters; verified empirically
-# against this interpreter too. So the temp name is
-# ``{key}.{8 random chars}.tmp`` = key + 1 ("." after key) + 8 + 4 (".tmp").
-_NAME_MAX = 255
-_KEY_TMP_SUFFIX_BYTES = len(".") + 8 + len(".tmp")  # mkstemp's own suffix: 13
-_MAX_KEY_BYTES = _NAME_MAX - _KEY_TMP_SUFFIX_BYTES  # 242
-
-# session_id is a bare directory component (``<root>/<session_id>/blobs/``):
-# nothing ever appends a suffix to the session_id segment itself (mkstemp's
-# temp file lives inside the "blobs" subdirectory, widening the KEY, not the
-# session_id), so its budget is the plain NAME_MAX.
-_MAX_SESSION_ID_BYTES = _NAME_MAX
+# Temp files are created as ``{physical stem}.{8 random chars}.tmp``: the
+# stem plus 13 bytes.  ``blob_keys`` therefore folds an ordinary key to 242
+# bytes (242 + 13 = 255) and a mapped name's stem is a fixed 75 bytes.  The
+# session id is a bare directory component (nothing is appended), so its
+# budget is the plain NAME_MAX.
+_MAX_KEY_BYTES = MAX_KEY_BYTES
+_MAX_SESSION_ID_BYTES = MAX_SESSION_BYTES
 
 
 # ---------------------------------------------------------------------------
@@ -145,64 +156,96 @@ class AsyncDiskBlobStore:
         the plain ``NAME_MAX`` budget is correct here (no suffix is ever
         appended to the session_id segment itself).
         """
-        return fold_name(session_id, _MAX_SESSION_ID_BYTES)
-
-    @staticmethod
-    def _fold_key(key: str) -> str:
-        """Bound *key* to fit under ``write()``'s temp-file suffix budget.
-
-        See the module-level comment on ``_MAX_KEY_BYTES`` for the
-        ``tempfile.mkstemp`` suffix this is sized against.
-        """
-        return fold_name(key, _MAX_KEY_BYTES)
-
-    def _make_uri(self, session_id: str, key: str) -> str:
-        """Return the canonical ``ci-blob://`` URI for a session/key pair.
-
-        Both components are folded to their filesystem-safe length BEFORE
-        being embedded in the URI: this URI is what gets persisted into
-        the graph, and ``_blob_path`` (which resolves it back to disk) also
-        folds -- so an unfolded URI here would point at a path no read
-        could ever reach. Folding is idempotent, so calling this with an
-        already-folded session_id/key (e.g. from ``_parse_uri``) is a
-        no-op.
-        """
-        return f"{_SCHEME}{self._fold_session_id(session_id)}/{self._fold_key(key)}"
+        return fold_name(component(session_id), _MAX_SESSION_ID_BYTES)
 
     def _parse_uri(self, uri: str) -> tuple[str, str]:
         """Parse a ``ci-blob://`` URI into ``(session_id, key)``.
 
+        *key* is the ordinary name, or the canonical handle
+        ``~ci-key-v1/<64 hex>`` for a mapped blob.
+
         Raises:
             ValueError: If *uri* is not a valid ``ci-blob://`` URI.
         """
-        if not uri.startswith(_SCHEME):
-            raise ValueError(
-                f"Invalid URI scheme — expected '{_SCHEME}...', got: {uri!r}"
-            )
-        remainder = uri[len(_SCHEME) :]
-        # remainder must be "<session_id>/<key>" — both parts non-empty
-        if "/" not in remainder:
-            raise ValueError(f"URI missing key component: {uri!r}")
-        session_id, _, key = remainder.partition("/")
-        if not session_id or not key:
-            raise ValueError(f"URI has empty session_id or key: {uri!r}")
-        return session_id, key
+        address = parse_address(uri)
+        handle = f"{MAPPED_MARKER}/{address.name}" if address.mapped else address.name
+        return address.session, handle
 
     def _session_dir(self, session_id: str) -> Path:
         """Return ``<root>/<folded-session_id>`` -- the shared base every
         session-scoped path (blob path, list scan, delete) resolves under."""
         return self._root / self._fold_session_id(session_id)
 
-    def _blob_path(self, session_id: str, key: str) -> Path:
-        """Return the filesystem path for a given session/key blob.
+    def _address(self, session_id: str, key: str) -> BlobAddress:
+        """Resolve a ``(session_id, key)`` pair to its physical address.
 
-        Both *session_id* and *key* are folded here too -- calling this
-        with an already-folded pair (as ``read``/``size``/``dump`` do,
-        via ``_parse_uri``) is an idempotent no-op, but ``write()`` calls
-        this FIRST, before a URI exists, so the fold must happen here
-        independently of ``_make_uri``.
+        A key spelled ``~ci-key-v1/<64 hex>`` is the canonical handle that
+        ``parse_uri`` returns: it names the stored file directly and is never
+        hashed again.  Every other key is a logical write name.
         """
-        return self._session_dir(session_id) / "blobs" / f"{self._fold_key(key)}.json"
+        if key.startswith(f"{MAPPED_MARKER}/"):
+            try:
+                return exact_address(
+                    f"{_SCHEME}{self._fold_session_id(session_id)}/{key}"
+                )
+            except ValueError:
+                pass
+        return write_address(session_id, key)
+
+    def _blob_path(self, session_id: str, key: str) -> Path:
+        """Return the filesystem path for a given session/key blob."""
+        return (
+            self._session_dir(session_id)
+            / "blobs"
+            / self._address(session_id, key).filename
+        )
+
+    @staticmethod
+    def _recognised(session: str, entries: Any) -> list[BlobAddress]:
+        """Addresses of the regular ``.json`` / ``.blob`` files in *entries*."""
+        found: list[BlobAddress] = []
+        for entry in entries:
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            try:
+                address = address_from_filename(session, entry.name)
+            except ValueError:
+                continue  # a recognised-but-invalid name never poisons the listing
+            if address is not None:
+                found.append(address)
+        return found
+
+    @staticmethod
+    def _open_first(
+        dir_fd: int, candidates: tuple[BlobAddress, ...]
+    ) -> tuple[int, BlobAddress] | None:
+        """Open the first candidate that exists.
+
+        Only a missing file falls through to the next candidate: a symlink,
+        permission error or non-regular entry must never be masked by a
+        fallback.
+        """
+        for candidate in candidates:
+            try:
+                fd = os.open(
+                    candidate.filename,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=dir_fd,
+                )
+            except FileNotFoundError:
+                continue
+            return fd, candidate
+        return None
+
+    @staticmethod
+    def _raise_missing(
+        root: Root, candidates: tuple[BlobAddress, ...], message: str
+    ) -> NoReturn:
+        """Every candidate is physically absent: report a recorded expiry, else not-found."""
+        for candidate in candidates:
+            if expired(root, candidate.uri):
+                raise BlobExpiredError(candidate.uri)
+        raise FileNotFoundError(message)
 
     # ------------------------------------------------------------------
     # Public accessors (mirror of internal helpers for external callers)
@@ -225,43 +268,60 @@ class AsyncDiskBlobStore:
     ) -> str:
         """Persist *value* as JSON and return a ``ci-blob://`` URI.
 
-        Creates the directory ``<root>/<session_id>/blobs/`` if needed.
+        *key* is a raw logical name.  Creates ``<root>/<session_id>/blobs/``
+        if needed.  A pre-upgrade backslash file is never created, migrated or
+        deleted: if its expiry is recorded the write keeps that old URI and
+        creates nothing, so replay never rehydrates a pruned payload.
 
         Returns:
-            A ``ci-blob://<session_id>/<key>`` URI.
+            The canonical URI, or the recorded-expired URI that blocked the write.
         """
-        path = self._blob_path(session_id, key)
-        # Fold explicitly and reuse the SAME value for the mkstemp prefix
-        # below. ``_blob_path`` already folds ``key`` internally to build
-        # ``path``'s stem -- fold_name is deterministic, so re-deriving it
-        # here is guaranteed identical -- but the mkstemp prefix must never
-        # be built from the RAW key: that key can be far longer than the
-        # budget, and the whole point of folding is that the temp file's
-        # name (this module's own widest suffix -- see the module-level
-        # comment on ``_MAX_KEY_BYTES``) never exceeds NAME_MAX.
-        folded_key = self._fold_key(key)
+        canonical = write_address(session_id, key)  # validates before any I/O
+        legacy = legacy_address(session_id, key)
+        if legacy == canonical:
+            legacy = None
 
-        def _write() -> None:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            data = json.dumps(value)
-            tmp_fd, tmp_name = tempfile.mkstemp(
-                dir=str(path.parent), prefix=f"{folded_key}.", suffix=".tmp"
-            )
-            try:
-                with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                    f.write(data)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp_name, path)
-            except BaseException:
-                try:
-                    os.unlink(tmp_name)
-                except FileNotFoundError:
-                    pass
-                raise
+        def _write() -> str:
+            # The lock lives inside the thread: cancelling the awaiting task
+            # cannot release it while an atomic write is still in progress.
+            with RootLock(self._root, create_root=True) as lock:
+                if expired(lock.root, canonical.uri):
+                    return canonical.uri  # replay keeps the reference, never rehydrates
+                if legacy is not None and expired(lock.root, legacy.uri):
+                    return legacy.uri
+                with lock.root.blobs(canonical.session, create=True) as fd:
+                    data = json.dumps(value)
+                    for _ in range(100):
+                        tmp_name = f"{canonical.stem}.{secrets.token_urlsafe(6)}.tmp"
+                        try:
+                            tmp_fd = os.open(
+                                tmp_name,
+                                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                0o600,
+                                dir_fd=fd,
+                            )
+                            break
+                        except FileExistsError:
+                            continue
+                    else:
+                        raise FileExistsError("Could not allocate blob temporary file")
+                    try:
+                        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                            f.write(data)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(
+                            tmp_name, canonical.filename, src_dir_fd=fd, dst_dir_fd=fd
+                        )
+                    except BaseException:
+                        try:
+                            os.unlink(tmp_name, dir_fd=fd)
+                        except FileNotFoundError:
+                            pass
+                        raise
+                return canonical.uri
 
-        await asyncio.to_thread(_write)
-        return self._make_uri(session_id, key)
+        return await filesystem(self._root, _write)
 
     async def read(self, uri: str) -> dict[str, Any] | list[Any]:
         """Return the blob addressed by *uri*.
@@ -273,53 +333,77 @@ class AsyncDiskBlobStore:
         Raises:
             ValueError: If *uri* is not a valid ``ci-blob://`` URI.
             FileNotFoundError: If no blob exists at the resolved path.
+            BlobExpiredError: If every candidate is absent and one has a
+                recorded expiry.
         """
-        session_id, key = self._parse_uri(uri)
-        path = self._blob_path(session_id, key)
+        candidates = read_candidates(uri)
+        first = candidates[0]
+        path = self._root / first.session / "blobs" / first.filename
 
         def _read() -> dict[str, Any] | list[Any]:
-            try:
-                return cast(
-                    dict[str, Any] | list[Any],
-                    json.loads(path.read_text(encoding="utf-8")),
+            with RootLock(self._root, create_root=True) as lock:
+                try:
+                    with lock.root.blobs(first.session) as fd:
+                        opened = self._open_first(fd, candidates)
+                        if opened is not None:
+                            with os.fdopen(opened[0], "r", encoding="utf-8") as f:
+                                self._check_payload(f.fileno())
+                                return cast(dict[str, Any] | list[Any], json.load(f))
+                except FileNotFoundError:
+                    pass  # no session/blobs directory: every candidate is missing
+                self._raise_missing(
+                    lock.root,
+                    candidates,
+                    f"Blob not found: {first.uri!r} (path: {path})",
                 )
-            except FileNotFoundError:
-                raise FileNotFoundError(f"Blob not found: {uri!r} (path: {path})")
 
-        return await asyncio.to_thread(_read)
+        return await filesystem(self._root, _read)
 
     async def list(self, session_id: str) -> list[str]:
         """Return all blob URIs for *session_id*, sorted lexicographically.
 
-        Returns an empty list if the session directory does not exist.
-
-        *session_id* is folded via ``_session_dir`` to locate the
-        directory; ``p.stem`` recovers an ALREADY-folded key (every file
-        on disk is named with its folded key), so the ``_make_uri`` call
-        below folds it again as a no-op -- idempotent, per ``fold_name``.
+        Returns an empty list if the session directory does not exist.  Both
+        ``.json`` and mapped ``.blob`` files are listed under the URI of their
+        physical name; unrecognised entries are ignored.
         """
-        blobs_dir = self._session_dir(session_id) / "blobs"
+        session = self._fold_session_id(session_id)
 
         def _list() -> list[str]:
-            if not blobs_dir.exists():
-                return []
-            keys = sorted(p.stem for p in blobs_dir.glob("*.json"))
-            return [self._make_uri(session_id, key) for key in keys]
+            with RootLock(self._root, create_root=True) as lock:
+                try:
+                    with lock.root.blobs(session) as fd, os.scandir(fd) as entries:
+                        return sorted(
+                            address.uri
+                            for address in self._recognised(session, entries)
+                        )
+                except FileNotFoundError:
+                    return []
 
-        return await asyncio.to_thread(_list)
+        return await filesystem(self._root, _list)
 
     async def size(self, uri: str) -> int:
         """Return the byte size of the blob addressed by *uri*, or 0 if missing."""
-        session_id, key = self._parse_uri(uri)
-        path = self._blob_path(session_id, key)
+        candidates = read_candidates(uri)
 
         def _size() -> int:
-            try:
-                return path.stat().st_size
-            except FileNotFoundError:
+            with RootLock(self._root, create_root=True) as lock:
+                try:
+                    with lock.root.blobs(candidates[0].session) as fd:
+                        for candidate in candidates:
+                            try:
+                                st = os.stat(
+                                    candidate.filename, dir_fd=fd, follow_symlinks=False
+                                )
+                            except FileNotFoundError:
+                                continue
+                            if not stat.S_ISREG(st.st_mode):
+                                raise ValueError("Unsafe blob payload")
+                            return st.st_size
+                except FileNotFoundError:
+                    pass
                 return 0
 
-        return await asyncio.to_thread(_size)
+        return await filesystem(self._root, _size)
 
     async def delete_session(self, session_id: str) -> int:
         """Delete all blobs for *session_id* and return the number removed.
@@ -327,20 +411,24 @@ class AsyncDiskBlobStore:
         Removes ``<root>/<folded-session_id>/``. Idempotent: a session
         with no stored blobs returns 0 and is not an error.
         """
-        session_dir = self._session_dir(session_id)
-        blobs_dir = session_dir / "blobs"
+        session = self._fold_session_id(session_id)
 
         def _delete() -> int:
-            if not blobs_dir.exists():
-                return 0
-            count = sum(1 for _ in blobs_dir.glob("*.json"))
-            shutil.rmtree(session_dir)
-            return count
+            with RootLock(self._root, create_root=True) as lock:
+                try:
+                    with lock.root.blobs(session) as fd, os.scandir(fd) as entries:
+                        count = len(self._recognised(session, entries))
+                    shutil.rmtree(session, dir_fd=lock.root.fd)
+                    return count
+                except FileNotFoundError:
+                    return 0
 
-        return await asyncio.to_thread(_delete)
+        return await filesystem(self._root, _delete, exclusive=True)
 
     async def dump(self, uri: str, dest_dir: Path | str | None = None) -> str:
         """Copy the blob file addressed by *uri* to *dest_dir*.
+
+        The copy is named after the selected PHYSICAL file (never the URI).
 
         Args:
             uri: ``ci-blob://`` URI identifying the blob to copy.
@@ -353,9 +441,11 @@ class AsyncDiskBlobStore:
         Raises:
             ValueError: If *uri* is not a valid ``ci-blob://`` URI.
             FileNotFoundError: If no blob exists at the resolved path.
+            BlobExpiredError: If every candidate is absent and one has a
+                recorded expiry.
         """
-        session_id, key = self._parse_uri(uri)
-        src = self._blob_path(session_id, key)
+        candidates = read_candidates(uri)
+        first = candidates[0]
 
         if dest_dir is None:
             dest_dir_path = Path(tempfile.gettempdir()) / "ci-blobs"
@@ -363,9 +453,50 @@ class AsyncDiskBlobStore:
             dest_dir_path = Path(dest_dir)
 
         def _copy() -> str:
-            if not src.exists():
-                raise FileNotFoundError(f"Blob not found: {uri!r}")
-            dest_dir_path.mkdir(parents=True, exist_ok=True)
-            return str(shutil.copy2(src, dest_dir_path))
+            with RootLock(self._root, create_root=True) as lock:
+                try:
+                    with lock.root.blobs(first.session) as fd:
+                        opened = self._open_first(fd, candidates)
+                        if opened is not None:
+                            file_fd, selected = opened
+                            with os.fdopen(file_fd, "rb") as src:
+                                self._check_payload(src.fileno())
+                                st = os.fstat(src.fileno())
+                                dest_dir_path.mkdir(parents=True, exist_ok=True)
+                                dest = dest_dir_path / selected.filename
+                                # Do not truncate the source if destination is its
+                                # own directory, a symlink alias, or a hardlink.
+                                dest_fd = os.open(
+                                    dest,
+                                    os.O_WRONLY
+                                    | os.O_CREAT
+                                    | os.O_NOFOLLOW
+                                    | os.O_NONBLOCK,
+                                    0o600,
+                                )
+                                with os.fdopen(dest_fd, "wb") as out:
+                                    self._check_payload(out.fileno())
+                                    dst = os.fstat(out.fileno())
+                                    if (dst.st_dev, dst.st_ino) == (
+                                        st.st_dev,
+                                        st.st_ino,
+                                    ):
+                                        raise shutil.SameFileError(
+                                            "Blob dump destination is the source payload"
+                                        )
+                                    os.ftruncate(out.fileno(), 0)
+                                    shutil.copyfileobj(src, out)
+                                os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns))
+                                return str(dest)
+                except FileNotFoundError:
+                    pass  # no session/blobs directory: every candidate is missing
+                self._raise_missing(
+                    lock.root, candidates, f"Blob not found: {first.uri!r}"
+                )
 
-        return await asyncio.to_thread(_copy)
+        return await filesystem(self._root, _copy)
+
+    @staticmethod
+    def _check_payload(fd: int) -> None:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("Unsafe blob payload: not a regular file")

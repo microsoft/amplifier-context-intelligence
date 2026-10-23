@@ -267,8 +267,7 @@ curl -sS "$SERVER/admin/keys"       -H "Authorization: Bearer $ADMIN_API_KEY" # 
 
 ## 7. Checking state
 
-`GET /status` is unauthenticated and surfaces config-level booleans only (no
-credentials, no hashes). Use it to confirm the admin API is live:
+`GET /status` is unauthenticated and exposes no credentials or hashes. Its cached `auth.identity_ready` and `identity_reason` report identity-store readiness (`initializing`, `store_unavailable`, or `null`); while unavailable, protected auth/admin requests return `503` rather than using stale credentials. Use it to confirm the admin API is live:
 
 ```bash
 curl -sS "$SERVER/status" | jq '.auth'
@@ -290,26 +289,14 @@ curl -sS "$SERVER/status" | jq '.auth'
 
 ---
 
-## 8. How resolution stays fresh (no cache) & durability
+## 8. Identity-store readiness & durability
 
-**There is no cache and no TTL.** Each map is an **in-process live dictionary**
-that the active resolver (`StaticKeyResolver` / `EntraResolver`) holds **by
-reference**. A `/admin/*` `PUT`/`DELETE` mutates that same dict, so the change is
-visible to the resolver on the **very next request** — there is nothing to expire
-or invalidate.
+Identity maps remain live in-process dictionaries held by resolver reference; admin mutations are visible on the next request. Stores load once during app-factory setup; lifespan starts background I/O without blocking listener startup. Startup performs no retries, scans, or reconciliation. `/status` reports cached `auth.identity_ready` and `identity_reason` (`initializing`, `store_unavailable`, or `null`).
 
-- **Commit order (write-file-then-swap-memory).** A mutation first writes the JSON
-  file atomically (tempfile → `os.replace`), and **only on success** updates the
-  in-process dict. The file is therefore never behind memory; a mid-write crash
-  cannot leave memory ahead of disk.
-- **Single replica is why this is safe and simple.** The pilot runs `maxReplicas=1`
-  (the drainer is a single writer), so there is no second process whose copy of the
-  map could go stale — the one in-process map *is* the source of truth. If a future
-  read-tier (M3) adds replicas, it would introduce a short TTL / poll re-read of the
-  store file; **that does not exist today** and is not needed at one replica.
-- Both maps live on the **`/data` Azure Files volume** and survive restarts and
-  redeploys. Loads are **fail-closed**: a corrupt store starts empty and loud
-  rather than crash-looping.
+- Expected store I/O failure leaves status/listener available but protected auth and identity-admin requests return `503`, never stale credentials. Corrupt store files retain the existing fail-closed read behavior and loud reporting.
+- Use a stable canonical identity-store path and nonblocking exclusive sidecar ownership, selected even when unseeded, to prevent stale auth across roots. Retain ownership until shutdown has settled real I/O. The configured private storage directory is trusted; locks are cooperative advisory locks. Never manually unlink the sidecar or impose new chmod/UID profiles.
+- **Upgrade compatibility:** the identity store is independent of the queue root, whose lock covers queues and ledgers only. Store paths and defaults are unchanged, so a server whose store sits outside the queue root (for example the host default `~/.local/share/ci-server/identity/` beside the `/data` queue root) starts normally and keeps its existing credentials; no move or migration is required. Existing file content always wins: configured seeds only populate an *absent* file and never merge into or overwrite an existing one. If an operator deliberately selects a different path, a seed will not carry old credentials over, so copy the file there explicitly while the server is stopped. The sidecar `<store>.lock` needs a writable directory beside the store.
+- Mutations retain write-file-then-swap-memory (atomic replace before memory update); the store file remains the durable state across restarts.
 - The **admin authority itself cannot be removed via the API**:
   - **Static:** the configured `admin_api_key` is a config credential, not a
     data-store entry — it cannot be deleted or shadow-bound through

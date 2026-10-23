@@ -35,12 +35,15 @@ from __future__ import annotations
 
 import logging
 import re
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from context_intelligence_server.config import _ALL_ZEROS_GUID, _GUID_RE
 from context_intelligence_server.identity_store import IdentityStore
+from context_intelligence_server.blob_retention import duration_ns
+from context_intelligence_server.retention_service import JobConflict, JobNotFound, RetentionService
 
 # ---------------------------------------------------------------------------
 # Validation constants
@@ -193,6 +196,27 @@ class IdentityBody(_ContributorIdBody):
 
 class KeyBody(_ContributorIdBody):
     """Body for PUT /admin/keys/{sha256hash}."""
+
+
+class RecoveryReceiptBody(BaseModel):
+    """Opaque admin-only identifier for one native recovery receipt."""
+
+    source_handle: str
+    ordinal: int
+
+    @field_validator("source_handle")
+    @classmethod
+    def source_handle_must_be_sha256(cls, value: str) -> str:
+        if not _HASH_RE.fullmatch(value):
+            raise ValueError("source_handle must be lowercase SHA-256 hex")
+        return value
+
+    @field_validator("ordinal")
+    @classmethod
+    def ordinal_must_not_be_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("ordinal must not be negative")
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +373,64 @@ router = APIRouter(
     dependencies=[Depends(require_admin)],
     include_in_schema=False,
 )
+
+
+class PruneBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    older_than: str = Field(max_length=32)
+
+    @field_validator("older_than")
+    @classmethod
+    def valid_age(cls, value: str) -> str:
+        duration_ns(value)
+        return value
+
+
+class PruneStartBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    confirmation: str = Field(max_length=16)
+
+
+def _retention(request: Request) -> RetentionService:
+    service = getattr(request.app.state, "retention_service", None)
+    if service is None:
+        raise HTTPException(503, "Online retention is not running")
+    return service
+
+
+async def _prune_call(operation):
+    try:
+        return await operation
+    except JobNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except JobConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.post("/blobs/prune", status_code=202)
+async def preview_blobs(body: PruneBody, request: Request) -> dict:
+    return await _prune_call(_retention(request).preview(body.older_than))
+
+
+@router.get("/blobs/prune")
+@router.get("/blobs/prune/{job_id}")
+async def blob_prune_status(request: Request, job_id: UUID | None = None) -> dict:
+    try:
+        return _retention(request).status(str(job_id) if job_id is not None else None)
+    except JobNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.post("/blobs/prune/{job_id}/start", status_code=202)
+async def start_blob_prune(job_id: UUID, body: PruneStartBody, request: Request) -> dict:
+    return await _prune_call(_retention(request).start(str(job_id), body.confirmation))
+
+
+@router.post("/blobs/prune/{job_id}/cancel", status_code=202)
+async def cancel_blob_prune(job_id: UUID, request: Request) -> dict:
+    return await _prune_call(_retention(request).cancel(str(job_id)))
 
 
 # --- Entra identities -------------------------------------------------------
@@ -551,7 +633,9 @@ async def recovery_status(request: Request) -> dict[str, object]:
 async def pause_recovery(request: Request) -> dict[str, bool]:
     if not getattr(request.app.state, "recovery_enabled", False):
         raise HTTPException(status_code=404, detail="Not found")
-    request.app.state.recovery_paused = True
+    condition = request.app.state.recovery_pause_condition
+    async with condition:
+        request.app.state.recovery_paused = True
     return {"paused": True}
 
 
@@ -559,7 +643,10 @@ async def pause_recovery(request: Request) -> dict[str, bool]:
 async def resume_recovery(request: Request) -> dict[str, bool]:
     if not getattr(request.app.state, "recovery_enabled", False):
         raise HTTPException(status_code=404, detail="Not found")
-    request.app.state.recovery_paused = False
+    condition = request.app.state.recovery_pause_condition
+    async with condition:
+        request.app.state.recovery_paused = False
+        condition.notify_all()
     return {"paused": False}
 
 
@@ -567,10 +654,36 @@ async def resume_recovery(request: Request) -> dict[str, bool]:
 async def retry_quarantined_recovery(request: Request) -> dict[str, int]:
     if not getattr(request.app.state, "recovery_enabled", False):
         raise HTTPException(status_code=404, detail="Not found")
-    if not await request.app.state.recovery_receipts.retry_quarantined():
-        return {"retried": 0}
     # Deferred import avoids the main/router import cycle.
-    from context_intelligence_server.main import _reconcile_native_recovery_outbox
+    from context_intelligence_server.main import _retry_quarantined_native_recovery
 
-    await _reconcile_native_recovery_outbox(request.app)
+    if not await _retry_quarantined_native_recovery(request.app):
+        return {"retried": 0}
     return {"retried": 1}
+
+
+@router.get("/recovery/pending")
+async def pending_recovery_receipts(request: Request) -> dict[str, object]:
+    """List only opaque identifiers/state needed for a safe admin intervention."""
+    if not getattr(request.app.state, "recovery_enabled", False):
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"pending": await request.app.state.recovery_receipts.pending_receipts()}
+
+
+@router.post("/recovery/quarantine-pending")
+async def quarantine_pending_recovery(
+    body: RecoveryReceiptBody, request: Request
+) -> dict[str, int]:
+    """Dead-letter and terminalize one selected receipt while recovery is paused."""
+    if not getattr(request.app.state, "recovery_enabled", False):
+        raise HTTPException(status_code=404, detail="Not found")
+    from context_intelligence_server.main import _quarantine_pending_native_recovery
+
+    # The paused check is made inside the helper while it holds the pause
+    # condition; a check here would be stale by the time quarantine ran.
+    outcome = await _quarantine_pending_native_recovery(
+        request.app, body.source_handle, body.ordinal
+    )
+    if outcome == "not_paused":
+        raise HTTPException(status_code=409, detail="Recovery must be paused first")
+    return {"quarantined": int(outcome == "quarantined")}

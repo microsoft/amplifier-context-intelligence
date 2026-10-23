@@ -314,3 +314,33 @@ class TestFlatDictLiveReference:
 
         assert store.flat_dict[FAKE_HASH_A] == "alice"
         assert store.flat_dict[FAKE_HASH_B] == "bob"
+
+
+# ---------------------------------------------------------------------------
+# r4332085777 / r4332085805 controls: UNMANAGED stores keep their historical
+# lenient behaviour (they own no lock, so there is nothing to protect).
+# ---------------------------------------------------------------------------
+
+
+class TestUnmanagedIoFallbackIsPreserved:
+    def test_unmanaged_read_error_still_falls_back_to_empty(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "keys.json"
+        path.write_text(json.dumps({FAKE_HASH_A: _alice_entry()}), encoding="utf-8")
+        store = IdentityStore(path)
+        with patch.object(Path, "read_text", side_effect=OSError("synthetic EIO")):
+            store.load()  # must not raise
+        assert store.flat_dict == {}
+
+    def test_unmanaged_seed_write_failure_still_seeds_memory(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        store = IdentityStore(tmp_path / "keys.json")
+        with (
+            patch("os.replace", side_effect=OSError("simulated disk full")),
+            caplog.at_level(logging.WARNING),
+        ):
+            store.seed({FAKE_HASH_A: _alice_entry()})  # must not raise
+        assert store.flat_dict == {FAKE_HASH_A: "alice"}
+        assert any("could not write seed" in r.getMessage() for r in caplog.records)

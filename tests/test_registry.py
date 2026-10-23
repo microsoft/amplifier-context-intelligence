@@ -5,18 +5,18 @@ import contextlib
 import dataclasses
 import json
 import logging
+import sqlite3
 import time
 from collections import deque
 from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import context_intelligence_server.registry as registry_module
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
-from context_intelligence_server.config import get_settings
 from context_intelligence_server.queue_manager import QueueManager, Record
 from context_intelligence_server.registry import (
     CompletedSession,
@@ -259,7 +259,7 @@ class TestSessionWorkerHasServices:
         """worker.services.blob_store._root matches Settings.blob_path."""
         worker = registry.get_or_create("session-1", "/workspace/test")
 
-        settings = get_settings()
+        settings = registry_module.get_settings()
         blob_store = worker.services.blob_store
         assert isinstance(blob_store, AsyncDiskBlobStore)
         assert blob_store._root == Path(settings.blob_path)
@@ -2751,6 +2751,7 @@ class TestTransientInfraFailuresAreNeverDeadLettered:
         assert is_transient(TransientError("deadlock"))
         assert is_transient(asyncio.TimeoutError())
         assert is_transient(OSError("connection reset"))
+        assert is_transient(sqlite3.OperationalError("database is locked"))
 
         # Deterministic -- dead-letterable.
         assert not is_transient(
@@ -2783,3 +2784,116 @@ class TestTransientInfraFailuresAreNeverDeadLettered:
             QueueManager._validate_session_id(too_long)
 
         assert not is_transient(excinfo.value)
+
+
+class TestRecoveryFlushEligibilityCoversDispatchedBatch:
+    """Eligibility is judged on every dispatched record, not only the acked prefix.
+
+    ``drain_worker`` acknowledges only ``records[:safe_count]`` of a batch that
+    reaches ``session:end``, but the terminal record has already been dispatched
+    into the graph buffer.  The recovery eligibility hook must therefore see the
+    whole dispatched batch or a quarantined terminal-only batch would flush.
+    """
+
+    @staticmethod
+    def _recovery_worker(
+        reg: SessionRegistry, sid: str
+    ) -> tuple[SessionWorker, list[list[Any]]]:
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        worker.services.graph.close = AsyncMock()  # type: ignore[method-assign]
+        worker.services.graph.discard_buffer = MagicMock()  # type: ignore[method-assign]
+        reg._register_for_test(worker)
+        seen: list[list[Any]] = []
+
+        def refuse(_worker: Any, records: list[Any]) -> None:
+            seen.append(list(records))
+            _worker.services.graph.discard_buffer()
+            raise RuntimeError("recovery record was terminalized before graph flush")
+
+        reg.is_recovery = True
+        reg.before_recovery_flush = refuse
+        return worker, seen
+
+    async def test_terminal_only_batch_is_checked_and_not_flushed(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        reg, qm = reg_qm
+        sid = "elig-terminal-only"
+        worker, seen = self._recovery_worker(reg, sid)
+        with patch(
+            "context_intelligence_server.registry.process_event",
+            new_callable=AsyncMock,
+        ):
+            await qm.append(sid, _line("session:end", "/ws", {"session_id": sid}))
+            task = asyncio.create_task(reg.drain_worker(worker, flush_timeout=10.0))
+            await asyncio.sleep(0.3)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert seen, "eligibility hook never saw the terminal-only batch"
+        assert all(len(call) == 1 for call in seen)
+        cast(AsyncMock, worker.services.graph.flush).assert_not_awaited()
+        cast(MagicMock, worker.services.graph.discard_buffer).assert_called()
+
+    async def test_mixed_batch_hook_sees_terminal_record_but_commit_unchanged(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        reg, qm = reg_qm
+        sid = "elig-mixed"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg.is_recovery = True
+        seen: list[list[bytes]] = []
+        reg.before_recovery_flush = lambda _w, records: seen.append(
+            [r.raw for r in records]
+        )
+        batch_lines = [
+            _line("tool:pre", "/ws", {"session_id": sid}),
+            _line("session:end", "/ws", {"session_id": sid}),
+        ]
+        for raw in batch_lines:
+            await qm.append(sid, raw)
+        batch = await qm.read_batch(sid, max_items=10)
+        committed: list[int] = []
+        real_commit = qm.commit
+
+        async def spy_commit(session_id: str, offset: int) -> Any:
+            committed.append(offset)
+            return await real_commit(session_id, offset)
+
+        qm.commit = spy_commit  # type: ignore[method-assign]
+        await reg._flush_and_commit(
+            worker,
+            batch.records[:1],
+            batch.records[1].start,
+            eligibility_records=batch.records,
+        )
+
+        assert seen == [batch_lines]  # full dispatched batch, terminal included
+        assert committed == [batch.records[1].start]  # ack still stops before it
+
+    async def test_default_eligibility_is_the_committed_records(
+        self, reg_qm: tuple[SessionRegistry, Any]
+    ) -> None:
+        """Other callers pass only the full list and keep their behavior."""
+        reg, qm = reg_qm
+        sid = "elig-default"
+        worker = SessionWorker(
+            session_id=sid, workspace="/ws", services=HookStateService(workspace="/ws")
+        )
+        worker.services.graph.flush = AsyncMock()  # type: ignore[method-assign]
+        reg.is_recovery = True
+        seen: list[list[bytes]] = []
+        reg.before_recovery_flush = lambda _w, records: seen.append(
+            [r.raw for r in records]
+        )
+        raw = _line("tool:pre", "/ws", {"session_id": sid})
+        await qm.append(sid, raw)
+        batch = await qm.read_batch(sid, max_items=10)
+        await reg._flush_and_commit(worker, batch.records, batch.end_offset)
+        assert seen == [[raw]]
