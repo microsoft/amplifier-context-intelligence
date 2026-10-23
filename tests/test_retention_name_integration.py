@@ -49,7 +49,7 @@ async def test_disk_boundaries_and_canonical_lifecycle(tmp_path, monkeypatch, se
     assert path == store._root / folded_session / "blobs" / f"{folded_key}.json"
     assert path.is_file() and temporary_names
     assert len(os.fsencode(temporary_names[0])) == len(folded_key.encode()) + 13
-    assert store._make_uri(folded_session, folded_key) == uri
+    assert f"ci-blob://{folded_session}/{folded_key}" == uri
     assert await store.read(uri) == {"payload": "preserved"}
     assert await store.list(session) == await store.list(folded_session) == [uri]
     assert await store.size(uri) == path.stat().st_size

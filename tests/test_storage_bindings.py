@@ -78,23 +78,42 @@ async def test_additive_backfill_bounded_clean_and_provisional_rows(tmp_path):
     _legacy(path, [
         (f"ordinary-{i}", "owner", "one", None) for i in range(600)
     ] + [(original, "owner", "one", None), ("provisional", "owner", "one", "token"),
-         ("invalid#component", "owner", "one", None)])
+         ("invalid/component", "owner", "one", None)])
     claims = SessionClaimStore(path)
     assert await claims.get_blob_workspace(original) == "one"
     assert await claims.get_blob_workspace(AsyncDiskBlobStore._fold_session_id(original)) == "one"
     assert await claims.storage_identity_matches(original)
     assert await claims.get_blob_workspace("provisional") is None
-    assert await claims.get_blob_workspace("invalid#component") is None
-    assert not await claims.claim("invalid#component", "owner", "one")
-    assert await claims.get_workspace("invalid#component") == "one"
+    assert await claims.get_blob_workspace("invalid/component") is None
+    assert not await claims.claim("invalid/component", "owner", "one")
+    assert await claims.get_workspace("invalid/component") == "one"
     assert await claims.finalize_recovery("provisional", "owner", "one", "token")
     assert await SessionClaimStore(path).get_blob_workspace("provisional") == "one"
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT count(*) FROM session_claims").fetchone() == (603,)
         assert db.execute(
             "SELECT session_id FROM storage_bindings WHERE kind='queue' AND component=?",
-            ("invalid#component",),
-        ).fetchone() == ("invalid#component",)
+            ("invalid/component",),
+        ).fetchone() == ("invalid/component",)
+
+
+async def test_legacy_percent_query_fragment_ids_get_both_bindings(tmp_path):
+    """'%', '?' and '#' are literal, valid storage names: a legacy claim is
+    backfilled with BOTH a blob and a queue binding to the original id."""
+    path = tmp_path / "claims.sqlite3"
+    legacy_id = "legacy%sess?id#1"
+    _legacy(path, [(legacy_id, "owner", "one", None)])
+    claims = SessionClaimStore(path)
+    assert await claims.get_blob_workspace(legacy_id) == "one"
+    assert await claims.storage_identity_matches(legacy_id)
+    assert await claims.claim(legacy_id, "owner", "one")
+    with sqlite3.connect(path) as db:
+        assert db.execute(
+            "SELECT kind, component, session_id FROM storage_bindings ORDER BY kind"
+        ).fetchall() == [
+            ("blob", legacy_id, legacy_id),
+            ("queue", legacy_id, legacy_id),
+        ]
 
 
 @pytest.mark.parametrize("family", ["blob", "queue"])
@@ -353,3 +372,43 @@ async def test_migration_holds_canonical_admission_and_preserves_concurrent_appe
         if append is not None:
             await append
     assert (await queue.read_batch(folded, 10)).lines == [b"original", b"new"]
+
+
+# --- Summary and deletion see every blob address kind (PR126) ---------------
+
+
+@pytest.mark.parametrize("with_legacy_twin", [False, True])
+async def test_summary_and_deletion_cover_ordinary_mapped_and_legacy_backslash_blobs(
+    tmp_path, with_legacy_twin
+):
+    """Real stores; only the graph is the in-memory fake.  Sizes come from the filesystem."""
+    from context_intelligence_server.deletion import DeletionService
+    from context_intelligence_server.services import GraphState
+
+    store = AsyncDiskBlobStore(tmp_path / "blobs")
+    await store.write("root", "plain", {"v": 1})
+    await store.write("root", "a/b", {"v": 2})
+    blob_dir = tmp_path / "blobs" / "root" / "blobs"
+    (blob_dir / "pre-upgrade\\x.json").write_text(
+        '{"legacy": "only"}', encoding="utf-8"
+    )
+    if with_legacy_twin:
+        # The same logical name exists both as a legacy file and (via a new write) as a mapped one.
+        (blob_dir / "a\\b.json").write_text('{"legacy": "twin"}', encoding="utf-8")
+        await store.write("root", "a\\b", {"v": 3})
+    expected_files = len(list(blob_dir.iterdir()))
+    expected_bytes = sum(path.stat().st_size for path in blob_dir.iterdir())
+    assert expected_files == (5 if with_legacy_twin else 3)
+
+    graph = GraphState(workspace="one")
+    await graph.upsert_node("root", {"labels": ["Session", "RootSession"]})
+    service = DeletionService(graph, store, QueueManager(tmp_path / "queues"))
+
+    preview = await service.preview("root")
+    assert preview is not None
+    assert (preview.blob_count, preview.blob_bytes) == (expected_files, expected_bytes)
+
+    result = await service.apply("root")
+    assert result is not None and result.blobs_deleted == expected_files
+    assert not (tmp_path / "blobs" / "root").exists()
+    assert await store.list("root") == []

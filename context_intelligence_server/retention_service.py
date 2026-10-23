@@ -121,6 +121,43 @@ class RetentionService:
         finally:
             ledger.__exit__()
 
+    @staticmethod
+    def _validate_foreign_report(value: object, stored_root: str) -> None:
+        """Shape-check a foreign terminal snapshot's report before it is ignored.
+
+        Mirrors the fields of ``r.Report`` without depending on the model. The
+        stored root is compared as a string only; it is never resolved or opened.
+        """
+        counters = (
+            "files",
+            "logical_bytes",
+            "allocated_bytes",
+            "retained",
+            "skipped",
+            "changed",
+            "errors",
+            "deleted",
+        )
+        recognized = {"root", "cutoff_ns", "recovery_required", "samples", *counters}
+
+        def is_int(item: object) -> bool:
+            return isinstance(item, int) and not isinstance(item, bool)
+
+        if (
+            not isinstance(value, dict)
+            or not set(value) <= recognized
+            or value.get("root") != stored_root
+            or not is_int(value.get("cutoff_ns"))
+            or any(
+                name in value and (not is_int(value[name]) or value[name] < 0)
+                for name in counters
+            )
+            or not isinstance(value.get("recovery_required", False), bool)
+            or not isinstance(value.get("samples", []), list)
+            or not all(isinstance(item, str) for item in value.get("samples", []))
+        ):
+            raise r.RetentionError("Invalid retention job snapshot")
+
     def _load(self) -> None:
         with self._coordinator.lease(), r.Root(self.path) as root, self._metadata(root) as ledger:
             if ledger.fd is None:
@@ -134,12 +171,34 @@ class RetentionService:
                 if not r._regular(st) or st.st_uid != os.geteuid() or st.st_mode & 0o077 or st.st_size > 65536:
                     raise r.RetentionError("Unsafe retention job snapshot")
                 saved = json.load(stream)
+            # A snapshot from another canonical root (the blob directory was copied
+            # or renamed) may only be finished history. A running/cancelling job
+            # there would be resumed against the wrong root, so it is rejected.
+            # The stored root is only ever compared as a string: a malformed value
+            # must fail closed here, never be treated as "some other root". It is
+            # never resolved, opened or required to exist (the old root is gone).
+            stored = saved.get("root")
+            if (
+                not isinstance(stored, str)
+                or not stored
+                or "\x00" in stored
+                or not os.path.isabs(stored)
+            ):
+                raise r.RetentionError("Invalid retention job snapshot")
+            foreign = stored != str(self.path)
+            allowed = TERMINAL if foreign else TERMINAL | {"running", "cancelling"}
+            if saved.get("state") not in allowed:
+                raise r.RetentionError("Invalid retention job snapshot")
             if (saved.get("version") != 1 or saved.get("confirmed") is not True
-                    or saved.get("root") != str(self.path)
-                    or saved.get("state") not in TERMINAL | {"running", "cancelling"}
                     or str(uuid.UUID(saved["id"])) != saved["id"]):
                 raise r.RetentionError("Invalid retention job snapshot")
-            self.report = r.Report(**saved.pop("report"))
+            if foreign:
+                # Ignored history must still be a well-formed report of ITS root.
+                self._validate_foreign_report(saved.get("report"), stored)
+                return
+            # Fully validated into locals before anything is published on self.
+            report = r.Report(**saved.pop("report"))
+            self.report = report
             self.job = saved
             if saved["state"] not in TERMINAL:
                 saved["state"] = "interrupted"

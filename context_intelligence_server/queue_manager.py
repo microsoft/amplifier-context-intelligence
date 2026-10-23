@@ -62,24 +62,38 @@ _COMMIT_TEMP_FILENAME_SUFFIX = ".offset." + ("0" * 32) + ".tmp"
 MAX_SESSION_ID_BYTES = QUEUE_FILENAME_NAME_MAX - len(_COMMIT_TEMP_FILENAME_SUFFIX)
 
 
-def is_safe_session_id(session_id: object) -> bool:
-    """Whether *session_id* is safe as one bounded queue filename component."""
+def _is_safe_session_component(value: object) -> bool:
+    """Whether *value* is safe as one filename component, with NO length limit.
+
+    A non-empty text that is not ``.``/``..``, has no path separator, encodes to
+    UTF-8 and holds no control (``Cc``) character. Boot passes use it to reject
+    a legacy key before deriving any path from it, while still accepting an
+    over-long key that migration can fold.
+    """
     if (
-        not isinstance(session_id, str)
-        or not session_id
-        or session_id in {".", ".."}
-        or "/" in session_id
-        or "\\" in session_id
+        not isinstance(value, str)
+        or not value
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
     ):
         return False
     try:
-        if len(session_id.encode("utf-8")) > MAX_SESSION_ID_BYTES:
-            return False
+        value.encode("utf-8")
     except UnicodeEncodeError:
         return False
     return not any(
         ord(char) < 32 or ord(char) == 127 or unicodedata.category(char) == "Cc"
-        for char in session_id
+        for char in value
+    )
+
+
+def is_safe_session_id(session_id: object) -> bool:
+    """Whether *session_id* is safe as one bounded queue filename component."""
+    return (
+        _is_safe_session_component(session_id)
+        and isinstance(session_id, str)
+        and len(session_id.encode("utf-8")) <= MAX_SESSION_ID_BYTES
     )
 
 # --- worker-key length budget --------------------------------------------
@@ -150,6 +164,11 @@ def fold_worker_key(key: str) -> str:
 
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
+# The only two key sets a recovery origin may have (see _is_valid_recovery_origin).
+_V1_ORIGIN_KEYS = frozenset({"source_handle", "ordinal", "source_line_sha256"})
+_LEGACY_ORIGIN_KEYS = frozenset(
+    {"session_id", "source_stream_sha256", "ordinal", "source_line_sha256"}
+)
 
 
 class RecoveryReceiptError(ValueError):
@@ -332,16 +351,41 @@ class QueueManager:
         return self._dir / f"{session_id}.dead.jsonl"
 
     @staticmethod
+    def _normalized_recovery_origin(candidate: Any) -> tuple[str, int, str] | None:
+        """Reduce a recognized origin to ``(source_handle, ordinal, line_sha256)``.
+
+        A v1 origin already names its source handle. A pre-v1 origin (still
+        present in a spool written before the upgrade) is mapped to the handle
+        its migrated receipt lives under, so one receipt matches its old and new
+        spool lines alike. An unrecognized shape normalizes to ``None`` and so
+        never matches anything.
+        """
+        if not QueueManager._is_valid_recovery_origin(candidate):
+            return None
+        if "source_handle" in candidate:
+            handle = candidate["source_handle"]
+        else:
+            # Deferred import: recovery imports this module at load time.
+            from context_intelligence_server.recovery import legacy_source_handle
+
+            handle = legacy_source_handle(candidate)
+        return handle, candidate["ordinal"], candidate["source_line_sha256"]
+
+    @staticmethod
     def _matches_recovery_origin(envelope: Any, encoded_origin: str) -> bool:
-        """Return whether a decoded durable envelope has the requested origin."""
+        """Return whether a decoded durable envelope has the requested origin.
+
+        The single matcher for every recovery-origin consumer (queue presence,
+        commit state, dead letters, retry audits and archival). The stored
+        envelope bytes are never rewritten; only the comparison is normalized.
+        """
         if not isinstance(envelope, dict):
             return False
-        candidate = envelope.get("_recovery_origin")
-        return (
-            isinstance(candidate, dict)
-            and json.dumps(candidate, sort_keys=True, separators=(",", ":"))
-            == encoded_origin
+        wanted = QueueManager._normalized_recovery_origin(json.loads(encoded_origin))
+        found = QueueManager._normalized_recovery_origin(
+            envelope.get("_recovery_origin")
         )
+        return wanted is not None and wanted == found
 
     async def contains_recovery_origin(self, origin: dict[str, Any]) -> bool:
         """Return whether the separate recovery spool already holds *origin*.
@@ -426,8 +470,15 @@ class QueueManager:
         reads, ``{session_id, ordinal, source_line_sha256,
         source_stream_sha256}`` (``LegacyNativeRecoveryOrigin``).  Digests are
         lowercase SHA-256 hex, as the request models require.
+
+        The key set is checked before any value and must equal one shape
+        exactly: a hybrid of both shapes, an unknown extra key, or a missing
+        key is not an origin this server wrote and is never trusted.
         """
         if not isinstance(candidate, dict):
+            return False
+        keys = set(candidate)
+        if keys != _V1_ORIGIN_KEYS and keys != _LEGACY_ORIGIN_KEYS:
             return False
         ordinal = candidate.get("ordinal")
         if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 0:
@@ -468,9 +519,15 @@ class QueueManager:
         ``payload_b64`` record, which cannot hold a JSON origin.  Anything that
         is structurally not a dead-letter record raises
         ``RecoveryReceiptError``: such a line might have held the origin being
-        asked about, so it must never be read as "no match".
+        asked about, so it must never be read as "no match".  The same holds
+        when the ``_recovery_origin`` key is present but is not one of the two
+        exact origin shapes: that record claims to be recovery evidence this
+        server cannot read, so it is untrusted rather than absent.
         """
         corrupt = RecoveryReceiptError(f"corrupt dead-letter record in {path.name}")
+        malformed = RecoveryReceiptError(
+            f"dead-letter record in {path.name} has a malformed recovery origin"
+        )
         try:
             record = json.loads(raw)
             if not isinstance(record, dict):
@@ -480,9 +537,16 @@ class QueueManager:
                 envelope = json.loads(payload)
                 if not isinstance(envelope, dict):
                     raise corrupt
+                if (
+                    "_recovery_origin" in envelope
+                    and not QueueManager._is_valid_recovery_origin(
+                        envelope["_recovery_origin"]
+                    )
+                ):
+                    raise malformed
                 return envelope
         except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError
-            if exc is corrupt:
+            if exc is corrupt or exc is malformed:
                 raise
             raise corrupt from exc
         if isinstance(record.get("payload_b64"), str):
@@ -664,7 +728,7 @@ class QueueManager:
 
         def _has_pending() -> bool:
             try:
-                for key in self._all_worker_keys():
+                for key in self._pending_worker_keys():
                     committed = self._read_committed_offset(key)
                     complete_end = self._complete_data_end(key)
                     if committed < 0 or committed > complete_end:
@@ -1245,6 +1309,17 @@ class QueueManager:
             result: list[str] = []
             for log in sorted(self._dir.glob("*.log")):
                 session_id = log.stem
+                # A legacy log whose name is no longer a valid key (control
+                # character, over-long) can never be read or drained through
+                # this manager. Validate first, before any offset or log state
+                # is touched, and leave the files exactly where they are so an
+                # operator can still inspect them. ``%a`` escapes the key so a
+                # hostile name cannot forge or split a log line.
+                try:
+                    self._validate_session_id(session_id)
+                except ValueError:
+                    logger.error("recover_invalid_key_skipped session=%a", session_id)
+                    continue
                 # Fault-isolate PER KEY -- a corrupt/unreadable
                 # `.offset` for one session (NUL-filled, negative,
                 # non-numeric) must not raise out of a boot-path scan and
@@ -1343,7 +1418,7 @@ class QueueManager:
                         keys_reclaimed += 1
                         bytes_reclaimed += size
             except (OSError, ValueError):
-                logger.warning("reclaim_drained_orphans_key_failed key=%s", key)
+                logger.warning("reclaim_drained_orphans_key_failed key=%a", key)
                 continue
 
         # Sweep orphaned offset temp files.
@@ -1382,6 +1457,24 @@ class QueueManager:
                 _ORPHAN_TMP_MAX_AGE_S,
             )
         return keys_reclaimed, bytes_reclaimed
+
+    def _pending_worker_keys(self) -> list[str]:
+        """Strictly enumerate worker keys for the admission decision.
+
+        Unlike ``_all_worker_keys`` (``Path.glob`` swallows EACCES and
+        returns nothing, which startup callers rely on), this lets every
+        ``OSError`` propagate so ``has_pending_records`` fails closed when the
+        spool cannot be read, is missing, or is not a directory.
+        """
+        keys: set[str] = set()
+        with os.scandir(self._dir) as entries:
+            for entry in entries:
+                name = entry.name
+                if name.endswith(".dead.jsonl"):
+                    keys.add(name[: -len(".dead.jsonl")])
+                elif name.endswith(".log"):
+                    keys.add(name[: -len(".log")])
+        return sorted(keys)
 
     def _all_worker_keys(self) -> list[str]:
         """Return the sorted union of ``.log`` and ``.dead.jsonl`` stems.
@@ -1525,11 +1618,16 @@ class QueueManager:
         to the boot log and to callers, which is precisely what let this
         migration silently no-op in production.
         """
-        overlong = sorted(
-            key
-            for key in self._all_worker_keys()
-            if len(key.encode("utf-8")) > _MAX_KEY_BYTES
-        )
+        # The component check comes first: an unsafe key is neither measured
+        # (a non-UTF-8 name cannot be encoded), read nor renamed. Safe
+        # over-long keys, ASCII or multibyte, are folded as before.
+        overlong: list[str] = []
+        for key in self._all_worker_keys():
+            if not _is_safe_session_component(key):
+                logger.error("migrate_overlong_keys_unsafe_key_skipped key=%a", key)
+            elif len(key.encode("utf-8")) > _MAX_KEY_BYTES:
+                overlong.append(key)
+        overlong.sort()
         migrated = 0
         skipped = 0
         failed = 0
@@ -1847,6 +1945,12 @@ class QueueManager:
             accepted = 0
             written = 0
             for key in self._all_worker_keys():
+                # An unsafe legacy key (control character, separator, not
+                # UTF-8) is rejected before ANY path is derived from it, so no
+                # file or ``.offset`` symlink is touched. It contributes 0/0.
+                if not _is_safe_session_component(key):
+                    logger.error("recovery_seed_counts_unsafe_key_skipped key=%a", key)
+                    continue
                 # Fault-isolate PER KEY -- a corrupt `.offset` must
                 # not crash the whole seed pass (which runs on every boot,
                 # BEFORE drainers respawn). A skipped key contributes 0/0.
@@ -1935,6 +2039,13 @@ class QueueManager:
         def _reconcile() -> int:
             total_skipped = 0
             for key in self._all_worker_keys():
+                # Reject an unsafe legacy key before ANY path is derived from
+                # it: no existence check, no read, no offset write or rename.
+                if not _is_safe_session_component(key):
+                    logger.error(
+                        "recovery_reconcile_dead_unsafe_key_skipped key=%a", key
+                    )
+                    continue
                 # Check `.log` existence BEFORE reading the whole
                 # `.dead.jsonl` into RAM (+ a payload set at ~3.6x its size).
                 # A key with only a `.dead.jsonl` (the common shape left by

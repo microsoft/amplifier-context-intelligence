@@ -146,8 +146,7 @@ def test_symlinks_hardlinks_and_unknown_layout_skipped(tmp_path):
 
 @pytest.mark.parametrize("uri", [
     "ci-blob://../key", "ci-blob://session/../escape", "ci-blob://session/..",
-    "ci-blob://session/a\\b", "ci-blob://session/a\nb",
-    "ci-blob://session/%2e%2e", "ci-blob://session/key?query",
+    "ci-blob://session/a\nb",
 ])
 async def test_uri_escape_rejected(tmp_path, uri):
     store = AsyncDiskBlobStore(tmp_path)
@@ -1127,3 +1126,333 @@ async def test_worker_lifespan_fresh_tilde_blob_root(tmp_path, monkeypatch):
     assert list(cwd.iterdir()) == [], (
         "startup must not create a literal './~' directory"
     )
+
+
+# --- Legacy '%', '?', '#' identifiers (PR126 lane A) -----------------------
+# URIs are parsed by literal scheme-stripping; nothing is ever URL-decoded, so
+# these characters are ordinary component bytes, never traversal.
+
+_LITERAL_NAMES = ["a%b", "a?b", "a#b", "q?x=1#f", "a%2fb", "%2e%2e", "%", "?", "#"]
+
+
+@pytest.mark.parametrize("name", _LITERAL_NAMES)
+def test_component_accepts_percent_query_fragment_literally(name):
+    assert r.component(name) == name
+
+
+@pytest.mark.parametrize(
+    "uri, expected",
+    [
+        ("ci-blob://s%2fx/k%2e%2e", ("s%2fx", "k%2e%2e")),
+        ("ci-blob://a?b/c#d", ("a?b", "c#d")),
+        ("ci-blob://s%1/k%00", ("s%1", "k%00")),
+    ],
+)
+def test_parse_uri_is_literal_with_no_url_decoding(uri, expected):
+    assert r.parse_uri(uri) == expected
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "ci-blob://a/b/c",
+        "ci-blob://a",
+        "ci-blob://a/",
+        "ci-blob:///k",
+        "ci-blob://s/..",
+        "ci-blob://s/a\x00b",
+        f"ci-blob://s/{r.METADATA}",
+        f"ci-blob://{r.LOCK}/k",
+        "http://s/k",
+    ],
+)
+def test_parse_uri_still_rejects_structurally_unsafe_uris(uri):
+    with pytest.raises(ValueError):
+        r.parse_uri(uri)
+
+
+def _legacy_payloads(root: Path) -> list[str]:
+    layout = {"s%1?2#3": ["k%?#a", "plain"], "legacy": ["x%2fy"]}
+    uris = []
+    for session, keys in layout.items():
+        for key in keys:
+            path = root / session / "blobs" / f"{key}.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('{"value": 1}')
+            os.utime(path, ns=(CUTOFF - 1, CUTOFF - 1))
+            uris.append(f"ci-blob://{session}/{key}")
+    return sorted(uris)
+
+
+async def test_offline_retention_enumerates_and_prunes_legacy_names(tmp_path):
+    uris = _legacy_payloads(tmp_path)
+    store = AsyncDiskBlobStore(tmp_path)
+
+    report = r.preview(tmp_path, CUTOFF)
+    assert (report.files, report.skipped, report.errors) == (3, 0, 0)
+
+    applied = r.apply(tmp_path, CUTOFF, lambda _: True)
+    assert (applied.deleted, applied.errors) == (3, 0)
+    assert list(tmp_path.rglob("*.json")) == []
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert all(ledger.contains(uri) for uri in uris)
+    for uri in uris:
+        with pytest.raises(r.BlobExpiredError) as exc:
+            await store.read(uri)
+        assert exc.value.uri == uri
+
+
+async def test_online_retention_scan_and_batch_prune_legacy_names(tmp_path):
+    import time
+
+    uris = _legacy_payloads(tmp_path)
+    store = AsyncDiskBlobStore(tmp_path)
+    report = r.Report(str(tmp_path), CUTOFF)
+    cursor, items = r.ScanCursor(), []
+    started = time.time_ns()
+    while not cursor.done:
+        items.extend(
+            r.scan_window(
+                tmp_path, cursor, report, started, max_entries=10, budget_ns=10**9
+            )
+        )
+
+    assert sorted(item.uri for item in items) == uris
+    assert (report.skipped, report.errors) == (0, 0)
+
+    r.apply_batch(tmp_path, items, report)
+    assert (report.deleted, report.errors) == (3, 0)
+    for uri in uris:
+        with pytest.raises(r.BlobExpiredError):
+            await store.read(uri)
+
+
+# --- Mapped (.blob) and pre-upgrade backslash (.json) names (PR126) ---------
+
+_MARK = "~ci-key-v1"
+_SLASH = "5998a4c7b7280b4eb36c9f88878ed97c34b2cbeb7f138372a02365515c97bde9"
+_BACKSLASH = "f3af24d320ab49ad3ecaddd0d48f69cb7c393eb657ffbf1b80416af26a1346b4"
+_MAPPED_URI = f"ci-blob://s/{_MARK}/{_SLASH}"
+_LEGACY_URI = "ci-blob://s/a\\b"
+
+
+def _put(root: Path, session: str, filename: str, mtime: int = CUTOFF - 1) -> Path:
+    path = root / session / "blobs" / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"value": 1}', encoding="utf-8")
+    os.utime(path, ns=(mtime, mtime))
+    return path
+
+
+def _mixed_layout(root: Path) -> list[str]:
+    _put(root, "s", "a\\b.json")
+    _put(root, "s", f"{_MARK}~{_SLASH}.blob")
+    _put(root, "s", "plain.json")
+    for junk in ("x.tmp", "foo.blob", ".json"):
+        _put(root, "s", junk)
+    return sorted([_LEGACY_URI, _MAPPED_URI, "ci-blob://s/plain"])
+
+
+def test_parse_uri_accepts_a_pre_upgrade_backslash_name_on_posix():
+    assert r.parse_uri("ci-blob://s/a\\b") == ("s", "a\\b")
+
+
+@pytest.mark.parametrize("uri", [_LEGACY_URI, _MAPPED_URI, "ci-blob://s/plain"])
+def test_ledger_contains_accepts_every_address_kind(tmp_path, uri):
+    _put(tmp_path, "s", "plain.json")
+    with (
+        r.RootLock(tmp_path, exclusive=True) as lock,
+        r.Ledger(lock.root, writable=True) as ledger,
+    ):
+        ledger.journal([r.Candidate(uri, (1, 2, 3, 4, 5), 0)])
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.contains(uri) is True
+        assert ledger.contains("ci-blob://s/absent") is False
+        assert ledger.contains(f"ci-blob://s/{_MARK}/{'1' * 64}") is False
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        f"ci-blob://s/{_MARK}/{'A' * 64}",
+        f"ci-blob://s/{_MARK}/short",
+        "ci-blob://s/a/b",
+    ],
+)
+def test_ledger_contains_still_rejects_malformed_uris(tmp_path, uri):
+    with (
+        r.Root(tmp_path) as root,
+        r.Ledger(root) as ledger,
+        pytest.raises(ValueError),
+    ):
+        ledger.contains(uri)
+
+
+async def test_offline_retention_prunes_backslash_json_and_mapped_blob_files(tmp_path):
+    uris = _mixed_layout(tmp_path)
+    store = AsyncDiskBlobStore(tmp_path)
+
+    report = r.preview(tmp_path, CUTOFF)
+    assert (report.files, report.skipped, report.errors) == (3, 3, 0)
+    assert sorted(report.samples) == uris
+
+    applied = r.apply(tmp_path, CUTOFF, lambda _: True)
+
+    assert (applied.deleted, applied.errors) == (3, 0)
+    assert sorted(p.name for p in (tmp_path / "s" / "blobs").iterdir()) == [
+        ".json",
+        "foo.blob",
+        "x.tmp",
+    ]
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert all(ledger.contains(uri) for uri in uris)
+    for uri in uris:
+        with pytest.raises(r.BlobExpiredError) as exc:
+            await store.read(uri)
+        assert exc.value.uri == uri
+
+
+async def test_online_retention_scans_and_prunes_backslash_json_and_mapped_blob_files(
+    tmp_path,
+):
+    import time
+
+    uris = _mixed_layout(tmp_path)
+    store = AsyncDiskBlobStore(tmp_path)
+    report = r.Report(str(tmp_path), CUTOFF)
+    cursor, items = r.ScanCursor(), []
+    started = time.time_ns()
+    while not cursor.done:
+        items.extend(
+            r.scan_window(
+                tmp_path, cursor, report, started, max_entries=10, budget_ns=10**9
+            )
+        )
+
+    assert sorted(item.uri for item in items) == uris
+    assert (report.skipped, report.errors) == (3, 0)
+
+    r.apply_batch(tmp_path, items, report)
+
+    assert (report.deleted, report.errors) == (3, 0)
+    assert sorted(p.name for p in (tmp_path / "s" / "blobs").iterdir()) == [
+        ".json",
+        "foo.blob",
+        "x.tmp",
+    ]
+    for uri in uris:
+        with pytest.raises(r.BlobExpiredError) as exc:
+            await store.read(uri)
+        assert exc.value.uri == uri
+
+
+def test_a_hardlinked_mapped_blob_is_skipped_not_pruned(tmp_path):
+    mapped = _put(tmp_path, "s", f"{_MARK}~{_SLASH}.blob")
+    os.link(mapped, tmp_path / "alias")
+
+    assert r.preview(tmp_path, CUTOFF).files == 0
+    assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 0
+    assert mapped.exists()
+
+
+def test_on_disk_names_are_never_folded_when_enumerated(tmp_path):
+    long_name = "k" * 250
+    _put(tmp_path, "s", f"{long_name}.json")
+
+    applied = r.apply(tmp_path, CUTOFF, lambda report: report.files == 1)
+
+    assert (applied.deleted, applied.errors) == (1, 0)
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.contains(f"ci-blob://s/{long_name}") is True
+
+
+def test_recovery_unlinks_a_pending_mapped_blob_by_its_exact_filename(tmp_path):
+    mapped = _put(tmp_path, "s", f"{_MARK}~{_SLASH}.blob")
+    item = r.Candidate(_MAPPED_URI, r.fingerprint(mapped.stat()), 0)
+    with (
+        r.RootLock(tmp_path, exclusive=True) as lock,
+        r.Ledger(lock.root, writable=True) as ledger,
+    ):
+        ledger.journal([item])  # journalled (pending) but never unlinked: a crash
+
+    assert mapped.exists()
+    applied = r.apply(tmp_path, CUTOFF, lambda _: True)
+
+    assert (applied.deleted, applied.errors) == (1, 0)
+    assert not mapped.exists()
+
+
+def test_a_restored_mapped_blob_keeps_its_tombstone_and_is_not_pruned_again(tmp_path):
+    mapped = _put(tmp_path, "s", f"{_MARK}~{_SLASH}.blob")
+    assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 1
+    restored = _put(tmp_path, "s", f"{_MARK}~{_SLASH}.blob")
+
+    result = r.apply(tmp_path, CUTOFF, lambda _: True)
+
+    assert result.deleted == 0 and result.skipped >= 1
+    assert restored.exists() and mapped == restored
+
+
+async def test_replay_after_a_legacy_prune_returns_the_old_uri_and_creates_nothing(
+    tmp_path,
+):
+    _put(tmp_path, "s", "a\\b.json")
+    store = AsyncDiskBlobStore(tmp_path)
+    assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 1
+
+    assert await store.write("s", "a\\b", {"replayed": True}) == _LEGACY_URI
+
+    assert list((tmp_path / "s" / "blobs").iterdir()) == []
+    assert await store.list("s") == []
+    with pytest.raises(r.BlobExpiredError) as exc:
+        await store.read(_LEGACY_URI)
+    assert exc.value.uri == _LEGACY_URI
+
+
+async def test_replay_after_a_mapped_prune_does_not_rehydrate(tmp_path):
+    store = AsyncDiskBlobStore(tmp_path)
+    uri = await store.write("s", "a/b", {"v": 1})
+    assert uri == _MAPPED_URI
+    os.utime(store.blob_path("s", "a/b"), ns=(CUTOFF - 1, CUTOFF - 1))
+    assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 1
+
+    assert await store.write("s", "a/b", {"v": 2}) == uri
+
+    assert list((tmp_path / "s" / "blobs").iterdir()) == []
+    with pytest.raises(r.BlobExpiredError) as exc:
+        await store.read(uri)
+    assert exc.value.uri == uri
+
+
+@pytest.mark.parametrize("kind", ["legacy", "mapped"])
+async def test_each_phase_through_a_fresh_store_sees_the_same_disk_truth(
+    tmp_path, kind
+):
+    """Prune -> expired read -> replay -> physical restore, reopening the store every phase."""
+    if kind == "legacy":
+        path = _put(tmp_path, "s", "a\\b.json")
+        uri, logical = _LEGACY_URI, "a\\b"
+    else:
+        path = _put(tmp_path, "s", f"{_MARK}~{_SLASH}.blob")
+        uri, logical = _MAPPED_URI, "a/b"
+
+    assert await AsyncDiskBlobStore(tmp_path).read(uri) == {"value": 1}
+    assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 1
+    assert not path.exists()
+
+    with pytest.raises(r.BlobExpiredError) as expired:
+        await AsyncDiskBlobStore(tmp_path).read(uri)
+    assert expired.value.uri == uri
+
+    # Replay (a brand-new writer instance) keeps the recorded URI and rehydrates nothing,
+    # and never creates the other address kind either.
+    assert (
+        await AsyncDiskBlobStore(tmp_path).write("s", logical, {"replayed": True})
+        == uri
+    )
+    assert list((tmp_path / "s" / "blobs").iterdir()) == []
+
+    # A physically restored file wins over the tombstone for every later reader.
+    path.write_text('{"restored": true}', encoding="utf-8")
+    assert await AsyncDiskBlobStore(tmp_path).read(uri) == {"restored": True}
+    assert await AsyncDiskBlobStore(tmp_path).list("s") == [uri]

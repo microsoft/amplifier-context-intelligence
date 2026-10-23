@@ -11,11 +11,13 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -198,9 +200,18 @@ def _valid_source_descriptor(value: Any) -> bool:
 
 
 def _sanitize_stored_payload(value: Any) -> tuple[dict[str, Any], bool]:
-    """Scrub paths and identify payloads that cannot safely enter a queue."""
+    """Scrub paths and report whether the payload is unsafe to REPLAY.
+
+    The flag means "must not enter a queue", not "was changed": removing a
+    ``working_dir`` key (null, string or nested) from an otherwise valid
+    payload leaves a replayable record, so scrubbing alone never sets it. It is
+    set for a non-object payload, an unsafe or missing ``data.session_id``, or
+    an envelope lacking what replay needs (see ``_has_replayable_envelope``).
+    Callers that must purge paths from storage compare the scrubbed payload
+    with the stored one themselves.
+    """
     sanitized = sanitize_recovery_payload(value)
-    invalid = sanitized != value
+    invalid = False
     if not isinstance(sanitized, dict):
         return {}, True
     data = sanitized.get("data")
@@ -211,7 +222,39 @@ def _sanitize_stored_payload(value: Any) -> tuple[dict[str, Any], bool]:
             data = dict(data)
             data.pop("session_id", None)
             sanitized["data"] = data
+    if not _has_replayable_envelope(sanitized):
+        invalid = True
     return sanitized, invalid
+
+
+def _has_replayable_envelope(payload: dict[str, Any]) -> bool:
+    """Whether a scrubbed payload has the structure replay needs, unchanged.
+
+    Checks shape only: ``event`` is text, ``workspace`` is non-blank text,
+    ``data`` is an object with an ISO-8601 ``timestamp``, and
+    ``idempotency_key`` is absent, null or text. Nothing is coerced or
+    defaulted and unknown compatibility fields are ignored; the session id is
+    checked separately by the caller.
+    """
+    workspace = payload.get("workspace")
+    if (
+        not isinstance(payload.get("event"), str)
+        or not isinstance(workspace, str)
+        or not workspace.strip()
+    ):
+        return False
+    key = payload.get("idempotency_key")
+    if key is not None and not isinstance(key, str):
+        return False
+    data = payload.get("data")
+    timestamp = data.get("timestamp") if isinstance(data, dict) else None
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        return False
+    try:
+        datetime.fromisoformat(timestamp)
+    except ValueError:
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -443,6 +486,23 @@ class RecoveryReceiptStore:
             except FileNotFoundError:
                 pass
 
+    def _prepare_replacement_locked(self, temporary: Path) -> None:
+        """Create the empty replacement carrying the live database's mode bits.
+
+        The file is created exclusively at 0600, then ``fchmod``-ed to the
+        original's ordinary permission bits before SQLite opens it or any
+        payload is copied, so a migration neither widens nor narrows access.
+        Only the mode is carried over: umask, parent directory, owner, group
+        and ACLs are deliberately left alone. The descriptor is always closed;
+        a failure propagates and the caller's cleanup removes the temporary.
+        """
+        mode = stat.S_IMODE(self.path.stat().st_mode) & 0o777
+        fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
+
     def _rebuild_legacy_database_locked(self, columns: set[str]) -> None:
         """Replace an old receipt DB with a sanitized, current-schema database.
 
@@ -474,6 +534,7 @@ class RecoveryReceiptStore:
 
         source = sqlite3.connect(self.path, timeout=30)
         replaced = False
+        receipt_rows: sqlite3.Cursor | None = None
         try:
             source.execute("PRAGMA busy_timeout=30000")
             checkpoint = source.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
@@ -510,6 +571,7 @@ class RecoveryReceiptStore:
                           source_line_sha256, actor, workspace, payload_sha256,
                           payload, state FROM recovery_receipts"""
             )
+            self._prepare_replacement_locked(temporary)
             with sqlite3.connect(temporary, timeout=30) as destination:
                 destination.execute("PRAGMA journal_mode=DELETE")
                 destination.execute("PRAGMA synchronous=FULL")
@@ -613,7 +675,15 @@ class RecoveryReceiptStore:
             self._fsync_path(self.path.parent)
         finally:
             if source is not None:
-                source.close()
+                # The receipt cursor is streamed, not materialized. A cursor
+                # abandoned half-read keeps its statement, and so the exclusive
+                # lock, alive after ``close()`` for as long as a traceback
+                # holds this frame. Finalize it explicitly first.
+                try:
+                    if receipt_rows is not None:
+                        receipt_rows.close()
+                finally:
+                    source.close()
             if not replaced:
                 self._remove_sqlite_sidecars(temporary)
                 try:
@@ -643,12 +713,13 @@ class RecoveryReceiptStore:
                             return True
                         continue
                     try:
-                        _payload, invalid = _sanitize_stored_payload(
-                            json.loads(payload)
-                        )
+                        decoded = json.loads(payload)
+                        sanitized, invalid = _sanitize_stored_payload(decoded)
                     except (TypeError, ValueError):
                         return True
-                    if invalid:
+                    # A scrub-only difference is replayable but still has to be
+                    # rebuilt, so a stored path never survives in the database.
+                    if invalid or sanitized != decoded:
                         return True
         except sqlite3.DatabaseError as exc:
             raise RuntimeError("invalid recovery receipt database") from exc
@@ -715,6 +786,7 @@ class RecoveryReceiptStore:
                 if "recovery_lease_consumptions" in tables
                 else []
             )
+            self._prepare_replacement_locked(temporary)
             with sqlite3.connect(temporary, timeout=30) as destination:
                 destination.execute("PRAGMA journal_mode=DELETE")
                 destination.execute("PRAGMA synchronous=FULL")
@@ -1280,17 +1352,14 @@ class RecoveryReceiptStore:
                     ).fetchall()
                     for row in rows:
                         try:
-                            payload = json.loads(row[5])
+                            decoded = json.loads(row[5])
                         except (TypeError, ValueError):
                             continue
-                        if not isinstance(payload, dict):
-                            continue
-                        # A startup scrub strips an unsafe session_id; such a
-                        # receipt cannot be replayed, so it stays quarantined.
-                        data = payload.get("data")
-                        if not isinstance(data, dict) or not is_safe_session_id(
-                            data.get("session_id")
-                        ):
+                        # A receipt that cannot be replayed (a stripped session
+                        # id, or a payload missing what replay needs) stays
+                        # quarantined; a later valid one may still be returned.
+                        payload, unsafe = _sanitize_stored_payload(decoded)
+                        if unsafe:
                             continue
                         return {
                             "source_handle": row[0],

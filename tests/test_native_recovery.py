@@ -1329,6 +1329,101 @@ async def test_recovery_admission_reads_the_supplied_app_registry() -> None:
     queue_manager.has_pending_records.assert_awaited_once()
 
 
+def _real_native_app(tmp_path: Path) -> Any:
+    from context_intelligence_server.main import create_asgi_app
+
+    return create_asgi_app(
+        settings=Settings(
+            api_key=None,
+            api_keys=None,
+            api_keys_store_path=str(tmp_path / "keys.json"),
+            allow_unauthenticated=True,
+            queues_path=str(tmp_path / "live"),
+            recovery=cast(
+                Any,
+                {
+                    "enabled": True,
+                    "receipt_store_path": str(tmp_path / "receipts.sqlite3"),
+                    "queues_path": str(tmp_path / "recovery"),
+                },
+            ),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_gate_fails_closed_on_real_unreadable_live_spool(
+    tmp_path: Path,
+) -> None:
+    """Real live queue + writable separate recovery spool: no mocked has_pending."""
+    import os
+
+    from context_intelligence_server.main import (
+        _native_recovery_admission_available,
+        _native_recovery_live_available,
+        app,
+    )
+
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission bits; not real EACCES proof")
+    _real_native_app(tmp_path)
+    live = app.state.registry.queue_manager
+    recovery_dir = app.state.recovery_registry.queue_manager._dir
+    assert live._dir != recovery_dir
+    assert os.access(recovery_dir, os.W_OK)
+
+    assert await _native_recovery_admission_available(cast(FastAPI, app)) is True
+    assert await _native_recovery_live_available(cast(FastAPI, app)) is True
+
+    os.chmod(live._dir, 0o300)
+    try:
+        assert await _native_recovery_admission_available(cast(FastAPI, app)) is False
+        assert await _native_recovery_live_available(cast(FastAPI, app)) is False
+    finally:
+        os.chmod(live._dir, 0o700)
+    assert await _native_recovery_admission_available(cast(FastAPI, app)) is True
+
+
+@pytest.mark.asyncio
+async def test_real_admission_request_unreadable_live_spool_issues_no_permit(
+    tmp_path: Path,
+) -> None:
+    """Unreadable live spool: real HTTP admission is 429, no permit; restore allows."""
+    import os
+
+    from context_intelligence_server.main import app
+
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission bits; not real EACCES proof")
+    asgi_app = _real_native_app(tmp_path)
+    live_dir = app.state.registry.queue_manager._dir
+    gate = app.state.recovery_admission_gate
+    body = _recovery_body()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=asgi_app),
+        base_url="http://test",
+        headers=_source_headers(),
+    ) as client:
+        permits_before = len(gate._permits)
+        os.chmod(live_dir, 0o300)
+        try:
+            denied = await client.post(
+                "/recovery/admissions", json=_admission_body(body)
+            )
+        finally:
+            os.chmod(live_dir, 0o700)
+        assert denied.status_code == 429
+        assert "permit" not in denied.json()
+        assert len(gate._permits) == permits_before
+        recovery_qm = app.state.recovery_registry.queue_manager
+        assert await recovery_qm.has_pending_records() is False
+
+        allowed = await client.post("/recovery/admissions", json=_admission_body(body))
+        assert allowed.status_code == 201
+        assert allowed.json()["permit"]
+
+
 @pytest.mark.asyncio
 async def test_permit_denials_scan_live_queue_for_existing_and_new_origins(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
