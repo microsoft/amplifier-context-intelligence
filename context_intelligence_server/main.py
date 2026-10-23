@@ -15,9 +15,10 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from contextlib import asynccontextmanager, nullcontext, suppress
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Path as PathParam
 from pydantic import ValidationError
 from fastapi.responses import JSONResponse, Response
 from neo4j import READ_ACCESS, WRITE_ACCESS
@@ -39,6 +40,7 @@ from context_intelligence_server.authz import (  # noqa: F401 — re-exported fo
     require_workspace_access,
     require_write,
 )
+from context_intelligence_server.blob_keys import MAPPED_MARKER
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.blob_retention import BlobExpiredError
 from context_intelligence_server.retention_service import RetentionService
@@ -332,7 +334,7 @@ async def _crash_recovery_topup(respawn_limit: int | None) -> int:
         try:
             batch = await registry.queue_manager.read_batch(sid, max_items=1)
         except (OSError, ValueError):
-            logger.exception("crash_recovery_topup_read_failed session=%s", sid)
+            logger.exception("crash_recovery_topup_read_failed session=%a", sid)
             continue
         if not batch.lines:
             # recover()/read_batch disagreement (e.g. a concurrent finalize
@@ -492,7 +494,17 @@ async def _startup_recovery_body(app: FastAPI) -> None:
         deferred_count = 0
     respawned = 0
     for sid in to_process:
-        batch = await registry.queue_manager.read_batch(sid, max_items=1)
+        # Guarded per key (same shape as _crash_recovery_topup; read_batch
+        # itself stays loud for the live drainer's hot path) so one legacy or
+        # unreadable key cannot abort the pass for the healthy sessions behind
+        # it. Only OSError/ValueError are per-key conditions: cancellation and
+        # programming errors still propagate to the wrapper. ``%a`` escapes
+        # control characters in a legacy key so the log line stays one line.
+        try:
+            batch = await registry.queue_manager.read_batch(sid, max_items=1)
+        except (OSError, ValueError):
+            logger.exception("startup_recovery_read_failed session=%a", sid)
+            continue
         if not batch.lines:
             continue
         if await _scoped_queue_binding_matches(app, sid, batch.lines[0]) and _recover_one_session(
@@ -2918,13 +2930,14 @@ async def list_blobs(session_id: str, request: Request) -> JSONResponse:
     return JSONResponse(content={"session_id": session_id, "blobs": uris})
 
 
-@app.get("/blobs/{session_id}/{key}", dependencies=[Depends(require_read)])
-async def get_blob(session_id: str, key: str, request: Request) -> JSONResponse:
+async def _read_blob_response(
+    request: Request, session_id: str, uri: str
+) -> JSONResponse:
+    """Authorize the physical blob session, THEN read: shared by every blob GET route."""
     if getattr(request.app.state, "access_control_mode", "compatibility") == "scoped":
         await _session_claim_store(request.app)
     await require_claimed_blob_access(request, session_id, "data:read")
     blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
-    uri = f"ci-blob://{session_id}/{key}"
     try:
         content = await blob_store.read(uri)
     except BlobExpiredError as exc:
@@ -2932,6 +2945,29 @@ async def get_blob(session_id: str, key: str, request: Request) -> JSONResponse:
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Blob not found: {uri}")
     return JSONResponse(content=content)
+
+
+@app.get("/blobs/{session_id}/{key}", dependencies=[Depends(require_read)])
+async def get_blob(session_id: str, key: str, request: Request) -> JSONResponse:
+    return await _read_blob_response(
+        request, session_id, f"ci-blob://{session_id}/{key}"
+    )
+
+
+@app.get(
+    f"/blobs/{{session_id}}/{MAPPED_MARKER}/{{digest}}",
+    dependencies=[Depends(require_read)],
+)
+async def get_mapped_blob(
+    session_id: str,
+    digest: Annotated[str, PathParam(pattern=r"^[0-9a-f]{64}$")],
+    request: Request,
+) -> JSONResponse:
+    uri = f"ci-blob://{session_id}/{MAPPED_MARKER}/{digest}"
+    try:
+        return await _read_blob_response(request, session_id, uri)
+    except ValueError:  # an unsafe session id: the digest is already regex-validated
+        raise HTTPException(status_code=404, detail=f"Blob not found: {uri}")
 
 
 @app.post("/cypher", dependencies=[Depends(require_read)])

@@ -1006,3 +1006,652 @@ async def test_real_http_events_graph_and_new_blobs_remain_available(tmp_path, m
         await main.registry.close_neo4j_driver()
         await client.aclose()
         await service.close()
+
+
+# --- Relocated-root startup: a terminal snapshot from another root is history ---
+
+
+async def _completed_root(root: Path) -> None:
+    """Run a REAL job to completion at *root*, leaving one expired blob."""
+    payload(root)
+    service = await RetentionService.open(root)
+    try:
+        job = await ready(service)
+        await service.start(job, "prune")
+        await finish(service)
+        assert service.status()["state"] == "completed", service.status()
+        assert service.report is not None
+        assert service.report.deleted == 1
+    finally:
+        await service.close()
+
+
+def _metadata_state(root: Path) -> dict[str, tuple[bytes, int]]:
+    base = root / r.METADATA
+    return {
+        str(p.relative_to(base)): (p.read_bytes(), p.stat().st_mtime_ns)
+        for p in sorted(base.rglob("*"))
+        if p.is_file()
+    }
+
+
+def _rewrite_snapshot(
+    base: Path, mode: int = 0o600, drop: tuple[str, ...] = (), **changes
+) -> None:
+    file = base / r.METADATA / SNAPSHOT
+    saved = json.loads(file.read_text())
+    # A real service writes report.root == snapshot root; keep a rewritten root
+    # coherent unless the caller supplies its own report.
+    if isinstance(changes.get("root"), str):
+        saved["report"] = {**saved["report"], "root": changes["root"]}
+    saved.update(changes)
+    for key in drop:
+        del saved[key]
+    file.write_text(json.dumps(saved))
+    file.chmod(mode)
+
+
+@pytest.mark.parametrize("relocate", ["rename", "copy"])
+async def test_relocated_completed_root_reopens_without_job_and_keeps_expiry(
+    tmp_path, relocate
+):
+    import shutil
+
+    old_root, new_root = tmp_path / "old", tmp_path / "new"
+    await _completed_root(old_root)
+    if relocate == "rename":
+        old_root.rename(new_root)
+    else:
+        shutil.copytree(old_root, new_root)
+    before = _metadata_state(new_root)
+
+    service = await RetentionService.open(new_root)
+    try:
+        assert service.job is None and service.report is None
+        with pytest.raises(JobNotFound):
+            service.status()
+        with pytest.raises(r.BlobExpiredError):
+            await AsyncDiskBlobStore(new_root).read("ci-blob://session/old")
+        assert _metadata_state(new_root) == before
+
+        payload(new_root, "fresh")
+        job = await ready(service)
+        await service.start(job, "prune")
+        await finish(service)
+        status = service.status()
+        assert status["state"] == "completed" and status["id"] == job, status
+        assert status["root"] == str(new_root.resolve())
+    finally:
+        await service.close()
+    saved = json.loads((new_root / r.METADATA / SNAPSHOT).read_text())
+    assert saved["root"] == str(new_root.resolve()) and saved["id"] == job
+    with pytest.raises(r.BlobExpiredError):
+        await AsyncDiskBlobStore(new_root).read("ci-blob://session/old")
+
+
+@pytest.mark.parametrize("state", sorted(TERMINAL))
+async def test_foreign_terminal_snapshot_of_every_terminal_state_is_history(
+    tmp_path, state
+):
+    await _completed_root(tmp_path)
+    _rewrite_snapshot(tmp_path, state=state, root=str(tmp_path.parent / "elsewhere"))
+    before = _metadata_state(tmp_path)
+    service = await RetentionService.open(tmp_path)
+    try:
+        assert service.job is None and service.report is None
+        with pytest.raises(JobNotFound):
+            service.status()
+    finally:
+        await service.close()
+    assert _metadata_state(tmp_path) == before
+
+
+@pytest.mark.parametrize("state", ["running", "cancelling", "ready", "previewing"])
+async def test_foreign_active_or_executable_snapshot_is_rejected_untouched(
+    tmp_path, state
+):
+    await _completed_root(tmp_path)
+    _rewrite_snapshot(tmp_path, state=state, root=str(tmp_path.parent / "elsewhere"))
+    before = _metadata_state(tmp_path)
+    with pytest.raises(r.RetentionError):
+        await RetentionService.open(tmp_path)
+    assert coordinator_for(tmp_path).service is None
+    assert _metadata_state(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    "changes, mode, expected",
+    [
+        pytest.param(
+            {"version": 2}, 0o600, r.RetentionError, id="same-root-bad-version"
+        ),
+        pytest.param(
+            {"confirmed": False}, 0o600, r.RetentionError, id="same-root-unconfirmed"
+        ),
+        pytest.param({"id": "not-a-uuid"}, 0o600, ValueError, id="same-root-bad-uuid"),
+        pytest.param(
+            {"state": "bogus"}, 0o600, r.RetentionError, id="same-root-unknown-state"
+        ),
+        pytest.param(
+            {"state": "bogus", "root": "/elsewhere"},
+            0o600,
+            r.RetentionError,
+            id="foreign-unknown-state",
+        ),
+        pytest.param(
+            {"root": "/elsewhere", "version": 2},
+            0o600,
+            r.RetentionError,
+            id="foreign-bad-version",
+        ),
+        pytest.param(
+            {"root": "/elsewhere", "confirmed": False},
+            0o600,
+            r.RetentionError,
+            id="foreign-unconfirmed",
+        ),
+        pytest.param(
+            {"root": "/elsewhere", "id": "not-a-uuid"},
+            0o600,
+            ValueError,
+            id="foreign-bad-uuid",
+        ),
+        pytest.param(
+            {"root": "/elsewhere"}, 0o644, r.RetentionError, id="foreign-unsafe-mode"
+        ),
+        pytest.param({}, 0o644, r.RetentionError, id="same-root-unsafe-mode"),
+    ],
+)
+async def test_malformed_or_unsafe_snapshots_still_fail_closed(
+    tmp_path, changes, mode, expected
+):
+    await _completed_root(tmp_path)
+    _rewrite_snapshot(tmp_path, mode=mode, **changes)
+    before = _metadata_state(tmp_path)
+    with pytest.raises(expected):
+        await RetentionService.open(tmp_path)
+    assert coordinator_for(tmp_path).service is None
+    assert _metadata_state(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    "remove, expected",
+    [("report", r.RetentionError), ("id", KeyError)],
+)
+async def test_foreign_terminal_snapshot_missing_required_field_fails_closed(
+    tmp_path, remove, expected
+):
+    await _completed_root(tmp_path)
+    _rewrite_snapshot(tmp_path, root="/elsewhere", drop=(remove,))
+    before = _metadata_state(tmp_path)
+    with pytest.raises(expected):
+        await RetentionService.open(tmp_path)
+    assert coordinator_for(tmp_path).service is None
+    assert _metadata_state(tmp_path) == before
+
+
+@pytest.mark.raw_identity_factory
+async def test_outer_lifespan_starts_for_relocated_completed_root(
+    tmp_path, monkeypatch
+):
+    """The real lifespan reaches the (mocked) Neo4j driver boundary, not a retention failure."""
+    import shutil
+
+    from context_intelligence_server import main
+    from context_intelligence_server.config import RecoveryConfig, Settings
+
+    await _completed_root(tmp_path / "original")
+    moved = tmp_path / "moved"
+    shutil.copytree(tmp_path / "original", moved)
+    settings = Settings(
+        queues_path=str(tmp_path / "state" / "queues"),
+        blob_path=str(moved),
+        log_path=str(tmp_path / "logs" / "server.jsonl"),
+        api_keys_store_path=str(tmp_path / "identity" / "keys.json"),
+        allow_unauthenticated=True,
+        recovery=RecoveryConfig(enabled=False),
+    )
+
+    class DriverBoundary(Exception):
+        pass
+
+    calls: list[str] = []
+
+    def stop_before_driver(*args, **kwargs):
+        calls.append("driver")
+        raise DriverBoundary("mock Neo4j boundary; no connection created")
+
+    monkeypatch.setattr(main, "_settings", settings)
+    monkeypatch.setattr(main, "setup_logging", lambda: None)
+    monkeypatch.setattr(main, "build_neo4j_driver", stop_before_driver)
+    main.create_asgi_app(settings)
+    with pytest.raises(DriverBoundary):
+        async with main.lifespan(main.app):
+            raise AssertionError("lifespan must stop at the mocked driver boundary")
+    assert calls == ["driver"]
+
+
+_MISSING = object()
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        pytest.param(_MISSING, id="missing"),
+        pytest.param(None, id="null"),
+        pytest.param(7, id="integer"),
+        pytest.param(1.5, id="float"),
+        pytest.param(True, id="boolean"),
+        pytest.param(["/old/root"], id="list"),
+        pytest.param({"path": "/old/root"}, id="object"),
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="blank"),
+        pytest.param("old/root", id="relative"),
+        pytest.param("./old/root", id="dot-relative"),
+        pytest.param("/old\x00/root", id="nul"),
+    ],
+)
+@pytest.mark.parametrize("state", sorted(TERMINAL))
+async def test_malformed_stored_root_is_rejected_for_every_terminal_state(
+    tmp_path, state, stored
+):
+    await _completed_root(tmp_path)
+    if stored is _MISSING:
+        _rewrite_snapshot(tmp_path, state=state, drop=("root",))
+    else:
+        _rewrite_snapshot(tmp_path, state=state, root=stored)
+    before = _metadata_state(tmp_path)
+    with pytest.raises(r.RetentionError, match="Invalid retention job snapshot"):
+        await RetentionService.open(tmp_path)
+    assert coordinator_for(tmp_path).service is None
+    assert _metadata_state(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    "old_root",
+    ["/definitely/not/there/old-root", "/definitely/not/there/../old-root", "/"],
+)
+async def test_valid_absolute_foreign_root_need_not_exist_and_is_never_touched(
+    tmp_path, old_root
+):
+    await _completed_root(tmp_path)
+    _rewrite_snapshot(tmp_path, root=old_root)
+    before = _metadata_state(tmp_path)
+    service = await RetentionService.open(tmp_path)
+    try:
+        assert service.job is None and service.report is None
+    finally:
+        await service.close()
+    assert _metadata_state(tmp_path) == before
+    assert not Path("/definitely").exists()
+
+
+STORED = "/old/foreign/root"
+CUTOFF = 1_700_000_000_000_000_000
+COUNTERS = (
+    "files",
+    "logical_bytes",
+    "allocated_bytes",
+    "retained",
+    "skipped",
+    "changed",
+    "errors",
+    "deleted",
+)
+
+
+def _report(**fields) -> dict:
+    return {"root": STORED, "cutoff_ns": CUTOFF, **fields}
+
+
+async def _open_rejected(tmp_path, state, report) -> None:
+    """A foreign snapshot with this report must fail closed, untouched."""
+    await _completed_root(tmp_path)
+    if report is _MISSING:
+        _rewrite_snapshot(tmp_path, state=state, root=STORED, drop=("report",))
+    else:
+        _rewrite_snapshot(tmp_path, state=state, root=STORED, report=report)
+    before = _metadata_state(tmp_path)
+    with pytest.raises(r.RetentionError, match=r"^Invalid retention job snapshot$"):
+        await RetentionService.open(tmp_path)
+    assert coordinator_for(tmp_path).service is None
+    assert _metadata_state(tmp_path) == before
+
+
+async def _open_accepted_as_history(tmp_path, state, report) -> None:
+    await _completed_root(tmp_path)
+    _rewrite_snapshot(tmp_path, state=state, root=STORED, report=report)
+    before = _metadata_state(tmp_path)
+    service = await RetentionService.open(tmp_path)
+    try:
+        assert service.job is None and service.report is None
+        with pytest.raises(JobNotFound):
+            service.status()
+    finally:
+        await service.close()
+    assert coordinator_for(tmp_path).service is None
+    assert _metadata_state(tmp_path) == before
+
+
+@pytest.mark.parametrize("state", sorted(TERMINAL))
+@pytest.mark.parametrize(
+    "report",
+    [
+        pytest.param(
+            {"root": [], "cutoff_ns": "not-time"}, id="confirmed-root-list-cutoff-str"
+        ),
+        pytest.param(_MISSING, id="missing-report"),
+        pytest.param([], id="report-list"),
+        pytest.param({"cutoff_ns": CUTOFF}, id="missing-root"),
+        pytest.param({"root": STORED}, id="missing-cutoff"),
+        pytest.param(
+            {"root": "/some/other/root", "cutoff_ns": CUTOFF},
+            id="root-differs-from-snapshot",
+        ),
+        pytest.param(_report(cutoff_ns=True), id="cutoff-bool"),
+        pytest.param(_report(files=-1), id="counter-negative"),
+        pytest.param(_report(deleted=True), id="counter-bool"),
+        pytest.param(_report(recovery_required=1), id="recovery-int"),
+        pytest.param(_report(samples=["ok", 1]), id="samples-non-str-element"),
+        pytest.param(_report(unexpected=1), id="unknown-field"),
+    ],
+)
+async def test_foreign_malformed_report_is_rejected_for_every_terminal_state(
+    tmp_path, state, report
+):
+    await _open_rejected(tmp_path, state, report)
+
+
+_BAD_FIELD_VALUES = {
+    "cutoff_ns": {"bool": True, "float": 1.5, "str": "1", "null": None, "list": []},
+    "root": {
+        "list": [],
+        "null": None,
+        "int": 7,
+        "empty": "",
+        "relative": "relative/root",
+        "other": "/other/root",
+        "trailing-slash": STORED + "/",
+        "unnormalized": "/x/.." + STORED,
+    },
+    "recovery_required": {"int-0": 0, "int-1": 1, "str": "true", "null": None},
+    "samples": {
+        "str": "uri",
+        "null": None,
+        "int": 5,
+        "non-str": ["ok", 1],
+        "null-element": [None],
+    },
+    **{
+        name: {"bool": True, "str": "1", "float": 1.5, "null": None, "negative": -1}
+        for name in COUNTERS
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "field_name, value",
+    [
+        pytest.param(name, value, id=f"{name}-{label}")
+        for name, labelled in _BAD_FIELD_VALUES.items()
+        for label, value in labelled.items()
+    ],
+)
+async def test_foreign_report_field_with_wrong_value_is_rejected(
+    tmp_path, field_name, value
+):
+    await _open_rejected(tmp_path, "completed", _report(**{field_name: value}))
+
+
+@pytest.mark.parametrize(
+    "report",
+    ["text", 5, None, [_report()]],
+    ids=["str", "int", "null", "list-of-report"],
+)
+async def test_foreign_non_object_report_is_rejected(tmp_path, report):
+    await _open_rejected(tmp_path, "completed", report)
+
+
+async def test_foreign_report_rejection_never_leaks_snapshot_values(tmp_path):
+    await _completed_root(tmp_path)
+    marker = "SECRET-MARKER-9f3a"
+    _rewrite_snapshot(
+        tmp_path, root=STORED, report=_report(samples=[marker, 1], **{marker: marker})
+    )
+    with pytest.raises(r.RetentionError) as caught:
+        await RetentionService.open(tmp_path)
+    assert caught.value.args == ("Invalid retention job snapshot",)
+    assert marker not in repr(caught.value)
+
+
+@pytest.mark.parametrize("state", sorted(TERMINAL))
+async def test_foreign_minimal_report_is_history_for_every_terminal_state(
+    tmp_path, state
+):
+    await _open_accepted_as_history(tmp_path, state, _report())
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        pytest.param(_report(cutoff_ns=-5), id="negative-cutoff"),
+        pytest.param(_report(cutoff_ns=0), id="zero-cutoff"),
+        pytest.param(_report(recovery_required=True), id="recovery-true-only"),
+        pytest.param(_report(recovery_required=False), id="recovery-false-only"),
+        pytest.param(_report(samples=[]), id="empty-samples"),
+        pytest.param(
+            _report(samples=["ci-blob://a/b", "ci-blob://c/d"]), id="str-samples"
+        ),
+        pytest.param(
+            _report(**dict.fromkeys(COUNTERS, 0), recovery_required=False, samples=[]),
+            id="full-zero-counters",
+        ),
+        pytest.param(_report(**dict.fromkeys(COUNTERS, 10**18)), id="large-counters"),
+        pytest.param(_report(files=3, deleted=1, errors=0), id="partial-counters"),
+    ],
+)
+async def test_foreign_valid_report_shapes_are_history(tmp_path, report):
+    await _open_accepted_as_history(tmp_path, "completed", report)
+
+
+@pytest.mark.parametrize(
+    "mutate, expected",
+    [
+        pytest.param(lambda saved: saved.pop("report"), KeyError, id="missing-report"),
+        pytest.param(
+            lambda saved: saved["report"].update(unexpected=1),
+            TypeError,
+            id="unknown-field",
+        ),
+    ],
+)
+async def test_same_root_report_failures_keep_their_original_types(
+    tmp_path, mutate, expected
+):
+    await _completed_root(tmp_path)
+    file = tmp_path / r.METADATA / SNAPSHOT
+    saved = json.loads(file.read_text())
+    mutate(saved)
+    file.write_text(json.dumps(saved))
+    file.chmod(0o600)
+    before = _metadata_state(tmp_path)
+    with pytest.raises(expected):
+        await RetentionService.open(tmp_path)
+    assert coordinator_for(tmp_path).service is None
+    assert _metadata_state(tmp_path) == before
+
+
+async def test_same_root_report_values_are_not_newly_validated(tmp_path):
+    """Only the foreign-terminal exemption is new; same-root loading is unchanged."""
+    await _completed_root(tmp_path)
+    _rewrite_snapshot(tmp_path, report={"root": "/other/root", "cutoff_ns": "not-time"})
+    service = await RetentionService.open(tmp_path)
+    try:
+        status = service.status()
+        assert status["state"] == "completed"
+        assert status["report"]["cutoff_ns"] == "not-time"
+    finally:
+        await service.close()
+
+
+# --- Mapped (.blob) and pre-upgrade backslash (.json) names (PR126) ---------
+
+
+async def test_online_service_prunes_mapped_legacy_and_ordinary_files_and_replay_stays_expired(
+    tmp_path,
+):
+    store = AsyncDiskBlobStore(tmp_path)
+    mapped_uri = await store.write("session", "a/b", {"v": "mapped"})
+    old = time.time_ns() - 90 * 86400 * 10**9
+    os.utime(store.blob_path("session", "a/b"), ns=(old, old))
+    payload(tmp_path, "a\\b")  # pre-upgrade file: a literal backslash in its name
+    payload(tmp_path, "plain")
+    legacy_uri = "ci-blob://session/a\\b"
+    uris = sorted([mapped_uri, legacy_uri, "ci-blob://session/plain"])
+
+    service = await RetentionService.open(tmp_path)
+    try:
+        job = await ready(service)
+        assert sorted(service.status()["report"]["samples"]) == uris
+        await service.start(job, "prune")
+        await finish(service)
+        result = service.status()
+    finally:
+        await service.close()
+
+    assert result["state"] == "completed", result
+    assert (result["report"]["deleted"], result["report"]["errors"]) == (3, 0)
+    assert list((tmp_path / "session" / "blobs").iterdir()) == []
+    for uri in uris:
+        with pytest.raises(r.BlobExpiredError) as expired:
+            await store.read(uri)
+        assert expired.value.uri == uri
+    # Replay keeps the recorded reference and never rehydrates a pruned payload.
+    assert await store.write("session", "a/b", {"replayed": True}) == mapped_uri
+    assert await store.write("session", "a\\b", {"replayed": True}) == legacy_uri
+    assert list((tmp_path / "session" / "blobs").iterdir()) == []
+
+
+_MAPPED_DIGEST = "5998a4c7b7280b4eb36c9f88878ed97c34b2cbeb7f138372a02365515c97bde9"  # sha256 of "a/b" under the key domain
+
+
+@pytest.mark.parametrize("kind", ["mapped", "legacy"])
+@pytest.mark.parametrize(
+    "operation", ["write", "read", "list", "size", "dump", "delete_session"]
+)
+async def test_mapped_and_legacy_operations_queue_behind_an_exclusive_lease(
+    tmp_path, kind, operation
+):
+    store = AsyncDiskBlobStore(tmp_path)
+    if kind == "mapped":
+        uri, key = await store.write("session", "a/b", {"seed": kind}), "a/b"
+    else:
+        payload(tmp_path, "a\\b")  # pre-upgrade file with a literal backslash
+        uri, key = "ci-blob://session/a\\b", "a\\b"
+    coord = await asyncio.to_thread(coordinator_for, tmp_path)
+    entered, release = threading.Event(), threading.Event()
+
+    def exclusive():
+        with coord.lease(exclusive=True):
+            entered.set()
+            assert release.wait(5)
+
+    holder = asyncio.create_task(asyncio.to_thread(exclusive))
+    await until(entered.is_set)
+    calls = {
+        "write": lambda: store.write("session", key, {"new": kind}),
+        "read": lambda: store.read(uri),
+        "list": lambda: store.list("session"),
+        "size": lambda: store.size(uri),
+        "dump": lambda: store.dump(uri, tmp_path / "dump"),
+        "delete_session": lambda: store.delete_session("session"),
+    }
+    task = asyncio.create_task(calls[operation]())
+    try:
+        await until(lambda: len(coord.queue) == 1)
+        assert not task.done()
+        assert coord.queue[0][1] == (operation == "delete_session")
+    finally:
+        release.set()
+        await holder
+    result = await task
+    if operation == "read":
+        assert result == ({"seed": "mapped"} if kind == "mapped" else {"value": 1})
+    if operation == "list":
+        assert result == [uri]
+    if operation == "delete_session":
+        assert result == 1
+
+
+async def test_a_cancelled_waiting_mapped_write_creates_nothing(tmp_path):
+    store = AsyncDiskBlobStore(tmp_path)
+    coord = await asyncio.to_thread(coordinator_for, tmp_path)
+    entered, release = threading.Event(), threading.Event()
+
+    def exclusive():
+        with coord.lease(exclusive=True):
+            entered.set()
+            assert release.wait(5)
+
+    holder = asyncio.create_task(asyncio.to_thread(exclusive))
+    await until(entered.is_set)
+    waiting = asyncio.create_task(store.write("session", "a/b", {"v": 1}))
+    try:
+        await until(lambda: len(coord.queue) == 1)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+    finally:
+        release.set()
+        await holder
+
+    assert not (tmp_path / "session").exists()
+    assert not coord.queue and coord.readers == 0
+
+
+async def test_an_admitted_mapped_write_finishes_after_cancellation_and_excludes_retention(
+    tmp_path, monkeypatch
+):
+    store = AsyncDiskBlobStore(tmp_path)
+    coord = await asyncio.to_thread(coordinator_for, tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    real_fsync = os.fsync
+
+    def gated_fsync(fd):
+        # Real fsync, but the FIRST one (inside the admitted write) waits at a barrier.
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", gated_fsync)
+    write = asyncio.create_task(store.write("session", "a/b", {"v": 1}))
+    await until(entered.is_set)
+    write.cancel()
+    seen: list[list[str]] = []
+    maintenance = asyncio.create_task(
+        filesystem(
+            tmp_path,
+            lambda: seen.append(
+                sorted(p.name for p in (tmp_path / "session" / "blobs").iterdir())
+            ),
+            exclusive=True,
+        )
+    )
+    try:
+        await until(
+            lambda: len(coord.queue) == 1
+        )  # retention-style exclusive work waits
+        assert seen == []
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await write
+    await maintenance
+
+    # The admitted write completed under its lease; exclusive work never saw a temp file.
+    assert seen == [[f"~ci-key-v1~{_MAPPED_DIGEST}.blob"]]
+    assert await store.read(f"ci-blob://session/~ci-key-v1/{_MAPPED_DIGEST}") == {
+        "v": 1
+    }
+    assert not coord.queue and coord.readers == 0

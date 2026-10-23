@@ -23,8 +23,15 @@ from pathlib import Path
 from typing import Callable, Iterator
 from zoneinfo import ZoneInfo
 
-LOCK = ".ci-blob-retention.lock"
-METADATA = ".ci-blob-retention"
+from context_intelligence_server.blob_keys import (
+    LOCK,
+    METADATA,
+    address_from_filename,
+    component,
+    exact_address,
+    parse_uri,  # noqa: F401  (re-exported for compatibility)
+)
+
 DATABASE = "expiry.sqlite3"
 BATCH_SIZE = 512
 _DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -41,26 +48,6 @@ class BlobExpiredError(FileNotFoundError):
     def __init__(self, uri: str):
         self.uri = uri
         super().__init__(f"Blob expired: {uri}")
-
-
-def component(value: str) -> str:
-    """Accept one unambiguous URI/filesystem component, never a path."""
-    if (
-        not value or value in (".", "..", LOCK, METADATA)
-        or any(c in value for c in "/\\%?#")
-        or any(ord(c) < 32 or ord(c) == 127 for c in value)
-    ):
-        raise ValueError(f"Unsafe blob component: {value!r}")
-    return value
-
-
-def parse_uri(uri: str) -> tuple[str, str]:
-    if not uri.startswith("ci-blob://"):
-        raise ValueError(f"Invalid blob URI: {uri!r}")
-    parts = uri[10:].split("/")
-    if len(parts) != 2:
-        raise ValueError(f"Invalid blob URI: {uri!r}")
-    return component(parts[0]), component(parts[1])
 
 
 def duration_ns(value: str) -> int:
@@ -258,7 +245,7 @@ class Report:
 
 
 def candidates(root: Root, cutoff_ns: int, report: Report) -> Iterator[Candidate]:
-    """Only root/session/blobs/key.json; memory independent of tree size."""
+    """Only root/session/blobs/<name>.json or mapped .blob; memory independent of tree size."""
     with os.scandir(root.fd) as sessions:
         for session in sessions:
             if session.name in (LOCK, METADATA):
@@ -272,17 +259,19 @@ def candidates(root: Root, cutoff_ns: int, report: Report) -> Iterator[Candidate
                     with os.scandir(fd) as files:
                         for entry in files:
                             try:
-                                if not entry.name.endswith(".json"):
+                                address = address_from_filename(
+                                    session.name, entry.name
+                                )
+                                if address is None:
                                     report.skipped += 1
                                     continue
-                                key = component(entry.name[:-5])
-                                st = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
+                                st = os.stat(address.filename, dir_fd=fd, follow_symlinks=False)
                                 if not _regular(st):
                                     report.skipped += 1
                                 elif st.st_mtime_ns >= cutoff_ns:
                                     report.retained += 1
                                 else:
-                                    item = Candidate(f"ci-blob://{session.name}/{key}", fingerprint(st), st.st_blocks * 512)
+                                    item = Candidate(address.uri, fingerprint(st), st.st_blocks * 512)
                                     report.files += 1
                                     report.logical_bytes += st.st_size
                                     report.allocated_bytes += item.allocated
@@ -433,7 +422,7 @@ class Ledger:
             raise
 
     def contains(self, uri: str) -> bool:
-        parse_uri(uri)
+        exact_address(uri)
         if self.db is None:
             return False
         self._check()
@@ -470,10 +459,10 @@ def expired(root: Root, uri: str) -> bool:
 
 
 def _matches(root: Root, item: Candidate) -> bool:
-    session, key = parse_uri(item.uri)
+    address = exact_address(item.uri)
     try:
-        with root.blobs(session) as fd:
-            st = os.stat(key + ".json", dir_fd=fd, follow_symlinks=False)
+        with root.blobs(address.session) as fd:
+            st = os.stat(address.filename, dir_fd=fd, follow_symlinks=False)
             return _regular(st) and fingerprint(st) == item.fp
     except FileNotFoundError:
         return False
@@ -523,12 +512,12 @@ def _unlink(
     if row is None or tuple(row[:5]) != item.fp or not row[5]:
         report.changed += 1
         return
-    session, key = parse_uri(item.uri)
+    address = exact_address(item.uri)
     try:
         ledger._check()
-        with root.blobs(session) as fd:
+        with root.blobs(address.session) as fd:
             try:
-                st = os.stat(key + ".json", dir_fd=fd, follow_symlinks=False)
+                st = os.stat(address.filename, dir_fd=fd, follow_symlinks=False)
             except FileNotFoundError:
                 # A previous process may have died after unlink but before
                 # syncing this directory. Absence must be durable too.
@@ -542,7 +531,7 @@ def _unlink(
                     return
                 if dirty_dirs is not None:
                     _pin_directory(fd, dirty_dirs)  # failure must precede unlink
-                os.unlink(key + ".json", dir_fd=fd)
+                os.unlink(address.filename, dir_fd=fd)
                 report.deleted += 1
                 if dirty_dirs is None:
                     os.fsync(fd)
@@ -759,17 +748,19 @@ def scan_window(
                             cursor.session_cookie = cookie
                             if name not in (".", ".."):
                                 try:
-                                    if not name.endswith(".json"):
+                                    address = address_from_filename(
+                                        cursor.session, name
+                                    )
+                                    if address is None:
                                         report.skipped += 1
                                     else:
-                                        key = component(name[:-5])
-                                        st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                                        st = os.stat(address.filename, dir_fd=fd, follow_symlinks=False)
                                         if not _regular(st):
                                             report.skipped += 1
                                         elif st.st_mtime_ns >= report.cutoff_ns or st.st_ctime_ns > preview_started_ns:
                                             report.retained += 1
                                         else:
-                                            item = Candidate(f"ci-blob://{cursor.session}/{key}", fingerprint(st), st.st_blocks * 512)
+                                            item = Candidate(address.uri, fingerprint(st), st.st_blocks * 512)
                                             items.append(item)
                                             report.files += 1
                                             report.logical_bytes += st.st_size

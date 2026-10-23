@@ -1326,6 +1326,96 @@ async def test_has_pending_records_treats_out_of_range_offset_as_unavailable(qm)
     assert await qm.has_pending_records()
 
 
+def _restore_mode(path, mode=0o700):
+    import os
+
+    os.chmod(path, mode)
+
+
+async def test_has_pending_records_real_queue_states(qm):
+    """Empty is False, pending is True, fully committed and dead-only keep old semantics."""
+    assert await qm.has_pending_records() is False
+
+    await qm.append("s1", b"a")
+    assert await qm.has_pending_records() is True
+
+    batch = await qm.read_batch("s1", 1)
+    await qm.commit("s1", batch.end_offset)
+    assert await qm.has_pending_records() is False
+
+    (qm._dir / "dead-only.dead.jsonl").write_bytes(b'{"x":1}\n')
+    assert await qm.has_pending_records() is False
+
+
+async def test_has_pending_records_real_unreadable_dir_is_unavailable(qm):
+    """A real non-root EACCES enumeration failure must fail closed (True)."""
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission bits; not real EACCES proof")
+    await qm.append("s1", b"a")
+    batch = await qm.read_batch("s1", 1)
+    await qm.commit("s1", batch.end_offset)
+    os.chmod(qm._dir, 0o300)  # write+search, no read: cannot enumerate
+    try:
+        assert await qm.has_pending_records() is True
+    finally:
+        _restore_mode(qm._dir)
+
+
+async def test_has_pending_records_deleted_initialized_dir_is_unavailable(qm):
+    import shutil
+
+    shutil.rmtree(qm._dir)
+    assert await qm.has_pending_records() is True
+
+
+async def test_has_pending_records_dir_replaced_by_file_is_unavailable(qm):
+    import shutil
+
+    shutil.rmtree(qm._dir)
+    qm._dir.write_text("not a directory", encoding="utf-8")
+    assert await qm.has_pending_records() is True
+
+
+async def test_has_pending_records_injected_scandir_eio_is_unavailable(qm, monkeypatch):
+    import errno
+    import os
+
+    def boom(*_a, **_k):
+        raise OSError(errno.EIO, "injected EIO")
+
+    monkeypatch.setattr(os, "scandir", boom)
+    assert await qm.has_pending_records() is True
+
+
+def test_pending_worker_keys_exact_suffixes_sorted_dedup_no_file_filter(qm):
+    (qm._dir / "b.log").write_bytes(b"")
+    (qm._dir / "a.log").write_bytes(b"")
+    (qm._dir / "a.dead.jsonl").write_bytes(b"")
+    (qm._dir / "c.dead.jsonl").write_bytes(b"")
+    (qm._dir / "d.offset").write_bytes(b"")
+    (qm._dir / "e.log.tmp").write_bytes(b"")
+    (qm._dir / "dirkey.log").mkdir()  # no is_file filter: a directory still counts
+    assert qm._pending_worker_keys() == ["a", "b", "c", "dirkey"]
+
+
+async def test_lenient_startup_callers_still_tolerate_unreadable_dir(qm):
+    """_all_worker_keys stays lenient: unreadable dir yields no keys, no raise."""
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission bits")
+    await qm.append("s1", b"a")
+    os.chmod(qm._dir, 0o300)
+    try:
+        assert qm._all_worker_keys() == []
+        await qm.reclaim_drained_orphans()
+        await qm.recovery_seed_counts()
+    finally:
+        _restore_mode(qm._dir)
+
+
 async def test_refresh_spool_stats_empty_directory(qm):
     """An empty spool directory reports zero for all three aggregates."""
     stats = await qm.refresh_spool_stats()

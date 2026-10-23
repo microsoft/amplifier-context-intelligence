@@ -6,6 +6,7 @@ import json
 import logging
 from pathlib import Path
 from collections.abc import AsyncGenerator
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -400,6 +401,227 @@ async def test_get_blob_works_for_a_300_char_session_id(
     response = await client.get(f"/blobs/{session_id}/{key}")
     assert response.status_code == 200
     assert response.json() == blob_data
+
+
+# ---------------------------------------------------------------------------
+# Mapped (~ci-key-v1) blob route and pre-upgrade backslash reads (PR126).
+# Digests are hand-derived: sha256(b"ci-blob-event-key:v1\x00" + key.encode()).
+# ---------------------------------------------------------------------------
+
+_MAPPED_MARK = "~ci-key-v1"
+_MAPPED_HTTP_KEYS = [
+    ("a/b", "5998a4c7b7280b4eb36c9f88878ed97c34b2cbeb7f138372a02365515c97bde9"),
+    ("a\\b", "f3af24d320ab49ad3ecaddd0d48f69cb7c393eb657ffbf1b80416af26a1346b4"),
+    ("a\nb", "97acd576bb4912bc9586a183710a1ee2753dacc4d562fae69f46a9523cc79a93"),
+]
+
+
+@pytest.mark.parametrize(("key", "digest"), _MAPPED_HTTP_KEYS)
+async def test_get_mapped_blob_returns_200_with_content_and_round_trips_the_listing(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    digest: str,
+) -> None:
+    from context_intelligence_server.blob_store import AsyncDiskBlobStore
+
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    uri = await AsyncDiskBlobStore(root=tmp_path).write("sess", key, {"k": key})
+    assert uri == f"ci-blob://sess/{_MAPPED_MARK}/{digest}"
+
+    response = await client.get(f"/blobs/sess/{_MAPPED_MARK}/{digest}")
+    assert response.status_code == 200
+    assert response.json() == {"k": key}
+
+    listed = (await client.get("/blobs/sess")).json()["blobs"]
+    assert listed == [uri]
+    again = await client.get("/blobs/" + listed[0].removeprefix("ci-blob://"))
+    assert again.json() == {"k": key}
+
+
+async def test_get_mapped_blob_returns_404_for_a_missing_blob(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+
+    response = await client.get(f"/blobs/sess/{_MAPPED_MARK}/{'0' * 64}")
+
+    assert response.status_code == 404
+    assert (
+        response.json()["detail"]
+        == f"Blob not found: ci-blob://sess/{_MAPPED_MARK}/{'0' * 64}"
+    )
+
+
+async def test_get_mapped_blob_returns_410_with_the_recorded_uri_when_expired(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from context_intelligence_server import blob_retention as r
+
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    uri = f"ci-blob://sess/{_MAPPED_MARK}/{'1' * 64}"
+    with (
+        r.RootLock(tmp_path, exclusive=True, create_root=True) as lock,
+        r.Ledger(lock.root, writable=True) as ledger,
+    ):
+        ledger.journal([r.Candidate(uri, (1, 2, 3, 4, 5), 0)])
+
+    response = await client.get(f"/blobs/sess/{_MAPPED_MARK}/{'1' * 64}")
+
+    assert response.status_code == 410
+    assert response.json()["detail"] == {"code": "blob_expired", "uri": uri}
+
+
+@pytest.mark.parametrize(
+    "digest",
+    ["A" * 64, "a" * 63, "a" * 65, "g" * 64, "0" * 32 + "Z" * 32],
+    ids=["uppercase", "short", "long", "non-hex", "mixed-case-tail"],
+)
+async def test_get_mapped_blob_rejects_a_malformed_digest_with_a_controlled_422(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    digest: str,
+) -> None:
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+
+    response = await client.get(f"/blobs/sess/{_MAPPED_MARK}/{digest}")
+
+    assert response.status_code == 422
+    assert list(tmp_path.iterdir()) == []  # rejected before any storage was touched
+
+
+async def test_the_marker_alone_is_an_ordinary_key_and_longer_paths_have_no_route(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    blob_dir = tmp_path / "sess" / "blobs"
+    blob_dir.mkdir(parents=True)
+    (blob_dir / f"{_MAPPED_MARK}.json").write_text(
+        '{"ordinary": true}', encoding="utf-8"
+    )
+
+    assert (await client.get(f"/blobs/sess/{_MAPPED_MARK}")).json() == {
+        "ordinary": True
+    }
+    assert (
+        await client.get(f"/blobs/sess/{_MAPPED_MARK}/{'0' * 64}/x")
+    ).status_code == 404
+
+
+async def test_transport_escaped_percent_is_decoded_once_and_never_again(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from context_intelligence_server.blob_store import AsyncDiskBlobStore
+
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    store = AsyncDiskBlobStore(root=tmp_path)
+    await store.write("s%1?2#3", "k%", {"which": "percent"})
+    await store.write("a%2fb", "k%2fx", {"which": "literal-2f"})
+
+    assert (await client.get("/blobs/s%251%3F2%233/k%25")).json() == {
+        "which": "percent"
+    }
+    assert (await client.get("/blobs/a%252fb/k%252fx")).json() == {
+        "which": "literal-2f"
+    }
+
+
+async def test_a_pre_upgrade_backslash_blob_is_still_served_over_http(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    blob_dir = tmp_path / "sess" / "blobs"
+    blob_dir.mkdir(parents=True)
+    (blob_dir / "a\\b.json").write_text('{"legacy": true}', encoding="utf-8")
+
+    response = await client.get("/blobs/sess/a%5Cb")
+
+    assert response.status_code == 200
+    assert response.json() == {"legacy": True}
+    assert (await client.get("/blobs/sess")).json()["blobs"] == ["ci-blob://sess/a\\b"]
+
+
+async def test_the_mapped_route_answers_an_unsafe_session_id_with_a_controlled_404(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+
+    response = await client.get(f"/blobs/a%0Ab/{_MAPPED_MARK}/{'0' * 64}")
+
+    assert response.status_code == 404
+    assert "Blob not found" in response.json()["detail"]
+    assert list(tmp_path.iterdir()) == []  # nothing was created for a rejected id
+
+
+@pytest.fixture
+def _scoped_blob_access(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Scoped mode: contributor ``owner`` may read workspace ``one`` only."""
+    from context_intelligence_server.config import ContributorGrant
+    from context_intelligence_server.session_claims import SessionClaimStore
+
+    claims = SessionClaimStore(tmp_path / "claims.sqlite3")
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path / "blobs"))
+    monkeypatch.setattr(main_module.app.state, "access_control_mode", "scoped")
+    monkeypatch.setattr(main_module.app.state, "session_claims", claims)
+    monkeypatch.setattr(
+        main_module.app.state,
+        "contributor_grants",
+        {"owner": ContributorGrant(workspaces=["one"], capabilities={"data:read"})},
+    )
+    return tmp_path
+
+
+@pytest.mark.parametrize("claim_workspace", ["one", "two", "provisional", None])
+async def test_the_mapped_route_checks_the_session_claim_before_touching_the_payload(
+    auth_client: httpx.AsyncClient,
+    _scoped_blob_access: Path,
+    claim_workspace: str | None,
+) -> None:
+    from context_intelligence_server.blob_store import AsyncDiskBlobStore
+
+    tmp_path = _scoped_blob_access
+    claims = main_module.app.state.session_claims
+    if claim_workspace == "provisional":
+        # A recovery reservation is not a committed binding: it grants nothing.
+        assert (
+            await claims.reserve_recovery("sess", "author", "one", "token")
+            == "reserved"
+        )
+    elif claim_workspace is not None:
+        assert await claims.claim("sess", "author", claim_workspace)
+    uri = await AsyncDiskBlobStore(tmp_path / "blobs").write(
+        "sess", "a/b", {"private": True}
+    )
+    path = "/blobs/" + uri.removeprefix("ci-blob://")
+    headers = {"Authorization": "Bearer test-secret"}
+
+    response = await auth_client.get(path, headers=headers)
+    absent = await auth_client.get(
+        f"/blobs/sess/{_MAPPED_MARK}/{'0' * 64}", headers=headers
+    )
+
+    if claim_workspace == "one":
+        assert (response.status_code, response.json()) == (200, {"private": True})
+        assert absent.status_code == 404
+    else:
+        # Denied before the payload (or even its absence) is observable.
+        assert response.status_code == absent.status_code == 403
+        assert "private" not in response.text
+    assert (await auth_client.get(path)).status_code == 401
 
 
 # ---------------------------------------------------------------------------
@@ -2533,3 +2755,318 @@ class TestHeadlessDocsSurface:
             f"/admin/* must not appear in the unauthenticated OpenAPI schema; "
             f"found: {admin_paths}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Lane D: startup recovery per-key fault isolation. One unreadable or
+# legacy-invalid key must not abort the boot-time respawn loop for the healthy
+# sessions behind it (probe5a_base / probe5b_head evidence).
+# ---------------------------------------------------------------------------
+
+_LEGACY_BAD_KEYS = ["\tbad-tab", "bad\nnewline"]
+
+
+@pytest.fixture
+def hermetic_recovery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> SimpleNamespace:
+    """Temp HOME/cwd, unbounded cap, no sweep, recorded ``get_or_create``."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", None)
+    monkeypatch.setattr(
+        main_module._settings, "crash_recovery_sweep_interval_seconds", 0
+    )
+    spawned: list[str] = []
+    monkeypatch.setattr(registry, "get_or_create", lambda s, w, **kw: spawned.append(s))
+    queue_dir = tmp_path / "queues"
+    queue_dir.mkdir(exist_ok=True)
+    app_stub = SimpleNamespace(
+        state=SimpleNamespace(
+            recovery_complete=asyncio.Event(),
+            recovery_error=None,
+            access_control_mode="compatibility",
+        )
+    )
+    return SimpleNamespace(spawned=spawned, queue_dir=queue_dir, app=app_stub)
+
+
+def _write_legacy_log(queue_dir: Path, key: str) -> bytes:
+    """Write a base-format ``<key>.log`` straight to disk.
+
+    ``QueueManager.append`` rejects control-character keys, so files a pre-fix
+    server wrote can only be recreated by writing the bytes directly.
+    """
+    line = (
+        json.dumps(
+            {"event": "tool:post", "workspace": "ws", "data": {"session_id": key}}
+        ).encode("utf-8")
+        + b"\n"
+    )
+    (queue_dir / f"{key}.log").write_bytes(line)
+    return line
+
+
+def _control_free(text: str) -> bool:
+    return not any(ord(c) < 32 or ord(c) == 127 for c in text)
+
+
+async def test_startup_recovery_legacy_control_char_keys_do_not_abort_valid_respawn(
+    hermetic_recovery: SimpleNamespace,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Real base-format tab/newline files before AND between valid keys leave
+    the healthy sessions respawned, the invalid files untouched, and no
+    global ``recovery_error``.
+
+    Combined behavior: ``QueueManager.recover()`` filters the invalid keys
+    (escaped ``recover_invalid_key_skipped`` log) BEFORE the cap and the
+    respawn loop, so the loop sees only the 2 valid keys (``2/2``) and the
+    main-level read guard is never needed here. The guard itself stays
+    covered by the injected-failure test below."""
+    qd = hermetic_recovery.queue_dir
+    keys = ["\tbad-tab", "aa-valid", "bad\nnewline", "zz-valid"]
+    original = {k: _write_legacy_log(qd, k) for k in keys}
+    app_stub = hermetic_recovery.app
+
+    with caplog.at_level(logging.INFO, logger="context_intelligence_server"):
+        await main_module._startup_recovery(app_stub)
+
+    assert app_stub.state.recovery_error is None
+    assert app_stub.state.recovery_complete.is_set()
+    assert sorted(hermetic_recovery.spawned) == ["aa-valid", "zz-valid"]
+    for bad in _LEGACY_BAD_KEYS:
+        assert (qd / f"{bad}.log").read_bytes() == original[bad]
+        assert not (qd / f"{bad}.offset").exists()
+    messages = [r.getMessage() for r in caplog.records]
+    # Invalid keys were filtered before the loop: 2 valid of 2 recovered.
+    assert any("respawned 2/2 drainers" in m for m in messages), messages
+    # No key reached the main-level read guard.
+    assert not any("startup_recovery_read_failed" in m for m in messages), messages
+    # The queue-level filter reported each invalid key once, escaped.
+    skipped = [m for m in messages if "recover_invalid_key_skipped" in m]
+    assert len(skipped) == 2
+    assert any(r"'\tbad-tab'" in m for m in skipped)
+    assert any(r"'bad\nnewline'" in m for m in skipped)
+    assert all(_control_free(m) for m in skipped), [repr(m) for m in skipped]
+    # Scoped to the two modules this boot path owns for escaping: main.py's own
+    # records and recover()'s skip records. ``reclaim_drained_orphans`` (a
+    # separate queue_manager path) is not part of this combined behavior.
+    main_messages = [
+        r.getMessage() for r in caplog.records if r.pathname.endswith("/main.py")
+    ]
+    assert main_messages
+    assert all(_control_free(m) for m in main_messages), [
+        repr(m) for m in main_messages
+    ]
+
+
+@pytest.mark.parametrize("exc", [OSError("boom-io"), ValueError("boom-value")])
+async def test_startup_recovery_read_batch_guard_isolates_injected_failure_on_valid_key(
+    hermetic_recovery: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    exc: Exception,
+) -> None:
+    """With every key VALID (so queue-level filtering cannot help), a per-key
+    OSError/ValueError from ``read_batch`` must be isolated by the loop guard.
+    The scoped-binding check must run only for keys whose read succeeded."""
+    qd = hermetic_recovery.queue_dir
+    for key in ("aa-valid", "mm-flaky", "zz-valid"):
+        _write_legacy_log(qd, key)
+    qm = registry.queue_manager
+    real_read_batch = qm.read_batch
+
+    async def flaky_read_batch(session_id: str, *args: Any, **kwargs: Any) -> Any:
+        if session_id == "mm-flaky":
+            raise exc
+        return await real_read_batch(session_id, *args, **kwargs)
+
+    monkeypatch.setattr(qm, "read_batch", flaky_read_batch)
+    binding = AsyncMock(return_value=True)
+    monkeypatch.setattr(main_module, "_scoped_queue_binding_matches", binding)
+    app_stub = hermetic_recovery.app
+
+    with caplog.at_level(logging.INFO, logger="context_intelligence_server"):
+        await main_module._startup_recovery(app_stub)
+
+    assert app_stub.state.recovery_error is None
+    assert app_stub.state.recovery_complete.is_set()
+    assert hermetic_recovery.spawned == ["aa-valid", "zz-valid"]
+    assert [call.args[1] for call in binding.await_args_list] == [
+        "aa-valid",
+        "zz-valid",
+    ]
+    failed = [
+        r for r in caplog.records if "startup_recovery_read_failed" in r.getMessage()
+    ]
+    assert len(failed) == 1
+    assert failed[0].levelno == logging.ERROR
+    assert "'mm-flaky'" in failed[0].getMessage()
+    assert failed[0].exc_info is not None
+    assert any("respawned 2/3 drainers" in r.getMessage() for r in caplog.records)
+
+
+async def test_startup_recovery_finite_cap_invalid_key_does_not_take_a_slot(
+    hermetic_recovery: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Combined behavior: the invalid key is filtered by ``recover()`` BEFORE
+    the cap slice, so with cap=2 both valid sessions are respawned at boot --
+    nothing deferred, no read-guard hit, no global error."""
+    qd = hermetic_recovery.queue_dir
+    for key in ("aa-valid", "bad\tkey", "zz-valid"):
+        _write_legacy_log(qd, key)
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 2)
+    app_stub = hermetic_recovery.app
+
+    with caplog.at_level(logging.INFO, logger="context_intelligence_server"):
+        await main_module._startup_recovery(app_stub)
+
+    assert app_stub.state.recovery_error is None
+    assert hermetic_recovery.spawned == ["aa-valid", "zz-valid"]
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("deferred" in m for m in messages), messages
+    assert not any("startup_recovery_read_failed" in m for m in messages), messages
+    assert any("respawned 2/2 drainers" in m for m in messages), messages
+
+
+async def test_startup_recovery_multiple_invalid_keys_filling_cap_do_not_starve_valid(
+    hermetic_recovery: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Invalid keys sort first (control characters < letters), so with cap=2 the
+    entire pre-filter ``recovered[:limit]`` prefix would be invalid keys and
+    both valid sessions would be deferred -- and, since invalid keys never
+    drain, starved forever. After filtering, both valid sessions respawn
+    immediately at boot with nothing deferred."""
+    qd = hermetic_recovery.queue_dir
+    invalid = ["\tbad-1", "\nbad-2", "\x1fbad-3"]
+    for key in [*invalid, "aa-valid", "zz-valid"]:
+        _write_legacy_log(qd, key)
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 2)
+    app_stub = hermetic_recovery.app
+
+    with caplog.at_level(logging.INFO, logger="context_intelligence_server"):
+        await main_module._startup_recovery(app_stub)
+
+    assert app_stub.state.recovery_error is None
+    assert app_stub.state.recovery_complete.is_set()
+    assert hermetic_recovery.spawned == ["aa-valid", "zz-valid"]
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("deferred" in m for m in messages), messages
+    assert not any("startup_recovery_read_failed" in m for m in messages), messages
+    assert len([m for m in messages if "recover_invalid_key_skipped" in m]) == 3
+    for key in invalid:
+        assert (qd / f"{key}.log").exists()
+        assert not (qd / f"{key}.offset").exists()
+
+
+async def test_startup_recovery_multiple_invalid_keys_with_tight_cap_sweep_reaches_valid_tail(
+    hermetic_recovery: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Invalid keys fill (and exceed) the cap=1 prefix. The one valid session
+    that fits the cap respawns at boot, the other is deferred; once the head
+    drains, the sweep dispatches the deferred valid session -- the invalid keys
+    that never drain must not hold a slot at any point."""
+    qd = hermetic_recovery.queue_dir
+    for key in ["\tbad-1", "\nbad-2", "aa-valid", "zz-valid"]:
+        _write_legacy_log(qd, key)
+    monkeypatch.setattr(main_module._settings, "crash_recovery_respawn_limit", 1)
+    app_stub = hermetic_recovery.app
+    qm = registry.queue_manager
+
+    with caplog.at_level(logging.INFO, logger="context_intelligence_server"):
+        await main_module._startup_recovery(app_stub)
+
+    assert app_stub.state.recovery_error is None
+    assert hermetic_recovery.spawned == ["aa-valid"]
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("1/1 respawned" in m and "1 session(s) deferred" in m for m in messages)
+
+    # The head session drains (what a real drainer does); the sweep pass must
+    # now reach the deferred valid key.
+    batch = await qm.read_batch("aa-valid", max_items=10)
+    await qm.commit("aa-valid", batch.end_offset)
+    hermetic_recovery.spawned.clear()
+    dispatched = await main_module._crash_recovery_topup(1)
+    assert dispatched == 1
+    assert hermetic_recovery.spawned == ["zz-valid"]
+
+
+async def test_startup_recovery_does_not_swallow_cancellation(
+    hermetic_recovery: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation raised from ``read_batch`` is shutdown, not a per-key
+    failure: it must propagate out of both the body and the wrapper and must
+    not be recorded as ``recovery_error``."""
+    _write_legacy_log(hermetic_recovery.queue_dir, "aa-valid")
+    monkeypatch.setattr(
+        registry.queue_manager,
+        "read_batch",
+        AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+    app_stub = hermetic_recovery.app
+
+    with pytest.raises(asyncio.CancelledError):
+        await main_module._startup_recovery(app_stub)
+
+    assert app_stub.state.recovery_error is None
+    assert hermetic_recovery.spawned == []
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("bug"), TypeError("bug"), KeyError("k")])
+async def test_startup_recovery_does_not_swallow_programming_errors(
+    hermetic_recovery: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    exc: Exception,
+) -> None:
+    """Only ``(OSError, ValueError)`` are reasonable per-key read failures; a
+    programming error must still surface as the global ``recovery_error``
+    rather than being logged away per key."""
+    for key in ("aa-valid", "zz-valid"):
+        _write_legacy_log(hermetic_recovery.queue_dir, key)
+    monkeypatch.setattr(
+        registry.queue_manager, "read_batch", AsyncMock(side_effect=exc)
+    )
+    app_stub = hermetic_recovery.app
+
+    await main_module._startup_recovery(app_stub)
+
+    assert app_stub.state.recovery_error == repr(exc)
+    assert app_stub.state.recovery_complete.is_set()
+    assert hermetic_recovery.spawned == []
+
+
+async def test_crash_recovery_topup_read_failure_logs_escaped_key(
+    hermetic_recovery: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The sweep's per-key read guard logs the key escaped (``%a``), matching
+    the startup guard: a control-character key cannot split or forge a log
+    line. ``recover()`` is patched to hand the sweep a key that reaches the
+    guard, because the real ``recover()`` now filters such keys earlier; the
+    real ``read_batch`` then rejects it and the valid key still dispatches."""
+    _write_legacy_log(hermetic_recovery.queue_dir, "zz-valid")
+    qm = registry.queue_manager
+    monkeypatch.setattr(qm, "recover", AsyncMock(return_value=["bad\tkey", "zz-valid"]))
+
+    with caplog.at_level(logging.INFO, logger="context_intelligence_server"):
+        dispatched = await main_module._crash_recovery_topup(None)
+
+    assert dispatched == 1
+    assert hermetic_recovery.spawned == ["zz-valid"]
+    failed = [
+        r.getMessage()
+        for r in caplog.records
+        if "crash_recovery_topup_read_failed" in r.getMessage()
+    ]
+    assert len(failed) == 1
+    assert r"session='bad\tkey'" in failed[0]
+    assert _control_free(failed[0]), repr(failed[0])

@@ -1301,6 +1301,12 @@ class SessionRegistry:
         closing" and "it is marked"."""
         worker.store_closed = True
         try:
+            if self.is_recovery:
+                # Every abandoned path converges here (idle, died, cancel,
+                # backoff). Unflushed recovery data is unacknowledged and
+                # replays from the queue; flushing it here would bypass the
+                # pause guard and quarantine eligibility checks.
+                worker.services.graph.discard_buffer()
             await worker.services.graph.close()
         except Exception:
             logger.exception("graph.close failed for session %s", worker.session_id)

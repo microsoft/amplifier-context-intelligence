@@ -268,6 +268,20 @@ changes, scheduler auto-install, or ingestion stop/restart hooks. User-unit setu
 `docs/service-setup.md` → "Nightly online pruning — explicit unattended opt-in".
 Tests: `uv run pytest tests/test_retention_scheduler.py tests/test_retention_client.py -q`.
 
+### Blob migration and startup recovery invariants
+
+- Parse blob URI paths as components without URL-decoding literal `%`, `?`, or `#`; retain structural, unsafe-component, metadata, and symlink guards.
+- A receipt `working_dir` scrub alone is not grounds for unsafe quarantine; refresh its digest and rebuild against the current DB. Legacy/v1 origin matching uses canonical source handle, ordinal, and line SHA without rewriting the old spool.
+- Both receipt DB rebuild paths preserve the existing ordinary file mode before payload copy; do not impose a fresh-DB mode policy or UID-folder rule.
+- Reject malformed or active foreign-root retention snapshots; ignore valid terminal foreign-root history while preserving expiry DB state.
+- Startup recovery skips invalid legacy keys before applying the cap and isolates per-key `OSError`/`ValueError` so other keys continue.
+- On shutdown, an abandoned recovery worker must discard its buffered events before graph close, so quarantined/paused data cannot flush; eligible queued work stays durable for replay. Preserve the live worker's final flush unchanged.
+- Live-backlog admission must treat strict `scandir` failures (`EACCES`, `ENOTDIR`, `EIO`, or a missing initialized directory) as unavailable and block recovery. Keep the separate startup scan lenient.
+- Blob-key migration: ordinary two-part `ci-blob://<session>/<name>` keys keep their historical `.json` paths; unsafe logical keys map to `ci-blob://<session>/~ci-key-v1/<full-domain-SHA256>` and flat `~ci-key-v1~<digest>.blob` filenames.
+- Keep mapped keys structurally disjoint from ordinary raw keys (three URI parts and `.blob` suffix); never URL-decode. Do not change graph/session/node IDs.
+- On POSIX, read a legacy literal-backslash `.json` path exactly first (never follow symlinks), then try its mapped address only after `FileNotFoundError`. Check legacy expiry before mapping on writes; expired data must not be rehydrated.
+- Listing, sizing, dump, retention (offline/online), and session deletion must recognize exact ordinary, mapped, and legacy-backslash forms. Mapped HTTP reads retain the same exact-claims authorization; do not add catch-all access.
+
 ### Temporal properties are `ZONED DATETIME`
 
 All temporal properties are stored as native Neo4j ZONED DATETIME, not ISO strings.
@@ -447,6 +461,7 @@ with admin"). Runtime runbook: `docs/identity-management.md`.
 - **New API endpoint**: Add a route to `main.py` or a new router under `routers/`.
 - **Configuration**: Add fields to `ServerConfig` in `config.py`. Keep defaults conservative.
 - **Tests**: Every handler should have a unit test in `tests/handlers/`. Integration tests live in `tests/integration/`.
+- Durable append-framing regression fixtures are generated deterministically in `tests/test_durable_append_framing.py`; they must be self-contained and must not depend on external ancestor-capture seed files. These synthetic fixtures are not production captures, and the framing tests should run without seed-related skips.
 - **Idle queue workers**: Append notifications belong to `QueueManager`, covering live ingress, recovery and replay alike. Hold the same key guard across clear-before-read and notification wait; never replace that guard while a waiter references it. Signal after a write attempt settles, including cancellation or failure, since readable bytes may remain. Keep notification waits outside dispatch/finalization, preserve periodic stale/trim maintenance, and test both lost-wakeup windows plus cancellation-safe guard cleanup (`tests/test_queue_wakeups.py`). The queue remains crash-durable, not power-loss-durable. Recovery eligibility includes the full batch, including terminal events; acquire locks in the documented order, and retry leases only after proof of a real flush, failing closed on corrupt retry audit.
 - **Server process**: Gunicorn runs one `uvicorn_worker.UvicornWorker` (`worker_class` in `main.py` `run()`), from the `uvicorn-worker` package. Do not use the deprecated `uvicorn.workers` module.
 
