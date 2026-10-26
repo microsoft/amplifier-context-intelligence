@@ -10,6 +10,7 @@ on:
       - 'context_intelligence_server/**'
       - 'pyproject.toml'
       - 'uv.lock'
+      - 'amplifier-online.yaml'
   # Nightly OS-patch refresh. The image floats its Azure Linux base and runs
   # `tdnf update` at build time, but that layer is cache-keyed on its instruction
   # text, so without a periodic cache bust it stops absorbing patches while the
@@ -36,8 +37,10 @@ env:
 
 jobs:
   build:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment: production
     outputs:
       image-digest: ${{ steps.push.outputs.digest }}
       image-tag: ${{ github.sha }}
@@ -78,6 +81,57 @@ jobs:
             ${{ env.IMAGE_NAME }}:latest
           cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      # Packaging only: no sidecar is provisioned or authenticated by this smoke.
+      - name: Smoke test server image (SDK-free)
+        env:
+          SERVER_IMAGE: ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          name="server-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() { timeout 15 docker rm -f "$name" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          timeout 120 docker pull "$SERVER_IMAGE"
+          timeout 60 docker run --rm --pull never --name "$name" \
+            --label "ci.server-smoke=$name" --network none --memory 512m --cpus 1 \
+            --entrypoint python3 -i "$SERVER_IMAGE" - <<'PY'
+          import hashlib
+          import http.client
+          import os
+          import tempfile
+          from importlib.metadata import version
+          from importlib.util import find_spec
+          from pathlib import Path
+          from unittest.mock import patch
+
+          assert version("context-intelligence-server") == "6.11.2"
+          assert find_spec("mise") is None
+          assert find_spec("jwt") is None
+          with tempfile.TemporaryDirectory() as root:
+              prefix = "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_"
+              with patch.dict(os.environ, {
+                  prefix + "AUTH_MODE": "static",
+                  prefix + "API_KEY": "image-smoke-throwaway-key",
+                  prefix + "ALLOW_UNAUTHENTICATED": "false",
+                  prefix + "API_KEYS_STORE_PATH": str(Path(root) / "keys.json"),
+                  prefix + "ENTRA_IDENTITIES_STORE_PATH": str(Path(root) / "identities.json"),
+                  prefix + "LOG_PATH": str(Path(root) / "server.jsonl"),
+              }), patch.object(http.client, "HTTPConnection", side_effect=AssertionError("Unexpected HTTP")):
+                  from context_intelligence_server import mise_validation
+                  from context_intelligence_server.config import Settings
+                  from context_intelligence_server.main import create_asgi_app
+
+                  assert mise_validation.MiseTokenValidator
+                  app = create_asgi_app(Settings(
+                      auth_mode="static",
+                      api_keys={hashlib.sha256(b"image-smoke-throwaway-key").hexdigest(): {"id": "smoke"}},
+                      allow_unauthenticated=False,
+                      api_keys_store_path=str(Path(root) / "static.json"),
+                      entra_identities_store_path=str(Path(root) / "entra.json"),
+                  ))
+                  assert callable(app)
+          print("SDK-free static application construction passed; no sidecar proof")
+          PY
 
       # Pinned to a SHA like every other action here, so Dependabot's existing
       # github-actions group proposes upgrades on a reviewable schedule instead of

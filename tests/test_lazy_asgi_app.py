@@ -33,9 +33,9 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
-from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
@@ -287,3 +287,74 @@ class TestAsgiAppLazySingleton:
             pass
         else:
             raise AssertionError("expected AttributeError for an unknown attribute")
+
+
+class TestSidecarIndependentEntrypoints:
+    @pytest.mark.parametrize("action", ["import", "help", "version", "static"])
+    def test_does_not_import_or_construct_mise(
+        self, tmp_path: Path, action: str
+    ) -> None:
+        env = _clean_env(tmp_path)
+        env.update(
+            {
+                "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AUTH_MODE": "entra",
+                "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_CLIENT_ID": "aaaabbbb-1111-2222-3333-ccccddddeeee",
+                "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_TENANT_ID": "ffffeeee-dddd-cccc-bbbb-aaaa99998888",
+            }
+        )
+        code = """
+import sys
+import http.client
+from importlib.abc import MetaPathFinder
+
+attempts = []
+http_attempts = []
+def reject_connection(*args, **kwargs):
+    http_attempts.append(True)
+    raise AssertionError("Import/help/static must not connect to a sidecar")
+http.client.HTTPConnection = reject_connection
+class RejectMiseImport(MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "mise" or fullname.startswith("mise."):
+            attempts.append(fullname)
+            raise AssertionError("Genuine MISE must not be imported here")
+sys.meta_path.insert(0, RejectMiseImport())
+
+from context_intelligence_server import mise_validation
+def reject_construction(*args, **kwargs):
+    raise AssertionError("MISE validator must not be constructed here")
+mise_validation.MiseTokenValidator.__init__ = reject_construction
+
+from context_intelligence_server import main as module
+assert module._asgi_app is None
+action = sys.argv[1]
+if action == "static":
+    from context_intelligence_server.auth import StaticKeyResolver
+    from context_intelligence_server.config import Settings
+    settings = Settings(
+        auth_mode="static", allow_unauthenticated=False,
+        api_keys_store_path=sys.argv[2],
+    )
+    wrapped = module.create_asgi_app(settings=settings)
+    assert isinstance(wrapped.resolver, StaticKeyResolver)
+elif action in ("help", "version"):
+    try:
+        module.main(["--" + action])
+    except SystemExit as exc:
+        assert exc.code == (0 if action == "help" else 2)
+    else:
+        raise AssertionError("Expected argparse to exit")
+assert attempts == []
+assert http_attempts == []
+assert "mise" not in sys.modules
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code, action, str(tmp_path / "api-keys.json")],
+            cwd=str(PROJECT_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=_FAST_CLI_TIMEOUT_S,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr

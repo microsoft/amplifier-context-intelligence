@@ -11,6 +11,18 @@ IDs, addresses, and endpoints below are **placeholders** — substitute your own
 Never commit real secrets, object IDs, private addresses, or resource names to
 this repo.
 
+> **Sidecar review only; not merge ready.** The server now requires a separately
+> configured localhost MISE sidecar for Entra mode; no Python `mise` SDK or private
+> package feed is required in the server image. The existing v1 route has not
+> established supported sidecar wiring here. The manifest below and in the repo
+> does **not** provision it. Build/release automation remains enabled; merging
+> before wiring is resolved may create an unavailable, fail-closed revision.
+> Establish actually consumed sidecar configuration, resource/probe fit,
+> configured-image conformance, positive user/app tokens, and production telemetry
+> before merging. A successful health response is not signing-key readiness. The platform/DB
+> procedures below are retained reference, not instructions to deploy this review
+> branch as-is. A v2 upgrade is separate work after this release.
+
 > **Two moving parts.** The **server** runs as an Azure Container App (deployed by
 > `amplifier-online`). **Neo4j** runs separately on a **VM inside a private
 > virtual network** (you provision this once). The server reaches Neo4j over
@@ -69,7 +81,10 @@ Preserve these load-bearing steps when editing the `Dockerfile`:
 - **Run `tdnf update` at build time** so the image captures the latest fix-only
   patches before it is pushed.
 
-The image build/run is exercised by `tests/integration/test_docker_image.py`.
+The opt-in `integration and image` tier in
+`tests/integration/test_docker_image.py` builds/runs the real server image in
+static mode. Public contract tests in that file run without Docker; neither
+is proof of a configured MISE sidecar or current S360 clearance.
 
 ### The image is built on the approved base, then imported and deployed by `amplifier-online`
 
@@ -167,7 +182,9 @@ git push        # CI builds from this repo's Dockerfile (approved base) → ghcr
                 # then the provisioner imports ghcr.io → amplifieronlinecr and rolls a revision
 ```
 
-What happens on each push:
+For this repo's existing workflow, builds/releases are restricted to `main`
+and the protected `production` environment, not PR branch pushes. Nightly
+refreshes build/scan/attest but do not deploy. On a qualifying merge:
 
 1. **Build job** builds the image from this repo's `Dockerfile` (approved MCR Azure
    Linux base) and pushes it to **`ghcr.io/<owner>/<repo>-api:<sha>`**.
@@ -559,7 +576,14 @@ Entra mode — seed the identity map (below). The repo-root `deploy.sh` runs
 ## Deploying with Entra auth
 
 To run the server in **Microsoft Entra** mode (`auth_mode=entra`) instead of
-static keys, supply the entra settings via manifest env / Key Vault. The full
+static keys, first establish supported external sidecar wiring on the same
+localhost network at `127.0.0.1:5000`. This repo does not declare sidecar
+manifest fields or a separate MISE service. Verify the effective resource/client,
+tenant, both audiences (`<client_id>` and `api://<client_id>`), user/app token
+support, and PII-safe logging in the deployed sidecar; these are required
+outcomes, not invented environment or manifest keys. Then supply the server's
+entra settings via manifest env / Key Vault. Those settings do not configure
+the sidecar. The full
 model is in [entra-auth-setup.md](entra-auth-setup.md); the deployment-relevant
 variables are:
 

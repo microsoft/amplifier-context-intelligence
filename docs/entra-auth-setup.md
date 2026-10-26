@@ -27,12 +27,12 @@ provenance field. Two authentication modes exist, selected by the single
 | `auth_mode` | Credential | What the server checks |
 |---|---|---|
 | `static` (default) | Pre-shared bearer tokens | `sha256(token)` looked up in the `api_keys` keystore → contributor id |
-| `entra` | Microsoft Entra JWT | RS256 signature (via Entra JWKS) + audience/issuer/tenant/scope, then `oid` → contributor id |
+| `entra` | Microsoft Entra JWT | A separately configured localhost MISE sidecar authenticates the token; application tenant/scope/role policy and `oid` → contributor mapping follow |
 
 In **entra mode** the chain is:
 
 ```
-az access token  →  server validates the JWT  →  extracts the oid claim
+az access token  →  localhost MISE validates authenticity  →  application checks subject claims
    →  oid → contributor (your entra_identities map)  →  created_by = <contributor>
 ```
 
@@ -45,6 +45,18 @@ for the full dual-path model. The two *auth modes* (`static`/`entra`) remain
 mutually exclusive — exactly one resolver is active at a time. Switching is a
 one-line config change (`auth_mode: static` → `auth_mode: entra`) plus the
 supporting fields below.
+
+Entra mode requires a separately configured MISE sidecar at `127.0.0.1:5000`.
+The server image installs locked public Python dependencies only: no Python
+`mise` SDK, private feed, or JWT-validation fallback. Static-key and admin
+behavior are unchanged.
+
+**Sidecar review only; not merge ready.** The existing v1 deployment route has
+no established supported sidecar wiring here. The manifest does not provision
+it, and adding unsupported keys would not establish delivery. Build/release
+automation remains enabled; merging before wiring is resolved may create an
+unavailable, fail-closed revision. Required release evidence is listed in §5;
+an Amplifier Online v2 upgrade is separate work after this release.
 
 All config is read by Pydantic Settings (`config.py`): **environment variables**
 (prefix `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_`) take precedence over the **YAML
@@ -65,8 +77,8 @@ config file**, which takes precedence over defaults.
 > than restating it.
 
 In entra mode the server authenticates **two kinds of token** along separate
-paths inside `EntraResolver.resolve()` (`auth.py`). After the shared JWT
-validation (signature / audience / issuer / `tid`, below), a single
+paths inside `EntraResolver.resolve()` (`auth.py`). After shared MISE authenticity
+validation (`mise_validation.py`) and the application's explicit `tid` check, a single
 **discriminator** picks the path from the token's `scp` and `idtyp` claims:
 
 | Token shape | Path | How it is authorized | `created_by` |
@@ -138,17 +150,26 @@ against.
   *value* (`access_as_user`) or, via the SDK, the resource's **`/.default`** form
   (see below). The GUID is plumbing; it never appears in client code or in this doc.
 
-**What the server checks** (every claim below is enforced in `EntraResolver`,
-`auth.py`):
+**Authenticity boundary and configuration.** `MiseTokenValidator` in
+`mise_validation.py` delegates token authenticity to localhost MISE. The server's
+`azure_client_id` and `azure_tenant_id` settings do **not** configure the sidecar.
+Operators must verify these effective sidecar outcomes through a supported
+external deployment/configuration contract (no schema keys are prescribed here):
 
-| Check | Value (placeholder) | Code |
+| Check | Required outcome (placeholder) | Boundary |
 |---|---|---|
-| Signature algorithm | **RS256** only (`alg=none`/HS256 rejected) | `algorithms=["RS256"]` |
-| Signing key | tenant **JWKS**, eager-fetched at startup | `PyJWKClient(.../<AZURE_TENANT_ID>/discovery/v2.0/keys)` |
-| Audience (`aud`) | one of `<AZURE_CLIENT_ID>` **or** `api://<AZURE_CLIENT_ID>` | `audience=[client_id, "api://"+client_id]` |
-| Issuer (`iss`) | `https://login.microsoftonline.com/<AZURE_TENANT_ID>/v2.0` | `issuer=...` |
-| Tenant (`tid`) | must equal `<AZURE_TENANT_ID>` (explicit, defense-in-depth) | `claims["tid"] == tenant_id` |
-| Required claims | `exp`, `iss`, `aud` must be present | `options={"require": ["exp","iss","aud"]}` |
+| Token authenticity | Signature, issuer, and lifetime validation belong to genuine MISE; only a successful result is accepted | `MiseTokenValidator.validate()`, status **200** |
+| Resource/client and authority | Intended API registration and Microsoft Entra tenant | External sidecar configuration |
+| Audience (`aud`) | one of `<AZURE_CLIENT_ID>` **or** `api://<AZURE_CLIENT_ID>` | External sidecar configuration |
+| Tenant (`tid`) | configured tenant only, plus an explicit application check (defense-in-depth) | External sidecar configuration; `EntraResolver`: `claims.get("tid") == tenant_id` |
+| Token kinds | Both delegated user and app access tokens | External sidecar configuration |
+| Claims source | Successful **subject** claims only; never actor claims for identity | `MiseTokenValidator.validate()` |
+| Privacy | No raw tokens, subject identifiers, or sensitive diagnostics in logs/telemetry | Verify both server and effective sidecar logging policy |
+
+The application does not decode the JWT or maintain a separate signature/key
+validator. It passes the bearer and original URI/method derived from the inbound
+ASGI scope to MISE, not caller-supplied forwarding headers.
+No application-side algorithm/issuer overrides are introduced.
 
 The next checks are **path-specific** — selected by the `scp`/`idtyp`
 discriminator (see the model table above):
@@ -257,7 +278,11 @@ resolves:**
 
 ## 2. Operator guide — configure `auth_mode=entra`
 
-**Goal:** zero to a protected server in under 30 minutes.
+**Prerequisite:** a separately configured sidecar must already be reachable in
+the server's localhost network at `127.0.0.1:5000`, with the verified effective
+configuration outcomes above. Do not expose its validation port publicly.
+The server image and manifest do not provision the sidecar; see
+[verification tiers](#5-verification-tiers) for the open release gates.
 
 ### 2.1 Required settings
 
@@ -362,9 +387,13 @@ supported **bootstrap** state (see §2.5.1).
 **`azure_client_id` and `azure_tenant_id` are still REQUIRED** in `auth_mode=entra`.
 Their absence is a hard startup error.
 
-**On success:** the server starts normally and entra auth is active. (No special
-log line — a clean boot means the validators passed. If the effective identity map
-is empty, the server logs a loud bootstrap WARNING; see §2.5.1.)
+**On success:** the server config passes validation and the Entra resolver
+constructs its localhost adapter. Its malformed-token probe must return exactly
+401; unreachable or unexpected responses refuse startup with a sanitized
+`MISE initialization failed` error. There is no fallback validator.
+This probe proves connectivity/rejection only, not effective configuration,
+signing-key readiness, or positive live-token acceptance. If the effective
+identity map is empty, the server logs the bootstrap WARNING in §2.5.1.
 
 **On misconfiguration**, the server raises and exits with one of these (the message
 names both the env var and the YAML key):
@@ -580,17 +609,20 @@ graph.
   manually correct the already-written `created_by` values in the graph (a data
   operation — there is no automatic backfill).
 
-### 4.2 JWKS / signing-key rotation
+### 4.2 MISE initialization and token validation
 
-The server validates token signatures against Entra's published signing keys
-(JWKS), fetched once **eagerly at startup** (a server with an unreachable JWKS
-endpoint **refuses to start** — fail-closed) and cached thereafter (`PyJWKClient`,
-~5-minute lifespan). Entra rotates signing keys roughly **every 6 weeks**.
+MISE owns token authenticity and signing-key handling. There is no
+application-managed key prefetch or fixed five-minute cache/restart recovery
+contract. The adapter's startup connectivity/rejection probe is eager and
+fail-closed; it is not evidence of a network key fetch or successful live-token
+validation. A successful sidecar health response is not proof of signing-key
+readiness.
 
-- If a wave of **401s** appears immediately after a key rotation, the cache is
-  briefly stale. **Wait one cache cycle (~5 min) or restart once, cleanly.**
-- **Do not** restart repeatedly in a tight loop — that hammers the JWKS endpoint and
-  doesn't speed recovery. One clean restart refreshes the keys.
+Each authenticated request validates again. A MISE rejection or adapter/transport
+failure becomes a sanitized **401**, never cached authorization or a fallback
+validator. Only a successful MISE result supplies claims to the existing Entra
+tenant/scope/role/identity-map policy. The adapter does not return or log sidecar
+diagnostics or raw bearers.
 
 ### 4.3 Reading auth logs
 
@@ -600,7 +632,7 @@ internal error. The raw bearer token is **never** logged (credential hygiene).
 | Log tag | Level | Meaning | Grep |
 |---|---|---|---|
 | `auth_event=auth_denied` | **INFO** | A normal token rejection (401 or 403) — bad/expired/unbound token. Expected, not a server fault. The line includes the reason and status code. | `grep 'auth_event=auth_denied'` |
-| `auth_event=resolver_unexpected_exception` | **ERROR** | An *unexpected* error inside `resolver.resolve()` (e.g. a transient library bug). The request is still denied fail-closed (401, never a 500) and a full stack trace is logged for investigation. | `grep 'auth_event=resolver_unexpected_exception'` |
+| `auth_event=resolver_unexpected_exception` | **ERROR** | An *unexpected* error inside `resolver.resolve()` (e.g. a transient library bug). The request is still denied fail-closed (401, never a 500) and error logging is sanitized, without tokens, URIs, SDK diagnostics, or tracebacks. | `grep 'auth_event=resolver_unexpected_exception'` |
 
 A steady trickle of `auth_denied` is normal. Any `resolver_unexpected_exception` is
 worth investigating — it means the resolver hit something it did not expect.
@@ -633,16 +665,61 @@ legibly instead of as a bare `Invalid isoformat string: ''`.
 
 ---
 
+## 5. Verification tiers
+
+- **Credential-free application tests:** explicit opaque-token validators test
+  Entra authorization, HTTP status dispatch, live-map onboarding/offboarding,
+  static/admin behavior, and `created_by`. Local HTTP doubles separately exercise
+  the sidecar wire contract, repeated/encoded claims, and sanitized failures.
+  Neither proves configured-image MISE conformance.
+
+  ```bash
+  uv sync --locked --dev
+  uv run --locked pytest tests/ -q -m "not neo4j and not integration and not image"
+  uv run --locked pytest tests/test_mise_validation.py -q
+  ```
+
+- **Opt-in real server image tier:** requires Docker, no SDK credentials:
+
+  ```bash
+  uv run --locked pytest tests/integration/test_docker_image.py -q -m "integration and image"
+  ```
+
+  Explicit selection with missing Docker fails, never skips. It builds the
+  shipping image, boots static mode with a throwaway key, and checks status,
+  installed version, and missing-bearer rejection. It does **not** run a MISE
+  sidecar. The protected-main offline image smoke likewise checks SDK-free
+  packaging/static app construction only; neither establishes Entra readiness.
+- **Configured-sidecar conformance:** requires the actual configured image,
+  supported deployment wiring, effective tenant/resource/dual-audience/user/app
+  settings, PII-safe telemetry, fail-closed HTTP/claims behavior, and measured
+  readiness/resource fit. Fake servers and static-mode image tests are not this
+  evidence. A successful health response or malformed-token rejection is not
+  positive-token proof.
+- **Positive live-token/deployed proof:** requires authorized deployment traffic
+  and telemetry for the actual service. Application fakes, malformed-token
+  rejection, and PR checks do not establish this proof or S360 clearance.
+
+**Open release gates:** supported v1 sidecar deployment/configuration wiring,
+configured-image/runtime and production validation, meaningful readiness and
+resource fit, positive user/app token proof, and deployed telemetry. No unsupported
+manifest fields are offered as a substitute. Do not merge this review work
+before those gates are resolved; local/fake tests do not establish S360 clearance.
+
+---
+
 ## Reference — accurate to the code
 
 - Config fields & validators: `context_intelligence_server/config.py`
   (`auth_mode`, `azure_client_id`, `azure_tenant_id`, `entra_identities`,
   `service_identities`, `service_data_role`, `reader_role`, `entra_admin_role`,
   `allow_unauthenticated`, `build_identity_map()`, `build_service_identity_map()`).
-- JWT validation: `context_intelligence_server/auth.py` (`EntraResolver`) — RS256
-  pinned, audience `[<client_id>, api://<client_id>]`, issuer
-  `https://login.microsoftonline.com/<tenant_id>/v2.0`, explicit `tid`; then the
-  **dual-path discriminator** on `scp`/`idtyp`:
+- Token authenticity: `context_intelligence_server/mise_validation.py`
+  (`MiseTokenValidator`) — localhost MISE wire adapter; only successful subject
+  claims cross this boundary. The external sidecar must enforce the configured
+  tenant and audiences `[<client_id>, api://<client_id>]`.
+- Entra policy: `context_intelligence_server/auth.py` (`EntraResolver`) —
+  explicit `tid`, then the **dual-path discriminator** on `scp`/`idtyp`:
   - **User** (`scp` present): `scp` must contain `access_as_user`, `oid` →
     contributor; **403** when the `oid` is unbound.
   - **Service** (`scp` absent): `roles` must contain `Contributor`/`Reader`/

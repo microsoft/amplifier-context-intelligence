@@ -101,10 +101,11 @@ For auth, choose one of:
   ```
 
 - **Microsoft Entra JWT** (`auth_mode=entra`) — clients authenticate with Azure AD
-  bearer tokens instead of pre-shared keys; the server validates the JWT and maps the
-  token's `oid` to a contributor. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md).
+  bearer tokens instead of pre-shared keys; a separately configured localhost
+  MISE sidecar validates token authenticity, then the server maps `oid` to a contributor. See
+  [docs/entra-auth-setup.md](docs/entra-auth-setup.md).
 
-The server verifies every request by hashing the presented token (`sha256(token)`)
+In static mode, the server verifies requests by hashing the presented token (`sha256(token)`)
 and matching the digest. The full guide — adding/revoking/rotating peers, the
 empty-`{}` hard-error rule, and the raw-token-vs-digest guardrail — is in
 [docs/managing-api-keys.md](docs/managing-api-keys.md). Use the client token as
@@ -191,6 +192,18 @@ outage: a 38 GB queue spool, a 22 GB Neo4j, a 43.9 GB OOM-killed startup, and
 
 See [docs/azure-deployment.md](docs/azure-deployment.md) for a full guide to deploying as an Azure Container App with automatic HTTPS, persistent storage, and Neo4j on AuraDB.
 
+The server image installs locked public Python dependencies only; it contains
+neither a Python `mise` SDK nor a JWT-validation fallback. Entra mode requires
+a separately configured MISE sidecar at `127.0.0.1:5000`.
+
+**Sidecar review only; not merge ready.** The existing v1 deployment route has
+no established supported sidecar wiring here; the manifest does not provision one.
+Build/release automation remains enabled: merging before wiring is resolved may
+create an unavailable, fail-closed revision. Configured-image conformance,
+meaningful readiness/resource fit, positive user/app token validations, and
+production telemetry remain release gates, not claims made by local/fake tests.
+An Amplifier Online v2 upgrade is separate work after this release.
+
 ---
 
 ## Sharing with Trusted Peers
@@ -264,9 +277,11 @@ resolver:
 - **`static`** (default) — pre-shared bearer tokens. The server hashes the
   presented token (`sha256`) and looks the digest up in the keystore to get the
   contributor id. See [docs/managing-api-keys.md](docs/managing-api-keys.md).
-- **`entra`** — Microsoft Entra JWTs (RS256, validated against the tenant JWKS,
-  with audience / issuer / `tid` checks), then a **dual-path** discriminator on
-  the token's `scp`/`idtyp` claims:
+- **`entra`** — Microsoft Entra JWT authenticity through localhost MISE
+  (`mise_validation.py`); the external sidecar must be configured for the tenant
+  and both client-ID audiences.
+  The application's explicit `tid` check remains, then a **dual-path**
+  discriminator on the token's `scp`/`idtyp` claims:
   - **User (delegated)** — `scp` present: must contain `access_as_user`, then the
     token's `oid` maps to a contributor via `entra_identities`. *Unchanged.*
   - **Service (app / managed-identity)** — `scp` absent: authorized by an Entra
@@ -294,6 +309,9 @@ middleware, distinct from data keys); in entra mode the App Role named by
 `entra_admin_role` (default `IdentityAdmin`) in the token's `roles` claim. Regular
 data keys/tokens get **403** on `/admin/*`; if the admin credential for the active
 mode is unconfigured, `/admin/*` returns **503**.
+
+MISE replaces only token authenticity; static-key behavior, admin authorization,
+live identity maps, and write-once `created_by` attribution are unchanged.
 
 ### How identity resolution stays fresh — no cache
 
@@ -422,7 +440,7 @@ Values are resolved with this priority (highest first):
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE` | *(env only)* | `server-config.yaml` | Path to the YAML config file |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY` | `api_key` | *(empty — auth disabled)* | Legacy single bearer token (folds to contributor id `owner`). When set, all API endpoints except the fixed exempt set (`/status`, `/version`, `/docs`, `/openapi.json`) require `Authorization: Bearer <value>`. The server verifies a request by computing `sha256(token)` and matching it. Coexists with `api_keys`. See [docs/managing-api-keys.md](docs/managing-api-keys.md). |
 | *(YAML only)* | `api_keys` | *(empty — disabled)* | Per-contributor keystore: a map of `sha256_hex(token) -> {id: <contributor>}`. The server stores only digests; the peer sends the **raw** token and the server hashes it to look up the contributor. `api_keys: {}` (empty map) is a **hard startup error** — omit or use `null` to disable auth. The matched `id` is recorded as `created_by` on graph nodes. See [docs/managing-api-keys.md](docs/managing-api-keys.md). |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AUTH_MODE` | `auth_mode` | `static` | Selects the active resolver: `static` (sha256 keystore, the `api_key`/`api_keys` path above) or `entra` (Microsoft Entra JWT validation via JWKS). Exactly one mode is active. `entra` requires the three fields below. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AUTH_MODE` | `auth_mode` | `static` | Selects the active resolver: `static` (sha256 keystore, the `api_key`/`api_keys` path above) or `entra` (Microsoft Entra token authenticity via a separately configured localhost MISE sidecar). Exactly one mode is active. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md) for sidecar prerequisites and server settings. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_CLIENT_ID` | `azure_client_id` | *(empty)* | App Registration (client) GUID. **Required when `auth_mode=entra`** (startup refuses otherwise). See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_TENANT_ID` | `azure_tenant_id` | *(empty)* | Azure AD tenant GUID. **Required when `auth_mode=entra`**. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES` (JSON) | `entra_identities` | *(empty)* | Identity map `oid -> {id: <contributor>}` for the **user (delegated)** path (oids are Azure Object IDs — **PII**, never commit real values). **Required (non-empty) when `auth_mode=entra`**; the matched `id` is recorded as `created_by`. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
@@ -556,8 +574,16 @@ uv sync
 ### Run tests
 
 ```bash
-uv run pytest tests/ -q
+uv run --locked pytest tests/ -q -m "not neo4j and not integration and not image"
 ```
+
+Ordinary credential-free PR tests exclude real `image` builds/runs. Application
+token-validator fakes prove policy; local HTTP doubles prove the client wire
+contract, not configured MISE conformance. The opt-in `integration and image`
+tier builds the real SDK-free server image and checks static-mode HTTP/auth;
+it does not run a MISE sidecar. Configured-sidecar and positive live-token/deployed
+telemetry proof are separate release gates; see
+[docs/entra-auth-setup.md](docs/entra-auth-setup.md#5-verification-tiers).
 
 ### Project structure
 

@@ -13,62 +13,97 @@ See [README.md](README.md) for full setup instructions.
 
 ---
 
-## Current Work: Documentation & Setup Cleanup
+## Current Work: Paul's S360 MISE Compliance Request
 
-We are cleaning up this repo's **documentation and setup instructions** so the
-server + Neo4j run locally **without Docker Compose**, with API keys primed for
-local runs. Scope is intentionally narrow — do this and nothing else.
+This task is scoped ONLY to `microsoft/amplifier-context-intelligence` and its
+Azure-deployed server. Resonance/other apps and other repositories are out of
+scope. Amplifier Online v2 upgrade is a separate future task AFTER this release,
+not part of this work. Preserve existing authorization, identity, and provenance
+behavior; only Entra token authenticity validation is in scope.
+Review-push authorization is limited to existing PR #128; the release and
+confidentiality constraints are defined under **Boundaries** below.
+
+### Paul's review direction — localhost sidecar review work
+
+Paul's follow-up directs replacing the SDK/CFS integration with a localhost
+MISE sidecar, targeting the **existing** `amplifier-online.yaml` (`web-app-aca`)
+and existing deployment endpoint only. No Amplifier Online v2 migration or
+platform-repo work.
+
+- Preserve `TokenValidator.validate(bearer, *, original_uri, original_method) -> dict`,
+  injectable `EntraResolver`, app-owned authorization/policy, ASGI request context,
+  sanitized fail-closed behavior, required `oid` identity mapping, and user/service
+  compatibility. Retain broad fake-based policy coverage.
+- Implement the known sidecar client protocol and SDK/CFS removal for review.
+  Supported wiring and configured-image conformance gate release, not review
+  implementation; applicable local checks and security review precede pushing.
+- Keep deployment wiring, configured-image/runtime and production validation,
+  positive valid-token proof, telemetry, resource fit, and meaningful readiness
+  gaps explicit as open PR release gates. Local/fake tests prove only their
+  tested client/policy behavior, not configured-image conformance, production
+  success, or S360 clearance.
+- Do not invent manifest keys or claim unsupported/silently ignored sidecars
+  complete deployment wiring. Name the wiring blocker for review without
+  changing another repository. A v2 schema is not v1 evidence.
+- Preserve OS hardening, scanning, deployment gates, bootstrap, and persistent
+  volumes during replacement. Keep raw internal protocol/config notes, private
+  source references, and diagnostic evidence out of public guidance.
+
+### Build and release evidence boundaries
+
+- The server installs locked public dependencies; no Python `mise` SDK, private
+  feed, or JWT fallback. Entra requires separately configured localhost MISE.
+- The manifest needs external sidecar wiring not provisioned here. Review only,
+  not merge ready: merging before supported wiring may create an unavailable,
+  fail-closed revision. Keep existing build/release automation enabled.
+- Credential-free policy/client/delivery contracts are public PR evidence.
+  Only the opt-in `integration and image` tier builds/runs the real server image,
+  in static mode; neither tier proves configured-sidecar/live-token behavior.
+- Sidecar health responses and constructor malformed-token rejection establish
+  connectivity/rejection, not signing-key readiness or positive-token proof.
 
 ### KEEP (do NOT remove)
 
-- **`Dockerfile` (the server image).** This is the shipping-product container and
-  it is **S360-compliant** via PR #50 (`payneio` — "adopt Azure Linux base +
-  remove EOL packaging tools to clear S360 SCA findings",
-  https://github.com/microsoft/amplifier-context-intelligence/pull/50). Do NOT
-  drop the instructions Amplifier uses to build this container.
+- **`Dockerfile` (the server image).** This is the shipping-product container.
+  Preserve the approved-base, OS-patching, and packaging-tool cleanup from
+  [PR #50](https://github.com/microsoft/amplifier-context-intelligence/pull/50).
+  Do NOT drop its build instructions or treat the remediation as current S360 clearance.
   - **Why it must stay on the approved base** (`mcr.microsoft.com/azurelinux/base/python:...`):
     the service is scanned by **S360** (Microsoft security compliance) via
     **Qualys SCA**. Non-approved bases (e.g. Docker Hub `python:*-slim`) and the
     EOL `pip`/`setuptools`/`wheel` rpms they ship get flagged as CVE findings.
-    Azure Linux is continuously patched via a fix-only feed, so CRITICAL/HIGH
-    clear at build time **without suppression lists**, and the base matches the
+    Azure Linux's fix-only feed supplies build-time security patches
+    **without suppression lists**, and the base matches the
     Azure Linux 3.0 AKS nodes this runs on.
   - **The full rationale + the remediation pattern to preserve** (remove EOL rpms
     rather than in-place upgrade; `tdnf update` at build time) live in
     **`docs/azure-deployment.md` → "Container base image policy (S360 / SCA
     compliance)"**. Read it before editing the `Dockerfile`.
-  - **Do NOT create new containers on non-approved bases.** This is exactly why
-    Neo4j is a script, not a `neo4j.Dockerfile` — its Docker Hub base would fail
-    S360. Any future container must use an approved MCR Azure Linux base.
+  - **Do NOT create new containers on non-approved bases.** Any future
+    container must use an approved MCR Azure Linux base.
 - **`.dockerignore` and `docker-entrypoint.sh`** — both support the server
   `Dockerfile` build/first-run; they stay with it.
 - **Test containers** — `tests/neo4j/` fixtures and the `docker` dev-dependency
   spin up throwaway Neo4j for tests. Keeping containers for testing is fine.
 
-### REMOVE
-
-- **`docker-compose.yml` + `docker-compose.airgap.yml`** — the Compose stack
-  hasn't been used in ages. Delete.
-- **`neo4j.Dockerfile`** — we run Neo4j ourselves, so we need a **script, not a
-  container image**. (Its `neo4j:*-community` base is also not an approved base,
-  so it would trip S360 anyway.) Replace with a run/setup script.
-- **`start.sh`** — it only wraps `docker compose up`. Delete once Compose is gone.
-
-### ADD (the real gaps)
-
-- **A script to run Neo4j locally** (install/launch Neo4j 5.x + APOC, `bolt://`
-  auth) — replacing what `neo4j.Dockerfile`/Compose did.
-- **Local credential + API-key priming** — replicate what the container first-run
-  bootstrap generated (Neo4j password + API token + sha256 digest +
-  `server-config.yaml`) for a non-Docker run.
-- **"Ask Amplifier to spin it up" prompts** in the setup instructions.
-
 ### Boundaries
 
-- **No additional work** beyond documentation and setup cleanup. Do not refactor
-  server code or change behavior. (Code defaults that assume Compose — e.g.
-  `neo4j_url = neo4j://neo4j:7687`, `/data/...` storage paths — are
-  **documented-around**, not changed.)
+- **Current task boundary:** Implement only Paul's S360 MISE compliance request
+  for this repo and its Azure-deployed server. Preserve authorization, identity,
+  and provenance behavior except for replacing Entra token authenticity
+  validation with supported MISE. Exclude Resonance/other apps and Amplifier
+  Online v2 migration; v2 upgrade follows this release as a separate future task.
+- **Review, release, and confidentiality:** Commit + push to existing PR #128
+  for Paul's review is explicitly authorized after applicable local checks and
+  security review. Release happens on checks-green merge to `main` through the
+  existing protected-main flow; NO merge, auto-merge, deploy, ad hoc deployment,
+  or manual Azure changes are authorized here. Other pushes/new PRs still need
+  explicit authorization. Keep missing deployment/runtime/production evidence
+  explicit as PR release gates. Never expose credentials, private feed details,
+  internal guides, private source references/URLs, diagnostic facts, or real
+  deployment IDs.
+- **Dependency changes:** Require a server version bump in `pyproject.toml`
+  and an updated lock file.
 - **Planning docs go in the workspace-root `docs/`** (one level up from this
   repo), never in this repo's `docs/`.
 - **This repo's `docs/` is product documentation only** — it ships with the
@@ -118,12 +153,19 @@ the **workspace root `docs/`** (one level up from this repo), never here.
 Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
 
 ```bash
-uv sync
-uv run pytest tests/ -q                    # All tests (no Neo4j required)
-uv run pytest tests/neo4j/ -q              # Neo4j tests (requires running instance)
+uv sync --locked --dev
+uv run --locked pytest tests/ -q -m "not neo4j and not integration and not image"
+uv run --locked pytest tests/neo4j/ -q     # Neo4j tests (requires running instance)
 ```
 
 Most tests run against in-memory fakes. The `tests/neo4j/` suite requires a live Neo4j 5.x instance — see `tests/neo4j/conftest.py` for connection details.
+Real image tests require Docker: `uv run --locked pytest tests/integration/test_docker_image.py -q -m "integration and image"`.
+Explicit selection with missing Docker fails, never silently skips. See
+`docs/entra-auth-setup.md` §5 for the separate configured-sidecar release gates.
+
+**Service-role denial tests:** Use a mapped identity and assert the
+policy-specific denial reason/required roles, not only `403`; otherwise an
+identity-mapping `403` can mask a missing role check.
 
 ---
 
@@ -308,14 +350,14 @@ Canonical guide: `docs/managing-api-keys.md`. Design record:
 
 The server also supports **Microsoft Entra** authentication as an alternative to
 static keys. `auth_mode` (in `config.py`) selects the active resolver — `static`
-(default, the api_keys keystore above) or `entra` (JWT validation via Entra JWKS).
+(default, the api_keys keystore above) or `entra` (token authenticity via MISE).
 Exactly one mode is active; switching is a config change, no code change.
 
 Auth model facts (the canonical statement of "which tokens are accepted" lives in
 `docs/entra-auth-setup.md` — this is a pointer, not a restatement):
-- Entra mode is **dual-path** (M2): after shared RS256 validation (audience
-  `[<client_id>, api://<client_id>]`, issuer `…/<tenant_id>/v2.0`, explicit `tid`),
-  a `scp`/`idtyp` discriminator selects the path:
+- Entra mode is **dual-path** (M2): after shared MISE validation (configured
+  tenant and audiences `[<client_id>, api://<client_id>]`) and the application's
+  explicit `tid` check, a `scp`/`idtyp` discriminator selects the path:
   - **User (delegated)** — `scp` present: must contain `access_as_user`, then
     `oid` → contributor via `entra_identities`. *Unchanged.*
   - **Service (app / managed-identity)** — `scp` absent: authorized by an Entra
@@ -454,5 +496,3 @@ with admin"). Runtime runbook: `docs/identity-management.md`.
 - **Configuration**: Add fields to `ServerConfig` in `config.py`. Keep defaults conservative.
 - **Tests**: Every handler should have a unit test in `tests/handlers/`. Integration tests live in `tests/integration/`.
 - **Server process**: Gunicorn runs one `uvicorn_worker.UvicornWorker` (`worker_class` in `main.py` `run()`), from the `uvicorn-worker` package. Do not use the deprecated `uvicorn.workers` module.
-
-Run `uv run pytest tests/ -q` to verify before committing.

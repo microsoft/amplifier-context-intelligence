@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 # Runtime base: Microsoft Azure Linux 3.0 (CBL-Mariner). Continuously patched by
 # MS with a fix-only security feed, so a build-time `tdnf update` clears reported
 # CRITICAL/HIGH without suppression lists. Also matches the AzureLinux 3.0 AKS
@@ -35,12 +37,20 @@ WORKDIR /app
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-COPY pyproject.toml .
+COPY pyproject.toml uv.lock .
 COPY context_intelligence_server/ context_intelligence_server/
 COPY docker-entrypoint.sh .
 RUN chmod +x docker-entrypoint.sh
 
-RUN uv pip install --system --no-cache .
+# Install the runtime closure from the public lock, then the project without
+# re-resolving its dependencies. Entra validation runs in a separate sidecar.
+RUN uv --no-config export --locked --no-dev --no-emit-project \
+        --format requirements-txt --output-file /tmp/server-requirements.txt && \
+    uv --no-config pip install --system --no-cache --default-index https://pypi.org/simple \
+        --require-hashes -r /tmp/server-requirements.txt && \
+    uv --no-config pip install --system --no-cache --default-index https://pypi.org/simple \
+        --no-deps . && \
+    rm -f /tmp/server-requirements.txt
 
 # security: the Azure Linux base ships EOL Python packaging tools (pip/setuptools/
 # wheel) that Qualys SCA (S360) flags. In-place upgrades don't clear the findings
@@ -63,7 +73,7 @@ RUN tdnf -y remove python3-pip python3-setuptools python3-wheel && \
            /usr/lib/python3.12/site-packages/distutils-precedence.pth \
            /usr/lib/python3.12/site-packages/wheel \
            /usr/lib/python3.12/site-packages/wheel-*.dist-info && \
-    uv pip install --system --no-cache "setuptools>=79" && \
+    uv --no-config pip install --system --no-cache --default-index https://pypi.org/simple "setuptools>=79" && \
     tdnf -y clean all
 
 EXPOSE 8000

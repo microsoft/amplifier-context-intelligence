@@ -1,606 +1,351 @@
-"""T5: JWKS hardening tests — lifespan pin, distinct log tags, post-startup fail-closed.
+"""Safety properties at the application validator boundary (formerly JWKS).
 
-Three areas validated here (council-ordered, trimmed from the full T5 plan):
-
-  1) JWKS_CACHE_LIFESPAN_SECONDS constant + explicit lifespan kwarg to PyJWKClient
-     RED against old code: constant doesn't exist → AttributeError on import.
-     GREEN after: constant added, wired to PyJWKClient(lifespan=...).
-
-  2) Distinct greppable log tags in BearerTokenMiddleware:
-       auth_event=auth_denied          (normal AuthError denial — INFO)
-       auth_event=resolver_unexpected_exception  (catch-all — ERROR)
-     RED against old code: catch-all has no auth_event tag; AuthError path has NO log.
-     GREEN after: both paths emit their respective tags.
-
-  3) Post-startup JWKS failure paths → AuthError(401), NOT unhandled 500.
-     PyJWKClientConnectionError and PyJWKClientError are both PyJWTError subclasses,
-     so EntraResolver.resolve() already converts them to AuthError(401).
-     These are characterisation tests — they pin the contract so a future refactor
-     cannot accidentally break it.
+The server no longer owns PyJWKClient cache/rotation/prefetch mechanics. Keep the
+load-bearing guarantees here: fatal initialization, one validation per request,
+no cached authorization after denial/outage, distinct log severity, and sanitized
+errors. These application doubles do NOT prove cryptographic authenticity;
+configured-image and positive live-token evidence remain separate release gates.
 """
 
 from __future__ import annotations
 
 import logging
-import time
+import traceback
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# Fake constants — NEVER real GUIDs / tenant ids / oids
-# ---------------------------------------------------------------------------
+from context_intelligence_server.auth import (
+    AuthError,
+    BearerTokenMiddleware,
+    EntraResolver,
+)
+from context_intelligence_server.mise_validation import (
+    TokenValidationError,
+    TokenValidator,
+)
+from tests.conftest import ApplicationTokenValidator
+
 FAKE_CLIENT_ID = "aaaabbbb-1111-2222-3333-ccccddddeeee"
 FAKE_TENANT_ID = "ffffeeee-dddd-cccc-bbbb-aaaa99998888"
 FAKE_OID = "11111111-2222-3333-4444-555566667777"
 FAKE_IDENTITY_MAP = {FAKE_OID.lower(): "colombod"}
-FAKE_ISSUER = f"https://login.microsoftonline.com/{FAKE_TENANT_ID}/v2.0"
+REQUEST_URI = "https://service.example.test/events?part=%2F"
+PRIVATE_DIAGNOSTIC = "synthetic native diagnostic that must not escape"
+FAKE_BEARER = "opaque-sensitive-test-handle"
 
 
-# ---------------------------------------------------------------------------
-# RSA keypair fixture (local — not imported from test_entra_resolver.py)
-# ---------------------------------------------------------------------------
+def _claims() -> dict[str, Any]:
+    return {"oid": FAKE_OID, "tid": FAKE_TENANT_ID, "scp": "access_as_user"}
 
 
-@pytest.fixture(scope="module")
-def rsa_keypair_local() -> tuple[Any, Any]:
-    """2048-bit RSA keypair for the one real-crypto test in this module."""
-    from cryptography.hazmat.primitives.asymmetric import rsa
-
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    return private_key, private_key.public_key()
-
-
-# ---------------------------------------------------------------------------
-# Stub JWKS clients
-# ---------------------------------------------------------------------------
-
-
-class _StubSigningKey:
-    def __init__(self, key: Any) -> None:
-        self.key = key
-
-
-class _StubJWKSClient:
-    """Always returns a fixed key; fetch_data is a no-op."""
-
-    def __init__(self, key: Any) -> None:
-        self._key = _StubSigningKey(key)
-
-    def fetch_data(self) -> None:
-        pass
-
-    def get_signing_key_from_jwt(self, token: str) -> _StubSigningKey:
-        return self._key
-
-    def get_jwk_set(self) -> Any:
-        _k = self._key
-
-        class _FakeJWKSet:
-            keys = [_k]
-
-        return _FakeJWKSet()
-
-
-class _PostStartupConnectionFailClient:
-    """Construction succeeds; every signing-key lookup raises PyJWKClientConnectionError.
-
-    Models: JWKS endpoint alive at startup (fetch_data OK), then network dies
-    before any signing-key lookup can succeed (e.g. new kid requires a re-fetch).
-    """
-
-    def fetch_data(self) -> None:
-        pass  # startup succeeds
-
-    def get_jwk_set(self) -> Any:
-        class _FakeJWKSet:
-            keys = [object()]  # non-empty — passes the empty-JWKS guard
-
-        return _FakeJWKSet()
-
-    def get_signing_key_from_jwt(self, token: str) -> Any:
-        from jwt import PyJWKClientConnectionError
-
-        raise PyJWKClientConnectionError(
-            "connection refused — JWKS endpoint unreachable post-startup"
-        )
-
-
-class _PostStartupMalformedJWKSClient:
-    """Construction succeeds; get_signing_key_from_jwt raises a non-connection PyJWKClientError.
-
-    Models: JWKS endpoint returns malformed data or has no matching kid after startup.
-    """
-
-    def fetch_data(self) -> None:
-        pass
-
-    def get_jwk_set(self) -> Any:
-        class _FakeJWKSet:
-            keys = [object()]
-
-        return _FakeJWKSet()
-
-    def get_signing_key_from_jwt(self, token: str) -> Any:
-        from jwt import PyJWKClientError
-
-        raise PyJWKClientError("unable to find a signing key — malformed JWKS response")
-
-
-class _CachedKeyJWKSClient:
-    """Simulates PyJWKClient with a key already in-memory cache.
-
-    After fetch_data() at construction the key is available; get_signing_key_from_jwt
-    returns from 'cache' without a network call, modelling the within-lifespan path.
-    """
-
-    def __init__(self, key: Any) -> None:
-        self._cached = _StubSigningKey(key)
-
-    def fetch_data(self) -> None:
-        pass  # populates 'cache' at construction
-
-    def get_jwk_set(self) -> Any:
-        _k = self._cached
-
-        class _FakeJWKSet:
-            keys = [_k]
-
-        return _FakeJWKSet()
-
-    def get_signing_key_from_jwt(self, token: str) -> _StubSigningKey:
-        return self._cached  # pure cache-hit; no network
-
-
-# ---------------------------------------------------------------------------
-# Helper: build an EntraResolver with an injected JWKS client
-# ---------------------------------------------------------------------------
-
-
-def _make_entra_resolver(jwks_client: Any) -> Any:
-    from context_intelligence_server.auth import EntraResolver
-
+def _make_entra_resolver(validator: TokenValidator) -> EntraResolver:
     return EntraResolver(
         client_id=FAKE_CLIENT_ID,
         tenant_id=FAKE_TENANT_ID,
         identity_map=FAKE_IDENTITY_MAP,
-        jwks_client=jwks_client,
+        validator=validator,
     )
 
 
-# ---------------------------------------------------------------------------
-# Helper: run BearerTokenMiddleware and capture HTTP status + log records
-# ---------------------------------------------------------------------------
+class _FailingValidator:
+    """An application-boundary failure, never a simulated SDK or JWT parser."""
+
+    def __init__(self, failure: Exception) -> None:
+        self.failure = failure
+        self.calls: list[tuple[str, str, str]] = []
+
+    def validate(
+        self, bearer: str, *, original_uri: str, original_method: str
+    ) -> dict[str, Any]:
+        self.calls.append((bearer, original_uri, original_method))
+        raise self.failure
 
 
 async def _run_middleware_and_capture(
-    resolver: Any,
-    token: str = "dummy-bearer",
+    resolver: EntraResolver,
+    token: str = FAKE_BEARER,
     path: str = "/events",
-) -> tuple[int, ...]:
-    """Run middleware; return tuple of received HTTP statuses (usually length 1)."""
-    from context_intelligence_server.auth import BearerTokenMiddleware
+) -> tuple[int, str, bool]:
+    """Run the real middleware and capture its response and downstream dispatch."""
+    dispatched: list[dict[str, Any]] = []
 
-    app = AsyncMock()
+    async def downstream(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        dispatched.append(scope)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
     statuses: list[int] = []
+    bodies: list[bytes] = []
 
     async def capture_send(event: dict[str, Any]) -> None:
         if event.get("type") == "http.response.start":
             statuses.append(event["status"])
+        elif event.get("type") == "http.response.body":
+            bodies.append(event["body"])
 
     scope = {
         "type": "http",
+        "scheme": "https",
         "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"part=%2F",
         "method": "POST",
-        "headers": [(b"authorization", f"Bearer {token}".encode())],
+        "headers": [
+            (b"host", b"service.example.test"),
+            (b"authorization", f"Bearer {token}".encode()),
+        ],
     }
-    middleware = BearerTokenMiddleware(app, resolver=resolver)
+    middleware = BearerTokenMiddleware(downstream, resolver=resolver)
     await middleware(scope, AsyncMock(), capture_send)
-    return tuple(statuses)
+    assert len(statuses) == 1
+    return (
+        statuses[0],
+        b"".join(bodies).decode(),
+        len(dispatched) == 1,
+    )
 
 
-# ===========================================================================
-# 1. LIFESPAN PIN
-# RED against old code: JWKS_CACHE_LIFESPAN_SECONDS doesn't exist.
-# GREEN after: constant added + passed to PyJWKClient(lifespan=...).
-# ===========================================================================
+class TestValidatorInitialization:
+    def test_default_validator_is_constructed_once_and_reused(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        application_validator: ApplicationTokenValidator,
+    ) -> None:
+        """The resolver owns one configured validator, not one per request."""
+        from context_intelligence_server import auth
+
+        constructed: list[bool] = []
+
+        def construct() -> ApplicationTokenValidator:
+            constructed.append(True)
+            return application_validator
+
+        # A local factory-wiring probe, not a suite-wide production override.
+        monkeypatch.setattr(auth, "MiseTokenValidator", construct)
+        resolver = EntraResolver(FAKE_CLIENT_ID, FAKE_TENANT_ID, FAKE_IDENTITY_MAP)
+        assert application_validator.calls == []
+        bearer = application_validator.issue(_claims())
+        for _ in range(2):
+            assert resolver.resolve(
+                bearer, original_uri=REQUEST_URI, original_method="POST"
+            ) == ("colombod", [], False)
+        assert constructed == [True]
+        assert application_validator.calls == [(bearer, REQUEST_URI, "POST")] * 2
+
+    @pytest.mark.parametrize(
+        "failure_type",
+        [ValueError, OSError],
+        ids=["malformed-contract", "transport-failure"],
+    )
+    def test_initialization_failure_is_fatal_and_sanitized(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        failure_type: type[Exception],
+    ) -> None:
+        """Use the real sidecar client's startup failure path."""
+        from context_intelligence_server import mise_validation
+
+        attempts: list[str] = []
+
+        def unavailable(*args: Any, **kwargs: Any) -> Any:
+            attempts.append("exchange")
+            raise failure_type(f"{PRIVATE_DIAGNOSTIC} {FAKE_BEARER}")
+
+        monkeypatch.setattr(mise_validation, "_exchange", unavailable, raising=False)
+        with caplog.at_level(logging.DEBUG), pytest.raises(RuntimeError) as failed:
+            EntraResolver(FAKE_CLIENT_ID, FAKE_TENANT_ID, FAKE_IDENTITY_MAP)
+        assert attempts == ["exchange"]
+        assert str(failed.value) == "MISE initialization failed"
+        assert failed.value.__cause__ is None
+        assert failed.value.__suppress_context__
+        rendered = "".join(traceback.format_exception(failed.value))
+        assert PRIVATE_DIAGNOSTIC not in rendered + caplog.text
+        assert FAKE_BEARER not in rendered + caplog.text
 
 
-class TestJWKSLifespanPin:
-    """JWKS_CACHE_LIFESPAN_SECONDS constant exists and is wired into PyJWKClient."""
-
-    def test_jwks_cache_lifespan_constant_exists(self) -> None:
-        """auth module exposes JWKS_CACHE_LIFESPAN_SECONDS as a positive int.
-
-        RED: AttributeError — module has no attribute 'JWKS_CACHE_LIFESPAN_SECONDS'.
-        GREEN: constant is importable.
-        """
-        import context_intelligence_server.auth as auth_module
-
-        constant = auth_module.JWKS_CACHE_LIFESPAN_SECONDS  # AttributeError if missing
-        assert isinstance(constant, int)
-        assert constant > 0, "lifespan must be a positive number of seconds"
-
-    def test_jwks_cache_lifespan_is_300_seconds(self) -> None:
-        """JWKS_CACHE_LIFESPAN_SECONDS == 300 (matches the PyJWKClient library default).
-
-        Pinning the library default explicitly makes the contract visible in code even
-        though it does not change behaviour at runtime.  If the library default ever
-        changes, this assertion flags the divergence.
-        """
-        import context_intelligence_server.auth as auth_module
-
-        assert auth_module.JWKS_CACHE_LIFESPAN_SECONDS == 300
-
-    def test_pyjwkclient_receives_explicit_lifespan_kwarg(self) -> None:
-        """EntraResolver passes lifespan=JWKS_CACHE_LIFESPAN_SECONDS to PyJWKClient.
-
-        RED: kwarg is absent — PyJWKClient is constructed without 'lifespan'.
-        GREEN: 'lifespan' kwarg is present and matches the constant.
-        """
-        import context_intelligence_server.auth as auth_module
-
-        captured_kwargs: list[dict[str, Any]] = []
-
-        class _CapturingPyJWKClient:
-            def __init__(self, uri: str, **kwargs: Any) -> None:
-                captured_kwargs.append(kwargs)
-
-            def fetch_data(self) -> None:
-                pass
-
-            def get_jwk_set(self) -> Any:
-                class _FJK:
-                    keys = [object()]
-
-                return _FJK()
-
-        with patch(
-            "context_intelligence_server.auth.PyJWKClient", _CapturingPyJWKClient
-        ):
-            from context_intelligence_server.auth import EntraResolver
-
-            EntraResolver(
-                client_id=FAKE_CLIENT_ID,
-                tenant_id=FAKE_TENANT_ID,
-                identity_map=FAKE_IDENTITY_MAP,
-                # no jwks_client → default build path fires and calls PyJWKClient(...)
+class TestValidatorPerRequest:
+    async def test_each_request_validates_once_with_its_uri_and_method(
+        self, application_validator: ApplicationTokenValidator
+    ) -> None:
+        resolver = _make_entra_resolver(application_validator)
+        bearer = application_validator.issue(_claims())
+        assert application_validator.calls == []
+        for path in ("/events", "/admin/identities"):
+            status, _, called = await _run_middleware_and_capture(
+                resolver, bearer, path=path
             )
+            assert status == 200
+            assert called
+        assert application_validator.calls == [
+            (bearer, REQUEST_URI, "POST"),
+            (bearer, "https://service.example.test/admin/identities?part=%2F", "POST"),
+        ]
 
-        assert len(captured_kwargs) == 1, "PyJWKClient constructed exactly once"
-        assert "lifespan" in captured_kwargs[0], (
-            "PyJWKClient must receive an explicit 'lifespan' kwarg — "
-            "this makes the cache TTL contract visible even though it matches the default"
+    async def test_previous_success_is_not_cached_after_validator_denial(
+        self, application_validator: ApplicationTokenValidator
+    ) -> None:
+        resolver = _make_entra_resolver(application_validator)
+        bearer = application_validator.issue(_claims())
+        assert await _run_middleware_and_capture(resolver, bearer) == (200, "", True)
+        application_validator.reject(bearer)
+        status, body, called = await _run_middleware_and_capture(resolver, bearer)
+        assert status == 401
+        assert not called
+        assert "Missing or invalid bearer token" in body
+        assert application_validator.calls == [(bearer, REQUEST_URI, "POST")] * 2
+
+    async def test_previous_success_is_not_cached_during_validator_outage(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        application_validator: ApplicationTokenValidator,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        resolver = _make_entra_resolver(application_validator)
+        bearer = application_validator.issue(_claims())
+        assert await _run_middleware_and_capture(resolver, bearer) == (200, "", True)
+
+        outage = _FailingValidator(
+            TokenValidationError(f"{PRIVATE_DIAGNOSTIC} {bearer}")
         )
-        assert captured_kwargs[0]["lifespan"] == auth_module.JWKS_CACHE_LIFESPAN_SECONDS
+        monkeypatch.setattr(application_validator, "validate", outage.validate)
+        with caplog.at_level(logging.INFO, logger="context_intelligence_server.auth"):
+            status, body, called = await _run_middleware_and_capture(resolver, bearer)
+        assert status == 401
+        assert not called
+        assert application_validator.calls == [(bearer, REQUEST_URI, "POST")]
+        assert outage.calls == [(bearer, REQUEST_URI, "POST")]
+        assert bearer not in body + caplog.text
+        assert PRIVATE_DIAGNOSTIC not in body + caplog.text
+        assert "auth_denied" in caplog.text
 
-    def test_todo_t5_comment_is_replaced(self) -> None:
-        """The '# TODO(T5)' comment is removed from auth.py.
+    @pytest.mark.parametrize("path", ["/status", "/version", "/docs", "/openapi.json"])
+    async def test_exact_exempt_paths_do_not_call_validator(
+        self, application_validator: ApplicationTokenValidator, path: str
+    ) -> None:
+        resolver = _make_entra_resolver(application_validator)
+        assert await _run_middleware_and_capture(resolver, path=path) == (200, "", True)
+        assert application_validator.calls == []
 
-        RED: the TODO comment still exists in source.
-        GREEN: comment has been replaced with a note about PyJWKClient handling.
-        """
-        import inspect
-
-        import context_intelligence_server.auth as auth_module
-
-        source = inspect.getsource(auth_module)
-        assert "TODO(T5)" not in source, (
-            "T5 is done — the TODO(T5) comment must be removed and replaced with "
-            "a note that PyJWKClient handles per-kid caching and lifespan refresh"
-        )
-
-
-# ===========================================================================
-# 2. DISTINCT LOG TAGS
-# RED against old code: catch-all has no auth_event tag; AuthError path has no log.
-# GREEN after: both paths emit distinct tags.
-# ===========================================================================
+    @pytest.mark.parametrize(
+        "path",
+        ["/status/extra", "/version/extra", "/docs/extra", "/openapi.json/extra"],
+    )
+    async def test_exempt_path_prefixes_still_validate(
+        self, application_validator: ApplicationTokenValidator, path: str
+    ) -> None:
+        resolver = _make_entra_resolver(application_validator)
+        status, _, called = await _run_middleware_and_capture(resolver, path=path)
+        assert status == 401
+        assert not called
+        assert application_validator.calls == [
+            (FAKE_BEARER, f"https://service.example.test{path}?part=%2F", "POST")
+        ]
 
 
 class TestDistinctLogTags:
-    """BearerTokenMiddleware emits distinct greppable log tags for the two failure modes."""
-
     async def test_catch_all_logs_resolver_unexpected_exception_tag(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Unexpected resolver exception → ERROR with auth_event=resolver_unexpected_exception.
-
-        RED: log message has no 'resolver_unexpected_exception' tag.
-        GREEN: tag is present in the ERROR log.
-        """
-        from context_intelligence_server.auth import BearerTokenMiddleware
-
-        class _BrokenResolver:
-            @property
-            def auth_enabled(self) -> bool:
-                return True
-
-            def resolve(self, token: str, *, admin_path: bool = False) -> str:
-                _ = admin_path
-                raise RuntimeError("simulated unexpected internal resolver bug")
-
-        middleware = BearerTokenMiddleware(AsyncMock(), resolver=_BrokenResolver())
-        statuses: list[int] = []
-
-        async def capture_send(event: dict[str, Any]) -> None:
-            if event.get("type") == "http.response.start":
-                statuses.append(event["status"])
-
-        scope = {
-            "type": "http",
-            "path": "/events",
-            "headers": [(b"authorization", b"Bearer dummy-token")],
-        }
-
+        validator = _FailingValidator(
+            RuntimeError(f"{PRIVATE_DIAGNOSTIC} {FAKE_BEARER}")
+        )
         with caplog.at_level(logging.ERROR, logger="context_intelligence_server.auth"):
-            await middleware(scope, AsyncMock(), capture_send)
-
-        assert statuses == [401], (
-            "unexpected resolver exception must deny with HTTP 401"
-        )
-
-        # RED: old message has no 'resolver_unexpected_exception' tag
-        all_messages = " ".join(r.getMessage() for r in caplog.records)
-        assert "resolver_unexpected_exception" in all_messages, (
-            "ERROR log must contain 'resolver_unexpected_exception' so operators can "
-            "grep for unexpected resolver crashes distinctly from normal auth denials. "
-            f"Got messages: {all_messages!r}"
-        )
+            status, _, called = await _run_middleware_and_capture(
+                _make_entra_resolver(validator)
+            )
+        assert status == 401
+        assert not called
+        assert validator.calls == [(FAKE_BEARER, REQUEST_URI, "POST")]
+        unexpected = [
+            r
+            for r in caplog.records
+            if "resolver_unexpected_exception" in r.getMessage()
+        ]
+        assert len(unexpected) == 1
+        assert unexpected[0].levelno == logging.ERROR
 
     async def test_auth_error_logs_auth_denied_tag(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """AuthError from resolver → log entry with auth_event=auth_denied.
-
-        RED: the AuthError path in old code emits NO log at all — zero records.
-        GREEN: a log with 'auth_denied' is present at a sub-ERROR level.
-        """
-        from context_intelligence_server.auth import AuthError, BearerTokenMiddleware
-
-        class _DenyingResolver:
-            @property
-            def auth_enabled(self) -> bool:
-                return True
-
-            def resolve(self, token: str, *, admin_path: bool = False) -> str:
-                _ = admin_path
-                raise AuthError(401, "token rejected — auth_denied path test")
-
-        middleware = BearerTokenMiddleware(AsyncMock(), resolver=_DenyingResolver())
-        statuses: list[int] = []
-
-        async def capture_send(event: dict[str, Any]) -> None:
-            if event.get("type") == "http.response.start":
-                statuses.append(event["status"])
-
-        scope = {
-            "type": "http",
-            "path": "/events",
-            "headers": [(b"authorization", b"Bearer dummy-token")],
-        }
-
+        validator = _FailingValidator(TokenValidationError(PRIVATE_DIAGNOSTIC))
         with caplog.at_level(logging.DEBUG, logger="context_intelligence_server.auth"):
-            await middleware(scope, AsyncMock(), capture_send)
-
-        assert statuses == [401]
-
-        # RED: no log at all in the old code → no records with 'auth_denied'
-        all_messages = " ".join(r.getMessage() for r in caplog.records)
-        assert "auth_denied" in all_messages, (
-            "AuthError denial must emit a log containing 'auth_denied' so operators "
-            "can distinguish 'bad token rejected' from 'resolver crashed'. "
-            f"Got messages: {all_messages!r}"
-        )
+            status, _, called = await _run_middleware_and_capture(
+                _make_entra_resolver(validator)
+            )
+        assert status == 401
+        assert not called
+        assert validator.calls == [(FAKE_BEARER, REQUEST_URI, "POST")]
+        assert "auth_denied" in caplog.text
+        assert "resolver_unexpected_exception" not in caplog.text
 
     async def test_auth_error_log_is_below_error_level(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """AuthError denial log is INFO or below — distinguishable from ERROR catch-all.
-
-        Operators who filter at ERROR+ should see only unexpected crashes, not every
-        normal auth rejection (which can be high-volume in production).
-        """
-        from context_intelligence_server.auth import AuthError, BearerTokenMiddleware
-
-        class _DenyingResolver:
-            @property
-            def auth_enabled(self) -> bool:
-                return True
-
-            def resolve(self, token: str, *, admin_path: bool = False) -> str:
-                _ = admin_path
-                raise AuthError(401, "normal rejection — severity check")
-
-        middleware = BearerTokenMiddleware(AsyncMock(), resolver=_DenyingResolver())
-        statuses: list[int] = []
-
-        async def capture_send(event: dict[str, Any]) -> None:
-            if event.get("type") == "http.response.start":
-                statuses.append(event["status"])
-
-        scope = {
-            "type": "http",
-            "path": "/events",
-            "headers": [(b"authorization", b"Bearer t")],
-        }
-
+        validator = _FailingValidator(TokenValidationError(PRIVATE_DIAGNOSTIC))
         with caplog.at_level(logging.DEBUG, logger="context_intelligence_server.auth"):
-            await middleware(scope, AsyncMock(), capture_send)
-
-        auth_denied_records = [
-            r for r in caplog.records if "auth_denied" in r.getMessage()
-        ]
-        assert auth_denied_records, (
-            "auth_denied record must be emitted (tested separately)"
-        )
-        for record in auth_denied_records:
-            assert record.levelno < logging.ERROR, (
-                f"auth_denied log must be below ERROR level; got {record.levelname}"
+            status, _, called = await _run_middleware_and_capture(
+                _make_entra_resolver(validator)
             )
+        assert status == 401
+        assert not called
+        denied = [r for r in caplog.records if "auth_denied" in r.getMessage()]
+        assert denied
+        assert all(r.levelno < logging.ERROR for r in denied)
 
-    async def test_raw_token_not_in_catch_all_log_message(
-        self, caplog: pytest.LogCaptureFixture
+    @pytest.mark.parametrize(
+        "failure_type",
+        [TokenValidationError, ConnectionError, RuntimeError],
+        ids=["validator-denial", "unexpected-outage", "unexpected-bug"],
+    )
+    async def test_raw_token_not_in_errors_logs_or_tracebacks(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        failure_type: type[Exception],
     ) -> None:
-        """The raw bearer token must never appear in the catch-all log MESSAGE.
-
-        Credential hygiene: the exception message may contain the token (we can't
-        control what the resolver puts in RuntimeError), but the middleware's own
-        log message must not echo it.  The exc_info traceback is acceptable.
-        """
-        from context_intelligence_server.auth import BearerTokenMiddleware
-
-        secret_token = "super-secret-bearer-xyz987"
-
-        class _BrokenResolver:
-            @property
-            def auth_enabled(self) -> bool:
-                return True
-
-            def resolve(self, token: str, *, admin_path: bool = False) -> str:
-                _ = admin_path
-                raise RuntimeError("boom — credentials are safe in this test")
-
-        middleware = BearerTokenMiddleware(AsyncMock(), resolver=_BrokenResolver())
-        statuses: list[int] = []
-
-        async def capture_send(event: dict[str, Any]) -> None:
-            if event.get("type") == "http.response.start":
-                statuses.append(event["status"])
-
-        scope = {
-            "type": "http",
-            "path": "/events",
-            "headers": [(b"authorization", f"Bearer {secret_token}".encode())],
-        }
-
-        with caplog.at_level(logging.ERROR, logger="context_intelligence_server.auth"):
-            await middleware(scope, AsyncMock(), capture_send)
-
-        for record in caplog.records:
-            assert secret_token not in record.getMessage(), (
-                f"Raw bearer token must not appear in log MESSAGE; "
-                f"found in: {record.getMessage()!r}"
+        validator = _FailingValidator(
+            failure_type(f"{PRIVATE_DIAGNOSTIC} {FAKE_BEARER}")
+        )
+        with caplog.at_level(logging.DEBUG, logger="context_intelligence_server.auth"):
+            status, body, called = await _run_middleware_and_capture(
+                _make_entra_resolver(validator)
             )
+        assert status == 401
+        assert not called
+        assert body == '{"detail": "Missing or invalid bearer token"}'
+        assert validator.calls == [(FAKE_BEARER, REQUEST_URI, "POST")]
+        assert FAKE_BEARER not in body + caplog.text
+        assert PRIVATE_DIAGNOSTIC not in body + caplog.text
+        assert caplog.records
+        assert all(r.exc_info is None and r.stack_info is None for r in caplog.records)
 
 
-# ===========================================================================
-# 3. POST-STARTUP JWKS FAILURE — FAIL-CLOSED (characterisation tests)
-# ===========================================================================
-
-
-class TestJWKSPostStartupFailClosed:
-    """Post-startup JWKS failures → AuthError(401), NOT unhandled exception / 500.
-
-    PyJWKClientConnectionError and PyJWKClientError are both subclasses of PyJWTError,
-    so the existing ``except jwt.PyJWTError`` in EntraResolver.resolve() already
-    converts them to AuthError(401).  These tests PIN that contract.
-    """
-
-    def test_connection_error_during_signing_key_lookup_raises_auth_error_401(
-        self,
-    ) -> None:
-        """PyJWKClientConnectionError from get_signing_key_from_jwt → AuthError(401).
-
-        Characterisation: post-startup network loss must NOT propagate as an
-        unhandled exception (which the middleware catch-all would turn into 401 anyway,
-        but via the wrong code path — this ensures it goes via the PyJWTError branch).
-        """
-        from context_intelligence_server.auth import AuthError
-
-        resolver = _make_entra_resolver(_PostStartupConnectionFailClient())
-        with pytest.raises(AuthError) as exc_info:
-            resolver.resolve("any-jwt-token")
-        assert exc_info.value.status_code == 401, (
-            "PyJWKClientConnectionError must become AuthError(401), not propagate as 500"
+class TestValidatorPostStartupFailClosed:
+    def test_validator_denial_becomes_sanitized_auth_error_401(self) -> None:
+        validator = _FailingValidator(
+            TokenValidationError(f"{PRIVATE_DIAGNOSTIC} {FAKE_BEARER}")
         )
+        resolver = _make_entra_resolver(validator)
+        with pytest.raises(AuthError) as denied:
+            resolver.resolve(
+                FAKE_BEARER, original_uri=REQUEST_URI, original_method="POST"
+            )
+        assert denied.value.status_code == 401
+        assert denied.value.reason == "Missing or invalid bearer token"
+        assert denied.value.__cause__ is None
+        assert denied.value.__suppress_context__
+        rendered = "".join(traceback.format_exception(denied.value))
+        assert PRIVATE_DIAGNOSTIC not in rendered
+        assert FAKE_BEARER not in rendered
+        assert validator.calls == [(FAKE_BEARER, REQUEST_URI, "POST")]
 
-    def test_malformed_jwks_response_raises_auth_error_401(self) -> None:
-        """Non-connection PyJWKClientError (e.g. no matching kid) → AuthError(401).
-
-        Characterisation: any PyJWKClientError variant must be fail-closed.
-        """
-        from context_intelligence_server.auth import AuthError
-
-        resolver = _make_entra_resolver(_PostStartupMalformedJWKSClient())
-        with pytest.raises(AuthError) as exc_info:
-            resolver.resolve("any-jwt-token")
-        assert exc_info.value.status_code == 401, (
-            "PyJWKClientError (malformed/no-match) must become AuthError(401), not 500"
+    async def test_post_startup_outage_returns_http_401(self) -> None:
+        validator = _FailingValidator(ConnectionError(PRIVATE_DIAGNOSTIC))
+        status, _, called = await _run_middleware_and_capture(
+            _make_entra_resolver(validator)
         )
-
-    def test_cached_key_resolves_after_endpoint_modelled_as_dead(
-        self,
-        rsa_keypair_local: tuple[Any, Any],
-    ) -> None:
-        """Keys in cache (within lifespan window) resolve successfully.
-
-        Models the PyJWKClient cache-hit path: fetch_data() populated the key at
-        construction; get_signing_key_from_jwt() returns from memory without any
-        network call, so resolution succeeds even when the JWKS endpoint is down.
-        """
-        import jwt as pyjwt
-
-        private_key, public_key = rsa_keypair_local
-        now = int(time.time())
-        claims: dict[str, Any] = {
-            "oid": FAKE_OID,
-            "tid": FAKE_TENANT_ID,
-            "scp": "access_as_user",
-            "aud": FAKE_CLIENT_ID,
-            "iss": FAKE_ISSUER,
-            "exp": now + 3600,
-            "iat": now - 10,
-        }
-        token = pyjwt.encode(claims, private_key, algorithm="RS256")
-
-        resolver = _make_entra_resolver(_CachedKeyJWKSClient(public_key))
-        result = resolver.resolve(token)
-        # M2 protocol change: resolve() returns (contributor_id, roles, is_service) 3-tuple.
-        assert result is not None
-        contributor_id, _roles, _is_service = result
-        assert contributor_id == "colombod", (
-            "A cached signing key must resolve a valid token even when the endpoint is down"
-        )
-
-    async def test_post_startup_connection_error_returns_http_401(self) -> None:
-        """End-to-end: PyJWKClientConnectionError → HTTP 401 (not 500) via middleware."""
-        statuses = await _run_middleware_and_capture(
-            _make_entra_resolver(_PostStartupConnectionFailClient())
-        )
-        assert statuses == (401,), (
-            "Post-startup connection error must produce HTTP 401, not 500"
-        )
-
-
-# ===========================================================================
-# 4. PyJWKClientError HIERARCHY SANITY CHECK
-# Pins the PyJWT exception hierarchy that our fail-closed contract relies on.
-# ===========================================================================
-
-
-class TestPyJWKClientErrorHierarchy:
-    """Pin the PyJWT exception hierarchy that the fail-closed guarantee depends on.
-
-    If a future pyjwt release breaks this hierarchy, these tests fail loudly
-    before a silent regression lets 500s through.
-    """
-
-    def test_pyjwkclientconnection_error_is_pyjwterror(self) -> None:
-        """PyJWKClientConnectionError IS-A PyJWTError → caught by resolve()."""
-        from jwt import PyJWKClientConnectionError, PyJWTError
-
-        assert issubclass(PyJWKClientConnectionError, PyJWTError), (
-            "EntraResolver.resolve() catches PyJWTError; "
-            "PyJWKClientConnectionError must remain a subclass for fail-closed to hold"
-        )
-
-    def test_pyjwkclient_error_is_pyjwterror(self) -> None:
-        """PyJWKClientError IS-A PyJWTError → caught by resolve()."""
-        from jwt import PyJWKClientError, PyJWTError
-
-        assert issubclass(PyJWKClientError, PyJWTError), (
-            "EntraResolver.resolve() catches PyJWTError; "
-            "PyJWKClientError must remain a subclass for fail-closed to hold"
-        )
+        assert status == 401
+        assert not called
+        assert validator.calls == [(FAKE_BEARER, REQUEST_URI, "POST")]
