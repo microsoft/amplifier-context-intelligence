@@ -1,16 +1,24 @@
 # M2 auth — live-token acceptance gate
 
-> **Current status: EXECUTED — green on 2026-06-30.** The live-token
+> **Current sidecar gate: NOT EXECUTED. Review only; not merge ready.**
+> Configured MISE sidecar conformance, positive user/app tokens, production
+> telemetry, readiness/resource fit, and supported v1 wiring remain release gates.
+> Existing build/release automation is enabled; merging before wiring is resolved
+> may create an unavailable, fail-closed revision. A v2 upgrade is separate work
+> after this release.
+>
+> **Historical pre-sidecar evidence — green on 2026-06-30.** The live-token
 > acceptance gate ran successfully against a **real** Microsoft Entra app-only
 > token from the corp tenant (`72f988bf-…`):
 > [run 28479002620](https://github.com/microsoft/amplifier-context-intelligence/actions/runs/28479002620)
 > — STEP A.1 reported `ALL CLAIM-SHAPE ASSERTIONS PASSED` and STEP A.2 reported
-> `Resolver ACCEPTED the live token … is_service=True`. M2 is now **verified
-> against reality**: a real app-only token has the shape `EntraResolver`
+> `Resolver ACCEPTED the live token … is_service=True`. This is historical
+> claim-shape evidence: a real app-only token had the shape `EntraResolver`
 > assumes. Acquisition path: federated-OIDC self-call, no secret. One STEP A.1
 > confidence assertion was deliberately broadened to match this tenant's actual
 > token (no `idtyp`/`appidacr` emitted) — see §6. The offline synthetic-token
-> unit tests remain the fast regression layer.
+> tests remain the fast regression layer. That run does not validate the new
+> localhost MISE authenticity boundary or the current mapped-identity assertion.
 
 > **Superseded by the service-identity alignment change.** The resolver's `created_by` **fallback chain
 > described below no longer exists**: `service_identities[oid] → appid → azp
@@ -73,8 +81,21 @@ push/PR.
 
 ## 3. Prerequisites
 
-You need **tenant access** (or someone who has it) to complete these before
-the workflow can do anything beyond skip with a warning.
+You need **tenant access** (or someone who has it) and a separately configured
+MISE sidecar on the acceptance runner. Missing prerequisites **fail**, never
+skip or produce green acceptance evidence.
+
+The workflow does not provision a sidecar. Before credential acquisition it
+checks that the fixed localhost sidecar is reachable and rejects a malformed
+bearer. This proves
+only connectivity/rejection, not signing-key readiness or valid-token acceptance.
+The default GitHub-hosted runner has no sidecar; dispatch will fail at this
+check until supported runner-side wiring is arranged. No platform configuration
+schema, new privileges, or production deployment is implied by this workflow.
+
+Verify the sidecar's effective resource/client, tenant, dual audiences (bare
+client ID and `api://<client_id>`), delegated user/app tokens, and PII-safe
+logging externally. The server's settings do not configure the sidecar.
 
 ### 3.1 A caller app registration with a GitHub-OIDC federated credential
 
@@ -189,6 +210,8 @@ this is additive — omit it entirely for the self-call default.
 |---|---|---|
 | `AZURE_CLIENT_ID` | **Yes** | The API app registration's client ID (the resource). Server's `azure_client_id`. |
 | `AZURE_TENANT_ID` | **Yes** | The Azure AD tenant ID. Server's `azure_tenant_id`. |
+| `ACCEPTANCE_EXPECTED_OID` | **Yes** | Independently verified caller service-principal object ID. Kept in operator configuration, never committed or printed. The resolver must validate this identity, not derive an identity seed from an unverified JWT. |
+| `ACCEPTANCE_CONTRIBUTOR_ID` | **Yes** | Expected mapped contributor handle (`A-Z`, `a-z`, digits, `_`, `-`, up to 100 characters). Used by the local resolver assertion and optional graph read-back. |
 | `AZURE_CALLER_CLIENT_ID` | No (default: same as `AZURE_CLIENT_ID`) | Client ID of a separate caller app registration — only needed for the §3.4 setup. |
 | `ACCEPTANCE_SERVER_URL` | No | Base URL of a **deployed** server to drive STEP B/C end-to-end (e.g. `https://ci-server.example.com`). Omit to run STEP A only (the core gate). |
 | `AZURE_READER_CLIENT_ID` | No | Client ID of the §3.3 Reader-only caller. Enables STEP C. |
@@ -196,16 +219,19 @@ this is additive — omit it entirely for the self-call default.
 | `ACCEPTANCE_READER_ROLE` | No (default `Reader`) | Set only if the live server's `reader_role` differs from the default. |
 | `ACCEPTANCE_ADMIN_ROLE` | No (default `IdentityAdmin`) | Set only if the live server's `entra_admin_role` differs from the default. |
 
-No secret values are configured anywhere for this workflow — by design,
-since federated OIDC is the whole point.
+No long-lived authentication secret is used; federation obtains a masked
+short-lived token. Treat the expected object ID as sensitive operator configuration.
+For optional B/C, pre-map both caller identities in the deployed server's shared
+identity store. Neither `appid` nor `azp` is a fallback contributor identity.
 
 ## 4. Running it
 
 GitHub UI → **Actions** → **M2 Auth — Live-Token Acceptance Gate** → **Run
 workflow**. No inputs to fill in; all configuration comes from the repo
-Variables above. If `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` are unset, the
-`preflight` job prints a warning and the rest of the workflow is skipped
-(not failed) — see the job summary for exactly which Variable is missing.
+Variables above. Missing/invalid resource or expected-identity configuration
+fails preflight. Missing configured localhost sidecar fails the acceptance job
+**before Azure login or token acquisition** with an actionable prerequisite
+message. Neither failure is a successful acceptance run.
 
 > **Must run from the canonical org repo.** Dispatch from
 > `microsoft/amplifier-context-intelligence` on GitHub-hosted runners — that is
@@ -255,37 +281,33 @@ fine):
 
 1. `scp` is **absent** (the discriminator must route this token to the
    service branch).
-2. At least one app-only signal: `idtyp == "app"` **or** `appidacr` is
-   present.
+2. At least one app-only signal: `idtyp == "app"`, `appidacr` present, **or**
+   scp absent together with `appid` / `azp` present (historical finding in §6).
 3. `roles` contains at least one of the server's configured App Roles
    (`Contributor` / `Reader` / `IdentityAdmin`, or your overrides from §3.5).
-4. *(historical assertion, now superseded)* `appid` or `azp` is present — this
-   targeted the old `created_by` fallback chain, which no longer exists (see
-   the note at the top of this document). It no longer gates anything in the
-   resolver; the real requirement now is that the token's `oid` is
-   mapped in the shared identity store (`service_identities` seed, or
-   `PUT /admin/identities`) — otherwise STEP A.2 now fails with 403.
+4. The payload's `oid` matches the **independently configured**
+   `ACCEPTANCE_EXPECTED_OID`. The local resolver is seeded with this configured
+   oid → `ACCEPTANCE_CONTRIBUTOR_ID` mapping, not a value trusted from the payload.
 
-A redacted claim summary is always printed (`aud`, `iss`, `tid`, `scp`
-presence, `idtyp`, `appidacr`, `roles`, `appid`, `azp`, and a truncated
-`oid`). **The raw token is never printed**, only ever referenced through a
-GitHub Actions masked environment variable.
+Only the boolean success summary is printed; claim values, oid, and raw token
+are withheld. The token is referenced through a masked environment variable.
 
 **A.2 — the real resolver, not a re-implementation.** Constructs the actual
-`context_intelligence_server.auth.EntraResolver` (which performs its own
-live JWKS fetch against `https://login.microsoftonline.com/<tenant>/...` —
-i.e. the **real signature verification** the hand-decode in A.1 skips) and
-calls `.resolve(token)` — the exact code path production uses. Asserts:
+`context_intelligence_server.auth.EntraResolver`, which delegates authenticity
+to the separately configured localhost MISE sidecar, and calls
+`.resolve(token, original_uri=..., original_method=...)`. Asserts:
 
 - it does not raise `AuthError` (i.e. the real tenant's signing key
   validates the token, the audience/issuer/tenant checks pass, and a
   qualifying App Role was found), and
 - it returns `is_service=True` (classified as a service/app token, not a
-  delegated user token).
+  delegated user token), and
+- the contributor equals the independently configured
+  `ACCEPTANCE_CONTRIBUTOR_ID` after validated `oid` lookup.
 
-If A.2 fails with a 403, the caller's App Role assignment (§3.2) is missing
-or wrong. If it fails with a 401, re-check the federated credential subject
-(§3.1), the resource URI (`api://<AZURE_CLIENT_ID>`), or the tenant ID.
+Failure diagnostics are intentionally withheld from public logs. Investigate
+tenant/resource/sidecar configuration, App Roles, and expected identity through
+approved private diagnostics; do not paste tokens or subject claims into a PR.
 
 ### STEP B — optional, best-effort, never fails the job
 
@@ -308,16 +330,16 @@ Only runs when `ACCEPTANCE_SERVER_URL` is set:
 
 Only runs when **both** `ACCEPTANCE_SERVER_URL` and `AZURE_READER_CLIENT_ID`
 are set: logs in as the Reader-only caller (§3.3), requests a token, and
-asserts `POST /events` returns **403** (write requires `Contributor`; a
-Reader-only token must be rejected on a write route per
-`authz.require_write`).
+first asserts `GET /whoami` returns **200**, then asserts `POST /events`
+returns **403**. The positive read establishes authenticity and identity mapping
+before checking write-role denial, so a mapping 403 cannot mask the role check.
 
 ### Pass criterion, in one sentence
 
-Preflight **proceeded** (not skipped), and **both** STEP A.1
+Preflight and the configured-sidecar prerequisite **passed**, and **both** STEP A.1
 (`ALL CLAIM-SHAPE ASSERTIONS PASSED`) and STEP A.2 (`Resolver ACCEPTED … is_service=True`)
 are green on a real federated-OIDC token from the corp tenant — with the run
-link and decoded-claims output attached to the PR. STEP B/C are best-effort and
+link and sanitized boolean summaries attached to the PR. STEP B/C are best-effort and
 never decide the verdict.
 
 ### Evidence to capture for the PR
@@ -327,11 +349,11 @@ A green run is only useful if it is auditable. Attach to the PR:
 1. **Permalink to the green run**, explicitly noting it ran in
    `microsoft/amplifier-context-intelligence` (not a fork — see §4).
 2. **STEP A.1** (step id `assert_shape`): the `ALL CLAIM-SHAPE ASSERTIONS PASSED`
-   line plus the redacted claim summary (`aud`/`iss`/`tid`/`roles`/`appid`/`azp`,
-   `scp` absent). **Never paste a raw token.**
+   line (scp absent, qualifying role and expected oid present). **Never paste
+   a raw token or subject identifiers.**
 3. **STEP A.2** (step id `assert_resolver`): the `Resolver ACCEPTED the live
    token: created_by=… is_service=True` line — the load-bearing proof that
-   production code (with its live JWKS fetch) accepted a real token.
+   production code (through configured localhost MISE) accepted a real token.
    `is_service` MUST be `True`.
 4. If run: **STEP B** `202` and **STEP C** `403` lines.
 5. One line naming the **acquisition path** (federated-OIDC self-call, or the
@@ -346,7 +368,8 @@ A green run is only useful if it is auditable. Attach to the PR:
 
 ## 6. Honest gaps — what we could not determine without a real token
 
-> **RESOLVED 2026-06-30 — [run 28479002620](https://github.com/microsoft/amplifier-context-intelligence/actions/runs/28479002620).**
+> **Historical claim-shape finding, not sidecar acceptance —
+> [run 28479002620](https://github.com/microsoft/amplifier-context-intelligence/actions/runs/28479002620).**
 > The gate has now seen a real app-only token from this tenant. Confirmed
 > claim shape (redacted):
 >
@@ -374,23 +397,15 @@ A green run is only useful if it is auditable. Attach to the PR:
 > now comes solely from the shared identity store's mapped contributor id; `azp`
 > is no longer read for this purpose.
 
-We have never seen a real Microsoft Entra app-only access token from this
-tenant, only Microsoft's general documentation and the Team Pulse mirror
-referenced in `auth.py`'s docstring. Specifically uncertain, and exactly
-what this gate exists to settle:
+The historical token shape does not establish configured-sidecar behavior.
+Current gaps are supported runner/deployment wiring, effective sidecar
+configuration, meaningful readiness/resource fit, positive user/app token
+validation, and production telemetry. In particular:
 
-- **Whether `appidacr` is actually present** on a v2.0 app-only access
-  token issued by this tenant for this audience. It is a well-documented
-  optional claim, but optional claims configuration on the app registration
-  can suppress it. The A.1 check accepts `idtyp == "app"` **or**
-  `appidacr` present — if neither shows up, that is a real finding, not a
-  workflow bug; check what the printed claim summary actually contains and
-  loosen/adjust the assertion deliberately (with eyes open) rather than
-  assuming the workflow is broken.
-- **Whether `idtyp` is present at all** on a v2.0 token from a workload
-  federated identity vs. a Managed Identity vs. a client-credentials flow —
-  these can differ. This gate's first real run is the first time we'll know
-  for this tenant.
+- A successful sidecar health response does not prove signing-key readiness.
+- Constructor malformed-token rejection is not positive-token proof.
+- Fake HTTP tests and static-mode server image tests do not run the configured
+  MISE image.
 - **The exact graph schema for the STEP B read-back.** The Cypher query in
   STEP B assumes some node in the graph carries a `session_id` property
   matching the probe event. This is plausible (events are queued under
@@ -398,9 +413,8 @@ what this gate exists to settle:
   (`docs/architecture/03-graph-model.dot`) as part of this work — hence
   STEP B is explicitly best-effort/non-blocking.
 
-If A.1 or A.2 fail on the **first real run**, that is exactly the signal
-this gate was built to surface — do not treat it as a workflow bug without
-first reading the printed claim summary and the resolver's actual error.
+If A.1 or A.2 fail, investigate the failed step and approved private diagnostics;
+the public log deliberately withholds claim values and resolver diagnostics.
 
 ## 7. Reference — accurate to the code
 

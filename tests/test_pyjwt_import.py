@@ -32,10 +32,16 @@ def test_static_import_and_construction_need_neither_mise_nor_pyjwt(
     """Fresh-process import guard, not fake SDK installation or token validation."""
     code = """
 import hashlib
+import http.client
 import sys
 from importlib.abc import MetaPathFinder
 
 attempts = []
+http_attempts = []
+def reject_connection(*args, **kwargs):
+    http_attempts.append(True)
+    raise AssertionError("Static mode must not connect to a sidecar")
+http.client.HTTPConnection = reject_connection
 class RejectAuthenticitySdkImport(MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname.split(".")[0] in {"mise", "jwt"}:
@@ -60,6 +66,7 @@ assert wrapped.resolver.resolve("static-import-handle") == (
     "static-contributor", [], False
 )
 assert attempts == []
+assert http_attempts == []
 assert "mise" not in sys.modules
 assert "jwt" not in sys.modules
 """

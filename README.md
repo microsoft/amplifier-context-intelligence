@@ -101,8 +101,8 @@ For auth, choose one of:
   ```
 
 - **Microsoft Entra JWT** (`auth_mode=entra`) — clients authenticate with Azure AD
-  bearer tokens instead of pre-shared keys; genuine Microsoft MISE 2.7.0 validates
-  token authenticity, then the server maps `oid` to a contributor. See
+  bearer tokens instead of pre-shared keys; a separately configured localhost
+  MISE sidecar validates token authenticity, then the server maps `oid` to a contributor. See
   [docs/entra-auth-setup.md](docs/entra-auth-setup.md).
 
 In static mode, the server verifies requests by hashing the presented token (`sha256(token)`)
@@ -192,11 +192,17 @@ outage: a 38 GB queue spool, a 22 GB Neo4j, a 43.9 GB OOM-killed startup, and
 
 See [docs/azure-deployment.md](docs/azure-deployment.md) for a full guide to deploying as an Azure Container App with automatic HTTPS, persistent storage, and Neo4j on AuraDB.
 
-The production image is configured to acquire genuine internal Microsoft MISE
-2.7.0 through CFS only, using required BuildKit secrets — never the public PyPI
-package named `mise`. Its protected-main image gate fails closed before deployment.
-Production CFS identity/feed/federation configuration is not yet provisioned;
-this is not evidence of a successful CFS image build or S360 clearance.
+The server image installs locked public Python dependencies only; it contains
+neither a Python `mise` SDK nor a JWT-validation fallback. Entra mode requires
+a separately configured MISE sidecar at `127.0.0.1:5000`.
+
+**Sidecar review only; not merge ready.** The existing v1 deployment route has
+no established supported sidecar wiring here; the manifest does not provision one.
+Build/release automation remains enabled: merging before wiring is resolved may
+create an unavailable, fail-closed revision. Configured-image conformance,
+meaningful readiness/resource fit, positive user/app token validations, and
+production telemetry remain release gates, not claims made by local/fake tests.
+An Amplifier Online v2 upgrade is separate work after this release.
 
 ---
 
@@ -271,8 +277,9 @@ resolver:
 - **`static`** (default) — pre-shared bearer tokens. The server hashes the
   presented token (`sha256`) and looks the digest up in the keystore to get the
   contributor id. See [docs/managing-api-keys.md](docs/managing-api-keys.md).
-- **`entra`** — Microsoft Entra JWT authenticity through genuine MISE 2.7.0
-  (`mise_validation.py`), configured for the tenant and both client-ID audiences.
+- **`entra`** — Microsoft Entra JWT authenticity through localhost MISE
+  (`mise_validation.py`); the external sidecar must be configured for the tenant
+  and both client-ID audiences.
   The application's explicit `tid` check remains, then a **dual-path**
   discriminator on the token's `scp`/`idtyp` claims:
   - **User (delegated)** — `scp` present: must contain `access_as_user`, then the
@@ -433,7 +440,7 @@ Values are resolved with this priority (highest first):
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE` | *(env only)* | `server-config.yaml` | Path to the YAML config file |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY` | `api_key` | *(empty — auth disabled)* | Legacy single bearer token (folds to contributor id `owner`). When set, all API endpoints except the fixed exempt set (`/status`, `/version`, `/docs`, `/openapi.json`) require `Authorization: Bearer <value>`. The server verifies a request by computing `sha256(token)` and matching it. Coexists with `api_keys`. See [docs/managing-api-keys.md](docs/managing-api-keys.md). |
 | *(YAML only)* | `api_keys` | *(empty — disabled)* | Per-contributor keystore: a map of `sha256_hex(token) -> {id: <contributor>}`. The server stores only digests; the peer sends the **raw** token and the server hashes it to look up the contributor. `api_keys: {}` (empty map) is a **hard startup error** — omit or use `null` to disable auth. The matched `id` is recorded as `created_by` on graph nodes. See [docs/managing-api-keys.md](docs/managing-api-keys.md). |
-| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AUTH_MODE` | `auth_mode` | `static` | Selects the active resolver: `static` (sha256 keystore, the `api_key`/`api_keys` path above) or `entra` (Microsoft Entra token authenticity via genuine MISE 2.7.0). Exactly one mode is active. Entra settings are described below; see [docs/entra-auth-setup.md](docs/entra-auth-setup.md) for SDK prerequisites and configuration. |
+| `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AUTH_MODE` | `auth_mode` | `static` | Selects the active resolver: `static` (sha256 keystore, the `api_key`/`api_keys` path above) or `entra` (Microsoft Entra token authenticity via a separately configured localhost MISE sidecar). Exactly one mode is active. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md) for sidecar prerequisites and server settings. |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_CLIENT_ID` | `azure_client_id` | *(empty)* | App Registration (client) GUID. **Required when `auth_mode=entra`** (startup refuses otherwise). See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_TENANT_ID` | `azure_tenant_id` | *(empty)* | Azure AD tenant GUID. **Required when `auth_mode=entra`**. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
 | `AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES` (JSON) | `entra_identities` | *(empty)* | Identity map `oid -> {id: <contributor>}` for the **user (delegated)** path (oids are Azure Object IDs — **PII**, never commit real values). **Required (non-empty) when `auth_mode=entra`**; the matched `id` is recorded as `created_by`. See [docs/entra-auth-setup.md](docs/entra-auth-setup.md). |
@@ -567,14 +574,15 @@ uv sync
 ### Run tests
 
 ```bash
-uv run --locked pytest tests/ -q -m "not neo4j and not integration and not mise"
+uv run --locked pytest tests/ -q -m "not neo4j and not integration and not image"
 ```
 
-Ordinary public/credential-free PR tests exclude `mise`. Their application
-token-validator fakes prove policy and wiring, not genuine SDK validation.
-Ordinary PR OIDC is prohibited and compliant ordinary-PR feed authentication
-does not exist under current policy. Genuine Linux/native tests and positive
-live-token/deployed telemetry proof are separate tiers; see
+Ordinary credential-free PR tests exclude real `image` builds/runs. Application
+token-validator fakes prove policy; local HTTP doubles prove the client wire
+contract, not configured MISE conformance. The opt-in `integration and image`
+tier builds the real SDK-free server image and checks static-mode HTTP/auth;
+it does not run a MISE sidecar. Configured-sidecar and positive live-token/deployed
+telemetry proof are separate release gates; see
 [docs/entra-auth-setup.md](docs/entra-auth-setup.md#5-verification-tiers).
 
 ### Project structure

@@ -7,6 +7,7 @@ from collections.abc import Callable, MutableMapping
 from typing import Any
 from urllib.parse import quote
 
+from starlette.concurrency import run_in_threadpool
 from typing_extensions import Protocol
 
 from context_intelligence_server.mise_validation import (
@@ -207,7 +208,7 @@ class EntraResolver:
         reader_role:          App Role name granting read-only access.  ``""`` disables.
         entra_admin_role:     App Role name granting admin access.  ``""`` disables.
         validator:            Injectable application token validator. The default
-                              constructs and configures MISE once at startup.
+                              checks the localhost sidecar once at startup.
     """
 
     def __init__(
@@ -232,9 +233,7 @@ class EntraResolver:
         self._reader_role = reader_role
         self._entra_admin_role = entra_admin_role
         self._validator: TokenValidator = (
-            validator
-            if validator is not None
-            else MiseTokenValidator(client_id, tenant_id)
+            validator if validator is not None else MiseTokenValidator()
         )
 
     @property
@@ -717,7 +716,8 @@ class BearerTokenMiddleware:
             query = scope.get("query_string", b"").decode("latin-1")
             if query:
                 request_uri += f"?{query}"
-            result = self.resolver.resolve(
+            result = await run_in_threadpool(
+                self.resolver.resolve,
                 token,
                 original_uri=request_uri,
                 original_method=scope.get("method", ""),

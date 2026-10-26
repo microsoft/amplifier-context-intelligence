@@ -1021,8 +1021,8 @@ def create_asgi_app(
     *_token_validator* is an application token validator used **only** when
     ``auth_mode="entra"`` — intended for tests that need to construct an
     :class:`~context_intelligence_server.auth.EntraResolver` without making
-    real SDK calls. Production deployments leave it as ``None``; the
-    resolver constructs the genuine ``MiseTokenValidator`` once at startup.
+    real sidecar HTTP calls. Production deployments leave it as ``None``; the
+    resolver constructs ``MiseTokenValidator`` once at startup.
 
     Startup behavior on an EMPTY store:
         An empty keystore (static) or empty identity map (entra) does NOT

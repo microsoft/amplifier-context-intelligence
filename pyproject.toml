@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "context-intelligence-server"
-version = "6.11.1"
+version = "6.11.2"
 description = "Context Intelligence Server for Amplifier"
 requires-python = ">=3.11"
 dependencies = [
@@ -23,7 +23,6 @@ dependencies = [
     "neo4j>=5.0",
     "aiofiles>=24.0.0",
     "pyyaml>=6.0",
-    "cffi>=1.16.0",
 ]
 
 [project.scripts]
@@ -41,7 +40,7 @@ testpaths = ["tests"]
 markers = [
     "neo4j: marks tests as requiring a live Neo4j container (deselect with -m 'not neo4j')",
     "integration: marks tests that exercise live async drain-workers or the full HTTP pipeline (deselect with -m 'not integration')",
-    "mise: requires the genuine MISE 2.7.0 package and Linux x86_64 with ICU (deselect with -m 'not mise')",
+    "image: builds and runs the real server image; requires Docker (deselect with -m 'not image')",
 ]
 timeout = 30
 

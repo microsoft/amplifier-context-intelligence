@@ -1,2 +1,0 @@
-# Genuine Microsoft MISE Release wheel; acquire only through the configured CFS index.
-mise==2.7.0 --hash=sha256:aa08b4b17e5e76022ed2e06e356c817d7ea01e15d1fdb097f274bf7959056af0

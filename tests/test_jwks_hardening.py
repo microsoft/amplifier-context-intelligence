@@ -3,8 +3,8 @@
 The server no longer owns PyJWKClient cache/rotation/prefetch mechanics. Keep the
 load-bearing guarantees here: fatal initialization, one validation per request,
 no cached authorization after denial/outage, distinct log severity, and sanitized
-errors. These application doubles do NOT prove cryptographic authenticity; that
-requires the genuine SDK tier in test_mise_validation.py.
+errors. These application doubles do NOT prove cryptographic authenticity;
+configured-image and positive live-token evidence remain separate release gates.
 """
 
 from __future__ import annotations
@@ -116,10 +116,10 @@ class TestValidatorInitialization:
         """The resolver owns one configured validator, not one per request."""
         from context_intelligence_server import auth
 
-        constructed: list[tuple[str, str]] = []
+        constructed: list[bool] = []
 
-        def construct(client_id: str, tenant_id: str) -> ApplicationTokenValidator:
-            constructed.append((client_id, tenant_id))
+        def construct() -> ApplicationTokenValidator:
+            constructed.append(True)
             return application_validator
 
         # A local factory-wiring probe, not a suite-wide production override.
@@ -131,13 +131,13 @@ class TestValidatorInitialization:
             assert resolver.resolve(
                 bearer, original_uri=REQUEST_URI, original_method="POST"
             ) == ("colombod", [], False)
-        assert constructed == [(FAKE_CLIENT_ID, FAKE_TENANT_ID)]
+        assert constructed == [True]
         assert application_validator.calls == [(bearer, REQUEST_URI, "POST")] * 2
 
     @pytest.mark.parametrize(
         "failure_type",
-        [ImportError, OSError],
-        ids=["sdk-missing", "native-load-failure"],
+        [ValueError, OSError],
+        ids=["malformed-contract", "transport-failure"],
     )
     def test_initialization_failure_is_fatal_and_sanitized(
         self,
@@ -145,19 +145,19 @@ class TestValidatorInitialization:
         caplog: pytest.LogCaptureFixture,
         failure_type: type[Exception],
     ) -> None:
-        """Use the real adapter's failure path; do not install a fake mise module."""
+        """Use the real sidecar client's startup failure path."""
         from context_intelligence_server import mise_validation
 
         attempts: list[str] = []
 
-        def unavailable(name: str) -> Any:
-            attempts.append(name)
+        def unavailable(*args: Any, **kwargs: Any) -> Any:
+            attempts.append("exchange")
             raise failure_type(f"{PRIVATE_DIAGNOSTIC} {FAKE_BEARER}")
 
-        monkeypatch.setattr(mise_validation, "import_module", unavailable)
+        monkeypatch.setattr(mise_validation, "_exchange", unavailable, raising=False)
         with caplog.at_level(logging.DEBUG), pytest.raises(RuntimeError) as failed:
             EntraResolver(FAKE_CLIENT_ID, FAKE_TENANT_ID, FAKE_IDENTITY_MAP)
-        assert attempts == ["mise"]
+        assert attempts == ["exchange"]
         assert str(failed.value) == "MISE initialization failed"
         assert failed.value.__cause__ is None
         assert failed.value.__suppress_context__

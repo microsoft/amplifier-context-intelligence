@@ -10,7 +10,7 @@ on:
       - 'context_intelligence_server/**'
       - 'pyproject.toml'
       - 'uv.lock'
-      - 'requirements-mise.txt'
+      - 'amplifier-online.yaml'
   # Nightly OS-patch refresh. The image floats its Azure Linux base and runs
   # `tdnf update` at build time, but that layer is cache-keyed on its instruction
   # text, so without a periodic cache bust it stops absorbing patches while the
@@ -49,75 +49,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Check CFS configuration
-        env:
-          CFS_AZURE_CLIENT_ID: ${{ vars.CFS_AZURE_CLIENT_ID }}
-          CFS_AZURE_TENANT_ID: ${{ vars.CFS_AZURE_TENANT_ID }}
-          CFS_PYTHON_INDEX_URL: ${{ secrets.CFS_PYTHON_INDEX_URL }}
-        run: |
-          python3 - <<'PY'
-          import os
-
-          for name in ("CFS_AZURE_CLIENT_ID", "CFS_AZURE_TENANT_ID", "CFS_PYTHON_INDEX_URL"):
-              if not os.environ.get(name, "").strip():
-                  raise SystemExit(f"Missing required CFS configuration: {name}")
-          PY
-
-      - name: Log in to Azure for CFS
-        uses: Azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
-        with:
-          client-id: ${{ vars.CFS_AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.CFS_AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-
-      - name: Set up CFS
-        uses: 1es-actions/setup-cfs@ca9f87a2de7ac289f170105e79a9d2e68ac6ce32 # v1.1
-
-      - name: Write CFS BuildKit secrets
-        env:
-          CFS_PYTHON_INDEX_URL: ${{ secrets.CFS_PYTHON_INDEX_URL }}
-        run: |
-          umask 077
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          from urllib.parse import urlsplit
-
-          token = os.environ.get("CFS_ACCESSTOKEN", "")
-          if not token.strip():
-              raise SystemExit("Missing CFS_ACCESSTOKEN")
-          index_url = os.environ.get("CFS_PYTHON_INDEX_URL", "")
-          try:
-              url = urlsplit(index_url)
-              _ = url.port
-              valid = (
-                  url.scheme == "https" and bool(url.hostname)
-                  and url.username is None and url.password is None
-                  and "?" not in index_url and "#" not in index_url
-                  and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in index_url)
-              )
-          except ValueError:
-              valid = False
-          if not valid:
-              raise SystemExit(
-                  "Invalid CFS_PYTHON_INDEX_URL: require HTTPS without credentials, query, or fragment"
-              )
-          config = (
-              '[[index]]\nname = "cfs"\n'
-              f'url = {json.dumps(index_url)}\n'
-              'default = true\nauthenticate = "always"\n'
-          )
-          for filename, contents in (("cfs-uv.toml", config), ("cfs-token", token)):
-              fd = os.open(
-                  Path(os.environ["RUNNER_TEMP"]) / filename,
-                  os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                  0o600,
-              )
-              with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                  stream.write(contents)
-          PY
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
@@ -145,81 +76,61 @@ jobs:
           push: true
           build-args: |
             OS_PATCH_EPOCH=${{ steps.epoch.outputs.day }}
-          secret-files: |
-            cfs_config=${{ runner.temp }}/cfs-uv.toml
-            cfs_token=${{ runner.temp }}/cfs-token
           tags: |
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
             ${{ env.IMAGE_NAME }}:latest
           cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
 
-      - name: Smoke test native MISE
+      # Packaging only: no sidecar is provisioned or authenticated by this smoke.
+      - name: Smoke test server image (SDK-free)
         env:
-          MISE_IMAGE: ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          SERVER_IMAGE: ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
         run: |
-          docker run --rm --network none --entrypoint python3 -i "$MISE_IMAGE" - <<'PY'
-          import json
-          import traceback
+          set -euo pipefail
+          name="server-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() { timeout 15 docker rm -f "$name" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          timeout 120 docker pull "$SERVER_IMAGE"
+          timeout 60 docker run --rm --pull never --name "$name" \
+            --label "ci.server-smoke=$name" --network none --memory 512m --cpus 1 \
+            --entrypoint python3 -i "$SERVER_IMAGE" - <<'PY'
+          import hashlib
+          import http.client
+          import os
+          import tempfile
           from importlib.metadata import version
+          from importlib.util import find_spec
+          from pathlib import Path
+          from unittest.mock import patch
 
-          from context_intelligence_server.mise_validation import (
-              MiseTokenValidator,
-              TokenValidationError,
-          )
+          assert version("context-intelligence-server") == "6.11.2"
+          assert find_spec("mise") is None
+          assert find_spec("jwt") is None
+          with tempfile.TemporaryDirectory() as root:
+              prefix = "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_"
+              with patch.dict(os.environ, {
+                  prefix + "AUTH_MODE": "static",
+                  prefix + "API_KEY": "image-smoke-throwaway-key",
+                  prefix + "ALLOW_UNAUTHENTICATED": "false",
+                  prefix + "API_KEYS_STORE_PATH": str(Path(root) / "keys.json"),
+                  prefix + "ENTRA_IDENTITIES_STORE_PATH": str(Path(root) / "identities.json"),
+                  prefix + "LOG_PATH": str(Path(root) / "server.jsonl"),
+              }), patch.object(http.client, "HTTPConnection", side_effect=AssertionError("Unexpected HTTP")):
+                  from context_intelligence_server import mise_validation
+                  from context_intelligence_server.config import Settings
+                  from context_intelligence_server.main import create_asgi_app
 
-          client_id = "aaaaaaaa-0000-0000-0000-000000000001"
-          tenant_id = "bbbbbbbb-0000-0000-0000-000000000002"
-          bearer = "not-a-jwt"
-          try:
-              import mise
-
-              assert version("mise") == "2.7.0"
-              client = mise.Mise()
-              configuration = {
-                  "MiseVersion": "2.0",
-                  "AzureAd": {
-                      "Instance": "https://login.microsoftonline.com/",
-                      "ClientId": client_id,
-                      "TenantId": tenant_id,
-                      "ValidTenantIds": [tenant_id],
-                      "Audiences": [client_id, f"api://{client_id}"],
-                      "Protocols": {
-                          "Bearer": {
-                              "TokenTypes": {
-                                  "AccessToken": {"UserToken": True, "AppToken": True}
-                              }
-                          }
-                      },
-                  },
-              }
-              with client.configure(json.dumps(configuration), "AzureAd") as result:
-                  assert result.error_code == 0
-              validation_input = mise.MiseValidationInput()
-              validation_input.authorization_header = f"Bearer {bearer}"
-              validation_input.original_uri_header = "https://service.example.test/events"
-              validation_input.original_method_header = "POST"
-              with client.validate(validation_input=validation_input) as result:
-                  assert result.http_response_status_code == 401
-                  assert result.subject_claims == []
-          except Exception:  # noqa: BLE001 - Never emit SDK/native diagnostics.
-              raise SystemExit("Native MISE smoke failed") from None
-
-          validator = MiseTokenValidator(client_id, tenant_id)
-          try:
-              validator.validate(
-                  bearer,
-                  original_uri="https://service.example.test/events",
-                  original_method="POST",
-              )
-          except TokenValidationError as error:
-              assert str(error) == "Token validation failed"
-              assert error.__cause__ is None and error.__suppress_context__
-              rendered = "".join(traceback.format_exception(error))
-              assert client_id not in rendered and tenant_id not in rendered
-              assert bearer not in rendered
-          else:
-              raise AssertionError("MISE accepted a malformed bearer")
+                  assert mise_validation.MiseTokenValidator
+                  app = create_asgi_app(Settings(
+                      auth_mode="static",
+                      api_keys={hashlib.sha256(b"image-smoke-throwaway-key").hexdigest(): {"id": "smoke"}},
+                      allow_unauthenticated=False,
+                      api_keys_store_path=str(Path(root) / "static.json"),
+                      entra_identities_store_path=str(Path(root) / "entra.json"),
+                  ))
+                  assert callable(app)
+          print("SDK-free static application construction passed; no sidecar proof")
           PY
 
       # Pinned to a SHA like every other action here, so Dependabot's existing
@@ -248,10 +159,6 @@ jobs:
           subject-name: "${{ env.IMAGE_NAME }}"
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
-
-      - name: Remove CFS BuildKit secrets
-        if: always()
-        run: rm -f -- "$RUNNER_TEMP/cfs-uv.toml" "$RUNNER_TEMP/cfs-token"
 
   deploy:
     needs: build

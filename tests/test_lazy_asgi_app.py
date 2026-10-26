@@ -33,9 +33,9 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
-from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
@@ -289,7 +289,7 @@ class TestAsgiAppLazySingleton:
             raise AssertionError("expected AttributeError for an unknown attribute")
 
 
-class TestMiseSdkIndependentEntrypoints:
+class TestSidecarIndependentEntrypoints:
     @pytest.mark.parametrize("action", ["import", "help", "version", "static"])
     def test_does_not_import_or_construct_mise(
         self, tmp_path: Path, action: str
@@ -304,9 +304,15 @@ class TestMiseSdkIndependentEntrypoints:
         )
         code = """
 import sys
+import http.client
 from importlib.abc import MetaPathFinder
 
 attempts = []
+http_attempts = []
+def reject_connection(*args, **kwargs):
+    http_attempts.append(True)
+    raise AssertionError("Import/help/static must not connect to a sidecar")
+http.client.HTTPConnection = reject_connection
 class RejectMiseImport(MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname == "mise" or fullname.startswith("mise."):
@@ -339,6 +345,7 @@ elif action in ("help", "version"):
     else:
         raise AssertionError("Expected argparse to exit")
 assert attempts == []
+assert http_attempts == []
 assert "mise" not in sys.modules
 """
         result = subprocess.run(

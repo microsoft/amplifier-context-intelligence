@@ -16,30 +16,51 @@ See [README.md](README.md) for full setup instructions.
 ## Current Work: Paul's S360 MISE Compliance Request
 
 This task is scoped ONLY to `microsoft/amplifier-context-intelligence` and its
-Azure-deployed server. Resonance/other apps and Amplifier Online v2 migration are
-out of scope. Preserve existing authorization, identity, and provenance
-behavior; only Entra token authenticity has changed to MISE. Target a
-checks-green PR merged to `main`, then the protected-main image gate before the
-existing deployment flow; no ad hoc deployment or manual Azure changes. Do not
-push, open a PR, merge, or deploy without explicit authorization. Never expose
-credentials, private feed details, internal guides, or real deployment IDs.
+Azure-deployed server. Resonance/other apps and other repositories are out of
+scope. Amplifier Online v2 upgrade is a separate future task AFTER this release,
+not part of this work. Preserve existing authorization, identity, and provenance
+behavior; only Entra token authenticity validation is in scope.
+Review-push authorization is limited to existing PR #128; the release and
+confidentiality constraints are defined under **Boundaries** below.
 
-- **Authenticity boundary:** `context_intelligence_server/mise_validation.py`
-  uses genuine internal Microsoft MISE **2.7.0**, never the public PyPI package
-  named `mise`. Downstream Entra authorization, live identity maps, `created_by`,
-  static-key behavior, and admin gates are unchanged.
-- **Production acquisition:** CFS only, via required BuildKit secrets, with no
-  public fallback or persisted feed credentials. The protected-main image gate
-  fails closed on missing configuration, acquisition, or native validation.
-- **PR evidence:** ordinary PR checks are credential-free and exclude `mise`;
-  application fakes prove policy/wiring, not genuine SDK authenticity. Ordinary
-  PR OIDC is prohibited, so compliant ordinary-PR feed authentication does not
-  exist under current policy.
-- **External production blocker:** protected production CFS
-  identity/feed/federation configuration is not provisioned. The acquisition
-  path is implemented, not evidence of a successful production CFS build.
-  Positive live-token proof and S360 clearance still require authorized
-  deployment traffic and telemetry; neither is established by these tests.
+### Paul's review direction — localhost sidecar review work
+
+Paul's follow-up directs replacing the SDK/CFS integration with a localhost
+MISE sidecar, targeting the **existing** `amplifier-online.yaml` (`web-app-aca`)
+and existing deployment endpoint only. No Amplifier Online v2 migration or
+platform-repo work.
+
+- Preserve `TokenValidator.validate(bearer, *, original_uri, original_method) -> dict`,
+  injectable `EntraResolver`, app-owned authorization/policy, ASGI request context,
+  sanitized fail-closed behavior, required `oid` identity mapping, and user/service
+  compatibility. Retain broad fake-based policy coverage.
+- Implement the known sidecar client protocol and SDK/CFS removal for review.
+  Supported wiring and configured-image conformance gate release, not review
+  implementation; applicable local checks and security review precede pushing.
+- Keep deployment wiring, configured-image/runtime and production validation,
+  positive valid-token proof, telemetry, resource fit, and meaningful readiness
+  gaps explicit as open PR release gates. Local/fake tests prove only their
+  tested client/policy behavior, not configured-image conformance, production
+  success, or S360 clearance.
+- Do not invent manifest keys or claim unsupported/silently ignored sidecars
+  complete deployment wiring. Name the wiring blocker for review without
+  changing another repository. A v2 schema is not v1 evidence.
+- Preserve OS hardening, scanning, deployment gates, bootstrap, and persistent
+  volumes during replacement. Keep raw internal protocol/config notes, private
+  source references, and diagnostic evidence out of public guidance.
+
+### Build and release evidence boundaries
+
+- The server installs locked public dependencies; no Python `mise` SDK, private
+  feed, or JWT fallback. Entra requires separately configured localhost MISE.
+- The manifest needs external sidecar wiring not provisioned here. Review only,
+  not merge ready: merging before supported wiring may create an unavailable,
+  fail-closed revision. Keep existing build/release automation enabled.
+- Credential-free policy/client/delivery contracts are public PR evidence.
+  Only the opt-in `integration and image` tier builds/runs the real server image,
+  in static mode; neither tier proves configured-sidecar/live-token behavior.
+- Sidecar health responses and constructor malformed-token rejection establish
+  connectivity/rejection, not signing-key readiness or positive-token proof.
 
 ### KEEP (do NOT remove)
 
@@ -71,11 +92,18 @@ credentials, private feed details, internal guides, or real deployment IDs.
   for this repo and its Azure-deployed server. Preserve authorization, identity,
   and provenance behavior except for replacing Entra token authenticity
   validation with supported MISE. Exclude Resonance/other apps and Amplifier
-  Online v2 migration.
-- **Release and confidentiality:** Target a checks-green PR merged to `main`.
-  No ad hoc deployment or manual Azure changes; no push, PR, merge, or deploy
-  without explicit authorization. Never expose credentials, private feed
-  details, internal guides, or real deployment IDs.
+  Online v2 migration; v2 upgrade follows this release as a separate future task.
+- **Review, release, and confidentiality:** Commit + push to existing PR #128
+  for Paul's review is explicitly authorized after applicable local checks and
+  security review. Release happens on checks-green merge to `main` through the
+  existing protected-main flow; NO merge, auto-merge, deploy, ad hoc deployment,
+  or manual Azure changes are authorized here. Other pushes/new PRs still need
+  explicit authorization. Keep missing deployment/runtime/production evidence
+  explicit as PR release gates. Never expose credentials, private feed details,
+  internal guides, private source references/URLs, diagnostic facts, or real
+  deployment IDs.
+- **Dependency changes:** Require a server version bump in `pyproject.toml`
+  and an updated lock file.
 - **Planning docs go in the workspace-root `docs/`** (one level up from this
   repo), never in this repo's `docs/`.
 - **This repo's `docs/` is product documentation only** — it ships with the
@@ -126,13 +154,18 @@ Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
 
 ```bash
 uv sync --locked --dev
-uv run --locked pytest tests/ -q -m "not neo4j and not integration and not mise"
+uv run --locked pytest tests/ -q -m "not neo4j and not integration and not image"
 uv run --locked pytest tests/neo4j/ -q     # Neo4j tests (requires running instance)
 ```
 
 Most tests run against in-memory fakes. The `tests/neo4j/` suite requires a live Neo4j 5.x instance — see `tests/neo4j/conftest.py` for connection details.
-The genuine `mise` tier separately requires Linux x86_64, ICU, and the approved
-internal SDK; see `docs/entra-auth-setup.md` §5 for what each test tier proves.
+Real image tests require Docker: `uv run --locked pytest tests/integration/test_docker_image.py -q -m "integration and image"`.
+Explicit selection with missing Docker fails, never silently skips. See
+`docs/entra-auth-setup.md` §5 for the separate configured-sidecar release gates.
+
+**Service-role denial tests:** Use a mapped identity and assert the
+policy-specific denial reason/required roles, not only `403`; otherwise an
+identity-mapping `403` can mask a missing role check.
 
 ---
 
@@ -463,6 +496,3 @@ with admin"). Runtime runbook: `docs/identity-management.md`.
 - **Configuration**: Add fields to `ServerConfig` in `config.py`. Keep defaults conservative.
 - **Tests**: Every handler should have a unit test in `tests/handlers/`. Integration tests live in `tests/integration/`.
 - **Server process**: Gunicorn runs one `uvicorn_worker.UvicornWorker` (`worker_class` in `main.py` `run()`), from the `uvicorn-worker` package. Do not use the deprecated `uvicorn.workers` module.
-
-Run `uv run --locked pytest tests/ -q -m "not neo4j and not integration and not mise"`
-for the public check lane; it is not genuine SDK or deployed-token proof.

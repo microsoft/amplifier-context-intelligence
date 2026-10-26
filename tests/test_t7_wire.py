@@ -13,8 +13,10 @@ RED before implementation: these tests FAIL until production changes are applied
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -613,8 +615,7 @@ class TestTokenValidatorFactory:
         from context_intelligence_server import auth
         from context_intelligence_server.main import create_asgi_app
 
-        def refuse_start(client_id: str, tenant_id: str) -> None:
-            assert (client_id, tenant_id) == (FAKE_CLIENT_ID, FAKE_TENANT_ID)
+        def refuse_start() -> None:
             raise failure
 
         def refuse_network(*args: Any, **kwargs: Any) -> None:
@@ -629,7 +630,7 @@ class TestTokenValidatorFactory:
 
         assert denied.value is failure
 
-    def test_real_adapter_import_failure_refuses_startup_without_diagnostics(
+    def test_real_adapter_transport_failure_refuses_startup_without_diagnostics(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -638,14 +639,15 @@ class TestTokenValidatorFactory:
         from context_intelligence_server import mise_validation
         from context_intelligence_server.main import create_asgi_app
 
-        def refuse_import(name: str) -> Any:
-            assert name == "mise"
-            raise ModuleNotFoundError("sensitive native import diagnostics")
+        def refuse_exchange(*args: Any, **kwargs: Any) -> Any:
+            raise ValueError("sensitive transport diagnostics")
 
         def refuse_network(*args: Any, **kwargs: Any) -> None:
             raise AssertionError("Unexpected legacy JWKS network access")
 
-        monkeypatch.setattr(mise_validation, "import_module", refuse_import)
+        monkeypatch.setattr(
+            mise_validation, "_exchange", refuse_exchange, raising=False
+        )
         monkeypatch.setattr("urllib.request.urlopen", refuse_network)
         with pytest.raises(
             RuntimeError, match="^MISE initialization failed$"
@@ -653,7 +655,7 @@ class TestTokenValidatorFactory:
             create_asgi_app(settings=_token_validator_settings(tmp_path))
 
         assert denied.value.__suppress_context__ is True
-        assert "sensitive native import diagnostics" not in caplog.text
+        assert "sensitive transport diagnostics" not in caplog.text
 
     async def test_serving_entrypoint_loads_authenticated_asgi_wrapper(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -951,3 +953,117 @@ class TestTokenValidatorUriComponents:
         assert validator.calls == [("opaque.raw+bearer/==", uri, "PATCH")]
         assert scope.get("state", {}).get("contributor_id") == "mapped-contributor"
         app.assert_awaited_once_with(scope, receive, send)
+
+
+class TestBlockingValidation:
+    @pytest.mark.parametrize("delete_identity", [False, True])
+    async def test_version_remains_responsive_and_live_deletion_wins(
+        self, tmp_path: Path, delete_identity: bool
+    ) -> None:
+        from context_intelligence_server.main import (  # noqa: PLC0415
+            create_asgi_app,
+            get_entra_identity_store,
+        )
+
+        entered, release = threading.Event(), threading.Event()
+        timed_out: list[bool] = []
+
+        class BlockingValidator(_RequestTokenValidator):
+            def validate(
+                self, bearer: str, *, original_uri: str, original_method: str
+            ) -> dict[str, Any]:
+                entered.set()
+                if not release.wait(2):
+                    timed_out.append(True)
+                return super().validate(
+                    bearer, original_uri=original_uri, original_method=original_method
+                )
+
+        wrapped = create_asgi_app(
+            settings=_token_validator_settings(tmp_path),
+            _token_validator=BlockingValidator(),
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=wrapped),
+            base_url="https://ingest.example",
+        ) as client:
+            pending = asyncio.create_task(
+                client.get(
+                    "/whoami", headers={"Authorization": "Bearer blocking-token"}
+                )
+            )
+            try:
+                assert await asyncio.to_thread(entered.wait, 3)
+                # If validation runs inline, the bounded fallback above releases it;
+                # this assertion then fails rather than deadlocking the test runner.
+                version = await asyncio.wait_for(client.get("/version"), timeout=1)
+                assert version.status_code == 200
+                assert not pending.done()
+                assert not timed_out
+                if delete_identity:
+                    store = get_entra_identity_store()
+                    assert store is not None
+                    store.delete(FAKE_OID_1.lower())
+            finally:
+                release.set()
+                response = await asyncio.wait_for(pending, timeout=3)
+            assert response.status_code == (403 if delete_identity else 200)
+
+    async def test_parallel_validation_retains_each_request_context(self) -> None:
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        from context_intelligence_server.auth import BearerTokenMiddleware  # noqa: PLC0415
+
+        rendezvous = threading.Barrier(2, timeout=2)
+        calls: list[tuple[str, str, str, bool]] = []
+        loop_thread = threading.get_ident()
+        state_threads: list[int] = []
+
+        class Resolver:
+            auth_enabled = True
+
+            def resolve(
+                self,
+                token: str,
+                *,
+                original_uri: str,
+                original_method: str,
+                admin_path: bool = False,
+            ) -> tuple[str, list[str], bool]:
+                assert threading.get_ident() != loop_thread
+                calls.append((token, original_uri, original_method, admin_path))
+                rendezvous.wait()
+                return token, [original_method], False
+
+        async def downstream(scope: dict[str, Any], receive: Any, send: Any) -> None:
+            state_threads.append(threading.get_ident())
+
+        middleware = BearerTokenMiddleware(downstream, resolver=Resolver())
+        scopes = [
+            {
+                "type": "http",
+                "scheme": "https",
+                "path": path,
+                "method": method,
+                "headers": [
+                    (b"host", b"ingest.example"),
+                    (b"authorization", f"Bearer {token}".encode()),
+                ],
+            }
+            for path, method, token in [
+                ("/events", "PATCH", "first"),
+                ("/admin/identities", "GET", "second"),
+            ]
+        ]
+        await asyncio.gather(
+            *[middleware(scope, AsyncMock(), AsyncMock()) for scope in scopes]
+        )
+        assert set(calls) == {
+            ("first", "https://ingest.example/events", "PATCH", False),
+            ("second", "https://ingest.example/admin/identities", "GET", True),
+        }
+        assert [scope["state"]["contributor_id"] for scope in scopes] == [
+            "first",
+            "second",
+        ]
+        assert state_threads == [loop_thread, loop_thread]

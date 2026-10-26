@@ -15,7 +15,8 @@ httpx → ASGITransport.  Covers all nine §7 CAP rows:
 
 Pattern: explicit opaque-token application validator, create_asgi_app with
 service role names configured. This is policy evidence, not authenticity
-evidence (the genuine tier lives in test_mise_validation.py). Claims follow the discriminator in
+evidence. test_mise_validation.py provides client-wire-contract coverage using
+local HTTP doubles, not real MISE authenticity. Claims follow the discriminator in
 auth.py EntraResolver.resolve(): human tokens have scp="access_as_user" (user
 branch, is_service=False); service tokens omit scp (service branch, is_service=True).
 """
@@ -296,11 +297,22 @@ class TestM2CapabilityDeps:
 
     async def test_cap_sr_w_reader_write_blocked(
         self,
-        service_asgi: tuple[Any, Any],
+        service_asgi_with_map: tuple[Any, Any],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """CAP-SR-w: service Reader → POST /events → 403 (require_write fails)."""
-        validator, asgi = service_asgi
+        """CAP-SR-w: mapped service Reader → POST /events → require_write 403.
+
+        The mapped oid passes identity resolution; require_write denies access.
+        """
+        import context_intelligence_server.main as main_module  # noqa: PLC0415
+
+        validator, asgi = service_asgi_with_map
         token = validator.issue(_service_claims(roles=["Reader"]))
+
+        get_or_create = MagicMock()
+        append = AsyncMock()
+        monkeypatch.setattr(main_module.registry, "get_or_create", get_or_create)
+        monkeypatch.setattr(main_module.registry.queue_manager, "append", append)
 
         async with _make_client(asgi) as c:
             resp = await c.post(
@@ -318,6 +330,11 @@ class TestM2CapabilityDeps:
         assert resp.status_code == 403, (
             f"CAP-SR-w: expected 403 for Reader on /events, got {resp.status_code}: {resp.text}"
         )
+        assert resp.json()["detail"].startswith(
+            "Forbidden: write access requires the App Role 'Contributor'."
+        )
+        get_or_create.assert_not_called()
+        append.assert_not_called()
 
     # -- CAP-SR-r: service Reader → GET /blobs/{sid} → 2xx ----------------
 
@@ -350,11 +367,22 @@ class TestM2CapabilityDeps:
 
     async def test_cap_sadm_w_admin_only_write_blocked(
         self,
-        service_asgi: tuple[Any, Any],
+        service_asgi_with_map: tuple[Any, Any],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """CAP-SADM-w: service IdentityAdmin (no Contributor) → POST /events → 403."""
-        validator, asgi = service_asgi
+        """CAP-SADM-w: mapped service IdentityAdmin-only → require_write 403.
+
+        The mapped oid passes identity resolution; require_write denies access.
+        """
+        import context_intelligence_server.main as main_module  # noqa: PLC0415
+
+        validator, asgi = service_asgi_with_map
         token = validator.issue(_service_claims(roles=["IdentityAdmin"]))
+
+        get_or_create = MagicMock()
+        append = AsyncMock()
+        monkeypatch.setattr(main_module.registry, "get_or_create", get_or_create)
+        monkeypatch.setattr(main_module.registry.queue_manager, "append", append)
 
         async with _make_client(asgi) as c:
             resp = await c.post(
@@ -373,6 +401,11 @@ class TestM2CapabilityDeps:
             f"CAP-SADM-w: expected 403 for IdentityAdmin-only on /events, "
             f"got {resp.status_code}: {resp.text}"
         )
+        assert resp.json()["detail"].startswith(
+            "Forbidden: write access requires the App Role 'Contributor'."
+        )
+        get_or_create.assert_not_called()
+        append.assert_not_called()
 
     # -- CAP-SADM-a: service IdentityAdmin → /admin/* → 2xx ----------------
 
