@@ -752,6 +752,68 @@ async def test_separator_and_control_keys_round_trip_through_a_flat_mapped_file(
     assert not (tmp_path / "sess").exists()
 
 
+@pytest.mark.parametrize("session", ["s" * 300, "é" * 150], ids=["ascii", "multibyte"])
+@pytest.mark.parametrize("operation", ["read", "size", "dump"])
+async def test_mapped_blob_long_original_session_round_trips_read_size_and_dump(
+    store: AsyncDiskBlobStore, tmp_path: Path, session: str, operation: str
+) -> None:
+    from context_intelligence_server.utils import fold_name
+
+    folded_session = fold_name(session, _MAX_SESSION_ID_BYTES)
+    canonical_uri = f"ci-blob://{folded_session}/{_MARK}/{_SLASH_DIGEST}"
+    original_uri = f"ci-blob://{session}/{_MARK}/{_SLASH_DIGEST}"
+    payload = {"mapped": "a/b", "text": "café"}
+    assert await store.write(session, "a/b", payload) == canonical_uri
+    physical = _blobs(tmp_path, folded_session) / f"{_MARK}~{_SLASH_DIGEST}.blob"
+    physical_bytes = physical.read_bytes()
+
+    for spelling, uri in (("canonical", canonical_uri), ("original", original_uri)):
+        if operation == "read":
+            assert await store.read(uri) == payload
+        elif operation == "size":
+            assert await store.size(uri) == physical.stat().st_size > 0
+        else:
+            destination = tmp_path / f"dump-{spelling}"
+            dumped = Path(await store.dump(uri, destination))
+            assert dumped == destination / f"{_MARK}~{_SLASH_DIGEST}.blob"
+            assert dumped.read_bytes() == physical_bytes
+
+    assert await store.list(session) == [canonical_uri]
+    assert session not in {path.name for path in tmp_path.iterdir()}
+    assert [path.name for path in _blobs(tmp_path, folded_session).iterdir()] == [
+        physical.name
+    ]
+
+
+@pytest.mark.parametrize("session", ["s" * 300, "é" * 150], ids=["ascii", "multibyte"])
+@pytest.mark.parametrize("operation", ["read", "size", "dump"])
+async def test_mapped_blob_long_original_session_resolves_canonical_expiry(
+    store: AsyncDiskBlobStore, tmp_path: Path, session: str, operation: str
+) -> None:
+    from context_intelligence_server.utils import fold_name
+
+    folded_session = fold_name(session, _MAX_SESSION_ID_BYTES)
+    canonical_uri = f"ci-blob://{folded_session}/{_MARK}/{_SLASH_DIGEST}"
+    original_uri = f"ci-blob://{session}/{_MARK}/{_SLASH_DIGEST}"
+    _tombstone(tmp_path, canonical_uri)
+
+    for uri in (canonical_uri, original_uri):
+        if operation == "size":
+            assert await store.size(uri) == 0
+        else:
+            with pytest.raises(r.BlobExpiredError) as exc:
+                if operation == "read":
+                    await store.read(uri)
+                else:
+                    await store.dump(uri, tmp_path / "dump")
+            assert exc.value.uri == canonical_uri
+
+    assert await store.write(session, "a/b", {"no": "rehydration"}) == canonical_uri
+    assert not (tmp_path / folded_session).exists()
+    assert session not in {path.name for path in tmp_path.iterdir()}
+    assert not (tmp_path / "dump").exists()
+
+
 async def test_rewriting_a_mapped_key_replaces_the_same_physical_file(
     store: AsyncDiskBlobStore, tmp_path: Path
 ) -> None:

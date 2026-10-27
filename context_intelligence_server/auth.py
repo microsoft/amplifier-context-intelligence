@@ -3,7 +3,8 @@
 import hashlib
 import json
 import logging
-from collections.abc import Callable, MutableMapping
+from collections.abc import Awaitable, Callable, MutableMapping
+from inspect import isawaitable
 from typing import Any
 
 import jwt  # pyjwt[crypto] — added in T1; used by EntraResolver
@@ -617,7 +618,7 @@ class BearerTokenMiddleware:
         exempt_paths: frozenset[str] | None = None,
         admin_api_key_digest: str | None = None,
         allow_unauthenticated: bool = False,
-        identity_gate: Callable[[], bool] | None = None,
+        identity_gate: Callable[[], bool | Awaitable[bool]] | None = None,
     ) -> None:
         self.app = app
         # Optional readiness gate for a server-owned identity store.  When it
@@ -626,7 +627,7 @@ class BearerTokenMiddleware:
         # refused with 503 BEFORE any auth decision, including the
         # unauthenticated shortcut and the admin-key fast path.  ``None``
         # (the default) keeps standalone middleware behavior unchanged.
-        self._identity_gate: Callable[[], bool] | None = identity_gate
+        self._identity_gate: Callable[[], bool | Awaitable[bool]] | None = identity_gate
         # Explicit opt-out (test/dev ONLY): when True AND the resolver has no
         # credentials configured (auth_enabled is False), ALL requests pass
         # through unauthenticated. An empty keystore ALONE no longer fails
@@ -672,9 +673,13 @@ class BearerTokenMiddleware:
             gate_exempt = gated_path in self._exempt_paths or any(
                 gated_path.startswith(p) for p in _EXEMPT_PREFIXES
             )
-            if not gate_exempt and not self._identity_gate():
-                await _send_error(send, 503, "Identity store is not available")
-                return
+            if not gate_exempt:
+                ready = self._identity_gate()
+                if isawaitable(ready):
+                    ready = await ready
+                if not ready:
+                    await _send_error(send, 503, "Identity store is not available")
+                    return
 
         # Fail-open pass-through ONLY when the operator EXPLICITLY opted out via
         # allow_unauthenticated=True (test/dev) AND the resolver has no

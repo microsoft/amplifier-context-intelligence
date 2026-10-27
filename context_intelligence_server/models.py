@@ -109,7 +109,7 @@ class NativeRecoveryOrigin(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    ordinal: int = Field(ge=0)
+    ordinal: int = Field(ge=0, le=(1 << 63) - 1)
     source_line_sha256: str
 
     @field_validator("source_line_sha256")
@@ -179,7 +179,7 @@ class LegacyNativeRecoveryOrigin(BaseModel):
     """Former public-origin shape, accepted only in explicit lease mode."""
 
     session_id: str
-    ordinal: int = Field(ge=0)
+    ordinal: int = Field(ge=0, le=(1 << 63) - 1)
     source_line_sha256: str
     source_stream_sha256: str
 

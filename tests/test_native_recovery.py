@@ -878,6 +878,236 @@ def _permit_binding(
     )
 
 
+def _ordinal_settings(tmp_path: Path, *, permit_required: bool = True) -> Settings:
+    """Keep ordinal wire tests on fresh local storage without seeded identities."""
+    return Settings(
+        api_key=None,
+        api_keys=None,
+        api_keys_store_path=str(tmp_path / "keys.json"),
+        entra_identities_store_path=str(tmp_path / "entra.json"),
+        allow_unauthenticated=True,
+        queues_path=str(tmp_path / "live"),
+        blob_path=str(tmp_path / "blobs"),
+        log_path=str(tmp_path / "server.jsonl"),
+        recovery=cast(
+            Any,
+            {
+                "enabled": True,
+                "permit_required": permit_required,
+                "guard_lease_path": str(tmp_path / "lease.json"),
+                "claims_store_path": str(tmp_path / "claims.sqlite3"),
+                "receipt_store_path": str(tmp_path / "receipts.sqlite3"),
+                "queues_path": str(tmp_path / "recovery"),
+            },
+        ),
+    )
+
+
+@pytest.mark.parametrize("ordinal", [-1, 1 << 63])
+async def test_admission_rejects_ordinal_outside_sqlite_range_before_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ordinal: int
+) -> None:
+    """An invalid ordinal must not reach source classification or issue a permit."""
+    from context_intelligence_server.main import app, create_asgi_app
+
+    asgi_app = create_asgi_app(settings=_ordinal_settings(tmp_path))
+    receipts = app.state.recovery_receipts
+    assert await receipts.status() == {}
+    classify = AsyncMock(wraps=receipts.classify_source)
+    issue = AsyncMock(wraps=app.state.recovery_admission_gate.issue)
+    monkeypatch.setattr(receipts, "classify_source", classify)
+    monkeypatch.setattr(app.state.recovery_admission_gate, "issue", issue)
+    monkeypatch.setattr(app.state.recovery_registry, "get_or_create", MagicMock())
+    before = {
+        p.relative_to(tmp_path): p.read_bytes()
+        for p in tmp_path.rglob("*")
+        if p.is_file()
+    }
+    body = _recovery_body()
+    body["origin"]["ordinal"] = ordinal
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=asgi_app, raise_app_exceptions=False),
+        base_url="http://test",
+        headers=_source_headers(),
+    ) as client:
+        response = await client.post("/recovery/admissions", json=_admission_body(body))
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid recovery admission request"}
+    classify.assert_not_awaited()
+    issue.assert_not_awaited()
+    assert {
+        p.relative_to(tmp_path): p.read_bytes()
+        for p in tmp_path.rglob("*")
+        if p.is_file()
+    } == before
+
+
+@pytest.mark.parametrize("ordinal", [-1, 1 << 63])
+async def test_admin_quarantine_rejects_ordinal_outside_sqlite_range_before_receipt_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ordinal: int
+) -> None:
+    """Paused quarantine validates the ordinal before touching the receipt ledger."""
+    from context_intelligence_server.main import app, create_asgi_app
+    from context_intelligence_server.routers.admin import require_admin
+
+    asgi_app = create_asgi_app(settings=_ordinal_settings(tmp_path))
+    receipts = app.state.recovery_receipts
+    assert await receipts.status() == {}
+    pending = AsyncMock(wraps=receipts.pending_receipt)
+    monkeypatch.setattr(receipts, "pending_receipt", pending)
+    monkeypatch.setattr(app.state.recovery_registry, "get_or_create", MagicMock())
+    app.dependency_overrides[require_admin] = lambda: None
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=asgi_app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            paused = await client.post("/admin/recovery/pause")
+            assert paused.status_code == 200
+            assert paused.json() == {"paused": True}
+            before = {
+                p.relative_to(tmp_path): p.read_bytes()
+                for p in tmp_path.rglob("*")
+                if p.is_file()
+            }
+            response = await client.post(
+                "/admin/recovery/quarantine-pending",
+                json={"source_handle": _source_handle(), "ordinal": ordinal},
+            )
+
+        assert response.status_code == 422
+        assert [error["loc"] for error in response.json()["detail"]] == [
+            ["body", "ordinal"]
+        ]
+        pending.assert_not_awaited()
+        assert {
+            p.relative_to(tmp_path): p.read_bytes()
+            for p in tmp_path.rglob("*")
+            if p.is_file()
+        } == before
+    finally:
+        app.dependency_overrides.pop(require_admin, None)
+
+
+async def test_max_sqlite_ordinal_is_accepted_by_admission_and_admin_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The maximum ordinal survives real permit, receipt, queue and quarantine I/O."""
+    from context_intelligence_server.main import app, create_asgi_app
+    from context_intelligence_server.routers.admin import require_admin
+
+    asgi_app = create_asgi_app(settings=_ordinal_settings(tmp_path))
+    reg = app.state.recovery_registry
+    monkeypatch.setattr(reg, "get_or_create", MagicMock())
+    body = _recovery_body()
+    body["origin"]["ordinal"] = 9223372036854775807
+    app.dependency_overrides[require_admin] = lambda: None
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=asgi_app),
+            base_url="http://test",
+            headers=_source_headers(),
+        ) as client:
+            admission = await client.post(
+                "/recovery/admissions", json=_admission_body(body)
+            )
+            assert admission.status_code == 201
+            assert admission.json()["status"] == "permit"
+            queued = await client.post(
+                "/recovery/events",
+                json=body,
+                headers={"X-Recovery-Permit": admission.json()["permit"]},
+            )
+            assert queued.status_code == 202
+            assert queued.json() == {
+                "status": "queued",
+                "session_id": "recovery-session",
+            }
+            assert await app.state.recovery_receipts.status() == {"enqueued": 1}
+            batch = await reg.queue_manager.read_batch("recovery-session", 1)
+            assert len(batch.records) == 1
+            envelope = json.loads(batch.records[0].raw)
+            assert envelope["_recovery_origin"] == {
+                "source_handle": _source_handle(),
+                "ordinal": 9223372036854775807,
+                "source_line_sha256": "a" * 64,
+            }
+            assert (await client.post("/admin/recovery/pause")).json() == {
+                "paused": True
+            }
+            response = await client.post(
+                "/admin/recovery/quarantine-pending",
+                json={
+                    "source_handle": _source_handle(),
+                    "ordinal": 9223372036854775807,
+                },
+            )
+            assert response.status_code == 200
+            assert response.json() == {"quarantined": 1}
+
+        assert await app.state.recovery_receipts.status() == {"quarantined": 1}
+        assert (await reg.queue_manager.read_batch("recovery-session", 1)).records == []
+        with sqlite3.connect(app.state.recovery_receipts.path) as db:
+            assert db.execute(
+                "SELECT ordinal, state FROM recovery_receipts"
+            ).fetchall() == [(9223372036854775807, "quarantined")]
+    finally:
+        app.dependency_overrides.pop(require_admin, None)
+
+
+@pytest.mark.parametrize("ordinal", [-1, 1 << 63])
+@pytest.mark.parametrize("permit_required", [True, False], ids=["v1", "lease"])
+async def test_recovery_event_rejects_ordinal_outside_sqlite_range(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ordinal: int,
+    permit_required: bool,
+) -> None:
+    """Both supported event protocols reject out-of-range ordinals before SQLite."""
+    from context_intelligence_server.main import app, create_asgi_app
+
+    asgi_app = create_asgi_app(
+        settings=_ordinal_settings(tmp_path, permit_required=permit_required)
+    )
+    receipts = app.state.recovery_receipts
+    assert await receipts.status() == {}
+    classify = AsyncMock(wraps=receipts.classify_source)
+    monkeypatch.setattr(receipts, "classify_source", classify)
+    monkeypatch.setattr(app.state.recovery_registry, "get_or_create", MagicMock())
+    body = _recovery_body()
+    body["origin"]["ordinal"] = ordinal
+    if not permit_required:
+        source = body.pop("source")
+        body["origin"].update(
+            session_id=source["session_id"],
+            source_stream_sha256=source["source_stream_sha256"],
+        )
+        _write_lease(tmp_path / "lease.json")
+    before = {
+        p.relative_to(tmp_path): p.read_bytes()
+        for p in tmp_path.rglob("*")
+        if p.is_file()
+    }
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=asgi_app, raise_app_exceptions=False),
+        base_url="http://test",
+        headers=_source_headers(),
+    ) as client:
+        response = await client.post("/recovery/events", json=body)
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid recovery event"}
+    classify.assert_not_awaited()
+    assert {
+        p.relative_to(tmp_path): p.read_bytes()
+        for p in tmp_path.rglob("*")
+        if p.is_file()
+    } == before
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ("/recovery/admissions", "/recovery/events"))
 async def test_recovery_body_limit_rejects_declared_oversize_before_receive(

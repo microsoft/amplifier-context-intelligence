@@ -351,7 +351,7 @@ class QueueManager:
         return self._dir / f"{session_id}.dead.jsonl"
 
     @staticmethod
-    def _normalized_recovery_origin(candidate: Any) -> tuple[str, int, str] | None:
+    def normalized_recovery_origin(candidate: Any) -> tuple[str, int, str] | None:
         """Reduce a recognized origin to ``(source_handle, ordinal, line_sha256)``.
 
         A v1 origin already names its source handle. A pre-v1 origin (still
@@ -381,8 +381,8 @@ class QueueManager:
         """
         if not isinstance(envelope, dict):
             return False
-        wanted = QueueManager._normalized_recovery_origin(json.loads(encoded_origin))
-        found = QueueManager._normalized_recovery_origin(
+        wanted = QueueManager.normalized_recovery_origin(json.loads(encoded_origin))
+        found = QueueManager.normalized_recovery_origin(
             envelope.get("_recovery_origin")
         )
         return wanted is not None and wanted == found
@@ -481,7 +481,11 @@ class QueueManager:
         if keys != _V1_ORIGIN_KEYS and keys != _LEGACY_ORIGIN_KEYS:
             return False
         ordinal = candidate.get("ordinal")
-        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 0:
+        if (
+            not isinstance(ordinal, int)
+            or isinstance(ordinal, bool)
+            or not 0 <= ordinal <= (1 << 63) - 1
+        ):
             return False
 
         def _digest(value: Any) -> bool:

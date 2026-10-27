@@ -81,7 +81,12 @@ def _own_identity_after_factory(
     # The module-level FastAPI app is a process singleton: drop identity wiring
     # a previous test's factory call left on it, so lifespan tests that use a
     # settings stand-in do not inherit someone else's identity store.
-    for _attr in ("api_key_store", "entra_identity_store", "identity_config_token"):
+    for _attr in (
+        "api_key_store",
+        "entra_identity_store",
+        "identity_config_token",
+        "identity_runtime",
+    ):
         setattr(main_module.app.state, _attr, None)
     main_module.app.state.identity_ready_token = None
     main_module.app.state.identity_lifespan_active = False
@@ -96,16 +101,23 @@ def _own_identity_after_factory(
 
     def _stop_all() -> None:
         while owned:
-            main_module._stop_identity_ownership(main_module.app, owned.pop())
+            runtime, ownership = owned.pop()
+            assert not runtime.probes, (
+                "test must settle its identity I/O before sync teardown"
+            )
+            assert runtime.admitted == 0
+            main_module._stop_identity_ownership(
+                main_module.app, ownership, runtime=runtime
+            )
 
     def factory_with_ownership(*args: Any, **kwargs: Any) -> Any:
         _stop_all()
         wrapper = real_factory(*args, **kwargs)
-        owned.append(
-            main_module._start_identity_ownership(
-                main_module.app, main_module.app.state.settings
-            )
+        runtime = main_module.app.state.identity_runtime
+        ownership = main_module._start_identity_ownership(
+            main_module.app, main_module.app.state.settings, runtime=runtime
         )
+        owned.append((runtime, ownership))
         return wrapper
 
     monkeypatch.setattr(main_module, "create_asgi_app", factory_with_ownership)
