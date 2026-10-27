@@ -9,6 +9,7 @@ computed by the module under test.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 
 import pytest
 
@@ -150,11 +151,14 @@ def test_long_ordinary_names_fold_to_the_existing_242_byte_form() -> None:
     assert len(f"{addr.name}.tmp-suffix".encode()) <= 255  # 13-byte temp suffix budget
 
 
-def test_long_names_with_backslash_keep_the_existing_underscore_fold() -> None:
-    addr = write_address("s", "a\\" + "x" * 400)
+def test_long_names_with_backslash_map_the_full_raw_name() -> None:
+    logical = "a\\" + "x" * 400
+    addr = write_address("s", logical)
 
-    assert addr.mapped is False
-    assert addr.name == "a_" + "x" * 223 + "~" + "67c29909eca707fd"
+    assert addr.mapped is True
+    assert addr.name == hashlib.sha256(
+        b"ci-blob-event-key:v1\0" + logical.encode("utf-8")
+    ).hexdigest()
 
 
 def test_long_names_whose_fold_is_still_unsafe_map_to_the_digest() -> None:
@@ -165,34 +169,28 @@ def test_long_names_whose_fold_is_still_unsafe_map_to_the_digest() -> None:
 
 
 @pytest.mark.parametrize(
-    ("logical", "expected_name"),
-    [
-        # A separator/NUL inside the kept 225-byte prefix is replaced by "_" by the
-        # existing fold, so the fold is safe and the name stays ordinary.
-        ("a/" + "x" * 400, "a_" + "x" * 223 + "~4d42d46a6b95ff4c"),
-        ("a\x00" + "x" * 400, "a_" + "x" * 223 + "~7c10d2023276eb90"),
-        # A separator/newline PAST the cut is simply dropped by the fold.
-        ("k" * 300 + "/z", "k" * 225 + "~5842fdd431096743"),
-        ("k" * 300 + "\n", "k" * 225 + "~5656f61b9f78cb46"),
-    ],
-    ids=[
-        "slash-in-kept-prefix",
-        "nul-in-kept-prefix",
-        "slash-past-the-cut",
-        "newline-past-the-cut",
-    ],
+    "unsafe", ["/", "\\", "\0", "\n"], ids=["slash", "backslash", "nul", "newline"]
 )
-def test_long_names_whose_fold_is_safe_keep_the_pre_mapping_ordinary_fold(
-    logical: str, expected_name: str
+@pytest.mark.parametrize("position", ["prefix", "tail"])
+def test_long_unsafe_names_never_alias_their_safe_historical_fold(
+    unsafe: str, position: str
 ) -> None:
+    logical = "a" + unsafe + "k" * 300 if position == "prefix" else "k" * 300 + unsafe
+    historical = fold_name(logical, 242)
+    digest = hashlib.sha256(
+        b"ci-blob-event-key:v1\0" + logical.encode("utf-8")
+    ).hexdigest()
     addr = write_address("s", logical)
 
-    assert addr.mapped is False
-    assert addr.name == fold_name(logical, 242)  # the unchanged pre-mapping fold
-    assert addr.name == expected_name  # independently derived literal
-    assert len(addr.name.encode("utf-8")) <= 242
-    assert addr.uri == f"ci-blob://s/{expected_name}"
-    assert addr.filename == f"{expected_name}.json"
+    assert addr.mapped is True
+    assert addr.uri == f"ci-blob://s/{MARKER}/{digest}"
+    assert addr.filename == f"{MARKER}~{digest}.blob"
+    # New mapped storage is disjoint even when folding erased the unsafe byte.
+    if "\n" not in historical:
+        ordinary = write_address("s", historical)
+        assert not ordinary.mapped
+        assert addr.uri != ordinary.uri
+        assert addr.filename != ordinary.filename
 
 
 def test_a_mapped_address_leaves_room_for_the_temporary_suffix() -> None:
@@ -380,6 +378,8 @@ def test_parse_address_folds_long_mapped_session_without_changing_digest(
 def test_parse_address_rejects_malformed_and_unsafe_uris(uri: str) -> None:
     with pytest.raises(ValueError):
         parse_address(uri)
+    with pytest.raises(ValueError):
+        read_candidates(uri)
 
 
 def test_parse_address_folds_long_ordinary_names_like_the_store() -> None:
@@ -501,9 +501,11 @@ def test_address_from_filename_raises_for_recognised_but_invalid_ordinary_names(
 def test_legacy_address_matches_the_canonical_one_for_safe_names() -> None:
     assert legacy_address("s", "plain%?#") == write_address("s", "plain%?#")
     assert legacy_address("s", "k" * 300) == write_address("s", "k" * 300)
-    assert legacy_address("s", "a\\" + "x" * 400) == write_address(
-        "s", "a\\" + "x" * 400
+    logical = "a\\" + "x" * 400
+    assert legacy_address("s", logical) == BlobAddress(
+        "s", "a_" + "x" * 223 + "~67c29909eca707fd"
     )
+    assert legacy_address("s", logical) != write_address("s", logical)
 
 
 def test_legacy_address_is_the_literal_backslash_name_on_posix() -> None:
@@ -529,11 +531,66 @@ def test_legacy_address_is_none_when_the_old_name_was_never_creatable(
     name: str,
 ) -> None:
     assert legacy_address("s", name) is None
+    assert blob_keys.legacy_addresses("s", name) == ()
 
 
 def test_legacy_address_rejects_an_unsafe_session() -> None:
     with pytest.raises(ValueError):
         legacy_address("a/b", "k")
+    with pytest.raises(ValueError):
+        blob_keys.legacy_addresses("a/b", "k")
+
+
+@pytest.mark.parametrize("byte_count", [242, *range(243, 251), 251])
+@pytest.mark.parametrize("multibyte", [False, True], ids=["ascii", "utf8"])
+def test_legacy_candidates_preserve_physical_byte_limits_and_order(
+    byte_count: int, multibyte: bool
+) -> None:
+    logical = (
+        "é" * (byte_count // 2) + "k" * (byte_count % 2)
+        if multibyte
+        else "k" * byte_count
+    )
+    session = "é" * 150
+    folded_session = fold_name(session, 255)
+    folded = BlobAddress(folded_session, fold_name(logical, 242))
+    exact = BlobAddress(folded_session, logical)
+    expected = (folded,) if byte_count > 250 else tuple(dict.fromkeys((exact, folded)))
+
+    assert len(logical.encode("utf-8")) == byte_count
+    assert blob_keys.MAX_PHYSICAL_KEY_BYTES == 250
+    assert blob_keys.legacy_addresses(session, logical) == expected
+    assert legacy_address(session, logical) == expected[0]
+    assert read_candidates(f"ci-blob://{session}/{logical}") == expected
+    assert all(len(candidate.filename.encode("utf-8")) <= 255 for candidate in expected)
+    assert len(set(expected)) == len(expected)
+
+
+@pytest.mark.parametrize("logical", ["a\ud800", "a\ud800/b", "k" * 300 + "\ud800"])
+def test_legacy_candidates_do_not_swallow_invalid_utf8(logical: str) -> None:
+    with pytest.raises(UnicodeEncodeError):
+        blob_keys.legacy_addresses("s", logical)
+    with pytest.raises(UnicodeEncodeError):
+        legacy_address("s", logical)
+
+
+@pytest.mark.parametrize("byte_count", [242, 250, 251])
+def test_backslash_candidates_keep_bounded_exact_then_historical_then_full_raw_mapping(
+    byte_count: int,
+) -> None:
+    logical = "a\\" + "k" * (byte_count - 2)
+    folded = BlobAddress("s", fold_name(logical, 242))
+    old = (BlobAddress("s", logical), folded) if byte_count <= 250 else (folded,)
+    old = tuple(dict.fromkeys(old))
+    digest = hashlib.sha256(
+        b"ci-blob-event-key:v1\0" + logical.encode("utf-8")
+    ).hexdigest()
+
+    assert blob_keys.legacy_addresses("s", logical) == old
+    assert read_candidates(f"ci-blob://s/{logical}") == (
+        *old,
+        BlobAddress("s", digest, mapped=True),
+    )
 
 
 # --- read_candidates -------------------------------------------------------------------
@@ -558,11 +615,19 @@ def test_a_legacy_backslash_uri_tries_the_old_file_then_the_canonical_one() -> N
     )
 
 
-def test_a_long_safe_name_with_underscore_fold_is_not_a_legacy_candidate_pair() -> None:
-    # The folded form carries no backslash, so it has exactly one candidate.
-    uri = write_address("s", "a\\" + "x" * 400).uri
+def test_a_long_backslash_uri_keeps_its_historical_fold_and_full_raw_mapping() -> None:
+    logical = "a\\" + "x" * 400
+    digest = hashlib.sha256(
+        b"ci-blob-event-key:v1\0" + logical.encode("utf-8")
+    ).hexdigest()
 
-    assert len(read_candidates(uri)) == 1
+    assert read_candidates(f"ci-blob://s/{logical}") == (
+        BlobAddress("s", "a_" + "x" * 223 + "~67c29909eca707fd"),
+        BlobAddress("s", digest, mapped=True),
+    )
+    assert read_candidates(f"ci-blob://s/{MARKER}/{digest}") == (
+        BlobAddress("s", digest, mapped=True),
+    )
 
 
 def test_candidates_are_unique() -> None:

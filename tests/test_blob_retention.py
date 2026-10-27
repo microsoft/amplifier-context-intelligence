@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import shlex
 import sqlite3
@@ -1355,8 +1356,13 @@ def test_a_hardlinked_mapped_blob_is_skipped_not_pruned(tmp_path):
     assert mapped.exists()
 
 
-def test_on_disk_names_are_never_folded_when_enumerated(tmp_path):
-    long_name = "k" * 250
+@pytest.mark.parametrize("byte_count", range(243, 251))
+@pytest.mark.parametrize("multibyte", [False, True], ids=["ascii", "utf8"])
+def test_on_disk_names_are_never_folded_when_enumerated(tmp_path, byte_count, multibyte):
+    long_name = (
+        "é" * (byte_count // 2) + "k" * (byte_count % 2)
+        if multibyte else "k" * byte_count
+    )
     _put(tmp_path, "s", f"{long_name}.json")
 
     applied = r.apply(tmp_path, CUTOFF, lambda report: report.files == 1)
@@ -1424,7 +1430,13 @@ async def test_replay_after_a_mapped_prune_does_not_rehydrate(tmp_path):
     assert exc.value.uri == uri
 
 
-@pytest.mark.parametrize("kind", ["legacy", "mapped"])
+@pytest.mark.parametrize(
+    "kind",
+    ["legacy", "mapped", *[
+        f"{encoding}-{count}"
+        for encoding in ("ascii", "utf8") for count in range(243, 251)
+    ]],
+)
 async def test_each_phase_through_a_fresh_store_sees_the_same_disk_truth(
     tmp_path, kind
 ):
@@ -1432,17 +1444,39 @@ async def test_each_phase_through_a_fresh_store_sees_the_same_disk_truth(
     if kind == "legacy":
         path = _put(tmp_path, "s", "a\\b.json")
         uri, logical = _LEGACY_URI, "a\\b"
-    else:
+    elif kind == "mapped":
         path = _put(tmp_path, "s", f"{_MARK}~{_SLASH}.blob")
         uri, logical = _MAPPED_URI, "a/b"
+    else:
+        encoding, count = kind.split("-")
+        byte_count = int(count)
+        logical = (
+            "é" * (byte_count // 2) + "k" * (byte_count % 2)
+            if encoding == "utf8" else "k" * byte_count
+        )
+        assert len(logical.encode("utf-8")) == byte_count
+        path = _put(tmp_path, "s", f"{logical}.json")
+        uri = f"ci-blob://s/{logical}"
 
     assert await AsyncDiskBlobStore(tmp_path).read(uri) == {"value": 1}
+    assert await AsyncDiskBlobStore(tmp_path).list("s") == [uri]
+    assert await AsyncDiskBlobStore(tmp_path).size(uri) == path.stat().st_size
+    dumped = Path(await AsyncDiskBlobStore(tmp_path).dump(uri, tmp_path / "dump"))
+    assert dumped.name == path.name
+    assert json.loads(dumped.read_text(encoding="utf-8")) == {"value": 1}
     assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 1
     assert not path.exists()
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.contains(uri)
 
     with pytest.raises(r.BlobExpiredError) as expired:
         await AsyncDiskBlobStore(tmp_path).read(uri)
     assert expired.value.uri == uri
+    with pytest.raises(r.BlobExpiredError) as expired:
+        await AsyncDiskBlobStore(tmp_path).dump(uri, tmp_path / "expired-dump")
+    assert expired.value.uri == uri
+    assert await AsyncDiskBlobStore(tmp_path).size(uri) == 0
+    assert not (tmp_path / "expired-dump").exists()
 
     # Replay (a brand-new writer instance) keeps the recorded URI and rehydrates nothing,
     # and never creates the other address kind either.
@@ -1456,3 +1490,28 @@ async def test_each_phase_through_a_fresh_store_sees_the_same_disk_truth(
     path.write_text('{"restored": true}', encoding="utf-8")
     assert await AsyncDiskBlobStore(tmp_path).read(uri) == {"restored": True}
     assert await AsyncDiskBlobStore(tmp_path).list("s") == [uri]
+    assert await AsyncDiskBlobStore(tmp_path).size(uri) == path.stat().st_size
+    restored = Path(await AsyncDiskBlobStore(tmp_path).dump(uri, tmp_path / "restored"))
+    assert json.loads(restored.read_text(encoding="utf-8")) == {"restored": True}
+
+
+@pytest.mark.parametrize(
+    "logical", ["a/" + "k" * 300, "a\\" + "k" * 300, "a\0" + "k" * 300, "k" * 300 + "\n"],
+    ids=["slash", "backslash", "nul", "newline"],
+)
+async def test_real_prune_of_historical_fold_still_blocks_mapped_replay(tmp_path, logical):
+    from context_intelligence_server.utils import fold_name
+
+    folded = fold_name(logical, 242)
+    path = _put(tmp_path, "s", f"{folded}.json")
+    historical_uri = f"ci-blob://s/{folded}"
+    assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 1
+    assert not path.exists()
+    with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.contains(historical_uri)
+    store = AsyncDiskBlobStore(tmp_path)
+    assert await store.write("s", logical, {"replay": True}) == historical_uri
+    assert list(path.parent.iterdir()) == []
+    with pytest.raises(r.BlobExpiredError) as exc:
+        await store.read(historical_uri)
+    assert exc.value.uri == historical_uri

@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -1142,18 +1143,170 @@ async def test_where_a_backslash_is_a_separator_a_legacy_uri_is_refused_and_writ
     assert await store.read(uri) == {"v": 1}
 
 
-async def test_a_long_slash_key_round_trips_under_the_pre_mapping_ordinary_fold(
-    store: AsyncDiskBlobStore, tmp_path: Path
+@pytest.mark.parametrize("mapped_first", [True, False])
+@pytest.mark.parametrize("position", ["prefix", "tail"])
+@pytest.mark.parametrize(
+    "unsafe", ["/", "\\", "\0", "\n"], ids=["slash", "backslash", "nul", "newline"]
+)
+async def test_long_unsafe_keys_and_ordinary_fold_aliases_never_overwrite(
+    store: AsyncDiskBlobStore, tmp_path: Path,
+    unsafe: str, position: str, mapped_first: bool,
 ) -> None:
     from context_intelligence_server.utils import fold_name
 
-    logical = "a/" + "x" * 400
-    folded = "a_" + "x" * 223 + "~4d42d46a6b95ff4c"  # derived independently of the code
+    logical = "a" + unsafe + "k" * 300 if position == "prefix" else "k" * 300 + unsafe
+    # A kept newline was never a valid ordinary stem; use its safe look-alike.
+    ordinary = fold_name(logical, 242).replace("\n", "_")
+    digest = hashlib.sha256(
+        b"ci-blob-event-key:v1\0" + logical.encode("utf-8")
+    ).hexdigest()
+    mapped_uri = f"ci-blob://sess/{_MARK}/{digest}"
+    ordinary_uri = f"ci-blob://sess/{ordinary}"
+    writes = [(logical, {"which": "mapped"}), (ordinary, {"which": "ordinary"})]
+    if not mapped_first:
+        writes.reverse()
+    results = [await store.write("sess", key, value) for key, value in writes]
 
-    uri = await store.write("sess", logical, {"v": "long-slash"})
+    assert set(results) == {mapped_uri, ordinary_uri}
+    assert sorted(p.name for p in _blobs(tmp_path).iterdir()) == sorted(
+        [f"{_MARK}~{digest}.blob", f"{ordinary}.json"]
+    )
+    assert await store.read(mapped_uri) == {"which": "mapped"}
+    assert await store.read(ordinary_uri) == {"which": "ordinary"}
+    assert await store.list("sess") == sorted([mapped_uri, ordinary_uri])
 
-    assert uri == f"ci-blob://sess/{folded}"  # ordinary, NOT ~ci-key-v1
-    assert fold_name(logical, _MAX_KEY_BYTES) == folded  # the old fold, unchanged
-    assert [p.name for p in _blobs(tmp_path).iterdir()] == [f"{folded}.json"]
-    assert await store.read(uri) == {"v": "long-slash"}
-    assert await store.list("sess") == [uri]
+
+@pytest.mark.parametrize(
+    "logical", ["a/" + "k" * 300, "a\\" + "k" * 300, "a\0" + "k" * 300, "k" * 300 + "\n"],
+    ids=["slash", "backslash", "nul", "newline"],
+)
+async def test_historical_folded_payloads_remain_readable_by_their_own_uri(
+    store: AsyncDiskBlobStore, tmp_path: Path, logical: str,
+) -> None:
+    from context_intelligence_server.utils import fold_name
+
+    folded = fold_name(logical, 242)
+    path = _seed(tmp_path, f"{folded}.json", '{"historical": true}')
+    historical_uri = f"ci-blob://sess/{folded}"
+    mapped_uri = await store.write("sess", logical, {"new": True})
+
+    assert mapped_uri != historical_uri
+    assert await store.read(historical_uri) == {"historical": True}
+    assert await store.size(historical_uri) == path.stat().st_size
+    dumped = Path(await store.dump(historical_uri, tmp_path / "dump"))
+    assert dumped.name == path.name
+    assert dumped.read_bytes() == path.read_bytes()
+    assert await store.read(mapped_uri) == {"new": True}
+    if "\\" in logical:
+        assert await store.read(f"ci-blob://sess/{logical}") == {"historical": True}
+
+
+@pytest.mark.parametrize("byte_count", [243, 250])
+@pytest.mark.parametrize("multibyte", [False, True], ids=["ascii", "utf8"])
+async def test_bounded_exact_payload_precedes_folded_and_only_missing_falls_back(
+    store: AsyncDiskBlobStore, tmp_path: Path, byte_count: int, multibyte: bool,
+) -> None:
+    from context_intelligence_server.utils import fold_name
+
+    logical = (
+        "é" * (byte_count // 2) + "k" * (byte_count % 2)
+        if multibyte else "k" * byte_count
+    )
+    folded = fold_name(logical, 242)
+    exact = _seed(tmp_path, f"{logical}.json", '{"exact": true}')
+    fallback = _seed(tmp_path, f"{folded}.json", '{"folded": "different size"}')
+    uri = f"ci-blob://sess/{logical}"
+    # All physical candidates are considered before either expiry record.
+    _tombstone(tmp_path, uri)
+    _tombstone(tmp_path, f"ci-blob://sess/{folded}")
+
+    for selected, value in [(exact, {"exact": True}), (fallback, {"folded": "different size"})]:
+        assert await store.read(uri) == value
+        assert await store.size(uri) == selected.stat().st_size
+        dumped = Path(await store.dump(uri, tmp_path / selected.stem[:10] / str(len(value))))
+        assert dumped.name == selected.name
+        assert dumped.read_bytes() == selected.read_bytes()
+        selected.unlink()
+    with pytest.raises(r.BlobExpiredError) as exc:
+        await store.read(uri)
+    assert exc.value.uri == uri
+    assert await store.size(uri) == 0
+
+
+@pytest.mark.parametrize("kind", ["dangling_symlink", "directory", "invalid_json"])
+async def test_exact_boundary_entry_errors_never_fall_back_to_valid_folded_payload(
+    store: AsyncDiskBlobStore, tmp_path: Path, kind: str,
+) -> None:
+    from context_intelligence_server.utils import fold_name
+
+    logical = "k" * 250
+    folded = fold_name(logical, 242)
+    _seed(tmp_path, f"{folded}.json", '{"fallback": true}')
+    exact = _blobs(tmp_path) / f"{logical}.json"
+    if kind == "dangling_symlink":
+        exact.symlink_to(tmp_path / "absent")
+    elif kind == "directory":
+        exact.mkdir()
+    else:
+        exact.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises((OSError, ValueError)) as exc:
+        await store.read(f"ci-blob://sess/{logical}")
+    assert not isinstance(exc.value, FileNotFoundError)
+    if kind != "invalid_json":  # dump copies bytes; size does not parse JSON.
+        with pytest.raises((OSError, ValueError)):
+            await store.size(f"ci-blob://sess/{logical}")
+        with pytest.raises((OSError, ValueError)):
+            await store.dump(f"ci-blob://sess/{logical}", tmp_path / "dump")
+
+
+async def test_boundary_expiry_priority_is_canonical_on_write_but_exact_on_read(
+    store: AsyncDiskBlobStore, tmp_path: Path,
+) -> None:
+    from context_intelligence_server.utils import fold_name
+
+    logical = "k" * 250
+    exact_uri = f"ci-blob://sess/{logical}"
+    folded_uri = f"ci-blob://sess/{fold_name(logical, 242)}"
+    _tombstone(tmp_path, exact_uri)
+    assert await store.write("sess", logical, {"replay": 1}) == exact_uri
+    assert not (tmp_path / "sess").exists()
+    _tombstone(tmp_path, folded_uri)
+    assert await store.write("sess", logical, {"replay": 2}) == folded_uri
+    assert not (tmp_path / "sess").exists()
+    for operation in ("read", "dump"):
+        with pytest.raises(r.BlobExpiredError) as exc:
+            if operation == "read":
+                await store.read(exact_uri)
+            else:
+                await store.dump(exact_uri, tmp_path / "dump")
+        assert exc.value.uri == exact_uri
+    assert await store.size(exact_uri) == 0
+    assert not (tmp_path / "dump").exists()
+
+
+async def test_three_backslash_expiry_candidates_have_stable_priority(
+    store: AsyncDiskBlobStore, tmp_path: Path,
+) -> None:
+    from context_intelligence_server.utils import fold_name
+
+    logical = "a\\" + "k" * 248
+    exact_uri = f"ci-blob://sess/{logical}"
+    folded_uri = f"ci-blob://sess/{fold_name(logical, 242)}"
+    digest = hashlib.sha256(
+        b"ci-blob-event-key:v1\0" + logical.encode("utf-8")
+    ).hexdigest()
+    mapped_uri = f"ci-blob://sess/{_MARK}/{digest}"
+    for recorded in (folded_uri, exact_uri, mapped_uri):
+        _tombstone(tmp_path, recorded)
+        assert await store.write("sess", logical, {"replay": True}) == recorded
+        assert not (tmp_path / "sess").exists()
+    for operation in ("read", "dump"):
+        with pytest.raises(r.BlobExpiredError) as exc:
+            if operation == "read":
+                await store.read(exact_uri)
+            else:
+                await store.dump(exact_uri, tmp_path / "dump")
+        assert exc.value.uri == exact_uri
+    _seed(tmp_path, f"{_MARK}~{digest}.blob", '{"restored": true}')
+    assert await store.read(exact_uri) == {"restored": True}
