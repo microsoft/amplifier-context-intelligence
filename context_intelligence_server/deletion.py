@@ -13,12 +13,14 @@ ordering, and logging only.
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
 from context_intelligence_server.blob_store import BlobStore
 from context_intelligence_server.graph_store import GraphStore
+from context_intelligence_server.queue_manager import fold_worker_key
 from context_intelligence_server.services import total_blob_size
 
 logger = logging.getLogger(__name__)
@@ -106,16 +108,19 @@ class DeletionService:
         graph_store: GraphStore,
         blob_store: BlobStore,
         queue_manager: _QueueManagerLike,
+        *,
+        storage_guard: Callable[[frozenset[str]], Awaitable[None]] | None = None,
     ) -> None:
         self._graph = graph_store
         self._blobs = blob_store
         self._queue = queue_manager
+        self._storage_guard = storage_guard
 
     async def _pending_sessions(self, session_ids: frozenset[str]) -> list[str]:
         """Return the sorted subset of *session_ids* with pending queue records."""
         pending: list[str] = []
         for sid in sorted(session_ids):
-            if await self._queue.pending_count(sid) > 0:
+            if await self._queue.pending_count(fold_worker_key(sid)) > 0:
                 pending.append(sid)
         return pending
 
@@ -146,6 +151,8 @@ class DeletionService:
         if graph is None:
             return None
 
+        if self._storage_guard is not None:
+            await self._storage_guard(graph.session_ids)
         pending_sessions = await self._pending_sessions(graph.session_ids)
         blob_count, blob_bytes = await self._blob_stats(graph.session_ids)
         return DeletionPreview(
@@ -191,6 +198,8 @@ class DeletionService:
             return None
 
         session_ids = graph.session_ids
+        if self._storage_guard is not None:
+            await self._storage_guard(session_ids)
 
         pending_sessions = await self._pending_sessions(session_ids)
         if pending_sessions:
@@ -206,7 +215,7 @@ class DeletionService:
         queue_sessions_cleaned = 0
         for sid in session_ids:
             try:
-                if await self._queue.delete_session(sid):
+                if await self._queue.delete_session(fold_worker_key(sid)):
                     queue_sessions_cleaned += 1
             except RuntimeError as exc:
                 raise SessionsPendingError(graph.root_id, [sid]) from exc

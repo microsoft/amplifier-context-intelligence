@@ -258,7 +258,7 @@ curl -sS "$SERVER/admin/keys"       -H "Authorization: Bearer $ADMIN_API_KEY" # 
 |---|---|---|
 | **401** | No / invalid bearer token. Authentication runs (in the middleware) on `/admin/*` before authorization. | Send a valid token: the `IdentityAdmin` token (entra) or the `admin_api_key` (static). |
 | **403** | Authenticated, but **not an admin**. Entra: token lacks the required role — the message names it (`IdentityAdmin`). Static: a *data* key was used — the message says to use the **admin key**. | Entra: assign the `IdentityAdmin` App Role and re-acquire the token (ensure it lands in `roles`, not `groups`). Static: use the configured `admin_api_key`. |
-| **503** | Admin API **not configured for this mode**. Static: `admin_api_key` is unset. Entra: `entra_admin_role` is empty. (Also returned if you hit the *other* mode's endpoints — the store for an inactive mode is not loaded.) | Configure the credential per §2, or call the endpoints for the **active** `auth_mode`. |
+| **503** | Identity is initializing/unavailable, admin capability is unconfigured, or the endpoint belongs to the inactive auth mode. | Check top-level identity readiness and separate admin configuration in §7; use the active mode's endpoint and configure admin authority per §2. |
 | **409** | You tried to **delete or shadow the admin key** via `/admin/keys/{hash}`. The admin key is a config-level credential and is protected as the bootstrap floor. | Don't manage the admin key through the data store. To rotate it, update `admin_api_key` in config and restart. |
 | **422** | **Bad path param or body.** Invalid OID (not a lowercase-hex GUID, or all-zeros), invalid hash (not exactly 64 lowercase hex chars), or invalid contributor `id` (empty/whitespace, > 256 chars, or null bytes). | Correct the value. Use the real oid (`az ad signed-in-user show --query id -o tsv`) or a real SHA-256 digest, and a sane contributor id. |
 | **404** | `DELETE` of an entry that isn't present. | No action needed — the mapping already doesn't exist. |
@@ -267,8 +267,25 @@ curl -sS "$SERVER/admin/keys"       -H "Authorization: Bearer $ADMIN_API_KEY" # 
 
 ## 7. Checking state
 
-`GET /status` is unauthenticated and surfaces config-level booleans only (no
-credentials, no hashes). Use it to confirm the admin API is live:
+`GET /status` is unauthenticated and exposes no credentials or hashes.
+Identity-store readiness is reported by the **top-level** `identity_ready`
+and `identity_reason` fields:
+
+```bash
+curl -sS "$SERVER/status" | jq '{identity_ready, identity_reason}'
+```
+
+- `false` / `"initializing"`: identity initialization has not completed.
+- `false` / `"store_unavailable"`: identity initialization or store ownership
+  has failed, or a store failure has been detected.
+- `true` / `null`: identity initialization completed successfully.
+
+While identity is initializing or unavailable, protected requests, including
+identity-admin requests, return `503`. These fields are cached state, not a
+fresh identity-store filesystem probe.
+
+Check admin **configuration separately**; this does not establish readiness
+or the caller's admin permission:
 
 ```bash
 curl -sS "$SERVER/status" | jq '.auth'
@@ -284,32 +301,33 @@ curl -sS "$SERVER/status" | jq '.auth'
 ```
 
 - `auth.mode` — the active `auth_mode`.
-- `auth.admin_api_enabled` — `true` once the admin credential for that mode is
-  configured (`admin_api_key` set, or `entra_admin_role` non-empty). If this is
-  `false`, every `/admin/*` call returns `503`.
+- `auth.admin_api_enabled` — `true` when the active mode's admin credential
+  is configured: `admin_api_key` or `admin_api_key_sha256` in static mode,
+  or a non-empty `entra_admin_role` in Entra mode. It can remain `true`
+  while `identity_ready` is `false`. If `false`, the admin capability is
+  disabled. To check actual access, use the mode-specific authenticated
+  `GET` examples in §5. Without `jq`, inspect `curl -sS "$SERVER/status"`.
 
 ---
 
-## 8. How resolution stays fresh (no cache) & durability
+## 8. Identity-store readiness & durability
 
-**There is no cache and no TTL.** Each map is an **in-process live dictionary**
-that the active resolver (`StaticKeyResolver` / `EntraResolver`) holds **by
-reference**. A `/admin/*` `PUT`/`DELETE` mutates that same dict, so the change is
-visible to the resolver on the **very next request** — there is nothing to expire
-or invalidate.
+Identity maps remain live in-process dictionaries held by resolver reference;
+successful admin mutations are visible on the next request. App-factory
+setup constructs an empty managed store without reading or seeding its file.
+Lifespan starts a one-shot background initializer in an executor thread:
+for the selected store, it acquires exclusive ownership, loads the file,
+and applies any configured first-boot seed only when the file is absent.
+Listener startup does not wait for this identity-store I/O. Protected requests
+return `503` before lifespan initialization and until identity becomes ready;
+`/status` reports the top-level cached `identity_ready` and `identity_reason`
+fields described in §7. Identity initialization performs no retry loop or
+reconciliation.
 
-- **Commit order (write-file-then-swap-memory).** A mutation first writes the JSON
-  file atomically (tempfile → `os.replace`), and **only on success** updates the
-  in-process dict. The file is therefore never behind memory; a mid-write crash
-  cannot leave memory ahead of disk.
-- **Single replica is why this is safe and simple.** The pilot runs `maxReplicas=1`
-  (the drainer is a single writer), so there is no second process whose copy of the
-  map could go stale — the one in-process map *is* the source of truth. If a future
-  read-tier (M3) adds replicas, it would introduce a short TTL / poll re-read of the
-  store file; **that does not exist today** and is not needed at one replica.
-- Both maps live on the **`/data` Azure Files volume** and survive restarts and
-  redeploys. Loads are **fail-closed**: a corrupt store starts empty and loud
-  rather than crash-looping.
+- Expected store I/O failure leaves status/listener available but protected auth and identity-admin requests return `503`, never stale credentials. Corrupt store files retain the existing fail-closed read behavior and loud reporting.
+- Use a stable canonical identity-store path and nonblocking exclusive sidecar ownership, selected even when unseeded, to prevent stale auth across roots. Retain ownership until shutdown has settled real I/O. The configured private storage directory is trusted; locks are cooperative advisory locks. Never manually unlink the sidecar or impose new chmod/UID profiles.
+- **Upgrade compatibility:** the identity store is independent of the queue root, whose lock covers queues and ledgers only. Store paths and defaults are unchanged, so a server whose store sits outside the queue root (for example the host default `~/.local/share/ci-server/identity/` beside the `/data` queue root) starts normally and keeps its existing credentials; no move or migration is required. Existing file content always wins: configured seeds only populate an *absent* file and never merge into or overwrite an existing one. If an operator deliberately selects a different path, a seed will not carry old credentials over, so copy the file there explicitly while the server is stopped. The sidecar `<store>.lock` needs a writable directory beside the store.
+- Mutations retain write-file-then-swap-memory (atomic replace before memory update); the store file remains the durable state across restarts.
 - The **admin authority itself cannot be removed via the API**:
   - **Static:** the configured `admin_api_key` is a config credential, not a
     data-store entry — it cannot be deleted or shadow-bound through

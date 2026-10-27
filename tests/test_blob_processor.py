@@ -358,3 +358,64 @@ async def test_large_field_on_deeply_nested_session_offloads_to_real_blob(
     # The blob is REAL and readable -- not just a URI string.
     stored = await blob_store.read(uri)
     assert stored == {"content": "x" * 20_000}
+
+
+# --- Raw event names with separators or literal %?# (PR126) ------------------
+#
+# The blob key is f"{node_id}__{field}" and node_id keeps the RAW event name
+# (only ":" is replaced), so an event such as ``tool/pre`` puts a "/" in the key.
+
+_TS = "2026-06-16T20:17:11.604690+00:00"  # == epoch 1781641031604 ms
+
+
+async def test_a_slash_event_name_offloads_to_the_mapped_uri_with_the_node_id_unchanged(
+    tmp_path: Path,
+) -> None:
+    store = AsyncDiskBlobStore(tmp_path)
+    node_id = make_node_id("sess", "tool/pre", _TS)
+    data: dict[str, Any] = {"raw": {"payload": 1}}
+
+    await process_event_data(data, store, "sess", node_id)
+
+    assert node_id == "sess__tool/pre__1781641031604"
+    assert data["raw"] == {
+        "$blob_ref": "ci-blob://sess/~ci-key-v1/cce459bb2c9096559456d1ee211d690eb1813135669d0621e397e0d3f48490f3"
+    }
+    assert await store.read(data["raw"]["$blob_ref"]) == {"payload": 1}
+
+
+async def test_a_backslash_event_name_offloads_instead_of_losing_the_payload(
+    tmp_path: Path,
+) -> None:
+    store = AsyncDiskBlobStore(tmp_path)
+    node_id = make_node_id("sess", "a\\b", _TS)
+    data: dict[str, Any] = {"raw": {"payload": 2}}
+
+    await process_event_data(data, store, "sess", node_id)
+
+    assert data["raw"] == {
+        "$blob_ref": "ci-blob://sess/~ci-key-v1/cb138f8257fb136b0544767bd630a9728c78330b2e8ebfbe11019c133bfaba40"
+    }
+    assert await store.read(data["raw"]["$blob_ref"]) == {"payload": 2}
+
+
+@pytest.mark.parametrize("session_id", ["sess", "s%1?2#3"])
+@pytest.mark.parametrize(
+    "event_name",
+    ["tool/pre", "a\\b", "x:y/z", "100%", "q?a#b", "%?#", "a%2fb", "a%5cb", "a\nb"],
+)
+async def test_every_event_name_offloads_without_a_blob_error_and_reads_back(
+    tmp_path: Path, session_id: str, event_name: str
+) -> None:
+    store = AsyncDiskBlobStore(tmp_path)
+    node_id = make_node_id(session_id, event_name, _TS)
+    data: dict[str, Any] = {"raw": {"event": event_name}, "result": {"ok": True}}
+
+    await process_event_data(data, store, session_id, node_id)
+
+    assert set(data["raw"]) == {"$blob_ref"} and set(data["result"]) == {"$blob_ref"}
+    assert await store.read(data["raw"]["$blob_ref"]) == {"event": event_name}
+    assert await store.read(data["result"]["$blob_ref"]) == {"ok": True}
+    assert await store.list(session_id) == sorted(
+        [data["raw"]["$blob_ref"], data["result"]["$blob_ref"]]
+    )

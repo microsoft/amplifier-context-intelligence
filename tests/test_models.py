@@ -6,8 +6,47 @@ from pydantic import ValidationError
 from context_intelligence_server.models import (
     EventRequest,
     EventResponse,
+    LegacyNativeRecoveryOrigin,
+    NativeRecoveryOrigin,
+    RecoveryEventRequest,
     StatusResponse,
 )
+from context_intelligence_server.routers.admin import RecoveryReceiptBody
+
+
+@pytest.mark.parametrize(
+    ("model", "fields"),
+    [
+        (NativeRecoveryOrigin, {"source_line_sha256": "a" * 64}),
+        (
+            LegacyNativeRecoveryOrigin,
+            {
+                "session_id": "recovery-session",
+                "source_line_sha256": "a" * 64,
+                "source_stream_sha256": "b" * 64,
+            },
+        ),
+        (RecoveryReceiptBody, {"source_handle": "c" * 64}),
+    ],
+)
+@pytest.mark.parametrize("ordinal", [-1, 0, (1 << 63) - 1, 1 << 63])
+def test_recovery_ordinal_signed_int64_boundary(
+    model: type[NativeRecoveryOrigin]
+    | type[LegacyNativeRecoveryOrigin]
+    | type[RecoveryReceiptBody],
+    fields: dict[str, str],
+    ordinal: int,
+) -> None:
+    """Every public receipt identity rejects ordinals SQLite cannot bind."""
+    payload = {**fields, "ordinal": ordinal}
+    if ordinal in (-1, 1 << 63):
+        with pytest.raises(ValidationError):
+            model.model_validate(payload)
+    else:
+        assert model.model_validate(payload).ordinal == ordinal
+        schema = model.model_json_schema()["properties"]["ordinal"]
+        assert schema.get("minimum") == 0
+        assert schema.get("maximum") == 9223372036854775807
 
 
 def test_event_request_valid():
@@ -95,6 +134,16 @@ def test_event_request_accepts_working_dir():
     assert req.working_dir == "/home/user/project"
 
 
+def test_event_request_preserves_working_dir_inside_live_data():
+    """The recovery sanitizer must not alter normal live event payload data."""
+    req = EventRequest(
+        event="tool:pre",
+        workspace="main",
+        data={"session_id": "abc123", "working_dir": "/home/user/project"},
+    )
+    assert req.data["working_dir"] == "/home/user/project"
+
+
 def test_event_request_rejects_blank_working_dir():
     """A whitespace-only working_dir is never a legitimate path — reject it.
 
@@ -108,6 +157,27 @@ def test_event_request_rejects_blank_working_dir():
             workspace="main",
             working_dir="   ",
             data={"session_id": "abc123"},
+        )
+
+
+def test_recovery_event_request_rejects_working_dir():
+    """Recovery must never accept a local path retained by normal live ingest."""
+    with pytest.raises(ValidationError):
+        RecoveryEventRequest.model_validate(
+            {
+                "event": "session:start",
+                "workspace": "main",
+                "working_dir": "/home/user/private-project",
+                "data": {"session_id": "abc123"},
+                "source": {
+                    "protocol": "native-recovery-source-v1",
+                    "session_id": "abc123",
+                    "source_stream_sha256": "a" * 64,
+                    "source_sha256": "b" * 64,
+                    "record_count": 1,
+                },
+                "origin": {"ordinal": 0, "source_line_sha256": "c" * 64},
+            }
         )
 
 

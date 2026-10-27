@@ -3,7 +3,8 @@
 import hashlib
 import json
 import logging
-from collections.abc import Callable, MutableMapping
+from collections.abc import Awaitable, Callable, MutableMapping
+from inspect import isawaitable
 from typing import Any
 
 import jwt  # pyjwt[crypto] — added in T1; used by EntraResolver
@@ -229,7 +230,12 @@ class EntraResolver:
         self._tenant_id = tenant_id
         self._identity_map = identity_map
         # M2 service-path config — fail-closed defaults (empty disables each role).
-        self._service_identity_map: dict[str, str] = service_identity_map or {}
+        # `is None`, never `or {}`: an EMPTY live dict must stay aliased so a later
+        # store load/PUT is visible to this resolver (an `or {}` would silently
+        # detach it from the store's flat_dict).
+        self._service_identity_map: dict[str, str] = (
+            {} if service_identity_map is None else service_identity_map
+        )
         self._service_data_role = service_data_role
         self._reader_role = reader_role
         self._entra_admin_role = entra_admin_role
@@ -612,8 +618,16 @@ class BearerTokenMiddleware:
         exempt_paths: frozenset[str] | None = None,
         admin_api_key_digest: str | None = None,
         allow_unauthenticated: bool = False,
+        identity_gate: Callable[[], bool | Awaitable[bool]] | None = None,
     ) -> None:
         self.app = app
+        # Optional readiness gate for a server-owned identity store.  When it
+        # returns False (before startup, after shutdown, for a stale factory
+        # wrapper, or after ownership is lost) every non-exempt request is
+        # refused with 503 BEFORE any auth decision, including the
+        # unauthenticated shortcut and the admin-key fast path.  ``None``
+        # (the default) keeps standalone middleware behavior unchanged.
+        self._identity_gate: Callable[[], bool | Awaitable[bool]] | None = identity_gate
         # Explicit opt-out (test/dev ONLY): when True AND the resolver has no
         # credentials configured (auth_enabled is False), ALL requests pass
         # through unauthenticated. An empty keystore ALONE no longer fails
@@ -647,6 +661,25 @@ class BearerTokenMiddleware:
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
+
+        # Identity readiness gate.  Exempt paths (/status, /version, ...) are
+        # answered BEFORE the gate is even consulted, so health and status
+        # never cost a filesystem check and keep reporting while identity is
+        # initializing or unavailable.  Every other path answers 503 until the
+        # live generation's identity is ready: this precedes the unauthenticated
+        # shortcut and the admin-key fast path.
+        if self._identity_gate is not None:
+            gated_path: str = scope.get("path", "")
+            gate_exempt = gated_path in self._exempt_paths or any(
+                gated_path.startswith(p) for p in _EXEMPT_PREFIXES
+            )
+            if not gate_exempt:
+                ready = self._identity_gate()
+                if isawaitable(ready):
+                    ready = await ready
+                if not ready:
+                    await _send_error(send, 503, "Identity store is not available")
+                    return
 
         # Fail-open pass-through ONLY when the operator EXPLICITLY opted out via
         # allow_unauthenticated=True (test/dev) AND the resolver has no

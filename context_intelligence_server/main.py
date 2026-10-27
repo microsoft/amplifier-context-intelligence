@@ -9,14 +9,20 @@ import os
 import re
 import secrets
 import sys
+import threading
 import time
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from concurrent.futures import Future as ConcurrentFuture
+from contextlib import asynccontextmanager, nullcontext, suppress
+from dataclasses import dataclass, field
 from datetime import datetime
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Generic, Literal, TypeVar, cast
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Path as PathParam
+from pydantic import ValidationError
 from fastapi.responses import JSONResponse, Response
 from neo4j import READ_ACCESS, WRITE_ACCESS
 
@@ -30,43 +36,165 @@ from context_intelligence_server.auth import (
 from context_intelligence_server.authz import (  # noqa: F401 — re-exported for tests/routes
     _is_write_capable,
     require_arbitrary_data_read,
+    require_claimed_blob_access,
     require_claimed_session_access,
     require_read,
     require_recovery_write,
     require_workspace_access,
     require_write,
 )
+from context_intelligence_server.blob_keys import MAPPED_MARKER
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
+from context_intelligence_server.blob_retention import BlobExpiredError
+from context_intelligence_server.retention_service import RetentionService
 from context_intelligence_server.config import Neo4jClientConfig, Settings, get_settings
 from context_intelligence_server.idempotency import EventIdempotencyCache
 from context_intelligence_server.identity_store import IdentityStore
+from context_intelligence_server.instance_lock import (
+    IdentityStoreLock,
+    IdentityStoreOwnershipError,
+    InstanceLockUnavailable,
+    ServerInstanceLock,
+)
 from context_intelligence_server.logging_config import setup_logging
 from context_intelligence_server.models import (
     CypherRequest,
     EventRequest,
     EventResponse,
+    LegacyRecoveryEventRequest,
+    RecoveryAdmissionRequest,
+    RecoveryAdmissionDuplicateResponse,
+    RecoveryAdmissionPermitResponse,
     RecoveryEventRequest,
 )
+from context_intelligence_server.queue_manager import is_safe_session_id
 from context_intelligence_server.neo4j_store import (
     build_bounded_neo4j_driver,
     ensure_neo4j_schema,
     mark_schema_ready,
 )
-from context_intelligence_server.queue_manager import fold_worker_key
-from context_intelligence_server.recovery import RecoveryReceiptStore, lease_allows
+from context_intelligence_server.queue_manager import (
+    QueueManager,
+    _await_uninterrupted,
+    fold_worker_key,
+)
 from context_intelligence_server.registry import LiveFirstFlushGate, SessionRegistry
+from context_intelligence_server.recovery import (
+    PermitResult,
+    ReceiptClassification,
+    RecoveryAdmissionGate,
+    RecoveryReceiptStore,
+    canonical_payload_digest,
+    has_only_unicode_scalars,
+    legacy_source_descriptor,
+    legacy_source_handle,
+    lease_allows,
+    recovery_event_identity,
+    sanitize_recovery_payload,
+    source_descriptor_digest,
+    source_handle_from_capability,
+)
+from context_intelligence_server.session_claims import SessionClaimStore
 from context_intelligence_server.routers.admin import router as admin_router
 from context_intelligence_server.routers.deletion import router as deletion_router
 from context_intelligence_server.routers.queues import router as queues_router
 from context_intelligence_server.routers.version import router as version_router
 from context_intelligence_server.routers.whoami import router as whoami_router
-from context_intelligence_server.session_claims import SessionClaimStore
 from context_intelligence_server.status import build_status_response
 from context_intelligence_server.utils import SPOOL_EVENT_IDENTITY
 
 _settings = get_settings()
 
 logger = logging.getLogger("context_intelligence_server")
+
+# Native capture recovery accepts source records up to 16 MiB. Reserve a
+# bounded envelope allowance for the recovery source and origin fields.
+_MAX_RECOVERY_BODY_BYTES = 16 * 1024 * 1024 + 64 * 1024
+_RECOVERY_REQUEST_PATHS = frozenset({"/recovery/admissions", "/recovery/events"})
+_RecoveryRequest = (
+    RecoveryAdmissionRequest | RecoveryEventRequest | LegacyRecoveryEventRequest
+)
+
+
+class RecoveryBodyLimitMiddleware:
+    """Reject oversized recovery requests before FastAPI materializes JSON."""
+
+    def __init__(self, app_instance: Any) -> None:
+        self.app = app_instance
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if (
+            scope["type"] != "http"
+            or scope["method"] != "POST"
+            or scope["path"] not in _RECOVERY_REQUEST_PATHS
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        received = 0
+        content_length = dict(scope.get("headers", [])).get(b"content-length")
+        if content_length is not None:
+            try:
+                declared_size = int(content_length)
+            except ValueError:
+                declared_size = 0
+            if declared_size > _MAX_RECOVERY_BODY_BYTES:
+                response = JSONResponse(
+                    status_code=413,
+                    content={"detail": "Recovery request body is too large"},
+                )
+                await response(scope, receive, send)
+                return
+
+        async def limited_receive() -> dict[str, Any]:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > _MAX_RECOVERY_BODY_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Recovery request body is too large",
+                    )
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+
+_RecoveryRetryClass = Literal["global", "renew", "source"]
+_RECOVERY_PERMIT_TOKEN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
+
+
+def _recovery_unavailable(
+    retry_after_seconds: int, retry_class: _RecoveryRetryClass = "global"
+) -> HTTPException:
+    """Construct the uniform non-disclosing recovery-capacity response.
+
+    ``X-Recovery-Retry-Class`` is advisory for new clients.  The existing
+    status, body, and Retry-After header remain the interoperable contract for
+    old clients and intermediaries that omit or strip the new header.
+    """
+
+    return HTTPException(
+        status_code=429,
+        detail="Recovery unavailable",
+        headers={
+            "Retry-After": str(retry_after_seconds),
+            "X-Recovery-Retry-Class": retry_class,
+        },
+    )
+
+
+def _recovery_source_conflict() -> HTTPException:
+    """Construct a capability-holder-only, path-free source conflict response."""
+    return HTTPException(status_code=409, detail="Recovery source conflict")
+
+
+def _has_recovery_permit_shape(value: str | None) -> bool:
+    """Recognize the opaque 32-byte base64url permit form without decoding it."""
+    return (
+        isinstance(value, str) and _RECOVERY_PERMIT_TOKEN.fullmatch(value) is not None
+    )
 
 
 def _neo4j_access_const(mode: str) -> str:
@@ -210,7 +338,7 @@ async def _crash_recovery_topup(respawn_limit: int | None) -> int:
         try:
             batch = await registry.queue_manager.read_batch(sid, max_items=1)
         except (OSError, ValueError):
-            logger.exception("crash_recovery_topup_read_failed session=%s", sid)
+            logger.exception("crash_recovery_topup_read_failed session=%a", sid)
             continue
         if not batch.lines:
             # recover()/read_batch disagreement (e.g. a concurrent finalize
@@ -224,7 +352,9 @@ async def _crash_recovery_topup(respawn_limit: int | None) -> int:
         # get_or_create, whether or not a drainer already existed (get_or_create
         # is idempotent). So this count is "sessions dispatched this pass", an
         # upper bound on newly-spawned drainers -- fine for an INFO log.
-        if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
+        if await _scoped_queue_binding_matches(app, sid, batch.lines[0]) and _recover_one_session(
+            sid, batch.lines[0], registry.get_or_create
+        ):
             respawned += 1
     return respawned
 
@@ -368,10 +498,22 @@ async def _startup_recovery_body(app: FastAPI) -> None:
         deferred_count = 0
     respawned = 0
     for sid in to_process:
-        batch = await registry.queue_manager.read_batch(sid, max_items=1)
+        # Guarded per key (same shape as _crash_recovery_topup; read_batch
+        # itself stays loud for the live drainer's hot path) so one legacy or
+        # unreadable key cannot abort the pass for the healthy sessions behind
+        # it. Only OSError/ValueError are per-key conditions: cancellation and
+        # programming errors still propagate to the wrapper. ``%a`` escapes
+        # control characters in a legacy key so the log line stays one line.
+        try:
+            batch = await registry.queue_manager.read_batch(sid, max_items=1)
+        except (OSError, ValueError):
+            logger.exception("startup_recovery_read_failed session=%a", sid)
+            continue
         if not batch.lines:
             continue
-        if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
+        if await _scoped_queue_binding_matches(app, sid, batch.lines[0]) and _recover_one_session(
+            sid, batch.lines[0], registry.get_or_create
+        ):
             respawned += 1
     if deferred_count:
         # WARNING, not INFO, on purpose: a deferred backlog must never be a
@@ -456,6 +598,9 @@ async def _resume_native_recovery(app: FastAPI) -> None:
     recovery_registry = getattr(app.state, "recovery_registry", None)
     if recovery_registry is None:
         return
+    # This spool is separate from live ingest's boot migration. Rename only
+    # physical keys; receipt origins and payload session identities stay intact.
+    await recovery_registry.queue_manager.migrate_overlong_keys()
     await _reconcile_native_recovery_outbox(app)
     for session_id in await recovery_registry.queue_manager.recover():
         try:
@@ -467,7 +612,9 @@ async def _resume_native_recovery(app: FastAPI) -> None:
                 "native_recovery_resume_read_failed session=%s", session_id
             )
             continue
-        if batch.lines:
+        if batch.lines and await _scoped_queue_binding_matches(
+            app, session_id, batch.lines[0]
+        ):
             _recover_one_session(
                 session_id, batch.lines[0], recovery_registry.get_or_create
             )
@@ -490,68 +637,459 @@ async def _enqueue_native_recovery_receipt(
     if not await _finalize_native_recovery_claim(app, receipt):
         logger.error("native_recovery_claim_unresolved; receipt remains in outbox")
         return
-    origin = receipt["origin"]
+    origin = {
+        "source_handle": receipt["source_handle"],
+        **receipt["origin"],
+    }
     payload = {
-        **receipt["payload"],
+        # Defense for receipts created by an older server version:
+        # reconciliation must not reintroduce a local path at any depth.
+        **sanitize_recovery_payload(receipt["payload"]),
         "created_by": receipt["actor"],
         "_recovery_origin": origin,
     }
+    # A usable retained key identifies the same logical event as live ingest.
+    # Otherwise source-handle/ordinal preserves distinct same-timestamp records.
+    payload[SPOOL_EVENT_IDENTITY] = _recovery_event_identity(
+        payload, receipt["source_handle"], receipt["origin"]["ordinal"]
+    )
     session_id = payload["data"]["session_id"]
     worker_key = _recovery_worker_key(session_id)
     await recovery_registry.queue_manager.append(
         worker_key, json.dumps(payload, separators=(",", ":")).encode()
     )
-    try:
-        await receipts.mark(origin, "enqueued")
-    finally:
+    enqueued = await receipts.mark(
+        receipt["origin"], "enqueued", source_handle=receipt["source_handle"]
+    )
+    if enqueued:
         recovery_registry.get_or_create(
             worker_key, receipt["workspace"], created_by=receipt["actor"]
         )
+    else:
+        logger.error(
+            "native_recovery_enqueue_transition_failed; raw record remains durable"
+        )
 
 
-async def _reconcile_native_recovery_outbox_unlocked(app: FastAPI) -> None:
-    """Repair interrupted recovery admissions while the outbox lock is held."""
+async def _reconcile_native_recovery_outbox_unlocked(
+    app: FastAPI,
+    *,
+    bridge_retry_pending: bool = False,
+    retry_origins_with_audit: frozenset[str] = frozenset(),
+    retry_origins_captured: frozenset[str] = frozenset(),
+) -> None:
+    """Repair interrupted recovery admissions while the outbox lock is held.
+
+    Precondition: the caller holds ``recovery_outbox_lock``.  Every production
+    caller also holds ``recovery_quarantine_retry_lock``, taken first:
+    reconciliation, the operator retry, operator quarantine and event admission
+    (whose duplicate repair reaches this through ``_admit_native_recovery``).
+    ``bridge_retry_pending=False`` (as in that duplicate repair) is a policy
+    choice about which receipts to bridge, not a concurrency guarantee: the
+    shared lock is what keeps a retry from interleaving with it.
+
+    ``retry_origins_captured`` is the set of retry-pending origins the caller
+    observed (and computed ``retry_origins_with_audit`` for) before taking the
+    outbox lock.  A retry bridge is made only for those origins: one that
+    became pending after that snapshot has no audit evidence here, so its old
+    committed queue line could be mistaken for the new delivery.
+
+    Invariant: a committed queue line is the *previous* delivery's, and is never
+    proof that a retry was written, unless a valid retry audit says so.  A
+    retry-pending receipt whose queue line is committed and whose audit is
+    absent or invalid is left pending and reported with ``RecoveryReceiptError``;
+    an operator repairs the evidence and the next pass appends a fresh,
+    idempotent delivery.  Dead-letter evidence that cannot be read as proof is
+    treated the same way, never as "not dead".
+    """
+    from context_intelligence_server.queue_manager import RecoveryReceiptError
+
     receipts = getattr(app.state, "recovery_receipts", None)
     recovery_registry = getattr(app.state, "recovery_registry", None)
     if receipts is None or recovery_registry is None:
         return
     for receipt in await receipts.pending_outbox():
-        origin = receipt["origin"]
+        origin = {"source_handle": receipt["source_handle"], **receipt["origin"]}
         state = receipt["state"]
         if not await _finalize_native_recovery_claim(app, receipt):
             logger.error("native_recovery_claim_unresolved; receipt remains in outbox")
             continue
-        if state == "committed_pending":
-            await receipts.mark(origin, "written")
-            continue
-        if state == "enqueued":
-            # A successful transition follows the durable append. Startup
-            # resumes workers from the separate spool without a full scan.
-            continue
-        present = await recovery_registry.queue_manager.contains_recovery_origin(origin)
-        if present:
-            await receipts.mark(origin, "enqueued")
-            payload = receipt["payload"]
-            recovery_registry.get_or_create(
-                _recovery_worker_key(payload["data"]["session_id"]),
-                receipt["workspace"],
-                created_by=receipt["actor"],
+        # Dead-letter evidence is a stronger, terminal fact than a committed
+        # offset.  Historic versions could commit the recovery queue before
+        # recording this receipt transition; treating that offset as written
+        # would erase a deterministic failure on restart.
+        if await recovery_registry.queue_manager.recovery_origin_is_dead(origin):
+            await receipts.mark(
+                receipt["origin"], "quarantined", source_handle=receipt["source_handle"]
             )
             continue
-        if await recovery_registry.queue_manager.recovery_origin_is_dead(origin):
-            await receipts.mark(origin, "quarantined")
+        if state == "committed_pending":
+            await receipts.mark(
+                receipt["origin"], "written", source_handle=receipt["source_handle"]
+            )
+            continue
+        if state == "retry_pending" and not (
+            bridge_retry_pending
+            and json.dumps(origin, sort_keys=True, separators=(",", ":"))
+            in retry_origins_captured
+        ):
+            # A retry continuation is admitted only through the live-first
+            # admission check (the permit gate, or the live-availability
+            # predicate in lease mode), and only for origins captured with
+            # their audit evidence.  Never let a normal outbox scan bypass it.
+            continue
+        if state == "enqueued":
+            queue_state = (
+                await recovery_registry.queue_manager.recovery_origin_commit_state(
+                    origin
+                )
+            )
+            if queue_state == "committed":
+                # A committed offset proves only that this line was consumed,
+                # not that it was flushed: a quarantine acknowledges its line
+                # without any flush.  It is safe to read as a write here only
+                # because quarantine+acknowledgement and retry are serialized by
+                # ``recovery_quarantine_retry_lock`` (a retry never reuses a
+                # line whose old acknowledgement is still in flight) and
+                # because dead-letter evidence was checked first above.  It
+                # repairs receipts made by the former commit-then-terminalize
+                # ordering.
+                await receipts.mark(
+                    receipt["origin"],
+                    "written",
+                    source_handle=receipt["source_handle"],
+                )
+                continue
+            if queue_state == "queued":
+                # Startup resumes workers from the separate spool without a
+                # full outbox re-append.
+                continue
+            # The queued source disappeared before it could be acknowledged.
+            # Make it replayable rather than treating an enqueued receipt as
+            # proof of a graph write.
+            await receipts.mark(
+                receipt["origin"],
+                "pending_enqueue",
+                source_handle=receipt["source_handle"],
+            )
+        queue_state = (
+            await recovery_registry.queue_manager.recovery_origin_commit_state(origin)
+        )
+        if state == "retry_pending" and queue_state == "committed":
+            if (
+                json.dumps(origin, sort_keys=True, separators=(",", ":"))
+                not in retry_origins_with_audit
+            ):
+                # Without a valid retry audit this committed line cannot be
+                # told apart from the delivery that was quarantined.  Marking
+                # it written would acknowledge a retry that never flushed.
+                logger.error(
+                    "native_recovery_retry_without_audit; receipt remains pending"
+                )
+                raise RecoveryReceiptError(
+                    "retry is pending and its queue line is committed, but no "
+                    "valid retry audit proves that line is the prior delivery"
+                )
+            # This committed line belongs to the delivery that was
+            # quarantined and then archived, not the current retry bridge.
+            # Treat it as absent so this attempt gets its own raw queue line.
+            queue_state = None
+        if queue_state == "committed":
+            await receipts.mark(
+                receipt["origin"], "written", source_handle=receipt["source_handle"]
+            )
+            continue
+        if queue_state == "queued":
+            enqueued = await receipts.mark(
+                receipt["origin"], "enqueued", source_handle=receipt["source_handle"]
+            )
+            if enqueued:
+                payload = receipt["payload"]
+                recovery_registry.get_or_create(
+                    _recovery_worker_key(payload["data"]["session_id"]),
+                    receipt["workspace"],
+                    created_by=receipt["actor"],
+                )
+            else:
+                logger.error(
+                    "native_recovery_resume_transition_failed; raw record remains durable"
+                )
             continue
         await _enqueue_native_recovery_receipt(app, receipt)
 
 
 async def _reconcile_native_recovery_outbox(app: FastAPI) -> None:
-    """Idempotently bridge durable receipt admission into the recovery spool."""
+    """Idempotently bridge durable receipt admission into the recovery spool.
+
+    Takes ``recovery_quarantine_retry_lock`` first, so the evidence snapshots
+    below cannot predate a poison quarantine + acknowledgement or an operator
+    retry that is in flight.  A caller that already holds that lock must call
+    ``_reconcile_native_recovery_outbox_under_quarantine_lock`` instead: the
+    lock is not reentrant.  Nothing holding the lock, the admission gate or the
+    outbox lock may call this function.
+    """
+    quarantine_lock = getattr(app.state, "recovery_quarantine_retry_lock", None)
+    async with quarantine_lock or nullcontext():
+        await _await_uninterrupted(
+            _reconcile_native_recovery_outbox_under_quarantine_lock(app)
+        )
+
+
+async def _reconcile_native_recovery_outbox_under_quarantine_lock(
+    app: FastAPI,
+) -> None:
+    """Reconcile the outbox; the caller holds ``recovery_quarantine_retry_lock``.
+
+    The receipt/audit snapshots are taken here, under that lock, then the
+    admission gate (permit mode) and the outbox lock are taken in that order.
+    """
+    receipts = getattr(app.state, "recovery_receipts", None)
+    admission_gate = getattr(app.state, "recovery_admission_gate", None)
     lock = getattr(app.state, "recovery_outbox_lock", None)
-    if lock is None:
-        await _reconcile_native_recovery_outbox_unlocked(app)
+
+    # Read before the gate so a slow SQLite read/JSON validation never delays a
+    # normal /events append. An admin retry is the only writer of this bridge;
+    # seeing a new bridge after this read merely defers it to the next pass.
+    # Both admission modes (permit and legacy lease) share this snapshot: it
+    # decides whether a bridge is attempted and which retry origins carry
+    # audit evidence, so a stale committed line is never read as new delivery.
+    pending = await receipts.pending_outbox() if receipts is not None else []
+    retry_origins_captured: frozenset[str] = frozenset()
+    retry_origins_with_audit: frozenset[str] = frozenset()
+    if receipts is not None:
+        captured: list[str] = []
+        audited_retry_origins: list[str] = []
+        for receipt in pending:
+            if receipt["state"] != "retry_pending":
+                continue
+            origin = {"source_handle": receipt["source_handle"], **receipt["origin"]}
+            encoded = json.dumps(origin, sort_keys=True, separators=(",", ":"))
+            captured.append(encoded)
+            if await app.state.recovery_registry.queue_manager.recovery_origin_has_retry_audit(
+                origin
+            ):
+                audited_retry_origins.append(encoded)
+        retry_origins_captured = frozenset(captured)
+        retry_origins_with_audit = frozenset(audited_retry_origins)
+    has_retry_pending = bool(retry_origins_captured)
+
+    async def _reconcile_locked(*, bridge_retry_pending: bool) -> bool:
+        if lock is None:
+            await _reconcile_native_recovery_outbox_unlocked(
+                app,
+                bridge_retry_pending=bridge_retry_pending,
+                retry_origins_with_audit=retry_origins_with_audit,
+                retry_origins_captured=retry_origins_captured,
+            )
+        else:
+            async with lock:
+                await _reconcile_native_recovery_outbox_unlocked(
+                    app,
+                    bridge_retry_pending=bridge_retry_pending,
+                    retry_origins_with_audit=retry_origins_with_audit,
+                    retry_origins_captured=retry_origins_captured,
+                )
+        return True
+
+    if has_retry_pending and admission_gate is not None:
+        # Gate then outbox is the only combined order. The availability check
+        # intentionally ignores this retry bridge itself, otherwise the bridge
+        # could never self-heal after a process crash.
+        await admission_gate.run_if_available(
+            lambda: _native_recovery_live_available(app),
+            lambda: _reconcile_locked(bridge_retry_pending=True),
+        )
         return
-    async with lock:
-        await _reconcile_native_recovery_outbox_unlocked(app)
+    # Legacy lease mode has no permit gate, so retry follows the same
+    # live-first predicate directly: a paused recovery or pending live work
+    # leaves the retry bridge unbridged (still durable) until a later pass.
+    # Receipts that need no bridge are still reconciled either way.
+    bridge = has_retry_pending and await _native_recovery_live_available(app)
+    await _reconcile_locked(bridge_retry_pending=bridge)
+
+
+async def _retry_quarantined_native_recovery(app: FastAPI) -> bool:
+    """Retry one quarantined receipt through the normal live-first admission gate.
+
+    The whole operation (selection, fence, archive, reset and bridge) holds
+    ``recovery_quarantine_retry_lock`` and is awaited uninterrupted, so it can
+    neither interleave with a poison drainer's quarantine + acknowledgement nor
+    be left half-applied by a cancelled request.  The lock is held through the
+    bridge (the queue append), not through graph flush or worker completion.
+    """
+    receipts = getattr(app.state, "recovery_receipts", None)
+    recovery_registry = getattr(app.state, "recovery_registry", None)
+    if receipts is None or recovery_registry is None:
+        return False
+    quarantine_lock = getattr(app.state, "recovery_quarantine_retry_lock", None)
+    async with quarantine_lock or nullcontext():
+        return await _await_uninterrupted(
+            _retry_quarantined_native_recovery_under_quarantine_lock(app)
+        )
+
+
+async def _retry_quarantined_native_recovery_under_quarantine_lock(
+    app: FastAPI,
+) -> bool:
+    """Retry one quarantined receipt; the caller holds the quarantine/retry lock."""
+    receipts = app.state.recovery_receipts
+    recovery_registry = app.state.recovery_registry
+    admission_gate = getattr(app.state, "recovery_admission_gate", None)
+
+    admin_lock = app.state.recovery_admin_retry_lock
+    async with admin_lock:
+        receipt = await receipts.next_quarantined()
+        if receipt is None:
+            return False
+        origin = {"source_handle": receipt["source_handle"], **receipt["origin"]}
+        # Fence: a quarantined delivery whose old line is still queued (its
+        # acknowledgement failed, or the process died between the receipt
+        # transition and the offset rename) must not be archived or reset.
+        # Reusing that line would let its late acknowledgement read as a
+        # completed retry.  Leave evidence and payload untouched; the line is
+        # replayed and re-quarantined on its own, after which retry is allowed.
+        if (
+            await recovery_registry.queue_manager.recovery_origin_commit_state(origin)
+            == "queued"
+        ):
+            logger.warning(
+                "native_recovery_retry_refused; quarantined delivery is still queued"
+            )
+            return False
+        # Copy before active removal. This potentially slow scan deliberately
+        # happens outside the live admission gate, so normal /events appends
+        # retain their short critical section.
+        await recovery_registry.queue_manager.archive_recovery_dead_letters(origin)
+
+        async def _mark_retry_pending() -> bool:
+            return await receipts.requeue_quarantined(
+                receipt["source_handle"], receipt["origin"]["ordinal"]
+            )
+
+        if admission_gate is None:
+            # Legacy lease mode: no permit gate to serialize with, but the same
+            # live-first/pause predicate still governs the retry. Lease
+            # freshness stays enforced at ingress and flush, as before.
+            transitioned = (
+                await _native_recovery_live_available(app)
+                and await _mark_retry_pending()
+            )
+        else:
+            transitioned = await admission_gate.run_if_available(
+                lambda: _native_recovery_live_available(app), _mark_retry_pending
+            )
+        if not transitioned:
+            return False
+
+    # The durable bridge has been made visible. Ordinary reconciliation owns
+    # append/resume and reacquires the standard gate before it handles this
+    # retry, preserving gate -> outbox ordering.  The quarantine/retry lock is
+    # already held, so call the under-lock form (the lock is not reentrant).
+    await _reconcile_native_recovery_outbox_under_quarantine_lock(app)
+    return True
+
+
+async def _quarantine_pending_native_recovery(
+    app: FastAPI, source_handle: str, ordinal: int
+) -> Literal["quarantined", "none", "not_paused"]:
+    """Dead-letter and terminalize one selected receipt while recovery is paused.
+
+    The recovery pause condition is held from the authoritative paused check
+    through the final queue commit.  Resume takes the same condition, so it can
+    only return once the selected receipt is terminal; a drainer waiting on
+    resume then finds it ineligible instead of flushing it.  Lock order is
+    pause condition -> quarantine/retry lock -> outbox lock.  Nothing that
+    holds either of those locks may await the pause condition.
+
+    Returns ``"not_paused"`` when recovery is not paused (nothing changed),
+    ``"none"`` when no eligible pending receipt was quarantined, and
+    ``"quarantined"`` when the receipt was dead-lettered and terminalized.
+    """
+    receipts = getattr(app.state, "recovery_receipts", None)
+    recovery_registry = getattr(app.state, "recovery_registry", None)
+    if receipts is None or recovery_registry is None:
+        return "none"
+    quarantine_lock = getattr(app.state, "recovery_quarantine_retry_lock", None)
+    async with app.state.recovery_pause_condition:
+        if not getattr(app.state, "recovery_paused", False):
+            return "not_paused"
+        async with quarantine_lock or nullcontext(), app.state.recovery_outbox_lock:
+            # Settled: cancellation must not abandon a half-applied
+            # dead-letter / receipt / acknowledgement while locks are held.
+            if await _await_uninterrupted(
+                _quarantine_selected_receipt_locked(
+                    recovery_registry, receipts, source_handle, ordinal
+                )
+            ):
+                return "quarantined"
+            return "none"
+
+
+async def _quarantine_selected_receipt_locked(
+    recovery_registry: Any,
+    receipts: Any,
+    source_handle: str,
+    ordinal: int,
+) -> bool:
+    """Quarantine one pending receipt.
+
+    The caller holds the pause condition, the quarantine/retry lock and the
+    outbox lock.
+    """
+    receipt = await receipts.pending_receipt(source_handle, ordinal)
+    if receipt is None:
+        return False
+    origin = {"source_handle": source_handle, **receipt["origin"]}
+    queue = recovery_registry.queue_manager
+    session_id = receipt["payload"]["data"]["session_id"]
+    # A committed offset only says the line was consumed; the quarantine,
+    # retry audit and receipt state say what happened to the delivery.  Do not
+    # let a manual action overwrite a consumed delivery's completion with a
+    # quarantine, unless retry audit evidence proves it belongs to the prior
+    # delivery that this retry bridge replaced.
+    if await queue.recovery_origin_commit_state(
+        origin
+    ) == "committed" and not await queue.recovery_origin_has_retry_audit(origin):
+        return False
+    batch = await queue.read_batch(session_id, max_items=1)
+    if batch.records:
+        try:
+            envelope = json.loads(batch.records[0].raw)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(envelope, dict):
+            return False
+        selected = QueueManager.normalized_recovery_origin(origin)
+        found = QueueManager.normalized_recovery_origin(
+            envelope.get("_recovery_origin")
+        )
+        if selected is None or selected != found:
+            return False
+        await queue.dead_letter(
+            session_id,
+            batch.records[0].raw,
+            "operator quarantined stuck native recovery receipt",
+        )
+        await receipts.quarantine_pending(source_handle, ordinal)
+        await queue.commit(session_id, batch.end_offset)
+        return True
+    # An outbox record can be stuck before its first queue append. Preserve
+    # its sanitized envelope as dead-letter evidence before terminalizing it.
+    audit_payload = {
+        **sanitize_recovery_payload(receipt["payload"]),
+        "created_by": receipt["actor"],
+        "_recovery_origin": origin,
+        SPOOL_EVENT_IDENTITY: _recovery_event_identity(
+            receipt["payload"], source_handle, ordinal
+        ),
+    }
+    await queue.dead_letter(
+        session_id,
+        json.dumps(audit_payload, separators=(",", ":")).encode(),
+        "operator quarantined stuck native recovery receipt before enqueue",
+    )
+    await receipts.quarantine_pending(source_handle, ordinal)
+    return True
 
 
 async def _admit_native_recovery(
@@ -560,7 +1098,12 @@ async def _admit_native_recovery(
     claims: SessionClaimStore | None = None,
     release_reservation: bool = False,
 ) -> str:
-    """Atomically admit and enqueue a current request without an outbox scan."""
+    """Atomically admit and enqueue a current request.
+
+    The caller holds ``recovery_quarantine_retry_lock``; this takes the outbox
+    lock (shared -> gate -> outbox) and must never take the shared lock itself.
+    A duplicate outcome runs the interrupted-append repair scan below.
+    """
     lock = getattr(app.state, "recovery_outbox_lock", None)
     if lock is None:
         return await _admit_native_recovery_unlocked(
@@ -572,9 +1115,26 @@ async def _admit_native_recovery(
         )
 
 
-def _recovery_reservation_token(origin: dict[str, Any]) -> str:
-    """Derive a stable opaque reservation token from an immutable recovery origin."""
-    encoded = json.dumps(origin, sort_keys=True, separators=(",", ":")).encode()
+def _recovery_reservation_token(receipt: dict[str, Any]) -> str:
+    """Derive a stable reservation token from a source handle and ordinal.
+
+    The old-origin branch exists only so an explicitly configured lease-mode
+    reservation created before the source-capability upgrade can be finalized.
+    """
+    if "source_handle" in receipt:
+        source_handle = receipt["source_handle"]
+        ordinal = receipt["origin"]["ordinal"]
+    else:
+        source_handle = legacy_source_handle(receipt)
+        ordinal = receipt["ordinal"]
+    encoded = json.dumps(
+        {
+            "source_handle": source_handle,
+            "ordinal": ordinal,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
     return hashlib.sha256(b"recovery-reservation:" + encoded).hexdigest()
 
 
@@ -587,12 +1147,11 @@ async def _finalize_native_recovery_claim(
     if getattr(app.state, "access_control_mode", "compatibility") != "scoped":
         return True
     store = claims or await _session_claim_store(app)
-    origin = receipt["origin"]
     return await store.finalize_recovery(
-        origin["session_id"],
+        receipt["payload"]["data"]["session_id"],
         receipt["actor"],
         receipt["workspace"],
-        _recovery_reservation_token(origin),
+        _recovery_reservation_token(receipt),
     )
 
 
@@ -602,34 +1161,35 @@ async def _admit_native_recovery_unlocked(
     claims: SessionClaimStore | None,
     release_reservation: bool,
 ) -> str:
-    """Admit and enqueue while the recovery outbox lock is held."""
+    """Admit and enqueue while the shared lock and the outbox lock are held."""
     receipts = app.state.recovery_receipts
     try:
-        admitted = await receipts.admit(
+        admitted = await receipts.admit_source(
+            receipt["source_handle"],
+            receipt["source"],
             receipt["origin"],
             receipt["actor"],
             receipt["workspace"],
             receipt["payload"],
             app.state.recovery_lease_path,
+            require_lease=not getattr(app.state, "recovery_permit_required", False),
         )
     except Exception:
         if release_reservation and claims is not None:
-            origin = receipt["origin"]
             await claims.release_recovery(
-                origin["session_id"],
+                receipt["payload"]["data"]["session_id"],
                 receipt["actor"],
                 receipt["workspace"],
-                _recovery_reservation_token(origin),
+                _recovery_reservation_token(receipt),
             )
         raise
     if admitted in ("busy", "conflict"):
         if release_reservation and claims is not None:
-            origin = receipt["origin"]
             await claims.release_recovery(
-                origin["session_id"],
+                receipt["payload"]["data"]["session_id"],
                 receipt["actor"],
                 receipt["workspace"],
-                _recovery_reservation_token(origin),
+                _recovery_reservation_token(receipt),
             )
         return admitted
     if not await _finalize_native_recovery_claim(app, receipt, claims):
@@ -639,8 +1199,65 @@ async def _admit_native_recovery_unlocked(
     elif admitted == "duplicate":
         # A prior process may have died after receipt admission and before its
         # spool append. Reconcile only this interrupted path, not each new row.
+        # This runs under both the shared lock (held by the caller) and the
+        # outbox lock (held here).
         await _reconcile_native_recovery_outbox_unlocked(app)
     return admitted
+
+
+async def _native_recovery_admission_available(app_instance: FastAPI) -> bool:
+    """Read current durable state for a permit decision, never `/status` data."""
+    receipts = getattr(app_instance.state, "recovery_receipts", None)
+    # This is intentionally the live queue's direct durable read. It is called
+    # under RecoveryAdmissionGate, which serializes it with POST /events'
+    # append, so a concurrent live ingress and recovery decision have one
+    # linearization point.
+    receipt_pending = receipts is None
+    if receipts is not None:
+        try:
+            receipt_pending = await receipts.has_pending()
+        except Exception:
+            logger.exception("native_recovery_receipt_availability_check_failed")
+            receipt_pending = True
+    try:
+        live_pending = (
+            await app_instance.state.registry.queue_manager.has_pending_records()
+        )
+    except Exception:
+        logger.exception("native_recovery_live_availability_check_failed")
+        live_pending = True
+    return (
+        not getattr(app_instance.state, "recovery_paused", False)
+        and not receipt_pending
+        and not live_pending
+    )
+
+
+async def _native_recovery_live_available(app_instance: FastAPI) -> bool:
+    """Check only live-first availability for an existing retry bridge."""
+    try:
+        live_pending = (
+            await app_instance.state.registry.queue_manager.has_pending_records()
+        )
+    except Exception:
+        logger.exception("native_recovery_live_availability_check_failed")
+        live_pending = True
+    return (
+        not getattr(app_instance.state, "recovery_paused", False) and not live_pending
+    )
+
+
+async def _append_live_record(
+    app_instance: FastAPI, worker_key: str, body: bytes
+) -> None:
+    """Durably append a live record under the shared recovery admission gate."""
+    admission_gate = getattr(app_instance.state, "recovery_admission_gate", None)
+    queue_manager = app_instance.state.registry.queue_manager
+    if admission_gate is None:
+        await queue_manager.append(worker_key, body)
+        return
+    async with admission_gate.live_enqueue():
+        await queue_manager.append(worker_key, body)
 
 
 async def _spool_stats_refresher(app: FastAPI) -> None:
@@ -679,7 +1296,7 @@ async def _spool_stats_refresher(app: FastAPI) -> None:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+async def _server_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application lifespan: configure logging and create shared Neo4j driver."""
     setup_logging()
     _admin = _settings.resolve_neo4j_admin()
@@ -847,6 +1464,712 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             await recovery_registry.close_neo4j_driver()
 
 
+def _initialize_identity_store(
+    app: FastAPI, s: Any, store: IdentityStore, *, owned: bool
+) -> None:
+    """Load (and on first boot seed) the store when OWNED; always log status.
+
+    An unselected store (``owned`` False) performs no file I/O at all: there is
+    nothing to seed and no mutation path, but the empty-map startup warnings
+    still fire so an operator sees the fail-closed bootstrap state.
+    """
+    if owned:
+        store.load()
+    if s.auth_mode == "entra":
+        config_entra_map = s.build_identity_map()
+        config_service_map = s.build_service_identity_map()
+        if owned and not store.exists():
+            # First boot: seed from config -- ONE shared store serves both user
+            # and service oids (the factory enforced disjoint key spaces).
+            rich_seed: dict[str, dict[str, str]] = {
+                oid: {"id": cid}
+                for oid, cid in (
+                    *config_entra_map.items(),
+                    *config_service_map.items(),
+                )
+            }
+            if rich_seed:
+                store.seed(rich_seed)
+        if not store.flat_dict:
+            logger.warning(
+                "entra identity map is EMPTY at startup (0 bound oids) — server "
+                "is UP and serving, but every delegated (human) token will "
+                "receive 403 until identities are onboarded. Bind the first user "
+                "with an IdentityAdmin-role token via PUT /admin/identities/{oid} "
+                "(store=%s). This is expected on a fresh /data volume.",
+                s.entra_identities_store_path,
+            )
+        # service_identities is a FIRST-BOOT seed only: name the ignored oids
+        # so the wrong lever is obvious at boot.
+        ignored = sorted(
+            oid for oid in config_service_map if oid not in store.flat_dict
+        )
+        if ignored:
+            logger.warning(
+                "service_identities config lists %d oid(s) that are NOT in the "
+                "identity store and are being IGNORED: %r. service_identities "
+                "seeds the store on FIRST BOOT ONLY and store=%s already exists, "
+                "so config changes after the first boot have no effect and these "
+                "principals will receive 403. Add them at runtime with an "
+                "IdentityAdmin-role token via PUT /admin/identities/{oid} — no "
+                "redeploy required.",
+                len(ignored),
+                ignored,
+                s.entra_identities_store_path,
+            )
+    else:
+        if owned and not store.exists():
+            # First boot: seed from config (flat digest map -> rich format).
+            config_ks = s.build_keystore()
+            if config_ks:
+                store.seed({digest: {"id": cid} for digest, cid in config_ks.items()})
+        if not store.flat_dict:
+            if s.resolve_admin_api_key_digest() is not None:
+                logger.warning(
+                    "static keystore is EMPTY at startup (0 bound keys) — server "
+                    "is UP but fail-CLOSED; every request will 401 until keys are "
+                    "onboarded. Add the first key with the admin token via "
+                    "PUT /admin/keys/{sha256hash} (store=%s). Expected on a fresh "
+                    "/data volume.",
+                    s.api_keys_store_path,
+                )
+            else:
+                logger.warning(
+                    "static keystore is EMPTY at startup (0 bound keys) AND no "
+                    "admin_api_key/admin_api_key_sha256 is configured — server is "
+                    "UP but fail-CLOSED and CANNOT be bootstrapped at runtime (the "
+                    "/admin API is unreachable without an admin key: it 401s at "
+                    "the middleware before require_admin runs). Set "
+                    "admin_api_key/admin_api_key_sha256 to enable runtime "
+                    "onboarding, or add api_keys in config and restart. (store=%s)",
+                    s.api_keys_store_path,
+                )
+    resolver = getattr(app.state, "identity_resolver", None)
+    if s.allow_unauthenticated and resolver is not None and not resolver.auth_enabled:
+        logger.warning(
+            "allow_unauthenticated=True AND no credentials configured — the "
+            "server is WIDE OPEN: EVERY request is admitted UNAUTHENTICATED. "
+            "This opt-out is for TEST/DEV ONLY and must NEVER be set in "
+            "production. Configure api_key/api_keys (static) or entra_identities "
+            "(entra) and unset allow_unauthenticated to enforce authentication."
+        )
+
+
+# Identity readiness is one cached record on ``app.state``: ``identity_state`` is
+# "initializing" (closed, the initial state of every factory wrapper), "ready",
+# or "unavailable".  ``/status`` and the auth gate only read it.  The lock makes
+# a worker thread's "ready" lose cleanly against a shutdown that already began.
+_identity_state_lock = threading.Lock()
+_IDENTITY_REASONS = {"initializing": "initializing", "unavailable": "store_unavailable"}
+_IDENTITY_PROBE_CONCURRENCY = 4
+_IDENTITY_MAX_ADMITTED = 36
+_IDENTITY_PROBE_TIMEOUT_SECONDS = 1.0
+_IdentityOwnership = tuple[IdentityStore, IdentityStoreLock | None] | None
+_IdentityResult = TypeVar("_IdentityResult")
+
+
+@dataclass
+class _IdentityCall(Generic[_IdentityResult]):
+    """Action ownership exists before dispatch, independent of its transport."""
+
+    completion: ConcurrentFuture[_IdentityResult]
+    io: asyncio.Future[_IdentityResult]
+    dispatch_error: BaseException | None = None
+
+
+def _new_identity_call(
+    loop: asyncio.AbstractEventLoop, completion: ConcurrentFuture[_IdentityResult]
+) -> _IdentityCall[_IdentityResult]:
+    return _IdentityCall(completion, asyncio.wrap_future(completion, loop=loop))
+
+
+def _run_identity_call(
+    completion: ConcurrentFuture[_IdentityResult], action: Callable[[], _IdentityResult]
+) -> None:
+    # The Future's atomic state transition arbitrates against dispatch abort.
+    # No identity file/lock/mutex access is permitted before winning this claim.
+    if not completion.set_running_or_notify_cancel():
+        return
+    try:
+        result = action()
+    except BaseException as exc:  # noqa: BLE001 - transport every worker outcome
+        completion.set_exception(exc)
+    else:
+        completion.set_result(result)
+
+
+def _identity_transport_done(transport: asyncio.Future[None]) -> None:
+    if not transport.cancelled():
+        transport.exception()  # action outcomes belong to the app completion
+
+
+def _dispatch_identity_call(
+    call: _IdentityCall[_IdentityResult], action: Callable[[], _IdentityResult]
+) -> None:
+    try:
+        transport = asyncio.get_running_loop().run_in_executor(
+            None, partial(_run_identity_call, call.completion, action)
+        )
+    except BaseException as exc:  # noqa: BLE001 - dispatch failure must arbitrate claim/abort
+        call.dispatch_error = exc
+        # Submit may have enqueued before raising. Only this atomic abort can
+        # prove that a late wrapper cannot execute the action.
+        call.completion.cancel()
+    else:
+        transport.add_done_callback(_identity_transport_done)
+
+
+@dataclass
+class _IdentityRuntime:
+    """One ownership lifetime; accounting belongs exclusively to the loop."""
+
+    token: object
+    store: IdentityStore
+    closing: bool = False
+    admitted: int = 0
+    slots: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(_IDENTITY_PROBE_CONCURRENCY)
+    )
+    drained: asyncio.Event = field(default_factory=asyncio.Event)
+    probes: set[asyncio.Future[bool]] = field(default_factory=set)
+    init_io: asyncio.Future[_IdentityOwnership] | None = None
+    init_task: asyncio.Task[_IdentityOwnership] | None = None
+    init_call: _IdentityCall[_IdentityOwnership] | None = None
+    cleanup_calls: list[_IdentityCall[None]] = field(default_factory=list)
+    cleanup_complete: bool = False
+    # Published by startup before acquisition/load; retained if partial stop
+    # fails, independent of exception tracebacks or init's returned result.
+    owned: _IdentityOwnership = None
+
+    def __post_init__(self) -> None:
+        self.drained.set()
+
+
+def _identity_observer_cancelled(runtime: _IdentityRuntime) -> bool:
+    task = runtime.init_task
+    return task is not None and (task.cancelled() or task.cancelling() > 0)
+
+
+def _set_identity_state(
+    app: FastAPI,
+    new_state: str,
+    *,
+    ready_token: Any = None,
+    owned: bool = False,
+    runtime: _IdentityRuntime | None = None,
+) -> None:
+    with _identity_state_lock:
+        state = app.state
+        if runtime is not None:
+            if (
+                getattr(state, "identity_runtime", None) is not runtime
+                or getattr(state, "identity_config_token", None) is not runtime.token
+            ):
+                return
+            ready_token = runtime.token
+        if new_state == "ready" and (
+            getattr(state, "identity_closing", False)
+            or (
+                runtime is not None
+                and (runtime.closing or _identity_observer_cancelled(runtime))
+            )
+        ):
+            new_state = "unavailable"  # shutdown began first: never reopen
+        is_ready = new_state == "ready"
+        state.identity_ready_token = ready_token if is_ready else None
+        state.identity_store_owned = owned and is_ready
+        state.identity_state = new_state
+
+
+def _publish_identity_failure(
+    app: FastAPI, *, runtime: _IdentityRuntime | None = None
+) -> None:
+    """Mirror an ALREADY-latched store failure into the cached readiness record.
+
+    Reads only the store's cached flag (no I/O, no ``healthy()``), and acts only
+    on the current ready state, so ``/status`` never predicts a failure and a
+    stale generation or an initializing/unavailable record is left untouched.
+    """
+    store = runtime.store if runtime is not None else _identity_store_of(app)
+    if (
+        store is not None
+        and store.failure_detected
+        and getattr(app.state, "identity_state", None) == "ready"
+    ):
+        _set_identity_state(app, "unavailable", runtime=runtime)
+
+
+def _close_identity_runtime(app: FastAPI, runtime: _IdentityRuntime) -> None:
+    with _identity_state_lock:
+        runtime.closing = True
+        if (
+            getattr(app.state, "identity_runtime", None) is runtime
+            and getattr(app.state, "identity_config_token", None) is runtime.token
+        ):
+            app.state.identity_closing = True
+    _set_identity_state(app, "unavailable", runtime=runtime)
+
+
+def _identity_runtime_ready(app: FastAPI, runtime: _IdentityRuntime) -> bool:
+    """Cached readiness only: never enter the store mutex or filesystem."""
+    if _identity_observer_cancelled(runtime):
+        _close_identity_runtime(app, runtime)
+    _publish_identity_failure(app, runtime=runtime)
+    state = app.state
+    return (
+        getattr(state, "identity_runtime", None) is runtime
+        and _identity_store_of(app) is runtime.store
+        and getattr(state, "identity_config_token", None) is runtime.token
+        and getattr(state, "identity_ready_token", None) is runtime.token
+        and getattr(state, "identity_state", None) == "ready"
+        and not getattr(state, "identity_closing", False)
+        and not runtime.closing
+        and not runtime.store.failure_detected
+    )
+
+
+def _identity_admission_finished(runtime: _IdentityRuntime) -> None:
+    runtime.admitted -= 1
+    if runtime.admitted == 0:
+        runtime.drained.set()
+
+
+def _identity_probe_done(
+    app: FastAPI, runtime: _IdentityRuntime, future: asyncio.Future[bool]
+) -> None:
+    """Real completion, not HTTP completion, owns submitted capacity."""
+    try:
+        if future.cancelled():
+            return  # dispatch abort won before any action; not ownership loss
+        try:
+            healthy = future.result()
+        except Exception:  # logging observes orphaned executor errors
+            logger.exception("identity verification failed unexpectedly")
+            healthy = False
+        if not healthy:
+            _set_identity_state(app, "unavailable", runtime=runtime)
+    finally:
+        runtime.probes.discard(future)
+        runtime.slots.release()
+        _identity_admission_finished(runtime)
+
+
+async def _verify_identity_runtime(app: FastAPI, runtime: _IdentityRuntime) -> bool:
+    if not _identity_runtime_ready(app, runtime):
+        return False
+    if not getattr(app.state, "identity_store_owned", False):
+        return True  # deliberately unselected store, no ownership I/O
+    if runtime.admitted >= _IDENTITY_MAX_ADMITTED:
+        return False
+    runtime.admitted += 1
+    runtime.drained.clear()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _IDENTITY_PROBE_TIMEOUT_SECONDS
+    slot_acquired = submitted = False
+    try:
+        try:
+            async with asyncio.timeout_at(deadline):
+                await runtime.slots.acquire()
+                slot_acquired = True
+        except TimeoutError:
+            return False
+        if not _identity_runtime_ready(app, runtime) or loop.time() >= deadline:
+            return False
+        completion: ConcurrentFuture[bool] = ConcurrentFuture()
+        call = _new_identity_call(loop, completion)
+        future = call.io
+        runtime.probes.add(future)
+        future.add_done_callback(partial(_identity_probe_done, app, runtime))
+        submitted = True  # accounting transfers BEFORE any possible dispatch
+        _dispatch_identity_call(call, runtime.store.healthy)
+        if call.dispatch_error is not None:
+            _close_identity_runtime(app, runtime)
+            logger.error(
+                "identity verification dispatch failed: %r", call.dispatch_error
+            )
+            if not isinstance(call.dispatch_error, Exception):
+                raise call.dispatch_error
+            return False
+        done, _ = await asyncio.wait({future}, timeout=max(0, deadline - loop.time()))
+        if not done or future.cancelled() or loop.time() >= deadline:
+            return False
+        try:
+            healthy = future.result()
+        except Exception:  # noqa: BLE001 - callback owns error logging
+            return False
+        return healthy and _identity_runtime_ready(app, runtime)
+    finally:
+        if not submitted:
+            if slot_acquired:
+                runtime.slots.release()
+            _identity_admission_finished(runtime)
+
+
+def _identity_store_of(app: FastAPI) -> IdentityStore | None:
+    # IdentityStore defines __len__, so an empty store is falsy: test for None.
+    store = getattr(app.state, "entra_identity_store", None)
+    if store is None:
+        store = getattr(app.state, "api_key_store", None)
+    return store
+
+
+def _release_identity(store: IdentityStore, lock: IdentityStoreLock | None) -> None:
+    """Release exclusion only after even a partial store has stopped safely."""
+    store.stop()
+    if lock is not None:
+        lock.release()
+
+
+def _start_identity_ownership(
+    app: FastAPI, s: Any, *, runtime: _IdentityRuntime | None = None
+) -> _IdentityOwnership:
+    """Select, lock, load and seed the identity store.  Runs ONCE, in a thread.
+
+    Expected identity failures (a selection ``ValueError``, ``OSError``, an
+    ownership error) are logged privately and leave identity "unavailable": the
+    server stays up, authenticated and mutating requests answer 503, and the
+    served map is cleared with any partially taken lock released.  Nothing is
+    retried.  Any other exception is a programming error: it is NOT swallowed
+    here (partial state is still released) and surfaces on the task, where the
+    done-callback records identity unavailable.
+    """
+    if runtime is None:
+        runtime = getattr(app.state, "identity_runtime", None)
+    store = runtime.store if runtime is not None else _identity_store_of(app)
+    if store is None:
+        return None  # no identity wiring on this app
+    try:
+        selected = s.active_identity_store_path()
+    except ValueError as exc:
+        logger.error("identity store selection failed; identity unavailable: %s", exc)
+        _set_identity_state(app, "unavailable", runtime=runtime)
+        return None
+    lock: IdentityStoreLock | None = None
+    try:
+        if selected is not None:
+            lock = IdentityStoreLock(store.path)
+        owned = (store, lock)
+        if runtime is not None:
+            runtime.owned = owned
+        if lock is not None:
+            lock.acquire()
+            store.attach(lock)
+        _initialize_identity_store(app, s, store, owned=lock is not None)
+    except (OSError, IdentityStoreOwnershipError) as exc:
+        _release_identity(store, lock)
+        if runtime is not None:
+            runtime.owned = None  # clear only AFTER stop and release succeeded
+        logger.error(
+            "identity store initialization failed; identity unavailable: %r", exc
+        )
+        _set_identity_state(app, "unavailable", runtime=runtime)
+        return None
+    except BaseException:
+        _release_identity(store, lock)
+        if runtime is not None:
+            runtime.owned = None
+        raise
+    _set_identity_state(
+        app,
+        "ready",
+        ready_token=(
+            runtime.token
+            if runtime is not None
+            else getattr(app.state, "identity_config_token", None)
+        ),
+        owned=lock is not None,
+        runtime=runtime,
+    )
+    return owned
+
+
+def _stop_identity_ownership(
+    app: FastAPI, owned: _IdentityOwnership, *, runtime: _IdentityRuntime | None = None
+) -> None:
+    """Close readiness first, then stop operations, clear the cache, release."""
+    if runtime is None:
+        runtime = getattr(app.state, "identity_runtime", None)
+    if runtime is not None:
+        _close_identity_runtime(app, runtime)
+    else:
+        with _identity_state_lock:
+            app.state.identity_closing = True
+        _set_identity_state(app, "unavailable")
+    if owned is not None:
+        _release_identity(*owned)
+        if runtime is not None:
+            runtime.owned = None
+
+
+def _identity_init_done(
+    app: FastAPI, runtime: _IdentityRuntime, future: asyncio.Future[_IdentityOwnership]
+) -> None:
+    """Observe private I/O even if the public observer was cancelled."""
+    if future.cancelled():
+        return  # known pre-claim abort, not a programming error
+    exc = future.exception()
+    if exc is not None:
+        logger.error(
+            "identity initialization failed unexpectedly; identity unavailable: %r",
+            exc,
+            exc_info=exc,
+        )
+        _set_identity_state(app, "unavailable", runtime=runtime)
+
+
+async def _observe_identity_init(
+    app: FastAPI, runtime: _IdentityRuntime
+) -> _IdentityOwnership:
+    assert runtime.init_io is not None
+    try:
+        await asyncio.wait({runtime.init_io})
+        return runtime.init_io.result()
+    except asyncio.CancelledError:
+        _close_identity_runtime(app, runtime)
+        raise
+
+
+def _identity_observer_done(
+    app: FastAPI, runtime: _IdentityRuntime, task: asyncio.Task[_IdentityOwnership]
+) -> None:
+    if task.cancelled():
+        _close_identity_runtime(app, runtime)  # includes before-first-step cancellation
+    else:
+        task.exception()  # raw I/O callback owns unexpected-error logging
+
+
+@asynccontextmanager
+async def _identity_lifespan(app: FastAPI, s: Any) -> AsyncGenerator[None, None]:
+    """Start identity init in a worker thread; never wait for it.
+
+    The server (listener, health, status) comes up immediately.  Shutdown closes
+    readiness first, then waits for the init thread to really finish -- it is
+    doing blocking I/O and cannot be killed, so a hung filesystem can delay
+    shutdown and no finite OS guarantee is claimed here -- and only then clears
+    the store and releases the identity lock (the root lock is released last by
+    ``lifespan``).
+    """
+    state = app.state
+    if _identity_store_of(app) is None:
+        yield
+        return
+    if getattr(state, "identity_lifespan_active", False):
+        raise RuntimeError("an application lifespan already owns the identity store")
+    store = _identity_store_of(app)
+    assert store is not None
+    with _identity_state_lock:
+        previous = getattr(state, "identity_runtime", None)
+        if previous is not None:
+            previous.closing = True
+        runtime = _IdentityRuntime(getattr(state, "identity_config_token", None), store)
+        state.identity_runtime = runtime
+        state.identity_lifespan_active = True
+        state.identity_closing = False
+    _set_identity_state(app, "initializing", runtime=runtime)
+    loop = asyncio.get_running_loop()
+    cancelled: asyncio.CancelledError | None = None
+
+    async def settle(future: asyncio.Future[Any]) -> None:
+        nonlocal cancelled
+        while not future.done():
+            try:
+                await asyncio.wait({future})
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+        if not future.cancelled():
+            future.exception()  # observe the asyncio adapter as well as completion
+
+    async def yield_settlement() -> None:
+        nonlocal cancelled
+        try:
+            await asyncio.sleep(0.01)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+
+    try:
+        init_completion: ConcurrentFuture[_IdentityOwnership] = ConcurrentFuture()
+        runtime.init_call = _new_identity_call(loop, init_completion)
+        runtime.init_io = runtime.init_call.io
+        runtime.init_io.add_done_callback(partial(_identity_init_done, app, runtime))
+        _dispatch_identity_call(
+            runtime.init_call,
+            partial(_start_identity_ownership, app, s, runtime=runtime),
+        )
+        if runtime.init_call.dispatch_error is not None:
+            _close_identity_runtime(app, runtime)
+            logger.error(
+                "identity initialization dispatch failed: %r",
+                runtime.init_call.dispatch_error,
+            )
+            raise runtime.init_call.dispatch_error
+        observer_coro = _observe_identity_init(app, runtime)
+        try:
+            runtime.init_task = asyncio.create_task(observer_coro)
+        except BaseException:
+            observer_coro.close()
+            raise
+        runtime.init_task.add_done_callback(
+            partial(_identity_observer_done, app, runtime)
+        )
+        state.identity_init_task = runtime.init_task
+        yield
+    finally:
+        _close_identity_runtime(app, runtime)
+        owned: _IdentityOwnership = None
+        cleanup_dispatch_error: BaseException | None = None
+        drained_setup_error: BaseException | None = None
+        cleanup_thread: threading.Thread | None = None
+        try:
+            try:
+                if runtime.init_call is not None:
+                    await settle(runtime.init_call.io)
+                    completion = runtime.init_call.completion
+                    if not completion.cancelled() and completion.exception() is None:
+                        owned = completion.result()
+                if runtime.init_task is not None:
+                    await settle(runtime.init_task)
+                    if not runtime.init_task.cancelled():
+                        runtime.init_task.exception()
+                # Closing forbids new jobs; callbacks return submitted slots.
+                for probe in tuple(runtime.probes):
+                    await settle(probe)
+                    if not probe.cancelled():
+                        probe.exception()
+                if not runtime.drained.is_set():
+                    drained_coro = runtime.drained.wait()
+                    try:
+                        drained = asyncio.create_task(drained_coro)
+                    except BaseException as exc:  # noqa: BLE001 - settle admissions before surfacing setup error
+                        drained_coro.close()
+                        drained_setup_error = exc
+                        # All real jobs have settled. Queued admissions have a
+                        # finite original deadline; no scheduler retry is needed.
+                        while runtime.admitted:
+                            await yield_settlement()
+                    else:
+                        await settle(drained)
+                        drained.result()
+            finally:
+                if owned is None:
+                    if runtime.owned is not None:
+                        # Init already attempted partial cleanup and its stop
+                        # failed. The exact owner remains reachable; retrying a
+                        # started stop here would fabricate a clean shutdown.
+                        raise RuntimeError(
+                            "identity initialization cleanup failed; identity and root exclusion retained"
+                        )
+                    # No dispatch, atomic init abort, or initializer's completed
+                    # partial-owner release: no stop action exists to retry.
+                    runtime.cleanup_complete = True
+                else:
+                    action = partial(
+                        _stop_identity_ownership, app, owned, runtime=runtime
+                    )
+                    cleanup_completion: ConcurrentFuture[None] = ConcurrentFuture()
+                    cleanup_call = _new_identity_call(loop, cleanup_completion)
+                    runtime.cleanup_calls.append(cleanup_call)
+                    _dispatch_identity_call(cleanup_call, action)
+                    if cleanup_call.dispatch_error is not None:
+                        cleanup_dispatch_error = cleanup_call.dispatch_error
+                        logger.error(
+                            "identity cleanup dispatch failed: %r",
+                            cleanup_dispatch_error,
+                        )
+                    await settle(cleanup_call.io)
+                    if cleanup_call.completion.cancelled():
+                        # Only proven pre-claim abort permits one independent
+                        # dispatch attempt. Never retry a started/failed stop.
+                        fallback_completion: ConcurrentFuture[None] = ConcurrentFuture()
+                        fallback = _new_identity_call(loop, fallback_completion)
+                        runtime.cleanup_calls.append(fallback)
+                        try:
+                            cleanup_thread = threading.Thread(
+                                target=_run_identity_call,
+                                args=(fallback.completion, action),
+                                name="ci-identity-cleanup",
+                            )
+                            cleanup_thread.start()
+                        except BaseException as exc:  # noqa: BLE001 - start may report failure after claim
+                            fallback.dispatch_error = exc
+                            fallback.completion.cancel()
+                            logger.error(
+                                "identity cleanup fallback launch failed: %r", exc
+                            )
+                        try:
+                            await settle(fallback.io)
+                            if fallback.completion.cancelled():
+                                raise RuntimeError(
+                                    "identity cleanup could not start; identity and root exclusion retained"
+                                )
+                            fallback.completion.result()
+                        finally:
+                            if cleanup_thread is not None:
+                                while cleanup_thread.is_alive():
+                                    await yield_settlement()
+                        runtime.cleanup_complete = True
+                    else:
+                        cleanup_call.completion.result()
+                        runtime.cleanup_complete = True
+        finally:
+            if runtime.cleanup_complete:
+                state.identity_lifespan_active = False
+            else:
+                logger.critical(
+                    "identity cleanup incomplete; admission closed and identity/root exclusion retained"
+                )
+        if cancelled is not None:
+            raise cancelled
+        if cleanup_dispatch_error is not None:
+            raise cleanup_dispatch_error
+        if drained_setup_error is not None:
+            raise drained_setup_error
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Acquire the single-writer lock before initializing any server workers."""
+    settings = getattr(app.state, "settings", _settings)
+    _validate_single_worker()
+    try:
+        instance_lock = ServerInstanceLock(settings.stateful_root())
+    except ValueError as exc:
+        raise RuntimeError(f"invalid durable state-root configuration: {exc}") from exc
+    try:
+        instance_lock.acquire()
+    except InstanceLockUnavailable as exc:
+        raise RuntimeError(str(exc)) from exc
+    app.state.server_instance_lock = instance_lock
+    try:
+        # Lock order: queue-root lock -> identity-store lock -> load/seed ->
+        # server lifespan.  Teardown reverses it: identity operations stop and
+        # the cache clears before the identity lock, then the root lock, go.
+        async with _identity_lifespan(app, settings):
+            # Worker-local (not the pre-fork gunicorn arbiter): hold until all
+            # drainers and drivers finish shutdown, including startup recovery.
+            service = await RetentionService.open(settings.blob_path)
+            app.state.retention_service = service
+            try:
+                async with _server_lifespan(app):
+                    try:
+                        yield
+                    finally:
+                        # Stop maintenance before quiescing drainers, but retain
+                        # the lifetime flock until their final writes and real
+                        # I/O exit.
+                        await service.stop()
+            finally:
+                await service.close()
+    finally:
+        if getattr(app.state, "identity_lifespan_active", False):
+            # A flag alone does not retain exclusion: keep the actual lock
+            # reachable on app.state and explicitly refuse this release.
+            logger.critical(
+                "root exclusion retained because identity cleanup is incomplete"
+            )
+            raise RuntimeError("identity cleanup incomplete; root exclusion retained")
+        instance_lock.release()
+
+
 app = FastAPI(
     title="Context Intelligence Server",
     version=__version__,
@@ -858,6 +2181,7 @@ app = FastAPI(
     redoc_url=None,
     openapi_url="/openapi.json",
 )
+app.add_middleware(RecoveryBodyLimitMiddleware)
 app.include_router(admin_router)
 app.include_router(version_router)
 app.include_router(queues_router)
@@ -869,6 +2193,9 @@ registry = SessionRegistry()
 # request.app.state.registry instead of importing the module-level name
 # (avoids a circular import between main and the routers package).
 app.state.registry = registry
+app.state.append_live_record = lambda worker_key, body: _append_live_record(
+    app, worker_key, body
+)
 idempotency_cache = EventIdempotencyCache()
 
 # Session-less events are keyed by a per-workspace sentinel stem so that events
@@ -889,6 +2216,16 @@ def _new_event_identity(idempotency_key: str | None) -> str:
         ).hexdigest()
         return f"key-{digest}"
     return f"new-{secrets.token_hex(16)}"
+
+
+def _recovery_event_identity(
+    payload: dict[str, Any], source_handle: str, ordinal: int
+) -> str:
+    """Use live identity for a retained recovery key, source identity otherwise."""
+    idempotency_key = payload.get("idempotency_key")
+    if isinstance(idempotency_key, str) and idempotency_key:
+        return _new_event_identity(idempotency_key)
+    return recovery_event_identity(source_handle, ordinal)
 
 
 def _workspace_slug(workspace: str) -> str:
@@ -1044,7 +2381,19 @@ def create_asgi_app(
     _assert_admin_not_exempt()
 
     s = settings if settings is not None else _settings
+    # The ASGI app and its identity wiring are a process singleton.  Replacing
+    # them while a lifespan owns the identity store would swap the store/gate
+    # under live traffic, so refuse BEFORE mutating any state.
+    if getattr(app.state, "identity_lifespan_active", False):
+        raise RuntimeError(
+            "create_asgi_app() cannot replace identity wiring while the "
+            "application lifespan owns the identity store"
+        )
     _assert_neo4j_clients_explicit(s)
+    # The ASGI lifespan must use the same settings object passed to this
+    # factory.  Direct uvicorn/gunicorn imports therefore validate and lock the
+    # actual configured state roots before any worker starts.
+    app.state.settings = s
 
     # Reset both stores; the active mode sets exactly one of them below.
     # app.state.* mirrors the module-level globals so the /admin router can
@@ -1068,7 +2417,15 @@ def create_asgi_app(
     app.state.access_control_mode = s.access_control_mode
     app.state.contributor_grants = s.contributor_grants
     app.state.recovery_enabled = s.recovery.enabled
+    app.state.recovery_permit_required = (
+        s.recovery.enabled and s.recovery.permit_required
+    )
     app.state.recovery_paused = False
+    # This condition serializes the admin pause boundary with a recovery
+    # graph-flush plus its dependent queue commit. The recovery worker waits
+    # before acquiring its graph-write slot; pause waits behind an already
+    # running write and returns only once that write has committed.
+    app.state.recovery_pause_condition = asyncio.Condition()
     recovery_queue_path, receipt_store_path, claims_store_path, lease_path = (
         s.recovery_paths()
     )
@@ -1080,8 +2437,21 @@ def create_asgi_app(
     app.state.recovery_receipts = None
     app.state.recovery_config = s.recovery
     app.state.recovery_lease_path = lease_path
+    app.state.recovery_admission_gate = None
     app.state.recovery_registry = None
     app.state.recovery_outbox_lock = asyncio.Lock()
+    app.state.recovery_admin_retry_lock = asyncio.Lock()
+    # Serializes a poison record's quarantine receipt + queue acknowledgement
+    # with operator retry, reconciliation, operator quarantine and recovery
+    # event admission. The recovery registry holds this very object (see
+    # ``SessionRegistry.for_recovery``).
+    # Lock order: pause condition -> this lock -> admission gate / outbox lock;
+    # this lock -> admin retry lock. Nothing holding this lock, the gate or the
+    # outbox lock may await the pause condition.
+    app.state.recovery_quarantine_retry_lock = asyncio.Lock()
+    app.state.append_live_record = lambda worker_key, body: _append_live_record(
+        app, worker_key, body
+    )
     registry.flush_gate = None
     registry.is_recovery = False
     registry.drain_batch_size = 100
@@ -1096,40 +2466,121 @@ def create_asgi_app(
             shared_write_semaphore=registry.write_semaphore,
             max_delivery_attempts=s.max_delivery_attempts,
             flush_gate=flush_gate,
+            quarantine_retry_lock=app.state.recovery_quarantine_retry_lock,
         )
         app.state.recovery_registry = recovery_registry
+        if s.recovery.permit_required:
+            app.state.recovery_admission_gate = RecoveryAdmissionGate(
+                s.recovery.permit_ttl_seconds
+            )
 
         async def _recovery_pre_flush() -> None:
-            # This is checked after every one-record recovery batch. Priority
-            # itself is atomic in LiveFirstFlushGate; this only controls
-            # recovery-specific availability.
+            # This runs immediately before recovery contends for a graph-write
+            # slot. The write guard rechecks pause after this wait and then
+            # holds the condition through graph flush plus queue commit, so a
+            # pause landing in that narrow hand-off cannot leak a write.
             while app.state.recovery_paused:
                 await asyncio.sleep(0.01)
-            # Capacity can change after ingress. Treat an absent/expired lease as
-            # transient so the record remains durably queued rather than becoming
-            # a dead letter.
-            if not lease_allows(lease_path):
+            # Legacy lease deployments retain their pre-existing flush guard.
+            # Server permits govern ingress only: once the receipt is durable,
+            # expiry must not strand it in the recovery spool.
+            if not s.recovery.permit_required and not lease_allows(lease_path):
                 raise OSError("recovery lease unavailable")
 
         recovery_registry.pre_flush = _recovery_pre_flush
 
-        async def _mark_recovery_written(_worker: Any, records: list[Any]) -> None:
+        @asynccontextmanager
+        async def _recovery_write_guard() -> AsyncIterator[None]:
+            condition = app.state.recovery_pause_condition
+            async with condition:
+                while app.state.recovery_paused:
+                    await condition.wait()
+                # Lock ordering is recovery pause condition -> live-first
+                # flush gate -> graph store. Admin pause/resume takes only the
+                # condition, so no cycle can deadlock a recovery drainer.
+                yield
+
+        recovery_registry.recovery_write_guard = _recovery_write_guard
+
+        async def _mark_recovery_flushed(_worker: Any, records: list[Any]) -> None:
             for record in records:
                 try:
                     envelope = json.loads(record.raw)
                     origin = envelope.get("_recovery_origin")
-                    if isinstance(origin, dict):
-                        # This callback runs only after QueueManager.commit for
-                        # this exact record. Failures are isolated by the
-                        # registry post-commit hook and retried by reconciliation.
+                    if (
+                        isinstance(origin, dict)
+                        and isinstance(origin.get("source_handle"), str)
+                        and isinstance(origin.get("ordinal"), int)
+                    ):
+                        # The registry invokes this only after the graph flush
+                        # but before QueueManager.commit. Its SQLite commit is
+                        # therefore the terminal receipt proof paired with
+                        # that flush; a later queue-commit crash replays an
+                        # idempotent graph event rather than wedging a receipt.
                         await app.state.recovery_receipts.mark(
-                            origin, "committed_pending"
+                            origin,
+                            "written",
+                            source_handle=origin["source_handle"],
                         )
+                    elif isinstance(origin, dict):
+                        # A pre-v1 spool record has the former public origin.
+                        # It can be completed only through the explicitly
+                        # retained legacy namespace, never the v1 protocol.
                         await app.state.recovery_receipts.mark(origin, "written")
                 except (ValueError, TypeError):
                     logger.error("recovery receipt completion record was malformed")
+                    # This hook is before the queue acknowledgement. Do not
+                    # allow a malformed completion record to advance its
+                    # offset and strand a non-terminal receipt.
+                    raise RuntimeError(
+                        "recovery receipt completion record was malformed"
+                    )
 
-        recovery_registry.on_batch_written = _mark_recovery_written
+        recovery_registry.on_batch_flushed = _mark_recovery_flushed
+
+        async def _ensure_recovery_records_are_flushable(
+            worker: Any, records: list[Any]
+        ) -> None:
+            """Discard selected work terminalized during a recovery pause."""
+            for record in records:
+                try:
+                    envelope = json.loads(record.raw)
+                except (TypeError, ValueError):
+                    envelope = None
+                normalized = QueueManager.normalized_recovery_origin(
+                    envelope.get("_recovery_origin")
+                    if isinstance(envelope, dict)
+                    else None
+                )
+                flushable = False
+                if normalized is not None:
+                    source_handle, ordinal, line_sha256 = normalized
+                    origin = {
+                        "source_handle": source_handle,
+                        "ordinal": ordinal,
+                        "source_line_sha256": line_sha256,
+                    }
+                    queue_state = await (
+                        recovery_registry.queue_manager.recovery_origin_commit_state(
+                            origin
+                        )
+                    )
+                    flushable = (
+                        queue_state == "queued"
+                        and await app.state.recovery_receipts.is_flushable(
+                            source_handle, ordinal
+                        )
+                    )
+                if not flushable:
+                    # Event handlers only buffer graph work; flush is the sole
+                    # write boundary. Drop that buffer before raising so a
+                    # paused-and-quarantined record cannot write after resume.
+                    worker.services.graph.discard_buffer()
+                    raise RuntimeError(
+                        "recovery record was terminalized before graph flush"
+                    )
+
+        recovery_registry.before_recovery_flush = _ensure_recovery_records_are_flushable
 
         async def _retry_recovery_receipt_transition() -> None:
             try:
@@ -1143,10 +2594,27 @@ def create_asgi_app(
             try:
                 envelope = json.loads(record.raw)
                 origin = envelope.get("_recovery_origin")
-                if isinstance(origin, dict):
+                if (
+                    isinstance(origin, dict)
+                    and isinstance(origin.get("source_handle"), str)
+                    and isinstance(origin.get("ordinal"), int)
+                ):
+                    await app.state.recovery_receipts.mark(
+                        origin, "quarantined", source_handle=origin["source_handle"]
+                    )
+                elif isinstance(origin, dict):
                     await app.state.recovery_receipts.mark(origin, "quarantined")
-            except (ValueError, TypeError):
+                else:
+                    raise ValueError("recovery quarantine record has no origin")
+            except (KeyError, ValueError, TypeError) as exc:
                 logger.error("recovery receipt quarantine record was malformed")
+                # This hook is before QueueManager.commit.  It must fail closed:
+                # acknowledging a dead-lettered recovery record with no durable
+                # receipt terminal state would make an operator-visible
+                # quarantine disappear on restart.
+                raise RuntimeError(
+                    "recovery receipt quarantine record was malformed"
+                ) from exc
 
         recovery_registry.on_record_quarantined = _mark_recovery_quarantined
 
@@ -1175,73 +2643,19 @@ def create_asgi_app(
             'sys.argv[1].encode()).hexdigest())" "<token>"'
         )
 
+    # The factory only CONSTRUCTS identity objects: no identity file is read,
+    # seeded, or written here.  Loading and seeding happen in
+    # ``_identity_lifespan`` under exclusive store ownership, and the
+    # middleware's identity gate keeps every request at 503 until then.
     if s.auth_mode == "entra":
-        # Build and load the entra identity store.
-        entra_store = IdentityStore(Path(s.entra_identities_store_path))
-        entra_store.load()
-        _config_entra_map = s.build_identity_map()
-        _config_service_map = s.build_service_identity_map()
-        if not entra_store.path.exists():
-            # First boot: seed in-process map from config -- ONE shared store
-            # serves both user and service oids (disjoint key spaces make sharing
-            # safe; the disjointness check below enforces that the two config
-            # maps never name the same oid).
-            rich_seed: dict[str, dict[str, str]] = {
-                oid: {"id": cid}
-                for oid, cid in (
-                    *_config_entra_map.items(),
-                    *_config_service_map.items(),
-                )
-            }
-            if rich_seed:
-                entra_store.seed(rich_seed)
-        _entra_identity_store = entra_store
-        app.state.entra_identity_store = entra_store
-
-        # Bootstrap visibility: announce an EMPTY identity map loudly at startup.
-        # This is a SUPPORTED state, not an error — the server is up and serving.
-        # Delegated (human) tokens will 403 until an IdentityAdmin role-holder
-        # binds the first oid via PUT /admin/identities/{oid}. Without this line
-        # an empty map would be silent and look like a misconfiguration.
-        if not entra_store.flat_dict:
-            logger.warning(
-                "entra identity map is EMPTY at startup (0 bound oids) — server "
-                "is UP and serving, but every delegated (human) token will "
-                "receive 403 until identities are onboarded. Bind the first user "
-                "with an IdentityAdmin-role token via PUT /admin/identities/{oid} "
-                "(store=%s). This is expected on a fresh /data volume.",
-                s.entra_identities_store_path,
-            )
-
-        # service_identities is a FIRST-BOOT seed only: once the store file
-        # exists, config is never re-read into it. An operator who sets
-        # SERVICE_IDENTITIES on an already-deployed server would otherwise get
-        # no signal at all — the only symptom is a 403 on the service token,
-        # whose message points at the administrator, not at the ignored config.
-        # Name the ignored oids here so the wrong lever is obvious at boot.
-        _ignored_service_oids = sorted(
-            oid for oid in _config_service_map if oid not in entra_store.flat_dict
+        entra_store = IdentityStore(
+            Path(s.entra_identities_store_path).expanduser(), managed=True
         )
-        if _ignored_service_oids:
-            logger.warning(
-                "service_identities config lists %d oid(s) that are NOT in the "
-                "identity store and are being IGNORED: %r. service_identities "
-                "seeds the store on FIRST BOOT ONLY and store=%s already exists, "
-                "so config changes after the first boot have no effect and these "
-                "principals will receive 403. Add them at runtime with an "
-                "IdentityAdmin-role token via PUT /admin/identities/{oid} — no "
-                "redeploy required.",
-                len(_ignored_service_oids),
-                _ignored_service_oids,
-                s.entra_identities_store_path,
-            )
-
         # Boot disjointness invariant — each oid must belong to exactly one
-        # identity source.  Checked against the two CONFIG maps, not the
-        # store's flat_dict: one shared store now holds user and service oids
-        # alike, so the store itself can no longer show the overlap.  This
-        # prevents a same-oid-in-both misconfiguration at startup.
-        _overlap = set(_config_entra_map) & set(_config_service_map)
+        # identity source.  Checked against the two CONFIG maps: one shared
+        # store holds user and service oids alike, so the store itself can no
+        # longer show the overlap.
+        _overlap = set(s.build_identity_map()) & set(s.build_service_identity_map())
         if _overlap:
             raise RuntimeError(
                 f"Boot invariant violated: oid(s) {sorted(_overlap)!r} appear "
@@ -1249,12 +2663,14 @@ def create_asgi_app(
                 f"belong to exactly one identity source. Fix the config to remove "
                 f"the overlap before restarting."
             )
-
+        _entra_identity_store = entra_store
+        app.state.entra_identity_store = entra_store
         # EntraResolver raises RuntimeError at construction if the JWKS
         # prefetch fails (eager fail-closed by design).
         # Pass entra_store.flat_dict (the LIVE dict) as BOTH maps so the
         # resolver sees any put()/delete() made by /admin immediately on
-        # either path, no restart required.
+        # either path, no restart required.  The dict is filled by the
+        # lifespan once the store is owned.
         resolver: StaticKeyResolver | EntraResolver = EntraResolver(
             s.azure_client_id,  # type: ignore[arg-type]  — validated non-None by config
             s.azure_tenant_id,  # type: ignore[arg-type]  — validated non-None by config
@@ -1268,62 +2684,41 @@ def create_asgi_app(
         )
         # Entra mode does not use admin_api_key_digest (admin via roles claim).
         admin_api_key_digest = None
+        active_identity_store = entra_store
     else:
-        # Build and load the API-key store.
-        key_store = IdentityStore(Path(s.api_keys_store_path))
-        key_store.load()
-        if not key_store.path.exists():
-            # First boot: seed from config.  Converts the flat
-            # {sha256_hex -> contributor_id} from build_keystore() to the
-            # rich {sha256_hex -> {"id": contributor_id}} format.
-            config_ks = s.build_keystore()
-            if config_ks:
-                rich_seed = {digest: {"id": cid} for digest, cid in config_ks.items()}
-                key_store.seed(rich_seed)
+        key_store = IdentityStore(
+            Path(s.api_keys_store_path).expanduser(), managed=True
+        )
         _api_key_store = key_store
         app.state.api_key_store = key_store
-
-        # Bootstrap visibility: announce an EMPTY keystore loudly at startup.
-        # This is a SUPPORTED state (fail-CLOSED, not fail-open) — the server
-        # is up and serving, but every request 401s until keys are onboarded.
-        if not key_store.flat_dict:
-            if s.resolve_admin_api_key_digest() is not None:
-                logger.warning(
-                    "static keystore is EMPTY at startup (0 bound keys) — server "
-                    "is UP but fail-CLOSED; every request will 401 until keys are "
-                    "onboarded. Add the first key with the admin token via "
-                    "PUT /admin/keys/{sha256hash} (store=%s). Expected on a fresh "
-                    "/data volume.",
-                    s.api_keys_store_path,
-                )
-            else:
-                logger.warning(
-                    "static keystore is EMPTY at startup (0 bound keys) AND no "
-                    "admin_api_key/admin_api_key_sha256 is configured — server is "
-                    "UP but fail-CLOSED and CANNOT be bootstrapped at runtime (the "
-                    "/admin API is unreachable without an admin key: every token "
-                    "401s at the middleware before require_admin runs). Set "
-                    "admin_api_key/admin_api_key_sha256 to enable runtime "
-                    "onboarding, or add api_keys in config and restart. (store=%s)",
-                    s.api_keys_store_path,
-                )
-
         # Pass key_store.flat_dict (the LIVE dict) so the resolver sees any
         # put()/delete() made by /admin immediately, no restart required.
         resolver = StaticKeyResolver(key_store.flat_dict)
+        active_identity_store = key_store
 
-    # Wide-open warning: fires ONLY on the explicit allow_unauthenticated
-    # opt-out combined with no credentials configured. An empty keystore/map
-    # ALONE does not trigger this and does not refuse to start — it boots
-    # fail-closed instead (see the empty-map/keystore warnings above).
-    if s.allow_unauthenticated and not resolver.auth_enabled:
-        logger.warning(
-            "allow_unauthenticated=True AND no credentials configured — the "
-            "server is WIDE OPEN: EVERY request is admitted UNAUTHENTICATED. "
-            "This opt-out is for TEST/DEV ONLY and must NEVER be set in "
-            "production. Configure api_key/api_keys (static) or entra_identities "
-            "(entra) and unset allow_unauthenticated to enforce authentication."
-        )
+    app.state.identity_resolver = resolver
+    # Generation + readiness gate on EVERY wrapper.  The token ties the wrapper
+    # to THIS factory call: once a later call replaces the shared app state this
+    # wrapper is obsolete and answers 503 to everything except the public status
+    # paths.  Readiness starts CLOSED; the lifespan's one-shot identity init
+    # opens it for the live generation ("ready"), or leaves it unavailable.
+    _gate_token = object()
+    app.state.identity_config_token = _gate_token
+    app.state.identity_ready_token = None
+    app.state.identity_store_owned = False
+    app.state.identity_closing = False
+    app.state.identity_state = "initializing"
+    app.state.identity_runtime = _IdentityRuntime(_gate_token, active_identity_store)
+
+    async def _identity_ready() -> bool:
+        runtime = getattr(app.state, "identity_runtime", None)
+        if (
+            runtime is None
+            or runtime.token is not _gate_token
+            or runtime.store is not active_identity_store
+        ):
+            return False
+        return await _verify_identity_runtime(app, runtime)
 
     # Log admin capability status for operator visibility.
     if s.auth_mode == "static":
@@ -1357,6 +2752,7 @@ def create_asgi_app(
         exempt_paths=_EXEMPT_PATHS,
         admin_api_key_digest=admin_api_key_digest,
         allow_unauthenticated=s.allow_unauthenticated,
+        identity_gate=_identity_ready,
     )
 
 
@@ -1373,6 +2769,26 @@ async def _session_claim_store(app_instance: FastAPI) -> SessionClaimStore:
             )
             app_instance.state.session_claims = store
         return store
+
+
+async def _scoped_queue_binding_matches(
+    app_instance: FastAPI, worker_key: str, first_line: bytes
+) -> bool:
+    """Never dispatch a historical scoped spool through a physical alias."""
+    if getattr(app_instance.state, "access_control_mode", "compatibility") != "scoped":
+        return True
+    try:
+        payload = json.loads(first_line)
+        original = payload["data"]["session_id"]
+        if not isinstance(original, str) or fold_worker_key(original) != worker_key:
+            return False
+    except (ValueError, TypeError, KeyError):
+        return False
+    claims = await _session_claim_store(app_instance)
+    matched = await claims.storage_identity_matches(original)
+    if not matched:
+        logger.error("scoped_recovery_storage_binding_blocked")
+    return matched
 
 
 # Module-level ASGI app used by Gunicorn: context_intelligence_server.main:asgi_app
@@ -1435,6 +2851,13 @@ def __getattr__(name: str) -> Any:
 @app.get("/status")
 async def get_status(request: Request) -> dict[str, Any]:
     response = build_status_response(registry, _start_time)
+    # Cached identity readiness (initializing | ready | unavailable): plain
+    # attribute reads, no I/O and no exception paths, so status keeps answering
+    # while identity initializes or is unavailable.  No identity wiring == ready.
+    _publish_identity_failure(request.app)  # reads the latched flag only
+    _identity = getattr(request.app.state, "identity_state", "ready")
+    response["identity_ready"] = _identity == "ready"
+    response["identity_reason"] = _IDENTITY_REASONS.get(_identity)
     response["neo4j_connected"] = await _check_driver_connected(
         request.app, "neo4j_driver"
     )
@@ -1586,9 +3009,151 @@ async def post_events(
     body_obj["created_by"] = contributor_id  # overwrite, never setdefault
     body_obj[SPOOL_EVENT_IDENTITY] = _new_event_identity(request.idempotency_key)
     body = json.dumps(body_obj, separators=(",", ":")).encode()
-    await registry.queue_manager.append(worker_key, body)
+    # The app-level helper serializes every live durable append (including
+    # dead-letter replay) with recovery admission when permits are active.
+    await http_request.app.state.append_live_record(worker_key, body)
     registry.record_accepted()  # count the durably-accepted event
     return EventResponse(status="queued", session_id=session_id or None)
+
+
+@app.post(
+    "/recovery/admissions",
+    status_code=201,
+    response_model=RecoveryAdmissionPermitResponse | RecoveryAdmissionDuplicateResponse,
+    dependencies=[Depends(require_recovery_write)],
+)
+async def post_recovery_admission(
+    http_request: Request,
+    recovery_source: str | None = Header(default=None, alias="X-Recovery-Source"),
+) -> RecoveryAdmissionPermitResponse | JSONResponse:
+    """Issue a binding, single-use permit when durable live work is absent."""
+    if not getattr(http_request.app.state, "recovery_enabled", False):
+        raise HTTPException(status_code=404, detail="Not found")
+    if not getattr(http_request.app.state, "recovery_permit_required", False):
+        raise HTTPException(status_code=404, detail="Not found")
+    source_handle = source_handle_from_capability(recovery_source)
+    if source_handle is None:
+        raise _recovery_unavailable(
+            http_request.app.state.recovery_config.retry_after_seconds, "source"
+        )
+    request = await _parse_recovery_admission(http_request)
+    if http_request.query_params:
+        raise HTTPException(
+            status_code=400, detail="Invalid recovery admission request"
+        )
+    require_workspace_access(http_request, request.workspace, "recovery:write")
+    # V1 recovery is an alternate admission path into the normal live ingest
+    # authority. A source capability is only an opaque capture namespace; it
+    # must not grant a recovery-only principal authority to inject events.
+    require_workspace_access(http_request, request.workspace, "live:write")
+    contributor_id = http_request.scope.get("state", {}).get("contributor_id") or ""
+    gate = http_request.app.state.recovery_admission_gate
+    source = request.source.model_dump()
+    descriptor_sha256 = source_descriptor_digest(source)
+    # Reconcile before a duplicate acknowledgement. A receipt alone only says
+    # admission was durable; its pending outbox append must be repaired before
+    # the client may advance its cursor on a 200.
+    try:
+        await _reconcile_native_recovery_outbox(http_request.app)
+    except Exception:
+        logger.exception("native_recovery_admission_reconciliation_failed")
+        raise _recovery_unavailable(
+            http_request.app.state.recovery_config.retry_after_seconds
+        )
+    classified = await http_request.app.state.recovery_receipts.classify_source(
+        source_handle,
+        source,
+        request.origin.model_dump(),
+        contributor_id,
+        request.workspace,
+        request.payload_sha256,
+    )
+    if classified == "conflict":
+        raise _recovery_source_conflict()
+    if classified == "duplicate":
+        # A 202 may have been lost after the exact receipt became durable.
+        # This is an acknowledgement only: it exposes no foreign receipt,
+        # consumes no permit capacity, and cannot authorize another write.
+        return JSONResponse(
+            status_code=200,
+            content=RecoveryAdmissionDuplicateResponse().model_dump(),
+        )
+    binding = gate.binding(
+        source_handle,
+        descriptor_sha256,
+        request.origin.model_dump(),
+        contributor_id,
+        request.workspace,
+        request.payload_sha256,
+    )
+    receipts = http_request.app.state.recovery_receipts
+    issued = await gate.issue(
+        binding,
+        lambda: _native_recovery_admission_available(http_request.app),
+        lambda: receipts.classify_source(
+            source_handle,
+            source,
+            request.origin.model_dump(),
+            contributor_id,
+            request.workspace,
+            request.payload_sha256,
+        ),
+    )
+    if issued is None:
+        raise _recovery_unavailable(
+            http_request.app.state.recovery_config.retry_after_seconds
+        )
+    permit, expires_at = issued
+    return RecoveryAdmissionPermitResponse(permit=permit, expires_at=expires_at)
+
+
+async def _parse_sanitized_recovery_json(
+    http_request: Request,
+    model: type[_RecoveryRequest],
+    error_detail: str,
+) -> _RecoveryRequest:
+    """Validate recovery JSON without reflecting prohibited local paths."""
+    try:
+        payload = await http_request.json()
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=400, detail=error_detail)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail=error_detail)
+    if not has_only_unicode_scalars(payload):
+        raise HTTPException(status_code=400, detail="Invalid recovery event")
+    try:
+        return model.model_validate(sanitize_recovery_payload(payload))
+    except ValidationError:
+        raise HTTPException(status_code=400, detail=error_detail)
+
+
+async def _parse_recovery_admission(
+    http_request: Request,
+) -> RecoveryAdmissionRequest:
+    """Validate an admission request without reflecting prohibited paths."""
+    return cast(
+        RecoveryAdmissionRequest,
+        await _parse_sanitized_recovery_json(
+            http_request, RecoveryAdmissionRequest, "Invalid recovery admission request"
+        ),
+    )
+
+
+async def _parse_recovery_event(
+    http_request: Request,
+) -> RecoveryEventRequest | LegacyRecoveryEventRequest:
+    """Validate an event request without reflecting prohibited paths."""
+    model = (
+        RecoveryEventRequest
+        if getattr(http_request.app.state, "recovery_permit_required", False)
+        else LegacyRecoveryEventRequest
+    )
+    return cast(
+        RecoveryEventRequest | LegacyRecoveryEventRequest,
+        await _parse_sanitized_recovery_json(
+            http_request, model, "Invalid recovery event"
+        ),
+    )
 
 
 @app.post(
@@ -1598,7 +3163,12 @@ async def post_events(
     dependencies=[Depends(require_recovery_write)],
 )
 async def post_recovery_events(
-    request: RecoveryEventRequest, http_request: Request
+    http_request: Request,
+    request: RecoveryEventRequest | LegacyRecoveryEventRequest = Depends(
+        _parse_recovery_event
+    ),
+    recovery_permit: str | None = Header(default=None, alias="X-Recovery-Permit"),
+    recovery_source: str | None = Header(default=None, alias="X-Recovery-Source"),
 ) -> EventResponse:
     """Admit one strictly identified native recovery record.
 
@@ -1610,86 +3180,209 @@ async def post_recovery_events(
         raise HTTPException(
             status_code=400, detail="Recovery replay parameters are not supported"
         )
-    # Complete any prior durable outbox admission before making a new
-    # availability decision. This is safe without a current lease because it
-    # does not flush graph data; the recovery flush gate still requires one.
-    await _reconcile_native_recovery_outbox(http_request.app)
-    if getattr(http_request.app.state, "recovery_paused", False):
-        raise HTTPException(
-            status_code=429, detail="Recovery unavailable", headers={"Retry-After": "2"}
-        )
     config = http_request.app.state.recovery_config
+    admission_gate = getattr(http_request.app.state, "recovery_admission_gate", None)
+    if admission_gate is not None:
+        source_handle = source_handle_from_capability(recovery_source)
+        if source_handle is None or not isinstance(request, RecoveryEventRequest):
+            raise _recovery_unavailable(config.retry_after_seconds, "source")
+        source = request.source.model_dump()
+    else:
+        if not isinstance(request, LegacyRecoveryEventRequest):
+            raise _recovery_unavailable(config.retry_after_seconds)
+        legacy_origin = request.origin.model_dump()
+        source_handle = legacy_source_handle(legacy_origin)
+        source = legacy_source_descriptor(legacy_origin)
     contributor_id = http_request.scope.get("state", {}).get("contributor_id")
     require_workspace_access(http_request, request.workspace, "recovery:write")
+    if admission_gate is not None:
+        # Preserve the lease protocol's explicit compatibility behavior while
+        # ensuring source-capability V1 never expands live ingest authority.
+        require_workspace_access(http_request, request.workspace, "live:write")
     session_id = request.data.get("session_id")
-    if not isinstance(session_id, str) or not session_id.strip():
-        raise HTTPException(status_code=400, detail="data.session_id is required")
-    if request.origin.session_id != session_id:
-        raise HTTPException(
-            status_code=400, detail="Recovery session identity is invalid"
-        )
-    _validate_data_timestamp(request.data)
-    origin = request.origin.model_dump()
-    claims: SessionClaimStore | None = None
-    reservation_created = False
     if (
-        getattr(http_request.app.state, "access_control_mode", "compatibility")
-        == "scoped"
+        not isinstance(session_id, str)
+        or not is_safe_session_id(session_id)
+        or (
+            admission_gate is not None
+            and (
+                not is_safe_session_id(source["session_id"])
+                or source["session_id"] != session_id
+            )
+        )
     ):
-        if not contributor_id:
-            raise HTTPException(status_code=409, detail="Session conflict")
-        claims = await _session_claim_store(http_request.app)
-        reservation = await claims.reserve_recovery(
-            session_id,
-            contributor_id,
-            request.workspace,
-            _recovery_reservation_token(origin),
-        )
-        if reservation == "conflict":
-            raise HTTPException(status_code=409, detail="Session conflict")
-        reservation_created = reservation == "reserved"
-    payload = request.model_dump(exclude={"origin"})
-    receipt = {
-        "origin": origin,
-        "actor": contributor_id or "",
-        "workspace": request.workspace,
-        "payload": payload,
-    }
-    admitted = await _admit_native_recovery(
-        http_request.app, receipt, claims, reservation_created
-    )
-    if admitted == "conflict":
-        raise HTTPException(status_code=409, detail="Recovery conflict")
-    if admitted == "busy":
-        raise HTTPException(
-            status_code=429,
-            detail="Recovery unavailable",
-            headers={"Retry-After": str(config.retry_after_seconds)},
-        )
-    if admitted == "duplicate":
-        return EventResponse(status="duplicate", session_id=session_id)
+        raise HTTPException(status_code=400, detail="Invalid recovery session identity")
+    _validate_data_timestamp(request.data)
+    origin = request.origin.model_dump(exclude={"session_id", "source_stream_sha256"})
+    # The recovery-only model excludes working_dir and rejects any undeclared
+    # fields. Optional nulls are omitted so clients can hash a stable canonical
+    # event/workspace/data envelope before transmission.
+    payload = request.model_dump(exclude={"origin", "source"}, exclude_none=True)
+    payload_sha256 = canonical_payload_digest(payload)
+    # Every valid recovery envelope reconciles once before any receipt
+    # classification or permit decision. Besides repairing the durable outbox,
+    # this gives duplicate, foreign-origin, and unavailable paths identical
+    # bounded reconciliation work.
+    await _reconcile_native_recovery_outbox(http_request.app)
+    if admission_gate is None and getattr(
+        http_request.app.state, "recovery_paused", False
+    ):
+        await _native_recovery_admission_available(http_request.app)
+        raise _recovery_unavailable(config.retry_after_seconds)
+    receipts = http_request.app.state.recovery_receipts
+    actor = contributor_id or ""
 
-    return EventResponse(status="queued", session_id=session_id)
+    async def _receipt_state() -> ReceiptClassification:
+        return await receipts.classify_source(
+            source_handle,
+            source,
+            origin,
+            actor,
+            request.workspace,
+            payload_sha256,
+        )
+
+    async def _admit_with_claim(permit_result: PermitResult) -> EventResponse:
+        if permit_result != "accepted":
+            raise _recovery_unavailable(config.retry_after_seconds)
+        receipt = {
+            "source_handle": source_handle,
+            "source": source,
+            "origin": origin,
+            "actor": actor,
+            "workspace": request.workspace,
+            "payload": payload,
+        }
+        claims: SessionClaimStore | None = None
+        reservation_created = False
+        if (
+            getattr(http_request.app.state, "access_control_mode", "compatibility")
+            == "scoped"
+        ):
+            if not contributor_id:
+                raise HTTPException(status_code=409, detail="Session conflict")
+            claims = await _session_claim_store(http_request.app)
+            reservation = await claims.reserve_recovery(
+                session_id,
+                contributor_id,
+                request.workspace,
+                _recovery_reservation_token(receipt),
+            )
+            if reservation == "conflict":
+                raise _recovery_unavailable(config.retry_after_seconds)
+            reservation_created = reservation == "reserved"
+        admitted = await _admit_native_recovery(
+            http_request.app, receipt, claims, reservation_created
+        )
+        if admitted == "conflict":
+            raise _recovery_source_conflict()
+        if admitted == "busy":
+            raise _recovery_unavailable(config.retry_after_seconds)
+        if admitted == "duplicate":
+            return EventResponse(status="duplicate", session_id=session_id)
+        return EventResponse(status="queued", session_id=session_id)
+
+    async def _admit_current_request() -> EventResponse:
+        if admission_gate is None:
+            existing = await _receipt_state()
+            if existing == "duplicate":
+                return EventResponse(status="duplicate", session_id=session_id)
+            if existing == "conflict":
+                raise _recovery_source_conflict()
+            return await _admit_with_claim("accepted")
+        binding = admission_gate.binding(
+            source_handle,
+            source_descriptor_digest(source),
+            origin,
+            actor,
+            request.workspace,
+            payload_sha256,
+        )
+        async with admission_gate.consume(
+            recovery_permit,
+            binding,
+            lambda: _native_recovery_admission_available(http_request.app),
+            _receipt_state,
+        ) as permit_result:
+            if permit_result == "duplicate":
+                return EventResponse(status="duplicate", session_id=session_id)
+            if permit_result == "conflict":
+                raise _recovery_source_conflict()
+            if permit_result == "existing":
+                raise _recovery_unavailable(config.retry_after_seconds)
+            if permit_result == "mismatch":
+                raise _recovery_unavailable(config.retry_after_seconds, "source")
+            if permit_result == "invalid":
+                retry_class: _RecoveryRetryClass = (
+                    "renew"
+                    if recovery_permit is None
+                    or _has_recovery_permit_shape(recovery_permit)
+                    else "global"
+                )
+                raise _recovery_unavailable(config.retry_after_seconds, retry_class)
+            return await _admit_with_claim(permit_result)
+
+    # Classification, permit consumption, claim, receipt, queue append and the
+    # duplicate repair all run under the shared quarantine/retry lock, taken
+    # BEFORE the admission gate and the outbox lock (their order is
+    # shared -> gate -> outbox).  A second submission can therefore not classify
+    # ``new`` before a first one's duplicate repair has run, and a retry cannot
+    # interleave with either.  The initial reconcile above stays outside: it
+    # takes this lock itself.  Settled uninterrupted so a cancelled request
+    # cannot release the lock with the receipt/queue work half-applied; worker
+    # flush and completion are not under the lock.
+    async with http_request.app.state.recovery_quarantine_retry_lock:
+        return await _await_uninterrupted(_admit_current_request())
 
 
 @app.get("/blobs/{session_id}", dependencies=[Depends(require_read)])
 async def list_blobs(session_id: str, request: Request) -> JSONResponse:
-    await require_claimed_session_access(request, session_id, "data:read")
+    if getattr(request.app.state, "access_control_mode", "compatibility") == "scoped":
+        await _session_claim_store(request.app)
+    await require_claimed_blob_access(request, session_id, "data:read")
     blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
     uris = await blob_store.list(session_id)
     return JSONResponse(content={"session_id": session_id, "blobs": uris})
 
 
-@app.get("/blobs/{session_id}/{key}", dependencies=[Depends(require_read)])
-async def get_blob(session_id: str, key: str, request: Request) -> JSONResponse:
-    await require_claimed_session_access(request, session_id, "data:read")
+async def _read_blob_response(
+    request: Request, session_id: str, uri: str
+) -> JSONResponse:
+    """Authorize the physical blob session, THEN read: shared by every blob GET route."""
+    if getattr(request.app.state, "access_control_mode", "compatibility") == "scoped":
+        await _session_claim_store(request.app)
+    await require_claimed_blob_access(request, session_id, "data:read")
     blob_store = AsyncDiskBlobStore(root=_settings.blob_path)
-    uri = f"ci-blob://{session_id}/{key}"
     try:
         content = await blob_store.read(uri)
+    except BlobExpiredError as exc:
+        raise HTTPException(status_code=410, detail={"code": "blob_expired", "uri": exc.uri})
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Blob not found: {uri}")
     return JSONResponse(content=content)
+
+
+@app.get("/blobs/{session_id}/{key}", dependencies=[Depends(require_read)])
+async def get_blob(session_id: str, key: str, request: Request) -> JSONResponse:
+    return await _read_blob_response(
+        request, session_id, f"ci-blob://{session_id}/{key}"
+    )
+
+
+@app.get(
+    f"/blobs/{{session_id}}/{MAPPED_MARKER}/{{digest}}",
+    dependencies=[Depends(require_read)],
+)
+async def get_mapped_blob(
+    session_id: str,
+    digest: Annotated[str, PathParam(pattern=r"^[0-9a-f]{64}$")],
+    request: Request,
+) -> JSONResponse:
+    uri = f"ci-blob://{session_id}/{MAPPED_MARKER}/{digest}"
+    try:
+        return await _read_blob_response(request, session_id, uri)
+    except ValueError:  # an unsafe session id: the digest is already regex-validated
+        raise HTTPException(status_code=404, detail=f"Blob not found: {uri}")
 
 
 @app.post("/cypher", dependencies=[Depends(require_read)])

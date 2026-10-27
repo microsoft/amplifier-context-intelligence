@@ -1,6 +1,15 @@
 """Pytest configuration and shared fixtures for the test suite."""
 
 import os
+import tempfile
+from pathlib import Path
+
+# Hermetic HOME, set BEFORE any server import.  Default identity-store paths
+# derive from Path.home() when the config module is imported, and an EXISTING
+# store file selects (and exclusively locks) that store.  Without this a
+# developer's real ~/.local/share/ci-server/identity files would be read and
+# locked by the test run.
+os.environ["HOME"] = tempfile.mkdtemp(prefix="ci-server-test-home-")
 
 # Allow the server to boot with no auth in the test harness.
 # create_asgi_app() refuses to start when no credentials are configured UNLESS
@@ -32,6 +41,90 @@ except ImportError:  # pragma: no cover - exercised only against unfixed code
 
     def reset_schema_state() -> None:  # type: ignore[misc]
         """No-op stand-in: unfixed code has no process-wide latch to reset."""
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "raw_identity_factory: do not auto-start identity ownership after "
+        "create_asgi_app() (the test drives the real lifespan itself)",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _own_identity_after_factory(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Generator[None, None, None]:
+    """Give legacy wire tests the identity state the lifespan used to leave.
+
+    ``create_asgi_app()`` now only CONSTRUCTS identity objects; the store is
+    loaded, seeded and exclusively locked by the ASGI lifespan, and the auth
+    middleware answers 503 until then.  httpx's ``ASGITransport`` never runs
+    the lifespan, so after each factory call this harness drives the REAL
+    ownership startup (``_start_identity_ownership``: sidecar lock, load, seed,
+    readiness) and the matching shutdown at teardown.  Tests that exercise the
+    lifespan or ownership themselves opt out with
+    ``@pytest.mark.raw_identity_factory``.
+    """
+    import shutil
+
+    import context_intelligence_server.main as main_module
+
+    # Default identity paths live under the (hermetic) HOME and an existing
+    # store file now SELECTS that store, so a store written by one test must
+    # not leak into the next test's default configuration.  The lazily built
+    # module-level ``asgi_app`` is also per-test: its identity gate is tied to
+    # the factory call that created it.
+    default_state = Path.home() / ".local" / "share" / "ci-server"
+    shutil.rmtree(default_state, ignore_errors=True)
+    main_module._asgi_app = None
+    # The module-level FastAPI app is a process singleton: drop identity wiring
+    # a previous test's factory call left on it, so lifespan tests that use a
+    # settings stand-in do not inherit someone else's identity store.
+    for _attr in (
+        "api_key_store",
+        "entra_identity_store",
+        "identity_config_token",
+        "identity_runtime",
+    ):
+        setattr(main_module.app.state, _attr, None)
+    main_module.app.state.identity_ready_token = None
+    main_module.app.state.identity_lifespan_active = False
+    if request.node.get_closest_marker("raw_identity_factory"):
+        yield
+        shutil.rmtree(default_state, ignore_errors=True)
+        main_module._asgi_app = None
+        return
+
+    real_factory = main_module.create_asgi_app
+    owned: list[Any] = []
+
+    def _stop_all() -> None:
+        while owned:
+            runtime, ownership = owned.pop()
+            assert not runtime.probes, (
+                "test must settle its identity I/O before sync teardown"
+            )
+            assert runtime.admitted == 0
+            main_module._stop_identity_ownership(
+                main_module.app, ownership, runtime=runtime
+            )
+
+    def factory_with_ownership(*args: Any, **kwargs: Any) -> Any:
+        _stop_all()
+        wrapper = real_factory(*args, **kwargs)
+        runtime = main_module.app.state.identity_runtime
+        ownership = main_module._start_identity_ownership(
+            main_module.app, main_module.app.state.settings, runtime=runtime
+        )
+        owned.append((runtime, ownership))
+        return wrapper
+
+    monkeypatch.setattr(main_module, "create_asgi_app", factory_with_ownership)
+    yield
+    _stop_all()
+    shutil.rmtree(default_state, ignore_errors=True)
+    main_module._asgi_app = None
 
 
 @pytest.fixture(autouse=True)
@@ -137,7 +230,7 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
     _real = _Settings()
 
     class _SettingsProxy:
-        blob_path: str = _real.blob_path
+        blob_path: str = str(tmp_path / "blobs")
         queues_path: str = str(tmp_path / "queues")
         # Redirect identity-store paths so the registry proxy never touches the
         # real /data/identity/ defaults on machines where those files exist.
@@ -174,11 +267,20 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
                 access_mode="READ",
             )
 
+        def stateful_root(self) -> Path:
+            """Match Settings' lock-root derivation without touching /data in tests."""
+            return Path(self.queues_path).parent
+
     with patch(
         "context_intelligence_server.registry.get_settings",
         return_value=_SettingsProxy(),
     ):
-        yield
+        # Lifespan acquires its process lock before it initializes drivers or
+        # workers. Point the module-level ASGI app at this test's isolated root
+        # rather than the production default (/data), which is intentionally
+        # not writable from the test runner.
+        with patch.object(app.state, "settings", _SettingsProxy(), create=True):
+            yield
 
 
 @pytest.fixture(autouse=True)

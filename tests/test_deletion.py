@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.deletion import DeletionService, SessionsPendingError
-from context_intelligence_server.queue_manager import QueueManager
+from context_intelligence_server.queue_manager import QueueManager, fold_worker_key
 from context_intelligence_server.services import GraphState
 
 pytestmark = pytest.mark.asyncio
@@ -126,6 +126,31 @@ async def _build_drained_multi_session_graph(
 
 async def test_preview_unknown_session_returns_none(service: DeletionService) -> None:
     assert await service.preview("does-not-exist") is None
+
+
+async def test_long_original_uses_physical_queue_key_but_reports_graph_identity(
+    service: DeletionService, graph: GraphState, blob_store: AsyncDiskBlobStore,
+    queue_manager: QueueManager,
+) -> None:
+    original = "nested-" * 70
+    worker = fold_worker_key(original)
+    await graph.upsert_node(original, {"labels": ["Session", "RootSession"]})
+    uri = await blob_store.write(original, "raw", {"preserved": True})
+    await queue_manager.append(worker, b"pending")
+    preview = await service.preview(original)
+    assert preview is not None and not preview.deletable
+    assert preview.pending_sessions == [original]
+    with pytest.raises(SessionsPendingError) as blocked:
+        await service.apply(original)
+    assert blocked.value.pending_sessions == [original]
+    assert await blob_store.read(uri) == {"preserved": True}
+    batch = await queue_manager.read_batch(worker, 1)
+    await queue_manager.commit(worker, batch.end_offset)
+    result = await service.apply(original)
+    assert result is not None and result.root_id == original
+    assert result.queue_sessions_cleaned == 1 and result.blobs_deleted == 1
+    assert await graph.resolve_session_graph(original) is None
+    assert await blob_store.list(original) == []
 
 
 async def test_preview_returns_facts_and_mutates_nothing(
