@@ -139,22 +139,23 @@ class IdentityStore:
         permissions disable authentication immediately instead of at the next
         mutation.  A failed check latches the store unavailable.
         """
-        if not self._managed:
+        with self._op_lock:
+            if not self._managed:
+                return True
+            lock = self._lock
+            if (
+                self._stopped
+                or self._ownership_failed
+                or lock is None
+                or not lock.owned_by_this_process()
+            ):
+                return False
+            try:
+                lock.assert_owned()
+            except IdentityStoreOwnershipError:
+                self._latch()
+                return False
             return True
-        lock = self._lock
-        if (
-            self._stopped
-            or self._ownership_failed
-            or lock is None
-            or not lock.owned_by_this_process()
-        ):
-            return False
-        try:
-            lock.assert_owned()
-        except IdentityStoreOwnershipError:
-            self._latch()
-            return False
-        return True
 
     @property
     def failure_detected(self) -> bool:

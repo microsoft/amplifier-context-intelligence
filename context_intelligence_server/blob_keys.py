@@ -151,12 +151,13 @@ def exact_address(uri: str) -> BlobAddress:
 
 
 def parse_address(uri: str) -> BlobAddress:
-    """Parse *uri*; ordinary names fold exactly as the store always has."""
+    """Parse *uri*, folding sessions in both forms and ordinary names only."""
     addr = exact_address(uri)
+    session = fold_name(addr.session, MAX_SESSION_BYTES)
     if addr.mapped:
-        return addr
+        return BlobAddress(session, addr.name, mapped=True)
     return BlobAddress(
-        fold_name(addr.session, MAX_SESSION_BYTES),
+        session,
         fold_name(addr.name, MAX_KEY_BYTES),
     )
 

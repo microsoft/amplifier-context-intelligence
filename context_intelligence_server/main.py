@@ -12,10 +12,13 @@ import sys
 import threading
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager, nullcontext, suppress
+from dataclasses import dataclass, field
 from datetime import datetime
+from functools import partial
 from pathlib import Path
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Generic, Literal, TypeVar, cast
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi import Path as PathParam
@@ -71,6 +74,7 @@ from context_intelligence_server.neo4j_store import (
     mark_schema_ready,
 )
 from context_intelligence_server.queue_manager import (
+    QueueManager,
     _await_uninterrupted,
     fold_worker_key,
 )
@@ -1053,7 +1057,13 @@ async def _quarantine_selected_receipt_locked(
             envelope = json.loads(batch.records[0].raw)
         except (TypeError, ValueError):
             return False
-        if envelope.get("_recovery_origin") != origin:
+        if not isinstance(envelope, dict):
+            return False
+        selected = QueueManager.normalized_recovery_origin(origin)
+        found = QueueManager.normalized_recovery_origin(
+            envelope.get("_recovery_origin")
+        )
+        if selected is None or selected != found:
             return False
         await queue.dead_letter(
             session_id,
@@ -1551,14 +1561,119 @@ def _initialize_identity_store(
 # a worker thread's "ready" lose cleanly against a shutdown that already began.
 _identity_state_lock = threading.Lock()
 _IDENTITY_REASONS = {"initializing": "initializing", "unavailable": "store_unavailable"}
+_IDENTITY_PROBE_CONCURRENCY = 4
+_IDENTITY_MAX_ADMITTED = 36
+_IDENTITY_PROBE_TIMEOUT_SECONDS = 1.0
+_IdentityOwnership = tuple[IdentityStore, IdentityStoreLock | None] | None
+_IdentityResult = TypeVar("_IdentityResult")
+
+
+@dataclass
+class _IdentityCall(Generic[_IdentityResult]):
+    """Action ownership exists before dispatch, independent of its transport."""
+
+    completion: ConcurrentFuture[_IdentityResult]
+    io: asyncio.Future[_IdentityResult]
+    dispatch_error: BaseException | None = None
+
+
+def _new_identity_call(
+    loop: asyncio.AbstractEventLoop, completion: ConcurrentFuture[_IdentityResult]
+) -> _IdentityCall[_IdentityResult]:
+    return _IdentityCall(completion, asyncio.wrap_future(completion, loop=loop))
+
+
+def _run_identity_call(
+    completion: ConcurrentFuture[_IdentityResult], action: Callable[[], _IdentityResult]
+) -> None:
+    # The Future's atomic state transition arbitrates against dispatch abort.
+    # No identity file/lock/mutex access is permitted before winning this claim.
+    if not completion.set_running_or_notify_cancel():
+        return
+    try:
+        result = action()
+    except BaseException as exc:  # noqa: BLE001 - transport every worker outcome
+        completion.set_exception(exc)
+    else:
+        completion.set_result(result)
+
+
+def _identity_transport_done(transport: asyncio.Future[None]) -> None:
+    if not transport.cancelled():
+        transport.exception()  # action outcomes belong to the app completion
+
+
+def _dispatch_identity_call(
+    call: _IdentityCall[_IdentityResult], action: Callable[[], _IdentityResult]
+) -> None:
+    try:
+        transport = asyncio.get_running_loop().run_in_executor(
+            None, partial(_run_identity_call, call.completion, action)
+        )
+    except BaseException as exc:  # noqa: BLE001 - dispatch failure must arbitrate claim/abort
+        call.dispatch_error = exc
+        # Submit may have enqueued before raising. Only this atomic abort can
+        # prove that a late wrapper cannot execute the action.
+        call.completion.cancel()
+    else:
+        transport.add_done_callback(_identity_transport_done)
+
+
+@dataclass
+class _IdentityRuntime:
+    """One ownership lifetime; accounting belongs exclusively to the loop."""
+
+    token: object
+    store: IdentityStore
+    closing: bool = False
+    admitted: int = 0
+    slots: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(_IDENTITY_PROBE_CONCURRENCY)
+    )
+    drained: asyncio.Event = field(default_factory=asyncio.Event)
+    probes: set[asyncio.Future[bool]] = field(default_factory=set)
+    init_io: asyncio.Future[_IdentityOwnership] | None = None
+    init_task: asyncio.Task[_IdentityOwnership] | None = None
+    init_call: _IdentityCall[_IdentityOwnership] | None = None
+    cleanup_calls: list[_IdentityCall[None]] = field(default_factory=list)
+    cleanup_complete: bool = False
+    # Published by startup before acquisition/load; retained if partial stop
+    # fails, independent of exception tracebacks or init's returned result.
+    owned: _IdentityOwnership = None
+
+    def __post_init__(self) -> None:
+        self.drained.set()
+
+
+def _identity_observer_cancelled(runtime: _IdentityRuntime) -> bool:
+    task = runtime.init_task
+    return task is not None and (task.cancelled() or task.cancelling() > 0)
 
 
 def _set_identity_state(
-    app: FastAPI, new_state: str, *, ready_token: Any = None, owned: bool = False
+    app: FastAPI,
+    new_state: str,
+    *,
+    ready_token: Any = None,
+    owned: bool = False,
+    runtime: _IdentityRuntime | None = None,
 ) -> None:
     with _identity_state_lock:
         state = app.state
-        if new_state == "ready" and getattr(state, "identity_closing", False):
+        if runtime is not None:
+            if (
+                getattr(state, "identity_runtime", None) is not runtime
+                or getattr(state, "identity_config_token", None) is not runtime.token
+            ):
+                return
+            ready_token = runtime.token
+        if new_state == "ready" and (
+            getattr(state, "identity_closing", False)
+            or (
+                runtime is not None
+                and (runtime.closing or _identity_observer_cancelled(runtime))
+            )
+        ):
             new_state = "unavailable"  # shutdown began first: never reopen
         is_ready = new_state == "ready"
         state.identity_ready_token = ready_token if is_ready else None
@@ -1566,20 +1681,128 @@ def _set_identity_state(
         state.identity_state = new_state
 
 
-def _publish_identity_failure(app: FastAPI) -> None:
+def _publish_identity_failure(
+    app: FastAPI, *, runtime: _IdentityRuntime | None = None
+) -> None:
     """Mirror an ALREADY-latched store failure into the cached readiness record.
 
     Reads only the store's cached flag (no I/O, no ``healthy()``), and acts only
     on the current ready state, so ``/status`` never predicts a failure and a
     stale generation or an initializing/unavailable record is left untouched.
     """
-    store = _identity_store_of(app)
+    store = runtime.store if runtime is not None else _identity_store_of(app)
     if (
         store is not None
         and store.failure_detected
         and getattr(app.state, "identity_state", None) == "ready"
     ):
-        _set_identity_state(app, "unavailable")
+        _set_identity_state(app, "unavailable", runtime=runtime)
+
+
+def _close_identity_runtime(app: FastAPI, runtime: _IdentityRuntime) -> None:
+    with _identity_state_lock:
+        runtime.closing = True
+        if (
+            getattr(app.state, "identity_runtime", None) is runtime
+            and getattr(app.state, "identity_config_token", None) is runtime.token
+        ):
+            app.state.identity_closing = True
+    _set_identity_state(app, "unavailable", runtime=runtime)
+
+
+def _identity_runtime_ready(app: FastAPI, runtime: _IdentityRuntime) -> bool:
+    """Cached readiness only: never enter the store mutex or filesystem."""
+    if _identity_observer_cancelled(runtime):
+        _close_identity_runtime(app, runtime)
+    _publish_identity_failure(app, runtime=runtime)
+    state = app.state
+    return (
+        getattr(state, "identity_runtime", None) is runtime
+        and _identity_store_of(app) is runtime.store
+        and getattr(state, "identity_config_token", None) is runtime.token
+        and getattr(state, "identity_ready_token", None) is runtime.token
+        and getattr(state, "identity_state", None) == "ready"
+        and not getattr(state, "identity_closing", False)
+        and not runtime.closing
+        and not runtime.store.failure_detected
+    )
+
+
+def _identity_admission_finished(runtime: _IdentityRuntime) -> None:
+    runtime.admitted -= 1
+    if runtime.admitted == 0:
+        runtime.drained.set()
+
+
+def _identity_probe_done(
+    app: FastAPI, runtime: _IdentityRuntime, future: asyncio.Future[bool]
+) -> None:
+    """Real completion, not HTTP completion, owns submitted capacity."""
+    try:
+        if future.cancelled():
+            return  # dispatch abort won before any action; not ownership loss
+        try:
+            healthy = future.result()
+        except Exception:  # logging observes orphaned executor errors
+            logger.exception("identity verification failed unexpectedly")
+            healthy = False
+        if not healthy:
+            _set_identity_state(app, "unavailable", runtime=runtime)
+    finally:
+        runtime.probes.discard(future)
+        runtime.slots.release()
+        _identity_admission_finished(runtime)
+
+
+async def _verify_identity_runtime(app: FastAPI, runtime: _IdentityRuntime) -> bool:
+    if not _identity_runtime_ready(app, runtime):
+        return False
+    if not getattr(app.state, "identity_store_owned", False):
+        return True  # deliberately unselected store, no ownership I/O
+    if runtime.admitted >= _IDENTITY_MAX_ADMITTED:
+        return False
+    runtime.admitted += 1
+    runtime.drained.clear()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _IDENTITY_PROBE_TIMEOUT_SECONDS
+    slot_acquired = submitted = False
+    try:
+        try:
+            async with asyncio.timeout_at(deadline):
+                await runtime.slots.acquire()
+                slot_acquired = True
+        except TimeoutError:
+            return False
+        if not _identity_runtime_ready(app, runtime) or loop.time() >= deadline:
+            return False
+        completion: ConcurrentFuture[bool] = ConcurrentFuture()
+        call = _new_identity_call(loop, completion)
+        future = call.io
+        runtime.probes.add(future)
+        future.add_done_callback(partial(_identity_probe_done, app, runtime))
+        submitted = True  # accounting transfers BEFORE any possible dispatch
+        _dispatch_identity_call(call, runtime.store.healthy)
+        if call.dispatch_error is not None:
+            _close_identity_runtime(app, runtime)
+            logger.error(
+                "identity verification dispatch failed: %r", call.dispatch_error
+            )
+            if not isinstance(call.dispatch_error, Exception):
+                raise call.dispatch_error
+            return False
+        done, _ = await asyncio.wait({future}, timeout=max(0, deadline - loop.time()))
+        if not done or future.cancelled() or loop.time() >= deadline:
+            return False
+        try:
+            healthy = future.result()
+        except Exception:  # noqa: BLE001 - callback owns error logging
+            return False
+        return healthy and _identity_runtime_ready(app, runtime)
+    finally:
+        if not submitted:
+            if slot_acquired:
+                runtime.slots.release()
+            _identity_admission_finished(runtime)
 
 
 def _identity_store_of(app: FastAPI) -> IdentityStore | None:
@@ -1591,17 +1814,15 @@ def _identity_store_of(app: FastAPI) -> IdentityStore | None:
 
 
 def _release_identity(store: IdentityStore, lock: IdentityStoreLock | None) -> None:
-    """Drop a (possibly partial) ownership: clear the served map, free the lock."""
-    try:
-        store.stop()
-    finally:
-        if lock is not None:
-            lock.release()
+    """Release exclusion only after even a partial store has stopped safely."""
+    store.stop()
+    if lock is not None:
+        lock.release()
 
 
 def _start_identity_ownership(
-    app: FastAPI, s: Any
-) -> tuple[IdentityStore, IdentityStoreLock | None] | None:
+    app: FastAPI, s: Any, *, runtime: _IdentityRuntime | None = None
+) -> _IdentityOwnership:
     """Select, lock, load and seed the identity store.  Runs ONCE, in a thread.
 
     Expected identity failures (a selection ``ValueError``, ``OSError``, an
@@ -1612,66 +1833,109 @@ def _start_identity_ownership(
     here (partial state is still released) and surfaces on the task, where the
     done-callback records identity unavailable.
     """
-    store = _identity_store_of(app)
+    if runtime is None:
+        runtime = getattr(app.state, "identity_runtime", None)
+    store = runtime.store if runtime is not None else _identity_store_of(app)
     if store is None:
         return None  # no identity wiring on this app
-    state = app.state
     try:
         selected = s.active_identity_store_path()
     except ValueError as exc:
         logger.error("identity store selection failed; identity unavailable: %s", exc)
-        _set_identity_state(app, "unavailable")
+        _set_identity_state(app, "unavailable", runtime=runtime)
         return None
     lock: IdentityStoreLock | None = None
     try:
         if selected is not None:
             lock = IdentityStoreLock(store.path)
+        owned = (store, lock)
+        if runtime is not None:
+            runtime.owned = owned
+        if lock is not None:
             lock.acquire()
             store.attach(lock)
         _initialize_identity_store(app, s, store, owned=lock is not None)
     except (OSError, IdentityStoreOwnershipError) as exc:
         _release_identity(store, lock)
+        if runtime is not None:
+            runtime.owned = None  # clear only AFTER stop and release succeeded
         logger.error(
             "identity store initialization failed; identity unavailable: %r", exc
         )
-        _set_identity_state(app, "unavailable")
+        _set_identity_state(app, "unavailable", runtime=runtime)
         return None
     except BaseException:
         _release_identity(store, lock)
+        if runtime is not None:
+            runtime.owned = None
         raise
     _set_identity_state(
         app,
         "ready",
-        ready_token=getattr(state, "identity_config_token", None),
+        ready_token=(
+            runtime.token
+            if runtime is not None
+            else getattr(app.state, "identity_config_token", None)
+        ),
         owned=lock is not None,
+        runtime=runtime,
     )
-    return store, lock
+    return owned
 
 
 def _stop_identity_ownership(
-    app: FastAPI, owned: tuple[IdentityStore, IdentityStoreLock | None] | None
+    app: FastAPI, owned: _IdentityOwnership, *, runtime: _IdentityRuntime | None = None
 ) -> None:
     """Close readiness first, then stop operations, clear the cache, release."""
-    with _identity_state_lock:
-        app.state.identity_closing = True
-    _set_identity_state(app, "unavailable")
+    if runtime is None:
+        runtime = getattr(app.state, "identity_runtime", None)
+    if runtime is not None:
+        _close_identity_runtime(app, runtime)
+    else:
+        with _identity_state_lock:
+            app.state.identity_closing = True
+        _set_identity_state(app, "unavailable")
     if owned is not None:
         _release_identity(*owned)
+        if runtime is not None:
+            runtime.owned = None
 
 
-def _identity_init_done(app: FastAPI, task: asyncio.Task[Any]) -> None:
-    """Always observe the init task so its exception is never left unretrieved."""
-    if task.cancelled():
-        _set_identity_state(app, "unavailable")
-        return
-    exc = task.exception()
+def _identity_init_done(
+    app: FastAPI, runtime: _IdentityRuntime, future: asyncio.Future[_IdentityOwnership]
+) -> None:
+    """Observe private I/O even if the public observer was cancelled."""
+    if future.cancelled():
+        return  # known pre-claim abort, not a programming error
+    exc = future.exception()
     if exc is not None:
         logger.error(
             "identity initialization failed unexpectedly; identity unavailable: %r",
             exc,
             exc_info=exc,
         )
-        _set_identity_state(app, "unavailable")
+        _set_identity_state(app, "unavailable", runtime=runtime)
+
+
+async def _observe_identity_init(
+    app: FastAPI, runtime: _IdentityRuntime
+) -> _IdentityOwnership:
+    assert runtime.init_io is not None
+    try:
+        await asyncio.wait({runtime.init_io})
+        return runtime.init_io.result()
+    except asyncio.CancelledError:
+        _close_identity_runtime(app, runtime)
+        raise
+
+
+def _identity_observer_done(
+    app: FastAPI, runtime: _IdentityRuntime, task: asyncio.Task[_IdentityOwnership]
+) -> None:
+    if task.cancelled():
+        _close_identity_runtime(app, runtime)  # includes before-first-step cancellation
+    else:
+        task.exception()  # raw I/O callback owns unexpected-error logging
 
 
 @asynccontextmanager
@@ -1691,32 +1955,174 @@ async def _identity_lifespan(app: FastAPI, s: Any) -> AsyncGenerator[None, None]
         return
     if getattr(state, "identity_lifespan_active", False):
         raise RuntimeError("an application lifespan already owns the identity store")
-    state.identity_lifespan_active = True
+    store = _identity_store_of(app)
+    assert store is not None
     with _identity_state_lock:
+        previous = getattr(state, "identity_runtime", None)
+        if previous is not None:
+            previous.closing = True
+        runtime = _IdentityRuntime(getattr(state, "identity_config_token", None), store)
+        state.identity_runtime = runtime
+        state.identity_lifespan_active = True
         state.identity_closing = False
-    _set_identity_state(app, "initializing")
-    task = asyncio.create_task(asyncio.to_thread(_start_identity_ownership, app, s))
-    task.add_done_callback(lambda finished: _identity_init_done(app, finished))
-    state.identity_init_task = task
+    _set_identity_state(app, "initializing", runtime=runtime)
+    loop = asyncio.get_running_loop()
     cancelled: asyncio.CancelledError | None = None
+
+    async def settle(future: asyncio.Future[Any]) -> None:
+        nonlocal cancelled
+        while not future.done():
+            try:
+                await asyncio.wait({future})
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+        if not future.cancelled():
+            future.exception()  # observe the asyncio adapter as well as completion
+
+    async def yield_settlement() -> None:
+        nonlocal cancelled
+        try:
+            await asyncio.sleep(0.01)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+
     try:
+        init_completion: ConcurrentFuture[_IdentityOwnership] = ConcurrentFuture()
+        runtime.init_call = _new_identity_call(loop, init_completion)
+        runtime.init_io = runtime.init_call.io
+        runtime.init_io.add_done_callback(partial(_identity_init_done, app, runtime))
+        _dispatch_identity_call(
+            runtime.init_call,
+            partial(_start_identity_ownership, app, s, runtime=runtime),
+        )
+        if runtime.init_call.dispatch_error is not None:
+            _close_identity_runtime(app, runtime)
+            logger.error(
+                "identity initialization dispatch failed: %r",
+                runtime.init_call.dispatch_error,
+            )
+            raise runtime.init_call.dispatch_error
+        observer_coro = _observe_identity_init(app, runtime)
+        try:
+            runtime.init_task = asyncio.create_task(observer_coro)
+        except BaseException:
+            observer_coro.close()
+            raise
+        runtime.init_task.add_done_callback(
+            partial(_identity_observer_done, app, runtime)
+        )
+        state.identity_init_task = runtime.init_task
         yield
     finally:
-        with _identity_state_lock:
-            state.identity_closing = True
-        _set_identity_state(app, "unavailable")
-        while not task.done():
-            try:
-                await asyncio.wait({task})
-            except asyncio.CancelledError as exc:  # keep settling the thread
-                cancelled = exc
-        owned = None if task.cancelled() or task.exception() else task.result()
+        _close_identity_runtime(app, runtime)
+        owned: _IdentityOwnership = None
+        cleanup_dispatch_error: BaseException | None = None
+        drained_setup_error: BaseException | None = None
+        cleanup_thread: threading.Thread | None = None
         try:
-            _stop_identity_ownership(app, owned)
+            try:
+                if runtime.init_call is not None:
+                    await settle(runtime.init_call.io)
+                    completion = runtime.init_call.completion
+                    if not completion.cancelled() and completion.exception() is None:
+                        owned = completion.result()
+                if runtime.init_task is not None:
+                    await settle(runtime.init_task)
+                    if not runtime.init_task.cancelled():
+                        runtime.init_task.exception()
+                # Closing forbids new jobs; callbacks return submitted slots.
+                for probe in tuple(runtime.probes):
+                    await settle(probe)
+                    if not probe.cancelled():
+                        probe.exception()
+                if not runtime.drained.is_set():
+                    drained_coro = runtime.drained.wait()
+                    try:
+                        drained = asyncio.create_task(drained_coro)
+                    except BaseException as exc:  # noqa: BLE001 - settle admissions before surfacing setup error
+                        drained_coro.close()
+                        drained_setup_error = exc
+                        # All real jobs have settled. Queued admissions have a
+                        # finite original deadline; no scheduler retry is needed.
+                        while runtime.admitted:
+                            await yield_settlement()
+                    else:
+                        await settle(drained)
+                        drained.result()
+            finally:
+                if owned is None:
+                    if runtime.owned is not None:
+                        # Init already attempted partial cleanup and its stop
+                        # failed. The exact owner remains reachable; retrying a
+                        # started stop here would fabricate a clean shutdown.
+                        raise RuntimeError(
+                            "identity initialization cleanup failed; identity and root exclusion retained"
+                        )
+                    # No dispatch, atomic init abort, or initializer's completed
+                    # partial-owner release: no stop action exists to retry.
+                    runtime.cleanup_complete = True
+                else:
+                    action = partial(
+                        _stop_identity_ownership, app, owned, runtime=runtime
+                    )
+                    cleanup_completion: ConcurrentFuture[None] = ConcurrentFuture()
+                    cleanup_call = _new_identity_call(loop, cleanup_completion)
+                    runtime.cleanup_calls.append(cleanup_call)
+                    _dispatch_identity_call(cleanup_call, action)
+                    if cleanup_call.dispatch_error is not None:
+                        cleanup_dispatch_error = cleanup_call.dispatch_error
+                        logger.error(
+                            "identity cleanup dispatch failed: %r",
+                            cleanup_dispatch_error,
+                        )
+                    await settle(cleanup_call.io)
+                    if cleanup_call.completion.cancelled():
+                        # Only proven pre-claim abort permits one independent
+                        # dispatch attempt. Never retry a started/failed stop.
+                        fallback_completion: ConcurrentFuture[None] = ConcurrentFuture()
+                        fallback = _new_identity_call(loop, fallback_completion)
+                        runtime.cleanup_calls.append(fallback)
+                        try:
+                            cleanup_thread = threading.Thread(
+                                target=_run_identity_call,
+                                args=(fallback.completion, action),
+                                name="ci-identity-cleanup",
+                            )
+                            cleanup_thread.start()
+                        except BaseException as exc:  # noqa: BLE001 - start may report failure after claim
+                            fallback.dispatch_error = exc
+                            fallback.completion.cancel()
+                            logger.error(
+                                "identity cleanup fallback launch failed: %r", exc
+                            )
+                        try:
+                            await settle(fallback.io)
+                            if fallback.completion.cancelled():
+                                raise RuntimeError(
+                                    "identity cleanup could not start; identity and root exclusion retained"
+                                )
+                            fallback.completion.result()
+                        finally:
+                            if cleanup_thread is not None:
+                                while cleanup_thread.is_alive():
+                                    await yield_settlement()
+                        runtime.cleanup_complete = True
+                    else:
+                        cleanup_call.completion.result()
+                        runtime.cleanup_complete = True
         finally:
-            state.identity_lifespan_active = False
+            if runtime.cleanup_complete:
+                state.identity_lifespan_active = False
+            else:
+                logger.critical(
+                    "identity cleanup incomplete; admission closed and identity/root exclusion retained"
+                )
         if cancelled is not None:
             raise cancelled
+        if cleanup_dispatch_error is not None:
+            raise cleanup_dispatch_error
+        if drained_setup_error is not None:
+            raise drained_setup_error
 
 
 @asynccontextmanager
@@ -1754,6 +2160,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             finally:
                 await service.close()
     finally:
+        if getattr(app.state, "identity_lifespan_active", False):
+            # A flag alone does not retain exclusion: keep the actual lock
+            # reachable on app.state and explicitly refuse this release.
+            logger.critical(
+                "root exclusion retained because identity cleanup is incomplete"
+            )
+            raise RuntimeError("identity cleanup incomplete; root exclusion retained")
         instance_lock.release()
 
 
@@ -2131,26 +2544,34 @@ def create_asgi_app(
             """Discard selected work terminalized during a recovery pause."""
             for record in records:
                 try:
-                    origin = json.loads(record.raw).get("_recovery_origin")
+                    envelope = json.loads(record.raw)
                 except (TypeError, ValueError):
-                    origin = None
-                if not (
-                    isinstance(origin, dict)
-                    and isinstance(origin.get("source_handle"), str)
-                    and isinstance(origin.get("ordinal"), int)
-                ):
-                    continue  # Explicit legacy records retain their former path.
-                queue_state = (
-                    await recovery_registry.queue_manager.recovery_origin_commit_state(
-                        origin
-                    )
+                    envelope = None
+                normalized = QueueManager.normalized_recovery_origin(
+                    envelope.get("_recovery_origin")
+                    if isinstance(envelope, dict)
+                    else None
                 )
-                if (
-                    queue_state != "queued"
-                    or not await app.state.recovery_receipts.is_flushable(
-                        origin["source_handle"], origin["ordinal"]
+                flushable = False
+                if normalized is not None:
+                    source_handle, ordinal, line_sha256 = normalized
+                    origin = {
+                        "source_handle": source_handle,
+                        "ordinal": ordinal,
+                        "source_line_sha256": line_sha256,
+                    }
+                    queue_state = await (
+                        recovery_registry.queue_manager.recovery_origin_commit_state(
+                            origin
+                        )
                     )
-                ):
+                    flushable = (
+                        queue_state == "queued"
+                        and await app.state.recovery_receipts.is_flushable(
+                            source_handle, ordinal
+                        )
+                    )
+                if not flushable:
                     # Event handlers only buffer graph work; flush is the sole
                     # write boundary. Drop that buffer before raising so a
                     # paused-and-quarantined record cannot write after resume.
@@ -2287,23 +2708,17 @@ def create_asgi_app(
     app.state.identity_store_owned = False
     app.state.identity_closing = False
     app.state.identity_state = "initializing"
+    app.state.identity_runtime = _IdentityRuntime(_gate_token, active_identity_store)
 
-    def _identity_ready() -> bool:
-        state = app.state
-        if getattr(state, "identity_config_token", None) is not _gate_token:
-            return False  # obsolete generation
-        if getattr(state, "identity_state", "initializing") != "ready":
-            return False  # initializing, unavailable, or shutting down
-        if getattr(state, "identity_ready_token", None) is not _gate_token:
+    async def _identity_ready() -> bool:
+        runtime = getattr(app.state, "identity_runtime", None)
+        if (
+            runtime is None
+            or runtime.token is not _gate_token
+            or runtime.store is not active_identity_store
+        ):
             return False
-        if getattr(state, "identity_store_owned", False):
-            if active_identity_store.healthy():
-                return True
-            _publish_identity_failure(app)  # a latched failure reaches /status
-            return False
-        return True
-
-    identity_gate: Callable[[], bool] = _identity_ready
+        return await _verify_identity_runtime(app, runtime)
 
     # Log admin capability status for operator visibility.
     if s.auth_mode == "static":
@@ -2337,7 +2752,7 @@ def create_asgi_app(
         exempt_paths=_EXEMPT_PATHS,
         admin_api_key_digest=admin_api_key_digest,
         allow_unauthenticated=s.allow_unauthenticated,
-        identity_gate=identity_gate,
+        identity_gate=_identity_ready,
     )
 
 

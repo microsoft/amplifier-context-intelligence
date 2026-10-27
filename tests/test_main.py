@@ -477,6 +477,90 @@ async def test_get_mapped_blob_returns_410_with_the_recorded_uri_when_expired(
     assert response.json()["detail"] == {"code": "blob_expired", "uri": uri}
 
 
+@pytest.mark.parametrize("session", ["s" * 300, "é" * 150], ids=["ascii", "multibyte"])
+async def test_get_mapped_blob_accepts_long_original_session(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session: str,
+) -> None:
+    from context_intelligence_server.blob_keys import MAX_SESSION_BYTES
+    from context_intelligence_server.blob_store import AsyncDiskBlobStore
+    from context_intelligence_server.utils import fold_name
+
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    folded_session = fold_name(session, MAX_SESSION_BYTES)
+    digest = _MAPPED_HTTP_KEYS[0][1]
+    canonical_uri = f"ci-blob://{folded_session}/{_MAPPED_MARK}/{digest}"
+    payload = {"mapped": "a/b", "text": "café"}
+    assert await AsyncDiskBlobStore(tmp_path).write(session, "a/b", payload) == (
+        canonical_uri
+    )
+
+    for session_spelling in (folded_session, session):
+        response = await client.get(
+            f"/blobs/{session_spelling}/{_MAPPED_MARK}/{digest}"
+        )
+        assert response.status_code == 200
+        assert response.json() == payload
+
+    listed = await client.get(f"/blobs/{session}")
+    assert listed.status_code == 200
+    assert listed.json() == {"session_id": session, "blobs": [canonical_uri]}
+    assert session not in {path.name for path in tmp_path.iterdir()}
+
+
+@pytest.mark.parametrize("session", ["s" * 300, "é" * 150], ids=["ascii", "multibyte"])
+async def test_get_mapped_blob_long_original_session_reports_canonical_expiry(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session: str,
+) -> None:
+    from context_intelligence_server import blob_retention as r
+    from context_intelligence_server.blob_keys import MAX_SESSION_BYTES
+    from context_intelligence_server.utils import fold_name
+
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    folded_session = fold_name(session, MAX_SESSION_BYTES)
+    digest = _MAPPED_HTTP_KEYS[0][1]
+    canonical_uri = f"ci-blob://{folded_session}/{_MAPPED_MARK}/{digest}"
+    with (
+        r.RootLock(tmp_path, exclusive=True, create_root=True) as lock,
+        r.Ledger(lock.root, writable=True) as ledger,
+    ):
+        ledger.journal([r.Candidate(canonical_uri, (1, 2, 3, 4, 5), 0)])
+
+    for session_spelling in (folded_session, session):
+        response = await client.get(
+            f"/blobs/{session_spelling}/{_MAPPED_MARK}/{digest}"
+        )
+        assert response.status_code == 410
+        assert response.json()["detail"] == {
+            "code": "blob_expired",
+            "uri": canonical_uri,
+        }
+    assert not (tmp_path / folded_session).exists()
+    assert session not in {path.name for path in tmp_path.iterdir()}
+
+
+@pytest.mark.parametrize("session", ["s" * 300, "é" * 150], ids=["ascii", "multibyte"])
+async def test_get_mapped_blob_long_original_session_missing_returns_404(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session: str,
+) -> None:
+    monkeypatch.setattr(main_module._settings, "blob_path", str(tmp_path))
+    uri = f"ci-blob://{session}/{_MAPPED_MARK}/{'0' * 64}"
+
+    response = await client.get("/blobs/" + uri.removeprefix("ci-blob://"))
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == f"Blob not found: {uri}"
+    assert session not in {path.name for path in tmp_path.iterdir()}
+
+
 @pytest.mark.parametrize(
     "digest",
     ["A" * 64, "a" * 63, "a" * 65, "g" * 64, "0" * 32 + "Z" * 32],

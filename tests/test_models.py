@@ -6,9 +6,47 @@ from pydantic import ValidationError
 from context_intelligence_server.models import (
     EventRequest,
     EventResponse,
+    LegacyNativeRecoveryOrigin,
+    NativeRecoveryOrigin,
     RecoveryEventRequest,
     StatusResponse,
 )
+from context_intelligence_server.routers.admin import RecoveryReceiptBody
+
+
+@pytest.mark.parametrize(
+    ("model", "fields"),
+    [
+        (NativeRecoveryOrigin, {"source_line_sha256": "a" * 64}),
+        (
+            LegacyNativeRecoveryOrigin,
+            {
+                "session_id": "recovery-session",
+                "source_line_sha256": "a" * 64,
+                "source_stream_sha256": "b" * 64,
+            },
+        ),
+        (RecoveryReceiptBody, {"source_handle": "c" * 64}),
+    ],
+)
+@pytest.mark.parametrize("ordinal", [-1, 0, (1 << 63) - 1, 1 << 63])
+def test_recovery_ordinal_signed_int64_boundary(
+    model: type[NativeRecoveryOrigin]
+    | type[LegacyNativeRecoveryOrigin]
+    | type[RecoveryReceiptBody],
+    fields: dict[str, str],
+    ordinal: int,
+) -> None:
+    """Every public receipt identity rejects ordinals SQLite cannot bind."""
+    payload = {**fields, "ordinal": ordinal}
+    if ordinal in (-1, 1 << 63):
+        with pytest.raises(ValidationError):
+            model.model_validate(payload)
+    else:
+        assert model.model_validate(payload).ordinal == ordinal
+        schema = model.model_json_schema()["properties"]["ordinal"]
+        assert schema.get("minimum") == 0
+        assert schema.get("maximum") == 9223372036854775807
 
 
 def test_event_request_valid():

@@ -202,20 +202,13 @@ class RecoveryReceiptBody(BaseModel):
     """Opaque admin-only identifier for one native recovery receipt."""
 
     source_handle: str
-    ordinal: int
+    ordinal: int = Field(ge=0, le=(1 << 63) - 1)
 
     @field_validator("source_handle")
     @classmethod
     def source_handle_must_be_sha256(cls, value: str) -> str:
         if not _HASH_RE.fullmatch(value):
             raise ValueError("source_handle must be lowercase SHA-256 hex")
-        return value
-
-    @field_validator("ordinal")
-    @classmethod
-    def ordinal_must_not_be_negative(cls, value: int) -> int:
-        if value < 0:
-            raise ValueError("ordinal must not be negative")
         return value
 
 

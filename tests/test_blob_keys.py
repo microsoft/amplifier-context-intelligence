@@ -328,6 +328,26 @@ def test_parse_address_accepts_the_exact_three_part_mapped_form() -> None:
     )
 
 
+@pytest.mark.parametrize("session", ["s" * 300, "é" * 150], ids=["ascii", "multibyte"])
+def test_parse_address_folds_long_mapped_session_without_changing_digest(
+    session: str,
+) -> None:
+    original_uri = f"ci-blob://{session}/{MARKER}/{DIGEST_A_SLASH_B}"
+    folded_session = fold_name(session, blob_keys.MAX_SESSION_BYTES)
+
+    addr = parse_address(original_uri)
+
+    assert addr.session == folded_session
+    assert len(addr.session.encode("utf-8")) <= 255
+    assert addr.mapped is True
+    assert addr.name == DIGEST_A_SLASH_B
+    assert addr.uri == f"ci-blob://{folded_session}/{MARKER}/{DIGEST_A_SLASH_B}"
+    assert addr == write_address(session, "a/b")
+    assert parse_address(addr.uri) == addr
+    assert read_candidates(original_uri) == (addr,)
+    assert blob_keys.exact_address(original_uri).session == session
+
+
 @pytest.mark.parametrize(
     "uri",
     [

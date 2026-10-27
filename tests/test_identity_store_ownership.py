@@ -24,12 +24,17 @@ import errno
 import fcntl
 import gc
 import hashlib
+import inspect
 import json
 import multiprocessing
 import os
 import stat
 import threading
+import time
+import warnings
 from collections.abc import AsyncGenerator
+from concurrent.futures import Future as ConcurrentFuture
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,6 +68,9 @@ STORE_NAMES = {"static": "api-keys.json", "entra": "entra-identities.json"}
 
 
 class _StubJWKS:
+    def get_signing_key_from_jwt(self, token: str) -> Any:
+        return SimpleNamespace(key="dummy")
+
     def fetch_data(self) -> None:
         pass
 
@@ -1152,9 +1160,9 @@ def _count_init_calls(monkeypatch: pytest.MonkeyPatch) -> list[int]:
     calls: list[int] = []
     real = main_module._start_identity_ownership
 
-    def counted(app: Any, s: Any) -> Any:
+    def counted(app: Any, s: Any, **kwargs: Any) -> Any:
         calls.append(1)
-        return real(app, s)
+        return real(app, s, **kwargs)
 
     monkeypatch.setattr(main_module, "_start_identity_ownership", counted)
     return calls
@@ -1193,23 +1201,929 @@ async def test_lifespan_yields_and_status_answers_while_identity_init_is_delayed
     release = threading.Event()
     real = main_module._start_identity_ownership
 
-    def delayed(app: Any, s: Any) -> Any:
+    def delayed(app: Any, s: Any, **kwargs: Any) -> Any:
         assert release.wait(timeout=5), "identity init was never released"
-        return real(app, s)
+        return real(app, s, **kwargs)
 
     monkeypatch.setattr(main_module, "_start_identity_ownership", delayed)
-    # The lifespan must yield WITHOUT awaiting identity initialization.
-    async with main_module.lifespan(main_module.app):
-        status = await _get_json(wrapper, "/status")
-        assert status["identity_ready"] is False
-        assert status["identity_reason"] == "initializing"
-        assert await _status(wrapper, "/whoami", TOKEN) == 503
+    try:
+        async with main_module.lifespan(main_module.app):
+            status = await _get_json(wrapper, "/status")
+            assert status["identity_ready"] is False
+            assert status["identity_reason"] == "initializing"
+            assert await _status(wrapper, "/whoami", TOKEN) == 503
+            release.set()
+            await main_module.app.state.identity_init_task
+            status = await _get_json(wrapper, "/status")
+            assert status["identity_ready"] is True
+            assert status["identity_reason"] is None
+            assert await _status(wrapper, "/whoami", TOKEN) == 200
+    finally:
         release.set()
-        await main_module.app.state.identity_init_task
-        status = await _get_json(wrapper, "/status")
-        assert status["identity_ready"] is True
-        assert status["identity_reason"] is None
-        assert await _status(wrapper, "/whoami", TOKEN) == 200
+
+
+# Unit I: each regression names a real await/lifetime boundary, not a mock gate.
+async def _until(predicate: Any, seconds: float = 1.0) -> None:
+    async with asyncio.timeout(seconds):
+        while not predicate():
+            await asyncio.sleep(0.001)
+
+
+def _refuse_identity_replacement(tmp_path: Path) -> None:
+    state = main_module.app.state
+    before = (
+        state.identity_config_token,
+        state.api_key_store,
+        state.identity_resolver,
+        state.identity_runtime,
+    )
+    with pytest.raises(RuntimeError, match="cannot replace identity wiring"):
+        _make_app(_settings(tmp_path / "other", "static", tmp_path / "other.json"))
+    after = (
+        state.identity_config_token,
+        state.api_key_store,
+        state.identity_resolver,
+        state.identity_runtime,
+    )
+    assert all(a is b for a, b in zip(before, after, strict=True))
+
+
+async def test_slow_runtime_ownership_probe_does_not_block_exempt_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _make_app(_settings(tmp_path / "state", "static", tmp_path / "keys.json"))
+    async with _serving():
+        loop_thread = threading.get_ident()
+        store = _store_for("static")
+        lock = store._lock
+        assert lock is not None
+        real = lock.assert_owned
+        threads: list[int] = []
+
+        def slow_assert() -> int:
+            threads.append(threading.get_ident())
+            time.sleep(0.08)  # finite even on the broken inline baseline
+            return real()
+
+        monkeypatch.setattr(lock, "assert_owned", slow_assert)
+        request = asyncio.create_task(_status(wrapper, "/whoami", TOKEN))
+        started = asyncio.get_running_loop().time()
+        try:
+            await asyncio.sleep(0.01)
+            assert await _status(wrapper, "/version") == 200
+            assert (await _get_json(wrapper, "/status"))["identity_ready"]
+            assert asyncio.get_running_loop().time() - started < 0.06
+            assert await request == 200
+            assert threads and all(t != loop_thread for t in threads)
+        finally:
+            await asyncio.gather(request, return_exceptions=True)
+
+
+@pytest.mark.parametrize("mode", ["static", "entra"])
+async def test_concurrent_protected_requests_each_verify_and_succeed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    monkeypatch.setattr(
+        "context_intelligence_server.auth.jwt.decode",
+        lambda *a, **k: {
+            "tid": TENANT_ID,
+            "oid": OID,
+            "scp": "access_as_user",
+            "roles": [],
+        },
+    )
+    wrapper = _make_app(_settings(tmp_path / "state", mode, tmp_path / "keys.json"))
+    async with _serving():
+        store = _store_for(mode)
+        real = store.healthy
+        threads: list[int] = []
+
+        def check() -> bool:
+            threads.append(threading.get_ident())
+            time.sleep(0.002)
+            return real()
+
+        monkeypatch.setattr(store, "healthy", check)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=wrapper), base_url="http://test"
+        ) as client:
+            tasks = [
+                asyncio.create_task(
+                    client.get(
+                        "/whoami",
+                        headers={"Authorization": f"Bearer {TOKEN}"},
+                    )
+                )
+                for _ in range(16)
+            ]
+            try:
+                responses = await asyncio.gather(*tasks)
+                assert [r.status_code for r in responses] == [200] * 16
+                assert [r.json() for r in responses] == [
+                    {"contributor_id": "writer"}
+                ] * 16
+                assert len(threads) == 16
+                assert threading.get_ident() not in threads
+            finally:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_runtime_probe_admission_and_executor_work_are_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _make_app(_settings(tmp_path / "state", "static", tmp_path / "keys.json"))
+    monkeypatch.setattr(
+        main_module, "_IDENTITY_PROBE_TIMEOUT_SECONDS", 2.5, raising=False
+    )
+    release = threading.Event()
+    tasks: list[asyncio.Task[Any]] = []
+    async with _serving():
+        store = _store_for("static")
+        real = store.healthy
+        calls: list[int] = []
+        loop_thread = threading.get_ident()
+
+        def check() -> bool:
+            calls.append(threading.get_ident())
+            if threading.get_ident() != loop_thread:  # baseline must not deadlock
+                assert release.wait(3)
+            return real()
+
+        monkeypatch.setattr(store, "healthy", check)
+        try:
+            tasks = [
+                asyncio.create_task(_status(wrapper, "/whoami", TOKEN))
+                for _ in range(36)
+            ]
+            await _until(lambda: len(calls) >= 4)
+            await asyncio.sleep(0.02)
+            assert len(calls) == 4, "more than four jobs submitted or inline probes"
+            runtime = main_module.app.state.identity_runtime
+            assert runtime.admitted == 36
+            assert (
+                await asyncio.wait_for(_status(wrapper, "/whoami", TOKEN), 0.3) == 503
+            )
+            assert len(calls) == 4
+            release.set()
+            assert await asyncio.gather(*tasks) == [200] * 36
+            assert len(calls) == 36
+            assert (
+                runtime.admitted == 0
+                and not runtime.probes
+                and runtime.drained.is_set()
+            )
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize("before_first_step", [False, True])
+async def test_direct_cancellation_of_init_observer_retains_real_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    before_first_step: bool,
+) -> None:
+    store_path = tmp_path / "keys.json"
+    wrapper = _make_app(_settings(tmp_path / "state", "static", store_path))
+    release, acquired, finished = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    real = main_module._initialize_identity_store
+    recorded: list[tuple[Any, Any]] = []
+
+    def initialize(app: Any, settings: Any, store: Any, **kwargs: Any) -> None:
+        recorded.append((store, store._lock))
+        acquired.set()
+        try:
+            assert release.wait(3)
+            real(app, settings, store, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(main_module, "_initialize_identity_store", initialize)
+    cm = (
+        main_module._identity_lifespan(main_module.app, main_module.app.state.settings)
+        if before_first_step
+        else main_module.lifespan(main_module.app)
+    )
+    shutdown = None
+    await cm.__aenter__()
+    observer = main_module.app.state.identity_init_task
+    try:
+        if not before_first_step:
+            await _until(acquired.is_set)
+            _refuse_identity_replacement(tmp_path)
+        observer.cancel()
+        observer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await observer
+        await _until(acquired.is_set)
+        shutdown = asyncio.create_task(cm.__aexit__(None, None, None))
+        await asyncio.sleep(0.02)
+        assert not shutdown.done(), "observer cancellation forgot the real initializer"
+        assert main_module.app.state.identity_lifespan_active
+        _refuse_identity_replacement(tmp_path)
+        assert lock_is_held(store_path.with_name("keys.json.lock"))
+        if not before_first_step:
+            assert lock_is_held(
+                tmp_path / "state" / ".context-intelligence-server.lock"
+            )
+        assert await _status(wrapper, "/whoami", TOKEN) == 503
+        assert await _status(wrapper, "/version") == 200
+        release.set()
+        await asyncio.wait_for(shutdown, 3)
+        # Product cleanup, BEFORE the emergency-repair finally (I-COV-1).
+        repair_needed = any(
+            lock is not None and lock.owned_by_this_process() for _, lock in recorded
+        )
+        assert not repair_needed
+        assert not lock_is_held(store_path.with_name("keys.json.lock"))
+        assert all(store.flat_dict == {} for store, _ in recorded)
+        assert not main_module.app.state.identity_lifespan_active
+        if not before_first_step:
+            assert not lock_is_held(
+                tmp_path / "state" / ".context-intelligence-server.lock"
+            )
+    finally:
+        release.set()
+        await _until(finished.is_set, 3)
+        if shutdown is None:
+            shutdown = asyncio.create_task(cm.__aexit__(None, None, None))
+        await asyncio.gather(shutdown, return_exceptions=True)
+        # Repair only a leaked baseline owner, after its actual thread finished.
+        for store, lock in recorded:
+            if lock is not None and lock.owned_by_this_process():
+                main_module._release_identity(store, lock)
+    assert not lock_is_held(store_path.with_name("keys.json.lock"))
+    assert _store_for("static").flat_dict == {}
+
+
+async def test_concurrent_ingest_is_not_rejected_for_identity_overlap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from context_intelligence_server.queue_manager import QueueManager
+
+    wrapper = _make_app(_settings(tmp_path / "state", "static", tmp_path / "keys.json"))
+    qm = QueueManager(queues_dir=tmp_path / "state" / "queues")
+    monkeypatch.setattr(main_module.registry, "_queue_manager", qm)
+    monkeypatch.setattr(main_module.registry, "start_drain", lambda worker: None)
+    async with _serving():
+        real = _store_for("static").healthy
+        calls: list[int] = []
+
+        def check() -> bool:
+            calls.append(threading.get_ident())
+            time.sleep(0.002)
+            return real()
+
+        monkeypatch.setattr(_store_for("static"), "healthy", check)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=wrapper), base_url="http://test"
+        ) as client:
+            tasks = [
+                asyncio.create_task(
+                    client.post(
+                        "/events",
+                        headers={"Authorization": f"Bearer {TOKEN}"},
+                        json={
+                            "event": "session:start",
+                            "workspace": "/identity-test",
+                            "data": {
+                                "session_id": f"identity-ingest-{i}",
+                                "timestamp": "2026-01-01T00:00:00Z",
+                            },
+                        },
+                    )
+                )
+                for i in range(16)
+            ]
+            try:
+                responses = await asyncio.gather(*tasks)
+                assert [r.status_code for r in responses] == [202] * 16
+                assert len(calls) == 16 and threading.get_ident() not in calls
+                for i in range(16):
+                    batch = await qm.read_batch(f"identity-ingest-{i}", max_items=2)
+                    assert len(batch.records) == 1
+                    assert json.loads(batch.records[0].raw)["created_by"] == "writer"
+            finally:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                main_module.registry._workers.clear()
+
+
+async def test_queued_probe_checks_ownership_after_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store_path = tmp_path / "keys.json"
+    wrapper = _make_app(_settings(tmp_path / "state", "static", store_path))
+    release = threading.Event()
+    tasks: list[asyncio.Task[Any]] = []
+    async with _serving():
+        store = _store_for("static")
+        real = store.healthy
+        checked: list[bool] = []
+
+        def check() -> bool:
+            result = real()
+            checked.append(result)
+            if len(checked) <= 4:
+                assert release.wait(3)  # deliberately OUTSIDE the real store mutex
+            return result
+
+        monkeypatch.setattr(store, "healthy", check)
+        try:
+            tasks = [
+                asyncio.create_task(_status(wrapper, "/whoami", TOKEN))
+                for _ in range(4)
+            ]
+            await _until(lambda: len(checked) == 4)
+            tasks.append(asyncio.create_task(_status(wrapper, "/whoami", TOKEN)))
+            await _until(lambda: main_module.app.state.identity_runtime.admitted == 5)
+            sidecar = store_path.with_name("keys.json.lock")
+            sidecar.unlink()
+            sidecar.write_bytes(b"")
+            release.set()
+            assert (await asyncio.gather(*tasks))[-1] == 503
+            assert len(checked) == 5 and checked[-1] is False
+            assert store.flat_dict == {}
+            # Cached status must not re-enter even a healthy() wrapper.
+            monkeypatch.setattr(store, "healthy", lambda: pytest.fail("status probed"))
+            assert not (await _get_json(wrapper, "/status"))["identity_ready"]
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_queue_timeout_and_cancel_do_not_submit_later(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _make_app(_settings(tmp_path / "state", "static", tmp_path / "keys.json"))
+    monkeypatch.setattr(main_module, "_IDENTITY_PROBE_TIMEOUT_SECONDS", 2.0)
+    release = threading.Event()
+    tasks: list[asyncio.Task[Any]] = []
+    async with _serving():
+        real = _store_for("static").healthy
+        calls: list[int] = []
+
+        def check() -> bool:
+            calls.append(1)
+            assert release.wait(3)
+            return real()
+
+        monkeypatch.setattr(_store_for("static"), "healthy", check)
+        try:
+            tasks = [
+                asyncio.create_task(_status(wrapper, "/whoami", TOKEN))
+                for _ in range(4)
+            ]
+            await _until(lambda: len(calls) == 4)
+            runtime = main_module.app.state.identity_runtime
+            monkeypatch.setattr(main_module, "_IDENTITY_PROBE_TIMEOUT_SECONDS", 0.05)
+            timed = asyncio.create_task(_status(wrapper, "/whoami", TOKEN))
+            cancelled = asyncio.create_task(_status(wrapper, "/whoami", TOKEN))
+            tasks.extend([timed, cancelled])
+            await _until(lambda: runtime.admitted == 6)
+            cancelled.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(cancelled, 0.2)
+            assert await asyncio.wait_for(timed, 0.3) == 503
+            assert runtime.admitted == 4 and len(calls) == 4
+            release.set()
+            assert await asyncio.gather(*tasks[:4]) == [200] * 4
+            assert runtime.admitted == 0 and len(calls) == 4
+            assert await _status(wrapper, "/whoami", TOKEN) == 200
+            assert len(calls) == 5
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_probe_cancel_at_slot_handoff_returns_capacity_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _make_app(_settings(tmp_path / "state", "static", tmp_path / "keys.json"))
+    async with _serving():
+        runtime = main_module.app.state.identity_runtime
+        target: list[asyncio.Task[Any]] = []
+
+        class HandoffSemaphore(asyncio.Semaphore):
+            def release(self) -> None:
+                super().release()
+                if target:
+                    target.pop().cancel()  # granted, but acquire hasn't resumed
+
+        slots = HandoffSemaphore(4)
+        runtime.slots = slots
+        for _ in range(4):
+            await slots.acquire()
+        task = asyncio.create_task(_status(wrapper, "/whoami", TOKEN))
+        try:
+            await _until(lambda: runtime.admitted == 1)
+            target.append(task)
+            slots.release()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert runtime.admitted == 0 and not runtime.probes
+            # Three held tokens plus the returned fourth: no under/over release.
+            for _ in range(3):
+                slots.release()
+            for _ in range(4):
+                await asyncio.wait_for(slots.acquire(), 0.2)
+            assert slots.locked()
+            for _ in range(4):
+                slots.release()
+            assert await _status(wrapper, "/whoami", TOKEN) == 200
+        finally:
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("outcome", ["healthy", "false", "error"])
+async def test_submitted_probe_timeout_and_cancel_retain_real_capacity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    wrapper = _make_app(_settings(tmp_path / "state", "static", tmp_path / "keys.json"))
+    monkeypatch.setattr(main_module, "_IDENTITY_PROBE_TIMEOUT_SECONDS", 0.05)
+    release = threading.Event()
+    tasks: list[asyncio.Task[Any]] = []
+    errors: list[Any] = []
+    loop = asyncio.get_running_loop()
+    old_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+    try:
+        async with _serving():
+            store = _store_for("static")
+            real = store.healthy
+            calls: list[int] = []
+
+            def check() -> bool:
+                calls.append(1)
+                assert release.wait(3)
+                if outcome == "error":
+                    raise RuntimeError("synthetic probe error")
+                return real() if outcome == "healthy" else False
+
+            monkeypatch.setattr(store, "healthy", check)
+            try:
+                tasks = [
+                    asyncio.create_task(_status(wrapper, "/whoami", TOKEN))
+                    for _ in range(4)
+                ]
+                await _until(lambda: len(calls) == 4)
+                tasks[0].cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(tasks[0], 0.2)
+                assert await asyncio.gather(*tasks[1:]) == [503] * 3
+                runtime = main_module.app.state.identity_runtime
+                assert len(runtime.probes) == runtime.admitted == 4
+                monkeypatch.setattr(main_module, "_IDENTITY_PROBE_TIMEOUT_SECONDS", 0.5)
+                later = [
+                    asyncio.create_task(_status(wrapper, "/whoami", TOKEN))
+                    for _ in range(32)
+                ]
+                tasks.extend(later)
+                await _until(lambda: runtime.admitted == 36)
+                assert len(calls) == 4
+                assert (
+                    await asyncio.wait_for(_status(wrapper, "/whoami", TOKEN), 0.2)
+                    == 503
+                )
+                assert runtime.admitted == 36 and len(calls) == 4
+                release.set()
+                assert (
+                    await asyncio.gather(*later)
+                    == [200 if outcome == "healthy" else 503] * 32
+                )
+                await _until(lambda: runtime.admitted == 0)
+                assert not runtime.probes
+                if outcome == "healthy":
+                    assert len(calls) == 36
+                else:
+                    assert not (await _get_json(wrapper, "/status"))["identity_ready"]
+                gc.collect()
+                await asyncio.sleep(0)
+                assert errors == []
+                assert TOKEN not in caplog.text and DIGEST not in caplog.text
+            finally:
+                release.set()
+                await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        loop.set_exception_handler(old_handler)
+
+
+@pytest.mark.parametrize(
+    "mode,uncertain", [("static", False), ("entra", False), ("static", True)]
+)
+async def test_revocation_during_awaited_probe_uses_live_map(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    uncertain: bool,
+) -> None:
+    monkeypatch.setattr(
+        "context_intelligence_server.auth.jwt.decode",
+        lambda *a, **k: {
+            "tid": TENANT_ID,
+            "oid": OID,
+            "scp": "access_as_user",
+            "roles": [],
+        },
+    )
+    wrapper = _make_app(_settings(tmp_path / "state", mode, tmp_path / "keys.json"))
+    release, checked = threading.Event(), threading.Event()
+    async with _serving():
+        store = _store_for(mode)
+        real = store.healthy
+
+        def check() -> bool:
+            result = real()
+            checked.set()
+            assert release.wait(3)
+            return result
+
+        monkeypatch.setattr(store, "healthy", check)
+        task = asyncio.create_task(_status(wrapper, "/whoami", TOKEN))
+        try:
+            await _until(checked.is_set)
+            if uncertain:
+                # Failure after replace, before directory fsync: committed file,
+                # untrustworthy cache. Exercise the real mutation's latch.
+                real_fsync = os.fsync
+
+                def fail_fsync(fd: int) -> None:
+                    if stat.S_ISDIR(os.fstat(fd).st_mode):
+                        raise OSError("synthetic uncertain commit")
+                    real_fsync(fd)
+
+                monkeypatch.setattr(os, "fsync", fail_fsync)
+                with pytest.raises(OSError):
+                    await asyncio.to_thread(store.delete, DIGEST)
+            else:
+                await asyncio.to_thread(
+                    store.delete, DIGEST if mode == "static" else OID
+                )
+            release.set()
+            assert await task == (
+                503 if uncertain else 401 if mode == "static" else 403
+            )
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("reenter", [False, True])
+@pytest.mark.parametrize("shortcut", ["data", "admin", "dev"])
+async def test_old_probe_cannot_authenticate_after_orderly_lifespan_reentry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reenter: bool,
+    shortcut: str,
+) -> None:
+    settings = _settings(
+        tmp_path / "state",
+        "static",
+        tmp_path / "keys.json",
+        seeded=shortcut != "dev",
+        admin=shortcut == "admin",
+    )
+    if shortcut == "dev":
+        (tmp_path / "keys.json").write_text("{}", encoding="utf-8")
+        settings = settings.model_copy(update={"allow_unauthenticated": True})
+    wrapper = _make_app(settings)
+    path = "/admin/keys" if shortcut == "admin" else "/whoami"
+    bearer = ADMIN_TOKEN if shortcut == "admin" else TOKEN
+    real_wait = asyncio.wait
+    parked, resume = asyncio.Event(), asyncio.Event()
+    target: list[asyncio.Task[Any]] = []
+
+    async def defer_wait(*args: Any, **kwargs: Any) -> Any:
+        result = await real_wait(*args, **kwargs)
+        if target and asyncio.current_task() is target[0]:
+            parked.set()
+            await resume.wait()
+        return result
+
+    monkeypatch.setattr(asyncio, "wait", defer_wait)
+    cm = _serving()
+    await cm.__aenter__()
+    old_runtime = main_module.app.state.identity_runtime
+    task = asyncio.create_task(_status(wrapper, path, bearer))
+    target.append(task)
+    try:
+        await asyncio.wait_for(parked.wait(), 0.5)
+        await _until(lambda: old_runtime.admitted == 0)
+        await cm.__aexit__(None, None, None)
+        if reenter:
+            cm = _serving()
+            await cm.__aenter__()
+            assert main_module.app.state.identity_runtime is not old_runtime
+            assert await _status(wrapper, path, bearer) == 200
+        resume.set()
+        assert await task == 503
+    finally:
+        resume.set()
+        await asyncio.gather(task, return_exceptions=True)
+        if main_module.app.state.identity_lifespan_active:
+            await cm.__aexit__(None, None, None)
+
+
+async def test_shutdown_waits_for_all_real_probes_and_queued_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated cancellation cannot skip probe drain or off-thread mutex stop."""
+    store_path = tmp_path / "keys.json"
+    root = tmp_path / "state"
+    wrapper = _make_app(_settings(root, "static", store_path))
+    monkeypatch.setattr(main_module, "_IDENTITY_PROBE_TIMEOUT_SECONDS", 2.0)
+    probe_release = threading.Event()
+    mutex_release = threading.Event()
+    mutex_entered = threading.Event()
+    stop_entered = threading.Event()
+    trace: list[str] = []
+    tasks: list[asyncio.Task[Any]] = []
+    holder = shutdown = None
+    cm = _serving()
+    await cm.__aenter__()
+    runtime = main_module.app.state.identity_runtime
+    store = runtime.store
+    real_check, real_stop = store.healthy, store.stop
+    real_identity_release = IdentityStoreLock.release
+    real_root_release = main_module.ServerInstanceLock.release
+    calls: list[int] = []
+    stop_threads: list[int] = []
+
+    def check() -> bool:
+        result = real_check()
+        calls.append(1)
+        assert probe_release.wait(3)
+        trace.append("probe-finished")
+        return result
+
+    def hold_mutex() -> None:
+        with store._op_lock:
+            mutex_entered.set()
+            assert mutex_release.wait(3)
+
+    def stop() -> None:
+        stop_threads.append(threading.get_ident())
+        trace.append("stop-start")
+        stop_entered.set()
+        real_stop()
+        trace.append("stop-finished")
+
+    def identity_release(lock: Any) -> None:
+        trace.append("identity-release")
+        real_identity_release(lock)
+
+    def root_release(lock: Any) -> None:
+        trace.append("root-release")
+        real_root_release(lock)
+
+    monkeypatch.setattr(store, "healthy", check)
+    monkeypatch.setattr(store, "stop", stop)
+    monkeypatch.setattr(IdentityStoreLock, "release", identity_release)
+    monkeypatch.setattr(main_module.ServerInstanceLock, "release", root_release)
+    try:
+        tasks = [
+            asyncio.create_task(_status(wrapper, "/whoami", TOKEN)) for _ in range(4)
+        ]
+        await _until(lambda: len(calls) == 4)
+        _refuse_identity_replacement(tmp_path)  # active probes
+        tasks.extend(
+            asyncio.create_task(_status(wrapper, "/whoami", TOKEN)) for _ in range(8)
+        )
+        await _until(lambda: runtime.admitted == 12)
+        holder = asyncio.create_task(asyncio.to_thread(hold_mutex))
+        await _until(mutex_entered.is_set)
+        shutdown = asyncio.create_task(cm.__aexit__(None, None, None))
+        await _until(lambda: runtime.closing)
+        for _ in range(3):
+            shutdown.cancel()
+            await asyncio.sleep(0)
+            assert not shutdown.done()
+            assert main_module.app.state.identity_lifespan_active
+            assert lock_is_held(root / ".context-intelligence-server.lock")
+            assert lock_is_held(store_path.with_name("keys.json.lock"))
+        assert trace == [] and len(calls) == 4
+        probe_release.set()
+        await _until(stop_entered.is_set)
+        assert trace[:4] == ["probe-finished"] * 4
+        assert trace[4:] == ["stop-start"]
+        assert runtime.admitted == 0 and not runtime.probes
+        _refuse_identity_replacement(tmp_path)  # cleanup is still outstanding
+        for _ in range(3):
+            shutdown.cancel()
+            await asyncio.sleep(0)
+            assert not shutdown.done()
+        started = asyncio.get_running_loop().time()
+        await asyncio.sleep(0.01)
+        assert await asyncio.wait_for(_status(wrapper, "/version"), 0.3) == 200
+        assert not (await asyncio.wait_for(_get_json(wrapper, "/status"), 0.3))[
+            "identity_ready"
+        ]
+        assert asyncio.get_running_loop().time() - started < 0.5
+        assert stop_threads == [stop_threads[0]]
+        assert stop_threads[0] != threading.get_ident()
+        assert lock_is_held(store_path.with_name("keys.json.lock"))
+        assert lock_is_held(root / ".context-intelligence-server.lock")
+        assert await asyncio.gather(*tasks) == [503] * 12
+        mutex_release.set()
+        await holder
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(shutdown, 1)
+        assert trace == ["probe-finished"] * 4 + [
+            "stop-start",
+            "stop-finished",
+            "identity-release",
+            "root-release",
+        ]
+        assert not main_module.app.state.identity_lifespan_active
+        assert not lock_is_held(store_path.with_name("keys.json.lock"))
+        assert not lock_is_held(root / ".context-intelligence-server.lock")
+        assert store.flat_dict == {}
+        fresh = _make_app(_settings(root, "static", store_path))  # now LEGAL
+        async with _serving():
+            assert await _status(wrapper, "/whoami", TOKEN) == 503
+            assert await _status(fresh, "/whoami", TOKEN) == 200
+            # Completed old-context publication cannot poison the new generation.
+            main_module._set_identity_state(
+                main_module.app, "unavailable", runtime=runtime
+            )
+            main_module._set_identity_state(main_module.app, "ready", runtime=runtime)
+            assert await _status(fresh, "/whoami", TOKEN) == 200
+    finally:
+        probe_release.set()
+        mutex_release.set()
+        if holder is not None:
+            await asyncio.gather(holder, return_exceptions=True)
+        if shutdown is None:
+            shutdown = asyncio.create_task(cm.__aexit__(None, None, None))
+        await asyncio.gather(shutdown, *tasks, return_exceptions=True)
+
+
+async def test_init_exception_after_observer_cancel_is_observed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    wrapper = _make_app(_settings(tmp_path / "state", "static", tmp_path / "keys.json"))
+    entered, release = threading.Event(), threading.Event()
+    errors: list[Any] = []
+    loop = asyncio.get_running_loop()
+    old_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+
+    def broken(app: Any, s: Any, store: Any, **kwargs: Any) -> None:
+        entered.set()
+        assert release.wait(3)
+        raise RuntimeError("synthetic init programming error")
+
+    monkeypatch.setattr(main_module, "_initialize_identity_store", broken)
+    try:
+        async with main_module.lifespan(main_module.app):
+            await _until(entered.is_set)
+            observer = main_module.app.state.identity_init_task
+            observer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await observer
+            release.set()
+            await _until(lambda: main_module.app.state.identity_runtime.init_io.done())
+            assert await _status(wrapper, "/whoami", TOKEN) == 503
+        gc.collect()
+        await asyncio.sleep(0)
+        assert not errors
+        assert caplog.text.count("identity initialization failed unexpectedly") == 1
+    finally:
+        release.set()
+        loop.set_exception_handler(old_handler)
+
+
+async def test_identity_init_submission_failure_clears_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _make_app(_settings(tmp_path / "state", "static", tmp_path / "keys.json"))
+    loop = asyncio.get_running_loop()
+    real = loop.run_in_executor
+    submitted: list[Any] = []
+
+    def submit(executor: Any, func: Any, *args: Any) -> Any:
+        submitted.append(func)
+        if len(submitted) == 1:
+            raise RuntimeError("synthetic executor submission error")
+        return real(executor, func, *args)
+
+    monkeypatch.setattr(loop, "run_in_executor", submit)
+    with pytest.raises(RuntimeError, match="synthetic executor submission"):
+        async with main_module._identity_lifespan(
+            main_module.app, main_module.app.state.settings
+        ):
+            pytest.fail("failed submission must not yield")
+    assert not main_module.app.state.identity_lifespan_active
+    assert main_module.app.state.identity_state == "unavailable"
+    assert not _store_for("static").flat_dict
+
+
+async def test_probe_deadline_includes_queue_and_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _make_app(_settings(tmp_path / "state", "static", tmp_path / "keys.json"))
+    release_first, release_later = threading.Event(), threading.Event()
+    calls: list[int] = []
+    tasks: list[asyncio.Task[Any]] = []
+    monkeypatch.setattr(main_module, "_IDENTITY_PROBE_TIMEOUT_SECONDS", 2.0)
+    async with _serving():
+        store = _store_for("static")
+        real = store.healthy
+
+        def check() -> bool:
+            calls.append(1)
+            barrier = release_first if len(calls) <= 4 else release_later
+            assert barrier.wait(3)
+            return real()
+
+        monkeypatch.setattr(store, "healthy", check)
+        try:
+            tasks = [
+                asyncio.create_task(_status(wrapper, "/whoami", TOKEN))
+                for _ in range(4)
+            ]
+            await _until(lambda: len(calls) == 4)
+            monkeypatch.setattr(main_module, "_IDENTITY_PROBE_TIMEOUT_SECONDS", 0.2)
+            started = asyncio.get_running_loop().time()
+            later = asyncio.create_task(_status(wrapper, "/whoami", TOKEN))
+            tasks.append(later)
+            await _until(lambda: main_module.app.state.identity_runtime.admitted == 5)
+            await asyncio.sleep(0.13)  # most of the single budget is spent queued
+            release_first.set()
+            await _until(lambda: len(calls) == 5)
+            assert await asyncio.wait_for(later, 0.14) == 503
+            assert asyncio.get_running_loop().time() - started < 0.3
+            assert main_module.app.state.identity_runtime.admitted == 1
+            release_later.set()
+            await _until(lambda: main_module.app.state.identity_runtime.admitted == 0)
+        finally:
+            release_first.set()
+            release_later.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_probe_and_mutation_share_operation_mutex_but_status_never_waits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _make_app(_settings(tmp_path / "state", "static", tmp_path / "keys.json"))
+    entered, release = threading.Event(), threading.Event()
+    checked = threading.Event()
+    async with _serving():
+        store = _store_for("static")
+        assert store._lock is not None
+        real = store._lock.assert_owned
+
+        def assert_owned() -> int:
+            checked.set()
+            return real()
+
+        def mutation() -> None:
+            with store._op_lock:
+                entered.set()
+                assert release.wait(3)
+                store.delete(DIGEST)
+
+        monkeypatch.setattr(store._lock, "assert_owned", assert_owned)
+        holder = asyncio.create_task(asyncio.to_thread(mutation))
+        task = None
+        try:
+            await _until(entered.is_set)
+            task = asyncio.create_task(_status(wrapper, "/whoami", TOKEN))
+            await _until(
+                lambda: len(main_module.app.state.identity_runtime.probes) == 1
+            )
+            assert not checked.is_set()
+            assert (await _get_json(wrapper, "/status"))["identity_ready"]
+            assert not task.done()
+            release.set()
+            await holder
+            assert await task == 401
+            assert checked.is_set()
+        finally:
+            release.set()
+            await asyncio.gather(
+                holder, *([task] if task is not None else []), return_exceptions=True
+            )
 
 
 @pytest.mark.asyncio
@@ -1706,3 +2620,927 @@ async def test_existing_credentials_outside_the_queue_root_survive_a_different_s
         else settings.entra_identities_store_path
     )
     assert configured == str(store)  # never relocated
+
+
+# Dispatch repair: each sync test owns an isolated loop and a real CPython
+# executor. asyncio.run settles that test executor after all barriers release.
+def _submit_test_loop(
+    executors: list[ThreadPoolExecutor] | None = None,
+) -> asyncio.AbstractEventLoop:
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(
+        max_workers=8,
+        thread_name_prefix="ci-identity-submit",
+    )
+    if executors is not None:
+        executors.append(executor)
+    loop.set_default_executor(executor)
+    return loop
+
+
+def _identity_submission_kind(func: Any) -> str | None:
+    target = getattr(func, "func", func)
+    if getattr(target, "__name__", "") == "_run_identity_call":
+        return _identity_submission_kind(func.args[1])
+    name = getattr(target, "__name__", "")
+    if name == "_start_identity_ownership":
+        return "init"
+    if name == "_stop_identity_ownership":
+        return "cleanup"
+    if name in {"healthy", "check"}:
+        return "probe"
+    return None
+
+
+async def _executor_holder(
+    loop: asyncio.AbstractEventLoop,
+) -> tuple[Any, threading.Event]:
+    entered, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        entered.set()
+        assert release.wait(3), "test executor holder was not released"
+
+    future = loop.run_in_executor(None, hold)
+    await _until(entered.is_set)
+    return future, release
+
+
+async def _repair_test_owner() -> None:
+    """Failure hygiene only; acceptance assertions must precede this helper."""
+    store = _store_for("static")
+    if store._lock is not None:
+        await asyncio.to_thread(main_module._release_identity, store, store._lock)
+    root = getattr(main_module.app.state, "server_instance_lock", None)
+    if root is not None:
+        root.release()
+    main_module.app.state.identity_lifespan_active = False
+
+
+def test_identity_init_thread_start_failure_after_enqueue_has_no_late_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        loop = _submit_test_loop()
+        root, path = tmp_path / "state", tmp_path / "keys.json"
+        _make_app(_settings(root, "static", path))
+        real_start = threading.Thread.start
+        real_init = main_module._start_identity_ownership
+        actions: list[int] = []
+        failed: list[str] = []
+
+        def counted(*args: Any, **kwargs: Any) -> Any:
+            actions.append(1)
+            return real_init(*args, **kwargs)
+
+        def start(thread: threading.Thread) -> None:
+            if thread.name.startswith("ci-identity-submit") and not failed:
+                failed.append(thread.name)  # submit already queued the wrapper
+                raise RuntimeError("synthetic queued init start failure")
+            real_start(thread)
+
+        monkeypatch.setattr(main_module, "_start_identity_ownership", counted)
+        try:
+            with monkeypatch.context() as scoped:
+                scoped.setattr(threading.Thread, "start", start)
+                with pytest.raises(
+                    RuntimeError, match="synthetic queued init start failure"
+                ):
+                    async with main_module.lifespan(main_module.app):
+                        pytest.fail("failed dispatch must not yield serving context")
+            # A real later worker retires the queued old wrapper.
+            await asyncio.wait({loop.run_in_executor(None, lambda: None)})
+            assert actions == [], "aborted initializer ran later without an owner"
+            runtime = main_module.app.state.identity_runtime
+            assert runtime.init_io is not None and runtime.init_io.cancelled()
+            assert runtime.cleanup_complete
+            assert not main_module.app.state.identity_lifespan_active
+            assert runtime.store.flat_dict == {} and runtime.store._lock is None
+            assert not path.with_name("keys.json.lock").exists()
+            assert not lock_is_held(root / ".context-intelligence-server.lock")
+        finally:
+            await _repair_test_owner()
+
+    asyncio.run(run())
+
+
+def test_repeated_runtime_submit_failures_do_not_queue_untracked_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        loop = _submit_test_loop()
+        wrapper = _make_app(
+            _settings(tmp_path / "state", "static", tmp_path / "keys.json")
+        )
+        async with _serving():
+            runtime = main_module.app.state.identity_runtime
+            real = runtime.store.healthy
+            calls: list[int] = []
+            starts: list[str] = []
+            real_start = threading.Thread.start
+
+            def check() -> bool:
+                calls.append(1)
+                return real()
+
+            def fail(thread: threading.Thread) -> None:
+                if thread.name.startswith("ci-identity-submit"):
+                    starts.append(thread.name)
+                    raise RuntimeError("synthetic runtime queued start failure")
+                real_start(thread)
+
+            monkeypatch.setattr(runtime.store, "healthy", check)
+            holder, release = await _executor_holder(loop)
+            try:
+                with monkeypatch.context() as scoped:
+                    scoped.setattr(threading.Thread, "start", fail)
+                    assert [
+                        await _status(wrapper, "/whoami", TOKEN) for _ in range(6)
+                    ] == [503] * 6
+                    assert len(starts) == 1, (
+                        "failed lifetime kept producing queued wrappers"
+                    )
+                    assert runtime.closing and calls == []
+                release.set()
+                await asyncio.wait({holder})
+                await asyncio.wait({loop.run_in_executor(None, lambda: None)})
+                await _until(lambda: runtime.admitted == 0)
+                assert not runtime.probes and calls == []
+            finally:
+                release.set()
+                await asyncio.wait({holder})
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "phase,late_error",
+    [
+        pytest.param(phase, error, id=f"{error}-{phase}")
+        for error in (False, True)
+        for phase in ("init", "probe", "cleanup")
+    ]
+    + [pytest.param("probe", "false", id="False-result-probe")],
+)
+def test_identity_dispatch_error_after_claim_retains_real_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    late_error: bool | str,
+) -> None:
+    """Actual Thread.start starts a worker/action, then reports failure."""
+    executors: list[ThreadPoolExecutor] = []
+
+    async def run() -> None:
+        loop = _submit_test_loop(executors)
+        root, path = tmp_path / "state", tmp_path / "keys.json"
+        wrapper = _make_app(_settings(root, "static", path))
+        entered, release = threading.Event(), threading.Event()
+        real_init = main_module._initialize_identity_store
+        store = _store_for("static")
+        real_check, real_stop = store.healthy, store.stop
+        actions: list[int] = []
+        stop_threads: list[int] = []
+        errors: list[Any] = []
+        loop.set_exception_handler(lambda _loop, context: errors.append(context))
+
+        def parked() -> None:
+            actions.append(1)
+            entered.set()
+            assert release.wait(3)
+            if late_error is True:
+                raise RuntimeError("synthetic claimed action error")
+
+        def initialize(*args: Any, **kwargs: Any) -> Any:
+            parked()  # _initialize is called AFTER real lock acquisition
+            return real_init(*args, **kwargs)
+
+        def check() -> bool:
+            parked()
+            result = real_check()
+            return False if late_error == "false" else result
+
+        def stop() -> None:
+            stop_threads.append(threading.get_ident())
+            if phase == "cleanup":
+                parked()
+            real_stop()
+
+        monkeypatch.setattr(store, "stop", stop)
+        if phase == "init":
+            monkeypatch.setattr(main_module, "_initialize_identity_store", initialize)
+        if phase == "probe":
+            monkeypatch.setattr(store, "healthy", check)
+        cm = main_module.lifespan(main_module.app)
+        task = holder = None
+        holder_release = threading.Event()
+        real_start = threading.Thread.start
+        faults: list[str] = []
+        real_submit = loop.run_in_executor
+        armed = False
+
+        def submit(executor: Any, func: Any, *args: Any) -> Any:
+            nonlocal armed
+            identity = executor is None and _identity_submission_kind(func) == phase
+            if identity and not faults:
+                # A fresh actual DEFAULT executor removes idle-worker timing
+                # from this Thread.start fault seam, without private internals.
+                _submit_test_loop(executors)
+            armed = identity
+            try:
+                return real_submit(executor, func, *args)
+            finally:
+                armed = False
+
+        def start(thread: threading.Thread) -> None:
+            if armed and thread.name.startswith("ci-identity-submit") and not faults:
+                faults.append(thread.name)
+                real_start(thread)
+                assert entered.wait(3), "new worker did not claim the action"
+                raise RuntimeError("synthetic after-claim dispatch failure")
+            real_start(thread)
+
+        try:
+            if phase != "init":
+                await cm.__aenter__()
+                await main_module.app.state.identity_init_task
+                holder, holder_release = await _executor_holder(loop)
+            with monkeypatch.context() as scoped:
+                scoped.setattr(threading.Thread, "start", start)
+                scoped.setattr(loop, "run_in_executor", submit)
+                if phase == "init":
+                    task = asyncio.create_task(cm.__aenter__())
+                elif phase == "probe":
+                    task = asyncio.create_task(_status(wrapper, "/whoami", TOKEN))
+                else:
+                    task = asyncio.create_task(cm.__aexit__(None, None, None))
+                await _until(entered.is_set)
+                runtime = main_module.app.state.identity_runtime
+                assert len(faults) == 1, "the real Thread.start fault was not exercised"
+                assert runtime.closing, "ambiguous dispatch did not close this lifetime"
+                assert main_module.app.state.identity_lifespan_active
+                assert lock_is_held(root / ".context-intelligence-server.lock")
+                assert lock_is_held(path.with_name("keys.json.lock"))
+                _refuse_identity_replacement(tmp_path)
+                assert await _status(wrapper, "/version") == 200
+                assert await _status(wrapper, "/whoami", TOKEN) == 503
+                if phase == "probe":
+                    assert await task == 503
+                    assert len(runtime.probes) == runtime.admitted == 1
+                    assert not next(iter(runtime.probes)).done()
+                else:
+                    if phase == "init":
+                        assert (
+                            runtime.init_io is not None and not runtime.init_io.done()
+                        )
+                        assert runtime.init_call.completion.running()
+                    else:
+                        assert len(runtime.cleanup_calls) == 1
+                        assert runtime.cleanup_calls[0].completion.running()
+                    for _ in range(3):
+                        task.cancel()
+                        await asyncio.sleep(0)
+                        assert not task.done()
+                release.set()
+                if phase == "probe":
+                    await _until(lambda: runtime.admitted == 0)
+                    assert not runtime.probes
+                    await cm.__aexit__(None, None, None)
+                else:
+                    result = await asyncio.gather(task, return_exceptions=True)
+                    assert isinstance(result[0], (RuntimeError, asyncio.CancelledError))
+                if phase == "cleanup" and late_error:
+                    assert not runtime.cleanup_complete
+                    assert main_module.app.state.identity_lifespan_active
+                    assert lock_is_held(root / ".context-intelligence-server.lock")
+                    assert lock_is_held(path.with_name("keys.json.lock"))
+                    assert (
+                        len(runtime.cleanup_calls) == 1
+                    )  # no retry of a started error
+                else:
+                    assert not main_module.app.state.identity_lifespan_active
+                    assert not lock_is_held(root / ".context-intelligence-server.lock")
+                    assert not lock_is_held(path.with_name("keys.json.lock"))
+                    assert store.flat_dict == {}
+                assert actions == [1]
+                assert stop_threads and threading.get_ident() not in stop_threads
+                assert len(stop_threads) == 1
+                gc.collect()
+                await asyncio.sleep(0)
+                assert errors == []
+            if not (phase == "cleanup" and late_error):
+                monkeypatch.setattr(store, "healthy", real_check)
+                monkeypatch.setattr(store, "stop", real_stop)
+                monkeypatch.setattr(
+                    main_module, "_initialize_identity_store", real_init
+                )
+                async with _serving():
+                    assert main_module.app.state.identity_runtime is not runtime
+                    assert await _status(wrapper, "/whoami", TOKEN) == 200
+        finally:
+            release.set()
+            holder_release.set()
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
+            if holder is not None:
+                await asyncio.wait({holder})
+            monkeypatch.setattr(store, "stop", real_stop)
+            if main_module.app.state.identity_lifespan_active:
+                # Explicit repair of expected retained-failure or broken baseline.
+                await _repair_test_owner()
+            elif store._lock is not None:
+                await _repair_test_owner()
+
+    try:
+        asyncio.run(run())
+    finally:
+        for executor in executors:
+            executor.shutdown(wait=True)  # outside every asyncio loop
+
+
+@pytest.mark.parametrize("fallback", ["normal", "after-claim", "abort", "construct"])
+@pytest.mark.parametrize("preenqueue", [False, True])
+def test_cleanup_prestart_abort_uses_one_guarded_thread_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fallback: str,
+    preenqueue: bool,
+) -> None:
+    executors: list[ThreadPoolExecutor] = []
+
+    async def run() -> None:
+        loop = _submit_test_loop(executors)
+        root, path = tmp_path / "state", tmp_path / "keys.json"
+        wrapper = _make_app(_settings(root, "static", path))
+        cm = _serving()
+        await cm.__aenter__()
+        runtime = main_module.app.state.identity_runtime
+        store = runtime.store
+        real_stop, real_start = store.stop, threading.Thread.start
+        entered, release = threading.Event(), threading.Event()
+        stops: list[int] = []
+        launched: list[Any] = []
+        trace: list[str] = []
+        real_submit = loop.run_in_executor
+        armed = False
+        fault_injected = False
+        fault_executor: ThreadPoolExecutor | None = None
+        real_root_release = main_module.ServerInstanceLock.release
+        real_lock_release = IdentityStoreLock.release
+
+        def stop() -> None:
+            stops.append(threading.get_ident())
+            entered.set()
+            assert release.wait(3)
+            real_stop()
+            trace.append("stop")
+
+        def root_release(lock: Any) -> None:
+            assert all(not thread.is_alive() for thread in launched)
+            trace.append("root")
+            real_root_release(lock)
+
+        def identity_release(lock: Any) -> None:
+            trace.append("identity")
+            real_lock_release(lock)
+
+        def start(thread: threading.Thread) -> None:
+            if armed and thread.name.startswith("ci-identity-submit"):
+                raise RuntimeError("synthetic cleanup default start failure")
+            if thread.name == "ci-identity-cleanup":
+                launched.append(thread)
+                if fallback == "abort":
+                    raise RuntimeError("synthetic fallback before claim")
+                real_start(thread)
+                if fallback == "after-claim":
+                    assert entered.wait(3)
+                    raise RuntimeError("synthetic fallback after claim")
+                return
+            real_start(thread)
+
+        def submit(executor: Any, func: Any, *args: Any) -> Any:
+            nonlocal armed, fault_injected, fault_executor
+            identity = executor is None and _identity_submission_kind(func) == "cleanup"
+            if identity and not fault_injected:
+                _submit_test_loop(executors)
+                fault_executor = executors[-1]
+                fault_injected = True
+            armed = identity
+            try:
+                if armed and preenqueue:
+                    raise RuntimeError("synthetic cleanup preenqueue rejection")
+                return real_submit(executor, func, *args)
+            finally:
+                armed = False
+
+        monkeypatch.setattr(store, "stop", stop)
+        monkeypatch.setattr(main_module.ServerInstanceLock, "release", root_release)
+        monkeypatch.setattr(IdentityStoreLock, "release", identity_release)
+        holder, holder_release = await _executor_holder(loop)
+        task = None
+        try:
+            with monkeypatch.context() as scoped:
+                scoped.setattr(threading.Thread, "start", start)
+                scoped.setattr(loop, "run_in_executor", submit)
+                if fallback == "construct":
+                    real_thread = threading.Thread
+
+                    def cannot_construct(*args: Any, **kwargs: Any) -> Any:
+                        if kwargs.get("name") == "ci-identity-cleanup":
+                            raise RuntimeError(
+                                "synthetic fallback construction failure"
+                            )
+                        return real_thread(*args, **kwargs)
+
+                    scoped.setattr(main_module.threading, "Thread", cannot_construct)
+                task = asyncio.create_task(cm.__aexit__(None, None, None))
+                if fallback in {"abort", "construct"}:
+                    result = await asyncio.gather(task, return_exceptions=True)
+                    assert isinstance(result[0], RuntimeError)
+                    assert main_module.app.state.identity_lifespan_active
+                    assert not runtime.cleanup_complete
+                    assert len(runtime.cleanup_calls) == 2
+                    assert all(c.completion.cancelled() for c in runtime.cleanup_calls)
+                    assert store.flat_dict == {DIGEST: "writer"} and stops == []
+                    assert trace == []
+                    assert lock_is_held(path.with_name("keys.json.lock"))
+                    assert lock_is_held(root / ".context-intelligence-server.lock")
+                    assert await _status(wrapper, "/whoami", TOKEN) == 503
+                    _refuse_identity_replacement(tmp_path)
+                else:
+                    await _until(entered.is_set)
+                    assert main_module.app.state.identity_lifespan_active
+                    assert lock_is_held(path.with_name("keys.json.lock"))
+                    assert lock_is_held(root / ".context-intelligence-server.lock")
+                    assert len(runtime.cleanup_calls) == 2
+                    assert runtime.cleanup_calls[0].completion.cancelled()
+                    assert runtime.cleanup_calls[1].completion.running()
+                    for _ in range(3):
+                        task.cancel()
+                        await asyncio.sleep(0)
+                        assert not task.done()
+                    release.set()
+                    result = await asyncio.gather(task, return_exceptions=True)
+                    assert isinstance(result[0], (RuntimeError, asyncio.CancelledError))
+                    assert runtime.cleanup_complete
+                    assert not main_module.app.state.identity_lifespan_active
+                    assert len(stops) == 1 and threading.get_ident() not in stops
+                    assert trace == ["stop", "identity", "root"]
+                    assert store.flat_dict == {} and not store._lock
+            # Keep the aborted wrapper's queue dormant until the SAME store
+            # owns a legal new lifetime on a different default executor.
+            holder_release.set()
+            await asyncio.wait({holder})
+            if fallback in {"normal", "after-claim"}:
+                assert len(stops) == 1
+                monkeypatch.setattr(store, "stop", real_stop)
+                _submit_test_loop(executors)
+                async with _serving():
+                    assert await _status(wrapper, "/whoami", TOKEN) == 200
+                    assert fault_executor is not None
+                    await asyncio.wait(
+                        {loop.run_in_executor(fault_executor, lambda: None)}
+                    )
+                    assert len(stops) == 1
+                    assert store.flat_dict == {DIGEST: "writer"}
+                    assert await _status(wrapper, "/whoami", TOKEN) == 200
+            else:
+                assert fault_executor is not None
+                await asyncio.wait({loop.run_in_executor(fault_executor, lambda: None)})
+        finally:
+            release.set()
+            holder_release.set()
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
+            await asyncio.wait({holder})
+            # Remove stop barrier before explicit retained-resource repair.
+            monkeypatch.setattr(store, "stop", real_stop)
+            monkeypatch.setattr(
+                main_module.ServerInstanceLock, "release", real_root_release
+            )
+            monkeypatch.setattr(IdentityStoreLock, "release", real_lock_release)
+            await _repair_test_owner()
+
+    try:
+        asyncio.run(run())
+    finally:
+        for executor in executors:
+            executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("state", ["aborted", "running", "completed"])
+def test_identity_dispatch_claim_or_abort_is_atomic(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    async def run() -> None:
+        _submit_test_loop()
+        new_call = getattr(main_module, "_new_identity_call", None)
+        run_call = getattr(main_module, "_run_identity_call", None)
+        dispatch = getattr(main_module, "_dispatch_identity_call", None)
+        assert callable(new_call) and callable(run_call) and callable(dispatch)
+        loop = asyncio.get_running_loop()
+        completion: ConcurrentFuture[int] = ConcurrentFuture()
+        call: Any = new_call(loop, completion)
+        entered, release = threading.Event(), threading.Event()
+        actions: list[int] = []
+        thread = None
+
+        def action() -> int:
+            actions.append(1)
+            entered.set()
+            assert release.wait(3)
+            return 42
+
+        def ambiguous_submit(executor: Any, func: Any, *args: Any) -> Any:
+            nonlocal thread
+            if state != "aborted":
+                thread = threading.Thread(
+                    target=func, args=args, name="ci-claim-control"
+                )
+                thread.start()
+                assert entered.wait(3)
+                if state == "completed":
+                    release.set()
+                    thread.join(3)  # test seam only, completion has no loop dependency
+                    assert not thread.is_alive()
+            raise RuntimeError("synthetic ambiguous dispatch")
+
+        try:
+            with monkeypatch.context() as scoped:
+                scoped.setattr(loop, "run_in_executor", ambiguous_submit)
+                dispatch(call, action)
+            assert isinstance(call.dispatch_error, RuntimeError)
+            if state == "aborted":
+                assert completion.cancelled()
+                run_call(completion, action)  # late executor wrapper must be inert
+                assert actions == []
+            else:
+                assert not completion.cancelled()
+                if state == "running":
+                    assert completion.running() and not completion.done()
+                release.set()
+            await asyncio.wait({call.io})
+            if state != "aborted":
+                assert completion.result() == call.io.result() == 42
+                assert actions == [1]
+        finally:
+            release.set()
+            if thread is not None:
+                owned_thread = thread
+                await _until(lambda: not owned_thread.is_alive(), 3)
+                thread.join(0)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("timing", ["during-init", "ready-same-turn"])
+async def test_cancelled_init_observer_late_success_stays_unavailable_without_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    timing: str,
+) -> None:
+    wrapper = _make_app(
+        _settings(
+            tmp_path / "state",
+            "static",
+            tmp_path / "keys.json",
+            admin=True,
+        )
+    )
+    entered, release = threading.Event(), threading.Event()
+    hold_observer = asyncio.Event()
+    real_init, real_observer = (
+        main_module._initialize_identity_store,
+        main_module._observe_identity_init,
+    )
+    calls: list[int] = []
+
+    def initialize(*args: Any, **kwargs: Any) -> None:
+        calls.append(1)
+        entered.set()
+        assert release.wait(3)
+        real_init(*args, **kwargs)
+
+    async def observer(*args: Any, **kwargs: Any) -> Any:
+        result = await real_observer(*args, **kwargs)
+        await hold_observer.wait()
+        return result
+
+    monkeypatch.setattr(main_module, "_initialize_identity_store", initialize)
+    monkeypatch.setattr(main_module, "_observe_identity_init", observer)
+    try:
+        async with main_module.lifespan(main_module.app):
+            await _until(entered.is_set)
+            runtime = main_module.app.state.identity_runtime
+            task = main_module.app.state.identity_init_task
+            if timing == "ready-same-turn":
+                release.set()
+                await asyncio.wait({runtime.init_io})
+                assert main_module._identity_runtime_ready(main_module.app, runtime)
+                assert main_module.app.state.identity_state == "ready"
+                assert not task.done()
+            task.cancel()
+            # No intervening await/callback: cancelling()>0 must deny readiness.
+            assert not main_module._identity_runtime_ready(main_module.app, runtime)
+            assert runtime.closing
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            release.set()
+            await asyncio.wait({runtime.init_io})
+            owned = runtime.init_io.result()
+            assert owned is not None and owned[0].flat_dict == {DIGEST: "writer"}
+            assert owned[1] is not None and owned[1].owned_by_this_process()
+            assert main_module.app.state.identity_lifespan_active
+            assert main_module.app.state.identity_state == "unavailable"
+            assert main_module.app.state.identity_ready_token is None
+            assert not (await _get_json(wrapper, "/status"))["identity_ready"]
+            assert await _status(wrapper, "/version") == 200
+            assert await _status(wrapper, "/whoami", TOKEN) == 503
+            assert await _status(wrapper, "/admin/keys", ADMIN_TOKEN) == 503
+            await asyncio.sleep(0.02)
+            assert calls == [1]
+        assert owned[0].flat_dict == {}
+        assert not owned[1].owned_by_this_process()
+        old_runtime = runtime
+        hold_observer.set()
+        async with _serving():
+            assert main_module.app.state.identity_runtime is not old_runtime
+            assert await _status(wrapper, "/whoami", TOKEN) == 200
+            assert await _status(wrapper, "/admin/keys", ADMIN_TOKEN) == 200
+    finally:
+        release.set()
+        hold_observer.set()
+
+
+def test_observer_create_task_failure_closes_coroutine_and_settles_init(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        _submit_test_loop()
+        root, path = tmp_path / "state", tmp_path / "keys.json"
+        _make_app(_settings(root, "static", path))
+        entered, release = threading.Event(), threading.Event()
+        rejected: list[Any] = []
+        stops: list[int] = []
+        errors: list[Any] = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: errors.append(context))
+        real_init, real_create = (
+            main_module._initialize_identity_store,
+            asyncio.create_task,
+        )
+        store = _store_for("static")
+        real_stop = store.stop
+
+        def initialize(*args: Any, **kwargs: Any) -> None:
+            entered.set()
+            assert release.wait(3)
+            real_init(*args, **kwargs)
+
+        def stop() -> None:
+            stops.append(threading.get_ident())
+            real_stop()
+
+        def create(coro: Any, **kwargs: Any) -> Any:
+            if coro.cr_code.co_name == "_observe_identity_init":
+                rejected.append(coro)
+                raise RuntimeError("synthetic observer scheduling rejection")
+            return real_create(coro, **kwargs)
+
+        monkeypatch.setattr(main_module, "_initialize_identity_store", initialize)
+        monkeypatch.setattr(store, "stop", stop)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with monkeypatch.context() as scoped:
+                scoped.setattr(asyncio, "create_task", create)
+                task = real_create(main_module.lifespan(main_module.app).__aenter__())
+                try:
+                    await _until(entered.is_set)
+                    for _ in range(3):
+                        task.cancel()
+                        await asyncio.sleep(0)
+                        assert not task.done()
+                    assert lock_is_held(path.with_name("keys.json.lock"))
+                    assert lock_is_held(root / ".context-intelligence-server.lock")
+                    assert inspect.getcoroutinestate(rejected[0]) == inspect.CORO_CLOSED
+                finally:
+                    release.set()
+                    result = await asyncio.gather(task, return_exceptions=True)
+            try:
+                assert isinstance(result[0], (RuntimeError, asyncio.CancelledError))
+                assert store.flat_dict == {} and store._lock is None
+                assert stops and len(stops) == 1 and stops[0] != threading.get_ident()
+                assert not lock_is_held(path.with_name("keys.json.lock"))
+                assert not lock_is_held(root / ".context-intelligence-server.lock")
+                del result
+                rejected.clear()
+                gc.collect()
+                await asyncio.sleep(0)
+                assert not any("was never awaited" in str(w.message) for w in caught)
+                assert errors == []
+            finally:
+                for coro in rejected:
+                    coro.close()  # red-only hygiene, not a passing acceptance assertion
+                await _repair_test_owner()
+
+    asyncio.run(run())
+
+
+async def test_drained_waiter_create_task_failure_closes_coroutine_and_settles_admissions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _make_app(_settings(tmp_path / "state", "static", tmp_path / "keys.json"))
+    cm = _serving()
+    await cm.__aenter__()
+    runtime = main_module.app.state.identity_runtime
+    # Public semaphore behavior leaves one real HTTP task admitted but queued.
+    runtime.slots = asyncio.Semaphore(0)
+    request = asyncio.create_task(_status(wrapper, "/whoami", TOKEN))
+    real_create = asyncio.create_task
+    rejected: list[Any] = []
+    task = None
+
+    def create(coro: Any, **kwargs: Any) -> Any:
+        if coro.cr_code.co_qualname == "Event.wait":
+            rejected.append(coro)
+            raise RuntimeError("synthetic drained waiter scheduling rejection")
+        return real_create(coro, **kwargs)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            await _until(lambda: runtime.admitted == 1)
+            with monkeypatch.context() as scoped:
+                scoped.setattr(asyncio, "create_task", create)
+                task = real_create(cm.__aexit__(None, None, None))
+                await _until(lambda: bool(rejected))
+                assert inspect.getcoroutinestate(rejected[0]) == inspect.CORO_CLOSED
+                assert main_module.app.state.identity_lifespan_active
+                assert lock_is_held(tmp_path / "keys.json.lock")
+                assert lock_is_held(
+                    tmp_path / "state" / ".context-intelligence-server.lock"
+                )
+                for _ in range(3):
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    assert not task.done()
+                runtime.slots.release()
+                assert await request == 503
+                result = await asyncio.gather(task, return_exceptions=True)
+                assert isinstance(result[0], (RuntimeError, asyncio.CancelledError))
+            assert runtime.admitted == 0 and runtime.cleanup_complete
+            assert not main_module.app.state.identity_lifespan_active
+            assert not lock_is_held(tmp_path / "keys.json.lock")
+            assert not lock_is_held(
+                tmp_path / "state" / ".context-intelligence-server.lock"
+            )
+            del result
+            rejected.clear()
+            gc.collect()
+            await asyncio.sleep(0)
+            assert not any("was never awaited" in str(w.message) for w in caught)
+        finally:
+            runtime.slots.release()
+            if task is None:
+                task = real_create(cm.__aexit__(None, None, None))
+            await asyncio.gather(task, request, return_exceptions=True)
+            for coro in rejected:
+                coro.close()
+
+
+async def test_release_identity_stop_failure_does_not_release_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The partial-owner helper must not unlock if stop failed before clearing."""
+    path = tmp_path / "keys.json"
+    _make_app(_settings(tmp_path / "state", "static", path))
+    async with _serving():
+        store = _store_for("static")
+        lock = store._lock
+        assert lock is not None
+        real_stop = store.stop
+        threads: list[int] = []
+
+        def stop() -> None:
+            threads.append(threading.get_ident())
+            raise RuntimeError("synthetic stop before cache clear")
+
+        try:
+            monkeypatch.setattr(store, "stop", stop)
+            with pytest.raises(RuntimeError, match="stop before cache clear"):
+                await asyncio.to_thread(main_module._release_identity, store, lock)
+            assert lock_is_held(path.with_name("keys.json.lock"))
+            assert lock.owned_by_this_process()
+            assert store.flat_dict == {DIGEST: "writer"}
+            assert threads and threads[0] != threading.get_ident()
+        finally:
+            monkeypatch.setattr(store, "stop", real_stop)
+
+
+@pytest.mark.parametrize("failure", ["shutdown", "load", "seed"])
+async def test_started_stop_failure_retains_exact_owner_and_both_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    root, path = tmp_path / "state", tmp_path / "keys.json"
+    if failure == "load":
+        path.write_text(json.dumps({DIGEST: {"id": "writer"}}), encoding="utf-8")
+    wrapper = _make_app(_settings(root, "static", path, admin=True))
+    store = _store_for("static")
+    real_stop = store.stop
+    real_load, real_seed = store.load, store.seed
+    stop_threads: list[int] = []
+    init_threads: list[int] = []
+    records: list[tuple[Any, Any]] = []
+    real_initialize = main_module._initialize_identity_store
+    cm = main_module.lifespan(main_module.app)
+    entered = False
+    shutdown_attempted = False
+
+    def initialize(*args: Any, **kwargs: Any) -> None:
+        init_threads.append(threading.get_ident())
+        records.append((store, store._lock))
+        runtime = main_module.app.state.identity_runtime
+        retained = getattr(runtime, "owned", None)
+        assert retained is not None, "owner must be retained BEFORE load/seed"
+        assert retained[0] is store and retained[1] is store._lock
+        real_initialize(*args, **kwargs)
+
+    def load() -> None:
+        real_load()
+        raise OSError("synthetic read failure after map publication")
+
+    def seed(*args: Any, **kwargs: Any) -> None:
+        real_seed(*args, **kwargs)
+        raise OSError("synthetic seed failure after map publication")
+
+    def stop() -> None:
+        stop_threads.append(threading.get_ident())
+        raise RuntimeError("synthetic started stop before cache clear")
+
+    monkeypatch.setattr(main_module, "_initialize_identity_store", initialize)
+    try:
+        if failure != "shutdown":
+            monkeypatch.setattr(store, "stop", stop)
+            monkeypatch.setattr(
+                store,
+                "load" if failure == "load" else "seed",
+                load if failure == "load" else seed,
+            )
+        await cm.__aenter__()
+        entered = True
+        observer = main_module.app.state.identity_init_task
+        if failure == "shutdown":
+            await observer
+            assert await _status(wrapper, "/whoami", TOKEN) == 200
+            monkeypatch.setattr(store, "stop", stop)
+        else:
+            with pytest.raises(RuntimeError, match="started stop before cache clear"):
+                await observer
+        shutdown_attempted = True
+        with pytest.raises(RuntimeError, match="root exclusion retained"):
+            await cm.__aexit__(None, None, None)
+        runtime = main_module.app.state.identity_runtime
+        # All acceptance assertions precede the emergency finally.
+        assert lock_is_held(path.with_name("keys.json.lock"))
+        assert lock_is_held(root / ".context-intelligence-server.lock")
+        assert main_module.app.state.identity_lifespan_active
+        assert runtime.closing and not runtime.cleanup_complete
+        assert store.flat_dict == {DIGEST: "writer"}
+        retained = getattr(runtime, "owned", None)
+        assert retained is not None, "partial owner survives only in an exception/local"
+        assert retained[0] is store and retained[1] is records[0][1]
+        assert retained[1].owned_by_this_process()
+        assert len(stop_threads) == 1 and threading.get_ident() not in stop_threads
+        assert len(init_threads) == 1 and threading.get_ident() not in init_threads
+        assert len(runtime.cleanup_calls) == (1 if failure == "shutdown" else 0)
+        if runtime.cleanup_calls:
+            assert not runtime.cleanup_calls[0].completion.cancelled()
+            assert isinstance(
+                runtime.cleanup_calls[0].completion.exception(), RuntimeError
+            )
+        else:
+            assert isinstance(runtime.init_call.completion.exception(), RuntimeError)
+        assert await _status(wrapper, "/whoami", TOKEN) == 503
+        assert await _status(wrapper, "/admin/keys", ADMIN_TOKEN) == 503
+        assert not (await _get_json(wrapper, "/status"))["identity_ready"]
+        assert await _status(wrapper, "/version") == 200
+        _refuse_identity_replacement(tmp_path)
+        gc.collect()
+        assert retained[1].owned_by_this_process()
+        assert len(stop_threads) == 1  # no stop retry or fallback after execution
+    finally:
+        monkeypatch.setattr(store, "stop", real_stop)
+        monkeypatch.setattr(store, "load", real_load)
+        monkeypatch.setattr(store, "seed", real_seed)
+        if entered and not shutdown_attempted:
+            await cm.__aexit__(None, None, None)
+        # Expected retained-failure resources are repaired ONLY after assertions.
+        await _repair_test_owner()

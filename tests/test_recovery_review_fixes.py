@@ -3002,3 +3002,359 @@ async def test_live_registry_close_still_flushes_resident_buffer() -> None:
 
     assert len(driver.writes) == 1 and "live-node" in driver.writes[0]
     assert worker.store_closed is True
+
+
+# --- r4357836422: migrated origins share quarantine and pre-flush eligibility --
+
+
+async def _migrated_review_app(
+    tmp_path: Path,
+    spelling: str,
+    event: str = "session:start",
+    *,
+    queued_origin: Any = ...,
+    raw_override: bytes | None = None,
+) -> tuple[Any, Any, dict[str, Any], bytes]:
+    """Use a real old-schema row, migration and spool, never a receipt mock."""
+    from context_intelligence_server.main import app, create_asgi_app
+
+    payload = {**_base_payload("absent"), "event": event}
+    _create_legacy_db(
+        tmp_path / "receipts.sqlite3",
+        [(_UPGRADE_ORIGIN, "alice", "synthetic", payload, "enqueued")],
+    )
+    asgi = create_asgi_app(settings=_permit_settings(tmp_path))
+    reg = app.state.recovery_registry
+    v1 = _v1_origin_of(_UPGRADE_ORIGIN)
+    if queued_origin is ...:
+        queued_origin = _UPGRADE_ORIGIN if spelling == "legacy" else v1
+    raw = raw_override
+    if raw is None:
+        raw = json.dumps(
+            {**payload, "created_by": "alice", "_recovery_origin": queued_origin},
+            separators=(",", ":"),
+        ).encode("utf-8")
+    await reg.queue_manager.append(_UPGRADE_SESSION, raw)
+    assert await app.state.recovery_receipts.status() == {"enqueued": 1}
+    assert await app.state.recovery_receipts.pending_receipts() == [
+        {"source_handle": v1["source_handle"], "ordinal": 0, "state": "enqueued"}
+    ]
+    return asgi, reg, v1, raw
+
+
+async def _migrated_selection_scenario(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    spelling: str,
+    event: str,
+    *,
+    quarantine: bool,
+) -> dict[str, Any]:
+    """Real drainer and graph buffer, paused after dispatch, before flush."""
+    from context_intelligence_server.main import app
+    from context_intelligence_server.routers.admin import require_admin
+
+    asgi, reg, v1, raw = await _migrated_review_app(tmp_path, spelling, event)
+    queue = reg.queue_manager
+    worker, store, driver = _real_store_worker()
+    worker.session_id, worker.workspace = _UPGRADE_SESSION, "synthetic"
+    worker.services.workspace = "synthetic"
+    parked, release, discarded = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    flushed = asyncio.Event()
+    real_discard, real_flushed = store.discard_buffer, reg.on_batch_flushed
+    flush_spy = AsyncMock(wraps=store.flush)
+    monkeypatch.setattr(store, "flush", flush_spy)
+
+    async def dispatch(
+        selected: Any, selected_event: str, data: dict[str, Any], *a: Any, **k: Any
+    ) -> None:
+        assert selected is worker and selected_event == event
+        assert data["session_id"] == _UPGRADE_SESSION
+        await store.upsert_node("selected-record", {"labels": ["Session"]})
+
+    async def hold() -> None:
+        parked.set()
+        async with asyncio.timeout(5):
+            await release.wait()
+
+    def discard() -> None:
+        real_discard()
+        discarded.set()
+
+    async def after_flush(selected: Any, records: list[Any]) -> None:
+        await real_flushed(selected, records)
+        flushed.set()
+
+    # Retain bytes for comparison; dispatch, commits and receipt hooks stay real.
+    monkeypatch.setattr(queue, "delete_drained", AsyncMock(return_value=True))
+    monkeypatch.setattr(reg, "_process_one", dispatch)
+    monkeypatch.setattr(reg, "pre_flush", hold)
+    monkeypatch.setattr(reg, "on_batch_flushed", after_flush)
+    monkeypatch.setattr(store, "discard_buffer", discard)
+    spool_before = queue._log_path(_UPGRADE_SESSION).read_bytes()
+    app.dependency_overrides[require_admin] = lambda: None
+    drain: asyncio.Task[None] | None = None
+    out: dict[str, Any] = {}
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=asgi), base_url="http://test"
+        ) as client:
+            drain = asyncio.create_task(reg.drain_worker(worker, flush_timeout=0.2))
+            await asyncio.wait_for(parked.wait(), timeout=3)
+            assert store._node_buffer, "selection must actually buffer graph work"
+            assert (await client.post("/admin/recovery/pause")).json() == {
+                "paused": True
+            }
+            if quarantine:
+                result = await client.post(
+                    "/admin/recovery/quarantine-pending",
+                    json={"source_handle": v1["source_handle"], "ordinal": 0},
+                )
+                assert result.status_code == 200
+                assert result.json() == {"quarantined": 1}
+                out["quarantine_offset"] = int(
+                    queue._offset_path(_UPGRADE_SESSION).read_text(encoding="utf-8")
+                )
+                assert await app.state.recovery_receipts.status() == {"quarantined": 1}
+            assert (await client.post("/admin/recovery/resume")).json() == {
+                "paused": False
+            }
+            release.set()
+            await asyncio.wait_for(
+                (discarded if quarantine else flushed).wait(), timeout=3
+            )
+            # close() may call flush on an empty buffer; count the write boundary
+            # before cancellation/close, then inspect driver writes after cleanup.
+            out["flushes"] = flush_spy.await_count
+    finally:
+        release.set()
+        async with app.state.recovery_pause_condition:
+            app.state.recovery_paused = False
+            app.state.recovery_pause_condition.notify_all()
+        try:
+            if drain is not None:
+                drain.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(drain, return_exceptions=True), timeout=5
+                )
+        finally:
+            try:
+                # Cleanup itself must not manufacture a successful graph write.
+                await reg._safe_close(worker)
+            finally:
+                app.dependency_overrides.pop(require_admin, None)
+    out.update(
+        writes=driver.writes,
+        discarded=discarded.is_set(),
+        buffer=dict(store._node_buffer),
+        receipts=await app.state.recovery_receipts.status(),
+        offset=int(queue._offset_path(_UPGRADE_SESSION).read_text(encoding="utf-8")),
+    )
+    assert queue._log_path(_UPGRADE_SESSION).read_bytes() == spool_before == raw + b"\n"
+    return out
+
+
+@pytest.mark.parametrize("spelling", ["legacy", "v1"])
+@pytest.mark.parametrize("event", ["session:start", "session:end"])
+async def test_migrated_origin_can_be_quarantined_after_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str, event: str
+) -> None:
+    """Breaks if literal origin comparison prevents quarantining an old spool."""
+    out = await _migrated_selection_scenario(
+        tmp_path, monkeypatch, spelling, event, quarantine=True
+    )
+    assert out["flushes"] == 0 and out["writes"] == []
+    assert out["discarded"] and out["buffer"] == {}
+    assert out["receipts"] == {"quarantined": 1}
+    assert out["offset"] >= out["quarantine_offset"]
+    [evidence] = [
+        json.loads(line)
+        for line in (tmp_path / "recovery" / f"{_UPGRADE_SESSION}.dead.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert (
+        evidence["payload"].encode("utf-8") + b"\n"
+        == (tmp_path / "recovery" / f"{_UPGRADE_SESSION}.log").read_bytes()
+    )
+
+
+@pytest.mark.parametrize("spelling", ["legacy", "v1"])
+@pytest.mark.parametrize("event", ["session:start", "session:end"])
+async def test_migrated_origin_flushes_without_quarantine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str, event: str
+) -> None:
+    """Positive control: the same selected record really flushes when eligible."""
+    out = await _migrated_selection_scenario(
+        tmp_path, monkeypatch, spelling, event, quarantine=False
+    )
+    assert out["flushes"] >= 1
+    assert out["writes"] and "selected-record" in out["writes"][0]
+    assert out["receipts"] == {"written": 1}
+
+
+@pytest.mark.parametrize("spelling", ["legacy", "v1"])
+async def test_legacy_flush_fence_rejects_terminalized_captured_record(
+    tmp_path: Path, spelling: str
+) -> None:
+    """Breaks if legacy origins bypass the independently installed flush fence."""
+    from context_intelligence_server.main import app
+
+    _, reg, v1, _ = await _migrated_review_app(tmp_path, spelling)
+    batch = await reg.queue_manager.read_batch(_UPGRADE_SESSION, max_items=1)
+    worker, store, driver = _real_store_worker()
+    await store.upsert_node("selected-record", {"labels": ["Session"]})
+    try:
+        # Deliberately bypass the quarantine helper: queue state stays queued.
+        await app.state.recovery_receipts.quarantine_pending(v1["source_handle"], 0)
+        assert await reg.queue_manager.recovery_origin_commit_state(v1) == "queued"
+        with pytest.raises(
+            RuntimeError, match="recovery record was terminalized before graph flush"
+        ):
+            await reg.before_recovery_flush(worker, batch.records)
+        assert store._node_buffer == {}
+        assert driver.writes == []
+        assert await app.state.recovery_receipts.status() == {"quarantined": 1}
+    finally:
+        await reg._safe_close(worker)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("session_id", "different-session"),
+        ("source_stream_sha256", "c" * 64),
+        ("ordinal", 1),
+        ("source_line_sha256", "d" * 64),
+    ],
+)
+async def test_pending_quarantine_does_not_match_a_different_normalized_origin(
+    tmp_path: Path, field: str, value: Any
+) -> None:
+    """Every identity component participates; mismatches leave storage untouched."""
+    from context_intelligence_server.main import (
+        _quarantine_pending_native_recovery,
+        app,
+    )
+
+    _, reg, v1, _ = await _migrated_review_app(
+        tmp_path, "legacy", queued_origin={**_UPGRADE_ORIGIN, field: value}
+    )
+    queue_dir = tmp_path / "recovery"
+    before = {p.name: p.read_bytes() for p in queue_dir.iterdir()}
+    rows_before = _read_all(tmp_path / "receipts.sqlite3")
+    app.state.recovery_paused = True
+
+    assert await _quarantine_pending_native_recovery(app, v1["source_handle"], 0) == (
+        "none"
+    )
+    assert _read_all(tmp_path / "receipts.sqlite3") == rows_before
+    assert {p.name: p.read_bytes() for p in queue_dir.iterdir()} == before
+    assert (
+        await reg.queue_manager.recovery_origin_commit_state(
+            _v1_origin_of({**_UPGRADE_ORIGIN, field: value})
+        )
+        == "queued"
+    )
+
+
+_INVALID_REVIEW_ORIGINS = [
+    None,
+    [],
+    {},
+    "private-payload-marker",
+    {**_UPGRADE_ORIGIN, "source_handle": "c" * 64},
+    {**_UPGRADE_ORIGIN, "extra": True},
+    {k: v for k, v in _UPGRADE_ORIGIN.items() if k != "source_line_sha256"},
+    {**_UPGRADE_ORIGIN, "session_id": ""},
+    {**_UPGRADE_ORIGIN, "source_stream_sha256": "not-a-digest"},
+    {**_UPGRADE_ORIGIN, "source_line_sha256": "A" * 64},
+    *[
+        {**origin, "ordinal": ordinal}
+        for origin in (_UPGRADE_ORIGIN, _v1_origin_of(_UPGRADE_ORIGIN))
+        for ordinal in (True, -1, "0", 1 << 63)
+    ],
+    {**_v1_origin_of(_UPGRADE_ORIGIN), "source_handle": "invalid"},
+]
+_INVALID_REVIEW_LINES = [
+    b"[]",
+    b"null",
+    b"{not-json-private-payload-marker",
+    b'{"event":"session:start"}',
+    *[
+        json.dumps({"_recovery_origin": origin}).encode("utf-8")
+        for origin in _INVALID_REVIEW_ORIGINS
+    ],
+]
+
+
+@pytest.mark.parametrize("raw", _INVALID_REVIEW_LINES)
+async def test_pending_quarantine_refuses_malformed_envelope_without_mutation(
+    tmp_path: Path, raw: bytes
+) -> None:
+    from context_intelligence_server.main import (
+        _quarantine_pending_native_recovery,
+        app,
+    )
+
+    await _migrated_review_app(tmp_path, "legacy", raw_override=raw)
+    v1 = _v1_origin_of(_UPGRADE_ORIGIN)
+    before = {p.name: p.read_bytes() for p in (tmp_path / "recovery").iterdir()}
+    rows_before = _read_all(tmp_path / "receipts.sqlite3")
+    app.state.recovery_paused = True
+
+    assert await _quarantine_pending_native_recovery(app, v1["source_handle"], 0) == (
+        "none"
+    )
+    assert _read_all(tmp_path / "receipts.sqlite3") == rows_before
+    assert {p.name: p.read_bytes() for p in (tmp_path / "recovery").iterdir()} == before
+
+
+@pytest.mark.parametrize("raw", _INVALID_REVIEW_LINES)
+async def test_flush_fence_refuses_malformed_origin_before_receipt_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: Any, raw: bytes
+) -> None:
+    """Breaks if absent/invalid/overflow origins skip the fence or reach SQLite."""
+    from context_intelligence_server.main import app
+
+    _, reg, _, _ = await _migrated_review_app(tmp_path, "legacy", raw_override=raw)
+    batch = await reg.queue_manager.read_batch(_UPGRADE_SESSION, max_items=1)
+    io_calls: list[str] = []
+
+    async def forbidden_io(*a: Any, **k: Any) -> Any:
+        io_calls.append("invalid origin reached storage")
+        raise AssertionError("malformed origin must be rejected before storage I/O")
+
+    monkeypatch.setattr(reg.queue_manager, "recovery_origin_commit_state", forbidden_io)
+    monkeypatch.setattr(app.state.recovery_receipts, "is_flushable", forbidden_io)
+    worker, store, driver = _real_store_worker()
+    await store.upsert_node("selected-record", {"labels": ["Session"]})
+    try:
+        with pytest.raises(
+            RuntimeError, match="recovery record was terminalized before graph flush"
+        ) as excinfo:
+            await reg.before_recovery_flush(worker, batch.records)
+        assert io_calls == []
+        assert store._node_buffer == {} and driver.writes == []
+        assert "private-payload-marker" not in str(excinfo.value) + caplog.text
+    finally:
+        await reg._safe_close(worker)
+
+
+def test_public_recovery_origin_normalizer_matches_legacy_and_v1() -> None:
+    """The public boundary preserves exact identity and rejects unsafe origins."""
+    normalize = getattr(QueueManager, "normalized_recovery_origin", None)
+    assert callable(normalize), (
+        "recovery consumers need the canonical public normalizer"
+    )
+    v1 = _v1_origin_of(_UPGRADE_ORIGIN)
+    expected = (v1["source_handle"], 0, "b" * 64)
+    assert normalize(_UPGRADE_ORIGIN) == normalize(v1) == expected
+    maximum = (1 << 63) - 1
+    assert normalize({**_UPGRADE_ORIGIN, "ordinal": maximum}) == (
+        v1["source_handle"],
+        maximum,
+        "b" * 64,
+    )
+    for invalid in _INVALID_REVIEW_ORIGINS:
+        assert normalize(invalid) is None

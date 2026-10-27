@@ -1,11 +1,13 @@
 """Tests for bearer token authentication middleware."""
 
+import asyncio
 import hashlib
 import json
 import logging
 from unittest.mock import AsyncMock
 
 import httpx
+import pytest
 
 from context_intelligence_server.auth import BearerTokenMiddleware, _resolve_token
 
@@ -35,6 +37,83 @@ def _make_scope_with_auth(
 def _keystore(token: str, contributor_id: str = "tester") -> dict[str, str]:
     """Build a minimal keystore from a raw token string (for test convenience)."""
     return {hashlib.sha256(token.encode()).hexdigest(): contributor_id}
+
+
+@pytest.mark.parametrize("kind", ["none", "sync", "async"])
+@pytest.mark.parametrize("ready", [False, True])
+async def test_identity_gate_additive_contract(kind: str, ready: bool) -> None:
+    """An async False must not be treated as a truthy coroutine."""
+
+    async def gate() -> bool:
+        await asyncio.sleep(0)
+        return ready
+
+    downstream = AsyncMock()
+    middleware = BearerTokenMiddleware(
+        downstream,
+        keystore=_keystore("synthetic"),
+        identity_gate=None
+        if kind == "none"
+        else (gate if kind == "async" else lambda: ready),
+    )
+    send = AsyncMock()
+    await middleware(_make_scope_with_auth("synthetic"), AsyncMock(), send)
+    if ready or kind == "none":
+        downstream.assert_awaited_once()
+    else:
+        downstream.assert_not_called()
+        assert send.call_args_list[0].args[0]["status"] == 503
+
+
+async def test_identity_gate_waits_before_resolving_and_propagates_cancellation() -> (
+    None
+):
+    entered, release = asyncio.Event(), asyncio.Event()
+    live = _keystore("synthetic")
+
+    async def gate() -> bool:
+        entered.set()
+        await release.wait()
+        return True
+
+    downstream, send = AsyncMock(), AsyncMock()
+    middleware = BearerTokenMiddleware(downstream, keystore=live, identity_gate=gate)
+    task = asyncio.create_task(
+        middleware(_make_scope_with_auth("synthetic"), AsyncMock(), send)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 0.5)
+        downstream.assert_not_called()
+        live.clear()
+        release.set()
+        await task
+        assert send.call_args_list[0].args[0]["status"] == 401
+        downstream.assert_not_called()
+        release.clear()
+        entered.clear()
+        task = asyncio.create_task(
+            middleware(_make_scope_with_auth("synthetic"), AsyncMock(), send)
+        )
+        await asyncio.wait_for(entered.wait(), 0.5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        downstream.assert_not_called()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("path", ["/status", "/version", "/docs", "/openapi.json"])
+async def test_identity_gate_exempt_paths_never_probe(path: str) -> None:
+    def forbidden() -> bool:
+        raise AssertionError("public path probed identity")
+
+    downstream = AsyncMock()
+    middleware = BearerTokenMiddleware(downstream, identity_gate=forbidden)
+    await middleware(_make_scope(path), AsyncMock(), AsyncMock())
+    await middleware({"type": "lifespan"}, AsyncMock(), AsyncMock())
+    assert downstream.await_count == 2
 
 
 class TestMiddlewareNoApiKey:
