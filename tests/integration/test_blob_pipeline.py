@@ -12,13 +12,16 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import socket
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import httpx
 import pytest
+from neo4j import AsyncGraphDatabase
 
 from context_intelligence_server.config import get_settings
 from context_intelligence_server.main import app, registry
@@ -110,24 +113,43 @@ class TestBlobPipelineEndToEnd:
     """End-to-end blob pipeline tests via HTTP endpoints."""
 
     async def test_post_events_returns_202(
-        self, integration_env: httpx.AsyncClient
+        self, integration_env: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """POST /events with a blob-eligible 'result' field returns 202."""
-        client = integration_env
-        response = await client.post(
-            "/events",
-            json={
-                "event": "tool:post",
-                "workspace": "test-workspace",
-                "data": {
-                    "session_id": "blob-integ-202-check",
-                    "timestamp": "2024-06-01T09:00:05+00:00",
-                    "tool_call_id": "call_202_check",
-                    "result": {"output": "hello", "exit_code": 0},
-                },
-            },
+        """Admission durably queues the payload without starting a Neo4j worker."""
+        driver = Mock(
+            side_effect=AssertionError(
+                "admission-only test must not construct Neo4j driver"
+            )
         )
+        # integration_env shares monkeypatch, so the guard survives its teardown.
+        monkeypatch.setattr(AsyncGraphDatabase, "driver", driver)
+        get_or_create = Mock(return_value=None)
+        monkeypatch.setattr(registry, "get_or_create", get_or_create)
+        client = integration_env
+        payload = {
+            "event": "tool:post",
+            "workspace": "test-workspace",
+            "data": {
+                "session_id": "blob-integ-202-check",
+                "timestamp": "2024-06-01T09:00:05+00:00",
+                "tool_call_id": "call_202_check",
+                "result": {"output": "hello", "exit_code": 0},
+            },
+        }
+        response = await client.post("/events", json=payload)
         assert response.status_code == 202
+        assert response.json()["status"] == "queued"
+        get_or_create.assert_called_once_with(
+            "blob-integ-202-check", "test-workspace", created_by=None
+        )
+        batch = await registry.queue_manager.read_batch(payload["data"]["session_id"], 2)
+        assert len(batch.lines) == 1
+        queued = json.loads(batch.lines[0])
+        assert queued["event"] == payload["event"]
+        assert queued["workspace"] == payload["workspace"]
+        assert queued["data"] == payload["data"]
+        assert registry.workers() == []
+        driver.assert_not_called()
 
     @pytest.mark.skipif(
         not _neo4j_reachable(), reason="Neo4j not reachable at neo4j:7687"
