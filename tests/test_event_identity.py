@@ -13,7 +13,11 @@ import pytest
 import context_intelligence_server.main as main_module
 import context_intelligence_server.registry as registry_module
 from context_intelligence_server.handlers.data_layer_1.default import DefaultHandler
-from context_intelligence_server.pipeline import PipelineHandlers, process_event, setup_handlers
+from context_intelligence_server.pipeline import (
+    PipelineHandlers,
+    process_event,
+    setup_handlers,
+)
 from context_intelligence_server.queue_manager import QueueManager
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
 from context_intelligence_server.services import HookStateService
@@ -43,7 +47,10 @@ async def test_post_assigns_distinct_server_owned_ids_for_same_timestamp_events(
 
     monkeypatch.setattr(main_module.registry.queue_manager, "append", capture)
     timestamp = "2026-09-15T12:00:00+00:00"
-    for key, marker in (("collision-key-one", "first"), ("collision-key-two", "second")):
+    for key, marker in (
+        ("collision-key-one", "first"),
+        ("collision-key-two", "second"),
+    ):
         response = await client.post(
             "/events",
             json={
@@ -72,15 +79,23 @@ async def test_post_assigns_distinct_server_owned_ids_for_same_timestamp_events(
     handlers = PipelineHandlers(default=DefaultHandler(services), enrichers=[])
     node_ids: list[str] = []
     for raw in captured:
-        event, _workspace, _working_dir, data, identity = SessionRegistry._parse_line(raw)
+        event, _workspace, _working_dir, data, identity = SessionRegistry._parse_line(
+            raw
+        )
         await process_event(worker, event, data, handlers, event_identity=identity)
         node_ids.append(
             f"{make_node_id('same-time-session', 'custom:marker', timestamp)}__{identity}"
         )
 
     assert node_ids[0] != node_ids[1]
-    assert json.loads((await services.graph.get_node(node_ids[0]))["data"])["marker"] == "first"  # type: ignore[index]
-    assert json.loads((await services.graph.get_node(node_ids[1]))["data"])["marker"] == "second"  # type: ignore[index]
+    assert (
+        json.loads((await services.graph.get_node(node_ids[0]))["data"])["marker"]
+        == "first"
+    )  # type: ignore[index]
+    assert (
+        json.loads((await services.graph.get_node(node_ids[1]))["data"])["marker"]
+        == "second"
+    )  # type: ignore[index]
 
 
 async def test_keyed_terminal_reprocessing_reuses_event_and_blob_identity(
@@ -112,8 +127,8 @@ async def test_keyed_terminal_reprocessing_reuses_event_and_blob_identity(
     )
     assert response.status_code == 202
 
-    _event, _workspace, _working_dir, _first_data, identity = SessionRegistry._parse_line(
-        captured[0]
+    _event, _workspace, _working_dir, _first_data, identity = (
+        SessionRegistry._parse_line(captured[0])
     )
     _event, _workspace, _working_dir, _second_data, second_identity = (
         SessionRegistry._parse_line(captured[0])
@@ -136,7 +151,9 @@ async def test_keyed_terminal_reprocessing_reuses_event_and_blob_identity(
     # parsed/processed again by finalization's drain-to-EOF path.
     assert await registry._drain_to_eof(worker, handlers)
 
-    event_id = f"{make_node_id('terminal-session', 'session:end', timestamp)}__{identity}"
+    event_id = (
+        f"{make_node_id('terminal-session', 'session:end', timestamp)}__{identity}"
+    )
     assert await services.graph.get_node(event_id) is not None
     sourced_from = await services.graph.get_edge("terminal-session", event_id)
     assert sourced_from is not None
@@ -161,10 +178,16 @@ async def test_scoped_identity_agrees_between_event_blob_and_sourced_from() -> N
     }
 
     await process_event(
-        worker, "cancel:completed", data, setup_handlers(services), event_identity=identity
+        worker,
+        "cancel:completed",
+        data,
+        setup_handlers(services),
+        event_identity=identity,
     )
 
-    event_id = f"{make_node_id('cancel-session', 'cancel:completed', timestamp)}__{identity}"
+    event_id = (
+        f"{make_node_id('cancel-session', 'cancel:completed', timestamp)}__{identity}"
+    )
     cancellation_id = f"cancel-session::cancellation::{timestamp}"
     assert await services.graph.get_node(event_id) is not None
     assert await services.graph.get_edge(cancellation_id, event_id) == {
@@ -193,16 +216,16 @@ async def test_keyless_identity_survives_dead_letter_replay_and_queue_recreation
 
     assert (await client.post("/events", json=payload)).status_code == 202
     first = (await queue_manager.read_batch("keyless-session", 1)).records[0]
-    _event, _workspace, _working_dir, _data, first_identity = SessionRegistry._parse_line(
-        first.raw
+    _event, _workspace, _working_dir, _data, first_identity = (
+        SessionRegistry._parse_line(first.raw)
     )
     await queue_manager.commit("keyless-session", first.end)
     assert await queue_manager.delete_drained("keyless-session")
 
     assert (await client.post("/events", json=payload)).status_code == 202
     second = (await queue_manager.read_batch("keyless-session", 1)).records[0]
-    _event, _workspace, _working_dir, _data, second_identity = SessionRegistry._parse_line(
-        second.raw
+    _event, _workspace, _working_dir, _data, second_identity = (
+        SessionRegistry._parse_line(second.raw)
     )
     assert first_identity is not None
     assert second_identity is not None
@@ -214,8 +237,8 @@ async def test_keyless_identity_survives_dead_letter_replay_and_queue_recreation
     response = await client.post("/queues/dead-letter/keyless-session/replay")
     assert response.status_code == 200
     replayed = (await queue_manager.read_batch("keyless-session", 1)).records[0]
-    _event, _workspace, _working_dir, _data, replayed_identity = SessionRegistry._parse_line(
-        replayed.raw
+    _event, _workspace, _working_dir, _data, replayed_identity = (
+        SessionRegistry._parse_line(replayed.raw)
     )
     assert replayed_identity == first_identity
 
@@ -256,7 +279,9 @@ async def test_registry_passes_persisted_identity_to_each_pipeline_dispatch(
     assert captured == ["persisted-identity", None]
 
 
-async def test_event_identity_scope_isolated_and_resets_after_failure_and_cancel() -> None:
+async def test_event_identity_scope_isolated_and_resets_after_failure_and_cancel() -> (
+    None
+):
     """ContextVar state cannot cross concurrent records or survive abnormal exits."""
     timestamp = "2026-09-15T12:04:00+00:00"
     worker = MagicMock()
@@ -269,10 +294,14 @@ async def test_event_identity_scope_isolated_and_resets_after_failure_and_cancel
 
     async def concurrent_handler(_event: str, data: dict[str, Any]) -> None:
         marker = data["marker"]
-        observed[marker].append(make_node_id("scope-session", "custom:scope", timestamp))
+        observed[marker].append(
+            make_node_id("scope-session", "custom:scope", timestamp)
+        )
         entered[0 if marker == "one" else 1].set()
         await release.wait()
-        observed[marker].append(make_node_id("scope-session", "custom:scope", timestamp))
+        observed[marker].append(
+            make_node_id("scope-session", "custom:scope", timestamp)
+        )
 
     handlers = PipelineHandlers(default=concurrent_handler, enrichers=[])  # type: ignore[arg-type]
     tasks = [
@@ -280,7 +309,11 @@ async def test_event_identity_scope_isolated_and_resets_after_failure_and_cancel
             process_event(
                 worker,
                 "custom:scope",
-                {"session_id": "scope-session", "timestamp": timestamp, "marker": marker},
+                {
+                    "session_id": "scope-session",
+                    "timestamp": timestamp,
+                    "marker": marker,
+                },
                 handlers,
                 event_identity=marker,
             )
@@ -297,7 +330,10 @@ async def test_event_identity_scope_isolated_and_resets_after_failure_and_cancel
     }
 
     async def fails(_event: str, _data: dict[str, Any]) -> None:
-        assert make_node_id("scope-session", "custom:scope", timestamp) == f"{legacy}__fails"
+        assert (
+            make_node_id("scope-session", "custom:scope", timestamp)
+            == f"{legacy}__fails"
+        )
         raise RuntimeError("forced")
 
     with pytest.raises(RuntimeError, match="forced"):
@@ -361,4 +397,6 @@ async def test_post_overwrites_a_client_supplied_event_identity(
     assert response.status_code == 202
     persisted = json.loads(captured[0])
     assert persisted[SPOOL_EVENT_IDENTITY] != "attacker-selected"
-    assert persisted[SPOOL_EVENT_IDENTITY] == main_module._new_event_identity("spoof-key")
+    assert persisted[SPOOL_EVENT_IDENTITY] == main_module._new_event_identity(
+        "spoof-key"
+    )
