@@ -2729,8 +2729,10 @@ def test_repeated_runtime_submit_failures_do_not_queue_untracked_checks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    executors: list[ThreadPoolExecutor] = []
+
     async def run() -> None:
-        loop = _submit_test_loop()
+        loop = _submit_test_loop(executors)
         wrapper = _make_app(
             _settings(tmp_path / "state", "static", tmp_path / "keys.json")
         )
@@ -2740,39 +2742,80 @@ def test_repeated_runtime_submit_failures_do_not_queue_untracked_checks(
             calls: list[int] = []
             starts: list[str] = []
             real_start = threading.Thread.start
+            real_submit = loop.run_in_executor
+            probe_dispatches: list[int] = []
+            fault_executor: ThreadPoolExecutor | None = None
+            armed = False
 
             def check() -> bool:
                 calls.append(1)
                 return real()
 
             def fail(thread: threading.Thread) -> None:
-                if thread.name.startswith("ci-identity-submit"):
+                if armed and thread.name.startswith("ci-identity-submit"):
                     starts.append(thread.name)
                     raise RuntimeError("synthetic runtime queued start failure")
                 real_start(thread)
 
-            monkeypatch.setattr(runtime.store, "healthy", check)
-            holder, release = await _executor_holder(loop)
-            try:
-                with monkeypatch.context() as scoped:
-                    scoped.setattr(threading.Thread, "start", fail)
-                    assert [
-                        await _status(wrapper, "/whoami", TOKEN) for _ in range(6)
-                    ] == [503] * 6
-                    assert len(starts) == 1, (
-                        "failed lifetime kept producing queued wrappers"
-                    )
-                    assert runtime.closing and calls == []
-                release.set()
-                await asyncio.wait({holder})
-                await asyncio.wait({loop.run_in_executor(None, lambda: None)})
-                await _until(lambda: runtime.admitted == 0)
-                assert not runtime.probes and calls == []
-            finally:
-                release.set()
-                await asyncio.wait({holder})
+            def submit(executor: Any, func: Any, *args: Any) -> Any:
+                nonlocal armed, fault_executor
+                probe = executor is None and _identity_submission_kind(func) == "probe"
+                if probe:
+                    probe_dispatches.append(1)
+                if probe and fault_executor is None:
+                    # Startup may leave several idle workers. Only a fresh real
+                    # pool guarantees submit enqueues before Thread.start fails.
+                    _submit_test_loop(executors)
+                    fault_executor = executors[-1]
+                    armed = True
+                    try:
+                        return real_submit(executor, func, *args)
+                    finally:
+                        armed = False
+                return real_submit(executor, func, *args)
 
-    asyncio.run(run())
+            monkeypatch.setattr(runtime.store, "healthy", check)
+            with monkeypatch.context() as scoped:
+                scoped.setattr(threading.Thread, "start", fail)
+                scoped.setattr(loop, "run_in_executor", submit)
+                assert await _status(wrapper, "/whoami", TOKEN) == 503
+                assert len(starts) == 1, "the real queued start failure was not exercised"
+                assert probe_dispatches == [1]
+                assert runtime.closing and calls == []
+                assert [
+                    await _status(wrapper, "/whoami", TOKEN) for _ in range(5)
+                ] == [503] * 5
+                assert len(starts) == 1 and probe_dispatches == [1], (
+                    "failed lifetime kept producing queued wrappers"
+                )
+                assert runtime.closing and calls == []
+            # Restore both dispatch and thread starts before a real worker drains
+            # the SAME pool's canceled wrapper, then completes this no-op.
+            assert fault_executor is not None
+            await loop.run_in_executor(fault_executor, lambda: None)
+            await _until(lambda: runtime.admitted == 0)
+            assert not runtime.probes and calls == []
+            assert len(starts) == 1 and probe_dispatches == [1]
+            acquired = 0
+            try:
+                for _ in range(4):
+                    assert not runtime.slots.locked()
+                    await runtime.slots.acquire()
+                    acquired += 1
+                assert runtime.slots.locked()  # all four slots, no under/over release
+            finally:
+                for _ in range(acquired):
+                    runtime.slots.release()
+            assert runtime.closing
+            assert main_module.app.state.identity_state == "unavailable"
+            assert main_module.app.state.identity_ready_token is None
+            assert not (await _get_json(wrapper, "/status"))["identity_ready"]
+
+    try:
+        asyncio.run(run())
+    finally:
+        for executor in executors:
+            executor.shutdown(wait=True)  # includes the superseded startup pool
 
 
 @pytest.mark.parametrize(
