@@ -27,6 +27,7 @@ __all__ = [
     "LOCK",
     "MAPPED_MARKER",
     "MAX_KEY_BYTES",
+    "MAX_PHYSICAL_KEY_BYTES",
     "MAX_SESSION_BYTES",
     "METADATA",
     "BlobAddress",
@@ -34,6 +35,7 @@ __all__ = [
     "component",
     "exact_address",
     "legacy_address",
+    "legacy_addresses",
     "parse_address",
     "parse_uri",
     "read_candidates",
@@ -50,6 +52,7 @@ MAX_SESSION_BYTES = (
     255  # NAME_MAX: nothing is ever appended to a session directory name
 )
 MAX_KEY_BYTES = 242  # NAME_MAX - 13, the ``.<8 chars>.tmp`` suffix of a temp file
+MAX_PHYSICAL_KEY_BYTES = 250  # NAME_MAX - len(".json"), for existing files only
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _MAPPED_FILENAME = re.compile(re.escape(MAPPED_MARKER) + r"~([0-9a-f]{64})\.blob")
 
@@ -131,11 +134,11 @@ def write_address(session_id: str, logical_name: str) -> BlobAddress:
     if logical_name in ("", ".", "..", LOCK, METADATA):
         raise ValueError(f"Unsafe blob key: {logical_name!r}")
     logical_name.encode("utf-8")  # a lone surrogate stays a UnicodeEncodeError
-    folded = fold_name(logical_name, MAX_KEY_BYTES)
     try:
-        return BlobAddress(session, component(folded))
+        component(logical_name)
     except ValueError:
         return _mapped(session, logical_name)
+    return BlobAddress(session, fold_name(logical_name, MAX_KEY_BYTES))
 
 
 def exact_address(uri: str) -> BlobAddress:
@@ -182,22 +185,42 @@ def address_from_filename(session: str, filename: str) -> BlobAddress | None:
     return None
 
 
-def legacy_address(session_id: str, logical_name: str) -> BlobAddress | None:
-    """The pre-mapping physical address, or ``None`` if it was never creatable.
+def legacy_addresses(session_id: str, logical_name: str) -> tuple[BlobAddress, ...]:
+    """Existing ordinary addresses, exact first and historical fold second.
 
-    Used for reads and expiry checks only; nothing is ever created here.
+    Exact stems may use the full ``.json`` filename budget; only new writes
+    need room for the longer temporary suffix. Invalid candidates are skipped,
+    but invalid sessions and UTF-8 still raise. Nothing is ever created here.
     """
     session = fold_name(component(session_id), MAX_SESSION_BYTES)
-    try:
-        return BlobAddress(session, fold_name(logical_name, MAX_KEY_BYTES))
-    except ValueError:
-        return None
+    raw = logical_name.encode("utf-8")
+    if logical_name in ("", ".", "..", LOCK, METADATA):
+        return ()
+    stems = []
+    if len(raw) <= MAX_PHYSICAL_KEY_BYTES:
+        stems.append(logical_name)
+    stems.append(fold_name(logical_name, MAX_KEY_BYTES))
+    addresses: list[BlobAddress] = []
+    for stem in stems:
+        try:
+            candidate = BlobAddress(session, stem)
+        except ValueError:
+            continue
+        if candidate not in addresses:
+            addresses.append(candidate)
+    return tuple(addresses)
+
+
+def legacy_address(session_id: str, logical_name: str) -> BlobAddress | None:
+    """First pre-mapping physical address, or ``None`` if none was creatable."""
+    addresses = legacy_addresses(session_id, logical_name)
+    return addresses[0] if addresses else None
 
 
 def read_candidates(uri: str) -> tuple[BlobAddress, ...]:
     """Physical addresses to try, in order, for *uri*."""
-    addr = parse_address(uri)
-    if addr.mapped or "\\" not in addr.name:
-        return (addr,)
+    addr = exact_address(uri)  # reject malformed paths before deriving alternatives
+    if addr.mapped:
+        return (parse_address(uri),)
     canonical = write_address(addr.session, addr.name)
-    return (addr,) if canonical == addr else (addr, canonical)
+    return tuple(dict.fromkeys((*legacy_addresses(addr.session, addr.name), canonical)))

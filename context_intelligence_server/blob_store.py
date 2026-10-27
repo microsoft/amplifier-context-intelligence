@@ -33,7 +33,7 @@ from context_intelligence_server.blob_keys import (
     address_from_filename,
     component,
     exact_address,
-    legacy_address,
+    legacy_addresses,
     parse_address,
     read_candidates,
     write_address,
@@ -269,26 +269,26 @@ class AsyncDiskBlobStore:
         """Persist *value* as JSON and return a ``ci-blob://`` URI.
 
         *key* is a raw logical name.  Creates ``<root>/<session_id>/blobs/``
-        if needed.  A pre-upgrade backslash file is never created, migrated or
-        deleted: if its expiry is recorded the write keeps that old URI and
-        creates nothing, so replay never rehydrates a pruned payload.
+        if needed. Check expiry in canonical, exact legacy, then historical
+        folded order before creating any payload paths. A recorded expiry keeps
+        that URI and creates nothing, so replay never rehydrates pruned data.
+        Legacy files are never created, migrated or deleted here.
 
         Returns:
             The canonical URI, or the recorded-expired URI that blocked the write.
         """
         canonical = write_address(session_id, key)  # validates before any I/O
-        legacy = legacy_address(session_id, key)
-        if legacy == canonical:
-            legacy = None
+        expiry_addresses = tuple(
+            dict.fromkeys((canonical, *legacy_addresses(session_id, key)))
+        )
 
         def _write() -> str:
             # The lock lives inside the thread: cancelling the awaiting task
             # cannot release it while an atomic write is still in progress.
             with RootLock(self._root, create_root=True) as lock:
-                if expired(lock.root, canonical.uri):
-                    return canonical.uri  # replay keeps the reference, never rehydrates
-                if legacy is not None and expired(lock.root, legacy.uri):
-                    return legacy.uri
+                for candidate in expiry_addresses:
+                    if expired(lock.root, candidate.uri):
+                        return candidate.uri  # replay keeps the reference, never rehydrates
                 with lock.root.blobs(canonical.session, create=True) as fd:
                     data = json.dumps(value)
                     for _ in range(100):
