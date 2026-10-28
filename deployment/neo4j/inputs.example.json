@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "versions": {"neo4j": "5.26.27", "apoc": "5.26.27", "gds": "2.13.11"},
+  "apt": {"neo4j_package_version": null, "key_url": null, "key_sha256": null},
+  "storage": {
+    "lun": 0,
+    "partition": null,
+    "filesystem_uuid": null,
+    "filesystem": null,
+    "mount": null,
+    "data_dir": null,
+    "transaction_logs_dir": null,
+    "database_store": null,
+    "system_store": null,
+    "store_markers": null,
+    "plugins_dir": null,
+    "uid": null,
+    "gid": null
+  },
+  "config": {"neo4j_conf": null, "sha256": null},
+  "identity": {"kind": null, "client_id": null},
+  "credentials": {
+    "username_secret_url": "https://kv-context-intel.vault.azure.net/secrets/context-intelligence-neo4j-user",
+    "password_secret_url": "https://kv-context-intel.vault.azure.net/secrets/context-intelligence-neo4j-password",
+    "version_policy": null
+  },
+  "plugins": [
+    {"name": "apoc", "version": "5.26.27", "filename": null, "sha256": null, "url": null, "bundled_path": null},
+    {"name": "gds", "version": "2.13.11", "filename": null, "sha256": null, "url": null, "bundled_path": null}
+  ]
+}
