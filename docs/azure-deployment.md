@@ -266,6 +266,70 @@ It is not deploy-ready and bootstrap refuses before guest effects.**
 Source ownership and deployment integration remain review decisions; authoring
 these files is not evidence of a deployed model, successful rebuild or S360 closure.
 
+#### Retained-plugin strategy for OS image upgrades
+
+**Goal: install verified APOC/GDS once on the retained data disk, not reinstall
+or redownload them on each OS image update.** This is the target strategy, not
+a deployed or accepted candidate.
+
+| Storage | Current layout (not independently verified) | TARGET lifecycle |
+|---|---|---|
+| Data disk | Whole ext4 filesystem at `/mnt/neo4j-data` | Retain same filesystem, `data_dir`, databases, transactions and system/auth stores |
+| Plugins | `/var/lib/neo4j/plugins` on OS disk | Prepare `/mnt/neo4j-data/plugins` once; reuse across OS replacements |
+| Configuration | `/etc/neo4j/neo4j.conf` on OS disk | Reconstruct on each replacement, pointing to retained plugins |
+
+Proposed setting: `server.directories.plugins=/mnt/neo4j-data/plugins`.
+There is **no data relocation or repartitioning**. Generic `/var/lib/neo4j`
+mount examples apply only where independently verified, not to this layout.
+
+**One-time authorized preparation, after mount verification:** copy existing
+approved, matching production JARs when available, checking against a trusted
+manifest SHA-256. Missing APOC may come from the matching Neo4j distribution's
+bundled JAR or an approved HTTPS exact-version artifact; missing GDS requires an
+approved HTTPS exact-version artifact. Validate SHA-256 and ZIP integrity before
+atomic no-clobber publication, then point configuration at retained plugins.
+Observed hashes alone do not establish trusted artifact provenance. Artifact URLs
+are not established. Unknown candidate inputs stay `null` until verified through
+private inputs.
+
+The JAR directory and every ancestor controlling its replacement must be
+root-controlled. The existing code's file policy is `root:<service-group>` JARs
+`0644`, new directories `0755`, readable by Neo4j. The mount root's actual numeric
+owner is unknown and requires authorized inspection/approval. Separating
+service-writable database subdirectories from root-controlled plugin trust
+still needs a code fix. **Do not change production ownership now:** no automatic
+chown of the mount root or stores, and no claim this layout is already ready.
+
+**Each OS replacement:** mount the same filesystem by UUID, never an ephemeral
+`sda` name; validate initialized database/system markers before installation.
+Wrong mounts block startup: no formatting or empty-database fallback. Reconstruct
+Java **21**, Neo4j package **`1:5.26.27`**, root helper, systemd and configuration
+from self-contained cloud-init customData plus the nonsecret manifest in the
+VMSS model. Future model updates must use repository-generated safe customData,
+never passwords. Hash-validate and **keep valid JARs unchanged: zero plugin GETs**.
+Ordinary Neo4j restarts validate only, without provisioning.
+
+Managed identity retrieves both pre-provisioned Key Vault username/password
+values into memory to validate existing auth, never reset/generate it or embed
+secrets in customData. Malformed, mismatched or unexpected JARs fail safely;
+never overwrite active JARs. Only missing JARs may provision from an explicit
+approved source before start—not on every normal upgrade. Plugin upgrades are
+separate, intentional compatible-version/manifest changes: APOC **5.26.27** and
+GDS **2.13.11** stay pinned, never implicit “latest” during monthly OS updates.
+Disk detach/reuse is **not backup**; snapshots and recovery remain separate.
+
+**Future acceptance—not yet executed:** an isolated fresh-OS retained clone must
+show unchanged JAR hashes/no plugin downloads, the same graph/auth credentials,
+exact versions, an actual APOC function, a GDS algorithm and API reconnect.
+Offline tests are not runtime, rebuild or PR CI proof. Layout compatibility,
+tcp6 handling and lint/type issues remain outstanding.
+This documentation closes no S360 finding.
+
+#### Candidate mechanics and validation limits
+
+The following describes candidate mechanics, not proof that the target above
+works. The reported-layout and ownership fix remains pending.
+
 This path is **only for an already initialized retained database on LUN 0**,
 on **Ubuntu 22.04**, with Neo4j Community **5.26.27**, APOC Core **5.26.27**
 and GDS **2.13.11**. It is not a fresh-database installer. Do not use the
@@ -290,8 +354,8 @@ For an owner-reviewed future render, copy the example to
 `deployment/neo4j/inputs.local.json` and fill **verified nonsecret inputs**:
 partition (`0` means the whole LUN), filesystem UUID/type, mount and data/transaction/
 plugin/store paths, regular-file markers in **both** initialized `neo4j` and
-`system` stores, retained UID/GID, exact Debian package version (including epoch
-only if verified), trusted armored repository key URL/SHA-256, exact JAR names/
+`system` stores, retained UID/GID, exact Debian package version (target
+`1:5.26.27`, to verify before use), trusted armored repository key URL/SHA-256, exact JAR names/
 URLs/SHA-256, selected managed-identity **client ID** and explicit secret-version
 policy. Do not substitute a principal/object ID for a client ID.
 Restore the actual selected nonsecret `neo4j.conf` text and its SHA-256; the
