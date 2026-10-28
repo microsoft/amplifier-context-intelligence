@@ -24,6 +24,16 @@ See [README.md](README.md) for full setup instructions.
 - `docs/` contains product documentation only. Put plans and fix designs in the
   workspace-root `docs/`, not in this repository's `docs/`.
 
+### Retained-store Neo4j cloud-init (review candidate)
+
+This candidate covers `deployment/neo4j/` and Step 2c of
+`docs/azure-deployment.md`, not the API or server runtime. The generated
+cloud-config is for review, not deployed infrastructure. Run the offline suite
+with `python3 -B -m unittest discover -s deployment/neo4j -p 'test_*.py' -v`.
+Never run the guest `bootstrap` on the development host; imports/rendering are
+side-effect-free with respect to guest operations. Real inputs/rendered configs
+stay git-ignored; clone/rebuild, guest and compliance acceptance remain separate.
+
 ---
 
 ## Project Structure
