@@ -256,70 +256,189 @@ vm:
 - Bring this VM up **before** the web app (producer before consumer):
   `amplifier-online up` from the manifest's directory.
 
-### 2c. Install Neo4j 5.26 LTS + APOC + GDS 2.13.11 via cloud-init
+### 2c. Retained-store Neo4j + APOC + GDS cloud-init (review candidate)
 
-Software is installed on first boot by the `cloud_init` file referenced above — not
-by hand. This project targets **Neo4j Community 5.26 LTS** with **GDS Community
-2.13.11** (the latest `2.13.x` patch — the `2.13` series pairs with the `5.26` line
-per the official
-[GDS ↔ Neo4j compatibility matrix](https://neo4j.com/docs/graph-data-science/current/installation/supported-neo4j-versions/);
-pin the newest patch so GDS loads on recent `5.26.x` releases). `./cloud-init.yaml`:
+The actual artifacts are [`deployment/neo4j/cloud-init.yaml`](../deployment/neo4j/cloud-init.yaml),
+[`bootstrap.py`](../deployment/neo4j/bootstrap.py), and
+[`inputs.example.json`](../deployment/neo4j/inputs.example.json).
+**The checked-in cloud-config deliberately contains unknown inputs as `null`.
+It is not deploy-ready and bootstrap refuses before guest effects.**
+Source ownership and deployment integration remain review decisions; authoring
+these files is not evidence of a deployed model, successful rebuild or S360 closure.
 
-```yaml
-#cloud-config
-package_update: true
-packages:
-  - openjdk-21-jre-headless        # Neo4j 5.26 requires Java 21
-  - wget
-  - gnupg
+#### Retained-plugin strategy for OS image upgrades
 
-runcmd:
-  # 1. Format + mount the persistent data disk at Neo4j's data dir
-  - |
-    set -euxo pipefail
-    DISK=$(lsblk -rno NAME,TYPE,MOUNTPOINT | awk '$2=="disk" && $3=="" {print "/dev/"$1}' | head -n1)
-    if ! blkid "$DISK"; then mkfs.ext4 -F "$DISK"; fi
-    mkdir -p /var/lib/neo4j
-    echo "$DISK /var/lib/neo4j ext4 defaults,nofail 0 2" >> /etc/fstab
-    mount -a
-  # 2. Install Neo4j Community 5.26 LTS (pin the 5.26 line; do NOT jump to CalVer 2026.xx)
-  - |
-    set -euxo pipefail
-    wget -qO- https://debian.neo4j.com/neotechnology.gpg.key | gpg --dearmor -o /usr/share/keyrings/neo4j.gpg
-    echo 'deb [signed-by=/usr/share/keyrings/neo4j.gpg] https://debian.neo4j.com stable 5' > /etc/apt/sources.list.d/neo4j.list
-    apt-get update
-    apt-get install -y neo4j=1:5.26.0
-  # 3. Plugins: APOC Core (bundled in labs/) + GDS 2.13.11 (downloaded)
-  - |
-    set -euxo pipefail
-    PLUGINS=/var/lib/neo4j/plugins; mkdir -p "$PLUGINS"
-    cp /var/lib/neo4j/labs/apoc-*-core.jar "$PLUGINS"/ || true
-    wget -qO "$PLUGINS/neo4j-graph-data-science-2.13.11.jar" \
-      https://graphdatascience.ninja/neo4j-graph-data-science-2.13.11.jar
-    chown -R neo4j:neo4j /var/lib/neo4j
-  # 4. Bind Bolt on the private interface + allow the plugin procedures.
-  #    Set ONLY `unrestricted` — an `allowlist` of apoc.*,gds.* would block the
-  #    built-in db.*/dbms.* procedures the server relies on.
-  - |
-    set -euxo pipefail
-    CONF=/etc/neo4j/neo4j.conf
-    sed -i 's/^#\?server.default_listen_address=.*/server.default_listen_address=0.0.0.0/' "$CONF"
-    sed -i 's/^#\?server.bolt.listen_address=.*/server.bolt.listen_address=0.0.0.0:7687/' "$CONF"
-    echo 'dbms.security.procedures.unrestricted=apoc.*,gds.*' >> "$CONF"
-  # 5. Set an initial password, then start. Capture the password into Key Vault
-  #    (kv-context-intel) out of band so the web app's NEO4J_PASSWORD secretRef matches.
-  - neo4j-admin dbms set-initial-password "$(openssl rand -base64 24)"
-  - systemctl enable neo4j
-  - systemctl restart neo4j
+**Goal: install verified APOC/GDS once on the retained data disk, not reinstall
+or redownload them on each OS image update.** This is the target strategy, not
+a deployed or accepted candidate.
+
+| Storage | Current layout (not independently verified) | TARGET lifecycle |
+|---|---|---|
+| Data disk | Whole ext4 filesystem at `/mnt/neo4j-data` | Retain same filesystem, `data_dir`, databases, transactions and system/auth stores |
+| Plugins | `/var/lib/neo4j/plugins` on OS disk | Prepare `/mnt/neo4j-data/plugins` once; reuse across OS replacements |
+| Configuration | `/etc/neo4j/neo4j.conf` on OS disk | Reconstruct on each replacement, pointing to retained plugins |
+
+Proposed setting: `server.directories.plugins=/mnt/neo4j-data/plugins`.
+There is **no data relocation or repartitioning**. Generic `/var/lib/neo4j`
+mount examples apply only where independently verified, not to this layout.
+
+**One-time authorized preparation, after mount verification:** copy existing
+approved, matching production JARs when available, checking against a trusted
+manifest SHA-256. Missing APOC may come from the matching Neo4j distribution's
+bundled JAR or an approved HTTPS exact-version artifact; missing GDS requires an
+approved HTTPS exact-version artifact. Validate SHA-256 and ZIP integrity before
+atomic no-clobber publication, then point configuration at retained plugins.
+Observed hashes alone do not establish trusted artifact provenance. Artifact URLs
+are not established. Unknown candidate inputs stay `null` until verified through
+private inputs.
+
+The JAR directory and every ancestor controlling its replacement must be
+root-controlled. The existing code's file policy is `root:<service-group>` JARs
+`0644`, new directories `0755`, readable by Neo4j. The mount root's actual numeric
+owner is unknown and requires authorized inspection/approval. Separating
+service-writable database subdirectories from root-controlled plugin trust
+still needs a code fix. **Do not change production ownership now:** no automatic
+chown of the mount root or stores, and no claim this layout is already ready.
+
+**Each OS replacement:** mount the same filesystem by UUID, never an ephemeral
+`sda` name; validate initialized database/system markers before installation.
+Wrong mounts block startup: no formatting or empty-database fallback. Reconstruct
+Java **21**, Neo4j package **`1:5.26.27`**, root helper, systemd and configuration
+from self-contained cloud-init customData plus the nonsecret manifest in the
+VMSS model. Future model updates must use repository-generated safe customData,
+never passwords. Hash-validate and **keep valid JARs unchanged: zero plugin GETs**.
+Ordinary Neo4j restarts validate only, without provisioning.
+
+Managed identity retrieves both pre-provisioned Key Vault username/password
+values into memory to validate existing auth, never reset/generate it or embed
+secrets in customData. Malformed, mismatched or unexpected JARs fail safely;
+never overwrite active JARs. Only missing JARs may provision from an explicit
+approved source before start—not on every normal upgrade. Plugin upgrades are
+separate, intentional compatible-version/manifest changes: APOC **5.26.27** and
+GDS **2.13.11** stay pinned, never implicit “latest” during monthly OS updates.
+Disk detach/reuse is **not backup**; snapshots and recovery remain separate.
+
+**Future acceptance—not yet executed:** an isolated fresh-OS retained clone must
+show unchanged JAR hashes/no plugin downloads, the same graph/auth credentials,
+exact versions, an actual APOC function, a GDS algorithm and API reconnect.
+Offline tests are not runtime, rebuild or PR CI proof. Layout compatibility,
+tcp6 handling and lint/type issues remain outstanding.
+This documentation closes no S360 finding.
+
+#### Candidate mechanics and validation limits
+
+The following describes candidate mechanics, not proof that the target above
+works. The reported-layout and ownership fix remains pending.
+
+This path is **only for an already initialized retained database on LUN 0**,
+on **Ubuntu 22.04**, with Neo4j Community **5.26.27**, APOC Core **5.26.27**
+and GDS **2.13.11**. It is not a fresh-database installer. Do not use the
+stack's 24.04 default for this candidate. The helper explicitly installs
+`openjdk-21-jre-headless` after storage guards and selects the package's Java 21
+for the Neo4j service; it does not change global Java alternatives.
+
+**Offline authoring commands, from the repository root** (Python 3.10+ stdlib;
+no install, cloud access, guest execution or secrets are needed):
+
+```bash
+# Reproduce the checked-in, intentionally incomplete candidate.
+python3 -B deployment/neo4j/bootstrap.py render \
+  --manifest deployment/neo4j/inputs.example.json \
+  --output deployment/neo4j/cloud-init.yaml --candidate
+
+# Run only the isolated offline tests, not the server/Neo4j fixtures.
+python3 -B -m unittest discover -s deployment/neo4j -p 'test_*.py' -v
 ```
 
-After first boot, confirm the plugins loaded (`az vm run-command` — there is no
-public SSH):
+For an owner-reviewed future render, copy the example to
+`deployment/neo4j/inputs.local.json` and fill **verified nonsecret inputs**:
+partition (`0` means the whole LUN), filesystem UUID/type, mount and data/transaction/
+plugin/store paths, regular-file markers in **both** initialized `neo4j` and
+`system` stores, retained UID/GID, exact Debian package version (target
+`1:5.26.27`, to verify before use), trusted armored repository key URL/SHA-256, exact JAR names/
+URLs/SHA-256, selected managed-identity **client ID** and explicit secret-version
+policy. Do not substitute a principal/object ID for a client ID.
+Restore the actual selected nonsecret `neo4j.conf` text and its SHA-256; the
+validator accepts a deliberately narrow settings set, not arbitrary JVM/APOC
+hooks. Unknown settings fail rather than being silently discarded.
+Filled manifests, rendered local YAML, `.conf` and `.env` files in this directory
+are ignored; never commit their real identity/configuration values.
 
-```cypher
-RETURN apoc.version();
-RETURN gds.version();
+```bash
+python3 -B deployment/neo4j/bootstrap.py validate \
+  --manifest deployment/neo4j/inputs.local.json
+python3 -B deployment/neo4j/bootstrap.py render \
+  --manifest deployment/neo4j/inputs.local.json \
+  --output deployment/neo4j/cloud-init.local.yaml
 ```
+
+Rendering is deterministic and atomic; invalid strict inputs leave output
+untouched. The decoded cloud-config must fit Azure's **65,535-byte** limit.
+It embeds the exact helper and manifest as root-owned `0600` files with one
+argv-form `python3 -I` bootstrap command (isolated imports). Guest CLI commands
+require root and check both files and **every ancestor** for root ownership,
+no symlinks and no group/world write permission before loading the manifest.
+Offline `validate`/`render` still work for ordinary-user input files.
+There is no top-level `packages`/`package_update`
+that could install or start Neo4j ahead of the disk guards.
+
+On a **separately authorized isolated clone**, the guest helper checks the LUN,
+partition parent/number, UUID, filesystem, exact mount, initialized stores and
+ownership before package operations. It never formats, recursively chowns,
+initializes a replacement DB, resets auth or overwrites an existing JAR.
+It persists a UUID mount requirement, masks Neo4j and temporarily inhibits
+package autostart (restoring any original policy bytes/mode even on failure).
+It reuses matching retained JARs without fetching, otherwise provisions missing
+APOC from an exact hash-checked package bundle or approved URL and GDS from its
+approved URL, validating SHA-256 and ZIP integrity before atomic no-clobber publish.
+The plugin directory, retained mount root and all plugin ancestors must be
+root-controlled, not service-owned or group/world writable; existing JARs must
+also be root-owned. The plugin directory is `0755`, JARs `0644`, with the verified
+service GID. **Database/transaction/system-store subdirectories keep the verified
+Neo4j UID/GID.** An incompatible retained layout fails without chmod/chown repair.
+An owner-approved one-time layout preparation is a separate prerequisite, not
+permission to alter the unknown production layout or move its data here.
+
+The explicit managed identity retrieves **both** existing credential references
+(`context-intelligence-neo4j-user` and `context-intelligence-neo4j-password` in the
+designated vault). Latest versus pinned versions must be selected explicitly.
+Values stay in memory, never customData, argv, persistent files or logs; the
+helper never writes the vault. A root every-start guard checks storage/config/
+JARs and credential availability; IMDS must return the selected client ID,
+Bearer token type and vault audience (`https://vault.azure.net`, optionally one
+trailing slash). Bootstrap and every-start preflight reject an occupied `7474`
+before mounting/installing or retrieving credentials, respectively.
+
+Before sending Basic credentials, the root post-start probe connects to literal
+`127.0.0.1:7474` and matches that **connected peer's accepted socket inode** from
+`/proc/net/tcp` to file descriptors in the actual unit's process group. It checks
+`systemctl show` MainPID/ControlGroup and `/proc/*/cgroup`; this candidate requires
+the standard `/system.slice/neo4j.service` cgroup. An unavailable, ambiguous or
+wrong-unit proof fails closed. No proxy, redirects or automatic reconnect are
+allowed. The same live socket then authenticates the unchanged retained auth
+store and verifies exact Community/kernel/APOC/GDS versions.
+
+Only HTTP `502`/`503`, connection availability failures and Neo4j
+`Neo.TransientError.*` responses are retried for these read-only metadata queries.
+Authentication, missing plugins and version mismatches fail immediately.
+Readiness has a hard **120-second total deadline**, including vault retrieval,
+and per-request timeouts at most 10 seconds. Root systemd pre/post hooks use
+`python3 -I`; the start timeout is 240 seconds and the vendor's **stop timeout is
+not overridden**. After an owned startup failure, stop is best effort and masking
+is always attempted even if stop times out. The original failure is preserved.
+
+CLI failures report only JSON `stage` and allowlisted `code` (or generic `REFUSED`),
+never exception text, HTTP bodies or values. Independent cleanup failures add
+only fixed `cleanup.stop`/`cleanup.mask` codes in `cleanup`; they do not replace
+the original diagnostic. For example, `storage.uid`, `path.root_trust` and
+`readiness.peer` identify the boundary to inspect without disclosing inputs.
+
+**Offline tests and cloud-init schema validation are not a rebuild proof.**
+Fresh-OS/package installation, real Key Vault/auth continuity, an APOC function,
+a GDS algorithm, application reconnect/no-lost-events, manual recovery, VMSS Flex
+automatic OS upgrade and production compliance acceptance still require their
+own authorized validation. This section authorizes no deployment, Run Command,
+guest installation or production changes.
 
 ### 2d. How the web app reaches it
 

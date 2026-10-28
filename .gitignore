@@ -19,3 +19,13 @@ MagicMock/
 # scripts/seed-entra-identities.sh and scripts/entra-identities.example.json.
 scripts/entra-identities.local.json
 entra-identities.local.json
+
+# Retained Neo4j: filled inputs/configs carry real identity and guest details.
+# Only the null-input example and generated review candidate belong in source.
+/deployment/neo4j/*.json
+!/deployment/neo4j/inputs.example.json
+/deployment/neo4j/*.yaml
+!/deployment/neo4j/cloud-init.yaml
+/deployment/neo4j/*.conf
+/deployment/neo4j/*.env
+/deployment/neo4j/local/
