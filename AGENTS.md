@@ -34,6 +34,11 @@ Never run the guest `bootstrap` on the development host; imports/rendering are
 side-effect-free with respect to guest operations. Real inputs/rendered configs
 stay git-ignored; clone/rebuild, guest and compliance acceptance remain separate.
 
+Retained-plugin OS-upgrade strategy is owned by
+[`docs/azure-deployment.md`, Step 2c](docs/azure-deployment.md#retained-plugin-strategy-for-os-image-upgrades):
+retain approved JARs, rebuild OS tooling/config; layout fixes and clone acceptance
+remain pending. Do not duplicate the strategy here or treat it as deployed.
+
 ---
 
 ## Project Structure
