@@ -2,8 +2,11 @@
 
 import asyncio
 import contextlib
+import gc
 import json
 import logging
+import weakref
+from types import SimpleNamespace
 from pathlib import Path
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -17,6 +20,91 @@ from context_intelligence_server.auth import BearerTokenMiddleware
 from context_intelligence_server.main import app, lifespan, registry
 from context_intelligence_server.models import CypherRequest
 from tests.conftest import MockNeo4jDriver
+
+
+@pytest.mark.parametrize("case", ["zero", "empty", "skipped", "multi", "disabled"])
+async def test_startup_payload_retention(tmp_path, monkeypatch, case):
+    """Real startup stays suspended in sweep, without its last probe payload."""
+    from context_intelligence_server.queue_manager import QueueManager
+    from context_intelligence_server.registry import SessionRegistry
+
+    qm = QueueManager(tmp_path / "startup-retention")
+    reg = SessionRegistry()
+    reg._queue_manager = qm
+    count = 3 if case in ("multi", "disabled") else int(case == "skipped")
+    for index in range(count):
+        await qm.append(f"startup-{index}", json.dumps({
+            "event": "tool:pre", "workspace": "/ws",
+            "data": {"session_id": f"startup-{index}",
+                     "payload": chr(65 + index) * (1 << 20)},
+        }).encode())
+    observed, recovered_ids, reclaim_live = [], [], []
+    original_read, original_reclaim = qm.read_batch, qm.reclaim_drained_orphans
+    sweep_entered, park = asyncio.Event(), asyncio.Event()
+
+    def live_count():
+        gc.collect()
+        return sum(ref() is not None for ref, _ in observed)
+
+    async def read(sid, max_items):
+        batch = await original_read(sid, max_items)
+        observed.extend((weakref.ref(r), len(r.raw)) for r in batch.records)
+        # Let to_thread's completed Future callbacks release their own result.
+        # The wrapper still owns batch; only startup owns it after this return.
+        checkpoint = asyncio.Event()
+        asyncio.get_running_loop().call_soon(checkpoint.set)
+        await asyncio.wait_for(checkpoint.wait(), 5)
+        return batch
+
+    async def reclaim():
+        reclaim_live.append(live_count())  # Before any reclaim await.
+        return await original_reclaim()
+
+    async def empty_recover():
+        return ["empty"]
+
+    def recover_one(sid, raw, get_or_create):
+        assert len(raw) > (1 << 20)
+        recovered_ids.append(sid)  # Deliberately do not own raw or Record.
+        return case != "skipped"
+
+    async def sweep(interval, limit):
+        assert interval == 1 and limit == 3
+        sweep_entered.set()
+        await park.wait()
+
+    monkeypatch.setattr(main_module, "registry", reg)
+    monkeypatch.setattr(main_module, "_settings", SimpleNamespace(
+        crash_recovery_respawn_limit=3,
+        crash_recovery_sweep_interval_seconds=0 if case == "disabled" else 1,
+    ))
+    monkeypatch.setattr(qm, "read_batch", read)
+    monkeypatch.setattr(qm, "reclaim_drained_orphans", reclaim)
+    if case == "empty":
+        monkeypatch.setattr(qm, "recover", empty_recover)
+    monkeypatch.setattr(main_module, "_recover_one_session", recover_one)
+    monkeypatch.setattr(main_module, "_crash_recovery_sweep_loop", sweep)
+    test_app = SimpleNamespace(state=SimpleNamespace(recovery_complete=asyncio.Event()))
+    task = asyncio.create_task(main_module._startup_recovery_body(test_app))
+    try:
+        if case == "disabled":
+            await asyncio.wait_for(asyncio.shield(task), 5)
+            assert not sweep_entered.is_set()
+        else:
+            await asyncio.wait_for(sweep_entered.wait(), 5)
+            assert not task.done(), "must measure the still-live startup coroutine"
+        assert test_app.state.recovery_complete.is_set()
+        assert reg._accepted_total == count and reg._written_total == 0
+        assert len(recovered_ids) == count
+        assert len(observed) == count
+        assert all(size > (1 << 20) for _, size in observed)
+        assert reclaim_live == [0], "startup retained its last probe before reclaim"
+        assert live_count() == 0, "startup retained its last probe during sweep"
+    finally:
+        if not task.done():
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 5)
 
 
 @pytest.fixture(autouse=True)

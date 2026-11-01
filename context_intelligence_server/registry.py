@@ -595,6 +595,8 @@ class SessionRegistry:
         # ends in a dead-letter, the transient one is unbounded and never does.
         transient_attempts = 0
 
+        batch: Batch | None = None
+        committed_records: list[Record] | None = None
         while True:
             try:
                 batch = await qm.read_batch(session_id, max_items=self.drain_batch_size)
@@ -801,6 +803,10 @@ class SessionRegistry:
                 await self._safe_close(worker)
                 self._deregister(session_id)  # See the note above.
                 return
+            finally:
+                # Iteration ownership ends before the next read or idle await.
+                batch = None
+                committed_records = None
 
     @staticmethod
     def _parse_line(
