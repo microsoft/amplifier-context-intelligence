@@ -367,12 +367,17 @@ async def _startup_recovery_body(app: FastAPI) -> None:
         to_process = recovered
         deferred_count = 0
     respawned = 0
+    batch = None
     for sid in to_process:
-        batch = await registry.queue_manager.read_batch(sid, max_items=1)
-        if not batch.lines:
-            continue
-        if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
-            respawned += 1
+        try:
+            batch = await registry.queue_manager.read_batch(sid, max_items=1)
+            if not batch.lines:
+                continue
+            if _recover_one_session(sid, batch.lines[0], registry.get_or_create):
+                respawned += 1
+        finally:
+            # A probe payload must not survive into reclaim or the permanent sweep.
+            batch = None
     if deferred_count:
         # WARNING, not INFO, on purpose: a deferred backlog must never be a
         # silent, un-discoverable fact. Names the exact counts and the
