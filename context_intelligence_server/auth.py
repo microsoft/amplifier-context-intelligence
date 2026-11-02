@@ -5,22 +5,18 @@ import json
 import logging
 from collections.abc import Callable, MutableMapping
 from typing import Any
+from urllib.parse import quote
 
-import jwt  # pyjwt[crypto] — added in T1; used by EntraResolver
-from jwt import PyJWKClient
+from starlette.concurrency import run_in_threadpool
 from typing_extensions import Protocol
 
-_log = logging.getLogger(__name__)
+from context_intelligence_server.mise_validation import (
+    MiseTokenValidator,
+    TokenValidationError,
+    TokenValidator,
+)
 
-# JWKS signing-key cache TTL passed to PyJWKClient.
-#
-# PyJWKClient handles per-kid caching and lifespan-bounded refresh natively;
-# making the value explicit here keeps the contract visible in code even
-# though 300 s matches the library default.  No custom per-kid dedup lock
-# or global refresh cap is built for the pilot (council/cranky: pilot-scale
-# does not justify that complexity — revisit at scale if stampede behaviour
-# is observed in production metrics).
-JWKS_CACHE_LIFESPAN_SECONDS: int = 300
+_log = logging.getLogger(__name__)
 
 # Paths that are exempt from authentication: health checks, version info, and
 # the developer-facing OpenAPI/Swagger surface (/docs, /openapi.json). This is
@@ -114,9 +110,9 @@ class PrincipalResolver(Protocol):
     capability deps (``require_write`` / ``require_read``) can gate service
     principals without re-parsing the token.
 
-    Only one concrete implementation exists today: :class:`StaticKeyResolver`.
-    The ``EntraResolver`` (JWT via JWKS) is added in T4.  Do NOT add a third
-    resolver without a separate design review.
+    Implementations are :class:`StaticKeyResolver` and :class:`EntraResolver`
+    (token authenticity via MISE). Do NOT add a third resolver without a
+    separate design review.
 
     M2 protocol change: ``resolve()`` previously returned
     ``tuple[str, list[str]] | None``.  Changed to
@@ -136,7 +132,12 @@ class PrincipalResolver(Protocol):
         ...
 
     def resolve(
-        self, token: str, *, admin_path: bool = False
+        self,
+        token: str,
+        *,
+        original_uri: str,
+        original_method: str,
+        admin_path: bool = False,
     ) -> tuple[str, list[str], bool] | None:
         """Return ``(contributor_id, roles, is_service)`` or ``None`` if token not recognised.
 
@@ -149,6 +150,10 @@ class PrincipalResolver(Protocol):
         ``is_service`` is ``True`` for app/service tokens (no ``scp`` claim,
         routed through the service branch); ``False`` for delegated user tokens
         and static-key tokens.
+
+        ``original_uri`` and ``original_method`` come from the inbound ASGI
+        scope, not caller-supplied forwarding headers. Entra passes them to its
+        token validator; static-key resolution ignores them.
 
         ``admin_path`` (keyword-only, default ``False``) signals that the
         request targets an ``/admin/*`` route. When ``True``, ``EntraResolver``
@@ -163,13 +168,11 @@ class PrincipalResolver(Protocol):
 
 
 class EntraResolver:
-    """Resolves Entra RS256 bearer tokens to contributor ids.
+    """Resolves MISE-validated Entra bearer tokens to contributor ids.
 
-    Mirrors ``validate_entra_token()`` from Team Pulse
-    (``amplifier-app-team-pulse`` / ``team_pulse/identity/extractors.py``):
-    PyJWKClient → ``jwt.decode`` with ``algorithms=["RS256"]``, dual audience,
-    explicit ``tid`` + ``scp`` + ``oid`` checks, then ``oid → contributor_id``
-    lookup via *identity_map*.
+    Token authenticity is delegated to the application ``TokenValidator``.
+    Explicit ``tid`` + ``scp`` + ``oid`` checks and ``oid → contributor_id``
+    lookup via *identity_map* remain application-owned.
 
     M2: adds a second branch for app/service tokens (no ``scp``) selected by
     a ``scp``-presence discriminator, authorized by App-Role alone, with a
@@ -182,8 +185,8 @@ class EntraResolver:
         :class:`AuthError` (403): Token is cryptographically valid but the
             lowercased ``oid`` is not in *identity_map* (user branch), or no
             qualifying App Role is present (service branch).
-        RuntimeError: At construction if eager JWKS prefetch fails — the server
-            must refuse to start rather than lazily fail at first request (§8b).
+        RuntimeError: At construction if MISE initialization fails — the server
+            must refuse to start rather than lazily fail at first request.
 
     Args:
         client_id:            Azure App Registration client ID (GUID).
@@ -204,13 +207,8 @@ class EntraResolver:
         service_data_role:    App Role name granting write access.  ``""`` disables.
         reader_role:          App Role name granting read-only access.  ``""`` disables.
         entra_admin_role:     App Role name granting admin access.  ``""`` disables.
-        jwks_client:          Injectable JWKS client for tests.
-
-    Note — JWKS caching (T5):
-        Per-``kid`` caching and lifespan-bounded refresh are handled by
-        ``PyJWKClient`` (``lifespan=JWKS_CACHE_LIFESPAN_SECONDS``).  No custom
-        per-``kid`` dedup lock or global refresh cap is built for the pilot;
-        revisit at scale if stampede behaviour appears in production metrics.
+        validator:            Injectable application token validator. The default
+                              checks the localhost sidecar once at startup.
     """
 
     def __init__(
@@ -223,71 +221,33 @@ class EntraResolver:
         service_data_role: str = "",  # NEW (M2)
         reader_role: str = "",  # NEW (M2)
         entra_admin_role: str = "",  # NEW (M2)
-        jwks_client: Any = None,
+        validator: TokenValidator | None = None,
     ) -> None:
-        self._client_id = client_id
         self._tenant_id = tenant_id
         self._identity_map = identity_map
         # M2 service-path config — fail-closed defaults (empty disables each role).
-        self._service_identity_map: dict[str, str] = service_identity_map or {}
+        self._service_identity_map: dict[str, str] = (
+            service_identity_map if service_identity_map is not None else {}
+        )
         self._service_data_role = service_data_role
         self._reader_role = reader_role
         self._entra_admin_role = entra_admin_role
-        # Accept both the bare client GUID (ID-token aud) and the api:// form
-        # (access-token aud when access_as_user scope is exposed).  Matches
-        # the Team Pulse mirror and the Q-AUD confirmation from §2b.
-        self._expected_aud = [client_id, f"api://{client_id}"]
-        self._expected_issuer = f"https://login.microsoftonline.com/{tenant_id}/v2.0"
-
-        if jwks_client is None:
-            jwks_uri = (
-                f"https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys"
-            )
-            jwks_client = PyJWKClient(jwks_uri, lifespan=JWKS_CACHE_LIFESPAN_SECONDS)
-
-        # Eager prefetch — fail-closed at startup (§8b / crusty gate).
-        # Called regardless of whether the client was injected or built by
-        # default so that tests can inject a _FailingJWKSClient and verify
-        # the fail-closed guarantee.
-        # Per-kid caching and lifespan-bounded refresh are handled by
-        # PyJWKClient (lifespan=JWKS_CACHE_LIFESPAN_SECONDS).  No custom
-        # per-kid dedup lock or global refresh cap is built for the pilot.
-        try:
-            jwks_client.fetch_data()
-        except Exception as exc:  # noqa: BLE001 — any failure is fatal here
-            raise RuntimeError(
-                f"EntraResolver: JWKS prefetch failed for tenant "
-                f"{tenant_id!r} — server cannot start without a reachable "
-                f"JWKS endpoint.  Cause: {exc}"
-            ) from exc
-
-        # Guard: a reachable-but-empty JWKS ({"keys": []}) would let
-        # construction succeed but then 401 every request lazily.  Detect it
-        # here so the server refuses to start rather than silently degrading.
-        # Uses get_jwk_set() if available; stubs that pre-date this check
-        # (AttributeError) are tolerated — all production PyJWKClient
-        # instances expose the method.
-        try:
-            jwk_set = jwks_client.get_jwk_set()
-        except AttributeError:
-            pass  # Pre-existing stub without get_jwk_set() — skip the check
-        else:
-            if not jwk_set.keys:
-                raise RuntimeError(
-                    f"EntraResolver: JWKS endpoint returned zero signing keys "
-                    f"for tenant {tenant_id!r} — server cannot start without "
-                    f"signing keys."
-                )
-
-        self._jwks_client = jwks_client
+        self._validator: TokenValidator = (
+            validator if validator is not None else MiseTokenValidator()
+        )
 
     @property
     def auth_enabled(self) -> bool:
-        """Always True — EntraResolver is always active (identity map is non-empty by construction)."""
+        """Always True — EntraResolver is active even with an empty identity map."""
         return True
 
     def resolve(
-        self, token: str, *, admin_path: bool = False
+        self,
+        token: str,
+        *,
+        original_uri: str,
+        original_method: str,
+        admin_path: bool = False,
     ) -> tuple[str, list[str], bool]:
         """Validate Entra JWT; return (contributor_id, roles, is_service).
 
@@ -317,23 +277,20 @@ class EntraResolver:
             AuthError(403): Valid user token with unmapped ``oid``, or valid
                 service token with no qualifying App Role [D7].
         """
-        # ---- SHARED VALIDATION (both paths) — UNCHANGED from V1 ----
+        # Shared token authenticity is application-injected; never cache claims.
         try:
-            key = self._jwks_client.get_signing_key_from_jwt(token).key
-            claims = jwt.decode(
+            claims = self._validator.validate(
                 token,
-                key,
-                algorithms=["RS256"],  # H1: pin RS256, reject alg=none / HS256
-                audience=self._expected_aud,  # B7: aud enforced here
-                issuer=self._expected_issuer,  # B7: iss enforced here
-                options={"require": ["exp", "iss", "aud"]},
+                original_uri=original_uri,
+                original_method=original_method,
             )
-        except jwt.PyJWTError as exc:
-            # Covers: InvalidSignatureError, ExpiredSignatureError,
-            # InvalidAudienceError, InvalidIssuerError, InvalidAlgorithmError,
-            # MissingRequiredClaimError, PyJWKClientError, ImmatureSignatureError
-            # (nbf), and all other PyJWT validation failures.
-            raise AuthError(401, f"Invalid bearer token: {exc}") from exc
+        except TokenValidationError:
+            raise AuthError(401, "Missing or invalid bearer token") from None
+
+        # MISE returns singleton claims as scalars; existing role policy expects lists.
+        roles_claim = claims.get("roles")
+        if isinstance(roles_claim, str):
+            claims = {**claims, "roles": [roles_claim]}
 
         # Explicit tid check — defense-in-depth alongside the issuer pin.
         # A v2 Entra token's iss already encodes the tenant, but the explicit
@@ -531,7 +488,12 @@ class StaticKeyResolver:
         return not self._keystore
 
     def resolve(
-        self, token: str, *, admin_path: bool = False
+        self,
+        token: str,
+        *,
+        original_uri: str = "",
+        original_method: str = "",
+        admin_path: bool = False,
     ) -> tuple[str, list[str], bool] | None:
         """Return ``(contributor_id, [], False)`` for *token*, or ``None`` on a miss.
 
@@ -547,7 +509,8 @@ class StaticKeyResolver:
         authorization goes through the admin-key fast-path (matched before
         this resolver is ever called), not identity-map membership.
         """
-        _ = admin_path  # unused: static-mode admin uses the admin-key fast-path
+        # Request context is unused; static-mode admin uses the admin-key fast-path.
+        _ = admin_path, original_uri, original_method
         contributor_id = _resolve_token(token, self._keystore)
         if contributor_id is None:
             return None
@@ -718,7 +681,48 @@ class BearerTokenMiddleware:
             # /admin/* (bootstrap): an unbound-but-valid delegated token reaches
             # require_admin, which then authorizes on the role claim. On every
             # non-admin path admin_path=False, so an unmapped oid is still 403.
-            result = self.resolver.resolve(token, admin_path=is_admin_path)
+            # Assemble components directly: decoded '?'/'#' belong to the path,
+            # never to URI query/fragment delimiters. Forwarding headers are unused.
+            scheme = scope.get("scheme") or "http"
+            authority = next(
+                (
+                    value.decode("latin-1")
+                    for name, value in scope.get("headers", [])
+                    if name.lower() == b"host"
+                ),
+                None,
+            )
+            if authority is None and scope.get("server") is not None:
+                host, port = scope["server"]
+                if ":" in host and not host.startswith("["):
+                    host = f"[{host}]"
+                authority = host
+                if port is not None and (scheme, port) not in {
+                    ("http", 80),
+                    ("https", 443),
+                }:
+                    authority = f"{host}:{port}"
+            raw_path = scope.get("raw_path")
+            request_path = (
+                raw_path.decode("latin-1")
+                if raw_path is not None
+                else quote(path, safe="/:@!$&'()*+,;=")
+            )
+            request_uri = (
+                f"{scheme}://{authority}{request_path}"
+                if authority is not None
+                else request_path
+            )
+            query = scope.get("query_string", b"").decode("latin-1")
+            if query:
+                request_uri += f"?{query}"
+            result = await run_in_threadpool(
+                self.resolver.resolve,
+                token,
+                original_uri=request_uri,
+                original_method=scope.get("method", ""),
+                admin_path=is_admin_path,
+            )
         except AuthError as exc:
             # EntraResolver (and future resolvers) raise AuthError to communicate
             # 401 vs 403.  Dispatch the status code directly.
@@ -731,18 +735,18 @@ class BearerTokenMiddleware:
             )
             await _send_error(send, exc.status_code, exc.reason)
             return
-        except Exception:
+        except Exception:  # noqa: BLE001 — deny without exposing resolver diagnostics
             # Defense-in-depth catch-all: any unexpected exception from the
             # resolver (e.g. a transient library bug) must not propagate as a
             # 500 — respond fail-closed (401) and log loudly for operators.
             # auth_event=resolver_unexpected_exception distinguishes this from
             # a normal auth denial so operators can grep specifically for it.
-            # The raw token is intentionally NOT logged (credential hygiene).
+            # Do not log exception messages/tracebacks: a validator failure may
+            # contain the raw token or native diagnostics (credential hygiene).
             _log.error(
                 "auth_event=resolver_unexpected_exception: unexpected error in "
                 "resolver.resolve() — denying request fail-closed "
-                "(investigate exc_info below)",
-                exc_info=True,
+                "(diagnostics suppressed to protect credentials)",
             )
             await _send_401(send)
             return

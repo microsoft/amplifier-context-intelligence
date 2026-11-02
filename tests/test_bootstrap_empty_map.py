@@ -30,6 +30,8 @@ from typing import Any
 
 import pytest
 
+from tests.conftest import ApplicationTokenValidator
+
 # ---------------------------------------------------------------------------
 # Fake constants -- never real credentials, OIDs, or keys
 # ---------------------------------------------------------------------------
@@ -48,55 +50,13 @@ FAKE_FIRST_DATA_KEY_DIGEST = hashlib.sha256(
 ).hexdigest()
 
 
-# ---------------------------------------------------------------------------
-# JWKS stubs (no network) -- mirrors tests/routers/test_admin_auth.py
-# ---------------------------------------------------------------------------
-
-
-class _StubSigningKey:
-    def __init__(self, key: Any) -> None:
-        self.key = key
-
-
-class _StubJWKSClient:
-    """Stub JWKS client that returns a fixed RSA public key."""
-
-    def __init__(self, public_key: Any) -> None:
-        self._key = _StubSigningKey(public_key)
-
-    def fetch_data(self) -> None:
-        pass
-
-    def get_signing_key_from_jwt(self, token: str) -> _StubSigningKey:
-        return self._key
-
-    def get_jwk_set(self) -> Any:
-        _k = self._key
-
-        class _FakeJWKSet:
-            keys = [_k]
-
-        return _FakeJWKSet()
-
-
-@pytest.fixture(scope="module")
-def rsa_keypair() -> tuple[Any, Any]:
-    """Generate a 2048-bit RSA keypair for entra JWT signing (module scope)."""
-    from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: PLC0415
-
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    return private_key, private_key.public_key()
-
-
 def _make_entra_token(
-    private_key: Any,
+    validator: ApplicationTokenValidator,
     *,
     oid: str = FAKE_OID_UNBOUND,
     roles: list[str] | None = None,
 ) -> str:
-    """Mint a real RS256 JWT for entra bootstrap tests."""
-    import jwt as pyjwt  # noqa: PLC0415
-
+    """Issue an opaque handle for bootstrap policy, not token authenticity."""
     now = int(time.time())
     claims: dict[str, Any] = {
         "oid": oid,
@@ -109,7 +69,7 @@ def _make_entra_token(
     }
     if roles is not None:
         claims["roles"] = roles
-    return pyjwt.encode(claims, private_key, algorithm="RS256")
+    return validator.issue(claims)
 
 
 def _entra_settings_empty_map(tmp_path: Path) -> Any:
@@ -164,20 +124,19 @@ class TestBootWithEmptyMapLogsWarning:
     def test_entra_boots_with_empty_map_and_logs_warning(
         self,
         tmp_path: Path,
-        rsa_keypair: tuple[Any, Any],
+        application_validator: ApplicationTokenValidator,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """entra: empty entra_identities boots successfully and logs a WARNING."""
         from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
-        _private_key, public_key = rsa_keypair
         settings = _entra_settings_empty_map(tmp_path)
 
         with caplog.at_level(
             logging.WARNING, logger="context_intelligence_server.main"
         ):
             middleware = create_asgi_app(
-                settings=settings, _jwks_client=_StubJWKSClient(public_key)
+                settings=settings, _token_validator=application_validator
             )
 
         assert middleware is not None
@@ -236,16 +195,15 @@ class TestEntraAdminBootstrapExemption:
 
     @pytest.fixture
     async def entra_empty_map_client(
-        self, tmp_path: Path, rsa_keypair: tuple[Any, Any]
+        self, tmp_path: Path, application_validator: ApplicationTokenValidator
     ):
         import httpx  # noqa: PLC0415
 
         from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
-        _private_key, public_key = rsa_keypair
         settings = _entra_settings_empty_map(tmp_path)
         middleware = create_asgi_app(
-            settings=settings, _jwks_client=_StubJWKSClient(public_key)
+            settings=settings, _token_validator=application_validator
         )
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=middleware),
@@ -256,13 +214,12 @@ class TestEntraAdminBootstrapExemption:
     async def test_admin_token_not_in_map_can_bootstrap_identity(
         self,
         entra_empty_map_client,
-        rsa_keypair: tuple[Any, Any],
+        application_validator: ApplicationTokenValidator,
     ) -> None:
         """Item 3: IdentityAdmin token, oid NOT in map -> PUT /admin/identities/{oid}
         200; a subsequent GET shows the new entry."""
-        private_key, _public_key = rsa_keypair
         token = _make_entra_token(
-            private_key, oid=FAKE_OID_UNBOUND, roles=["IdentityAdmin"]
+            application_validator, oid=FAKE_OID_UNBOUND, roles=["IdentityAdmin"]
         )
         headers = {"Authorization": f"Bearer {token}"}
 
@@ -285,13 +242,12 @@ class TestEntraAdminBootstrapExemption:
         )
 
     async def test_admin_token_empty_map_lists_no_identities(
-        self, entra_empty_map_client, rsa_keypair: tuple[Any, Any]
+        self, entra_empty_map_client, application_validator: ApplicationTokenValidator
     ) -> None:
         """Item 4: IdentityAdmin token, empty map -> GET /admin/identities 200
         {"identities": []}."""
-        private_key, _public_key = rsa_keypair
         token = _make_entra_token(
-            private_key, oid=FAKE_OID_UNBOUND, roles=["IdentityAdmin"]
+            application_validator, oid=FAKE_OID_UNBOUND, roles=["IdentityAdmin"]
         )
         headers = {"Authorization": f"Bearer {token}"}
 
@@ -300,13 +256,12 @@ class TestEntraAdminBootstrapExemption:
         assert resp.json() == {"identities": []}
 
     async def test_non_admin_token_unbound_oid_403_on_admin_put(
-        self, entra_empty_map_client, rsa_keypair: tuple[Any, Any]
+        self, entra_empty_map_client, application_validator: ApplicationTokenValidator
     ) -> None:
         """Item 5: NON-admin token (roles=[]), unbound oid -> PUT /admin/* 403
         (require_admin still enforces the role, even though the map-membership
         check was exempted for this path)."""
-        private_key, _public_key = rsa_keypair
-        token = _make_entra_token(private_key, oid=FAKE_OID_UNBOUND, roles=[])
+        token = _make_entra_token(application_validator, oid=FAKE_OID_UNBOUND, roles=[])
         headers = {"Authorization": f"Bearer {token}"}
 
         resp = await entra_empty_map_client.put(
@@ -317,7 +272,7 @@ class TestEntraAdminBootstrapExemption:
         assert resp.status_code == 403
 
     async def test_admin_token_unbound_oid_403_on_data_route(
-        self, entra_empty_map_client, rsa_keypair: tuple[Any, Any]
+        self, entra_empty_map_client, application_validator: ApplicationTokenValidator
     ) -> None:
         """Item 6: IdentityAdmin token, oid NOT in map -> POST /events 403.
 
@@ -325,9 +280,8 @@ class TestEntraAdminBootstrapExemption:
         /admin/* paths -- it must never leak to data routes, even for an
         admin-role-holder whose own oid isn't yet mapped.
         """
-        private_key, _public_key = rsa_keypair
         token = _make_entra_token(
-            private_key, oid=FAKE_OID_UNBOUND, roles=["IdentityAdmin"]
+            application_validator, oid=FAKE_OID_UNBOUND, roles=["IdentityAdmin"]
         )
         headers = {"Authorization": f"Bearer {token}"}
 

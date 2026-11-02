@@ -1,8 +1,9 @@
 """T5 tests: real /admin/* authorization enforcement.
 
 These tests do NOT use `app.dependency_overrides[require_admin]`.
-They exercise the real `require_admin` dependency with genuine credentials/tokens
-to prove the full 401/403/503 matrix.
+They exercise the real `require_admin` dependency with static credentials or
+explicit opaque-token application validators to prove the 401/403/503 matrix.
+They do not prove cryptographic authenticity; see test_mise_validation.py.
 
 Auth modes under test:
 - Static mode: admin_api_key credential gates /admin/*; data keys get 403.
@@ -26,6 +27,8 @@ from typing import Any
 import httpx
 import pytest
 
+from tests.conftest import ApplicationTokenValidator
+
 # ---------------------------------------------------------------------------
 # Fake constants (mirrors test_admin.py, kept independent)
 # ---------------------------------------------------------------------------
@@ -47,74 +50,12 @@ FAKE_HASH_FOR_PUT = "a" * 64  # 64-hex key hash used in PUT /admin/keys tests
 
 
 # ---------------------------------------------------------------------------
-# RSA keypair fixtures (real crypto — no network) — module scope for speed
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="module")
-def rsa_keypair() -> tuple[Any, Any]:
-    """Generate a 2048-bit RSA keypair for entra JWT signing (module scope = once)."""
-    from cryptography.hazmat.primitives.asymmetric import rsa
-
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_key = private_key.public_key()
-    return private_key, public_key
-
-
-# ---------------------------------------------------------------------------
-# JWKS stubs (no network)
-# ---------------------------------------------------------------------------
-
-
-class _StubSigningKey:
-    def __init__(self, key: Any) -> None:
-        self.key = key
-
-
-class _StubJWKSClient:
-    """Stub JWKS client that returns a fixed RSA public key."""
-
-    def __init__(self, public_key: Any) -> None:
-        self._key = _StubSigningKey(public_key)
-
-    def fetch_data(self) -> None:
-        pass
-
-    def get_signing_key_from_jwt(self, token: str) -> _StubSigningKey:
-        return self._key
-
-    def get_jwk_set(self) -> Any:
-        _k = self._key
-
-        class _FakeJWKSet:
-            keys = [_k]
-
-        return _FakeJWKSet()
-
-
-class _NoJWKSClient:
-    """Stub JWKS client for tests that must never call resolve() (admin tests use override)."""
-
-    def fetch_data(self) -> None:
-        pass
-
-    def get_signing_key_from_jwt(self, token: str) -> _StubSigningKey:
-        raise NotImplementedError("This test should not call resolve()")
-
-    def get_jwk_set(self) -> Any:
-        class _FakeJWKSet:
-            keys = [_StubSigningKey("dummy")]
-
-        return _FakeJWKSet()
-
-
-# ---------------------------------------------------------------------------
-# JWT helpers
+# Application-token helper
 # ---------------------------------------------------------------------------
 
 
 def _make_entra_token(
-    private_key: Any,
+    validator: ApplicationTokenValidator,
     *,
     oid: str = FAKE_OID,
     roles: list[str] | None = None,
@@ -122,14 +63,12 @@ def _make_entra_token(
     aud: str = FAKE_CLIENT_ID,
     scp: str = "access_as_user",
 ) -> str:
-    """Mint a real RS256 JWT for entra tests.
+    """Issue an opaque handle with already-validated application claims.
 
     Args:
         roles:  Value for the ``roles`` claim (App Role assignments).
         groups: Value for the ``groups`` claim (group memberships — NOT roles).
     """
-    import jwt as pyjwt
-
     now = int(time.time())
     claims: dict[str, Any] = {
         "oid": oid,
@@ -144,7 +83,7 @@ def _make_entra_token(
         claims["roles"] = roles
     if groups is not None:
         claims["groups"] = groups
-    return pyjwt.encode(claims, private_key, algorithm="RS256")
+    return validator.issue(claims)
 
 
 # ---------------------------------------------------------------------------
@@ -236,15 +175,14 @@ async def static_no_admin_client(
 
 @pytest.fixture
 async def entra_auth_client(
-    tmp_path: Path, rsa_keypair: tuple[Any, Any]
+    tmp_path: Path, application_validator: ApplicationTokenValidator
 ) -> AsyncGenerator[httpx.AsyncClient, None]:
     """httpx client for entra mode routed through the real auth middleware."""
     from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
-    _private_key, public_key = rsa_keypair
     settings = _make_entra_settings(tmp_path)
     middleware = create_asgi_app(
-        settings=settings, _jwks_client=_StubJWKSClient(public_key)
+        settings=settings, _token_validator=application_validator
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=middleware), base_url="http://test"
@@ -254,15 +192,14 @@ async def entra_auth_client(
 
 @pytest.fixture
 async def entra_no_role_client(
-    tmp_path: Path, rsa_keypair: tuple[Any, Any]
+    tmp_path: Path, application_validator: ApplicationTokenValidator
 ) -> AsyncGenerator[httpx.AsyncClient, None]:
     """httpx client for entra mode with entra_admin_role='' → 503."""
     from context_intelligence_server.main import create_asgi_app  # noqa: PLC0415
 
-    _private_key, public_key = rsa_keypair
     settings = _make_entra_settings(tmp_path, entra_admin_role="")
     middleware = create_asgi_app(
-        settings=settings, _jwks_client=_StubJWKSClient(public_key)
+        settings=settings, _token_validator=application_validator
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=middleware), base_url="http://test"
@@ -437,11 +374,12 @@ class TestEntraModeAdminAuth:
 
     @pytest.mark.anyio
     async def test_token_no_role_403_on_put_identities(
-        self, entra_auth_client: httpx.AsyncClient, rsa_keypair: tuple[Any, Any]
+        self,
+        entra_auth_client: httpx.AsyncClient,
+        application_validator: ApplicationTokenValidator,
     ) -> None:
         """Valid entra token with empty roles → 403 on PUT /admin/identities."""
-        private_key, _pub = rsa_keypair
-        token = _make_entra_token(private_key, roles=[])
+        token = _make_entra_token(application_validator, roles=[])
         resp = await entra_auth_client.put(
             f"/admin/identities/{self.FAKE_OID_2}",
             json={"id": "carol"},
@@ -451,11 +389,12 @@ class TestEntraModeAdminAuth:
 
     @pytest.mark.anyio
     async def test_token_no_role_403_on_get_identities(
-        self, entra_auth_client: httpx.AsyncClient, rsa_keypair: tuple[Any, Any]
+        self,
+        entra_auth_client: httpx.AsyncClient,
+        application_validator: ApplicationTokenValidator,
     ) -> None:
         """Valid entra token with no roles claim → 403 on GET /admin/identities."""
-        private_key, _pub = rsa_keypair
-        token = _make_entra_token(private_key, roles=None)  # no roles claim
+        token = _make_entra_token(application_validator, roles=None)  # no roles claim
         resp = await entra_auth_client.get(
             "/admin/identities",
             headers={"Authorization": f"Bearer {token}"},
@@ -464,11 +403,14 @@ class TestEntraModeAdminAuth:
 
     @pytest.mark.anyio
     async def test_token_wrong_role_403_on_put_identities(
-        self, entra_auth_client: httpx.AsyncClient, rsa_keypair: tuple[Any, Any]
+        self,
+        entra_auth_client: httpx.AsyncClient,
+        application_validator: ApplicationTokenValidator,
     ) -> None:
         """Valid entra token with a different role (not IdentityAdmin) → 403."""
-        private_key, _pub = rsa_keypair
-        token = _make_entra_token(private_key, roles=["SomeOtherRole", "AnotherRole"])
+        token = _make_entra_token(
+            application_validator, roles=["SomeOtherRole", "AnotherRole"]
+        )
         resp = await entra_auth_client.put(
             f"/admin/identities/{self.FAKE_OID_2}",
             json={"id": "carol"},
@@ -480,16 +422,17 @@ class TestEntraModeAdminAuth:
 
     @pytest.mark.anyio
     async def test_tb09_role_in_groups_not_roles_403_on_put(
-        self, entra_auth_client: httpx.AsyncClient, rsa_keypair: tuple[Any, Any]
+        self,
+        entra_auth_client: httpx.AsyncClient,
+        application_validator: ApplicationTokenValidator,
     ) -> None:
         """TB-09: IdentityAdmin in `groups` claim only (not `roles`) → 403.
 
         The admin check ONLY reads the `roles` claim. A matching value in `groups`
         must NEVER grant admin access — groups claim does not encode App Role assignments.
         """
-        private_key, _pub = rsa_keypair
         token = _make_entra_token(
-            private_key,
+            application_validator,
             roles=[],  # NOT in roles
             groups=["IdentityAdmin"],  # only in groups
         )
@@ -502,12 +445,13 @@ class TestEntraModeAdminAuth:
 
     @pytest.mark.anyio
     async def test_tb09_role_in_groups_not_roles_403_on_get(
-        self, entra_auth_client: httpx.AsyncClient, rsa_keypair: tuple[Any, Any]
+        self,
+        entra_auth_client: httpx.AsyncClient,
+        application_validator: ApplicationTokenValidator,
     ) -> None:
         """TB-09: IdentityAdmin in `groups` only → 403 on GET /admin/identities."""
-        private_key, _pub = rsa_keypair
         token = _make_entra_token(
-            private_key,
+            application_validator,
             roles=None,  # no roles claim
             groups=["IdentityAdmin"],  # only in groups
         )
@@ -521,11 +465,12 @@ class TestEntraModeAdminAuth:
 
     @pytest.mark.anyio
     async def test_identity_admin_role_200_on_put_identities(
-        self, entra_auth_client: httpx.AsyncClient, rsa_keypair: tuple[Any, Any]
+        self,
+        entra_auth_client: httpx.AsyncClient,
+        application_validator: ApplicationTokenValidator,
     ) -> None:
         """Valid entra token WITH IdentityAdmin in roles → 200 on PUT /admin/identities."""
-        private_key, _pub = rsa_keypair
-        token = _make_entra_token(private_key, roles=["IdentityAdmin"])
+        token = _make_entra_token(application_validator, roles=["IdentityAdmin"])
         resp = await entra_auth_client.put(
             f"/admin/identities/{self.FAKE_OID_2}",
             json={"id": "carol"},
@@ -535,11 +480,14 @@ class TestEntraModeAdminAuth:
 
     @pytest.mark.anyio
     async def test_identity_admin_role_200_on_get_identities(
-        self, entra_auth_client: httpx.AsyncClient, rsa_keypair: tuple[Any, Any]
+        self,
+        entra_auth_client: httpx.AsyncClient,
+        application_validator: ApplicationTokenValidator,
     ) -> None:
         """Valid entra token WITH IdentityAdmin → 200 on GET /admin/identities."""
-        private_key, _pub = rsa_keypair
-        token = _make_entra_token(private_key, roles=["IdentityAdmin", "AnotherRole"])
+        token = _make_entra_token(
+            application_validator, roles=["IdentityAdmin", "AnotherRole"]
+        )
         resp = await entra_auth_client.get(
             "/admin/identities",
             headers={"Authorization": f"Bearer {token}"},
@@ -552,11 +500,10 @@ class TestEntraModeAdminAuth:
     async def test_entra_admin_role_empty_503_on_put(
         self,
         entra_no_role_client: httpx.AsyncClient,
-        rsa_keypair: tuple[Any, Any],
+        application_validator: ApplicationTokenValidator,
     ) -> None:
         """Entra mode with entra_admin_role='' → 503 on PUT /admin/identities."""
-        private_key, _pub = rsa_keypair
-        token = _make_entra_token(private_key, roles=["IdentityAdmin"])
+        token = _make_entra_token(application_validator, roles=["IdentityAdmin"])
         resp = await entra_no_role_client.put(
             f"/admin/identities/{self.FAKE_OID_2}",
             json={"id": "carol"},
@@ -568,11 +515,10 @@ class TestEntraModeAdminAuth:
     async def test_entra_admin_role_empty_503_on_get(
         self,
         entra_no_role_client: httpx.AsyncClient,
-        rsa_keypair: tuple[Any, Any],
+        application_validator: ApplicationTokenValidator,
     ) -> None:
         """Entra mode with entra_admin_role='' → 503 on GET /admin/identities."""
-        private_key, _pub = rsa_keypair
-        token = _make_entra_token(private_key, roles=["IdentityAdmin"])
+        token = _make_entra_token(application_validator, roles=["IdentityAdmin"])
         resp = await entra_no_role_client.get(
             "/admin/identities",
             headers={"Authorization": f"Bearer {token}"},
@@ -583,11 +529,12 @@ class TestEntraModeAdminAuth:
 
     @pytest.mark.anyio
     async def test_403_names_the_required_role(
-        self, entra_auth_client: httpx.AsyncClient, rsa_keypair: tuple[Any, Any]
+        self,
+        entra_auth_client: httpx.AsyncClient,
+        application_validator: ApplicationTokenValidator,
     ) -> None:
         """403 response body must name the required role (operator guidance)."""
-        private_key, _pub = rsa_keypair
-        token = _make_entra_token(private_key, roles=[])
+        token = _make_entra_token(application_validator, roles=[])
         resp = await entra_auth_client.get(
             "/admin/identities",
             headers={"Authorization": f"Bearer {token}"},

@@ -1,6 +1,10 @@
 """Pytest configuration and shared fixtures for the test suite."""
 
 import os
+from copy import deepcopy
+from uuid import uuid4
+
+from context_intelligence_server.mise_validation import TokenValidationError
 
 # Allow the server to boot with no auth in the test harness.
 # create_asgi_app() refuses to start when no credentials are configured UNLESS
@@ -16,9 +20,43 @@ from typing import Any  # noqa: E402
 import httpx  # noqa: E402
 import pytest  # noqa: E402
 
-
 from context_intelligence_server.main import app, registry  # noqa: E402
 from context_intelligence_server.services import HookStateService  # noqa: E402
+
+
+class ApplicationTokenValidator:
+    """Opaque-token policy-test helper, NOT evidence of token authenticity.
+
+    Explicitly inject this into an Entra resolver/application. It never parses
+    JWTs, loads MISE, or replaces production construction globally.
+    """
+
+    def __init__(self) -> None:
+        self._claims: dict[str, dict[str, Any]] = {}
+        self.calls: list[tuple[str, str, str]] = []
+
+    def issue(self, claims: dict[str, Any]) -> str:
+        bearer = f"opaque-{uuid4().hex}"
+        self._claims[bearer] = deepcopy(claims)
+        return bearer
+
+    def reject(self, bearer: str) -> None:
+        self._claims.pop(bearer, None)
+
+    def validate(
+        self, bearer: str, *, original_uri: str, original_method: str
+    ) -> dict[str, Any]:
+        self.calls.append((bearer, original_uri, original_method))
+        if bearer not in self._claims:
+            raise TokenValidationError("Unknown or rejected test handle")
+        return deepcopy(self._claims[bearer])
+
+
+@pytest.fixture
+def application_validator() -> ApplicationTokenValidator:
+    """A fresh explicit application validator; never an autouse auth override."""
+    return ApplicationTokenValidator()
+
 
 # Guarded import so the suite still COLLECTS against unfixed source (where the
 # process-wide schema latch does not exist yet). Without this, reverting the

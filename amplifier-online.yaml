@@ -2,7 +2,11 @@
 # This stack (web-app-aca + auth.expose) deploys the context-intelligence API
 # with PUBLIC ingress behind an Azure API Management gateway. Callers present a
 # Microsoft Entra access_as_user token (no APIM subscription key required); the
-# server re-validates the JWT in-app (PyJWT + cached JWKS).
+# server delegates token authenticity to localhost MISE; app-owned policy follows.
+# This manifest needs external sidecar wiring not provisioned here.
+# Sidecar client/build changes are review only; not merge ready.
+# Merging before supported wiring is resolved may create an unavailable,
+# fail-closed revision. No sidecar keys are declared or implied by these comments.
 
 name: context-intelligence
 stack: web-app-aca
@@ -14,9 +18,9 @@ stack: web-app-aca
 #   - audience:        api://53aa4ffd-fbea-40a3-b35c-63fdcb609af1
 #   - delegated scope: access_as_user  (already exposed — BYO validation passes)
 #   - app roles:       team, council, IdentityAdmin (already defined + assigned)
-# NOTE: this server validates JWTs IN-APP (PyJWT + cached JWKS) using its own
-# AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_* env (see services.api.env). It does NOT
-# use the platform's bare AZURE_CLIENT_ID / JWT-middleware convention.
+# NOTE: the server sends tokens to localhost MISE and applies its own policy
+# using AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_* settings (see services.api.env).
+# These server settings do not configure or provision the external sidecar.
 auth:
   api_app_id: "53aa4ffd-fbea-40a3-b35c-63fdcb609af1"
   # Flip the BYO -api to "user-facing" so `amplifier-online up` provisions the
@@ -33,7 +37,7 @@ auth:
 #   direct: https://context-intelligence-api.<env-default-domain>
 #
 # Auth: bearer Microsoft Entra JWT (delegated access_as_user). This server does
-# NOT use EasyAuth; it validates JWTs in-app (PyJWT + cached JWKS).
+# NOT use EasyAuth; token authenticity requires a separately configured localhost MISE.
 services:
   api:
     # Image served from the platform ACR (amplifieronlinecr) — the only registry the

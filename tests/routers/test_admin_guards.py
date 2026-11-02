@@ -24,6 +24,8 @@ from typing import Any
 import httpx
 import pytest
 
+from tests.conftest import ApplicationTokenValidator
+
 # ---------------------------------------------------------------------------
 # Fake constants (NEVER real credentials / OIDs / keys)
 # ---------------------------------------------------------------------------
@@ -47,30 +49,6 @@ FAKE_ADMIN_KEY_DIGEST = hashlib.sha256(FAKE_ADMIN_RAW_KEY.encode()).hexdigest()
 ALL_ZEROS_OID = "00000000-0000-0000-0000-000000000000"
 
 ADMIN_LOGGER = "context_intelligence_server.routers.admin"
-
-
-# ---------------------------------------------------------------------------
-# JWKS stub (no network)
-# ---------------------------------------------------------------------------
-
-
-class _StubSigningKey:
-    def __init__(self, key: Any = "dummy-key") -> None:
-        self.key = key
-
-
-class _StubJWKSClient:
-    def fetch_data(self) -> None:
-        pass
-
-    def get_signing_key_from_jwt(self, token: str) -> _StubSigningKey:
-        raise NotImplementedError("guard tests do not call resolve()")
-
-    def get_jwk_set(self) -> Any:
-        class _FakeJWKSet:
-            keys = [_StubSigningKey()]
-
-        return _FakeJWKSet()
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +102,7 @@ async def entra_client(tmp_path: Path) -> AsyncGenerator[httpx.AsyncClient, None
     from context_intelligence_server.routers.admin import require_admin  # noqa: PLC0415
 
     settings = _make_entra_settings(tmp_path)
-    create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+    create_asgi_app(settings=settings, _token_validator=ApplicationTokenValidator())
     app.dependency_overrides[require_admin] = lambda: None
     try:
         async with httpx.AsyncClient(
@@ -702,7 +680,9 @@ class TestCorruptStoreIntegration:
         with caplog.at_level(
             logging.ERROR, logger="context_intelligence_server.identity_store"
         ):
-            create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+            create_asgi_app(
+                settings=settings, _token_validator=ApplicationTokenValidator()
+            )
 
         store = get_entra_identity_store()
         assert store is not None, "entra_identity_store not set on app.state"

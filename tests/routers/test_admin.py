@@ -21,6 +21,8 @@ from typing import Any
 import httpx
 import pytest
 
+from tests.conftest import ApplicationTokenValidator
+
 # ---------------------------------------------------------------------------
 # Fake constants
 # ---------------------------------------------------------------------------
@@ -38,30 +40,6 @@ FAKE_HASH_2 = "b" * 64  # second fake 64-hex key hash
 
 FAKE_CLIENT_ID = "aaaabbbb-1111-2222-3333-ccccddddeeee"
 FAKE_TENANT_ID = "ffffeeee-dddd-cccc-bbbb-aaaa99998888"
-
-
-# ---------------------------------------------------------------------------
-# JWKS stub — no network (satisfies EntraResolver eager-prefetch guard)
-# ---------------------------------------------------------------------------
-
-
-class _StubSigningKey:
-    def __init__(self, key: Any = "dummy-key") -> None:
-        self.key = key
-
-
-class _StubJWKSClient:
-    def fetch_data(self) -> None:
-        pass
-
-    def get_signing_key_from_jwt(self, token: str) -> _StubSigningKey:
-        raise NotImplementedError("admin tests do not call resolve()")
-
-    def get_jwk_set(self) -> Any:
-        class _FakeJWKSet:
-            keys = [_StubSigningKey()]
-
-        return _FakeJWKSet()
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +92,7 @@ async def entra_client(tmp_path: Path) -> AsyncGenerator[httpx.AsyncClient, None
     from context_intelligence_server.routers.admin import require_admin  # noqa: PLC0415
 
     settings = _make_entra_settings(tmp_path)
-    create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+    create_asgi_app(settings=settings, _token_validator=ApplicationTokenValidator())
     app.dependency_overrides[require_admin] = lambda: None
     try:
         async with httpx.AsyncClient(
@@ -258,7 +236,9 @@ class TestIdentityCRUD:
 
         # with_identity=True seeds FAKE_OID; FAKE_OID_2 is not in the store yet.
         settings = _make_entra_settings(tmp_path, with_identity=True)
-        middleware = create_asgi_app(settings=settings, _jwks_client=_StubJWKSClient())
+        middleware = create_asgi_app(
+            settings=settings, _token_validator=ApplicationTokenValidator()
+        )
         app.dependency_overrides[require_admin] = lambda: None
         try:
             # FAKE_OID_2 is not seeded; confirm it's absent from the resolver
