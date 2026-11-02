@@ -1,11 +1,13 @@
 """T8: Entra-mode integration tests over real HTTP (httpx → asgi_app).
 
-Exercises application policy through the authenticated ASGI wrapper using an
-explicit opaque-token validator. This tier does not prove token authenticity;
-genuine SDK rejection tests belong to test_mise_validation.py.
+Exercises application policy, authorization, and provenance over HTTP through
+the authenticated ASGI wrapper with an injected opaque-token validator.
+test_mise_validation.py covers the client wire contract with local HTTP doubles,
+not genuine MISE or cryptographic rejection. Configured-sidecar authenticity
+and positive-token verification remain separate release gates.
 
 Coverage:
-  AC2/AC9 — valid entra JWT → 202, created_by stamped as mapped contributor
+  AC2/AC9 — accepted claims → 202, created_by stamped as mapped contributor
   AC4      — unmapped oid  → 403 HTTP response
   AC3      — validator denial / unknown / missing bearer → 401 HTTP response
   Exempt   — /status passes through without a token
