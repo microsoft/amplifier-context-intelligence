@@ -22,9 +22,9 @@ from typing import Annotated, Any, Generic, Literal, TypeVar, cast
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi import Path as PathParam
-from pydantic import ValidationError
 from fastapi.responses import JSONResponse, Response
 from neo4j import READ_ACCESS, WRITE_ACCESS
+from pydantic import ValidationError
 
 from context_intelligence_server import __version__
 from context_intelligence_server.auth import (
@@ -44,9 +44,8 @@ from context_intelligence_server.authz import (  # noqa: F401 — re-exported fo
     require_write,
 )
 from context_intelligence_server.blob_keys import MAPPED_MARKER
-from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.blob_retention import BlobExpiredError
-from context_intelligence_server.retention_service import RetentionService
+from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.config import Neo4jClientConfig, Settings, get_settings
 from context_intelligence_server.idempotency import EventIdempotencyCache
 from context_intelligence_server.identity_store import IdentityStore
@@ -62,12 +61,11 @@ from context_intelligence_server.models import (
     EventRequest,
     EventResponse,
     LegacyRecoveryEventRequest,
-    RecoveryAdmissionRequest,
     RecoveryAdmissionDuplicateResponse,
     RecoveryAdmissionPermitResponse,
+    RecoveryAdmissionRequest,
     RecoveryEventRequest,
 )
-from context_intelligence_server.queue_manager import is_safe_session_id
 from context_intelligence_server.neo4j_store import (
     build_bounded_neo4j_driver,
     ensure_neo4j_schema,
@@ -77,8 +75,8 @@ from context_intelligence_server.queue_manager import (
     QueueManager,
     _await_uninterrupted,
     fold_worker_key,
+    is_safe_session_id,
 )
-from context_intelligence_server.registry import LiveFirstFlushGate, SessionRegistry
 from context_intelligence_server.recovery import (
     PermitResult,
     ReceiptClassification,
@@ -86,20 +84,22 @@ from context_intelligence_server.recovery import (
     RecoveryReceiptStore,
     canonical_payload_digest,
     has_only_unicode_scalars,
+    lease_allows,
     legacy_source_descriptor,
     legacy_source_handle,
-    lease_allows,
     recovery_event_identity,
     sanitize_recovery_payload,
     source_descriptor_digest,
     source_handle_from_capability,
 )
-from context_intelligence_server.session_claims import SessionClaimStore
+from context_intelligence_server.registry import LiveFirstFlushGate, SessionRegistry
+from context_intelligence_server.retention_service import RetentionService
 from context_intelligence_server.routers.admin import router as admin_router
 from context_intelligence_server.routers.deletion import router as deletion_router
 from context_intelligence_server.routers.queues import router as queues_router
 from context_intelligence_server.routers.version import router as version_router
 from context_intelligence_server.routers.whoami import router as whoami_router
+from context_intelligence_server.session_claims import SessionClaimStore
 from context_intelligence_server.status import build_status_response
 from context_intelligence_server.utils import SPOOL_EVENT_IDENTITY
 
@@ -320,42 +320,45 @@ async def _crash_recovery_topup(respawn_limit: int | None) -> int:
     It is SAFE to call repeatedly on a live server because respawn is
     idempotent -- ``registry.get_or_create`` returns the existing worker for a
     session that already has a live drainer (no duplicate drainer, no reset).
-    And because ``recover()`` reports only sessions that still have undrained
-    data, a session drops out the moment it finishes, so the number of live
-    RECOVERED drainers stays <= ``respawn_limit`` while the deferred tail
-    advances in deterministic sorted order as head sessions drain.
+    ``recover()`` reports only sessions that still have undrained data, so a
+    session drops out the moment it finishes. The limit counts successful
+    eligible dispatches per pass, not rejected probes or active-worker headroom.
+    The deferred tail advances in sorted order as eligible head sessions drain.
 
     Returns the number of sessions DISPATCHED to get_or_create on this pass --
     an upper bound on newly-spawned drainers, since get_or_create is a no-op
     for a session that already has a live drainer (see NOTE in the loop).
     """
     recovered = await registry.queue_manager.recover()
-    to_process = recovered if respawn_limit is None else recovered[:respawn_limit]
     respawned = 0
-    for sid in to_process:
-        # Guarded here (not inside read_batch, which must stay loud for the
-        # live drainer's hot path) so one bad key can't halt the whole pass.
+    batch = None
+    for sid in recovered:
+        if respawn_limit is not None and respawned >= respawn_limit:
+            break
         try:
-            batch = await registry.queue_manager.read_batch(sid, max_items=1)
-        except (OSError, ValueError):
-            logger.exception("crash_recovery_topup_read_failed session=%a", sid)
-            continue
-        if not batch.lines:
-            # recover()/read_batch disagreement (e.g. a concurrent finalize
-            # advanced the offset) -- not a loss, just no longer recoverable.
-            logger.warning(
-                "recovery_skipped_empty_batch session=%s reason=empty_batch",
-                sid,
-            )
-            continue
-        # NOTE: _recover_one_session returns True whenever it dispatched to
-        # get_or_create, whether or not a drainer already existed (get_or_create
-        # is idempotent). So this count is "sessions dispatched this pass", an
-        # upper bound on newly-spawned drainers -- fine for an INFO log.
-        if await _scoped_queue_binding_matches(app, sid, batch.lines[0]) and _recover_one_session(
-            sid, batch.lines[0], registry.get_or_create
-        ):
-            respawned += 1
+            # Guarded here (not inside read_batch, which must stay loud for the
+            # live drainer's hot path) so one bad key can't halt the whole pass.
+            try:
+                batch = await registry.queue_manager.read_batch(sid, max_items=1)
+            except (OSError, ValueError):
+                logger.exception("crash_recovery_topup_read_failed session=%a", sid)
+                continue
+            if not batch.lines:
+                # recover()/read_batch disagreement (e.g. a concurrent finalize
+                # advanced the offset) -- not a loss, just no longer recoverable.
+                logger.warning(
+                    "recovery_skipped_empty_batch session=%s reason=empty_batch",
+                    sid,
+                )
+                continue
+            # _recover_one_session counts dispatch even for an existing worker:
+            # get_or_create is idempotent, not an active-worker headroom check.
+            if await _scoped_queue_binding_matches(
+                app, sid, batch.lines[0]
+            ) and _recover_one_session(sid, batch.lines[0], registry.get_or_create):
+                respawned += 1
+        finally:
+            batch = None
     return respawned
 
 
@@ -490,15 +493,13 @@ async def _startup_recovery_body(app: FastAPI) -> None:
     # and a new event for that session spawns its drainer immediately via
     # get_or_create(), independent of this startup loop.
     respawn_limit = _settings.crash_recovery_respawn_limit
-    if respawn_limit is not None and len(recovered) > respawn_limit:
-        to_process = recovered[:respawn_limit]
-        deferred_count = len(recovered) - respawn_limit
-    else:
-        to_process = recovered
-        deferred_count = 0
-    respawned = 0
+    respawned = examined = 0
     batch = None
-    for sid in to_process:
+    for sid in recovered:
+        # A rejected probe must not strand eligible sessions behind it.
+        if respawn_limit is not None and respawned >= respawn_limit:
+            break
+        examined += 1
         try:
             # Guarded per key (same shape as _crash_recovery_topup; read_batch
             # itself stays loud for the live drainer's hot path) so one legacy or
@@ -513,13 +514,14 @@ async def _startup_recovery_body(app: FastAPI) -> None:
                 continue
             if not batch.lines:
                 continue
-            if await _scoped_queue_binding_matches(app, sid, batch.lines[0]) and _recover_one_session(
-                sid, batch.lines[0], registry.get_or_create
-            ):
+            if await _scoped_queue_binding_matches(
+                app, sid, batch.lines[0]
+            ) and _recover_one_session(sid, batch.lines[0], registry.get_or_create):
                 respawned += 1
         finally:
             # A probe payload must not survive into reclaim or the permanent sweep.
             batch = None
+    deferred_count = len(recovered) - examined
     if deferred_count:
         # WARNING, not INFO, on purpose: a deferred backlog must never be a
         # silent, un-discoverable fact. Names the exact counts and the
@@ -532,7 +534,7 @@ async def _startup_recovery_body(app: FastAPI) -> None:
             "to respawn more per boot.",
             respawn_limit,
             respawned,
-            len(to_process),
+            examined,
             deferred_count,
         )
     logger.info(
@@ -2610,7 +2612,7 @@ def create_asgi_app(
                 elif isinstance(origin, dict):
                     await app.state.recovery_receipts.mark(origin, "quarantined")
                 else:
-                    raise ValueError("recovery quarantine record has no origin")
+                    raise ValueError("recovery quarantine record has no origin")  # noqa: TRY004 - ValueError is the recovery record validation contract
             except (KeyError, ValueError, TypeError) as exc:
                 logger.error("recovery receipt quarantine record was malformed")
                 # This hook is before QueueManager.commit.  It must fail closed:
@@ -3169,7 +3171,7 @@ async def _parse_recovery_event(
 )
 async def post_recovery_events(
     http_request: Request,
-    request: RecoveryEventRequest | LegacyRecoveryEventRequest = Depends(
+    request: RecoveryEventRequest | LegacyRecoveryEventRequest = Depends(  # noqa: B008 - FastAPI dependency marker
         _parse_recovery_event
     ),
     recovery_permit: str | None = Header(default=None, alias="X-Recovery-Permit"),
@@ -3361,7 +3363,9 @@ async def _read_blob_response(
     try:
         content = await blob_store.read(uri)
     except BlobExpiredError as exc:
-        raise HTTPException(status_code=410, detail={"code": "blob_expired", "uri": exc.uri})
+        raise HTTPException(
+            status_code=410, detail={"code": "blob_expired", "uri": exc.uri}
+        )
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Blob not found: {uri}")
     return JSONResponse(content=content)

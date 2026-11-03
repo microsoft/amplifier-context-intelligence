@@ -21,7 +21,10 @@ from starlette.responses import RedirectResponse
 
 from context_intelligence_server.auth import BearerTokenMiddleware
 from context_intelligence_server.retention_client import (
-    ClientError, RetentionClient, admin_credential, server_url,
+    ClientError,
+    RetentionClient,
+    admin_credential,
+    server_url,
 )
 from context_intelligence_server.retention_service import RetentionService
 from context_intelligence_server.routers.admin import router
@@ -30,31 +33,58 @@ CLI = Path(sys.executable).parent / "context-intelligence-server"
 FIXTURE_KEY = "online-prune-fixture-admin"
 
 
-@pytest.mark.parametrize("url", [
-    "ftp://localhost", "https://", "https://host:bad", "https://host:99999",
-    "https://u:p@host", "https://host?key=raw", "https://host/#fragment",
-    "https://host/\npath", "https://host\\@evil", "http://10.0.0.1",
-    "http://example.com", "http://127.0.0.1.evil", "https://[broken",
-    "https://host/a/../b", "https://host/%2e%2e", "https://ho%73t", "https://host:0",
-])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ftp://localhost",
+        "https://",
+        "https://host:bad",
+        "https://host:99999",
+        "https://u:p@host",
+        "https://host?key=raw",
+        "https://host/#fragment",
+        "https://host/\npath",
+        "https://host\\@evil",
+        "http://10.0.0.1",
+        "http://example.com",
+        "http://127.0.0.1.evil",
+        "https://[broken",
+        "https://host/a/../b",
+        "https://host/%2e%2e",
+        "https://ho%73t",
+        "https://host:0",
+    ],
+)
 def test_reject_malformed_or_insecure_urls(url):
     with pytest.raises(ClientError):
         server_url(url)
 
 
-@pytest.mark.parametrize("url", [
-    "http://localhost:8000", "http://127.0.0.1:8000", "http://[::1]:8000",
-    "https://example.com/ci", "https://example.com",
-])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://[::1]:8000",
+        "https://example.com/ci",
+        "https://example.com",
+    ],
+)
 def test_safe_urls(url):
     assert server_url(url + "/") == url
 
 
 def test_missing_digest_only_and_no_data_key_fallback(monkeypatch):
     monkeypatch.delenv("ADMIN_API_KEY", raising=False)
-    monkeypatch.delenv("AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY", raising=False)
-    monkeypatch.setenv("AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY", "fixture-data-only")
-    settings = SimpleNamespace(admin_api_key=None, admin_api_key_sha256="a" * 64, api_key="fixture-data-only")
+    monkeypatch.delenv(
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY", raising=False
+    )
+    monkeypatch.setenv(
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_API_KEY", "fixture-data-only"
+    )
+    settings = SimpleNamespace(
+        admin_api_key=None, admin_api_key_sha256="a" * 64, api_key="fixture-data-only"
+    )
     with pytest.raises(ClientError, match="digest-only"):
         admin_credential(settings=settings)
     monkeypatch.setenv("ADMIN_API_KEY", FIXTURE_KEY)
@@ -76,7 +106,9 @@ def test_keyfile_permissions(tmp_path, mode):
         key.chmod(0o600)  # leave scratch fixtures readable by normal teardown tools
 
 
-def test_keyfile_symlink_fifo_hardlink_size_owner_and_bad_content(tmp_path, monkeypatch):
+def test_keyfile_symlink_fifo_hardlink_size_owner_and_bad_content(
+    tmp_path, monkeypatch
+):
     key = tmp_path / "admin"
     key.write_text(FIXTURE_KEY)
     key.chmod(0o600)
@@ -131,15 +163,27 @@ def live_retention(tmp_path):
         return RedirectResponse("/admin/blobs/prune", status_code=307)
 
     middleware = BearerTokenMiddleware(
-        app, keystore={hashlib.sha256(b"client-fixture-data").hexdigest(): "fixture"},
+        app,
+        keystore={hashlib.sha256(b"client-fixture-data").hexdigest(): "fixture"},
         admin_api_key_digest=hashlib.sha256(FIXTURE_KEY.encode()).hexdigest(),
     )
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     url = f"http://127.0.0.1:{sock.getsockname()[1]}"
-    server = uvicorn.Server(uvicorn.Config(middleware, host="127.0.0.1", loop="asyncio", ws="none",
-                                         access_log=False, log_config=None, log_level="critical"))
-    thread = threading.Thread(target=lambda: server.run(sockets=[sock]), name="retention-test-http")
+    server = uvicorn.Server(
+        uvicorn.Config(
+            middleware,
+            host="127.0.0.1",
+            loop="asyncio",
+            ws="none",
+            access_log=False,
+            log_config=None,
+            log_level="critical",
+        )
+    )
+    thread = threading.Thread(
+        target=lambda: server.run(sockets=[sock]), name="retention-test-http"
+    )
     thread.start()
     deadline = time.monotonic() + 5
     try:
@@ -159,13 +203,18 @@ def run_cli(url, *args, tty_input=None, env=None):
     if tty_input is not None:
         command = ["script", "-q", "-e", "-c", shlex.join(command), "/dev/null"]
     return subprocess.run(
-        command, input=tty_input or "", capture_output=True, text=True, timeout=10,
+        command,
+        check=False,
+        input=tty_input or "",
+        capture_output=True,
+        text=True,
+        timeout=10,
         env=env or {**os.environ, "ADMIN_API_KEY": FIXTURE_KEY},
     )
 
 
 def test_real_client_auth_redirect_refusal_and_remote_state(live_retention):
-    url, old, service = live_retention
+    url, old, _service = live_retention
     client = RetentionClient(url, FIXTURE_KEY)
     for wrong in ["wrong", "client-fixture-data"]:
         with pytest.raises(ClientError, match="HTTP (401|403)"):
@@ -215,7 +264,9 @@ def test_cli_reuses_same_preview_after_bounded_poll_timeout(live_retention):
     delayed = {**preview, "state": "previewing"}
     assert client.wait_preview(delayed, timeout=0)["state"] == "previewing"
     job = client.wait_preview(preview, timeout=3, interval=0.005)
-    result = run_cli(url, "prune", "--job-id", job["id"], "--apply", tty_input="prune\n")
+    result = run_cli(
+        url, "prune", "--job-id", job["id"], "--apply", tty_input="prune\n"
+    )
     assert result.returncode == 0, result.stdout + result.stderr
     assert f"Apply accepted: {job['id']}" in result.stdout
     assert service.status()["id"] == job["id"]

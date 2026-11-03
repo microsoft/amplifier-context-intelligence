@@ -2779,12 +2779,14 @@ def test_repeated_runtime_submit_failures_do_not_queue_untracked_checks(
                 scoped.setattr(threading.Thread, "start", fail)
                 scoped.setattr(loop, "run_in_executor", submit)
                 assert await _status(wrapper, "/whoami", TOKEN) == 503
-                assert len(starts) == 1, "the real queued start failure was not exercised"
+                assert len(starts) == 1, (
+                    "the real queued start failure was not exercised"
+                )
                 assert probe_dispatches == [1]
                 assert runtime.closing and calls == []
-                assert [
-                    await _status(wrapper, "/whoami", TOKEN) for _ in range(5)
-                ] == [503] * 5
+                assert [await _status(wrapper, "/whoami", TOKEN) for _ in range(5)] == [
+                    503
+                ] * 5
                 assert len(starts) == 1 and probe_dispatches == [1], (
                     "failed lifetime kept producing queued wrappers"
                 )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -118,7 +119,7 @@ def test_recovery_registry_defers_queue_initialization_until_lifespan(
 
 
 @asynccontextmanager
-async def _empty_server_lifespan(_app: FastAPI) -> Any:
+async def _empty_server_lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Avoid unrelated Neo4j setup while exercising the outer ASGI lifespan."""
     yield
 
@@ -129,7 +130,9 @@ async def test_direct_asgi_lifespan_refuses_second_server_and_releases(
 ) -> None:
     """Direct uvicorn/gunicorn ASGI loading cannot bypass the writer lock."""
     state_root = tmp_path / "state"
-    settings = SimpleNamespace(stateful_root=lambda: state_root, blob_path=str(tmp_path / "blobs"))
+    settings = SimpleNamespace(
+        stateful_root=lambda: state_root, blob_path=str(tmp_path / "blobs")
+    )
     first, second = FastAPI(), FastAPI()
     first.state.settings = settings
     second.state.settings = settings

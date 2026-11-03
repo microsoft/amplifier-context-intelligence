@@ -10,9 +10,10 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections import deque
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Iterator, TypeVar
+from typing import TypeVar
 
 T = TypeVar("T")
 
@@ -30,7 +31,9 @@ class Coordinator:
         self.service: object | None = None
 
     @contextmanager
-    def lease(self, *, exclusive: bool = False, cancel: threading.Event | None = None) -> Iterator[None]:
+    def lease(
+        self, *, exclusive: bool = False, cancel: threading.Event | None = None
+    ) -> Iterator[None]:
         token = object()
         with self.condition:
             self.queue.append((token, exclusive))
@@ -43,8 +46,13 @@ class Coordinator:
                         if queued is token:
                             break
                         preceding_writer |= write
-                    if not self.writer and not preceding_writer and (
-                        not exclusive or (self.queue[0][0] is token and not self.readers)
+                    if (
+                        not self.writer
+                        and not preceding_writer
+                        and (
+                            not exclusive
+                            or (self.queue[0][0] is token and not self.readers)
+                        )
                     ):
                         self.queue.remove((token, exclusive))
                         if exclusive:
@@ -85,7 +93,9 @@ def coordinator_for(path: Path | str) -> Coordinator:
 _pending: dict[asyncio.AbstractEventLoop, set[asyncio.Future]] = {}
 
 
-async def filesystem(path: Path, operation: Callable[[], T], *, exclusive: bool = False) -> T:
+async def filesystem(
+    path: Path, operation: Callable[[], T], *, exclusive: bool = False
+) -> T:
     loop = asyncio.get_running_loop()
     cancel = threading.Event()
 
@@ -117,4 +127,6 @@ async def wait_filesystem() -> None:
     """After drainers stop submitting, wait for queued AND running real I/O."""
     loop = asyncio.get_running_loop()
     while pending := tuple(_pending.get(loop, ())):
-        await asyncio.gather(*(asyncio.shield(f) for f in pending), return_exceptions=True)
+        await asyncio.gather(
+            *(asyncio.shield(f) for f in pending), return_exceptions=True
+        )

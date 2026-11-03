@@ -17,6 +17,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import FastAPI
 
 import context_intelligence_server.registry as registry_module
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
@@ -283,9 +284,23 @@ async def test_payload_commit_effect_then_raise(tmp_path, monkeypatch):
     lease.write_text(json.dumps({
         "allow": True, "expires_at": time.time() + 60, "lease_id": "synthetic-lease",
     }))
-    assert await receipts.admit(origin, "test", "/ws", {
-        "event": "tool:pre", "data": {"session_id": "boundary"},
-    }, lease) == "accepted"
+    assert (
+        await receipts.admit(
+            origin,
+            "test",
+            "/ws",
+            {
+                "event": "tool:pre",
+                "workspace": "/ws",
+                "data": {
+                    "session_id": "boundary",
+                    "timestamp": "2026-01-01T00:00:00+00:00",
+                },
+            },
+            lease,
+        )
+        == "accepted"
+    )
     await receipts.mark(origin, "enqueued")
     original_commit = qm.commit
 
@@ -318,17 +333,13 @@ async def test_payload_commit_effect_then_raise(tmp_path, monkeypatch):
     assert await qm.read_dead_letters("boundary") == []
 
 
-@pytest.mark.parametrize("denial", ["provisional", "alias"])
-async def test_startup_scoped_probe_releases_payloads(tmp_path, monkeypatch, denial):
-    """Scoped startup rejects unsafe bindings and releases every probe before idle."""
-    import context_intelligence_server.main as main
+async def _scoped_probe_queue(tmp_path, denial):
+    """Real durable queues with a denied first binding and an eligible second one."""
     from context_intelligence_server.queue_manager import fold_worker_key
     from context_intelligence_server.session_claims import SessionClaimStore
 
     root = tmp_path / "scoped-startup"
     qm = _RetentionQueue(root)
-    reg = SessionRegistry()
-    reg._queue_manager = qm
     claims = SessionClaimStore(tmp_path / "claims.sqlite3")
     blocked_original = "a-blocked-" * 60
     allowed_original = "z-allowed-" * 60
@@ -336,23 +347,51 @@ async def test_startup_scoped_probe_releases_payloads(tmp_path, monkeypatch, den
     allowed_key = fold_worker_key(allowed_original)
     assert await claims.claim(allowed_original, "owner", "/ws")
     if denial == "provisional":
-        assert await claims.reserve_recovery(
-            blocked_original, "owner", "/ws", "token"
-        ) == "reserved"
+        assert (
+            await claims.reserve_recovery(blocked_original, "owner", "/ws", "token")
+            == "reserved"
+        )
     else:
         # Same owner/workspace is insufficient: the folded alias is another original.
         assert await claims.claim(blocked_key, "owner", "/ws")
     assert not await claims.storage_identity_matches(blocked_original)
     assert await claims.storage_identity_matches(allowed_original)
     for key, original in (
-        (blocked_key, blocked_original), (allowed_key, allowed_original)
+        (blocked_key, blocked_original),
+        (allowed_key, allowed_original),
     ):
-        await qm.append(key, json.dumps({
-            "event": "tool:pre", "workspace": "/ws", "created_by": "owner",
-            "data": {"session_id": original, "payload": "x" * (1 << 20)},
-        }).encode())
+        await qm.append(
+            key,
+            json.dumps(
+                {
+                    "event": "tool:pre",
+                    "workspace": "/ws",
+                    "created_by": "owner",
+                    "data": {"session_id": original, "payload": "x" * (1 << 20)},
+                }
+            ).encode(),
+        )
     expected_keys = [blocked_key, allowed_key]
     assert await qm.recover() == expected_keys
+    return qm, claims, expected_keys, (blocked_original, allowed_original)
+
+
+@pytest.mark.parametrize("respawn_limit", [1, 2])
+@pytest.mark.parametrize("denial", ["provisional", "alias"])
+async def test_startup_scoped_probe_releases_payloads(
+    tmp_path,
+    monkeypatch,
+    denial,
+    respawn_limit,
+):
+    """Denied probes consume no dispatch slot and retain no payload before idle."""
+    from context_intelligence_server import main
+
+    qm, claims, expected_keys, originals = await _scoped_probe_queue(tmp_path, denial)
+    blocked_key, allowed_key = expected_keys
+    blocked_original, allowed_original = originals
+    reg = SessionRegistry()
+    reg._queue_manager = qm
     spawned, probed, reclaim_live, sweep_live = [], [], [], []
     original_read, original_reclaim = qm.read_batch, qm.reclaim_drained_orphans
     sweep_entered, park = asyncio.Event(), asyncio.Event()
@@ -375,7 +414,7 @@ async def test_startup_scoped_probe_releases_payloads(tmp_path, monkeypatch, den
         return await original_reclaim()
 
     async def sweep(interval, limit):
-        assert interval == 1 and limit == 2
+        assert interval == 1 and limit == respawn_limit
         sweep_live.append(qm.live_count())
         sweep_entered.set()
         await park.wait()
@@ -384,14 +423,19 @@ async def test_startup_scoped_probe_releases_payloads(tmp_path, monkeypatch, den
     monkeypatch.setattr(qm, "read_batch", read)
     monkeypatch.setattr(qm, "reclaim_drained_orphans", reclaim)
     monkeypatch.setattr(main, "registry", reg)
-    monkeypatch.setattr(main, "_settings", SimpleNamespace(
-        crash_recovery_respawn_limit=2, crash_recovery_sweep_interval_seconds=1,
-    ))
+    monkeypatch.setattr(
+        main,
+        "_settings",
+        SimpleNamespace(
+            crash_recovery_respawn_limit=respawn_limit,
+            crash_recovery_sweep_interval_seconds=1,
+        ),
+    )
     monkeypatch.setattr(main, "_crash_recovery_sweep_loop", sweep)
-    test_app = SimpleNamespace(state=SimpleNamespace(
-        access_control_mode="scoped", session_claims=claims,
-        recovery_complete=asyncio.Event(),
-    ))
+    test_app = FastAPI()
+    test_app.state.access_control_mode = "scoped"
+    test_app.state.session_claims = claims
+    test_app.state.recovery_complete = asyncio.Event()
     task = asyncio.create_task(main._startup_recovery_body(test_app))
     try:
         await asyncio.wait_for(sweep_entered.wait(), 5)
@@ -410,16 +454,168 @@ async def test_startup_scoped_probe_releases_payloads(tmp_path, monkeypatch, den
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.wait_for(task, 5)
 
-    fresh = QueueManager(root)
+    fresh = QueueManager(tmp_path / "scoped-startup")
     assert await fresh.recover() == expected_keys
     for key, original in (
-        (blocked_key, blocked_original), (allowed_key, allowed_original)
+        (blocked_key, blocked_original),
+        (allowed_key, allowed_original),
     ):
         assert await fresh.pending_count(key) == 1
         data = json.loads((await fresh.read_batch(key, 1)).lines[0])
         assert data["data"]["session_id"] == original
         assert data["created_by"] == "owner"
         assert await fresh.read_dead_letters(key) == []
+
+
+@pytest.mark.parametrize("denial", ["provisional", "alias"])
+async def test_topup_scoped_probe_budget_repeated(tmp_path, monkeypatch, denial):
+    """Two real cap-one passes must both reach the valid key behind a denied one."""
+    from context_intelligence_server import main
+
+    qm, claims, expected_keys, originals = await _scoped_probe_queue(tmp_path, denial)
+    reg = SessionRegistry()
+    reg._queue_manager = qm
+    spawned, probed = [], []
+    original_read = qm.read_batch
+
+    def get_or_create(sid, workspace, *, created_by=None):
+        spawned.append((sid, workspace, created_by))
+
+    async def read(sid, max_items):
+        assert qm.live_count() == 0, "previous top-up probe survived into next read"
+        probed.append(sid)
+        batch = await original_read(sid, max_items)
+        checkpoint = asyncio.Event()
+        asyncio.get_running_loop().call_soon(checkpoint.set)
+        await asyncio.wait_for(checkpoint.wait(), 5)
+        return batch
+
+    monkeypatch.setattr(reg, "get_or_create", get_or_create)
+    monkeypatch.setattr(qm, "read_batch", read)
+    monkeypatch.setattr(main, "registry", reg)
+    monkeypatch.setattr(
+        main,
+        "app",
+        SimpleNamespace(
+            state=SimpleNamespace(
+                access_control_mode="scoped",
+                session_claims=claims,
+            )
+        ),
+    )
+    results = []
+    for _ in range(2):
+        results.append(await main._crash_recovery_topup(1))
+        assert qm.live_count() == 0
+    assert results == [1, 1]
+    assert probed == expected_keys * 2
+    assert spawned == [(expected_keys[1], "/ws", "owner")] * 2
+    assert len(qm.observed) == 4
+    assert all(size > (1 << 20) for _, size in qm.observed)
+    assert not await claims.storage_identity_matches(originals[0])
+    assert await claims.storage_identity_matches(originals[1])
+    fresh = QueueManager(tmp_path / "scoped-startup")
+    assert await fresh.recover() == expected_keys
+    for key, original in zip(expected_keys, originals):
+        assert await fresh.pending_count(key) == 1
+        data = json.loads((await fresh.read_batch(key, 1)).lines[0])
+        assert data["data"]["session_id"] == original
+        assert await fresh.read_dead_letters(key) == []
+
+
+@pytest.mark.parametrize("phase", ["startup", "topup"])
+@pytest.mark.parametrize("fault", ["oserror", "valueerror", "empty", "malformed"])
+async def test_recovery_probe_failures_do_not_consume_dispatch_budget(
+    tmp_path,
+    monkeypatch,
+    caplog,
+    phase,
+    fault,
+):
+    """A cap-one pass skips a bad head, dispatches one valid key, and leaves a tail."""
+    from context_intelligence_server import main
+
+    root = tmp_path / "probe-failures"
+    qm = _RetentionQueue(root)
+    reg = SessionRegistry()
+    reg._queue_manager = qm
+    expected_keys = ["a-bad", "m-valid", "z-deferred"]
+    for key in expected_keys:
+        await qm.append(
+            key,
+            b"{"
+            if key == "a-bad" and fault == "malformed"
+            else _line("tool:pre", "/ws", {"session_id": key}),
+        )
+    original_read = qm.read_batch
+    probed, spawned, sweep_live = [], [], []
+
+    async def read(sid, max_items):
+        assert qm.live_count() == 0
+        probed.append(sid)
+        if sid == "a-bad":
+            if fault == "oserror":
+                raise OSError("synthetic unreadable head")
+            if fault == "valueerror":
+                raise ValueError("synthetic invalid head")
+        batch = await original_read(sid, max_items)
+        if sid == "a-bad" and fault == "empty":
+            batch = dataclasses.replace(
+                batch, records=[], end_offset=batch.start_offset
+            )
+        checkpoint = asyncio.Event()
+        asyncio.get_running_loop().call_soon(checkpoint.set)
+        await asyncio.wait_for(checkpoint.wait(), 5)
+        return batch
+
+    def get_or_create(sid, workspace, *, created_by=None):
+        spawned.append((sid, workspace, created_by))
+
+    async def sweep(interval, limit):
+        assert interval == 1 and limit == 1
+        sweep_live.append(qm.live_count())
+
+    test_app = FastAPI()
+    test_app.state.access_control_mode = "legacy"
+    test_app.state.recovery_complete = asyncio.Event()
+    monkeypatch.setattr(qm, "read_batch", read)
+    monkeypatch.setattr(reg, "get_or_create", get_or_create)
+    monkeypatch.setattr(main, "registry", reg)
+    monkeypatch.setattr(main, "app", test_app)
+    monkeypatch.setattr(
+        main,
+        "_settings",
+        SimpleNamespace(
+            crash_recovery_respawn_limit=1,
+            crash_recovery_sweep_interval_seconds=1,
+        ),
+    )
+    monkeypatch.setattr(main, "_crash_recovery_sweep_loop", sweep)
+    if phase == "startup":
+        await main._startup_recovery_body(test_app)
+        assert test_app.state.recovery_complete.is_set()
+        assert reg._accepted_total == 3 and reg._written_total == 0
+        assert sweep_live == [0]
+        assert any(
+            "1/2 respawned" in r.getMessage()
+            and "1 session(s) deferred" in r.getMessage()
+            for r in caplog.records
+        )
+    else:
+        assert await main._crash_recovery_topup(1) == 1
+    assert probed == expected_keys[:2]
+    assert spawned == [("m-valid", "/ws", None)]
+    assert qm.live_count() == 0
+    fresh = QueueManager(root)
+    assert await fresh.recover() == expected_keys
+    for key in expected_keys:
+        assert await fresh.pending_count(key) == 1
+        assert await fresh.read_dead_letters(key) == []
+    assert (await fresh.read_batch("a-bad", 1)).lines == [
+        b"{"
+        if fault == "malformed"
+        else _line("tool:pre", "/ws", {"session_id": "a-bad"})
+    ]
 
 
 # ---------------------------------------------------------------------------

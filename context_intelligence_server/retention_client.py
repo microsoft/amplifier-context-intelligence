@@ -8,14 +8,17 @@ import ipaddress
 import json
 import os
 import socket
+import ssl
 import stat
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
+from typing import Protocol, cast
 
 
 class ClientError(RuntimeError):
@@ -29,11 +32,17 @@ def server_url(value: str) -> str:
         if any(ord(c) <= 32 or ord(c) == 127 for c in value) or "\\" in value:
             raise ValueError()
         parsed = urllib.parse.urlsplit(value)
-        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
-                or parsed.username is not None or parsed.password is not None
-                or parsed.query or parsed.fragment or "%" in parsed.netloc
-                or any(part in {".", ".."} for part in parsed.path.split("/"))
-                or "%" in parsed.path):
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or "%" in parsed.netloc
+            or any(part in {".", ".."} for part in parsed.path.split("/"))
+            or "%" in parsed.path
+        ):
             raise ValueError()
         port = parsed.port
         if port is not None and not 1 <= port <= 65535:
@@ -44,26 +53,44 @@ def server_url(value: str) -> str:
         except ValueError:
             loopback = host.lower() == "localhost"
         if parsed.scheme == "http" and not loopback:
-            raise ClientError("Remote admin credentials require HTTPS; HTTP is allowed only for loopback")
+            raise ClientError(
+                "Remote admin credentials require HTTPS; HTTP is allowed only for loopback"
+            )
     except ValueError as exc:
-        raise ClientError("Invalid server URL: use http(s)://host[:port] without credentials, query, or fragment") from exc
+        raise ClientError(
+            "Invalid server URL: use http(s)://host[:port] without credentials, query, or fragment"
+        ) from exc
     return value.rstrip("/")
 
 
 def admin_credential(key_file: Path | None = None, settings=None) -> str:
     if key_file is not None:
-        fd = os.open(key_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        fd = os.open(
+            key_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        )
         with os.fdopen(fd, "rb") as stream:
             st = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1
-                    or st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) not in {0o400, 0o600}
-                    or st.st_size > 8192):
-                raise ClientError("Admin key file must be same-owner, regular, not a symlink, mode 0600/0400, at most 8192 bytes")
+            if (
+                not stat.S_ISREG(st.st_mode)
+                or st.st_nlink != 1
+                or st.st_uid != os.geteuid()
+                or stat.S_IMODE(st.st_mode) not in {0o400, 0o600}
+                or st.st_size > 8192
+            ):
+                raise ClientError(
+                    "Admin key file must be same-owner, regular, not a symlink, mode 0600/0400, at most 8192 bytes"
+                )
             raw = stream.read(8193).decode("utf-8").strip()
     else:
-        raw = (os.environ.get("ADMIN_API_KEY")
-               or os.environ.get("AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY")
-               or (getattr(settings, "admin_api_key", None) if settings is not None else None))
+        raw = (
+            os.environ.get("ADMIN_API_KEY")
+            or os.environ.get("AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ADMIN_API_KEY")
+            or (
+                getattr(settings, "admin_api_key", None)
+                if settings is not None
+                else None
+            )
+        )
     if not raw:
         raise ClientError(
             "A raw admin bearer token is required: set ADMIN_API_KEY (or "
@@ -87,12 +114,19 @@ def _remaining(deadline: float) -> float:
     return remaining
 
 
-def _connect(address, timeout, source_address, *, deadline):
+def _connect(
+    address: tuple[str, int],
+    timeout: float | None,
+    source_address: tuple[str, int] | None,
+    *,
+    deadline: float,
+) -> socket.socket:
     # urllib's default socket.create_connection grants the full timeout to EACH
     # resolved address. Share one remaining budget across all address attempts.
     # getaddrinfo is an OS resolver call, not bounded by Python's socket timeout.
     _remaining(deadline)
-    addresses = socket.getaddrinfo(*address, 0, socket.SOCK_STREAM)
+    host, port = address
+    addresses = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
     error = None
     for family, kind, protocol, _, sockaddr in addresses:
         left = _remaining(deadline)
@@ -118,7 +152,7 @@ class _BudgetReader(io.RawIOBase):
     Buffered HTTP parsing must therefore sit ABOVE this raw budget boundary.
     """
 
-    def __init__(self, sock, deadline):
+    def __init__(self, sock: socket.socket, deadline: float):
         self.sock, self.deadline = sock, deadline
         self.raw = sock.makefile("rb", buffering=0)
 
@@ -137,7 +171,7 @@ class _BudgetReader(io.RawIOBase):
 
 
 class _BudgetSocket:
-    def __init__(self, sock, deadline):
+    def __init__(self, sock: socket.socket, deadline: float):
         self.sock, self.deadline = sock, deadline
 
     def __getattr__(self, name):
@@ -153,39 +187,97 @@ class _BudgetSocket:
         return self.sock.sendall(data, *args)
 
 
-class _BudgetConnection:
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+class _SocketSlot(Protocol):
+    # http.client/urllib consume a socket-shaped adapter, not a new descriptor.
+    # Their nominal socket annotation cannot express that supported duck typing.
+    sock: socket.socket | _BudgetSocket | None
+
+
+class _BudgetConnection(http.client.HTTPConnection):
+    # CPython installs this replaceable instance hook, omitted from typeshed.
+    _create_connection: Callable[
+        [tuple[str, int], float | None, tuple[str, int] | None], socket.socket
+    ]
+
+    def __init__(
+        self,
+        host: str,
+        port: int | None = None,
+        timeout: float = 10,
+        source_address: tuple[str, int] | None = None,
+        blocksize: int = 8192,
+    ) -> None:
+        super().__init__(
+            host,
+            port,
+            timeout=timeout,
+            source_address=source_address,
+            blocksize=blocksize,
+        )
+        self._configure_budget()
+
+    def _configure_budget(self) -> None:
+        assert self.timeout is not None
         self.deadline = time.monotonic() + self.timeout
         self._create_connection = partial(_connect, deadline=self.deadline)
 
-    def connect(self):
+    def connect(self) -> None:
         super().connect()
-        self.sock = _BudgetSocket(self.sock, self.deadline)
+        sock = self.sock
+        assert sock is not None
+        cast(_SocketSlot, self).sock = _BudgetSocket(sock, self.deadline)
 
 
-class _HTTPConnection(_BudgetConnection, http.client.HTTPConnection):
+class _HTTPConnection(_BudgetConnection):
     pass
 
 
 class _HTTPSConnection(_BudgetConnection, http.client.HTTPSConnection):
-    def connect(self):
+    _context: ssl.SSLContext
+
+    def __init__(
+        self,
+        host: str,
+        port: int | None = None,
+        *,
+        timeout: float = 10,
+        source_address: tuple[str, int] | None = None,
+        context: ssl.SSLContext | None = None,
+        blocksize: int = 8192,
+    ) -> None:
+        # Preserve stdlib context defaults (verification, ALPN and TLS policy).
+        http.client.HTTPSConnection.__init__(
+            self,
+            host,
+            port,
+            timeout=timeout,
+            source_address=source_address,
+            context=context,
+            blocksize=blocksize,
+        )
+        self._configure_budget()
+
+    def connect(self) -> None:
         # Refresh the remaining budget between TCP connect and TLS handshake.
         # No proxies/tunnels are enabled for these credential-bearing requests.
         http.client.HTTPConnection.connect(self)
-        self.sock.settimeout(_remaining(self.deadline))
-        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
-        self.sock = _BudgetSocket(self.sock, self.deadline)
+        sock = self.sock
+        assert sock is not None
+        sock.settimeout(_remaining(self.deadline))
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        cast(_SocketSlot, self).sock = _BudgetSocket(self.sock, self.deadline)
 
 
 class _HTTPHandler(urllib.request.HTTPHandler):
-    def http_open(self, request):
-        return self.do_open(_HTTPConnection, request)
+    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(_HTTPConnection, req)
 
 
 class _HTTPSHandler(urllib.request.HTTPSHandler):
-    def https_open(self, request):
-        return self.do_open(_HTTPSConnection, request, context=self._context)
+    _context: ssl.SSLContext | None
+
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(_HTTPSConnection, req, context=self._context)
 
 
 class RetentionClient:
@@ -195,7 +287,10 @@ class RetentionClient:
         self.timeout = timeout
         # Never inherit ambient proxy settings for an admin credential.
         self._opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}), _NoRedirect(), _HTTPHandler(), _HTTPSHandler(),
+            urllib.request.ProxyHandler({}),
+            _NoRedirect(),
+            _HTTPHandler(),
+            _HTTPSHandler(),
         )
 
     @staticmethod
@@ -209,7 +304,10 @@ class RetentionClient:
         request = urllib.request.Request(
             self.url + "/admin/blobs/prune" + suffix,
             data=json.dumps(body).encode() if body is not None else None,
-            headers={"Authorization": f"Bearer {self._credential}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {self._credential}",
+                "Content-Type": "application/json",
+            },
             method=method,
         )
         try:
@@ -228,7 +326,9 @@ class RetentionClient:
                 status_code=exc.code,
             ) from None
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-            raise ClientError(f"Admin request failed ({type(exc).__name__}); remote job may still be running; query prune-status") from None
+            raise ClientError(
+                f"Admin request failed ({type(exc).__name__}); remote job may still be running; query prune-status"
+            ) from None
 
     def preview(self, older_than: str) -> dict:
         return self._request("POST", body={"older_than": older_than})
@@ -237,12 +337,16 @@ class RetentionClient:
         return self._request("GET", "/" + self._id(job_id) if job_id else "")
 
     def start(self, job_id: str, confirmation: str) -> dict:
-        return self._request("POST", "/" + self._id(job_id) + "/start", {"confirmation": confirmation})
+        return self._request(
+            "POST", "/" + self._id(job_id) + "/start", {"confirmation": confirmation}
+        )
 
     def cancel(self, job_id: str) -> dict:
         return self._request("POST", "/" + self._id(job_id) + "/cancel", {})
 
-    def wait_preview(self, job: dict, *, timeout: float = 120, interval: float = 0.25) -> dict:
+    def wait_preview(
+        self, job: dict, *, timeout: float = 120, interval: float = 0.25
+    ) -> dict:
         deadline = time.monotonic() + timeout
         while job["state"] == "previewing" and time.monotonic() < deadline:
             time.sleep(min(interval, max(0, deadline - time.monotonic())))

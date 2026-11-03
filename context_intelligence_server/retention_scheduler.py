@@ -15,8 +15,16 @@ from context_intelligence_server.retention_client import ClientError, RetentionC
 
 BUSY = frozenset({"previewing", "ready", "running", "cancelling"})
 TERMINAL = frozenset({"completed", "cancelled", "failed", "interrupted"})
-COUNTS = ("files", "logical_bytes", "allocated_bytes", "retained", "skipped",
-          "changed", "errors", "deleted")
+COUNTS = (
+    "files",
+    "logical_bytes",
+    "allocated_bytes",
+    "retained",
+    "skipped",
+    "changed",
+    "errors",
+    "deleted",
+)
 
 
 class ScheduledTermination(KeyboardInterrupt):
@@ -64,14 +72,24 @@ def _integer(value) -> bool:
 def _identity(job) -> _Identity:
     try:
         root = job["root"]
-        identity = _Identity(job["id"], root, job["older_than"],
-                             job["cutoff_ns"], job["preview_started_ns"])
-        if (str(uuid.UUID(identity.id)) != identity.id
-                or not isinstance(root, str) or not root.startswith("/")
-                or str(PurePosixPath(root)) != root or ".." in PurePosixPath(root).parts
-                or any(ord(c) < 32 for c in root)
-                or not _integer(identity.cutoff) or not _integer(identity.started)
-                or identity.started - duration_ns(identity.age) != identity.cutoff):
+        identity = _Identity(
+            job["id"],
+            root,
+            job["older_than"],
+            job["cutoff_ns"],
+            job["preview_started_ns"],
+        )
+        if (
+            str(uuid.UUID(identity.id)) != identity.id
+            or not isinstance(root, str)
+            or not root.startswith("/")
+            or str(PurePosixPath(root)) != root
+            or ".." in PurePosixPath(root).parts
+            or any(ord(c) < 32 for c in root)
+            or not _integer(identity.cutoff)
+            or not _integer(identity.started)
+            or identity.started - duration_ns(identity.age) != identity.cutoff
+        ):
             raise ValueError()
         return identity
     except (KeyError, TypeError, ValueError, AttributeError):
@@ -82,13 +100,17 @@ def _validate(job) -> tuple[str, dict[str, int]]:
     try:
         state = job["state"]
         report = job["report"]
-        if (state not in BUSY | TERMINAL or type(job["confirmed"]) is not bool
-                or "error" not in job
-                or report["root"] != job["root"] or report["cutoff_ns"] != job["cutoff_ns"]
-                or not _integer(report["cutoff_ns"])
-                or any(not _integer(report[key]) for key in COUNTS)
-                or (state in {"previewing", "ready"} and job["confirmed"])
-                or (state in {"running", "completed"} and not job["confirmed"])):
+        if (
+            state not in BUSY | TERMINAL
+            or type(job["confirmed"]) is not bool
+            or "error" not in job
+            or report["root"] != job["root"]
+            or report["cutoff_ns"] != job["cutoff_ns"]
+            or not _integer(report["cutoff_ns"])
+            or any(not _integer(report[key]) for key in COUNTS)
+            or (state in {"previewing", "ready"} and job["confirmed"])
+            or (state in {"running", "completed"} and not job["confirmed"])
+        ):
             raise ValueError()
         return state, {key: report[key] for key in COUNTS}
     except (KeyError, TypeError, ValueError):
@@ -100,13 +122,22 @@ def _error_code(exc: Exception) -> str:
         return str(exc)  # Only fixed internal codes, never remote text.
     if isinstance(exc, ClientError):
         code = exc.status_code
-        return f"http_{code}" if type(code) is int and 100 <= code <= 599 else "client_error"
+        return (
+            f"http_{code}"
+            if type(code) is int and 100 <= code <= 599
+            else "client_error"
+        )
     return "client_failure"
 
 
 def run_scheduled(
-    client: RetentionClient, *, older_than: str, dry_run: bool = False,
-    max_runtime: float = 3600, cancel_timeout: float = 120, poll_interval: float = 1,
+    client: RetentionClient,
+    *,
+    older_than: str,
+    dry_run: bool = False,
+    max_runtime: float = 3600,
+    cancel_timeout: float = 120,
+    poll_interval: float = 1,
 ) -> ScheduledResult:
     """Own at most one preview. Start it once, or explicitly cancel and observe.
 
@@ -152,7 +183,11 @@ def run_scheduled(
     def clean_preview(job):
         if job["confirmed"]:
             raise _Problem("unexpected_confirmation")
-        if job["error"] is not None or result.counts["errors"] or result.counts["changed"]:
+        if (
+            job["error"] is not None
+            or result.counts["errors"]
+            or result.counts["changed"]
+        ):
             raise _Problem("preview_errors")
         if job["state"] not in {"previewing", "ready"}:
             raise _Problem("preview_state")
@@ -161,7 +196,7 @@ def run_scheduled(
             if not _integer(expiry) or expiry <= time.time_ns():
                 raise _Problem("preview_expired")
 
-    def cleanup() -> bool:
+    def cleanup(owner: _Identity) -> bool:
         """Never inspect or cancel 'current'; every request pins the owned UUID."""
         until = time.monotonic() + cancel_timeout
         result.cleanup_state = "unconfirmed"
@@ -174,26 +209,28 @@ def run_scheduled(
                     and job["state"] in {"previewing", "ready", "running"}
                 ):
                     try:
-                        job = observe(call(client.cancel, owned.id, until=until))
+                        job = observe(call(client.cancel, owner.id, until=until))
                         acknowledged = True
                     except ClientError:
                         # The request or its reply can be lost. Observe only this UUID;
                         # if it is still active, cancel is retried within this deadline.
-                        job = observe(call(client.status, owned.id, until=until))
+                        job = observe(call(client.status, owner.id, until=until))
                 remaining(until)
                 if job["state"] in TERMINAL:
                     result.cleanup_state = job["state"]
                     return True
                 pause(until)
-                job = observe(call(client.status, owned.id, until=until))
+                job = observe(call(client.status, owner.id, until=until))
             except KeyboardInterrupt as exc:
                 # A first signal may arrive DURING cleanup, before cancel was
                 # sent. Continue within the original budget, not a new 120s.
                 result.error_code = result.error_code or (
-                    "sigterm" if isinstance(exc, ScheduledTermination) else "interrupted"
+                    "sigterm"
+                    if isinstance(exc, ScheduledTermination)
+                    else "interrupted"
                 )
                 result.exit_code = 143 if isinstance(exc, ScheduledTermination) else 130
-            except Exception:
+            except Exception:  # noqa: BLE001 - Cleanup failures must not leak remote text.
                 return False
         return False
 
@@ -243,7 +280,7 @@ def run_scheduled(
             job = observe(call(client.status, owned.id, until=deadline))
         if dry_run:
             estimate = result.counts.copy()
-            if not cleanup():
+            if not cleanup(owned):
                 raise _Problem("cancel_unconfirmed")
             if result.state != "cancelled" or result.confirmed:
                 raise _Problem("dry_run_not_cancelled")
@@ -277,15 +314,21 @@ def run_scheduled(
         result.error_code, result.exit_code = "interrupted", 130
     except (ValueError, TypeError, OverflowError):
         result.error_code = "invalid_arguments"
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - Only fixed allow-listed error codes are public.
         result.error_code = (
-            "deadline" if deadline and time.monotonic() >= deadline else _error_code(exc)
+            "deadline"
+            if deadline and time.monotonic() >= deadline
+            else _error_code(exc)
         )
     finally:
         # Returns still run finally. Successful runs and busy skips need no cancel.
-        if result.exit_code and owned is not None and result.cleanup_state == "not_requested":
-            if not cleanup():
-                result.outcome = "cancel_unconfirmed"
+        if (
+            result.exit_code
+            and owned is not None
+            and result.cleanup_state == "not_requested"
+            and not cleanup(owned)
+        ):
+            result.outcome = "cancel_unconfirmed"
         if result.cleanup_state == "unconfirmed":
             result.outcome = "cancel_unconfirmed"
         result.ended_at = _pacific_now()

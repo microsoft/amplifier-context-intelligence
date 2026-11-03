@@ -101,23 +101,27 @@ def test_stateful_root_covers_live_recovery_receipt_and_claim_storage(
     tmp_path: Path,
 ) -> None:
     """The single-server lock is rooted above every active durable state store."""
-    from context_intelligence_server.config import Settings
+    from context_intelligence_server.config import (
+        ContributorGrant,
+        RecoveryConfig,
+        Settings,
+    )
 
     settings = Settings(
         queues_path=str(tmp_path / "state" / "live"),
         access_control_mode="scoped",
         contributor_grants={
-            "writer": {
-                "all_workspaces": True,
-                "capabilities": ["live:write", "recovery:write"],
-            }
+            "writer": ContributorGrant(
+                all_workspaces=True,
+                capabilities={"live:write", "recovery:write"},
+            )
         },
-        recovery={
-            "enabled": True,
-            "queues_path": str(tmp_path / "state" / "recovery"),
-            "receipt_store_path": str(tmp_path / "state" / "receipts.sqlite3"),
-            "claims_store_path": str(tmp_path / "state" / "claims.sqlite3"),
-        },
+        recovery=RecoveryConfig(
+            enabled=True,
+            queues_path=str(tmp_path / "state" / "recovery"),
+            receipt_store_path=str(tmp_path / "state" / "receipts.sqlite3"),
+            claims_store_path=str(tmp_path / "state" / "claims.sqlite3"),
+        ),
     )
 
     assert settings.stateful_root() == (tmp_path / "state").resolve()
@@ -127,14 +131,14 @@ def test_stateful_root_rejects_recovery_storage_outside_live_state_volume(
     tmp_path: Path,
 ) -> None:
     """A single lock must not silently protect only a subset of durable state."""
-    from context_intelligence_server.config import Settings
+    from context_intelligence_server.config import RecoveryConfig, Settings
 
     settings = Settings(
         queues_path=str(tmp_path / "one" / "live"),
-        recovery={
-            "enabled": True,
-            "queues_path": str(tmp_path / "two" / "recovery"),
-        },
+        recovery=RecoveryConfig(
+            enabled=True,
+            queues_path=str(tmp_path / "two" / "recovery"),
+        ),
     )
 
     with pytest.raises(ValueError, match="all mutable server state"):

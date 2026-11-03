@@ -82,6 +82,36 @@ That compatibility mode accepts the former public-origin lease client and
 cannot provide the source-capability privacy boundary or the server-side
 atomic live-first guarantee. New deployments must use source capabilities.
 
+## Upgrade and rollback state compatibility
+
+**`recovery.permit_required: false` does not restore the previous database
+schema.** Receipt-store initialization detects a legacy schema and rebuilds it
+with `source_handle` identities, then atomically replaces the old database.
+There is no automatic retained old-schema backup or downgrade. This flag only
+permits the legacy client protocol, with the limitations above.
+
+Before upgrading an existing recovery deployment, follow the
+[6.11 to 6.13 handoff and rollback gate](azure-deployment.md#611-to-613-upgrade-and-rollback-boundary),
+including for non-Azure services through their own service manager. Stop all
+writers and settle real I/O before taking a consistent backup of configured
+live/recovery queues, receipts/outbox, claims/bindings, guard lease, blobs and
+expiry metadata, plus identity stores and lock sidecars—even outside the queue
+root. Preserve modes/ownership and SQLite journal consistency; copying live
+SQLite/WAL files independently is not a backup procedure.
+
+Image-only downgrade after migration is unsupported without evidenced
+compatibility. A reviewed restore must use the matching **pre-upgrade state,
+image and per-role configuration** (live/recovery storage, auth/grants and
+credential references), not a mixture of old receipts and current queues.
+Plan reconciliation of post-backup accepted events, producer replay and graph
+effects; any loss decision requires operator approval. A permit-policy toggle,
+cancellation or disabling retention does not undo schema migration or restore
+deleted payloads. Keep expiry tombstones; old writers can bypass them and old
+readers cannot serve new mapped blob URIs. No automatic restore tool or tested
+full rollback is implied.
+
+## Scoped access and administration
+
 In `access_control_mode: scoped`, source-capability recovery requires both the
 contributor's `recovery:write` and `live:write` capabilities for the target
 workspace. A source capability namespaces a capture; it is not authority to

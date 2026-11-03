@@ -6,7 +6,6 @@ import gc
 import json
 import logging
 import weakref
-from types import SimpleNamespace
 from pathlib import Path
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace

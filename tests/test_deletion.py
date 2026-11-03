@@ -129,7 +129,9 @@ async def test_preview_unknown_session_returns_none(service: DeletionService) ->
 
 
 async def test_long_original_uses_physical_queue_key_but_reports_graph_identity(
-    service: DeletionService, graph: GraphState, blob_store: AsyncDiskBlobStore,
+    service: DeletionService,
+    graph: GraphState,
+    blob_store: AsyncDiskBlobStore,
     queue_manager: QueueManager,
 ) -> None:
     original = "nested-" * 70

@@ -16,8 +16,11 @@ import sqlite3
 import stat
 import subprocess
 import sys
-from collections.abc import AsyncIterator
+import threading
+import time
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from types import SimpleNamespace, TracebackType
 from typing import Any, Literal, Self, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -29,9 +32,11 @@ from context_intelligence_server.queue_manager import QueueManager
 from context_intelligence_server.recovery import (
     RecoveryReceiptStore,
     _sanitize_stored_payload,
+    canonical_payload_digest,
     source_descriptor_digest,
 )
 from context_intelligence_server.services import GraphState
+from context_intelligence_server.session_claims import SessionClaimStore
 from tests.test_native_recovery import (
     _admission_body,
     _recovery_body,
@@ -3358,3 +3363,468 @@ def test_public_recovery_origin_normalizer_matches_legacy_and_v1() -> None:
     )
     for invalid in _INVALID_REVIEW_ORIGINS:
         assert normalize(invalid) is None
+
+
+@pytest.fixture
+def tracked_store_connections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Any]:
+    """Retain real connections: GC cannot disguise a missing explicit close."""
+    saved_connect = sqlite3.connect
+    tracker = SimpleNamespace(
+        connections=[],
+        failure=None,
+        query=None,
+        fired=0,
+        error=RuntimeError("post-insert resource fault"),
+    )
+
+    class TrackedConnection(sqlite3.Connection):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.path = Path(args[0])
+            self.created_thread = threading.get_ident()
+            self.events: list[str] = []
+            self.close_threads: list[int] = []
+            self.transaction_at_close: list[bool] = []
+            self.exit_exception: Any = None
+
+        def __enter__(self) -> Self:
+            self.events.append("enter")
+            if tracker.failure == "enter":
+                tracker.fired += 1
+                raise sqlite3.OperationalError("injected connection entry failure")
+            super().__enter__()
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> Literal[False]:
+            self.events.append("exit:start")
+            self.exit_exception = exc_type
+            try:
+                if tracker.failure == "exit":
+                    tracker.fired += 1
+                    self.rollback()
+                    raise sqlite3.OperationalError("injected transaction exit failure")
+                return super().__exit__(exc_type, exc_value, traceback)
+            finally:
+                self.events.append("exit:done")
+
+        def execute(self, sql: str, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+            cursor = super().execute(sql, *args, **kwargs)
+            if tracker.query and sql.lstrip().startswith(tracker.query):
+                tracker.query = None
+                tracker.fired += 1
+                assert self.in_transaction
+                raise tracker.error
+            return cursor
+
+        def close(self) -> None:
+            self.events.append("close")
+            self.close_threads.append(threading.get_ident())
+            self.transaction_at_close.append(self.in_transaction)
+            super().close()
+
+    def connect(database: Any, *args: Any, **kwargs: Any) -> TrackedConnection:
+        assert not args and kwargs == {"timeout": 30}
+        assert Path(database).is_relative_to(tmp_path)
+        if tracker.failure == "constructor":
+            tracker.fired += 1
+            raise sqlite3.OperationalError("injected connection constructor failure")
+        db = saved_connect(
+            database,
+            timeout=30,
+            factory=TrackedConnection,
+            check_same_thread=False,
+        )
+        tracker.connections.append(db)
+        return db
+
+    def check() -> None:
+        assert tracker.connections
+        for db in tracker.connections:
+            assert db.close_threads == [db.created_thread], (
+                f"Connection was not explicitly closed once on its creator thread: {db.events}"
+            )
+            if "enter" in db.events:
+                assert db.events[-1] == "close"
+                if "exit:done" in db.events:
+                    assert db.events.index("exit:done") < db.events.index("close")
+                    assert db.transaction_at_close == [False]
+            with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                db.execute("SELECT 1")
+        if sys.platform == "linux":
+            for number in os.listdir("/proc/self/fd"):
+                try:
+                    target = os.readlink(f"/proc/self/fd/{number}")
+                except FileNotFoundError:
+                    continue
+                assert not target.startswith(str(tmp_path) + "/"), target
+
+    async def checked(operation: Any) -> Any:
+        value = await operation
+        check()
+        return value
+
+    def read(path: Path, sql: str) -> list[Any]:
+        db = saved_connect(path)
+        try:
+            return db.execute(sql).fetchall()
+        finally:
+            db.close()
+
+    tracker.start = lambda: monkeypatch.setattr(sqlite3, "connect", connect)
+    tracker.check = check
+    tracker.checked = checked
+    tracker.read = read
+    tracker.saved_connect = saved_connect
+    tracker.descriptor = {
+        "protocol": "native-recovery-source-v1",
+        "session_id": "resource-session",
+        "source_stream_sha256": "a" * 64,
+        "source_sha256": "b" * 64,
+        "record_count": 2,
+    }
+    tracker.handle = "c" * 64
+    tracker.origin = {"ordinal": 0, "source_line_sha256": "d" * 64}
+    tracker.payload = {
+        "event": "session:start",
+        "workspace": "one",
+        "data": {"session_id": "resource-session", "timestamp": "2026-01-01T00:00:00"},
+    }
+    try:
+        yield tracker
+    finally:
+        # Only after assertions: close red-test leaks without invoking our spy.
+        for db in tracker.connections:
+            sqlite3.Connection.close(db)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_claim_connections_close_for_all_operations_and_early_returns(
+    tmp_path: Path,
+    tracked_store_connections: Any,
+    legacy: bool,
+) -> None:
+    t = tracked_store_connections
+    path = tmp_path / "claims.sqlite3"
+    if legacy:
+        db = t.saved_connect(path)
+        try:
+            db.execute(
+                "CREATE TABLE session_claims (session_id TEXT PRIMARY KEY, "
+                "contributor_id TEXT NOT NULL, workspace TEXT NOT NULL)"
+            )
+            db.execute("INSERT INTO session_claims VALUES ('legacy', 'alice', 'one')")
+            db.commit()
+        finally:
+            db.close()
+    store = SessionClaimStore(path)
+    assert not store._initialized and not t.connections
+    t.start()
+    assert await t.checked(store.claim("session", "alice", "one")) is True
+    assert await t.checked(store.claim("session", "alice", "one")) is True
+    assert await t.checked(store.claim("session", "other", "one")) is False
+    assert (
+        await t.checked(store.reserve_recovery("session", "alice", "one", "t"))
+        == "committed"
+    )
+    assert (
+        await t.checked(store.reserve_recovery("reserved", "alice", "one", "t"))
+        == "reserved"
+    )
+    assert (
+        await t.checked(store.reserve_recovery("reserved", "alice", "one", "t"))
+        == "existing_reservation"
+    )
+    assert (
+        await t.checked(store.reserve_recovery("reserved", "alice", "one", "wrong"))
+        == "conflict"
+    )
+    assert (
+        await t.checked(store.finalize_recovery("reserved", "alice", "one", "wrong"))
+        is False
+    )
+    assert (
+        await t.checked(store.finalize_recovery("reserved", "alice", "one", "t"))
+        is True
+    )
+    assert (
+        await t.checked(store.reserve_recovery("released", "alice", "one", "t"))
+        == "reserved"
+    )
+    await t.checked(store.release_recovery("released", "alice", "one", "wrong"))
+    assert t.read(
+        path, "SELECT reservation_token FROM session_claims WHERE session_id='released'"
+    ) == [("t",)]
+    await t.checked(store.release_recovery("released", "alice", "one", "t"))
+    assert (
+        t.read(path, "SELECT * FROM storage_bindings WHERE session_id='released'") == []
+    )
+    for session, expected in [("session", "one"), ("missing", None)]:
+        assert await t.checked(store.storage_identity_matches(session)) is (
+            expected is not None
+        )
+        assert await t.checked(store.get_blob_workspace(session)) == expected
+        assert await t.checked(store.get_workspace(session)) == expected
+    if legacy:
+        assert await t.checked(store.storage_identity_matches("legacy")) is True
+        assert await t.checked(store.get_blob_workspace("legacy")) == "one"
+    assert t.read(
+        path,
+        "SELECT contributor_id, workspace, reservation_token FROM session_claims WHERE session_id='session'",
+    ) == [
+        ("alice", "one", None),
+    ]
+    for _ in range(100):
+        assert await t.checked(store.claim("session", "alice", "one")) is True
+        assert await t.checked(store.get_workspace("session")) == "one"
+
+
+async def test_receipt_connections_close_for_all_operations_and_early_returns(
+    tmp_path: Path,
+    tracked_store_connections: Any,
+) -> None:
+    t = tracked_store_connections
+    path = tmp_path / "receipts.sqlite3"
+    store = RecoveryReceiptStore(path)
+    assert not store._initialized and not t.connections
+    t.start()
+    digest = canonical_payload_digest(t.payload)
+
+    async def classify(expected: str, **changes: Any) -> None:
+        args = {
+            "source_handle": t.handle,
+            "descriptor": t.descriptor,
+            "origin": t.origin,
+            "actor": "alice",
+            "workspace": "one",
+            "payload_sha256": digest,
+        }
+        args.update(changes)
+        assert await t.checked(store.classify_source(**args)) == expected
+
+    async def admit(expected: str, **changes: Any) -> None:
+        args = {
+            "source_handle": t.handle,
+            "descriptor": t.descriptor,
+            "origin": t.origin,
+            "actor": "alice",
+            "workspace": "one",
+            "payload": t.payload,
+            "require_lease": False,
+        }
+        args.update(changes)
+        assert await t.checked(store.admit_source(**args)) == expected
+
+    await classify("new")
+    assert await t.checked(store.next_quarantined()) is None
+    await admit("accepted")
+    await classify("duplicate")
+    await classify("foreign", actor="other")
+    await classify("conflict", payload_sha256="e" * 64)
+    await classify("conflict", descriptor={**t.descriptor, "record_count": 3})
+    await admit("duplicate")
+    await admit("busy", actor="other")
+    await admit("busy", origin={**t.origin, "ordinal": 1})
+    await admit("conflict", payload={**t.payload, "event": "changed"})
+    await admit("conflict", descriptor={**t.descriptor, "record_count": 3})
+    assert await t.checked(store.has_pending()) is True
+    assert await t.checked(store.is_flushable(t.handle, 0)) is True
+    assert len(await t.checked(store.pending_outbox())) == 1
+    assert await t.checked(store.status()) == {"pending_enqueue": 1}
+    assert await t.checked(store.pending_receipts()) == [
+        {"source_handle": t.handle, "ordinal": 0, "state": "pending_enqueue"},
+    ]
+    assert (await t.checked(store.pending_receipt(t.handle, 0)))["payload"] == t.payload
+    assert await t.checked(store.pending_receipt(t.handle, 1)) is None
+    assert await t.checked(store.requeue_quarantined(t.handle, 0)) is False
+    await t.checked(store.quarantine_pending(t.handle, 0))
+    assert (await t.checked(store.next_quarantined()))["payload"] == t.payload
+    assert await t.checked(store.requeue_quarantined(t.handle, 1)) is False
+    assert await t.checked(store.requeue_quarantined(t.handle, 0)) is True
+    assert (
+        await t.checked(store.mark(t.origin, "written", source_handle=t.handle)) is True
+    )
+    assert await t.checked(store.next_quarantined()) is None
+    with pytest.raises(RuntimeError, match="no durable receipt") as excinfo:
+        await store.mark({**t.origin, "ordinal": 1}, "written", source_handle=t.handle)
+    assert excinfo.traceback
+    t.check()
+    assert t.read(path, "SELECT state, payload FROM recovery_receipts") == [
+        ("written", "")
+    ]
+    assert {
+        row[0]
+        for row in t.read(path, "SELECT conflict_kind FROM recovery_source_conflicts")
+    } == {"ordinal", "descriptor"}
+    for _ in range(100):
+        assert await t.checked(store.status()) == {"written": 1}
+        assert await t.checked(store.has_pending()) is False
+
+
+@pytest.mark.parametrize("kind", ["claims", "receipts"])
+async def test_store_query_failure_rolls_back_before_close(
+    tmp_path: Path,
+    tracked_store_connections: Any,
+    kind: str,
+) -> None:
+    t = tracked_store_connections
+    path = tmp_path / "store.sqlite3"
+    store = SessionClaimStore(path) if kind == "claims" else RecoveryReceiptStore(path)
+    t.start()
+    await t.checked(
+        store.get_workspace("missing")
+        if isinstance(store, SessionClaimStore)
+        else store.status()
+    )
+    t.query = (
+        "INSERT INTO session_claims"
+        if kind == "claims"
+        else "INSERT INTO recovery_receipts"
+    )
+    lease = tmp_path / "lease.json"
+    lease.write_text(
+        json.dumps(
+            {
+                "allow": True,
+                "expires_at": time.time() + 60,
+                "lease_id": "resource-lease",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def operation() -> Any:
+        if isinstance(store, SessionClaimStore):
+            return await store.claim("resource-session", "alice", "one")
+        return await store.admit_source(
+            t.handle,
+            t.descriptor,
+            t.origin,
+            "alice",
+            "one",
+            t.payload,
+            lease,
+            require_lease=True,
+        )
+
+    with pytest.raises(RuntimeError, match="post-insert resource fault") as excinfo:
+        await operation()
+    assert excinfo.value is t.error and excinfo.traceback and t.fired == 1
+    t.check()
+    failed = t.connections[-1]
+    assert failed.exit_exception is RuntimeError
+    tables = (
+        ["session_claims", "storage_bindings"]
+        if kind == "claims"
+        else [
+            "recovery_receipts",
+            "recovery_sources",
+            "recovery_lease_consumptions",
+        ]
+    )
+    for table in tables:
+        assert t.read(path, f"SELECT * FROM {table}") == []
+    assert await t.checked(operation()) == (True if kind == "claims" else "accepted")
+
+
+@pytest.mark.parametrize("kind", ["claims", "receipts"])
+@pytest.mark.parametrize("failure", ["enter", "exit", "constructor"])
+async def test_connection_entry_or_exit_failure_still_closes(
+    tmp_path: Path,
+    tracked_store_connections: Any,
+    kind: str,
+    failure: str,
+) -> None:
+    """Exit failure is injected after real rollback, not a native commit failure."""
+    t = tracked_store_connections
+    path = tmp_path / "store.sqlite3"
+    store = SessionClaimStore(path) if kind == "claims" else RecoveryReceiptStore(path)
+    t.start()
+    await t.checked(
+        store.get_workspace("missing")
+        if isinstance(store, SessionClaimStore)
+        else store.status()
+    )
+    before = len(t.connections)
+    t.failure = failure
+    with pytest.raises(sqlite3.OperationalError, match="injected") as excinfo:
+        if isinstance(store, SessionClaimStore):
+            await store.claim("resource-session", "alice", "one")
+        else:
+            await store.admit_source(
+                t.handle,
+                t.descriptor,
+                t.origin,
+                "alice",
+                "one",
+                t.payload,
+                require_lease=False,
+            )
+    assert excinfo.traceback and t.fired == 1
+    assert len(t.connections) == before + (failure != "constructor")
+    t.check()
+    table = "session_claims" if kind == "claims" else "recovery_receipts"
+    assert t.read(path, f"SELECT * FROM {table}") == []
+
+
+@pytest.mark.parametrize("kind", ["legacy", "current"])
+@pytest.mark.parametrize(
+    "failure", [False, True], ids=["success", "post-insert-failure"]
+)
+async def test_receipt_rebuild_closes_connections_before_publish_and_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tracked_store_connections: Any,
+    kind: str,
+    failure: bool,
+) -> None:
+    t = tracked_store_connections
+    path = tmp_path / "receipts.sqlite3"
+    _seed_rebuild_database(path, kind)
+    path.chmod(0o640)
+    before = _read_all(path)
+    real_fsync = RecoveryReceiptStore._fsync_path
+    real_replace = os.replace
+    observed = []
+
+    def fsync(file: Path) -> None:
+        if file.name.endswith(".tmp"):
+            destinations = [db for db in t.connections if db.path == file]
+            assert len(destinations) == 1
+            assert destinations[0].events[-2:] == ["exit:done", "close"]
+            observed.append("fsync")
+        real_fsync(file)
+
+    def replace(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
+        if str(src).endswith(".tmp"):
+            t.check()
+            observed.append("replace")
+        real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(RecoveryReceiptStore, "_fsync_path", staticmethod(fsync))
+    monkeypatch.setattr(os, "replace", replace)
+    t.start()
+    if failure:
+        t.query = "INSERT INTO recovery_receipts"
+        with pytest.raises(RuntimeError, match="post-insert resource fault") as excinfo:
+            await RecoveryReceiptStore(path).status()
+        assert excinfo.value is t.error and excinfo.traceback and t.fired == 1
+        t.check()
+        # Existing integrity helper opens its own untracked, explicitly closed DB.
+        with monkeypatch.context() as patch:
+            patch.setattr(sqlite3, "connect", t.saved_connect)
+            _assert_original_untouched(tmp_path, path, before)
+        assert observed == []
+    else:
+        assert await t.checked(RecoveryReceiptStore(path).status()) == {"enqueued": 1}
+        assert observed == ["fsync", "replace"]
+        assert path.stat().st_mode & 0o777 == 0o640
+    sources = [db for db in t.connections if "enter" not in db.events]
+    assert len(sources) == 1  # The migration's existing manual source owner.
+    assert sources[0].events == ["close"]

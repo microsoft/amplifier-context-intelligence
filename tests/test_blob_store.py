@@ -1149,8 +1149,11 @@ async def test_where_a_backslash_is_a_separator_a_legacy_uri_is_refused_and_writ
     "unsafe", ["/", "\\", "\0", "\n"], ids=["slash", "backslash", "nul", "newline"]
 )
 async def test_long_unsafe_keys_and_ordinary_fold_aliases_never_overwrite(
-    store: AsyncDiskBlobStore, tmp_path: Path,
-    unsafe: str, position: str, mapped_first: bool,
+    store: AsyncDiskBlobStore,
+    tmp_path: Path,
+    unsafe: str,
+    position: str,
+    mapped_first: bool,
 ) -> None:
     from context_intelligence_server.utils import fold_name
 
@@ -1177,11 +1180,14 @@ async def test_long_unsafe_keys_and_ordinary_fold_aliases_never_overwrite(
 
 
 @pytest.mark.parametrize(
-    "logical", ["a/" + "k" * 300, "a\\" + "k" * 300, "a\0" + "k" * 300, "k" * 300 + "\n"],
+    "logical",
+    ["a/" + "k" * 300, "a\\" + "k" * 300, "a\0" + "k" * 300, "k" * 300 + "\n"],
     ids=["slash", "backslash", "nul", "newline"],
 )
 async def test_historical_folded_payloads_remain_readable_by_their_own_uri(
-    store: AsyncDiskBlobStore, tmp_path: Path, logical: str,
+    store: AsyncDiskBlobStore,
+    tmp_path: Path,
+    logical: str,
 ) -> None:
     from context_intelligence_server.utils import fold_name
 
@@ -1204,13 +1210,17 @@ async def test_historical_folded_payloads_remain_readable_by_their_own_uri(
 @pytest.mark.parametrize("byte_count", [243, 250])
 @pytest.mark.parametrize("multibyte", [False, True], ids=["ascii", "utf8"])
 async def test_bounded_exact_payload_precedes_folded_and_only_missing_falls_back(
-    store: AsyncDiskBlobStore, tmp_path: Path, byte_count: int, multibyte: bool,
+    store: AsyncDiskBlobStore,
+    tmp_path: Path,
+    byte_count: int,
+    multibyte: bool,
 ) -> None:
     from context_intelligence_server.utils import fold_name
 
     logical = (
         "é" * (byte_count // 2) + "k" * (byte_count % 2)
-        if multibyte else "k" * byte_count
+        if multibyte
+        else "k" * byte_count
     )
     folded = fold_name(logical, 242)
     exact = _seed(tmp_path, f"{logical}.json", '{"exact": true}')
@@ -1220,10 +1230,15 @@ async def test_bounded_exact_payload_precedes_folded_and_only_missing_falls_back
     _tombstone(tmp_path, uri)
     _tombstone(tmp_path, f"ci-blob://sess/{folded}")
 
-    for selected, value in [(exact, {"exact": True}), (fallback, {"folded": "different size"})]:
+    for selected, value in [
+        (exact, {"exact": True}),
+        (fallback, {"folded": "different size"}),
+    ]:
         assert await store.read(uri) == value
         assert await store.size(uri) == selected.stat().st_size
-        dumped = Path(await store.dump(uri, tmp_path / selected.stem[:10] / str(len(value))))
+        dumped = Path(
+            await store.dump(uri, tmp_path / selected.stem[:10] / str(len(value)))
+        )
         assert dumped.name == selected.name
         assert dumped.read_bytes() == selected.read_bytes()
         selected.unlink()
@@ -1235,7 +1250,9 @@ async def test_bounded_exact_payload_precedes_folded_and_only_missing_falls_back
 
 @pytest.mark.parametrize("kind", ["dangling_symlink", "directory", "invalid_json"])
 async def test_exact_boundary_entry_errors_never_fall_back_to_valid_folded_payload(
-    store: AsyncDiskBlobStore, tmp_path: Path, kind: str,
+    store: AsyncDiskBlobStore,
+    tmp_path: Path,
+    kind: str,
 ) -> None:
     from context_intelligence_server.utils import fold_name
 
@@ -1261,7 +1278,8 @@ async def test_exact_boundary_entry_errors_never_fall_back_to_valid_folded_paylo
 
 
 async def test_boundary_expiry_priority_is_canonical_on_write_but_exact_on_read(
-    store: AsyncDiskBlobStore, tmp_path: Path,
+    store: AsyncDiskBlobStore,
+    tmp_path: Path,
 ) -> None:
     from context_intelligence_server.utils import fold_name
 
@@ -1286,7 +1304,8 @@ async def test_boundary_expiry_priority_is_canonical_on_write_but_exact_on_read(
 
 
 async def test_three_backslash_expiry_candidates_have_stable_priority(
-    store: AsyncDiskBlobStore, tmp_path: Path,
+    store: AsyncDiskBlobStore,
+    tmp_path: Path,
 ) -> None:
     from context_intelligence_server.utils import fold_name
 

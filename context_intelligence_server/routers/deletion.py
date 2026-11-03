@@ -138,10 +138,13 @@ def _build_service(
             await require_claimed_session_access(request, session_id, capability)
 
     return DeletionService(
-        graph_store, blob_store, queue_manager,
+        graph_store,
+        blob_store,
+        queue_manager,
         storage_guard=(
             guard_storage
-            if getattr(request.app.state, "access_control_mode", "compatibility") == "scoped"
+            if getattr(request.app.state, "access_control_mode", "compatibility")
+            == "scoped"
             else None
         ),
     )

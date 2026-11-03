@@ -5,9 +5,9 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-from context_intelligence_server.queue_manager import is_safe_session_id
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from context_intelligence_server.queue_manager import is_safe_session_id
 
 _LOWER_SHA256 = re.compile(r"[0-9a-f]{64}")
 

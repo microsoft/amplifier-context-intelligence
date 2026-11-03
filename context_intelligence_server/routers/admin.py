@@ -40,10 +40,14 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from context_intelligence_server.blob_retention import duration_ns
 from context_intelligence_server.config import _ALL_ZEROS_GUID, _GUID_RE
 from context_intelligence_server.identity_store import IdentityStore
-from context_intelligence_server.blob_retention import duration_ns
-from context_intelligence_server.retention_service import JobConflict, JobNotFound, RetentionService
+from context_intelligence_server.retention_service import (
+    JobConflict,
+    JobNotFound,
+    RetentionService,
+)
 
 # ---------------------------------------------------------------------------
 # Validation constants
@@ -417,7 +421,9 @@ async def blob_prune_status(request: Request, job_id: UUID | None = None) -> dic
 
 
 @router.post("/blobs/prune/{job_id}/start", status_code=202)
-async def start_blob_prune(job_id: UUID, body: PruneStartBody, request: Request) -> dict:
+async def start_blob_prune(
+    job_id: UUID, body: PruneStartBody, request: Request
+) -> dict:
     return await _prune_call(_retention(request).start(str(job_id), body.confirmation))
 
 

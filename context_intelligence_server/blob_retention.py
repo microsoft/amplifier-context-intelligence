@@ -7,8 +7,8 @@ protect against unsafe on-disk entries, not a hostile process with our own uid.
 
 from __future__ import annotations
 
-import fcntl
 import ctypes
+import fcntl
 import os
 import re
 import sqlite3
@@ -16,11 +16,12 @@ import stat
 import sys
 import time
 import uuid
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Self
 from zoneinfo import ZoneInfo
 
 from context_intelligence_server.blob_keys import (
@@ -35,7 +36,29 @@ from context_intelligence_server.blob_keys import (
 DATABASE = "expiry.sqlite3"
 BATCH_SIZE = 512
 _DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-_COLUMNS = ("uri", "dev", "ino", "size", "mtime_ns", "ctime_ns", "expired_ns", "pending")
+_COLUMNS = (
+    "uri",
+    "dev",
+    "ino",
+    "size",
+    "mtime_ns",
+    "ctime_ns",
+    "expired_ns",
+    "pending",
+)
+
+
+class _Dirent(ctypes.Structure):
+    _fields_ = [
+        ("ino", ctypes.c_ulong),
+        ("off", ctypes.c_long),
+        ("reclen", ctypes.c_ushort),
+        ("type", ctypes.c_ubyte),
+        ("name", ctypes.c_char * 256),
+    ]
+
+
+_DirentPointer = ctypes.POINTER(_Dirent)
 
 
 class RetentionError(RuntimeError):
@@ -54,7 +77,11 @@ def duration_ns(value: str) -> int:
     match = re.fullmatch(r"([1-9][0-9]*)([smhdw])", value)
     if not match or len(match[1]) > 18:
         raise ValueError("Age must be a positive integer followed by s/m/h/d/w")
-    result = int(match[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[match[2]] * 10**9
+    result = (
+        int(match[1])
+        * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[match[2]]
+        * 10**9
+    )
     if result > 2**63 - 1:
         raise ValueError("Age exceeds supported nanosecond range")
     return result
@@ -145,15 +172,23 @@ class Root:
             fd = os.open("blobs", _DIR, dir_fd=session_fd)
             try:
                 self.check()
-                if _identity(os.stat(session, dir_fd=self.fd, follow_symlinks=False)) != _identity(os.fstat(session_fd)):
+                if _identity(
+                    os.stat(session, dir_fd=self.fd, follow_symlinks=False)
+                ) != _identity(os.fstat(session_fd)):
                     raise RetentionError("Session directory changed")
-                if _identity(os.stat("blobs", dir_fd=session_fd, follow_symlinks=False)) != _identity(os.fstat(fd)):
+                if _identity(
+                    os.stat("blobs", dir_fd=session_fd, follow_symlinks=False)
+                ) != _identity(os.fstat(fd)):
                     raise RetentionError("Blobs directory changed")
                 yield fd
                 self.check()
-                if _identity(os.stat(session, dir_fd=self.fd, follow_symlinks=False)) != _identity(os.fstat(session_fd)):
+                if _identity(
+                    os.stat(session, dir_fd=self.fd, follow_symlinks=False)
+                ) != _identity(os.fstat(session_fd)):
                     raise RetentionError("Session directory changed")
-                if _identity(os.stat("blobs", dir_fd=session_fd, follow_symlinks=False)) != _identity(os.fstat(fd)):
+                if _identity(
+                    os.stat("blobs", dir_fd=session_fd, follow_symlinks=False)
+                ) != _identity(os.fstat(fd)):
                     raise RetentionError("Blobs directory changed")
             finally:
                 os.close(fd)
@@ -163,7 +198,7 @@ class Root:
     def close(self) -> None:
         os.close(self.fd)
 
-    def __enter__(self) -> Root:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -173,7 +208,9 @@ class Root:
 class RootLock:
     """Independent open-file description; no process-global lock cache."""
 
-    def __init__(self, path: Path | str, *, exclusive: bool = False, create_root: bool = False):
+    def __init__(
+        self, path: Path | str, *, exclusive: bool = False, create_root: bool = False
+    ):
         # Expand before any mkdir: Root() expands too, so creating the literal path
         # would leave a stray './~' and then fail to open the real directory.
         self.path = Path(path).expanduser()
@@ -182,21 +219,34 @@ class RootLock:
         self.root: Root
         self.fd: int | None = None
 
-    def __enter__(self) -> RootLock:
+    def __enter__(self) -> Self:
         if self.create_root:
             self.path.mkdir(parents=True, exist_ok=True)
         self.root = Root(self.path)
         try:
-            self.fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self.root.fd)
+            self.fd = os.open(
+                LOCK,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=self.root.fd,
+            )
             st = os.fstat(self.fd)
             if not _regular(st):
                 raise RetentionError("Unsafe blob-retention lock file")
             try:
-                fcntl.flock(self.fd, (fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+                fcntl.flock(
+                    self.fd,
+                    (fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH)
+                    | fcntl.LOCK_NB,
+                )
             except BlockingIOError as exc:
-                raise RetentionError("Blob root is busy: stop writers through their service manager before apply") from exc
+                raise RetentionError(
+                    "Blob root is busy: stop writers through their service manager before apply"
+                ) from exc
             self.root.check()
-            if _identity(st) != _identity(os.stat(LOCK, dir_fd=self.root.fd, follow_symlinks=False)):
+            if _identity(st) != _identity(
+                os.stat(LOCK, dir_fd=self.root.fd, follow_symlinks=False)
+            ):
                 raise RetentionError("Blob-retention lock was replaced")
             return self
         except BaseException:
@@ -239,7 +289,11 @@ class Report:
             f"Root: {self.root}\nCutoff: {local:%Y-%m-%d %H:%M:%S}.{nanos:09d} {local:%Z} (America/Los_Angeles)\n"
             f"Eligible files: {self.files}; allocated bytes: {self.allocated_bytes}; logical bytes: {self.logical_bytes}\n"
             f"Retained: {self.retained}; skipped: {self.skipped}; changed: {self.changed}; errors: {self.errors}; deleted: {self.deleted}\n"
-            + ("Ledger rollback recovery required after confirmation.\n" if self.recovery_required else "")
+            + (
+                "Ledger rollback recovery required after confirmation.\n"
+                if self.recovery_required
+                else ""
+            )
             + "".join(f"Sample: {uri}\n" for uri in self.samples)
         ).rstrip()
 
@@ -255,33 +309,34 @@ def candidates(root: Root, cutoff_ns: int, report: Report) -> Iterator[Candidate
                 if not session.is_dir(follow_symlinks=False):
                     report.skipped += 1
                     continue
-                with root.blobs(session.name) as fd:
-                    with os.scandir(fd) as files:
-                        for entry in files:
-                            try:
-                                address = address_from_filename(
-                                    session.name, entry.name
-                                )
-                                if address is None:
-                                    report.skipped += 1
-                                    continue
-                                st = os.stat(address.filename, dir_fd=fd, follow_symlinks=False)
-                                if not _regular(st):
-                                    report.skipped += 1
-                                elif st.st_mtime_ns >= cutoff_ns:
-                                    report.retained += 1
-                                else:
-                                    item = Candidate(address.uri, fingerprint(st), st.st_blocks * 512)
-                                    report.files += 1
-                                    report.logical_bytes += st.st_size
-                                    report.allocated_bytes += item.allocated
-                                    if len(report.samples) < 5:
-                                        report.samples.append(item.uri)
-                                    yield item
-                            except ValueError:
+                with root.blobs(session.name) as fd, os.scandir(fd) as files:
+                    for entry in files:
+                        try:
+                            address = address_from_filename(session.name, entry.name)
+                            if address is None:
                                 report.skipped += 1
-                            except OSError:
-                                report.errors += 1
+                                continue
+                            st = os.stat(
+                                address.filename, dir_fd=fd, follow_symlinks=False
+                            )
+                            if not _regular(st):
+                                report.skipped += 1
+                            elif st.st_mtime_ns >= cutoff_ns:
+                                report.retained += 1
+                            else:
+                                item = Candidate(
+                                    address.uri, fingerprint(st), st.st_blocks * 512
+                                )
+                                report.files += 1
+                                report.logical_bytes += st.st_size
+                                report.allocated_bytes += item.allocated
+                                if len(report.samples) < 5:
+                                    report.samples.append(item.uri)
+                                yield item
+                        except ValueError:
+                            report.skipped += 1
+                        except OSError:
+                            report.errors += 1
             except (ValueError, FileNotFoundError, NotADirectoryError):
                 report.skipped += 1
             except OSError:
@@ -323,7 +378,11 @@ class Ledger:
         self.root.check()
         assert self.fd is not None
         st = os.stat(METADATA, dir_fd=self.root.fd, follow_symlinks=False)
-        if _identity(st) != _identity(os.fstat(self.fd)) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+        if (
+            _identity(st) != _identity(os.fstat(self.fd))
+            or st.st_uid != os.geteuid()
+            or st.st_mode & 0o077
+        ):
             raise RetentionError("Unsafe or replaced private expiry metadata directory")
         with os.scandir(self.fd) as entries:
             for entry in entries:
@@ -339,8 +398,12 @@ class Ledger:
     def _validate_schema(db: sqlite3.Connection) -> None:
         columns = tuple(row[1] for row in db.execute("PRAGMA table_info(expiry)"))
         if columns != _COLUMNS:
-            raise RetentionError("Invalid expiry ledger schema (no automatic migration)")
-        db.execute("SELECT uri, dev, ino, size, mtime_ns, ctime_ns, expired_ns, pending FROM expiry LIMIT 1").fetchone()
+            raise RetentionError(
+                "Invalid expiry ledger schema (no automatic migration)"
+            )
+        db.execute(
+            "SELECT uri, dev, ino, size, mtime_ns, ctime_ns, expired_ns, pending FROM expiry LIMIT 1"
+        ).fetchone()
 
     def _initialize(self) -> None:
         """Publish only a closed, validated, durable DB; caller holds root EX lock.
@@ -350,7 +413,12 @@ class Ledger:
         """
         assert self.fd is not None
         name = f"{DATABASE}.init-{uuid.uuid4().hex}"
-        fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self.fd)
+        fd = os.open(
+            name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=self.fd,
+        )
         try:
             self._check()
             path = self.root.path / METADATA / name
@@ -371,7 +439,9 @@ class Ledger:
                 db.close()
             os.fsync(fd)
             self._check()
-            if _identity(os.stat(name, dir_fd=self.fd, follow_symlinks=False)) != _identity(os.fstat(fd)):
+            if _identity(
+                os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+            ) != _identity(os.fstat(fd)):
                 raise RetentionError("Expiry ledger initialization file was replaced")
             os.fsync(self.fd)
             os.rename(name, DATABASE, src_dir_fd=self.fd, dst_dir_fd=self.fd)
@@ -379,7 +449,7 @@ class Ledger:
         finally:
             os.close(fd)
 
-    def __enter__(self) -> Ledger:
+    def __enter__(self) -> Self:
         try:
             if self.writable:
                 try:
@@ -395,12 +465,16 @@ class Ledger:
                 raise
             self._check()
             try:
-                fd = os.open(DATABASE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd)
+                fd = os.open(
+                    DATABASE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd
+                )
             except FileNotFoundError:
                 if not self.writable:
                     return self
                 self._initialize()
-                fd = os.open(DATABASE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd)
+                fd = os.open(
+                    DATABASE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd
+                )
             try:
                 st = os.fstat(fd)
                 if not _regular(st):
@@ -409,10 +483,15 @@ class Ledger:
             finally:
                 os.close(fd)
             path = self.root.path / METADATA / DATABASE
-            self.db = sqlite3.connect(path.as_uri() + ("?mode=rw" if self.writable else "?mode=ro"), uri=True)
+            self.db = sqlite3.connect(
+                path.as_uri() + ("?mode=rw" if self.writable else "?mode=ro"), uri=True
+            )
             self._check()
             if self.writable:
-                if self.db.execute("PRAGMA journal_mode=DELETE").fetchone()[0] != "delete":
+                if (
+                    self.db.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+                    != "delete"
+                ):
                     raise RetentionError("Expiry ledger must use DELETE journal mode")
                 self.db.execute("PRAGMA synchronous=FULL")
             self._validate_schema(self.db)
@@ -426,7 +505,10 @@ class Ledger:
         if self.db is None:
             return False
         self._check()
-        return self.db.execute("SELECT 1 FROM expiry WHERE uri=?", (uri,)).fetchone() is not None
+        return (
+            self.db.execute("SELECT 1 FROM expiry WHERE uri=?", (uri,)).fetchone()
+            is not None
+        )
 
     def commit(self) -> None:
         assert self.db is not None and self.fd is not None
@@ -508,7 +590,10 @@ def _unlink(
 ) -> None:
     """Never delete an updated/restored inode or a URI with a different record."""
     assert ledger.db is not None
-    row = ledger.db.execute("SELECT dev, ino, size, mtime_ns, ctime_ns, pending FROM expiry WHERE uri=?", (item.uri,)).fetchone()
+    row = ledger.db.execute(
+        "SELECT dev, ino, size, mtime_ns, ctime_ns, pending FROM expiry WHERE uri=?",
+        (item.uri,),
+    ).fetchone()
     if row is None or tuple(row[:5]) != item.fp or not row[5]:
         report.changed += 1
         return
@@ -554,17 +639,19 @@ def _recover(root: Root, ledger: Ledger, report: Report) -> None:
         rows = ledger.db.execute(
             "SELECT uri, dev, ino, size, mtime_ns, ctime_ns FROM expiry "
             "WHERE pending=1 AND mtime_ns<? AND uri>? ORDER BY uri LIMIT ?",
-            (report.cutoff_ns, after, BATCH_SIZE)
+            (report.cutoff_ns, after, BATCH_SIZE),
         ).fetchall()
         if not rows:
             break
-        with root.checked_batch():
-            with _sync_dirs() as directories:
-                for row in rows:
-                    _unlink(
-                        root, ledger, Candidate(row[0], tuple(row[1:]), 0),
-                        report, dirty_dirs=directories,
-                    )
+        with root.checked_batch(), _sync_dirs() as directories:
+            for row in rows:
+                _unlink(
+                    root,
+                    ledger,
+                    Candidate(row[0], tuple(row[1:]), 0),
+                    report,
+                    dirty_dirs=directories,
+                )
         ledger.commit()
         after = rows[-1][0]
 
@@ -590,7 +677,10 @@ def apply(
             # A valid hot rollback journal requires writable SQLite recovery.
             # Preview alone must remain read-only; confirmed apply may recover
             # it under the exclusive root lock. Do not mask other DB failures.
-            if getattr(exc, "sqlite_errorcode", None) != sqlite3.SQLITE_READONLY_ROLLBACK:
+            if (
+                getattr(exc, "sqlite_errorcode", None)
+                != sqlite3.SQLITE_READONLY_ROLLBACK
+            ):
                 raise
             recovery_required = True
         report = _preview_root(root, cutoff_ns)
@@ -651,18 +741,13 @@ def _directory_entries(fd: int, cookie: int) -> Iterator[Iterator[tuple[str, int
     Cookies provide a live estimate under mutations, not snapshot completeness.
     """
     if sys.platform != "linux" or ctypes.sizeof(ctypes.c_void_p) != 8:
-        raise RetentionError("Online bounded directory scans require 64-bit Linux; use offline prune")
-
-    class Dirent(ctypes.Structure):
-        _fields_ = [
-            ("ino", ctypes.c_ulong), ("off", ctypes.c_long),
-            ("reclen", ctypes.c_ushort), ("type", ctypes.c_ubyte),
-            ("name", ctypes.c_char * 256),
-        ]
+        raise RetentionError(
+            "Online bounded directory scans require 64-bit Linux; use offline prune"
+        )
 
     libc = ctypes.CDLL(None, use_errno=True)
     libc.fdopendir.argtypes, libc.fdopendir.restype = [ctypes.c_int], ctypes.c_void_p
-    libc.readdir.argtypes, libc.readdir.restype = [ctypes.c_void_p], ctypes.POINTER(Dirent)
+    libc.readdir.argtypes, libc.readdir.restype = [ctypes.c_void_p], _DirentPointer
     libc.seekdir.argtypes, libc.seekdir.restype = [ctypes.c_void_p, ctypes.c_long], None
     libc.telldir.argtypes, libc.telldir.restype = [ctypes.c_void_p], ctypes.c_long
     libc.closedir.argtypes, libc.closedir.restype = [ctypes.c_void_p], ctypes.c_int
@@ -692,8 +777,13 @@ def _directory_entries(fd: int, cookie: int) -> Iterator[Iterator[tuple[str, int
 
 
 def scan_window(
-    path: Path, cursor: ScanCursor, report: Report, preview_started_ns: int,
-    *, max_entries: int = 512, budget_ns: int = 10_000_000,
+    path: Path,
+    cursor: ScanCursor,
+    report: Report,
+    preview_started_ns: int,
+    *,
+    max_entries: int = 512,
+    budget_ns: int = 10_000_000,
     max_candidates: int = 32,
 ) -> list[Candidate]:
     """Caller holds a process-local shared lease; all resources close on return."""
@@ -702,8 +792,11 @@ def scan_window(
     started = time.monotonic_ns()
 
     def full() -> bool:
-        return (inspected >= max_entries or len(items) >= max_candidates
-                or (inspected > 0 and time.monotonic_ns() - started >= budget_ns))
+        return (
+            inspected >= max_entries
+            or len(items) >= max_candidates
+            or (inspected > 0 and time.monotonic_ns() - started >= budget_ns)
+        )
 
     with Root(path) as root:
         identity = _identity(os.fstat(root.fd))
@@ -719,7 +812,9 @@ def scan_window(
                         if name not in (".", "..", LOCK, METADATA):
                             try:
                                 component(name)
-                                st = os.stat(name, dir_fd=root.fd, follow_symlinks=False)
+                                st = os.stat(
+                                    name, dir_fd=root.fd, follow_symlinks=False
+                                )
                                 if stat.S_ISDIR(st.st_mode):
                                     cursor.session = name
                                     cursor.session_cookie = 0
@@ -737,7 +832,10 @@ def scan_window(
             try:
                 with root.blobs(cursor.session) as fd:
                     identity = _identity(os.fstat(fd))
-                    if cursor.blobs_identity is not None and identity != cursor.blobs_identity:
+                    if (
+                        cursor.blobs_identity is not None
+                        and identity != cursor.blobs_identity
+                    ):
                         report.changed += 1
                         cursor.session = None
                         continue
@@ -754,13 +852,24 @@ def scan_window(
                                     if address is None:
                                         report.skipped += 1
                                     else:
-                                        st = os.stat(address.filename, dir_fd=fd, follow_symlinks=False)
+                                        st = os.stat(
+                                            address.filename,
+                                            dir_fd=fd,
+                                            follow_symlinks=False,
+                                        )
                                         if not _regular(st):
                                             report.skipped += 1
-                                        elif st.st_mtime_ns >= report.cutoff_ns or st.st_ctime_ns > preview_started_ns:
+                                        elif (
+                                            st.st_mtime_ns >= report.cutoff_ns
+                                            or st.st_ctime_ns > preview_started_ns
+                                        ):
                                             report.retained += 1
                                         else:
-                                            item = Candidate(address.uri, fingerprint(st), st.st_blocks * 512)
+                                            item = Candidate(
+                                                address.uri,
+                                                fingerprint(st),
+                                                st.st_blocks * 512,
+                                            )
                                             items.append(item)
                                             report.files += 1
                                             report.logical_bytes += st.st_size
@@ -784,28 +893,40 @@ def scan_window(
     return items
 
 
-def recovery_page(path: Path, after: str, cutoff_ns: int, preview_started_ns: int) -> tuple[str, list[Candidate], int]:
+def recovery_page(
+    path: Path, after: str, cutoff_ns: int, preview_started_ns: int
+) -> tuple[str, list[Candidate], int]:
     """At most 512 PRIMARY KEY rows, including NONpending rows, under SH lease."""
     with Root(path) as root, Ledger(root) as ledger:
         if ledger.db is None:
             return after, [], 0
         rows = ledger.db.execute(
             "SELECT uri, dev, ino, size, mtime_ns, ctime_ns, pending FROM expiry "
-            "WHERE uri>? ORDER BY uri LIMIT 512", (after,),
+            "WHERE uri>? ORDER BY uri LIMIT 512",
+            (after,),
         ).fetchall()
         return (
             rows[-1][0] if rows else after,
-            [Candidate(row[0], tuple(row[1:6]), 0) for row in rows
-             if row[6] and row[4] < cutoff_ns and row[5] <= preview_started_ns],
+            [
+                Candidate(row[0], tuple(row[1:6]), 0)
+                for row in rows
+                if row[6] and row[4] < cutoff_ns and row[5] <= preview_started_ns
+            ],
             len(rows),
         )
 
 
-def apply_batch(path: Path, items: list[Candidate], report: Report, *, recovery: bool = False) -> None:
+def apply_batch(
+    path: Path, items: list[Candidate], report: Report, *, recovery: bool = False
+) -> None:
     """Caller holds EX in-process lease, never an upgraded flock."""
     if len(items) > 64:
         raise RetentionError("Online batch exceeds 64 candidates")
-    with Root(path) as root, root.checked_batch(), Ledger(root, writable=True) as ledger:
+    with (
+        Root(path) as root,
+        root.checked_batch(),
+        Ledger(root, writable=True) as ledger,
+    ):
         ready = []
         for item in items:
             if item.fp[3] >= report.cutoff_ns:

@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import hashlib
 import json
 import os
-import sqlite3
 import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from itertools import pairwise
 from pathlib import Path
-from typing import cast
+from types import SimpleNamespace
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -22,13 +24,19 @@ from fastapi import FastAPI
 from context_intelligence_server import blob_retention as r
 from context_intelligence_server.auth import BearerTokenMiddleware
 from context_intelligence_server.blob_coordination import (
-    Coordinator, coordinator_for, filesystem, wait_filesystem,
+    Coordinator,
+    coordinator_for,
+    filesystem,
 )
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.retention_client import ClientError, RetentionClient
 from context_intelligence_server.retention_scheduler import run_scheduled
 from context_intelligence_server.retention_service import (
-    JobConflict, JobNotFound, RetentionService, SNAPSHOT, TERMINAL,
+    SNAPSHOT,
+    TERMINAL,
+    JobConflict,
+    JobNotFound,
+    RetentionService,
 )
 from context_intelligence_server.routers.admin import router
 
@@ -48,14 +56,14 @@ async def until(predicate, timeout=5):
             await asyncio.sleep(0.002)
 
 
-async def ready(service):
+async def ready(service: RetentionService) -> str:
     job = await service.preview("30d")
-    await service.task
+    await finish(service)
     assert service.status()["state"] == "ready", service.status()
     return job["id"]
 
 
-async def finish(service) -> None:
+async def finish(service: RetentionService) -> None:
     """Await the service's current job task."""
     task = service.task
     assert task is not None
@@ -72,7 +80,9 @@ try:
 except RetentionError:
     sys.exit(7)
 """
-    return subprocess.run([sys.executable, "-c", code, str(root)], timeout=5).returncode
+    return subprocess.run(
+        [sys.executable, "-c", code, str(root)], check=False, timeout=5
+    ).returncode
 
 
 def test_fifo_cohorts_under_shared_and_exclusive_load():
@@ -91,10 +101,12 @@ def test_fifo_cohorts_under_shared_and_exclusive_load():
     assert entered.wait(5)
     # Force queue order while actual admissions use the real coordinator.
     for i, exclusive in enumerate([True, False, False, True, False, True]):
+
         def run(index=i, write=exclusive):
             with coord.lease(exclusive=write):
                 order.append(index)
                 time.sleep(0.002)
+
         thread = threading.Thread(target=run)
         thread.start()
         threads.append(thread)
@@ -112,7 +124,9 @@ def test_fifo_cohorts_under_shared_and_exclusive_load():
     assert not coord.queue and not coord.readers and not coord.writer
 
 
-@pytest.mark.parametrize("operation", ["write", "read", "list", "size", "dump", "delete_session"])
+@pytest.mark.parametrize(
+    "operation", ["write", "read", "list", "size", "dump", "delete_session"]
+)
 async def test_all_operations_automatically_coordinate_aliases(tmp_path, operation):
     root = tmp_path / "root"
     root.mkdir()
@@ -152,6 +166,7 @@ async def test_all_operations_automatically_coordinate_aliases(tmp_path, operati
 async def test_cancel_waiting_and_running_io_and_shutdown_external_exclusion(tmp_path):
     service = await RetentionService.open(tmp_path)
     coord = service._coordinator
+    assert coord is not None
     held, release = threading.Event(), threading.Event()
     touched = []
 
@@ -165,7 +180,9 @@ async def test_cancel_waiting_and_running_io_and_shutdown_external_exclusion(tmp
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    waiting = asyncio.create_task(filesystem(tmp_path, lambda: touched.append("must-not-run"), exclusive=True))
+    waiting = asyncio.create_task(
+        filesystem(tmp_path, lambda: touched.append("must-not-run"), exclusive=True)
+    )
     await until(lambda: len(coord.queue) == 1)
     waiting.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -183,11 +200,182 @@ async def test_cancel_waiting_and_running_io_and_shutdown_external_exclusion(tmp
     assert not coord.queue and coord.readers == 0
 
 
-def test_scan_windows_close_descriptors_and_static_multi_directory_coverage(tmp_path, monkeypatch):
+@pytest.mark.skipif(
+    sys.implementation.name != "cpython"
+    or sys.platform != "linux"
+    or ctypes.sizeof(ctypes.c_void_p) != 8,
+    reason="Real ctypes pointer-cache regression requires CPython on Linux LP64",
+)
+def test_scan_windows_do_not_grow_ctypes_pointer_cache(tmp_path):
+    """A fresh ctypes structure per reopened window leaks through POINTER's cache."""
+    for session in range(16):
+        for key in range(4):
+            payload(tmp_path, f"key{key}", f"session{session}")
+    expected = {
+        f"ci-blob://session{session}/key{key}"
+        for session in range(16)
+        for key in range(4)
+    }
+
+    def traverse() -> int:
+        cursor = r.ScanCursor()
+        report = r.Report(str(tmp_path), time.time_ns())
+        started = time.time_ns()
+        uris = []
+        for windows in range(1, 2001):
+            uris.extend(
+                item.uri
+                for item in r.scan_window(
+                    tmp_path,
+                    cursor,
+                    report,
+                    started,
+                    max_entries=3,
+                    budget_ns=10**9,
+                    max_candidates=1,
+                )
+            )
+            if cursor.done:
+                assert windows > 50
+                assert len(uris) == len(set(uris)) == report.files == 64
+                assert set(uris) == expected
+                return windows
+        pytest.fail("Real bounded scan did not terminate within 2000 windows")
+
+    def dirent_types():
+        # Ignore unrelated lazy ctypes consumers, but catch both the original
+        # local class and its fixed private module-level replacement.
+        cache = dict(cast(Any, ctypes)._pointer_type_cache)
+        return {
+            key: value
+            for key, value in cache.items()
+            if getattr(key, "__module__", None) == r.__name__
+            and getattr(key, "__name__", None) in {"Dirent", "_Dirent"}
+        }
+
+    traverse()
+    baseline = dirent_types()
+    assert baseline
+    windows = 0
+    for _ in range(2):
+        windows += traverse()
+        current = dirent_types()
+        assert current.keys() == baseline.keys(), (
+            "Directory windows retained new ctypes classes"
+        )
+        assert all(current[key] is value for key, value in baseline.items())
+    assert windows > 50
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or ctypes.sizeof(ctypes.c_void_p) != 8,
+    reason="Directory ABI and opaque cookie qualification requires Linux LP64",
+)
+def test_dirent_abi_and_cookie_roundtrip_preserve_raw_names(tmp_path):
+    """The shared FFI type must preserve native layout and surrogateescape names."""
+    assert r._Dirent._fields_ == [
+        ("ino", ctypes.c_ulong),
+        ("off", ctypes.c_long),
+        ("reclen", ctypes.c_ushort),
+        ("type", ctypes.c_ubyte),
+        ("name", ctypes.c_char * 256),
+    ]
+    assert [
+        (getattr(r._Dirent, field[0]).offset, ctypes.sizeof(field[1]))
+        for field in r._Dirent._fields_
+    ] == [
+        (0, 8),
+        (8, 8),
+        (16, 2),
+        (18, 1),
+        (19, 256),
+    ]
+    assert ctypes.sizeof(r._Dirent) == 280
+    assert ctypes.alignment(r._Dirent) == 8
+    assert cast(Any, r._DirentPointer)._type_ is r._Dirent
+    raw = b"raw-\xff"
+    names = ["ordinary", "unicode-\u00e9", os.fsdecode(raw)]
+    for name in names:
+        (tmp_path / name).touch()
+    fd = os.open(tmp_path, r._DIR)
+    try:
+        with r._directory_entries(fd, 0) as entries:
+            sequence = list(entries)
+        assert all(
+            isinstance(name, str) and isinstance(cookie, int)
+            for name, cookie in sequence
+        )
+        assert set(names).issubset(name for name, _ in sequence)
+        assert raw in [os.fsencode(name) for name, _ in sequence]
+        middle = len(sequence) // 2
+        with r._directory_entries(fd, sequence[middle][1]) as entries:
+            assert list(entries) == sequence[middle + 1 :]
+        os.fstat(fd)  # The stream owns a separate descriptor, not the caller's.
+    finally:
+        os.close(fd)
+    with pytest.raises(OSError):
+        os.fstat(fd)
+
+
+@pytest.mark.parametrize(
+    "platform,pointer_size", [("darwin", 8), ("win32", 8), ("linux", 4)]
+)
+def test_online_directory_guard_precedes_libc(monkeypatch, platform, pointer_size):
+    real_sizeof = ctypes.sizeof
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Unsupported ABI acquired libc or a descriptor")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(r, "sys", SimpleNamespace(platform=platform))
+        patch.setattr(
+            ctypes,
+            "sizeof",
+            lambda kind: pointer_size if kind is ctypes.c_void_p else real_sizeof(kind),
+        )
+        patch.setattr(ctypes, "CDLL", forbidden)
+        patch.setattr(os, "open", forbidden)
+        with (
+            pytest.raises(r.RetentionError, match="require 64-bit Linux"),
+            r._directory_entries(-1, 0),
+        ):
+            pytest.fail("Unsupported ABI accepted")
+
+
+def test_retention_import_does_not_acquire_libc():
+    code = """
+import ctypes, importlib, sys
+from context_intelligence_server import blob_retention as r
+def forbidden(*args, **kwargs):
+    raise AssertionError("Import acquired libc")
+ctypes.CDLL = forbidden
+sys.platform = "darwin"
+importlib.reload(r)
+assert r.duration_ns("1d") == 86400 * 10**9
+try:
+    with r._directory_entries(-1, 0):
+        raise AssertionError("Unsupported ABI accepted")
+except r.RetentionError as exc:
+    assert "require 64-bit Linux" in str(exc)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_scan_windows_close_descriptors_and_static_multi_directory_coverage(
+    tmp_path, monkeypatch
+):
     for i in range(1100):
         payload(tmp_path, f"{i:04}", f"s{i // 550}")
     cutoff, started = time.time_ns() - 30 * 86400 * 10**9, time.time_ns()
     cursor, report = r.ScanCursor(), r.Report(str(tmp_path), cutoff)
+
     def root_descriptors():
         descriptors = []
         for number in os.listdir("/proc/self/fd"):
@@ -212,7 +400,9 @@ def test_scan_windows_close_descriptors_and_static_multi_directory_coverage(tmp_
     monkeypatch.setattr(os, "stat", counted)
     while not cursor.done:
         stat_count = 0
-        items = r.scan_window(tmp_path, cursor, report, started, max_entries=19, budget_ns=10**9)
+        items = r.scan_window(
+            tmp_path, cursor, report, started, max_entries=19, budget_ns=10**9
+        )
         assert len(items) <= 19 and stat_count < 40
         assert not root_descriptors()
         all_items.extend(items)
@@ -221,19 +411,27 @@ def test_scan_windows_close_descriptors_and_static_multi_directory_coverage(tmp_
     assert not (tmp_path / r.METADATA).exists()
 
 
-def test_scan_cookie_survives_consumed_entry_deletion_and_directory_replacement(tmp_path):
+def test_scan_cookie_survives_consumed_entry_deletion_and_directory_replacement(
+    tmp_path,
+):
     for i in range(60):
         payload(tmp_path, f"{i:04}")
     report = r.Report(str(tmp_path), time.time_ns())
     started, cursor = time.time_ns(), r.ScanCursor()
-    first = r.scan_window(tmp_path, cursor, report, started, max_entries=10, budget_ns=10**9)
+    first = r.scan_window(
+        tmp_path, cursor, report, started, max_entries=10, budget_ns=10**9
+    )
     assert first
     for item in first:
         session, key = r.parse_uri(item.uri)
         (tmp_path / session / "blobs" / f"{key}.json").unlink()
     all_items = list(first)
     while not cursor.done:
-        all_items.extend(r.scan_window(tmp_path, cursor, report, started, max_entries=10, budget_ns=10**9))
+        all_items.extend(
+            r.scan_window(
+                tmp_path, cursor, report, started, max_entries=10, budget_ns=10**9
+            )
+        )
     assert len({item.uri for item in all_items}) == 60
     cursor = r.ScanCursor()
     r.scan_window(tmp_path, cursor, report, started, max_entries=10, budget_ns=10**9)
@@ -242,7 +440,9 @@ def test_scan_cookie_survives_consumed_entry_deletion_and_directory_replacement(
     blobs.mkdir()
     payload(tmp_path, "replacement")
     previous = report.changed
-    assert not r.scan_window(tmp_path, cursor, report, started, max_entries=10, budget_ns=10**9)
+    assert not r.scan_window(
+        tmp_path, cursor, report, started, max_entries=10, budget_ns=10**9
+    )
     assert report.changed == previous + 1
 
 
@@ -276,7 +476,9 @@ async def test_preview_side_effect_free_duplicate_expiry_and_cancel(tmp_path):
         await service.close()
 
 
-async def test_online_apply_retains_new_changed_files_and_replay_across_instances(tmp_path, monkeypatch):
+async def test_online_apply_retains_new_changed_files_and_replay_across_instances(
+    tmp_path, monkeypatch
+):
     for i in range(96):
         payload(tmp_path, f"{i:04}")
     # Alias lives outside root so scanner doesn't mistake it for a session.
@@ -298,15 +500,17 @@ async def test_online_apply_retains_new_changed_files_and_replay_across_instance
         await other.write("session", "0000", {"changed": True})
         newer = payload(tmp_path, "post-preview-old-mtime")
         await service.start(job, "prune")
+        apply_task = service.task
+        assert apply_task is not None
         writes = 0
-        while not service.task.done():
+        while not apply_task.done():
             uri = await other.write("live", f"new-{writes}", {"n": writes})
             assert await first_store.read(uri) == {"n": writes}
             assert await first_store.size(uri) > 0
             await other.list("live")
             writes += 1
             await asyncio.sleep(0.002)
-        await service.task
+        await apply_task
         result = service.status()
         assert result["state"] == "completed", result
         assert result["report"]["deleted"] == 95
@@ -314,26 +518,38 @@ async def test_online_apply_retains_new_changed_files_and_replay_across_instance
         assert await first_store.read("ci-blob://session/0000") == {"changed": True}
         assert newer.exists()
         assert sizes and max(sizes) <= 32
-        assert all(b - a >= 0.045 for a, b in zip(admission_times, admission_times[1:]))
+        assert all(b - a >= 0.045 for a, b in pairwise(admission_times))
         expired = "ci-blob://session/0001"
         with pytest.raises(r.BlobExpiredError):
             await other.read(expired)
         assert await other.write("session", "0001", {"replayed": True}) == expired
         assert not (tmp_path / "session/blobs/0001.json").exists()
         with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
-            assert tuple(row[1] for row in ledger.db.execute("PRAGMA table_info(expiry)")) == r._COLUMNS
-            assert ledger.db.execute("SELECT count(*) FROM expiry WHERE pending=1").fetchone()[0] == 0
+            assert ledger.db is not None
+            assert (
+                tuple(row[1] for row in ledger.db.execute("PRAGMA table_info(expiry)"))
+                == r._COLUMNS
+            )
+            assert (
+                ledger.db.execute(
+                    "SELECT count(*) FROM expiry WHERE pending=1"
+                ).fetchone()[0]
+                == 0
+            )
     finally:
         await service.close()
 
 
-async def test_dedicated_worker_progress_when_ordinary_pool_waits_for_exclusive(tmp_path):
+async def test_dedicated_worker_progress_when_ordinary_pool_waits_for_exclusive(
+    tmp_path,
+):
     payload(tmp_path)
     loop = asyncio.get_running_loop()
     pool = ThreadPoolExecutor(max_workers=1)
     loop.set_default_executor(pool)
     service = await RetentionService.open(tmp_path)
     coord = service._coordinator
+    assert coord is not None
     entered, release = threading.Event(), threading.Event()
 
     def hold():
@@ -346,7 +562,9 @@ async def test_dedicated_worker_progress_when_ordinary_pool_waits_for_exclusive(
     await until(entered.is_set)
     write = asyncio.create_task(AsyncDiskBlobStore(tmp_path).write("live", "new", {}))
     await until(lambda: len(coord.queue) == 1)
-    maintenance = asyncio.create_task(service._work(lambda: "dedicated", coordinated=False))
+    maintenance = asyncio.create_task(
+        service._work(lambda: "dedicated", coordinated=False)
+    )
     assert await asyncio.wait_for(maintenance, 1) == "dedicated"
     ticks = 0
     for _ in range(10):
@@ -360,7 +578,9 @@ async def test_dedicated_worker_progress_when_ordinary_pool_waits_for_exclusive(
     # Test's one-thread pool is joined by the event-loop runner at teardown.
 
 
-async def test_cancel_finishes_admitted_batch_and_durable_checkpoint(tmp_path, monkeypatch):
+async def test_cancel_finishes_admitted_batch_and_durable_checkpoint(
+    tmp_path, monkeypatch
+):
     for i in range(80):
         payload(tmp_path, str(i))
     service = await RetentionService.open(tmp_path)
@@ -402,12 +622,17 @@ async def test_cancel_finishes_admitted_batch_and_durable_checkpoint(tmp_path, m
 
 def test_large_nonpending_recovery_pages_use_primary_key_without_filter(tmp_path):
     with r.RootLock(tmp_path) as lock, r.Ledger(lock.root, writable=True) as ledger:
-        ledger.db.executemany("INSERT INTO expiry VALUES (?,1,1,1,1,1,1,0)",
-                             ((f"ci-blob://s/{i:08}",) for i in range(12000)))
+        assert ledger.db is not None
+        ledger.db.executemany(
+            "INSERT INTO expiry VALUES (?,1,1,1,1,1,1,0)",
+            ((f"ci-blob://s/{i:08}",) for i in range(12000)),
+        )
         ledger.commit()
     after, total, pages = "", 0, 0
     while True:
-        after, items, count = r.recovery_page(tmp_path, after, time.time_ns(), time.time_ns())
+        after, items, count = r.recovery_page(
+            tmp_path, after, time.time_ns(), time.time_ns()
+        )
         assert not items and count <= 512
         total += count
         pages += 1
@@ -415,9 +640,13 @@ def test_large_nonpending_recovery_pages_use_primary_key_without_filter(tmp_path
             break
     assert total == 12000 and pages == 24
     with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
-        plan = str(ledger.db.execute(
-            "EXPLAIN QUERY PLAN SELECT * FROM expiry WHERE uri>? ORDER BY uri LIMIT 512", ("",)
-        ).fetchall())
+        assert ledger.db is not None
+        plan = str(
+            ledger.db.execute(
+                "EXPLAIN QUERY PLAN SELECT * FROM expiry WHERE uri>? ORDER BY uri LIMIT 512",
+                ("",),
+            ).fetchall()
+        )
         assert "PRIMARY KEY" in plan
 
 
@@ -439,6 +668,7 @@ async def test_restarted_confirmed_job_is_interrupted_never_resumed(tmp_path):
     service = await RetentionService.open(tmp_path)
     job = await ready(service)
     # Simulate crash at the durable pre-deletion checkpoint, no auto apply.
+    assert service.job is not None
     service.job.update(confirmed=True, state="running")
     await service._work(service._save, exclusive=True)
     await service.close()
@@ -448,7 +678,10 @@ async def test_restarted_confirmed_job_is_interrupted_never_resumed(tmp_path):
         with pytest.raises(JobConflict):
             await reopened.start(job, "prune")
         assert old.exists()
-        assert json.loads((tmp_path / r.METADATA / SNAPSHOT).read_text())["state"] == "interrupted"
+        assert (
+            json.loads((tmp_path / r.METADATA / SNAPSHOT).read_text())["state"]
+            == "interrupted"
+        )
     finally:
         await reopened.close()
 
@@ -462,7 +695,8 @@ async def test_admin_auth_validation_and_status_during_slow_scan(tmp_path, monke
     app.state.admin_api_key_configured = True
     app.state.retention_service = service
     wrapped = BearerTokenMiddleware(
-        app, keystore={hashlib.sha256(b"fixture-data").hexdigest(): "test"},
+        app,
+        keystore={hashlib.sha256(b"fixture-data").hexdigest(): "test"},
         admin_api_key_digest=hashlib.sha256(b"fixture-admin").hexdigest(),
     )
     entered, release = threading.Event(), threading.Event()
@@ -476,31 +710,65 @@ async def test_admin_auth_validation_and_status_during_slow_scan(tmp_path, monke
     monkeypatch.setattr(r, "scan_window", slow)
     transport = httpx.ASGITransport(app=wrapped)
     try:
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
             base = "/admin/blobs/prune"
             for token, expected in [(None, 401), ("wrong", 401), ("fixture-data", 403)]:
                 headers = {"Authorization": f"Bearer {token}"} if token else {}
-                assert (await client.post(base, json={"older_than": "30d"}, headers=headers)).status_code == expected
+                assert (
+                    await client.post(base, json={"older_than": "30d"}, headers=headers)
+                ).status_code == expected
             client.headers["Authorization"] = "Bearer fixture-admin"
-            for body in [{"older_than": "30d", "root": "/elsewhere"},
-                         {"older_than": "30d", "cutoff_ns": 1}, {"older_than": "0d"}]:
+            for body in [
+                {"older_than": "30d", "root": "/elsewhere"},
+                {"older_than": "30d", "cutoff_ns": 1},
+                {"older_than": "0d"},
+            ]:
                 assert (await client.post(base, json=body)).status_code == 422
-            replies = await asyncio.gather(*(client.post(base, json={"older_than": "30d"}) for _ in range(2)))
+            replies = await asyncio.gather(
+                *(client.post(base, json={"older_than": "30d"}) for _ in range(2))
+            )
             assert sorted(reply.status_code for reply in replies) == [202, 409]
-            job = next(reply.json()["id"] for reply in replies if reply.status_code == 202)
-            for suffix, body in [("/start", {"confirmation": "prune"}), ("/cancel", {})]:
-                for token, expected in [(None, 401), ("wrong", 401), ("fixture-data", 403)]:
-                    headers = {"Authorization": f"Bearer {token}"} if token else {"Authorization": ""}
-                    assert (await client.post(base + "/" + job + suffix, json=body, headers=headers)).status_code == expected
+            job = next(
+                reply.json()["id"] for reply in replies if reply.status_code == 202
+            )
+            for suffix, body in [
+                ("/start", {"confirmation": "prune"}),
+                ("/cancel", {}),
+            ]:
+                for token, expected in [
+                    (None, 401),
+                    ("wrong", 401),
+                    ("fixture-data", 403),
+                ]:
+                    headers = (
+                        {"Authorization": f"Bearer {token}"}
+                        if token
+                        else {"Authorization": ""}
+                    )
+                    assert (
+                        await client.post(
+                            base + "/" + job + suffix, json=body, headers=headers
+                        )
+                    ).status_code == expected
             await until(entered.is_set)
             status = await asyncio.wait_for(client.get(base + "/" + job), 0.5)
             assert status.json()["state"] == "previewing"
-            assert (await client.post(base + "/" + job + "/start", json={"confirmation": "prune"})).status_code == 409
+            assert (
+                await client.post(
+                    base + "/" + job + "/start", json={"confirmation": "prune"}
+                )
+            ).status_code == 409
             release.set()
-            await service.task
+            await finish(service)
             assert (await client.get(base)).json()["state"] == "ready"
-            assert (await client.post(base + "/" + job + "/start",
-                                      json={"confirmation": "prune", "root": "/tmp"})).status_code == 422
+            assert (
+                await client.post(
+                    base + "/" + job + "/start",
+                    json={"confirmation": "prune", "root": "/tmp"},
+                )
+            ).status_code == 422
             assert (await client.post(base + "/" + job + "/cancel")).status_code == 202
             app.state.admin_api_key_configured = False
             assert (await client.get(base)).status_code == 503
@@ -526,14 +794,19 @@ def _hold_final_save(service, monkeypatch, *, fail: bool = False):
 
     def wrapped():
         if _final_save_in_flight(service):
-            seen["state"], seen["phase"] = service.job["state"], service.job.get("phase")
+            seen["state"], seen["phase"] = (
+                service.job["state"],
+                service.job.get("phase"),
+            )
             entered.set()
             assert release.wait(5)
             if fail:
                 raise OSError("injected final checkpoint failure")
         save()
         if _final_save_in_flight(service):
-            seen["durable"] = json.loads((service.path / r.METADATA / SNAPSHOT).read_text())["state"]
+            seen["durable"] = json.loads(
+                (service.path / r.METADATA / SNAPSHOT).read_text()
+            )["state"]
             seen["public_after_save"] = service.job["state"]
 
     monkeypatch.setattr(service, "_save", wrapped)
@@ -550,12 +823,14 @@ async def test_final_checkpoint_blocks_replacement_preview(tmp_path, monkeypatch
         await until(entered.is_set)
         status = service.status()
         assert status["state"] == "running" and status["phase"] == "finalizing", status
-        assert not service.task.done()
+        apply_task = service.task
+        assert apply_task is not None
+        assert not apply_task.done()
         with pytest.raises(JobConflict):
             await service.preview("30d")
         assert service.status()["id"] == job
         release.set()
-        await service.task
+        await apply_task
         assert service.status()["state"] == "completed"
         new = await ready(service)
         assert new != job and service.status()["state"] == "ready"
@@ -718,7 +993,9 @@ async def test_service_opens_fresh_tilde_root(tmp_path, monkeypatch):
     try:
         assert service.path == (home / "fresh-blobs").resolve()
         assert (home / "fresh-blobs" / r.LOCK).is_file()
-        assert list(cwd.iterdir()) == [], "a literal './~' directory must never be created"
+        assert list(cwd.iterdir()) == [], (
+            "a literal './~' directory must never be created"
+        )
     finally:
         await service.close()
 
@@ -822,12 +1099,22 @@ async def test_exact_fingerprint_revalidated_after_shared_scan(tmp_path):
         cutoff = time.time_ns() - 30 * 86400 * 10**9
         report = r.Report(str(tmp_path), cutoff)
         cursor, started = r.ScanCursor(), time.time_ns()
-        items = await service._work(lambda: r.scan_window(
-            tmp_path, cursor, report, started, budget_ns=10**9,
-        ))
+        items = await service._work(
+            lambda: r.scan_window(
+                tmp_path,
+                cursor,
+                report,
+                started,
+                budget_ns=10**9,
+            )
+        )
         assert len(items) == 1
-        await AsyncDiskBlobStore(tmp_path / ".").write("session", "old", {"changed": True})
-        await service._work(lambda: r.apply_batch(tmp_path, items, report), exclusive=True)
+        await AsyncDiskBlobStore(tmp_path / ".").write(
+            "session", "old", {"changed": True}
+        )
+        await service._work(
+            lambda: r.apply_batch(tmp_path, items, report), exclusive=True
+        )
         assert report.deleted == 0 and report.changed == 1
         assert json.loads(old.read_text()) == {"changed": True}
     finally:
@@ -868,7 +1155,13 @@ async def main():
     await service.task
 asyncio.run(main())
 """
-    child = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=8)
+    child = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
     assert child.returncode == 73, child.stderr
     snapshot = tmp_path / r.METADATA / SNAPSHOT
     saved = json.loads(snapshot.read_text())
@@ -881,14 +1174,17 @@ asyncio.run(main())
         try:
             assert service.status()["state"] == "interrupted"
             await asyncio.sleep(0.06)
-            assert len(list((tmp_path / "session/blobs").glob("*.json"))) == len(remaining)
+            assert len(list((tmp_path / "session/blobs").glob("*.json"))) == len(
+                remaining
+            )
             job = await ready(service)
             await service.start(job, "prune")
-            await service.task
+            await finish(service)
             assert service.status()["state"] == "completed", service.status()
             assert not list((tmp_path / "session/blobs").glob("*.json"))
         finally:
             await service.close()
+
     asyncio.run(reopen())
 
 
@@ -906,7 +1202,14 @@ with r.RootLock({str(tmp_path)!r}, exclusive=True) as lock, r.Ledger(lock.root, 
         ((f"ci-blob://s/{{i:08}}" + "x"*180,) for i in range(1000)))
     os._exit(73)
 """
-    child = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=5)
+    child = await asyncio.to_thread(
+        subprocess.run,
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
     assert child.returncode == 73, child.stderr
     directory = tmp_path / r.METADATA
     before = {p.name: p.read_bytes() for p in directory.iterdir()}
@@ -916,20 +1219,25 @@ with r.RootLock({str(tmp_path)!r}, exclusive=True) as lock, r.Ledger(lock.root, 
         assert service.status()["report"]["recovery_required"]
         assert before == {p.name: p.read_bytes() for p in directory.iterdir()}
         await service.cancel(job)
-        assert old.exists() and before == {p.name: p.read_bytes() for p in directory.iterdir()}
+        assert old.exists() and before == {
+            p.name: p.read_bytes() for p in directory.iterdir()
+        }
         job = await ready(service)
         await service.start(job, "prune")
-        await service.task
+        await finish(service)
         assert service.status()["state"] == "completed", service.status()
         assert not old.exists()
     finally:
         await service.close()
 
 
-async def test_real_http_events_graph_and_new_blobs_remain_available(tmp_path, monkeypatch):
+async def test_real_http_events_graph_and_new_blobs_remain_available(
+    tmp_path, monkeypatch
+):
     """Real ingress/drainer and blob paths; only the graph boundary is fake."""
     from unittest.mock import AsyncMock
-    import context_intelligence_server.main as main
+
+    from context_intelligence_server import main
     from context_intelligence_server.neo4j_store import Neo4jGraphStore
     from tests.conftest import MockNeo4jDriver
 
@@ -943,7 +1251,12 @@ async def test_real_http_events_graph_and_new_blobs_remain_available(tmp_path, m
     monkeypatch.setattr(main.app.state, "retention_service", service, raising=False)
     monkeypatch.setattr(main.app.state, "auth_mode", "static", raising=False)
     monkeypatch.setattr(main.app.state, "admin_api_key_configured", True, raising=False)
-    monkeypatch.setattr(main.app.state, "neo4j_query_driver", MockNeo4jDriver(rows=[{"n": 1}]), raising=False)
+    monkeypatch.setattr(
+        main.app.state,
+        "neo4j_query_driver",
+        MockNeo4jDriver(rows=[{"n": 1}]),
+        raising=False,
+    )
     monkeypatch.setattr(
         main.app.state, "neo4j_query_access_mode", "READ", raising=False
     )
@@ -960,12 +1273,17 @@ async def test_real_http_events_graph_and_new_blobs_remain_available(tmp_path, m
         )
         dispatched.append(uri)
 
-    monkeypatch.setattr("context_intelligence_server.registry.process_event", fake_graph_dispatch)
+    monkeypatch.setattr(
+        "context_intelligence_server.registry.process_event", fake_graph_dispatch
+    )
     wrapped = BearerTokenMiddleware(
-        main.app, keystore={hashlib.sha256(b"fixture-data").hexdigest(): "test"},
+        main.app,
+        keystore={hashlib.sha256(b"fixture-data").hexdigest(): "test"},
         admin_api_key_digest=hashlib.sha256(b"fixture-admin").hexdigest(),
     )
-    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=wrapped), base_url="http://test")
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=wrapped), base_url="http://test"
+    )
     try:
         admin = {"Authorization": "Bearer fixture-admin"}
         data = {"Authorization": "Bearer fixture-data"}
@@ -974,28 +1292,44 @@ async def test_real_http_events_graph_and_new_blobs_remain_available(tmp_path, m
         )
         assert response.status_code == 202
         job = response.json()["id"]
-        await service.task
-        assert (await client.post(f"/admin/blobs/prune/{job}/start",
-                                 json={"confirmation": "prune"}, headers=admin)).status_code == 202
+        await finish(service)
+        assert (
+            await client.post(
+                f"/admin/blobs/prune/{job}/start",
+                json={"confirmation": "prune"},
+                headers=admin,
+            )
+        ).status_code == 202
+        apply_task = service.task
+        assert apply_task is not None
         accepted = 0
-        while not service.task.done():
-            reply = await client.post("/events", json={
-                "event": "tool:pre", "workspace": "/fixture",
-                "data": {
-                    "session_id": "ingest",
-                    "timestamp": "2024-01-01T00:00:00+00:00",
+        while not apply_task.done():
+            reply = await client.post(
+                "/events",
+                json={
+                    "event": "tool:pre",
+                    "workspace": "/fixture",
+                    "data": {
+                        "session_id": "ingest",
+                        "timestamp": "2024-01-01T00:00:00+00:00",
+                    },
                 },
-            }, headers=data)
+                headers=data,
+            )
             assert reply.status_code == 202
-            graph = await client.post("/cypher", json={"query": "RETURN 1 AS n"}, headers=data)
+            graph = await client.post(
+                "/cypher", json={"query": "RETURN 1 AS n"}, headers=data
+            )
             assert graph.status_code == 200
             accepted += 1
             await asyncio.sleep(0.005)
-        await service.task
+        await apply_task
         await until(lambda: main.registry._written_total >= accepted)
         assert accepted > 3 and len(dispatched) == accepted and flushed.await_count > 0
-        assert service.status()["state"] == "completed" and service.report.errors == 0
-        assert service.report.deleted == 96
+        report = service.report
+        assert report is not None
+        assert service.status()["state"] == "completed" and report.errors == 0
+        assert report.deleted == 96
         for uri in dispatched:
             assert await AsyncDiskBlobStore(root).read(uri) == {"value": 1}
         gone = await client.get("/blobs/session/0", headers=data)
@@ -1006,6 +1340,236 @@ async def test_real_http_events_graph_and_new_blobs_remain_available(tmp_path, m
         await main.registry.close_neo4j_driver()
         await client.aclose()
         await service.close()
+
+
+@pytest.mark.neo4j
+@pytest.mark.integration
+@pytest.mark.raw_identity_factory
+async def test_real_neo4j_ingestion_commits_during_confirmed_online_prune(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Commit and read real ingress between prune batches, not inside an EX lease."""
+    from ipaddress import ip_address
+    from urllib.parse import urlsplit
+    from uuid import uuid4
+
+    from neo4j import AsyncDriver
+
+    from context_intelligence_server import main
+    from context_intelligence_server import registry as registry_module
+    from context_intelligence_server.config import (
+        Neo4jClientConfig,
+        Neo4jConfig,
+        RecoveryConfig,
+        Settings,
+    )
+
+    uri = os.environ.get("NEO4J_TEST_URI")
+    if uri is None:
+        pytest.skip("Requires the runner's disposable loopback NEO4J_TEST_URI")
+    endpoint = urlsplit(uri)
+    # Direct Bolt prevents a routing table from redirecting outside the guest.
+    assert endpoint.scheme in {"bolt", "bolt+s", "bolt+ssc"}
+    assert endpoint.hostname is not None and ip_address(endpoint.hostname).is_loopback
+    assert endpoint.username is None and endpoint.password is None
+    user = os.environ.get("NEO4J_TEST_USER", "neo4j")
+    password = os.environ.get("NEO4J_TEST_PASSWORD", "")
+    root = tmp_path / "blobs"
+    session_id = f"retention-overlap-{uuid4().hex}"
+    workspace = str(tmp_path / session_id)
+    old_files = [payload(root, str(i), session_id + "-old") for i in range(33)]
+    settings = Settings(
+        neo4j=Neo4jConfig(
+            admin=Neo4jClientConfig(
+                url=uri, username=user, password=password, access_mode="WRITE"
+            ),
+            cypher_query=Neo4jClientConfig(
+                url=uri, username=user, password=password, access_mode="READ"
+            ),
+        ),
+        neo4j_require_explicit_clients=True,
+        auth_mode="static",
+        api_key="fixture-overlap-data",  # Legacy credential resolves to owner.
+        api_keys=None,
+        admin_api_key="fixture-overlap-admin",
+        admin_api_key_sha256=None,
+        allow_unauthenticated=False,
+        access_control_mode="compatibility",
+        blob_path=str(root),
+        queues_path=str(tmp_path / "state" / "queues"),
+        log_path=str(tmp_path / "logs" / "server.jsonl"),
+        api_keys_store_path=str(tmp_path / "identity" / "keys.json"),
+        entra_identities_store_path=str(tmp_path / "identity" / "entra.json"),
+        recovery=RecoveryConfig(enabled=False),
+    )
+    monkeypatch.setattr(main, "_settings", settings)
+    monkeypatch.setattr(registry_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(main, "setup_logging", lambda: None)
+    wrapped = main.create_asgi_app(settings)
+    entered, release = asyncio.Event(), asyncio.Event()
+    admin = {"Authorization": "Bearer fixture-overlap-admin"}
+    data = {"Authorization": "Bearer fixture-overlap-data"}
+    expected = {"output": "x" * 262144}
+    timestamp = "2026-01-01T00:00:00+00:00"
+
+    async with main.lifespan(main.app):
+        service: RetentionService = main.app.state.retention_service
+        driver: AsyncDriver = main.app.state.neo4j_driver
+        coord = service._coordinator
+        assert coord is not None
+        real_batch = service._batch
+
+        async def held_batch(
+            items: list[r.Candidate], *, recovery: bool = False
+        ) -> None:
+            await real_batch(items, recovery=recovery)
+            # Real deletion, checkpoint and lease release precede this gate.
+            if not entered.is_set():
+                entered.set()
+                await asyncio.wait_for(release.wait(), 15)
+
+        monkeypatch.setattr(service, "_batch", held_batch)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=wrapped), base_url="http://test"
+        ) as client:
+            try:
+                async with asyncio.timeout(5):
+                    while True:
+                        status = await client.get("/status")
+                        assert status.status_code == 200
+                        if status.json()["identity_ready"]:
+                            break
+                        await asyncio.sleep(0.01)
+                # Configured but unreachable must fail, never skip.
+                await driver.verify_connectivity()
+                response = await client.post(
+                    "/admin/blobs/prune", json={"older_than": "30d"}, headers=admin
+                )
+                assert response.status_code == 202
+                job = response.json()["id"]
+                await finish(service)
+                preview = service.status(job)
+                assert preview["state"] == "ready" and preview["report"]["files"] == 33
+                response = await client.post(
+                    f"/admin/blobs/prune/{job}/start",
+                    json={"confirmation": "prune"},
+                    headers=admin,
+                )
+                assert response.status_code == 202
+                apply_task = service.task
+                assert apply_task is not None
+                await until(entered.is_set, timeout=5)
+
+                async def assert_overlap() -> None:
+                    response = await client.get(
+                        f"/admin/blobs/prune/{job}", headers=admin
+                    )
+                    assert response.status_code == 200
+                    current = response.json()
+                    assert current["id"] == job and current["confirmed"]
+                    assert current["state"] == "running" and current["phase"] == "scan"
+                    assert not apply_task.done() and not release.is_set()
+                    assert 0 < current["report"]["deleted"] < 33
+                    assert any(file.exists() for file in old_files)
+                    assert not coord.writer
+
+                async def read_persisted_blob() -> str:
+                    response = await client.post(
+                        "/cypher",
+                        headers=data,
+                        json={
+                            "query": (
+                                "MATCH (s:Session {node_id: $sid, workspace: $ws})"
+                                "-[:HAS_EVENT]->(e:Event {event_name: $event, workspace: $ws}) "
+                                "RETURN s.created_by AS session_owner, "
+                                "e.created_by AS event_owner, e.data AS data"
+                            ),
+                            "params": {
+                                "sid": session_id,
+                                "ws": workspace,
+                                "event": "custom:retention_overlap",
+                            },
+                        },
+                    )
+                    assert response.status_code == 200
+                    rows = response.json()["results"]
+                    assert len(rows) == 1
+                    assert rows[0]["session_owner"] == rows[0]["event_owner"] == "owner"
+                    stored = json.loads(rows[0]["data"])
+                    assert stored["session_id"] == session_id
+                    assert stored["timestamp"] == timestamp
+                    reference = stored["result"]
+                    assert set(reference) == {"$blob_ref"}
+                    blob_uri = reference["$blob_ref"]
+                    assert isinstance(blob_uri, str)
+                    assert blob_uri.startswith(f"ci-blob://{session_id}/")
+                    blob = await client.get(
+                        "/blobs/" + blob_uri.removeprefix("ci-blob://"), headers=data
+                    )
+                    assert blob.status_code == 200 and blob.json() == expected
+                    return blob_uri
+
+                await assert_overlap()
+                baseline = main.registry.pipeline_counters()["written_total"]
+                admitted_at = time.time()
+                response = await client.post(
+                    "/events",
+                    headers=data,
+                    json={
+                        "event": "custom:retention_overlap",
+                        "workspace": workspace,
+                        "data": {
+                            "session_id": session_id,
+                            "timestamp": timestamp,
+                            "result": expected,
+                        },
+                    },
+                )
+                assert response.status_code == 202
+                await until(
+                    lambda: (
+                        main.registry.pipeline_counters()["written_total"]
+                        == baseline + 1
+                    ),
+                    timeout=10,
+                )
+                workers = main.registry.workers()
+                assert len(workers) == 1 and workers[0].error_count == 0
+                assert workers[0].last_successful_flush >= admitted_at
+                assert (
+                    await main.registry.queue_manager.pending_count(
+                        workers[0].session_id
+                    )
+                    == 0
+                )
+                blob_uri = await read_persisted_blob()
+                # A completed-before-ingress negative control must fail here.
+                await assert_overlap()
+                release.set()
+                await finish(service)
+                final = service.status(job)
+                assert final["state"] == "completed" and final["confirmed"]
+                assert (
+                    final["report"]["deleted"] == 33 and final["report"]["errors"] == 0
+                )
+                assert all(not file.exists() for file in old_files)
+                expired = await client.get(f"/blobs/{session_id}-old/0", headers=data)
+                assert expired.status_code == 410
+                assert expired.json()["detail"]["code"] == "blob_expired"
+                assert await read_persisted_blob() == blob_uri
+            finally:
+                release.set()
+                await service.stop()
+                # No buffered writer may re-create these nodes after cleanup.
+                await main.registry.shutdown_workers()
+                async with driver.session() as session:
+                    result = await session.run(
+                        "MATCH (n:Node {workspace: $workspace}) DETACH DELETE n",
+                        {"workspace": workspace},
+                    )
+                    await result.consume()
+    assert not coord.writer and coord.readers == 0 and not coord.queue
+    assert await asyncio.to_thread(external_lock, root) == 0
 
 
 # --- Relocated-root startup: a terminal snapshot from another root is history ---

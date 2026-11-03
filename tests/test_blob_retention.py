@@ -14,6 +14,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
 
 from context_intelligence_server import blob_retention as r
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
@@ -35,16 +36,40 @@ def run_cli(root: Path, *args: str, tty_input: str | None = None, env=None):
     if tty_input is not None:
         # script owns/reaps its PTY child synchronously. No detached process.
         command = ["script", "-q", "-e", "-c", shlex.join(command), "/dev/null"]
-    return subprocess.run(command, input=tty_input or "", text=True, capture_output=True,
-                          timeout=10, env=env)
+    return subprocess.run(
+        command,
+        check=False,
+        input=tty_input or "",
+        text=True,
+        capture_output=True,
+        timeout=10,
+        env=env,
+    )
 
 
-@pytest.mark.parametrize("age,seconds", [("1s", 1), ("2m", 120), ("3h", 10800), ("30d", 2592000), ("2w", 1209600)])
+@pytest.mark.parametrize(
+    "age,seconds",
+    [("1s", 1), ("2m", 120), ("3h", 10800), ("30d", 2592000), ("2w", 1209600)],
+)
 def test_duration(age, seconds):
     assert r.duration_ns(age) == seconds * 10**9
 
 
-@pytest.mark.parametrize("age", ["0d", "-1d", "1.2d", "30", "d", "1D", "1 d", "01d", "9999999999999999999999999w", "9999999999w"])
+@pytest.mark.parametrize(
+    "age",
+    [
+        "0d",
+        "-1d",
+        "1.2d",
+        "30",
+        "d",
+        "1D",
+        "1 d",
+        "01d",
+        "9999999999999999999999999w",
+        "9999999999w",
+    ],
+)
 def test_bad_duration(age):
     with pytest.raises(ValueError):
         r.duration_ns(age)
@@ -103,8 +128,12 @@ def test_samples_bounded_and_batches_bounded(tmp_path, monkeypatch):
 def test_apply_preserves_graph_queue_unknowns_and_directories(tmp_path):
     old = payload(tmp_path)
     boundary = payload(tmp_path, "boundary", CUTOFF)
-    sentinels = [tmp_path / "graph.db", tmp_path / "session" / "queue.jsonl",
-                 old.parent / "unknown.tmp", old.parent / "nested" / "keep.json"]
+    sentinels = [
+        tmp_path / "graph.db",
+        tmp_path / "session" / "queue.jsonl",
+        old.parent / "unknown.tmp",
+        old.parent / "nested" / "keep.json",
+    ]
     for path in sentinels:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"sentinel")
@@ -115,7 +144,10 @@ def test_apply_preserves_graph_queue_unknowns_and_directories(tmp_path):
     assert (tmp_path / r.LOCK).is_file()
     with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
         assert ledger.contains("ci-blob://session/old")
-        assert ledger.db.execute("PRAGMA query_only").fetchone() == (0,)  # mode=ro enforces access
+        assert ledger.db is not None
+        assert ledger.db.execute("PRAGMA query_only").fetchone() == (
+            0,
+        )  # mode=ro enforces access
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             ledger.db.execute("DELETE FROM expiry")
 
@@ -137,7 +169,9 @@ def test_symlinks_hardlinks_and_unknown_layout_skipped(tmp_path):
     os.link(outside, old.parent / "hardlink.json")
     (old.parent / "directory.json").mkdir()
     (tmp_path / "fake-session").mkdir()
-    (tmp_path / "fake-session" / "blobs").symlink_to(old.parent, target_is_directory=True)
+    (tmp_path / "fake-session" / "blobs").symlink_to(
+        old.parent, target_is_directory=True
+    )
     payload(tmp_path, "bad\nname")
     result = r.apply(tmp_path, CUTOFF, lambda _: True)
     assert result.deleted == 1
@@ -145,10 +179,15 @@ def test_symlinks_hardlinks_and_unknown_layout_skipped(tmp_path):
     assert outside.read_text() == "{}"
 
 
-@pytest.mark.parametrize("uri", [
-    "ci-blob://../key", "ci-blob://session/../escape", "ci-blob://session/..",
-    "ci-blob://session/a\nb",
-])
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "ci-blob://../key",
+        "ci-blob://session/../escape",
+        "ci-blob://session/..",
+        "ci-blob://session/a\nb",
+    ],
+)
 async def test_uri_escape_rejected(tmp_path, uri):
     store = AsyncDiskBlobStore(tmp_path)
     with pytest.raises(ValueError):
@@ -170,7 +209,9 @@ def test_symlinked_metadata_rejected(tmp_path, entry):
     else:
         metadata = tmp_path / r.METADATA
         metadata.mkdir(mode=0o700)
-        (metadata / (r.DATABASE if entry == "database" else r.DATABASE + "-journal")).symlink_to(outside / "db")
+        (
+            metadata / (r.DATABASE if entry == "database" else r.DATABASE + "-journal")
+        ).symlink_to(outside / "db")
     with pytest.raises((OSError, r.RetentionError)):
         r.apply(tmp_path, CUTOFF, lambda _: True)
     assert old.exists() and not list(outside.iterdir())
@@ -207,10 +248,19 @@ def test_existing_empty_ledger_still_fails_closed(tmp_path):
     assert not (old.parent / "new.json").exists()
 
 
-@pytest.mark.parametrize("boundary", [
-    "file_created", "sqlite_opened", "schema_created", "schema_committed",
-    "file_synced", "before_publish", "after_publish", "directory_synced",
-])
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "file_created",
+        "sqlite_opened",
+        "schema_created",
+        "schema_committed",
+        "file_synced",
+        "before_publish",
+        "after_publish",
+        "directory_synced",
+    ],
+)
 def test_first_ledger_publication_process_crash_and_rerun(tmp_path, boundary):
     old = payload(tmp_path)
     code = f"""
@@ -260,7 +310,13 @@ os.open, r.sqlite3.connect = opened, connected
 os.fsync, os.rename = synced, renamed
 r.apply(root, {CUTOFF}, lambda _: True)
 """
-    child = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+    child = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
     assert child.returncode == 73, child.stderr
     assert old.exists()
     metadata = tmp_path / r.METADATA
@@ -269,7 +325,10 @@ r.apply(root, {CUTOFF}, lambda _: True)
     assert database.exists() == published
     if published:
         with sqlite3.connect(database) as db:
-            assert tuple(row[1] for row in db.execute("PRAGMA table_info(expiry)")) == r._COLUMNS
+            assert (
+                tuple(row[1] for row in db.execute("PRAGMA table_info(expiry)"))
+                == r._COLUMNS
+            )
             assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert not (metadata / (r.DATABASE + "-journal")).exists()
     else:
@@ -281,7 +340,10 @@ r.apply(root, {CUTOFF}, lambda _: True)
         r.apply(tmp_path, CUTOFF, lambda _: False)
     assert {p.name: p.read_bytes() for p in metadata.iterdir()} == before
     store = AsyncDiskBlobStore(tmp_path)
-    assert asyncio.run(store.write("session", "new", {"value": 2})) == "ci-blob://session/new"
+    assert (
+        asyncio.run(store.write("session", "new", {"value": 2}))
+        == "ci-blob://session/new"
+    )
     assert r.apply(tmp_path, CUTOFF, lambda report: report.files == 1).deleted == 1
     assert not old.exists()
     assert asyncio.run(store.read("ci-blob://session/new")) == {"value": 2}
@@ -295,7 +357,9 @@ r.apply(root, {CUTOFF}, lambda _: True)
 
 
 @pytest.mark.parametrize("boundary", ["file", "before_publish", "after_publish"])
-def test_first_ledger_fsync_failure_never_unlinks_and_can_retry(tmp_path, monkeypatch, boundary):
+def test_first_ledger_fsync_failure_never_unlinks_and_can_retry(
+    tmp_path, monkeypatch, boundary
+):
     old = payload(tmp_path)
     metadata = tmp_path / r.METADATA
     database = metadata / r.DATABASE
@@ -303,12 +367,17 @@ def test_first_ledger_fsync_failure_never_unlinks_and_can_retry(tmp_path, monkey
 
     def refuse(fd):
         import stat
+
         st = os.fstat(fd)
         if stat.S_ISREG(st.st_mode) and boundary == "file":
             raise OSError("initialization fsync refused")
-        if metadata.exists() and r._identity(st) == r._identity(metadata.stat()):
-            if database.exists() == (boundary == "after_publish") and boundary != "file":
-                raise OSError("initialization fsync refused")
+        if (
+            metadata.exists()
+            and r._identity(st) == r._identity(metadata.stat())
+            and database.exists() == (boundary == "after_publish")
+            and boundary != "file"
+        ):
+            raise OSError("initialization fsync refused")
         return real_fsync(fd)
 
     with monkeypatch.context() as m:
@@ -346,6 +415,7 @@ def test_metadata_fsync_failure_prevents_unlink(tmp_path, monkeypatch):
             if fd == self.fd:
                 raise OSError("metadata fsync refused")
             return real_fsync(fd)
+
         with monkeypatch.context() as m:
             m.setattr(os, "fsync", refuse_metadata)
             real_journal(self, batch)
@@ -356,7 +426,9 @@ def test_metadata_fsync_failure_prevents_unlink(tmp_path, monkeypatch):
     assert old.exists()
 
 
-def test_batch_directory_sync_is_deduplicated_and_precedes_completion(tmp_path, monkeypatch):
+def test_batch_directory_sync_is_deduplicated_and_precedes_completion(
+    tmp_path, monkeypatch
+):
     paths = [payload(tmp_path, key=f"old-{i}") for i in range(5)]
     directory = r._identity(paths[0].parent.stat())
     events = []
@@ -388,7 +460,9 @@ def test_batch_directory_sync_is_deduplicated_and_precedes_completion(tmp_path, 
     assert not any(path.exists() for path in paths)
 
 
-def test_directory_sync_failure_keeps_durable_pending_and_closes_all_fds(tmp_path, monkeypatch):
+def test_directory_sync_failure_keeps_durable_pending_and_closes_all_fds(
+    tmp_path, monkeypatch
+):
     paths = []
     for session in ("first", "second", "third"):
         path = tmp_path / session / "blobs" / "old.json"
@@ -423,6 +497,7 @@ def test_directory_sync_failure_keeps_durable_pending_and_closes_all_fds(tmp_pat
         with pytest.raises(OSError):
             os.fstat(fd)
     with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db is not None
         assert ledger.db.execute("SELECT pending FROM expiry").fetchall() == [(1,)] * 3
     assert not any(path.exists() for path in paths)
     attempts.clear()
@@ -438,18 +513,22 @@ def test_directory_sync_failure_keeps_durable_pending_and_closes_all_fds(tmp_pat
         assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 0
     assert set(attempts) == identities  # recovered absences synced before commit
     with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db is not None
         assert ledger.db.execute("SELECT pending FROM expiry").fetchall() == [(0,)] * 3
 
 
 def test_directory_pin_failure_precedes_unlink(tmp_path, monkeypatch):
     old = payload(tmp_path)
     with monkeypatch.context() as m:
+
         def refuse(fd):
             raise OSError("no descriptor available")
+
         m.setattr(os, "dup", refuse)
         result = r.apply(tmp_path, CUTOFF, lambda _: True)
     assert result.deleted == 0 and result.errors == 1 and old.exists()
     with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db is not None
         assert ledger.db.execute("SELECT pending FROM expiry").fetchone() == (1,)
     assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 1
 
@@ -472,10 +551,12 @@ def test_directory_close_failure_still_drains_other_descriptors(tmp_path, monkey
 
     monkeypatch.setattr(os, "fsync", record_sync)
     monkeypatch.setattr(os, "close", fail_first_close)
-    with pytest.raises(OSError, match="close result uncertain"):
-        with r._sync_dirs() as directories:
-            directories[(1, 1)] = first
-            directories[(1, 2)] = second
+    with (
+        pytest.raises(OSError, match="close result uncertain"),
+        r._sync_dirs() as directories,
+    ):
+        directories[(1, 1)] = first
+        directories[(1, 2)] = second
     assert synced == [first, second] and closed == [first, second]
     for fd in (first, second):
         with pytest.raises(OSError):
@@ -514,15 +595,16 @@ def test_checked_batch_restores_checks_and_rejects_replaced_root(tmp_path):
     original = tmp_path / "root"
     original.mkdir()
     with r.Root(original) as root:
-        with pytest.raises(RuntimeError, match="body failed"):
-            with root.checked_batch():
-                raise RuntimeError("body failed")
+        with pytest.raises(RuntimeError, match="body failed"), root.checked_batch():
+            raise RuntimeError("body failed")
         assert not root._inside_checked_batch
         root.check()
-        with pytest.raises(r.RetentionError, match="root changed"):
-            with root.checked_batch():
-                original.rename(tmp_path / "previous-root")
-                original.mkdir()
+        with (
+            pytest.raises(r.RetentionError, match="root changed"),
+            root.checked_batch(),
+        ):
+            original.rename(tmp_path / "previous-root")
+            original.mkdir()
         assert not root._inside_checked_batch
 
 
@@ -557,9 +639,12 @@ def crash(name, *args, **kwargs):
 os.unlink = crash
 r.apply({str(tmp_path)!r}, {CUTOFF}, lambda _: True)
 """
-    child = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=10)
+    child = subprocess.run(
+        [sys.executable, "-c", code], check=False, capture_output=True, timeout=10
+    )
     assert child.returncode == 73 and not old.exists()
     with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db is not None
         assert ledger.db.execute("SELECT pending FROM expiry").fetchone() == (1,)
     synced = []
     real_sync = os.fsync
@@ -573,6 +658,7 @@ r.apply({str(tmp_path)!r}, {CUTOFF}, lambda _: True)
     assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 0
     assert len(synced) == 1
     with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db is not None
         assert ledger.db.execute("SELECT pending FROM expiry").fetchone() == (0,)
 
 
@@ -589,6 +675,7 @@ def test_interrupted_commit_then_rerun_and_decline_pending(tmp_path, monkeypatch
     assert old.exists()
     with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
         assert ledger.contains("ci-blob://session/old")
+        assert ledger.db is not None
         assert ledger.db.execute("SELECT pending FROM expiry").fetchone() == (1,)
     with pytest.raises(r.RetentionError):
         r.apply(tmp_path, CUTOFF, lambda _: False)
@@ -609,12 +696,19 @@ from context_intelligence_server import blob_retention as r
 r._unlink = lambda *args, **kwargs: os._exit(73)
 r.apply({str(tmp_path)!r}, {cutoff_30d}, lambda report: report.files == 1)
 """
-    child = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+    child = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
     assert child.returncode == 73, child.stderr
     before_payload = old.read_bytes(), r.fingerprint(old.stat())
     database = tmp_path / r.METADATA / r.DATABASE
     before_database = database.read_bytes()
     with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db is not None
         row = ledger.db.execute("SELECT * FROM expiry").fetchone()
         assert row[-1] == 1
     seen = []
@@ -632,6 +726,7 @@ r.apply({str(tmp_path)!r}, {cutoff_30d}, lambda report: report.files == 1)
     assert result.deleted == 0 and result.retained == 1
     assert (old.read_bytes(), r.fingerprint(old.stat())) == before_payload
     with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db is not None
         assert ledger.db.execute("SELECT * FROM expiry").fetchone() == row
     seen.clear()
 
@@ -643,20 +738,26 @@ r.apply({str(tmp_path)!r}, {cutoff_30d}, lambda report: report.files == 1)
     assert seen == [(1, 0, ["ci-blob://session/old"])]
     assert not old.exists()
     with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db is not None
         assert ledger.db.execute("SELECT * FROM expiry").fetchone() == (*row[:-1], 0)
     assert r.apply(tmp_path, cutoff_30d, lambda _: True).deleted == 0
 
 
 @pytest.mark.parametrize("change", ["boundary", "replaced"])
-def test_pending_recovery_keeps_boundary_and_replaced_fingerprints(tmp_path, monkeypatch, change):
+def test_pending_recovery_keeps_boundary_and_replaced_fingerprints(
+    tmp_path, monkeypatch, change
+):
     old = payload(tmp_path)
     with monkeypatch.context() as m:
+
         def interrupt(*args, **kwargs):
             raise RuntimeError("interrupted")
+
         m.setattr(r, "_unlink", interrupt)
         with pytest.raises(RuntimeError, match="interrupted"):
             r.apply(tmp_path, CUTOFF, lambda _: True)
     with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db is not None
         row = ledger.db.execute("SELECT * FROM expiry").fetchone()
     if change == "boundary":
         cutoff = row[4]  # original mtime is exactly the current cutoff
@@ -671,6 +772,7 @@ def test_pending_recovery_keeps_boundary_and_replaced_fingerprints(tmp_path, mon
     assert result.deleted == 0
     assert (old.read_bytes(), r.fingerprint(old.stat())) == before
     with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
+        assert ledger.db is not None
         assert ledger.db.execute("SELECT * FROM expiry").fetchone() == row
 
 
@@ -685,14 +787,18 @@ def test_changed_fingerprint_retained(tmp_path, monkeypatch, when):
         os.utime(old, ns=(CUTOFF + 1, CUTOFF + 1))
 
     if when == "before_journal":
+
         def matches(root, item):
             rewrite()
             return real_matches(root, item)
+
         monkeypatch.setattr(r, "_matches", matches)
     else:
+
         def journal(self, batch):
             real_journal(self, batch)
             rewrite()
+
         monkeypatch.setattr(r.Ledger, "journal", journal)
     result = r.apply(tmp_path, CUTOFF, lambda _: True)
     assert result.deleted == 0 and result.changed == 1
@@ -728,35 +834,42 @@ def test_lock_cross_process_alias_coordination_and_release(tmp_path):
             "import asyncio; from context_intelligence_server.blob_store import AsyncDiskBlobStore;"
             f"asyncio.run(AsyncDiskBlobStore({str(tmp_path)!r}).write('session', 'new', {{}}))"
         )
-        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
         assert result.returncode != 0 and "busy" in result.stderr
     with r.RootLock(tmp_path, exclusive=True):
         pass
 
 
 async def test_worker_lifespan_refusal_hold_shutdown_and_release(tmp_path, monkeypatch):
-    import context_intelligence_server.main as main
     from types import SimpleNamespace
+
+    from context_intelligence_server import main
+
     root = tmp_path / "root"
     root.mkdir()
-    app = SimpleNamespace(state=SimpleNamespace(
-        settings=SimpleNamespace(blob_path=str(root), stateful_root=lambda: tmp_path / "state")
-    ))
+    app = FastAPI()
+    app.state.settings = SimpleNamespace(
+        blob_path=str(root), stateful_root=lambda: tmp_path / "state"
+    )
     entered = []
 
     @contextlib.asynccontextmanager
     async def fake_lifespan(app):
         entered.append(True)
         yield
-        with pytest.raises(r.RetentionError):
-            with r.RootLock(root, exclusive=True):
-                pass
+        with pytest.raises(r.RetentionError), r.RootLock(root, exclusive=True):
+            pass
 
     monkeypatch.setattr(main, "_server_lifespan", fake_lifespan)
-    with r.RootLock(root, exclusive=True):
-        with pytest.raises(r.RetentionError):
-            async with main.lifespan(app):
-                pytest.fail("worker started during apply")
+    with r.RootLock(root, exclusive=True), pytest.raises(r.RetentionError):
+        async with main.lifespan(app):
+            pytest.fail("worker started during apply")
     assert not entered
     async with main.lifespan(app):
         assert entered
@@ -768,6 +881,7 @@ async def test_worker_lifespan_refusal_hold_shutdown_and_release(tmp_path, monke
 
 async def test_cancelled_write_holds_lock_until_thread_exits(tmp_path, monkeypatch):
     import context_intelligence_server.blob_store as module
+
     store = AsyncDiskBlobStore(tmp_path)
     entered, release = threading.Event(), threading.Event()
     original = module.os.replace
@@ -784,9 +898,8 @@ async def test_cancelled_write_holds_lock_until_thread_exits(tmp_path, monkeypat
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        with pytest.raises(r.RetentionError):
-            with r.RootLock(tmp_path, exclusive=True):
-                pass
+        with pytest.raises(r.RetentionError), r.RootLock(tmp_path, exclusive=True):
+            pass
     finally:
         release.set()
         # Poll a concrete lock condition rather than assuming the thread ended.
@@ -812,7 +925,13 @@ from context_intelligence_server.cli import main
 main(['blobs', 'prune', '--blob-root', {str(tmp_path)!r}])
 assert not any(x in sys.modules for x in ['context_intelligence_server.main', 'neo4j', 'fastapi'])
 """
-    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
     assert result.returncode == 0, result.stderr
 
 
@@ -841,13 +960,32 @@ def test_cli_config_resolution_missing_explicit_config_and_root(tmp_path):
     payload(tmp_path)
     config = tmp_path / "server.yaml"
     config.write_text(f"blob_path: {tmp_path}\n")
-    env = {**os.environ, "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE": str(config)}
-    result = subprocess.run([str(CLI), "blobs", "prune"], env=env, capture_output=True, text=True, timeout=10)
+    env = {
+        **os.environ,
+        "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE": str(config),
+    }
+    result = subprocess.run(
+        [str(CLI), "blobs", "prune"],
+        check=False,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
     assert result.returncode == 0 and f"Root: {tmp_path}" in result.stdout
     env["AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH"] = str(tmp_path / "absent")
-    result = subprocess.run([str(CLI), "blobs", "prune"], env=env, capture_output=True, text=True, timeout=10)
+    result = subprocess.run(
+        [str(CLI), "blobs", "prune"],
+        check=False,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
     assert result.returncode != 0
-    env["AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE"] = str(tmp_path / "missing.yaml")
+    env["AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_CONFIG_FILE"] = str(
+        tmp_path / "missing.yaml"
+    )
     result = run_cli(tmp_path, env=env)
     assert result.returncode != 0 and "config file does not exist" in result.stderr
     assert not (tmp_path / "absent").exists()
@@ -855,10 +993,14 @@ def test_cli_config_resolution_missing_explicit_config_and_root(tmp_path):
 
 async def test_expired_read_dump_replay_restore_and_physical_listing(tmp_path):
     from context_intelligence_server.blob_processor import process_event_data
+
     store = AsyncDiskBlobStore(tmp_path)
-    data = {"raw": {"value": 1}}
+    data: dict[str, object] = {"raw": {"value": 1}}
     await process_event_data(data, store, "session", "node")
-    uri = data["raw"]["$blob_ref"]
+    raw = data["raw"]
+    assert isinstance(raw, dict)
+    uri = raw["$blob_ref"]
+    assert isinstance(uri, str)
     path = store.blob_path("session", "node__raw")
     os.utime(path, ns=(CUTOFF - 1, CUTOFF - 1))
     assert r.apply(tmp_path, CUTOFF, lambda _: True).deleted == 1
@@ -884,9 +1026,13 @@ async def test_expired_read_dump_replay_restore_and_physical_listing(tmp_path):
     assert await store.list("session") == [uri]
 
 
-async def test_authenticated_http_410_vs_404_and_auth_unchanged(tmp_path, auth_client, monkeypatch):
-    import context_intelligence_server.main as main
+async def test_authenticated_http_410_vs_404_and_auth_unchanged(
+    tmp_path, auth_client, monkeypatch
+):
     from types import SimpleNamespace
+
+    from context_intelligence_server import main
+
     monkeypatch.setattr(main, "_settings", SimpleNamespace(blob_path=str(tmp_path)))
     payload(tmp_path)
     r.apply(tmp_path, CUTOFF, lambda _: True)
@@ -895,8 +1041,13 @@ async def test_authenticated_http_410_vs_404_and_auth_unchanged(tmp_path, auth_c
     headers = {"Authorization": "Bearer test-secret"}
     response = await auth_client.get("/blobs/session/old", headers=headers)
     assert response.status_code == 410
-    assert response.json()["detail"] == {"code": "blob_expired", "uri": "ci-blob://session/old"}
-    assert (await auth_client.get("/blobs/session/unknown", headers=headers)).status_code == 404
+    assert response.json()["detail"] == {
+        "code": "blob_expired",
+        "uri": "ci-blob://session/old",
+    }
+    assert (
+        await auth_client.get("/blobs/session/unknown", headers=headers)
+    ).status_code == 404
 
 
 def test_unlink_partial_failure_is_honest_and_cli_nonzero(tmp_path, monkeypatch):
@@ -912,6 +1063,7 @@ def test_unlink_partial_failure_is_honest_and_cli_nonzero(tmp_path, monkeypatch)
     report = r.apply(tmp_path, CUTOFF, lambda _: True)
     assert report.deleted == 0 and report.errors == 1 and old.exists()
     from context_intelligence_server import cli
+
     monkeypatch.setattr(r, "apply", lambda *args: report)
     with pytest.raises(SystemExit) as exc:
         cli.main(["blobs", "prune", "--blob-root", str(tmp_path), "--apply"])
@@ -926,7 +1078,9 @@ from context_intelligence_server import blob_retention as r
 r._unlink = lambda *args, **kwargs: os._exit(73)
 r.apply({str(tmp_path)!r}, {CUTOFF}, lambda _: True)
 """
-    result = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=10)
+    result = subprocess.run(
+        [sys.executable, "-c", code], check=False, capture_output=True, timeout=10
+    )
     assert result.returncode == 73 and old.exists()
     with r.Root(tmp_path) as root, r.Ledger(root) as ledger:
         assert ledger.contains("ci-blob://session/old")
@@ -944,7 +1098,10 @@ async def test_physical_read_precedes_corrupt_ledger(tmp_path):
     (metadata / r.DATABASE).write_bytes(b"corrupt")
     store = AsyncDiskBlobStore(tmp_path)
     assert await store.read("ci-blob://session/old") == {"value": 1}
-    assert Path(await store.dump("ci-blob://session/old", tmp_path / "dump")).read_bytes() == old.read_bytes()
+    assert (
+        Path(await store.dump("ci-blob://session/old", tmp_path / "dump")).read_bytes()
+        == old.read_bytes()
+    )
     with pytest.raises(sqlite3.DatabaseError):
         await store.read("ci-blob://session/missing")
 
@@ -971,6 +1128,7 @@ async def test_standalone_operations_refuse_symlink_ancestor(tmp_path):
 
 def test_changed_apply_result_nonzero(tmp_path, monkeypatch):
     from context_intelligence_server import cli
+
     report = r.Report(str(tmp_path), CUTOFF, changed=1)
     monkeypatch.setattr(r, "apply", lambda *args: report)
     with pytest.raises(SystemExit) as exc:
@@ -1000,7 +1158,9 @@ async def test_reserved_sessions_cannot_damage_lock_or_ledger(tmp_path, reserved
     assert not old.exists()
 
 
-@pytest.mark.parametrize("alias", ["same_directory", "directory_symlink", "hardlink", "file_symlink"])
+@pytest.mark.parametrize(
+    "alias", ["same_directory", "directory_symlink", "hardlink", "file_symlink"]
+)
 async def test_dump_never_truncates_source_alias(tmp_path, alias):
     store = AsyncDiskBlobStore(tmp_path)
     uri = await store.write("session", "key", {"payload": "preserve"})
@@ -1039,7 +1199,13 @@ r.Ledger.__enter__ = small_cache
 r.Ledger.commit = lambda self: os._exit(73)
 r.apply({str(tmp_path)!r}, {CUTOFF}, lambda _: True)
 """
-    child = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+    child = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
     assert child.returncode == 73, child.stderr
     journal = tmp_path / r.METADATA / (r.DATABASE + "-journal")
     assert journal.stat().st_size > 0
@@ -1048,8 +1214,13 @@ r.apply({str(tmp_path)!r}, {CUTOFF}, lambda _: True)
         r.preview(tmp_path, CUTOFF)
     assert exc.value.sqlite_errorcode == sqlite3.SQLITE_READONLY_ROLLBACK
     seen = []
+
+    def decline(report: r.Report) -> bool:
+        seen.append(report.recovery_required)
+        return False
+
     with pytest.raises(r.RetentionError, match="not confirmed"):
-        r.apply(tmp_path, CUTOFF, lambda report: seen.append(report.recovery_required))
+        r.apply(tmp_path, CUTOFF, decline)
     assert seen == [True]
     assert {p.name: p.read_bytes() for p in journal.parent.iterdir()} == before
     result = r.apply(tmp_path, CUTOFF, lambda _: True)
@@ -1358,10 +1529,13 @@ def test_a_hardlinked_mapped_blob_is_skipped_not_pruned(tmp_path):
 
 @pytest.mark.parametrize("byte_count", range(243, 251))
 @pytest.mark.parametrize("multibyte", [False, True], ids=["ascii", "utf8"])
-def test_on_disk_names_are_never_folded_when_enumerated(tmp_path, byte_count, multibyte):
+def test_on_disk_names_are_never_folded_when_enumerated(
+    tmp_path, byte_count, multibyte
+):
     long_name = (
         "é" * (byte_count // 2) + "k" * (byte_count % 2)
-        if multibyte else "k" * byte_count
+        if multibyte
+        else "k" * byte_count
     )
     _put(tmp_path, "s", f"{long_name}.json")
 
@@ -1432,10 +1606,15 @@ async def test_replay_after_a_mapped_prune_does_not_rehydrate(tmp_path):
 
 @pytest.mark.parametrize(
     "kind",
-    ["legacy", "mapped", *[
-        f"{encoding}-{count}"
-        for encoding in ("ascii", "utf8") for count in range(243, 251)
-    ]],
+    [
+        "legacy",
+        "mapped",
+        *[
+            f"{encoding}-{count}"
+            for encoding in ("ascii", "utf8")
+            for count in range(243, 251)
+        ],
+    ],
 )
 async def test_each_phase_through_a_fresh_store_sees_the_same_disk_truth(
     tmp_path, kind
@@ -1452,7 +1631,8 @@ async def test_each_phase_through_a_fresh_store_sees_the_same_disk_truth(
         byte_count = int(count)
         logical = (
             "é" * (byte_count // 2) + "k" * (byte_count % 2)
-            if encoding == "utf8" else "k" * byte_count
+            if encoding == "utf8"
+            else "k" * byte_count
         )
         assert len(logical.encode("utf-8")) == byte_count
         path = _put(tmp_path, "s", f"{logical}.json")
@@ -1496,10 +1676,13 @@ async def test_each_phase_through_a_fresh_store_sees_the_same_disk_truth(
 
 
 @pytest.mark.parametrize(
-    "logical", ["a/" + "k" * 300, "a\\" + "k" * 300, "a\0" + "k" * 300, "k" * 300 + "\n"],
+    "logical",
+    ["a/" + "k" * 300, "a\\" + "k" * 300, "a\0" + "k" * 300, "k" * 300 + "\n"],
     ids=["slash", "backslash", "nul", "newline"],
 )
-async def test_real_prune_of_historical_fold_still_blocks_mapped_replay(tmp_path, logical):
+async def test_real_prune_of_historical_fold_still_blocks_mapped_replay(
+    tmp_path, logical
+):
     from context_intelligence_server.utils import fold_name
 
     folded = fold_name(logical, 242)

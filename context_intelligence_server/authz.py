@@ -171,7 +171,9 @@ async def require_claimed_session_access(
     if getattr(request.app.state, "access_control_mode", "compatibility") != "scoped":
         return
     claims = getattr(request.app.state, "session_claims", None)
-    workspace = await claims.get_workspace(session_id) if claims is not None else None
+    if claims is None:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    workspace = await claims.get_workspace(session_id)
     if workspace is None or not await claims.storage_identity_matches(session_id):
         raise HTTPException(status_code=403, detail="Forbidden")
     require_workspace_access(request, workspace, capability)

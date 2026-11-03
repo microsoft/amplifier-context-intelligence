@@ -9,14 +9,18 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Callable, Iterator, TypeVar
+from typing import TypeVar
 
 from context_intelligence_server import blob_retention as r
-from context_intelligence_server.blob_coordination import coordinator_for, wait_filesystem
+from context_intelligence_server.blob_coordination import (
+    coordinator_for,
+    wait_filesystem,
+)
 
 T = TypeVar("T")
 SNAPSHOT = "current-job.json"
@@ -41,7 +45,9 @@ class RetentionService:
     def __init__(self, path: Path | str):
         # Canonical before creation, so coordinator, lock and snapshot root agree.
         self.path = Path(path).expanduser().resolve()
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="blob-maintenance")
+        self.executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="blob-maintenance"
+        )
         self.guard = asyncio.Lock()
         self.job: dict | None = None
         self.report: r.Report | None = None
@@ -67,7 +73,13 @@ class RetentionService:
             raise
         return service
 
-    async def _work(self, operation: Callable[[], T], *, exclusive: bool = False, coordinated: bool = True) -> T:
+    async def _work(
+        self,
+        operation: Callable[[], T],
+        *,
+        exclusive: bool = False,
+        coordinated: bool = True,
+    ) -> T:
         def run() -> T:
             if not coordinated:
                 return operation()
@@ -159,16 +171,31 @@ class RetentionService:
             raise r.RetentionError("Invalid retention job snapshot")
 
     def _load(self) -> None:
-        with self._coordinator.lease(), r.Root(self.path) as root, self._metadata(root) as ledger:
+        coordinator = self._coordinator
+        assert coordinator is not None
+        with (
+            coordinator.lease(),
+            r.Root(self.path) as root,
+            self._metadata(root) as ledger,
+        ):
             if ledger.fd is None:
                 return
             try:
-                fd = os.open(SNAPSHOT, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=ledger.fd)
+                fd = os.open(
+                    SNAPSHOT,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=ledger.fd,
+                )
             except FileNotFoundError:
                 return
             with os.fdopen(fd, "rb") as stream:
                 st = os.fstat(stream.fileno())
-                if not r._regular(st) or st.st_uid != os.geteuid() or st.st_mode & 0o077 or st.st_size > 65536:
+                if (
+                    not r._regular(st)
+                    or st.st_uid != os.geteuid()
+                    or st.st_mode & 0o077
+                    or st.st_size > 65536
+                ):
                     raise r.RetentionError("Unsafe retention job snapshot")
                 saved = json.load(stream)
             # A snapshot from another canonical root (the blob directory was copied
@@ -189,8 +216,11 @@ class RetentionService:
             allowed = TERMINAL if foreign else TERMINAL | {"running", "cancelling"}
             if saved.get("state") not in allowed:
                 raise r.RetentionError("Invalid retention job snapshot")
-            if (saved.get("version") != 1 or saved.get("confirmed") is not True
-                    or str(uuid.UUID(saved["id"])) != saved["id"]):
+            if (
+                saved.get("version") != 1
+                or saved.get("confirmed") is not True
+                or str(uuid.UUID(saved["id"])) != saved["id"]
+            ):
                 raise r.RetentionError("Invalid retention job snapshot")
             if foreign:
                 # Ignored history must still be a well-formed report of ITS root.
@@ -208,13 +238,15 @@ class RetentionService:
             else:
                 interrupted = False
         if interrupted:
-            with self._coordinator.lease(exclusive=True):
+            with coordinator.lease(exclusive=True):
                 self._save()
 
     def _save(self) -> None:
         """Atomic, durable ONE snapshot; called only for confirmed jobs under EX."""
-        assert self.job is not None and self.job["confirmed"]
-        saved = {**self.job, **(self._terminal or {}), "report": asdict(self.report)}
+        job, report = self.job, self.report
+        assert job is not None and job["confirmed"]
+        assert report is not None
+        saved = {**job, **(self._terminal or {}), "report": asdict(report)}
         body = json.dumps(saved, separators=(",", ":")).encode()
         with r.Root(self.path) as root:
             try:
@@ -232,7 +264,12 @@ class RetentionService:
         name = "current-job.tmp"
         assert ledger.fd is not None
         # A prior crash may leave this private regular file. Never follow it.
-        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=ledger.fd)
+        fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=ledger.fd,
+        )
         with os.fdopen(fd, "wb") as stream:
             st = os.fstat(stream.fileno())
             if not r._regular(st) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
@@ -247,32 +284,45 @@ class RetentionService:
         ledger._check()
 
     def status(self, job_id: str | None = None) -> dict:
-        if self.job is None or (job_id is not None and self.job["id"] != job_id):
+        job, report = self.job, self.report
+        if job is None or (job_id is not None and job["id"] != job_id):
             raise JobNotFound("No matching current blob-prune job")
-        return {**self.job, "report": asdict(self.report)}
+        assert report is not None
+        return {**job, "report": asdict(report)}
 
     def _clock(self) -> None:
         now = time.time_ns()
         if now < self._last_wall:
-            raise r.RetentionError("Clock moved backwards; job stopped without widening cutoff")
+            raise r.RetentionError(
+                "Clock moved backwards; job stopped without widening cutoff"
+            )
         self._last_wall = now
 
     async def preview(self, older_than: str) -> dict:
         async with self.guard:
             if not self.accepting:
                 raise JobConflict("Server is shutting down")
-            if ((self.task is not None and not self.task.done())
-                    or (self.job is not None and self.job["state"] not in TERMINAL)):
+            if (self.task is not None and not self.task.done()) or (
+                self.job is not None and self.job["state"] not in TERMINAL
+            ):
                 raise JobConflict("Cancel the current preview/job before replacing it")
             started = time.time_ns()
             cutoff = r.cutoff_for(r.duration_ns(older_than), started)
             self._last_wall = started
             self.report = r.Report(str(self.path), cutoff)
             self.job = {
-                "version": 1, "id": str(uuid.uuid4()), "root": str(self.path),
-                "state": "previewing", "confirmed": False, "older_than": older_than,
-                "cutoff_ns": cutoff, "preview_started_ns": started,
-                "error": None, "phase": "scan", "windows": 0, "recovery_rows": 0,
+                "version": 1,
+                "id": str(uuid.uuid4()),
+                "root": str(self.path),
+                "state": "previewing",
+                "confirmed": False,
+                "older_than": older_than,
+                "cutoff_ns": cutoff,
+                "preview_started_ns": started,
+                "error": None,
+                "phase": "scan",
+                "windows": 0,
+                "recovery_rows": 0,
                 "preview_kind": "live estimate; apply rescans the frozen cutoff",
             }
             self.cancel_requested.clear()
@@ -280,83 +330,114 @@ class RetentionService:
             return self.status()
 
     def _validate_preview(self) -> None:
+        report = self.report
+        assert report is not None
         try:
             with r.Root(self.path) as root, r.Ledger(root):
                 pass
         except sqlite3.OperationalError as exc:
-            if getattr(exc, "sqlite_errorcode", None) != sqlite3.SQLITE_READONLY_ROLLBACK:
+            if (
+                getattr(exc, "sqlite_errorcode", None)
+                != sqlite3.SQLITE_READONLY_ROLLBACK
+            ):
                 raise
-            self.report.recovery_required = True
+            report.recovery_required = True
 
     async def _scan(self, *, applying: bool) -> None:
+        job, report = self.job, self.report
+        assert job is not None and report is not None
         cursor = r.ScanCursor()
         while not cursor.done and not self.cancel_requested.is_set():
             self._clock()
-            items = await self._work(lambda: r.scan_window(
-                self.path, cursor, self.report, self.job["preview_started_ns"],
-            ))
-            self.job["windows"] += 1
+            items = await self._work(
+                lambda: r.scan_window(
+                    self.path,
+                    cursor,
+                    report,
+                    job["preview_started_ns"],
+                )
+            )
+            job["windows"] += 1
             if applying and items and not self.cancel_requested.is_set():
                 await self._batch(items)
             else:
                 await asyncio.sleep(0.001)
 
     async def _preview(self) -> None:
+        job = self.job
+        assert job is not None
         try:
             await self._work(self._validate_preview)
             await self._scan(applying=False)
             if self.cancel_requested.is_set():
-                self.job["state"] = "cancelled"
+                job["state"] = "cancelled"
             else:
-                self.job["state"] = "ready"
-                self.job["phase"] = "ready"
+                job["state"] = "ready"
+                job["phase"] = "ready"
                 self._ready_deadline = time.monotonic() + 900
-                self.job["expires_ns"] = time.time_ns() + 900 * 10**9
-        except Exception as exc:
-            self.job["state"] = "failed"
-            self.job["error"] = self._error(exc)
+                job["expires_ns"] = time.time_ns() + 900 * 10**9
+        except Exception as exc:  # noqa: BLE001 - Fail the preview without exposing arbitrary error text.
+            job["state"] = "failed"
+            job["error"] = self._error(exc)
 
     @staticmethod
     def _error(exc: Exception) -> str:
         # Never include payloads, credentials, or arbitrary DB statements.
-        return str(exc)[:512] if isinstance(exc, r.RetentionError) else f"Filesystem/ledger failure ({type(exc).__name__})"
+        return (
+            str(exc)[:512]
+            if isinstance(exc, r.RetentionError)
+            else f"Filesystem/ledger failure ({type(exc).__name__})"
+        )
 
     async def start(self, job_id: str, confirmation: str) -> dict:
         async with self.guard:
             self.status(job_id)
-            if not self.accepting or self.job["state"] != "ready":
+            job = self.job
+            assert job is not None
+            if not self.accepting or job["state"] != "ready":
                 raise JobConflict("Only a current ready preview may start")
             if confirmation != "prune":
                 raise JobConflict("Exact confirmation 'prune' is required")
             try:
                 self._clock()
             except r.RetentionError as exc:
-                self.job["state"] = "failed"
-                self.job["error"] = str(exc)
+                job["state"] = "failed"
+                job["error"] = str(exc)
                 raise JobConflict(str(exc)) from exc
-            if time.monotonic() >= self._ready_deadline or time.time_ns() >= self.job["expires_ns"]:
-                raise JobConflict("Preview expired; cancel it and request a new preview")
-            self.job["confirmed"] = True
-            self.job["state"] = "running"
-            self.job["phase"] = "checkpoint"
+            if (
+                time.monotonic() >= self._ready_deadline
+                or time.time_ns() >= job["expires_ns"]
+            ):
+                raise JobConflict(
+                    "Preview expired; cancel it and request a new preview"
+                )
+            job["confirmed"] = True
+            job["state"] = "running"
+            job["phase"] = "checkpoint"
             self.task = asyncio.create_task(self._apply())
             return self.status()
 
     async def _batch(self, items: list[r.Candidate], *, recovery: bool = False) -> None:
         # Already admitted work finishes before cancellation is honored.
+        report = self.report
+        assert report is not None
         self._clock()
+
         def admitted() -> None:
             if not self.cancel_requested.is_set():
-                r.apply_batch(self.path, items, self.report, recovery=recovery)
+                r.apply_batch(self.path, items, report, recovery=recovery)
+
         await self._work(admitted, exclusive=True)
         await self._work(self._save, exclusive=True)
         await asyncio.sleep(0.05)
 
     async def _apply(self) -> None:
+        job = self.job
+        assert job is not None
         try:
             # Consent precedes metadata; checkpoint precedes ledger recovery/unlink.
             await self._work(self._save, exclusive=True)
-            self.report = r.Report(str(self.path), self.job["cutoff_ns"])
+            self.report = r.Report(str(self.path), job["cutoff_ns"])
 
             # Writable open recovers a genuine hot rollback journal only here.
             def initialize_ledger() -> None:
@@ -364,19 +445,19 @@ class RetentionService:
                     pass
 
             await self._work(initialize_ledger, exclusive=True)
-            self.job["phase"] = "recovery"
+            job["phase"] = "recovery"
             after = ""
             while not self.cancel_requested.is_set():
                 self._clock()
                 after, items, count = await self._work(
-                    lambda: r.recovery_page(
+                    lambda after=after: r.recovery_page(
                         self.path,
                         after,
-                        self.job["cutoff_ns"],
-                        self.job["preview_started_ns"],
+                        job["cutoff_ns"],
+                        job["preview_started_ns"],
                     )
                 )
-                self.job["recovery_rows"] += count
+                job["recovery_rows"] += count
                 for offset in range(0, len(items), 32):
                     if self.cancel_requested.is_set():
                         break
@@ -384,25 +465,23 @@ class RetentionService:
                 if count < 512:
                     break
                 await asyncio.sleep(0.001)
-            self.job["phase"] = "scan"
+            job["phase"] = "scan"
             await self._scan(applying=True)
             self._clock()
             outcome = {
                 "state": "cancelled" if self.cancel_requested.is_set() else "completed",
                 "phase": "finished",
             }
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Record a sanitized failed outcome for any I/O failure.
             outcome = {"state": "failed", "error": self._error(exc)}
         # Clients may acknowledge a terminal state, so it becomes public only after
         # its durable checkpoint: stay running (finalizing) while the save is in flight.
-        job = self.job
-        assert job is not None
         outcome.setdefault("phase", job["phase"])
         job["phase"] = "finalizing"
         self._terminal = outcome
         try:
             await self._work(self._save, exclusive=True)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Failed durability must never publish completed.
             outcome = {
                 **outcome,
                 "state": "failed",
@@ -415,13 +494,15 @@ class RetentionService:
     async def cancel(self, job_id: str) -> dict:
         async with self.guard:
             self.status(job_id)
+            job = self.job
+            assert job is not None
             # The outcome is already decided while its final checkpoint is in flight.
-            if self.job["state"] not in TERMINAL and self._terminal is None:
+            if job["state"] not in TERMINAL and self._terminal is None:
                 self.cancel_requested.set()
-                if self.job["state"] == "ready":
-                    self.job["state"] = "cancelled"
+                if job["state"] == "ready":
+                    job["state"] = "cancelled"
                 else:
-                    self.job["state"] = "cancelling"
+                    job["state"] = "cancelling"
             return self.status()
 
     async def stop(self) -> None:

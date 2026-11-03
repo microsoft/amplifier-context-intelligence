@@ -68,12 +68,18 @@ the **workspace root `docs/`** (one level up from this repo), never here.
 Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
 
 ```bash
-uv sync
-uv run pytest tests/ -q                    # All tests (no Neo4j required)
-uv run pytest tests/neo4j/ -q              # Neo4j tests (requires running instance)
+uv sync --locked --dev
+uv run pytest tests/ -q -m "not neo4j and not integration"  # CI service-free selector
+uv run pytest tests/ -q                    # Full suite: isolated test services required
+uv run pytest tests/neo4j/ -q              # Neo4j container fixtures require local Docker
 ```
 
-Most tests run against in-memory fakes. The `tests/neo4j/` suite requires a live Neo4j 5.x instance — see `tests/neo4j/conftest.py` for connection details.
+Most tests use in-memory fakes; the CI selector above is not the full suite.
+Full-suite runs need isolated Neo4j test services and local Docker for container
+tests; enable APOC for server integration paths that require it. Follow
+`.github/workflows/ci.yml` for CI selectors and `tests/neo4j/conftest.py` for
+container fixtures. Never point tests at a shared/production Neo4j URI or set a
+global production URI to satisfy test setup.
 
 ---
 
@@ -266,6 +272,9 @@ Preserve sanitized JSON receipts, finite work/cleanup budgets, scoped SIGTERM
 handling, and the interactive command's TTY/no-`--yes` guard. No server/schema
 changes, scheduler auto-install, or ingestion stop/restart hooks. User-unit setup:
 `docs/service-setup.md` → "Nightly online pruning — explicit unattended opt-in".
+Azure setup: [explicit opt-in runbook](docs/azure-deployment.md#azure-scheduled-blob-retention--explicit-opt-in).
+The v1 job-provisioning path is unverified; Azure Files requires qualification
+before production apply, and unattended Entra credential bootstrap is external.
 Tests: `uv run pytest tests/test_retention_scheduler.py tests/test_retention_client.py -q`.
 
 ### Blob migration and startup recovery invariants

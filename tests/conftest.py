@@ -271,16 +271,18 @@ def safe_settings(tmp_path: Any) -> Generator[None, None, None]:
             """Match Settings' lock-root derivation without touching /data in tests."""
             return Path(self.queues_path).parent
 
-    with patch(
-        "context_intelligence_server.registry.get_settings",
-        return_value=_SettingsProxy(),
+    with (
+        patch(
+            "context_intelligence_server.registry.get_settings",
+            return_value=_SettingsProxy(),
+        ),
+        patch.object(app.state, "settings", _SettingsProxy(), create=True),
     ):
         # Lifespan acquires its process lock before it initializes drivers or
         # workers. Point the module-level ASGI app at this test's isolated root
         # rather than the production default (/data), which is intentionally
         # not writable from the test runner.
-        with patch.object(app.state, "settings", _SettingsProxy(), create=True):
-            yield
+        yield
 
 
 @pytest.fixture(autouse=True)

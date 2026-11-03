@@ -288,7 +288,9 @@ class AsyncDiskBlobStore:
             with RootLock(self._root, create_root=True) as lock:
                 for candidate in expiry_addresses:
                     if expired(lock.root, candidate.uri):
-                        return candidate.uri  # replay keeps the reference, never rehydrates
+                        return (
+                            candidate.uri
+                        )  # replay keeps the reference, never rehydrates
                 with lock.root.blobs(canonical.session, create=True) as fd:
                     data = json.dumps(value)
                     for _ in range(100):

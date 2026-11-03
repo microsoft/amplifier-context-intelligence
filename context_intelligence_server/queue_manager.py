@@ -96,6 +96,7 @@ def is_safe_session_id(session_id: object) -> bool:
         and len(session_id.encode("utf-8")) <= MAX_SESSION_ID_BYTES
     )
 
+
 # --- worker-key length budget --------------------------------------------
 #
 # INCIDENT (production): a worker key derived straight from a deeply-nested
@@ -692,7 +693,9 @@ class QueueManager:
             with self._guard(worker_key) as guard:
                 async with guard.admission:
 
-                    def _archive(path: Path = path, worker_key: str = worker_key) -> int:
+                    def _archive(
+                        path: Path = path, worker_key: str = worker_key
+                    ) -> int:
                         try:
                             data = path.read_bytes()
                         except FileNotFoundError:
@@ -706,9 +709,7 @@ class QueueManager:
                         # would deadlock its non-reentrant threading.Lock.
                         self._write_record(guard, audit, b"".join(selected))
                         remaining = [line for line in lines if not _matches(line, path)]
-                        temporary = (
-                            self._dir / f"{worker_key}.{uuid.uuid4().hex}.tmp"
-                        )
+                        temporary = self._dir / f"{worker_key}.{uuid.uuid4().hex}.tmp"
                         try:
                             temporary.write_bytes(b"".join(remaining) + tail)
                             os.replace(temporary, path)
@@ -833,7 +834,7 @@ class QueueManager:
     @staticmethod
     def _validate_session_id(session_id: str) -> None:
         if not isinstance(session_id, str):
-            raise ValueError(f"Invalid session_id: {session_id!r}")
+            raise ValueError(f"Invalid session_id: {session_id!r}")  # noqa: TRY004 - ValueError is the public queue validation contract
         # Defense in depth: every real caller folds its worker key through
         # ``fold_worker_key`` before it ever reaches here (see main.py), so
         # this should never fire in production. It exists for the case a

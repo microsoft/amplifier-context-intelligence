@@ -15,7 +15,7 @@ import stat
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -407,7 +407,7 @@ class RecoveryReceiptStore:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         columns: set[str] = set()
-        with sqlite3.connect(self.path, timeout=30) as db:
+        with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
             columns = {
                 row[1] for row in db.execute("PRAGMA table_info(recovery_receipts)")
             }
@@ -415,7 +415,7 @@ class RecoveryReceiptStore:
             self._rebuild_legacy_database_locked(columns)
         elif columns and self._current_database_needs_sanitization_locked():
             self._rebuild_current_database_locked()
-        with sqlite3.connect(self.path, timeout=30) as db:
+        with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
             self._create_current_schema_locked(db)
         self._initialized = True
 
@@ -572,7 +572,10 @@ class RecoveryReceiptStore:
                           payload, state FROM recovery_receipts"""
             )
             self._prepare_replacement_locked(temporary)
-            with sqlite3.connect(temporary, timeout=30) as destination:
+            with (
+                closing(sqlite3.connect(temporary, timeout=30)) as destination,
+                destination,
+            ):
                 destination.execute("PRAGMA journal_mode=DELETE")
                 destination.execute("PRAGMA synchronous=FULL")
                 destination.execute("PRAGMA secure_delete=ON")
@@ -694,7 +697,7 @@ class RecoveryReceiptStore:
     def _current_database_needs_sanitization_locked(self) -> bool:
         """Detect persisted values which cannot safely be used as queue keys."""
         try:
-            with sqlite3.connect(self.path, timeout=30) as db:
+            with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                 source_rows = db.execute(
                     "SELECT descriptor FROM recovery_sources"
                 ).fetchall()
@@ -787,7 +790,10 @@ class RecoveryReceiptStore:
                 else []
             )
             self._prepare_replacement_locked(temporary)
-            with sqlite3.connect(temporary, timeout=30) as destination:
+            with (
+                closing(sqlite3.connect(temporary, timeout=30)) as destination,
+                destination,
+            ):
                 destination.execute("PRAGMA journal_mode=DELETE")
                 destination.execute("PRAGMA synchronous=FULL")
                 destination.execute("PRAGMA foreign_keys=ON")
@@ -1002,7 +1008,7 @@ class RecoveryReceiptStore:
         def _classify() -> ReceiptClassification:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     db.execute("BEGIN IMMEDIATE")
                     source_state, _ = self._source_state(db, source_handle, descriptor)
                     if source_state == "conflict":
@@ -1059,7 +1065,7 @@ class RecoveryReceiptStore:
         def _admit() -> ReceiptResult:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     db.execute("BEGIN IMMEDIATE")
                     source_state, descriptor_hash = self._source_state(
                         db, source_handle, descriptor
@@ -1171,7 +1177,7 @@ class RecoveryReceiptStore:
         def _has_pending() -> bool:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     return bool(
                         db.execute(
                             "SELECT 1 FROM recovery_receipts WHERE state IN "
@@ -1222,7 +1228,7 @@ class RecoveryReceiptStore:
         def _mark() -> bool:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     exists = db.execute(
                         """SELECT 1 FROM recovery_receipts
                            WHERE source_handle=? AND ordinal=?""",
@@ -1266,7 +1272,7 @@ class RecoveryReceiptStore:
         def _read() -> bool:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     row = db.execute(
                         """SELECT state FROM recovery_receipts
                            WHERE source_handle=? AND ordinal=?""",
@@ -1286,7 +1292,7 @@ class RecoveryReceiptStore:
         def _read() -> list[dict[str, Any]]:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     rows = db.execute(
                         """SELECT r.source_handle, r.ordinal, r.source_line_sha256,
                                   s.descriptor, r.actor, r.workspace, r.payload, r.state
@@ -1327,7 +1333,7 @@ class RecoveryReceiptStore:
         def _read() -> dict[str, int]:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     return {
                         state: count
                         for state, count in db.execute(
@@ -1343,7 +1349,7 @@ class RecoveryReceiptStore:
         def _read() -> dict[str, Any] | None:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     rows = db.execute(
                         """SELECT source_handle, ordinal, source_line_sha256, actor,
                                   workspace, payload, state
@@ -1379,7 +1385,7 @@ class RecoveryReceiptStore:
         def _retry() -> bool:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     db.execute("BEGIN IMMEDIATE")
                     if db.execute(
                         "SELECT 1 FROM recovery_receipts WHERE state IN "
@@ -1401,7 +1407,7 @@ class RecoveryReceiptStore:
         def _read() -> list[dict[str, Any]]:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     return [
                         {"source_handle": row[0], "ordinal": row[1], "state": row[2]}
                         for row in db.execute(
@@ -1422,7 +1428,7 @@ class RecoveryReceiptStore:
         def _read() -> dict[str, Any] | None:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     row = db.execute(
                         """SELECT source_line_sha256, actor, workspace, payload, state
                            FROM recovery_receipts
@@ -1454,7 +1460,7 @@ class RecoveryReceiptStore:
         def _quarantine() -> None:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     db.execute(
                         """UPDATE recovery_receipts SET state='quarantined'
                            WHERE source_handle=? AND ordinal=?

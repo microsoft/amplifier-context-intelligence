@@ -142,7 +142,9 @@ class TestBlobPipelineEndToEnd:
         get_or_create.assert_called_once_with(
             "blob-integ-202-check", "test-workspace", created_by=None
         )
-        batch = await registry.queue_manager.read_batch(payload["data"]["session_id"], 2)
+        batch = await registry.queue_manager.read_batch(
+            payload["data"]["session_id"], 2
+        )
         assert len(batch.lines) == 1
         queued = json.loads(batch.lines[0])
         assert queued["event"] == payload["event"]

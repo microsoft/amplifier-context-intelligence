@@ -7,7 +7,6 @@ import hashlib
 import json
 import sqlite3
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -993,7 +992,8 @@ async def test_recovery_receipt_terminalization_precedes_its_queue_commit(
 ) -> None:
     """A crash after terminalization leaves a replayable, already-terminal record."""
     from context_intelligence_server.queue_manager import QueueManager
-    from context_intelligence_server.registry import SessionRegistry
+    from context_intelligence_server.registry import SessionRegistry, SessionWorker
+    from context_intelligence_server.services import HookStateService
 
     handle = source_handle_from_capability(_capability(13))
     assert handle
@@ -1038,7 +1038,12 @@ async def test_recovery_receipt_terminalization_precedes_its_queue_commit(
     registry.on_batch_flushed = persist_terminal
     queue.commit = assert_terminal_then_commit  # type: ignore[method-assign]
     await registry._drain_to_eof(
-        SimpleNamespace(session_id="capture-session"), handlers=MagicMock()
+        SessionWorker(
+            session_id="capture-session",
+            workspace="one",
+            services=HookStateService(workspace="one"),
+        ),
+        handlers=MagicMock(),
     )
 
     assert (await queue.read_batch("capture-session", max_items=1)).records == []

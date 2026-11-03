@@ -156,9 +156,12 @@ def test_long_names_with_backslash_map_the_full_raw_name() -> None:
     addr = write_address("s", logical)
 
     assert addr.mapped is True
-    assert addr.name == hashlib.sha256(
-        b"ci-blob-event-key:v1\0" + logical.encode("utf-8")
-    ).hexdigest()
+    assert (
+        addr.name
+        == hashlib.sha256(
+            b"ci-blob-event-key:v1\0" + logical.encode("utf-8")
+        ).hexdigest()
+    )
 
 
 def test_long_names_whose_fold_is_still_unsafe_map_to_the_digest() -> None:

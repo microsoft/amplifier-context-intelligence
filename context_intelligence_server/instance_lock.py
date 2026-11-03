@@ -14,6 +14,7 @@ import os
 import secrets
 import stat
 from pathlib import Path
+from typing import Self
 
 _LOCK_FILENAME = ".context-intelligence-server.lock"
 
@@ -59,7 +60,7 @@ class ServerInstanceLock:
         finally:
             os.close(fd)
 
-    def __enter__(self) -> ServerInstanceLock:
+    def __enter__(self) -> Self:
         self.acquire()
         return self
 

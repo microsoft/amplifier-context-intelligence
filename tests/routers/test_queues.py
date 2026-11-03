@@ -290,7 +290,7 @@ class TestDeadLetterReplay:
             entered = 0
             exited = 0
 
-            def live_enqueue(self) -> "GateSpy":
+            def live_enqueue(self) -> GateSpy:
                 return self
 
             async def __aenter__(self) -> None:

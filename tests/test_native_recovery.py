@@ -27,17 +27,17 @@ from context_intelligence_server.config import Settings
 from context_intelligence_server.handlers.data_layer_1.default import DefaultHandler
 from context_intelligence_server.pipeline import PipelineHandlers, process_event
 from context_intelligence_server.recovery import (
-    _PermitBinding,
     RecoveryAdmissionGate,
     RecoveryReceiptStore,
+    _PermitBinding,
     lease_allows,
     recovery_event_identity,
     source_descriptor_digest,
     source_handle_from_capability,
 )
 from context_intelligence_server.registry import SessionRegistry, SessionWorker
-from context_intelligence_server.session_claims import SessionClaimStore
 from context_intelligence_server.services import HookStateService
+from context_intelligence_server.session_claims import SessionClaimStore
 from context_intelligence_server.utils import SPOOL_EVENT_IDENTITY, make_node_id
 
 
@@ -508,14 +508,16 @@ async def test_recovery_deadletter_boundaries_never_advance_past_an_unmarked_rec
         queue_manager.commit = fail_commit  # type: ignore[method-assign]
 
     batch = await queue_manager.read_batch("deadletter-boundary", max_items=1)
-    with patch(
-        "context_intelligence_server.registry.process_event",
-        new=AsyncMock(side_effect=ValueError("deterministic poison")),
+    with (
+        patch(
+            "context_intelligence_server.registry.process_event",
+            new=AsyncMock(side_effect=ValueError("deterministic poison")),
+        ),
+        pytest.raises(OSError, match="injected"),
     ):
-        with pytest.raises(OSError, match="injected"):
-            await recovery_registry._handle_exhausted_batch(
-                worker, batch, handlers=MagicMock()
-            )
+        await recovery_registry._handle_exhausted_batch(
+            worker, batch, handlers=MagicMock()
+        )
 
     # The evidence is durable, but neither error path may acknowledge the
     # original record or silently skip the following source record.
@@ -753,7 +755,9 @@ async def test_live_first_gate_prioritizes_waiting_live_flushes() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("access_mode", ["compatibility", "scoped"])
 async def test_startup_resumes_queued_native_recovery_worker(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, access_mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    access_mode: str,
 ) -> None:
     from context_intelligence_server.main import _resume_native_recovery, app
 
@@ -763,7 +767,9 @@ async def test_startup_resumes_queued_native_recovery_worker(
             recover=AsyncMock(return_value=["s"]),
             read_batch=AsyncMock(
                 return_value=SimpleNamespace(
-                    lines=[b'{"workspace":"one","created_by":"alice","data":{"session_id":"s"}}']
+                    lines=[
+                        b'{"workspace":"one","created_by":"alice","data":{"session_id":"s"}}'
+                    ]
                 )
             ),
         ),
@@ -2460,7 +2466,7 @@ async def test_admin_retry_archives_only_matching_dead_letter_and_requeues_once(
             assert await app.state.recovery_receipts.status() == {"quarantined": 1}
             assert (await queue.read_batch("recovery-session", 1)).records == []
             assert (
-                not await queue.recovery_origin_commit_state(
+                not await queue.recovery_origin_commit_state(  # noqa: SIM201 - negative control matches the predicate under test
                     {"source_handle": _source_handle(), **body["origin"]}
                 )
                 == "queued"

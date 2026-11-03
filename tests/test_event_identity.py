@@ -88,14 +88,12 @@ async def test_post_assigns_distinct_server_owned_ids_for_same_timestamp_events(
         )
 
     assert node_ids[0] != node_ids[1]
-    assert (
-        json.loads((await services.graph.get_node(node_ids[0]))["data"])["marker"]
-        == "first"
-    )  # type: ignore[index]
-    assert (
-        json.loads((await services.graph.get_node(node_ids[1]))["data"])["marker"]
-        == "second"
-    )  # type: ignore[index]
+    first_node = await services.graph.get_node(node_ids[0])
+    assert first_node is not None
+    assert json.loads(first_node["data"])["marker"] == "first"
+    second_node = await services.graph.get_node(node_ids[1])
+    assert second_node is not None
+    assert json.loads(second_node["data"])["marker"] == "second"
 
 
 async def test_keyed_terminal_reprocessing_reuses_event_and_blob_identity(

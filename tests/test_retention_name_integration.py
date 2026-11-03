@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 import time
 from pathlib import Path
@@ -11,11 +11,14 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import FastAPI
 
 from context_intelligence_server import blob_retention as retention
 from context_intelligence_server.blob_store import AsyncDiskBlobStore
 from context_intelligence_server.queue_manager import (
-    MAX_SESSION_ID_BYTES, QueueManager, fold_worker_key,
+    MAX_SESSION_ID_BYTES,
+    QueueManager,
+    fold_worker_key,
 )
 from context_intelligence_server.retention_service import RetentionService
 
@@ -30,7 +33,9 @@ from context_intelligence_server.retention_service import RetentionService
         ("nested-" * 70, "event-" * 90),
     ],
 )
-async def test_disk_boundaries_and_canonical_lifecycle(tmp_path, monkeypatch, session, key):
+async def test_disk_boundaries_and_canonical_lifecycle(
+    tmp_path, monkeypatch, session, key
+):
     store = AsyncDiskBlobStore(tmp_path / "blobs")
     real_open = os.open
     temporary_names = []
@@ -60,8 +65,10 @@ async def test_disk_boundaries_and_canonical_lifecycle(tmp_path, monkeypatch, se
 
 
 @pytest.mark.parametrize("online", [False, True])
-async def test_folded_expiry_replay_and_http(tmp_path, monkeypatch, auth_client, online):
-    import context_intelligence_server.main as main
+async def test_folded_expiry_replay_and_http(
+    tmp_path, monkeypatch, auth_client, online
+):
+    from context_intelligence_server import main
 
     root = tmp_path / "storage"
     store = AsyncDiskBlobStore(root)
@@ -79,12 +86,16 @@ async def test_folded_expiry_replay_and_http(tmp_path, monkeypatch, auth_client,
         service = await RetentionService.open(root)
         try:
             job = await service.preview("30d")
-            await service.task
+            preview_task = service.task
+            assert preview_task is not None
+            await preview_task
             assert service.status()["state"] == "ready"
             assert service.status()["report"]["samples"] == [uri]
             assert path.exists()
             await service.start(job["id"], "prune")
-            await service.task
+            apply_task = service.task
+            assert apply_task is not None
+            await apply_task
             result = service.status()
             assert result["state"] == "completed" and result["report"]["deleted"] == 1
         finally:
@@ -114,15 +125,19 @@ async def test_folded_expiry_replay_and_http(tmp_path, monkeypatch, auth_client,
     response = await auth_client.get(f"/blobs/{session}/{key}", headers=headers)
     assert response.status_code == 410
     assert response.json()["detail"] == {"code": "blob_expired", "uri": uri}
-    assert (await auth_client.get(f"/blobs/{physical_session}/absent", headers=headers)).status_code == 404
+    assert (
+        await auth_client.get(f"/blobs/{physical_session}/absent", headers=headers)
+    ).status_code == 404
     assert (await auth_client.get(url)).status_code == 401
     # Physical-first read remains stronger than a tombstone.
     path.write_text('{"restored": true}')
     assert (await auth_client.get(url, headers=headers)).json() == {"restored": True}
 
 
-async def test_temp_collision_does_not_follow_or_unlink_existing_symlink(tmp_path, monkeypatch):
-    import context_intelligence_server.blob_store as blob_store
+async def test_temp_collision_does_not_follow_or_unlink_existing_symlink(
+    tmp_path, monkeypatch
+):
+    from context_intelligence_server import blob_store
 
     store = AsyncDiskBlobStore(tmp_path / "root")
     directory = store.blob_path("session", "k" * 242).parent
@@ -156,23 +171,28 @@ async def test_recovery_retry_at_exact_worker_filename_budget(tmp_path):
     assert not list(queue._dir.glob("*.tmp"))
 
 
-async def test_native_spool_migrates_before_reconcile_without_rewriting_identity(tmp_path, monkeypatch):
-    import context_intelligence_server.main as main
+async def test_native_spool_migrates_before_reconcile_without_rewriting_identity(
+    tmp_path, monkeypatch
+):
+    from context_intelligence_server import main
 
     queue = QueueManager(tmp_path / "recovery")
     raw_worker = "worker-" + "x" * 239  # production band: .dead.jsonl cannot exist
     session = "source-" + "s" * 180  # admitted original identity stays distinct
     origin = {"source_handle": "a" * 64, "ordinal": 0, "source_line_sha256": "b" * 64}
     envelope = {
-        "event": "session:start", "workspace": "synthetic",
+        "event": "session:start",
+        "workspace": "synthetic",
         "data": {"session_id": session, "timestamp": "2026-01-01T00:00:00"},
-        "created_by": "owner", "_recovery_origin": origin,
+        "created_by": "owner",
+        "_recovery_origin": origin,
     }
     raw = json.dumps(envelope).encode() + b"\n"
     (queue._dir / f"{raw_worker}.log").write_bytes(raw)
     (queue._dir / f"{raw_worker}.offset").write_text("0")
     recovery_registry = SimpleNamespace(queue_manager=queue, get_or_create=MagicMock())
-    app = SimpleNamespace(state=SimpleNamespace(recovery_registry=recovery_registry))
+    app = FastAPI()
+    app.state.recovery_registry = recovery_registry
 
     async def reconcile(_):
         assert await queue.recovery_origin_commit_state(origin) == "queued"
@@ -207,12 +227,14 @@ async def test_migration_refuses_any_existing_destination_sibling(tmp_path, sibl
 
 
 @pytest.mark.parametrize("alias_kind", ["blob", "queue"])
-@pytest.mark.parametrize("actor,expected", [("owner", 200), ("other", 403), ("reader", 200)])
+@pytest.mark.parametrize(
+    "actor,expected", [("owner", 200), ("other", 403), ("reader", 200)]
+)
 async def test_scoped_claims_preserve_folded_blob_ownership(
     tmp_path, monkeypatch, auth_client, actor, expected, alias_kind
 ):
     """A physical alias must neither hide the owner nor grant another workspace access."""
-    import context_intelligence_server.main as main
+    from context_intelligence_server import main
     from context_intelligence_server.auth import StaticKeyResolver
     from context_intelligence_server.config import ContributorGrant
     from context_intelligence_server.session_claims import SessionClaimStore
@@ -229,17 +251,32 @@ async def test_scoped_claims_preserve_folded_blob_ownership(
     monkeypatch.setattr(main, "_settings", SimpleNamespace(blob_path=str(store._root)))
     monkeypatch.setattr(main.app.state, "access_control_mode", "scoped")
     monkeypatch.setattr(main.app.state, "session_claims", claims)
-    monkeypatch.setattr(main.app.state, "contributor_grants", {
-        "owner": ContributorGrant(workspaces=["workspace-one"], capabilities={"live:write", "data:read"}),
-        "other": ContributorGrant(workspaces=["workspace-two"], capabilities={"live:write", "data:read"}),
-        "reader": ContributorGrant(workspaces=["workspace-one"], capabilities={"data:read"}),
-    })
-    tokens = {"owner": "test-owner-token", "other": "test-other-token",
-              "reader": "test-reader-token"}
-    resolver = StaticKeyResolver({
-        hashlib.sha256(token.encode()).hexdigest(): identity
-        for identity, token in tokens.items()
-    })
+    monkeypatch.setattr(
+        main.app.state,
+        "contributor_grants",
+        {
+            "owner": ContributorGrant(
+                workspaces=["workspace-one"], capabilities={"live:write", "data:read"}
+            ),
+            "other": ContributorGrant(
+                workspaces=["workspace-two"], capabilities={"live:write", "data:read"}
+            ),
+            "reader": ContributorGrant(
+                workspaces=["workspace-one"], capabilities={"data:read"}
+            ),
+        },
+    )
+    tokens = {
+        "owner": "test-owner-token",
+        "other": "test-other-token",
+        "reader": "test-reader-token",
+    }
+    resolver = StaticKeyResolver(
+        {
+            hashlib.sha256(token.encode()).hexdigest(): identity
+            for identity, token in tokens.items()
+        }
+    )
     monkeypatch.setattr(main.asgi_app, "resolver", resolver)
     # Exercise real scoped admission, not a manually seeded claim. A physical
     # alias is refused before either claim insertion or queue append.
@@ -247,10 +284,15 @@ async def test_scoped_claims_preserve_folded_blob_ownership(
         ("owner", original, "workspace-one", 202),
         ("other", alias, "workspace-two", 409),
     ]:
-        accepted = await auth_client.post("/events", json={
-            "event": "session:start", "workspace": workspace,
-            "data": {"session_id": session, "timestamp": "2026-01-01T00:00:00"},
-        }, headers={"Authorization": f"Bearer {tokens[identity]}"})
+        accepted = await auth_client.post(
+            "/events",
+            json={
+                "event": "session:start",
+                "workspace": workspace,
+                "data": {"session_id": session, "timestamp": "2026-01-01T00:00:00"},
+            },
+            headers={"Authorization": f"Bearer {tokens[identity]}"},
+        )
         assert accepted.status_code == status
     assert await claims.get_workspace(original) == "workspace-one"
     assert await claims.get_workspace(alias) is None

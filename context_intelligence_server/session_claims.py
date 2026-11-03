@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
+from contextlib import closing
 from pathlib import Path
 from typing import Literal
 
@@ -39,7 +40,7 @@ class SessionClaimStore:
         if self._initialized:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.path, timeout=30) as db:
+        with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
             db.execute("BEGIN IMMEDIATE")
             db.execute(
                 """CREATE TABLE IF NOT EXISTS session_claims (
@@ -87,7 +88,8 @@ class SessionClaimStore:
             db.execute(
                 "SELECT session_id FROM storage_bindings WHERE kind=? AND component=?",
                 (kind, component),
-            ).fetchone() == (session_id,)
+            ).fetchone()
+            == (session_id,)
             for kind, component in components
         )
 
@@ -117,7 +119,7 @@ class SessionClaimStore:
         def _claim() -> bool:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     db.execute("BEGIN IMMEDIATE")
                     row = db.execute(
                         """SELECT contributor_id, workspace, reservation_token
@@ -154,7 +156,7 @@ class SessionClaimStore:
         def _reserve() -> RecoveryReservationResult:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     db.execute("BEGIN IMMEDIATE")
                     row = db.execute(
                         """SELECT contributor_id, workspace, reservation_token
@@ -198,7 +200,7 @@ class SessionClaimStore:
         def _finalize() -> bool:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     db.execute("BEGIN IMMEDIATE")
                     row = db.execute(
                         """SELECT contributor_id, workspace, reservation_token
@@ -237,7 +239,7 @@ class SessionClaimStore:
         def _release() -> None:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     db.execute("BEGIN IMMEDIATE")
                     removed = db.execute(
                         """DELETE FROM session_claims
@@ -255,16 +257,19 @@ class SessionClaimStore:
 
     async def storage_identity_matches(self, session_id: str) -> bool:
         """Whether a committed original unambiguously owns both storage names."""
+
         def _get() -> bool:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     db.execute("BEGIN")
-                    return bool(db.execute(
-                        """SELECT 1 FROM session_claims
+                    return bool(
+                        db.execute(
+                            """SELECT 1 FROM session_claims
                            WHERE session_id=? AND reservation_token IS NULL""",
-                        (session_id,),
-                    ).fetchone()) and self._bindings_match(db, session_id)
+                            (session_id,),
+                        ).fetchone()
+                    ) and self._bindings_match(db, session_id)
 
         return await asyncio.to_thread(_get)
 
@@ -278,7 +283,7 @@ class SessionClaimStore:
         def _get() -> str | None:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     row = db.execute(
                         """SELECT c.workspace FROM storage_bindings AS b
                            JOIN session_claims AS c ON c.session_id=b.session_id
@@ -296,7 +301,7 @@ class SessionClaimStore:
         def _get() -> str | None:
             with self._lock:
                 self._initialize_locked()
-                with sqlite3.connect(self.path, timeout=30) as db:
+                with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
                     row = db.execute(
                         """SELECT workspace FROM session_claims
                            WHERE session_id=? AND reservation_token IS NULL""",
