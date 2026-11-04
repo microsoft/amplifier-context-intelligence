@@ -84,6 +84,119 @@ def test_crash_recovery_respawn_limit_defaults_to_unbounded():
     assert s.crash_recovery_respawn_limit is None
 
 
+def test_native_recovery_permits_are_defaulted_on_and_validate_ttl():
+    from context_intelligence_server.config import RecoveryConfig
+
+    assert RecoveryConfig().permit_required
+    assert RecoveryConfig().permit_ttl_seconds == 15
+    with pytest.raises(ValueError, match="permit_ttl_seconds"):
+        RecoveryConfig(permit_ttl_seconds=0)
+
+
+def test_stateful_root_covers_live_recovery_receipt_and_claim_storage(
+    tmp_path: Path,
+) -> None:
+    """The single-server lock is rooted above every active durable state store."""
+    from context_intelligence_server.config import Settings
+
+    settings = Settings(
+        queues_path=str(tmp_path / "state" / "live"),
+        access_control_mode="scoped",
+        contributor_grants={
+            "writer": {
+                "all_workspaces": True,
+                "capabilities": ["live:write", "recovery:write"],
+            }
+        },
+        recovery={
+            "enabled": True,
+            "queues_path": str(tmp_path / "state" / "recovery"),
+            "receipt_store_path": str(tmp_path / "state" / "receipts.sqlite3"),
+            "claims_store_path": str(tmp_path / "state" / "claims.sqlite3"),
+        },
+    )
+
+    assert settings.stateful_root() == (tmp_path / "state").resolve()
+
+
+def test_stateful_root_rejects_recovery_storage_outside_live_state_volume(
+    tmp_path: Path,
+) -> None:
+    """A single lock must not silently protect only a subset of durable state."""
+    from context_intelligence_server.config import Settings
+
+    settings = Settings(
+        queues_path=str(tmp_path / "one" / "live"),
+        recovery={
+            "enabled": True,
+            "queues_path": str(tmp_path / "two" / "recovery"),
+        },
+    )
+
+    with pytest.raises(ValueError, match="all mutable server state"):
+        settings.stateful_root()
+
+
+def test_default_stateful_root_is_coherent_without_a_mutable_identity_store() -> None:
+    """An unconfigured static server has no identity-store writer to protect."""
+    from context_intelligence_server.config import Settings
+
+    assert Settings().stateful_root() == Path("/data")
+
+
+def test_stateful_root_covers_an_active_api_key_identity_store(tmp_path: Path) -> None:
+    """Configured static keys must share the queue root with their store."""
+    from context_intelligence_server.config import Settings
+
+    state_root = tmp_path / "state"
+    settings = Settings(
+        queues_path=str(state_root / "queues"),
+        api_keys={"a" * 64: {"id": "writer"}},
+        api_keys_store_path=str(state_root / "identity" / "api-keys.json"),
+    )
+
+    assert settings.stateful_root() == state_root.resolve()
+
+
+def test_stateful_root_rejects_active_api_key_store_outside_live_state_volume(
+    tmp_path: Path,
+) -> None:
+    """A separately rooted server cannot share a mutable API-key store."""
+    from context_intelligence_server.config import Settings
+
+    settings = Settings(
+        queues_path=str(tmp_path / "queue-volume" / "queues"),
+        api_keys={"a" * 64: {"id": "writer"}},
+        api_keys_store_path=str(tmp_path / "identity-volume" / "api-keys.json"),
+    )
+
+    with pytest.raises(ValueError, match="API-key identity store"):
+        settings.stateful_root()
+
+
+def test_stateful_root_rejects_active_entra_store_outside_live_state_volume(
+    tmp_path: Path,
+) -> None:
+    """The same root rule applies to Entra's runtime-mutable identity map."""
+    from context_intelligence_server.config import Settings
+
+    settings = Settings(
+        auth_mode="entra",
+        azure_client_id="client-id",
+        azure_tenant_id="tenant-id",
+        queues_path=str(tmp_path / "queue-volume" / "queues"),
+        entra_identities={
+            "12345678-1234-1234-1234-123456789abc": {"id": "writer"},
+        },
+        entra_identities_store_path=str(
+            tmp_path / "identity-volume" / "entra-identities.json"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Entra identity store"):
+        settings.stateful_root()
+
+
 def test_crash_recovery_sweep_interval_defaults_to_300():
     """A finite ceiling drains its deferred tail via a periodic sweep; the
     default interval must be a sane positive value so a finite cap is safe

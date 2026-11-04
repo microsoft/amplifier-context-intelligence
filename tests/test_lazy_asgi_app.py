@@ -254,10 +254,9 @@ class TestAuthGuardStillFiresWhenServing:
         env["AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_REQUIRE_EXPLICIT_CLIENTS"] = (
             "true"
         )
-        # A high, unlikely-to-collide port -- this must fail during app
-        # construction (inside the worker's load()), before ever binding
-        # matters for the assertion.
-        env["AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVER_PORT"] = "18321"
+        # Let the OS select a port atomically. Reserving then releasing one
+        # here would leave a TOCTOU race before Gunicorn binds it.
+        env["AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_SERVER_PORT"] = "0"
         result = _run_cli(
             ["serve"], cwd=PROJECT_ROOT, env=env, timeout=_SERVE_CLI_TIMEOUT_S
         )

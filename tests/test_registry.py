@@ -6,6 +6,7 @@ import dataclasses
 import gc
 import json
 import logging
+import sqlite3
 import time
 import weakref
 from collections import deque
@@ -3044,6 +3045,7 @@ class TestTransientInfraFailuresAreNeverDeadLettered:
         assert is_transient(TransientError("deadlock"))
         assert is_transient(asyncio.TimeoutError())
         assert is_transient(OSError("connection reset"))
+        assert is_transient(sqlite3.OperationalError("database is locked"))
 
         # Deterministic -- dead-letterable.
         assert not is_transient(

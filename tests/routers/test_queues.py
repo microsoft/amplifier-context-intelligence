@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from context_intelligence_server.main import registry
+from context_intelligence_server.main import _append_live_record, app, registry
 from context_intelligence_server.queue_manager import QueueManager
 
 
@@ -274,3 +274,45 @@ class TestDeadLetterReplay:
         after = registry.pipeline_counters()
         assert after["replayed_total"] == before["replayed_total"]
         assert after["accepted_total"] == before["accepted_total"]
+
+    @pytest.mark.anyio
+    async def test_replay_append_uses_the_recovery_live_enqueue_gate(
+        self,
+        client: httpx.AsyncClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Replay cannot slip between recovery's live-state check and append."""
+        qm = _point_registry_at(tmp_path)
+        await qm.dead_letter("k1", b'{"workspace":"ws1"}\n', "boom")
+
+        class GateSpy:
+            entered = 0
+            exited = 0
+
+            def live_enqueue(self) -> "GateSpy":
+                return self
+
+            async def __aenter__(self) -> None:
+                self.entered += 1
+
+            async def __aexit__(self, *args: object) -> None:
+                self.exited += 1
+
+        gate = GateSpy()
+        monkeypatch.setattr(app.state, "recovery_admission_gate", gate)
+        monkeypatch.setattr(
+            app.state,
+            "append_live_record",
+            lambda worker_key, body: _append_live_record(app, worker_key, body),
+        )
+        monkeypatch.setattr(
+            registry,
+            "get_or_create",
+            lambda session_id, workspace, created_by=None: None,
+        )
+
+        response = await client.post("/queues/dead-letter/k1/replay")
+
+        assert response.status_code == 200
+        assert gate.entered == gate.exited == 1

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
 
 import pytest
 from context_intelligence_server.queue_manager import (
+    _FILENAME_SUFFIXES,
     _MAX_KEY_BYTES,
+    MAX_SESSION_ID_BYTES,
+    QUEUE_FILENAME_NAME_MAX,
     Batch,
     QueueManager,
     Record,
@@ -115,6 +119,32 @@ async def test_append_does_not_double_newline(qm, tmp_path):
     await qm.append("s1", b'{"e":1}\n')
     log = tmp_path / "queues" / "s1.log"
     assert log.read_bytes() == b'{"e":1}\n'
+
+
+async def test_recovery_origin_scans_ignore_non_mapping_json(qm):
+    """Malformed queue lines must not abort recovery reconciliation scans."""
+    await qm.append("s1", b"[]")
+    origin = {"source_handle": "a" * 64, "ordinal": 0, "source_line_sha256": "b" * 64}
+
+    assert not await qm.contains_recovery_origin(origin)
+    assert await qm.recovery_origin_commit_state(origin) is None
+    assert not await qm.recovery_origin_is_dead(origin)
+
+
+async def test_recovery_origin_state_requires_all_matching_records_to_be_committed(qm):
+    """A stale committed copy cannot hide a requeued uncommitted copy."""
+    origin = {"source_handle": "a" * 64, "ordinal": 0, "source_line_sha256": "b" * 64}
+    raw = json.dumps({"_recovery_origin": origin}).encode()
+
+    await qm.append("old", raw)
+    old = await qm.read_batch("old", max_items=1)
+    await qm.commit("old", old.end_offset)
+    await qm.append("retry", raw)
+
+    assert await qm.recovery_origin_commit_state(origin) == "queued"
+    retry = await qm.read_batch("retry", max_items=1)
+    await qm.commit("retry", retry.end_offset)
+    assert await qm.recovery_origin_commit_state(origin) == "committed"
 
 
 @pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a\x00b"])
@@ -1119,6 +1149,14 @@ async def test_recovery_seed_counts_unchanged_under_streaming(qm):
     assert accepted == 2  # one written + one pending
 
 
+async def test_has_pending_records_treats_out_of_range_offset_as_unavailable(qm):
+    """A valid but impossible offset must not open the recovery admission gate."""
+    await qm.append("s1", b"a")
+    qm._offset_path("s1").write_text("999999", encoding="utf-8")
+
+    assert await qm.has_pending_records()
+
+
 async def test_refresh_spool_stats_empty_directory(qm):
     """An empty spool directory reports zero for all three aggregates."""
     stats = await qm.refresh_spool_stats()
@@ -1559,6 +1597,65 @@ class TestFoldWorkerKey:
 
 
 class TestWorkerKeyLengthBudget:
+    def test_budget_is_pinned_because_it_is_on_disk_state(self):
+        """211 is not a tuning knob -- it is the shape of names already written.
+
+        ``fold_worker_key`` emits EXACTLY ``_MAX_KEY_BYTES`` for every
+        over-budget key, and the 6.11.0 boot migration has already renamed
+        production spool artifacts onto those names. Lowering this constant
+        silently re-folds every one of them onto different names on the next
+        boot -- recoverable, but a migration, never a side effect of adding a
+        filename suffix.
+
+        So this pin is deliberately a tripwire, not a tautology: adding a
+        suffix wider than ``commit()``'s 44 bytes shrinks the derived budget
+        and fails HERE, forcing the choice to be made on purpose -- shorten
+        the suffix (free) or accept a re-fold (a migration).
+        """
+        assert MAX_SESSION_ID_BYTES == 211
+        assert _MAX_KEY_BYTES == MAX_SESSION_ID_BYTES
+
+    def test_every_filename_fits_name_max(self):
+        """No suffix this module can append may cross NAME_MAX at a full key.
+
+        The budget is only as good as the suffix it was sized against. When
+        ``archive_recovery_dead_letters`` was added it appended a 55-byte
+        ``.<key>.dead.jsonl.<32-hex>.retry.tmp`` while the budget was sized for
+        ``commit()``'s 44, which put every MAXIMALLY-folded key -- i.e. exactly
+        the deeply-nested sessions the fold exists to rescue -- 11 bytes over
+        the limit and reproduced the original ``OSError [Errno 36]``.
+
+        Asserting the PROPERTY (every constructible filename fits) rather than
+        a specific constant means the next suffix added is caught here instead
+        of in production.
+        """
+        key = "k" * _MAX_KEY_BYTES
+        for suffix in _FILENAME_SUFFIXES:
+            name = f"{key}{suffix}"
+            assert len(name.encode("utf-8")) <= QUEUE_FILENAME_NAME_MAX, (
+                f"{suffix!r} at a full-budget key is "
+                f"{len(name.encode('utf-8'))} bytes, over NAME_MAX "
+                f"({QUEUE_FILENAME_NAME_MAX}). Either shorten the suffix or "
+                f"lower MAX_SESSION_ID_BYTES -- note lowering it re-folds keys "
+                f"already on disk."
+            )
+
+    async def test_recovery_retry_tmp_fits_at_a_full_budget_key(self, qm):
+        """The real constructor, not a reconstruction of it.
+
+        ``test_every_filename_fits_name_max`` checks the registry; this checks
+        that ``archive_recovery_dead_letters`` actually writes a name matching
+        it, so the two cannot drift.
+        """
+        key = fold_worker_key("k-" + "a" * 400)
+        assert len(key.encode("utf-8")) == _MAX_KEY_BYTES
+        origin = {"source_handle": "h", "ordinal": 1}
+        raw = json.dumps({"event": "x", "_recovery_origin": origin}).encode()
+        await qm.append(key, raw)
+        await qm.dead_letter(key, raw, "poison")
+        # Would raise OSError [Errno 36] if the temp name were over-wide.
+        assert await qm.archive_recovery_dead_letters(origin) == 1
+
     @pytest.mark.parametrize(
         "raw_length",
         [_MAX_KEY_BYTES, _MAX_KEY_BYTES + 1, 244, 245, 248, 249, 251, 252, 9000],
