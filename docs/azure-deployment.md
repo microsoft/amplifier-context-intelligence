@@ -83,7 +83,9 @@ image delivery is **push-to-deploy**:
 2. On `git push`, CI builds the image from this repo's `Dockerfile` (approved base,
    above) and pushes it to **your GitHub repo's `ghcr.io`**.
 3. The Amplifier Online **provisioner imports `ghcr.io → amplifieronlinecr`** and
-   rolls a new Container Apps revision.
+   creates a new Container Apps revision. Existing stateful deployments require
+   the [non-overlapping upgrade handoff](#611-to-613-upgrade-and-rollback-boundary);
+   image delivery is not proof that overlapping revisions are safe.
 
 So the `services.<name>.image` value in `amplifier-online.yaml`
 (`amplifieronlinecr.azurecr.io/...`) is a **destination the provisioner writes to,
@@ -164,7 +166,7 @@ variables the deploy job needs (`AO_PROVISIONER_URL`, `AO_PROVISIONER_AUDIENCE`,
 ```bash
 git add .github/workflows/ && git commit -m "ci: add amplifier-online deploy workflow"
 git push        # CI builds from this repo's Dockerfile (approved base) → ghcr.io,
-                # then the provisioner imports ghcr.io → amplifieronlinecr and rolls a revision
+                # then the provisioner imports ghcr.io → amplifieronlinecr and creates a revision
 ```
 
 What happens on each push:
@@ -176,7 +178,9 @@ What happens on each push:
    on top of the approved `FROM` base in the Dockerfile.
 3. **Deploy job** authenticates to the provisioner with a GitHub **OIDC** token (no
    stored Azure secret); the provisioner **imports `ghcr.io → amplifieronlinecr`**
-   and rolls a new Container Apps revision.
+   and creates a new Container Apps revision. Gate production replacement through
+   the [upgrade handoff](#611-to-613-upgrade-and-rollback-boundary), not a default
+   overlapping rollout against shared state.
 
 > **There is no manual push path.** The shared platform registry
 > (`amplifieronlinecr`) has ACR admin disabled and grants **no** push access — a
@@ -390,8 +394,9 @@ az containerapp secret set -n <container-app-name> -g <resource-group> \
   up automatically** (~30 min). Pinning a version freezes the value.
 
 **3d — Map env → secret (RE-APPLY AFTER EVERY `up`).** `az containerapp update
---set-env-vars` automatically rolls a **new revision** (no manual restart); in
-single-revision mode it supersedes the old one:
+--set-env-vars` creates a **new revision**. Even single-revision mode is not
+evidence of a non-overlapping writer handoff. On an existing deployment, include
+this revision change in the approved [upgrade handoff](#611-to-613-upgrade-and-rollback-boundary):
 
 ```bash
 az containerapp update -n <container-app-name> -g <resource-group> \
@@ -539,7 +544,9 @@ services:
 
 ## Step 5 — Deploy with `amplifier-online up`
 
-Provision/update everything from the manifest:
+Provision from the manifest. For an **existing stateful deployment**, complete
+the [upgrade handoff](#611-to-613-upgrade-and-rollback-boundary) first; the command
+below is not permission to overlap old and new writers:
 
 ```bash
 amplifier-online up
@@ -652,10 +659,287 @@ overrides:
 
 ---
 
+## Azure scheduled blob retention — explicit opt-in
+
+The release provides the online retention API and a **one-shot client**,
+`blobs prune-scheduled`. It does **not** install cron, enable an automatic 60-day
+policy, or obtain/refresh Azure credentials. The setup below consists of
+**operator actions requiring approval**, not actions performed by deployment or
+by reading this guide.
+
+**Not deployment-ready by default:** this deployment uses the Amplifier Online
+**v1 `web-app-aca`** stack. Its approved scheduled-job provisioning path is
+**unverified**, and the current Azure Files backing for `/data/blobs` is
+**unqualified for online pruning**. An external credential bootstrap is also
+required and is not supplied by this CLI. Resolve these prerequisites before
+enabling retention; shipping the client alone does not resolve them.
+
+### 1. Qualify storage before any production apply
+
+Online pruning requires a single server worker on **64-bit Linux with local
+filesystem semantics**. Azure Files persistence across revisions does not prove
+those semantics. First qualify a **disposable equivalent Azure Files share**,
+using the same protocol, mount options, container runtime, and server storage
+layout as production. Record evidence for:
+
+- Directory-cookie continuation after closing/reopening scan directories, including
+  concurrent entry changes.
+- Stable stat identity and timestamps (device/inode/size/mtime/ctime), as used by
+  preview/apply fingerprint checks.
+- POSIX `flock` exclusion, atomic rename/unlink, and directory `fsync`.
+- SQLite locking, crash recovery, and durability, including WAL where used by
+  server stores. The expiry ledger itself uses rollback journaling, not WAL.
+
+**Local pytest results cannot qualify a network share. Production apply on this
+Azure Files setup is unsupported until qualification succeeds.** If these
+guarantees cannot be established, leave scheduling disabled and arrange a
+separately reviewed supported storage path; do not infer safety from a successful
+mount or preview.
+
+Review the [service guide's coordination boundary](service-setup.md#online-keep-ingestion-available)
+as well: process-local online leases do not protect against separate/old writers.
+Inventory and control those writers through their existing service managers
+before apply. Do not blindly stop production ingestion or add stop/restart hooks
+to the scheduled job; online pruning keeps the supported server running.
+
+### 2. Establish the approved scheduled-job and credential path
+
+Ask the platform owner to confirm an approved, platform-managed **Azure Container
+Apps scheduled Job** path for the existing v1 deployment. Use the
+[Azure scheduled-jobs reference](https://learn.microsoft.com/en-us/azure/container-apps/jobs#scheduled-jobs)
+for platform concepts, not as proof that the current Amplifier Online v1 manifest
+supports them. Do **not** paste v2 schedule fields into `amplifier-online.yaml`,
+migrate deployment APIs, or assume a separate Amplifier Online project is
+required. Until the v1 provisioning/update path is confirmed, this is a setup
+checklist, not an executable provisioning recipe.
+
+Have the approved path supply and review these settings:
+
+| Setting | Required choice |
+|---|---|
+| Schedule | `0 3 * * *`: daily at **03:00 UTC**, configurable by the operator; unlike the local systemd example, this does not follow Pacific daylight saving |
+| Retention age | Explicit `--older-than 60d` in this example: **operator policy**, not a release default; scheduled age is required and manual `blobs prune` remains `30d` by default |
+| Image | Observed `sha256` digest of the reviewed image delivered through the approved build/import pipeline; a commit-SHA tag can be rebuilt by nightly refresh and is not immutable content |
+| Command | Run the installed `context-intelligence-server` console entrypoint with the arguments below, after the reviewed credential bootstrap; do not start the API |
+| Per-execution limits | Parallelism **1**, replica completion count **1**, retry limit **0** |
+| Outer timeout | Greater than **1200 + 120 seconds**, with headroom for credential bootstrap, startup, and shutdown, within the approved platform's limit |
+| Access | Registry pull permission for the pinned image and HTTPS access to the approved API route, including DNS/TLS and any APIM policy |
+| Storage/credentials | Private ephemeral credential scratch space only; no server `/data` mount, Neo4j credentials, or storage-delete RBAC is needed by this API client |
+
+Parallelism 1 limits replicas **within one execution**; it is not a global mutex
+between cron executions. Executions can overlap. The server's one-current-job
+guard makes another scheduled invocation return `skipped_busy` without taking
+over or cancelling that job. Do not add automatic retries to defeat this guard.
+The timeout above is a job-budget requirement, not a claim that Azure generally
+has a 30-minute limit. Confirm the actual platform limit before provisioning.
+
+The image installs the console entrypoint from `pyproject.toml`
+`[project.scripts]` (`context_intelligence_server.cli:main`). Override the shipping
+`Dockerfile`'s `./docker-entrypoint.sh` bootstrap **as well as** its default server
+command: merely changing arguments still runs credential-generating bootstrap
+code. The reviewed job startup must obtain the token, invoke the console command,
+and clean up, without starting an API listener. Do **not** assume Azure CLI or
+`azure-identity` is installed in the current image.
+
+**Credential bootstrap is an external prerequisite, not an implemented feature.**
+Before unattended use, arrange a reviewed bootstrap through the approved platform
+path that:
+
+1. Uses the job's managed identity to obtain a **fresh API-audience Entra JWT for
+   each run**, requesting the API's expected `.default` scope
+   (`api://<api-client-id>/.default` for the registration described in the
+   [identity guide](identity-management.md#service-callers-entra-app-tokens)).
+   A token for Azure Resource Manager or storage is not an API token.
+2. Has the API's `IdentityAdmin` App Role (or the configured `entra_admin_role`)
+   enabled for **Application** members and assigned to the caller's service
+   principal. An existing authorized administrator must register the caller's
+   `oid` through `PUT /admin/identities/{oid}`, mapping it to the intended
+   contributor. Azure RBAC `Reader`/`Contributor` roles do **not** confer API admin
+   authority; neither do the API's data roles alone.
+3. Verifies that the chosen HTTPS route, **including APIM**, accepts app-only admin
+   requests to the retention endpoints. A delegated-user route working is not
+   evidence that a managed-identity token works through that route.
+4. Checks that token lifetime covers the work budget **and cancellation budget**,
+   plus startup margin, before invoking the client. The CLI reads one bearer
+   credential; it neither obtains nor refreshes tokens, nor provides this
+   preflight lifetime check.
+5. Writes the raw JWT to a private scratch file owned by the client user: regular,
+   mode `0400` or `0600`, neither symlinked nor hardlinked, at most **8192 bytes**.
+   Use a private directory and arrange cleanup on normal exit and interruption,
+   with ephemeral-storage cleanup after forced termination. Never put token
+   contents in arguments, logs, shell tracing, or committed configuration.
+
+Despite its name, `--admin-key-file` contains the **JWT**, not a shared admin key,
+in Entra mode. Do not substitute a data key or a long-lived token file. No
+credential-bootstrap implementation or dependency installation is provided here.
+
+### 3. Preview production, review, then explicitly approve deletion
+
+Only after storage qualification and the prerequisites above, run the approved
+job once with **`--dry-run`**, leaving its recurring schedule disabled. This is
+the client command the reviewed bootstrap invokes; the endpoint and scratch path
+are **placeholders**, not a real endpoint or an existing credential:
+
+```bash
+context-intelligence-server blobs prune-scheduled \
+  --online --older-than 60d \
+  --server-url "https://<approved-api-endpoint>" \
+  --admin-key-file /private/retention-admin.jwt \
+  --max-runtime 1200 --cancel-timeout 120 --dry-run
+```
+
+Dry-run creates a preview and cancels **only its owned preview UUID**, observing
+cancellation before reporting `dry_run`. A pre-existing active job produces
+`skipped_busy`; that is not a completed preview. Inspect the sanitized JSON
+receipt's cutoff, eligible file count, logical/allocated bytes, errors/changes,
+and cleanup state. Allocated bytes are an estimate, not promised space savings.
+Retain the receipt for operator review without credential/bootstrap logs.
+
+The **first apply includes the existing backlog** whose recognized payload
+`mtime_ns` is strictly older than server preview-start time minus 60 days. This
+is storage modification age, **not session age or last-access age**; equality,
+future-dated files, and changed candidates are retained. Confirm the backlog and
+policy with the data owner before approval. A preview is an estimate; apply
+rescans and can report different counts.
+
+After explicit approval, remove **only `--dry-run`** from the reviewed command
+and enable the approved schedule. **Without `--dry-run`, `prune-scheduled` applies
+deletion without an interactive prompt. There is no `--apply` flag for this
+command.** It deletes recognized eligible blob payloads, not Neo4j graphs/session
+metadata, queues, or unknown files. Keep expiry tombstones and the retention
+lock/ledger: tombstones prevent replay from rehydrating expired payloads, and
+authenticated reads of absent expired blobs return **410 `blob_expired`**.
+
+### 4. Monitor, disable, and update deliberately
+
+Collect the sanitized receipt and process exit code for every execution.
+Exit zero can mean `completed`, `dry_run`, **or `skipped_busy`**, so monitor the
+outcome, not just the exit code. Alert on `failed`, `cancel_unconfirmed`, nonzero
+exits, and repeated busy skips. Keep the owned UUID for investigation; HTTP 202
+or `cancelling` does not establish successful completion or cancellation. See
+[nightly client behavior](service-setup.md#nightly-online-pruning--explicit-unattended-opt-in)
+for receipt and deadline semantics.
+
+Disable future starts through the approved platform-managed job path when
+pausing retention. **Disabling the schedule does not cancel an active server
+UUID job.** Allow the client its SIGTERM cleanup window where possible; after
+forced termination, network loss, or `cancel_unconfirmed`, inspect/cancel the
+specific UUID using the existing
+[status/cancel commands](service-setup.md#online-keep-ingestion-available), with
+the same HTTPS URL and a fresh authorized admin credential. Observe a terminal
+state; never cancel an unrelated "current" job or bulk-delete storage as cleanup.
+
+Keep the job image pinned independently of routine API revision changes. Update
+the image pin, command, bootstrap, and schedule only through the reviewed
+pipeline/platform job-update path, then repeat dry-run review before re-enabling
+apply. Do not create redundant projects, mutate the server volume, or upgrade
+Amplifier Online merely to make this checklist appear provisioned.
+
+---
+
 ## Updating the server (build & deploy a new version — Neo4j-safe)
 
-Runbook for shipping a new version (e.g. `v6.7.0`) without disturbing Neo4j.
+Runbook for shipping **6.13.0** without reprovisioning Neo4j or the server volume.
 Placeholders in `<angle-brackets>`.
+
+### 6.11 to 6.13 upgrade and rollback boundary
+
+**Use a planned stop/handoff, not overlapping rolling revisions on shared
+`/data`.** 6.13 takes a nonblocking exclusive lock on the canonical state root
+before starting workers and holds it for the whole lifespan. An upgraded
+predecessor prevents an upgraded successor from starting until shutdown releases
+ownership. A 6.11 writer does **not** honor this lock or expiry tombstones:
+absence of lock contention does not make mixed-version operation safe.
+
+The actual Azure handoff is **not qualified here**. First rehearse the approved
+platform-managed stop/start and restore procedure in an isolated equivalent
+deployment. Azure Files remains **unqualified**, including state-root/identity
+locking, directory fsync, identity mutation/restart and SQLite durability—not
+just retention scanning. Qualify those contracts on disposable equivalent storage
+before approving this upgrade on that backing; disabling pruning is insufficient.
+See [storage qualification](#1-qualify-storage-before-any-production-apply).
+
+**Operator checklist — before allowing the successor to write:**
+
+1. **Gate automatic replacement.** Arrange the maintenance window, producer
+   buffering/retry plan, and approved platform controls before publishing into a
+   production-deploy trigger. Matching main pushes can deploy; nightly image
+   rebuilds can replace commit-named image tags, but the scheduled workflow does
+   not deploy those builds automatically. Neither is a safe handoff mechanism by
+   itself. Keep retention schedules
+   disabled during the transition, and inspect/cancel any active owned job using
+   the [existing UUID procedure](#4-monitor-disable-and-update-deliberately).
+2. **Inventory the actual configuration privately.** Resolve canonical paths from
+   effective settings, not just the illustrative `/data` layout:
+   - `queues_path` and its entire live spool, offsets, dead letters and retry
+     evidence; `recovery.queues_path`, `recovery.receipt_store_path`,
+     `recovery.claims_store_path`, and `recovery.guard_lease_path` where used.
+     Omitted recovery paths derive beside the live queue. The live queue, claim
+     ledger, and enabled recovery queue/receipt ledger must be **direct children**
+     of the live queue's canonical parent (the exclusive state root).
+   - `blob_path`, payloads, `.ci-blob-retention.lock`, and the complete private
+     `.ci-blob-retention/` state if present: expiry database, journals and
+     current-job snapshot. Do not omit tombstones because payloads are absent.
+   - The selected `api_keys_store_path` or `entra_identities_store_path` and its
+     `<store-name>.lock` sidecar. Identity storage is independently locked and may
+     be outside the state root; keep its configured location and writable trusted
+     parent. Include the state-root `.context-intelligence-server.lock` if present.
+3. **Quiesce every writer, then back up consistently.** Stop the old revision and
+   external/standalone writers through their approved platform/service managers.
+   Wait for all actual I/O, drainers and identity cleanup to settle and ownership
+   to be released normally; a cancelled await or a traffic switch is not proof.
+   Never unlink a root lock, identity sidecar or retention lock to force startup.
+   Hung I/O has no promised finite graceful shutdown; stop the procedure and
+   investigate rather than force-unlock. With writers quiescent, take and verify
+   a consistent backup of **all coupled state above**, preserving ownership,
+   modes and regular-file semantics. Use a reviewed SQLite-consistent backup
+   method; do not blindly copy live databases/WAL files or discard journals.
+   A share snapshot alone does not cover stores outside the share or establish
+   application consistency. Record matching configuration/secret references
+   privately; do not dump credential contents. Plan reconciliation with graph
+   state and producer-held events without changing the Neo4j VM in this rollout.
+4. **Match the actual artifact and start once.** Approve the image produced for
+   6.13.0 and record its observed registry **`sha256` digest**, including the
+   imported deployment image. A commit-SHA tag is not immutable: nightly refresh
+   can rebuild it. Do not invent a release tag or infer installed version from
+   source metadata. Only after the predecessor has fully stopped, start the
+   successor as **one replica, one worker** against the same canonical roots,
+   using the approved non-overlapping platform path. If that path cannot enforce
+   the ordering, do not deploy. Keep scoped claims, grants, identity bindings,
+   external credential references and storage layout intact.
+5. **Verify before restoring traffic/producers.** Confirm the actual image digest
+   and installed package version **6.13.0**; `/version.version` and
+   `/status.server_version` must match. Platform health alone is insufficient:
+   check top-level `/status` fields `identity_ready: true`, `identity_reason: null`,
+   `neo4j_connected: true`, `neo4j_query_connected: true`, `recovery_complete`
+   and `recovery_error`. Inspect queue backlog and authenticated queue APIs
+   (and recovery APIs when enabled),
+   check expected blob reads and external/offline consumers against the new API,
+   and confirm identity/auth enforcement without printing credentials. Backlog
+   can remain while draining; do not disable scoped access or discard denied
+   claims/queues to accelerate readiness. No destructive prune is needed for
+   upgrade verification. Resume producers only after these checks are accepted.
+
+**Rollback gate — an image revert is not a state rollback.** Do not run 6.11
+against migrated or post-retention 6.13 state unless compatibility for that exact
+state and binary is evidenced and explicitly approved. Otherwise require a
+reviewed, consistent restore of the **entire pre-upgrade coupled state**, matching
+old image/configuration and a non-overlapping handoff. Account for events accepted
+after the backup, producer replay, queue offsets/receipts, claim/identity bindings
+and graph effects. The operator must approve reconciliation or any loss of
+post-backup accepted data; restoring an old snapshot is not silently lossless.
+
+Legacy receipt initialization replaces the database schema; it does not retain
+an automatic old-schema backup. `recovery.permit_required: false` is client
+protocol compatibility, **not schema downgrade** (see
+[native recovery](native-recovery.md#upgrade-and-rollback-state-compatibility)).
+Old readers do not understand new mapped blob URIs, and old writers can rehydrate
+expired ordinary blobs even if tombstones remain. Disabling cron, cancelling a
+job, or changing the image cannot restore deleted payloads. Never clear expiry
+metadata to "roll back". Physical-first reads can read separately restored bytes,
+but payload-only restoration does not clear expiry or supply a supported
+unexpire/rollback procedure; keep tombstones and require a reviewed restore plan.
+No automatic downgrade/restore tool or tested full rollback is promised here.
 
 **Pre-flight**
 - Repo `pyproject.toml` version == the version you're shipping.
@@ -667,7 +951,7 @@ Placeholders in `<angle-brackets>`.
 approved base, and push — CI builds `ghcr.io/<owner>/<repo>-api:<sha>` and the
 provisioner imports it into `amplifieronlinecr`:
 ```bash
-git commit -am "release: v6.7.0" && git push
+git commit -am "release: v6.13.0" && git push
 ```
 There is **no manual `az acr build`** — the shared platform ACR rejects direct
 pushes (`UNAUTHORIZED`), and compliance is enforced **in CI** (approved `FROM` base
@@ -677,24 +961,28 @@ imported. Watch the run and confirm the new revision:
 amplifier-online status
 ```
 
-**2. Bump the manifest — the ONLY manifest change.** The image tag in
-`amplifier-online.yaml` records which built tag the app runs; CI produces it and the
-provisioner imports it. Change *only* the tag:
+**2. Update only the reviewed image reference in the manifest.** Record the
+observed imported image digest; the placeholder below is not a published image.
+Ensure the approved deploy request selects that same digest: an explicit image
+in the CI request can override the manifest pin.
 ```yaml
 services:
   api:
-    image: amplifieronlinecr.azurecr.io/context-intelligence-server:v6.7.0   # was :v6.6.6 — platform ACR (import destination)
+    image: amplifieronlinecr.azurecr.io/<approved-image>@sha256:<observed-digest>
     port: 8000
 ```
 Do **not** change `name`, `stack`, `port`, the `/data` volume, `resources`, or any
 `NEO4J__*` env leaves. Preview first: `amplifier-online up --dry-run` — expect it
-to report the image tag change and **nothing** about the volume, Neo4j, or infra.
+to report the image reference change and **nothing** about the volume, Neo4j,
+or infra.
 If it wants to recreate the volume or change infra, STOP.
 
-**4. Deploy:** `amplifier-online up` — rolls a new revision on the same app, same
-`/data` volume, same VNet.
+**3. Deploy only through the approved non-overlapping handoff above.**
+`amplifier-online up` creates a revision on the existing app/volume/VNet, but is
+**not by itself a verified stop-before-start procedure**. Do not run it against
+an active predecessor and assume the new lock makes rolling replacement safe.
 
-**5. Re-apply the password secretRef env (REQUIRED after every `up`).** `up`
+**4. Re-apply the password secretRef env (REQUIRED after every `up`).** `up`
 rewrites the container's entire env list; the non-secret `NEO4J__*` leaves survive
 (they're in the manifest) but the password secretRef mappings are wiped. On Neo4j
 **Community**, both clients reference the **one** shared secret:
@@ -708,9 +996,10 @@ az containerapp update -n <container-app-name> -g <resource-group> \
 > Neo4j password (a missing password trips the fail-loud validators and *looks*
 > like a Neo4j outage but is really a missing-env problem).
 
-**6. Verify:** `amplifier-online status` + `amplifier-online logs --since 10` —
-expect the new revision Running/Healthy, no `access_mode` validation error, and
-Neo4j connected on **both** clients.
+**5. Verify:** use `amplifier-online status` + `amplifier-online logs --since 10`
+and the version, readiness, authenticated API and backlog checks above. Expect
+one running writer, no `access_mode` validation error, and Neo4j connected on
+**both** clients; a Running/Healthy revision alone is not release acceptance.
 
 ### Neo4j safety — guarantees & do-NOT-touch list
 
@@ -744,8 +1033,10 @@ own second secret.
 
 ## Persistence & durability — what survives a version bump
 
-A tag-only image bump + `amplifier-online up` **preserves all durable data**. The
-guarantee is structural, not "be careful":
+Keeping the volume declaration unchanged preserves its backing resource across
+image changes. This is **not** a guarantee of schema compatibility, safe
+overlapping writers, or image-only rollback: follow the
+[6.11 to 6.13 handoff and rollback gate](#611-to-613-upgrade-and-rollback-boundary).
 
 - **Server `/data`** — blobs (`/data/blobs`), the **oid identity map**
   (`/data/identity/entra-identities.json`), durable ingest queues (`/data/queues`),
@@ -765,7 +1056,7 @@ guarantee is structural, not "be careful":
 - **Neo4j data** lives on the VM's **persistent managed data disk**, entirely
   outside the manifest (see Neo4j safety, above). Untouched by any server redeploy.
 
-### The ONLY things that can lose `/data` — avoid during a version bump
+### Infrastructure actions that can lose `/data` — avoid during a version bump
 
 | Destructive action | Why it loses data |
 |--------------------|-------------------|
@@ -776,19 +1067,19 @@ guarantee is structural, not "be careful":
 | Delete/re-provision the Azure Files share or storage account out-of-band | Removes the backing store |
 
 `size_gib: 16` is safe to leave unchanged — leaving it is the safe path. **Treat
-any `size_gib`/`tier` edit as potentially destructive.** A version bump changes
-**only the image tag**.
+any `size_gib`/`tier` edit as potentially destructive.** Keep infrastructure
+unchanged; the reviewed image reference and operational handoff are separate.
 
 ### Protect-the-durable-data checklist (before a version bump)
 
 ```
-[ ] Manifest diff shows ONLY the image tag change (v6.6.6 → v6.7.0).
+[ ] Manifest diff shows ONLY the reviewed image reference change.
     volume block byte-identical: mount_path: /data, size_gib: 16
     (no size_gib change, no tier added, no mount_path change).
 [ ] `amplifier-online up --dry-run` reports ONLY the image/revision change —
     NO volume, share, or storage change. If it mentions volume/storage → STOP.
-[ ] (Extra safety) Snapshot the Azure Files share first:
-      az storage share snapshot --name <share> --account-name <acct>
+[ ] Complete the quiescent, consistent coupled-state backup and rollback review
+    above; a live share snapshot alone is not sufficient.
 [ ] Do NOT run `amplifier-online destroy`; do NOT touch the share/storage account.
 [ ] Key Vault: READ + map only (secretref/keyvaultref). No `az keyvault secret set`.
 [ ] After `up`: re-apply the password secretRef env (mandatory every up), then

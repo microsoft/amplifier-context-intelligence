@@ -109,7 +109,8 @@ def test_image_builds_runs_and_serves_status(built_image: Any) -> None:
     container = client.containers.run(
         IMAGE_TAG,
         environment={
-            "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ALLOW_UNAUTHENTICATED": "true"
+            "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ALLOW_UNAUTHENTICATED": "true",
+            "AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL": "bolt://127.0.0.1:1",
         },
         ports={"8000/tcp": host_port},
         detach=True,
@@ -146,6 +147,9 @@ def test_image_builds_runs_and_serves_status(built_image: Any) -> None:
         # static stub.
         assert isinstance(body, dict), (
             f"/status must return a JSON object, got: {body!r}"
+        )
+        assert body["neo4j_url"] == "bolt://127.0.0.1:1", (
+            f"/status must report the configured Neo4j URL, got: {body['neo4j_url']!r}"
         )
         assert "neo4j_connected" in body, (
             f"/status body must include neo4j_connected (real handler); got keys: {list(body)}"

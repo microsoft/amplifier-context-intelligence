@@ -321,6 +321,11 @@ class RecoveryConfig(BaseModel):
     """Opt-in native recovery ingress configuration."""
 
     enabled: bool = False
+    # Server-issued permits are the default whenever recovery is enabled. The
+    # switch exists only for an existing deployment that has not upgraded its
+    # recovery client yet; it deliberately does not weaken the default.
+    permit_required: bool = True
+    permit_ttl_seconds: int = 15
     guard_lease_path: str | None = None
     receipt_store_path: str | None = None
     claims_store_path: str | None = None
@@ -332,6 +337,13 @@ class RecoveryConfig(BaseModel):
     def _positive_retry_after(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("recovery.retry_after_seconds must be > 0")
+        return value
+
+    @field_validator("permit_ttl_seconds")
+    @classmethod
+    def _positive_permit_ttl(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("recovery.permit_ttl_seconds must be > 0")
         return value
 
 
@@ -537,6 +549,106 @@ class Settings(BaseSettings):
             self.recovery.guard_lease_path or base / "recovery-guard-lease.json"
         )
         return recovery_queue, receipt_store, claims_store, lease
+
+    def _identity_store_and_mutability(self) -> tuple[Path, bool]:
+        """Return the current mode's identity store path and whether this server
+        can seed or mutate it (configured seeds or an enabled admin capability).
+
+        Pure configuration: no filesystem access.  ``~`` is expanded.
+        """
+        if self.auth_mode == "static":
+            return (
+                Path(self.api_keys_store_path).expanduser(),
+                bool(
+                    self.build_keystore()
+                    or self.resolve_admin_api_key_digest() is not None
+                ),
+            )
+        return (
+            Path(self.entra_identities_store_path).expanduser(),
+            bool(
+                self.entra_admin_role
+                or self.build_identity_map()
+                or self.build_service_identity_map()
+            ),
+        )
+
+    def active_identity_store_path(self) -> Path | None:
+        """Return the identity store this process must own, or ``None``.
+
+        Used by identity initialization (a worker thread), never by early
+        synchronous boot.  The store is *active* when this server can seed or
+        mutate it, **or when the file already exists**: an existing store is
+        read and enforced regardless of seeds, so it is locked like any other.
+
+        Only genuine absence (``FileNotFoundError``) means "absent".  A path
+        that cannot be inspected raises ``ValueError`` (identity then reports
+        unavailable) instead of silently disabling protection; a dangling
+        symlink counts as present.  An unselected, absent path is never
+        created, locked, or loaded.
+        """
+        path, mutable = self._identity_store_and_mutability()
+        if mutable:
+            return path
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ValueError(
+                f"identity store path {path} cannot be inspected ({exc!r}); "
+                "refusing to treat it as absent"
+            ) from exc
+        return path
+
+    def stateful_root(self) -> Path:
+        """Return the one volume root that the process-instance lock protects.
+
+        The file lock is meaningful only when it covers *every* durable
+        single-writer resource.  The live queue's parent is the implicit root:
+        the live queue, session-claim ledger, recovery queue and receipt ledger
+        must each be a DIRECT child of it (the defaults already are).  A deeper
+        spelling such as ``<root>/nested/recovery`` is refused: another server
+        rooted at ``<root>/nested`` could name the same resource yet take a
+        different root lock, so two writers would drain it independently.
+        Direct children make every contender of a shared resource resolve to the
+        same canonical root, hence the same lock.
+
+        The identity store is deliberately NOT part of this root.  It is guarded
+        by its own canonical per-store ``IdentityStoreLock`` (taken during
+        identity initialization, before any load or seed), which is independent
+        of the queue root.  The default store lives under the user's data dir
+        while the default queue root is ``/data``, so requiring containment here
+        would reject the supported default layout for every authenticated
+        configuration.
+
+        This runs synchronously during early boot, so it is configuration-only
+        and never inspects the identity file.
+        """
+        live_queue = Path(self.queues_path).resolve()
+        root = live_queue.parent
+        recovery_queue, receipt_store, claims_store, _lease = self.recovery_paths()
+        protected = [
+            ("live queue", live_queue),
+            ("session claims", claims_store.resolve()),
+        ]
+        if self.recovery.enabled:
+            protected.extend(
+                (
+                    ("recovery queue", recovery_queue.resolve()),
+                    ("recovery receipt ledger", receipt_store.resolve()),
+                )
+            )
+        split = [f"{name}={path}" for name, path in protected if path.parent != root]
+        if split:
+            rendered = ", ".join(split)
+            raise ValueError(
+                "all mutable server state must be beneath the live queue parent "
+                f"{root}, with queues and ledgers as its direct children so one "
+                "root lock covers every shared resource; incompatible paths: "
+                f"{rendered}"
+            )
+        return root
 
     # azure_client_id / azure_tenant_id: the App Registration coordinates.
     # Both are required when auth_mode="entra".  Empty / whitespace-only

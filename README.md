@@ -305,9 +305,16 @@ the **very next request** — no restart, no redeploy. Writes use a
 **write-file-then-swap-memory** commit (atomic file replace first, then the
 in-process update) so the file is never behind memory; a corrupt store file
 **fails closed** to an empty map (loud log, never a crash-loop). This is safe and
-simple because the pilot runs a **single replica** (`maxReplicas=1`, single-writer
-drainer): there is no second process to go stale. A future read-tier (M3) that adds
-replicas would introduce a short TTL/poll re-read; that does not exist today.
+simple because the pilot runs a **single replica and single worker**
+(`maxReplicas=1`, `WEB_CONCURRENCY=1`, single-writer drainer): there is no second
+process to go stale. Every ASGI launcher takes a nonblocking exclusive lock during
+lifespan startup at `<queues_path parent>/.context-intelligence-server.lock`, before
+drivers or workers initialize, and refuses a second writer for the same shared state
+volume. With recovery enabled, its queue, receipt ledger, and claim ledger must each be a
+direct child of that same parent; split or nested layouts are rejected rather than
+partially locked. A future read-tier
+(M3) that adds replicas would introduce a short TTL/poll re-read; that does not exist
+today.
 
 Full runtime onboarding/offboarding runbook and the `/admin/*` API:
 [docs/identity-management.md](docs/identity-management.md).

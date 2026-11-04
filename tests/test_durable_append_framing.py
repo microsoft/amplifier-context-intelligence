@@ -849,98 +849,192 @@ async def test_guard_survives_a_delete_that_races_a_parked_appender(
 
 
 # ---------------------------------------------------------------------------
-# captured production artifacts
+# synthetic framing regression fixtures (NOT captured production bytes)
 # ---------------------------------------------------------------------------
+#
+# Everything below is built deterministically in-process from ``_event_bytes``.
+# The interleaved line models the SHAPE of a short-write interleave (one whole
+# record spliced into the middle of another record's string payload, with no
+# newline between them). It is not a capture of any real production bytes and
+# makes no claim about any historical offset or recorded error position.
+
+_SYNTHETIC_FILLER = 2 * 1024 * 1024
+_SYNTHETIC_PAYLOAD_OPEN = b'"payload":"'
 
 
-def _seed_dir() -> Path | None:
-    """Locate captured dead-letter seed files (kept outside this repo);
-    walk upward so the lookup survives any checkout depth.
+def _synthetic_interleaved_line() -> tuple[bytes, int]:
+    """Build one physical line holding record B spliced into record A.
+
+    Returns ``(raw, cut)``: ``raw`` is ``A[:cut] + B + A[cut:]`` with no
+    newline, and ``cut`` is where B begins. Both A and B are first checked to
+    be complete, valid JSON events, so the only defect in ``raw`` is the
+    interleave itself and never arbitrary garbage.
     """
-    for parent in Path(__file__).resolve().parents:
-        candidate = parent / "docs" / "04-deadletter-artifacts" / "seeds"
-        if candidate.is_dir():
-            return candidate
-    return None
+    a = _event_bytes("llm:request", filler=_SYNTHETIC_FILLER)
+    b = _event_bytes("llm:stream_block_start")
+    assert json.loads(a)["event"] == "llm:request"
+    assert json.loads(b)["event"] == "llm:stream_block_start"
+
+    # Cut 1 MiB into A's run of "x" payload characters, so B lands inside A's
+    # open string rather than at a structural boundary.
+    cut = a.index(_SYNTHETIC_PAYLOAD_OPEN) + len(_SYNTHETIC_PAYLOAD_OPEN) + 1024 * 1024
+    assert a[cut - 1 : cut + 1] == b"xx", "cut must fall inside the x-filled string"
+
+    raw = a[:cut] + b + a[cut:]
+    return raw, cut
 
 
-_SEEDS = _seed_dir()
-_requires_seeds = pytest.mark.skipif(
-    _SEEDS is None,
-    reason="captured dead-letter seeds not present",
-)
-
-
-@_requires_seeds
-async def test_read_batch_over_a_pre_existing_merged_middle_line(
+async def test_read_batch_preserves_synthetic_interleaved_middle_line(
     tmp_path: Path,
 ) -> None:
-    """A pre-existing merged middle line still fails _parse_line -- consuming
-    it (dead-letter, commit past it) is the drainer's job, not this fix's.
+    """read_batch hands a malformed middle line through byte-exact, between
+    two good neighbours, applying no parser filtering of its own. Consuming
+    such a line is the drainer's job; this test does not cover the
+    drainer's dead-letter path.
     """
     qm = QueueManager(tmp_path)
-    key = "merged-middle-key"
-    assert _SEEDS is not None
-    merged = (_SEEDS / "seed_corrupt_merged_line_1.0MiB.raw").read_bytes()
+    key = "synthetic-merged"
+    merged, _cut = _synthetic_interleaved_line()
+    assert b"\n" not in merged, "the interleaved record is one physical line"
     good_before = _event_bytes("before")
     good_after = _event_bytes("after")
+    content = good_before + b"\n" + merged + b"\n" + good_after + b"\n"
     log_path = qm._log_path(key)
-    log_path.write_bytes(good_before + b"\n" + merged + b"\n" + good_after + b"\n")
+    log_path.write_bytes(content)
 
     batch = await qm.read_batch(key, max_items=10)
-    assert len(batch.lines) == 3
-    assert batch.lines[0] == good_before
-    assert batch.lines[1] == merged
-    assert batch.lines[2] == good_after
-    assert not _parses(merged), (
-        "the framing fix does not claim to fix a pre-existing merged middle line -- the drainer consumes it"
+
+    lines_exact = batch.lines == [good_before, merged, good_after]
+    assert lines_exact, (
+        f"read_batch must return the 3 physical lines unchanged; got "
+        f"{len(batch.lines)} lines of sizes {[len(ln) for ln in batch.lines]}"
     )
-    assert _parses(good_before) and _parses(good_after)
+    file_unchanged = log_path.read_bytes() == content
+    assert file_unchanged, "read_batch must never modify the log file"
+
+    for line, expected_event in ((good_before, "before"), (good_after, "after")):
+        event, workspace, _working_dir, data, _identity = SessionRegistry._parse_line(
+            line
+        )
+        assert event == expected_event
+        assert workspace == WORKSPACE
+        assert data["session_id"] == SESSION
+
+    with pytest.raises(json.JSONDecodeError):
+        SessionRegistry._parse_line(batch.lines[1])
 
 
-@_requires_seeds
-def test_captured_corrupt_seed_is_rejected_by_the_real_parser() -> None:
-    """A real captured corrupt production line still fails _parse_line, at
-    the same offset and with the same error text as the original dead-letter.
+def test_synthetic_interleaved_line_is_rejected_by_real_parser() -> None:
+    """The interleaved line fails the real parser at the splice, while both
+    original records are individually valid -- so the failure is caused by
+    the interleave and nothing else.
     """
-    assert _SEEDS is not None
-    raw = (_SEEDS / "seed_corrupt_merged_line_1.0MiB.raw").read_bytes()
+    raw, cut = _synthetic_interleaved_line()
 
-    # one physical line containing two merged records, no separator between them
-    assert raw.count(b"\n") == 0, "seed is a single physical line by construction"
-    starts = [i for i in range(len(raw)) if raw.startswith(b'{"event":', i)]
-    assert len(starts) == 2, f"expected two merged records, found {len(starts)}"
-    assert starts[0] == 0
-    boundary = starts[1]
-    assert raw[boundary - 1 : boundary] != b"\n", (
-        "record B is preceded by a newline -- that would be normal framing, not a tear"
+    # one physical line, plain ASCII, so byte offsets equal JSON char offsets
+    assert len(raw) > 1024 * 1024
+    assert raw.isascii()
+    raw.decode("utf-8")
+    assert raw.count(b"\n") == 0, "no newline anywhere: a single physical line"
+
+    marker = b'{"event":'
+    starts: list[int] = []
+    pos = raw.find(marker)
+    while pos != -1:
+        starts.append(pos)
+        pos = raw.find(marker, pos + 1)
+    assert starts == [0, cut], f"expected record starts [0, {cut}], got {starts}"
+    assert raw[cut - 1 : cut] != b"\n", (
+        "record B is preceded by a newline -- that would be normal framing, "
+        "not an interleave"
     )
+
+    # Both originals, recovered from the interleaved bytes, are valid events.
+    b_bytes = _event_bytes("llm:stream_block_start")
+    assert raw[cut : cut + len(b_bytes)] == b_bytes
+    a_bytes = raw[:cut] + raw[cut + len(b_bytes) :]
+    a_is_original = a_bytes == _event_bytes("llm:request", filler=_SYNTHETIC_FILLER)
+    assert a_is_original
+    assert _parses(a_bytes)
+    assert _parses(b_bytes)
 
     with pytest.raises(json.JSONDecodeError) as exc:
         SessionRegistry._parse_line(raw)
 
-    # parse fails near the merge boundary; here A tore inside a quoted string
-    # so B's leading bytes are swallowed, breaking a couple bytes later
-    assert boundary <= exc.value.pos <= boundary + 8, (
-        f"parse failed at {exc.value.pos}, merge boundary is {boundary}"
-    )
-    assert exc.value.pos == 1050641, "matches the recorded dead-letter error offset"
-    assert "Expecting ',' delimiter" in str(exc.value), (
-        "matches the recorded dead-letter error text"
-    )
+    # B's opening "{" is swallowed by A's open string, B's next quote closes
+    # that string, and the following "e" is where a ',' delimiter was expected:
+    # two characters past the splice point.
+    assert exc.value.pos == len(raw[:cut].decode("utf-8")) + 2
+    assert "Expecting ',' delimiter" in str(exc.value)
 
 
-@_requires_seeds
-def test_captured_valid_large_event_parses_cleanly() -> None:
-    """A real large event of similar size parses fine -- isolating the
-    defect to framing, not payload size.
+async def test_synthetic_valid_large_event_parses_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid >1 MiB event survives append (forced into many short writes)
+    and read_batch as exactly one newline-framed record, and parses cleanly
+    -- isolating the defect to framing, not payload size.
     """
-    assert _SEEDS is not None
-    raw = (_SEEDS / "seed_valid_large_event_1.04MiB.json").read_bytes()
-    assert len(raw) > 1024 * 1024
-    assert raw.count(b"\n") == 0
+    import hashlib
 
-    event, workspace, _working_dir, data, _identity = SessionRegistry._parse_line(raw)
-    assert event
-    assert workspace
-    assert isinstance(data, dict)
+    qm = QueueManager(tmp_path)
+    key = "synthetic-large"
+    raw = _event_bytes("llm:request", filler=_SYNTHETIC_FILLER)
+    assert len(raw) > 1024 * 1024
+    assert b"\n" not in raw
+    framed = raw + b"\n"
+
+    chunk = 128 * 1024
+    landed_writes: list[tuple[int, int, int]] = []
+
+    def _on_chunk(fd: int, idx: int, landed: bytes, total_len: int) -> None:
+        landed_writes.append((fd, len(landed), total_len))
+
+    real_write = os.write
+    monkeypatch.setattr(
+        qm_module.os,
+        "write",
+        _SplitWriteOS(real_write, chunk=chunk, on_chunk=_on_chunk),
+    )
+    await qm.append(key, raw)
+    monkeypatch.setattr(qm_module.os, "write", real_write)  # restore BEFORE reading
+
+    # The short-write path really ran: the record went out in many chunks.
+    log_fd = next(fd for fd, _n, total in landed_writes if total == len(framed))
+    sizes = [n for fd, n, _total in landed_writes if fd == log_fd]
+    assert sum(sizes) == len(framed)
+    assert max(sizes) <= chunk
+    assert len(sizes) == -(-len(framed) // chunk)
+    assert len(sizes) > 1
+
+    # Compare by length + digest so a failure never dumps megabytes of repr.
+    log_bytes = qm._log_path(key).read_bytes()
+    assert len(log_bytes) == len(framed)
+    assert hashlib.sha256(log_bytes).hexdigest() == hashlib.sha256(framed).hexdigest()
+
+    batch = await qm.read_batch(key, max_items=10)
+    assert len(batch.records) == 1
+    rec = batch.records[0]
+    assert rec.start == 0
+    assert rec.end == len(raw) + 1
+    assert batch.start_offset == 0
+    assert batch.end_offset == rec.end
+    assert len(rec.raw) == len(raw)
+    assert hashlib.sha256(rec.raw).hexdigest() == hashlib.sha256(raw).hexdigest()
+
+    parsed = SessionRegistry._parse_line(rec.raw)
+    expected = (
+        "llm:request",
+        WORKSPACE,
+        None,
+        {"session_id": SESSION, "payload": "x" * _SYNTHETIC_FILLER},
+        None,
+    )
+    parsed_matches = parsed == expected
+    assert parsed_matches, "real _parse_line tuple differs from the expected shape"
+
+    await qm.commit(key, batch.end_offset)
+    drained = await qm.read_batch(key, max_items=10)
+    assert drained.records == []
+    assert drained.lines == []
+    assert drained.start_offset == drained.end_offset == len(framed)
