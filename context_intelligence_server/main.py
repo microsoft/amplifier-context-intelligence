@@ -3394,9 +3394,22 @@ async def get_mapped_blob(
         raise HTTPException(status_code=404, detail=f"Blob not found: {uri}")
 
 
+@app.get("/capabilities", dependencies=[Depends(require_read)])
+async def read_capabilities(request: Request) -> dict:
+    """Authenticated protocol qualification; never inferred from READ_ACCESS."""
+    require_arbitrary_data_read(request)
+    return {
+        "protocol": "ci-read-v1",
+        "cypher": {"read_only": True, "enforcement": "neo4j-explain-query-type-v1"},
+        "blob_read": True,
+    }
+
+
+@app.post("/read/cypher", dependencies=[Depends(require_read)])
 @app.post("/cypher", dependencies=[Depends(require_read)])
 async def post_cypher(body: CypherRequest, request: Request) -> Response:
-    """Proxy a Cypher query to Neo4j and return the results as JSON."""
+    """Execute compiler-classified read-only Cypher and return JSON results."""
+    from context_intelligence_server.query_guard import QueryNotReadOnlyError, read_query
     require_arbitrary_data_read(request)
     driver = request.app.state.neo4j_query_driver
     access_mode = request.app.state.neo4j_query_access_mode
@@ -3408,11 +3421,11 @@ async def post_cypher(body: CypherRequest, request: Request) -> Response:
         async with driver.session(
             default_access_mode=_neo4j_access_const(access_mode)
         ) as session:
-            result = await session.run(body.query, params)
-            async for record in result:
-                rows.append(dict(record))
+            rows = await read_query(session, body.query, params)
         serialized = json.dumps({"results": rows}, default=str)
         return Response(content=serialized, media_type="application/json")
+    except QueryNotReadOnlyError:
+        raise HTTPException(status_code=403, detail="cypher_read_only_required") from None
     except Exception as exc:  # catch all Neo4j and serialization errors
         raise HTTPException(status_code=500, detail=str(exc))
 

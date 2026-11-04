@@ -471,8 +471,12 @@ GRANT ROLE reader TO readonly;
 > **`ACCESS_MODE=READ` is not a security boundary.** It marks the driver session
 > read-intent (a routing hint); it does **not** prevent writes. On Community —
 > where both clients share the one full-privilege account — `READ` provides **no**
-> write protection at all. Real read-only isolation comes only from an Enterprise
-> `reader`-role account.
+> write protection at all. The public `/cypher` endpoint therefore compiles
+> each statement with `EXPLAIN` and accepts only Neo4j's `r` (read-only) query
+> classification before executing it. Unknown, write, read/write and schema
+> classifications are rejected. Enterprise `reader` credentials additionally
+> enforce database-level isolation; the compiler guard is not a replacement for
+> database RBAC or permission controls on installed procedures.
 
 **To require the structured block** (reject a silent fall-back to the flat single
 account in a deployed profile), also set:

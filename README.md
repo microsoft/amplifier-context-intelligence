@@ -622,3 +622,31 @@ trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
+
+### Read-only Cypher capability
+
+`POST /cypher` and `POST /read/cypher` accept read-only statements for every caller, including
+Contributors. Before execution the server asks Neo4j to `EXPLAIN` the statement
+with the same parameters. Only the compiler's `r` query classification is
+accepted; write, schema and unknown classifications return 403 without executing
+the statement. Driver `READ_ACCESS` alone is a routing hint. Database-level reader
+credentials remain recommended where Neo4j Enterprise supports them, and database
+administrators must control installed procedures and their declared access modes.
+
+Authenticated clients can qualify this contract with `GET /capabilities`:
+
+```json
+{"protocol":"ci-read-v1","cypher":{"read_only":true,"enforcement":"neo4j-explain-query-type-v1"},"blob_read":true}
+```
+
+This endpoint uses the same arbitrary-data read authorization as `/cypher`.
+The query protocol does not introduce Project isolation. Statements already
+prefixed with `EXPLAIN`, `PROFILE` or a `CYPHER` options directive may fail
+compilation after the server adds its own `EXPLAIN`; send the underlying read
+statement instead. Use the supported mutation APIs rather than mutating Cypher.
+
+Brokers requiring this guarantee must use `/read/cypher`, which older servers do
+not expose. A capability probe followed by the legacy `/cypher` endpoint could
+otherwise land on an older replica during a rolling deployment. A missing guarded
+endpoint returns 404 without executing the query; clients must not fall back to
+the legacy path after that failure.

@@ -3241,3 +3241,20 @@ async def test_crash_recovery_topup_read_failure_logs_escaped_key(
     assert len(failed) == 1
     assert r"session='bad\tkey'" in failed[0]
     assert _control_free(failed[0]), repr(failed[0])
+
+
+async def test_read_capability_reports_server_enforcement(client: httpx.AsyncClient):
+    response = await client.get("/capabilities")
+    assert response.status_code == 200
+    assert response.json() == {
+        "protocol": "ci-read-v1",
+        "cypher": {"read_only": True, "enforcement": "neo4j-explain-query-type-v1"},
+        "blob_read": True,
+    }
+
+
+async def test_guarded_read_endpoint_uses_same_read_contract(client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(main_module.app.state, "neo4j_query_driver", MockNeo4jDriver(rows=[{"value": 1}]), raising=False)
+    response = await client.post("/read/cypher", json={"query": "RETURN 1 AS value"})
+    assert response.status_code == 200
+    assert response.json() == {"results": [{"value": 1}]}

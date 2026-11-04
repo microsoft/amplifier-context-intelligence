@@ -21,6 +21,8 @@ branch, is_service=False); service tokens omit scp (service branch, is_service=T
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import json
 import time
 from collections.abc import AsyncGenerator
@@ -141,6 +143,9 @@ class _MockNeo4jResult:
     def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
         self._rows = list(rows or [])
         self._index = 0
+
+    async def consume(self):
+        return SimpleNamespace(query_type="r")
 
     def __aiter__(self) -> "_MockNeo4jResult":
         return self
@@ -519,36 +524,24 @@ class TestM2CapabilityDeps:
 
     # -- CAP-cypher-soft: service Reader + MUTATING Cypher → 2xx (SOFT-M2) --
 
-    async def test_cap_cypher_soft_reader_can_mutate_soft_m2(
+    async def test_cap_cypher_reader_cannot_mutate(
         self,
         service_asgi_with_map: tuple[Any, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """CAP-cypher-soft: service Reader + MUTATING Cypher query → 2xx + mutation succeeds.
-
-        SOFT-M2: at M2, /cypher uses require_read not require_write.  A Reader can
-        technically issue a mutating Cypher query and it will execute.  This is the
-        consciously-accepted soft gap: Neo4j Community is single-user and does not
-        support read-only DB users.  This test pins the accepted soft behavior.
-
-        HARDENS TO 403 AT M3 via a read-only Neo4j DB user on the read path.
-        Do NOT assert "cannot mutate" — that assertion would be false at M2.
-        Uses service_asgi_with_map (mapped oid) -- see CAP-SC docstring.
-        """
+        """A Reader reaches /cypher, but a compiler-classified write is rejected."""
         from context_intelligence_server.main import app  # noqa: PLC0415
 
         private_key, asgi = service_asgi_with_map
         token = _sign_jwt(private_key, _service_claims(roles=["Reader"]))
 
-        # Mock the neo4j QUERY (read-intent) driver — /cypher reads
-        # app.state.neo4j_query_driver (two-client split, doc 12). The
-        # "mutation" is accepted by the mock (no real DB).
         mock_driver = _MockNeo4jDriver(rows=[])
         monkeypatch.setattr(app.state, "neo4j_query_driver", mock_driver, raising=False)
         monkeypatch.setattr(app.state, "neo4j_query_access_mode", "READ", raising=False)
-
-        # A MUTATING Cypher query — at M2 this is allowed through require_read
-        mutating_query = "CREATE (n:M2SoftGapNode {id: 'soft-gap-test'}) RETURN n"
+        async def write_summary(self):
+            return SimpleNamespace(query_type="rw")
+        monkeypatch.setattr(_MockNeo4jResult, "consume", write_summary)
+        mutating_query = "CREATE (n:ForbiddenNode) RETURN n"
 
         async with _make_client(asgi) as c:
             resp = await c.post(
@@ -557,16 +550,8 @@ class TestM2CapabilityDeps:
                 headers={"Authorization": f"Bearer {token}"},
             )
 
-        # SOFT-M2: 2xx — Reader can reach /cypher and mutations are not blocked at M2.
-        # This test exists to document and PIN the accepted gap, NOT to prove "can mutate".
-        # At M3: this will harden to 403 via a read-only Neo4j DB user on the read path.
-        assert resp.status_code == 200, (
-            f"CAP-cypher-soft (SOFT-M2): expected 200 for Reader mutating /cypher at M2, "
-            f"got {resp.status_code}: {resp.text}"
-        )
-        # Verify the response is valid JSON (the mock returns empty results)
-        data = resp.json()
-        assert "results" in data
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "cypher_read_only_required"
 
 
 # ---------------------------------------------------------------------------

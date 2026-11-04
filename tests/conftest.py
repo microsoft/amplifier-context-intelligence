@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 """Pytest configuration and shared fixtures for the test suite."""
 
 import os
@@ -155,6 +156,9 @@ class MockNeo4jResult:
     def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
         self._rows = list(rows or [])
         self._index = 0
+
+    async def consume(self):
+        return SimpleNamespace(query_type="r")
 
     def __aiter__(self) -> "MockNeo4jResult":
         return self
