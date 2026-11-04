@@ -325,7 +325,13 @@ class RetentionClient:
                 f"Admin request failed (HTTP {exc.code}); verify admin authority and current job status",
                 status_code=exc.code,
             ) from None
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,
+            TimeoutError,
+            OSError,
+            ValueError,
+        ) as exc:
             raise ClientError(
                 f"Admin request failed ({type(exc).__name__}); remote job may still be running; query prune-status"
             ) from None

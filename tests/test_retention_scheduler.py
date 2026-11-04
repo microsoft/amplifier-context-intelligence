@@ -22,10 +22,11 @@ import pytest
 from context_intelligence_server import retention_scheduler as s
 from context_intelligence_server.blob_retention import Report, duration_ns
 from context_intelligence_server.retention_client import ClientError, RetentionClient
-from tests.test_retention_client import CLI, FIXTURE_KEY
+from tests.test_retention_client import CLI, FIXTURE_KEY, TRUNCATED_CHUNK
 
 # Pytest discovers this imported fixture by name; the alias declares its re-export.
 from tests.test_retention_client import live_retention as live_retention  # noqa: PLC0414
+from tests.test_retention_client import raw_retention_http as raw_retention_http  # noqa: PLC0414
 
 
 def job(state: str = "ready", *, confirmed: bool = False) -> dict[str, object]:
@@ -330,6 +331,65 @@ def test_start_409_not_confirmation_when_still_ready():
     assert client.job is not None
     assert client.job["state"] == "cancelled" and not result.confirmed
     assert names(client).count("start") == 1
+
+
+@pytest.mark.parametrize("reconciled_state", ["running", "completed", "foreign"])
+def test_truncated_start_reply_reconciles_only_owned_uuid(
+    raw_retention_http, reconciled_state
+):
+    url, responses, calls = raw_retention_http
+    owned = job()
+    job_id = owned["id"]
+    path = f"/admin/blobs/prune/{job_id}"
+    completed = {**owned, "state": "completed", "confirmed": True}
+
+    def response(status, body):
+        data = json.dumps(body).encode()
+        return (
+            f"HTTP/1.1 {status} Reply\r\nContent-Length: {len(data)}\r\n\r\n".encode()
+            + data
+        )
+
+    reconciled = {
+        **completed,
+        "state": "running" if reconciled_state == "running" else "completed",
+    }
+    if reconciled_state == "foreign":
+        reconciled["id"] = str(uuid.uuid4())
+    responses.extend(
+        [
+            response(404, {}),
+            response(202, owned),
+            TRUNCATED_CHUNK,
+            response(200, reconciled),
+        ]
+    )
+    expected_calls = [
+        ("GET", "/admin/blobs/prune"),
+        ("POST", "/admin/blobs/prune"),
+        ("POST", path + "/start"),
+        ("GET", path),
+    ]
+    if reconciled_state == "running":
+        responses.append(response(200, completed))
+        expected_calls.append(("GET", path))
+    elif reconciled_state == "foreign":
+        responses.append(response(200, {**owned, "state": "cancelled"}))
+        expected_calls.append(("POST", path + "/cancel"))
+    client = RetentionClient(url, FIXTURE_KEY, timeout=1)
+    started = time.monotonic()
+    result = run(client, max_runtime=2, cancel_timeout=0.5)
+    assert time.monotonic() - started < 2.5
+    assert result.job_id == job_id and client.timeout == 1
+    assert calls == expected_calls and not responses
+    if reconciled_state == "foreign":
+        assert result.exit_code == 1 and result.error_code == "identity_changed"
+        assert result.cleanup_state == "cancelled"
+    else:
+        assert (
+            result.exit_code == 0 and result.outcome == "completed" and result.confirmed
+        )
+        assert result.cleanup_state == "not_requested"
 
 
 def test_dry_run_cancels_owned_preview_preserves_estimate():

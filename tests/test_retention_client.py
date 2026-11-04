@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import os
 import shlex
 import socket
@@ -10,9 +11,12 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import uvicorn
@@ -31,6 +35,108 @@ from context_intelligence_server.routers.admin import router
 
 CLI = Path(sys.executable).parent / "context-intelligence-server"
 FIXTURE_KEY = "online-prune-fixture-admin"
+TRUNCATED_CHUNK = (
+    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+    + b"40\r\nprivate-response-body"
+)
+
+
+@pytest.fixture
+def raw_retention_http():
+    """Serve scripted wire responses without any storage or database backend."""
+    responses: deque[bytes] = deque()
+    calls: list[tuple[str, str]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def respond(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            calls.append((self.command, self.path))
+            self.close_connection = True
+            self.wfile.write(responses.popleft())
+
+        do_GET = respond
+        do_POST = respond
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = False
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.01}
+    )
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", responses, calls
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+        assert not thread.is_alive(), "scratch protocol server did not stop"
+
+
+@pytest.mark.parametrize(
+    "response,error_name",
+    [
+        (TRUNCATED_CHUNK, "IncompleteRead"),
+        (b"private-response-body\r\n\r\n", "BadStatusLine"),
+        (b"", "RemoteDisconnected"),
+    ],
+)
+def test_http_protocol_failure_is_sanitized_client_error(
+    raw_retention_http, response, error_name
+):
+    url, responses, calls = raw_retention_http
+    responses.append(response)
+    with pytest.raises(ClientError, match=error_name) as failure:
+        RetentionClient(url, FIXTURE_KEY, timeout=1).status()
+    assert failure.value.status_code is None
+    assert "remote job may still be running" in str(failure.value)
+    assert "private-response-body" not in str(failure.value)
+    assert FIXTURE_KEY not in str(failure.value)
+    assert calls == [("GET", "/admin/blobs/prune")] and not responses
+
+
+@pytest.mark.parametrize(
+    "error", [http.client.HTTPException, http.client.ResponseNotReady]
+)
+def test_http_exception_base_is_normalized_without_remote_text(error):
+    client = RetentionClient("http://127.0.0.1:1", FIXTURE_KEY)
+    remote_error = error("private-response-body")
+    with (
+        patch.object(client._opener, "open", side_effect=remote_error),
+        pytest.raises(ClientError, match=error.__name__) as failure,
+    ):
+        client.status()
+    assert failure.value.status_code is None
+    assert "private-response-body" not in str(failure.value)
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 409, 429, 503])
+def test_http_status_error_keeps_status_without_reading_body(
+    raw_retention_http, status
+):
+    url, responses, calls = raw_retention_http
+    responses.append(
+        f"HTTP/1.1 {status} Refused\r\nTransfer-Encoding: chunked\r\n\r\n".encode()
+        + b"40\r\nprivate-response-body"
+    )
+    with pytest.raises(ClientError, match=f"HTTP {status}") as failure:
+        RetentionClient(url, FIXTURE_KEY, timeout=1).status()
+    assert failure.value.status_code == status
+    assert "private-response-body" not in str(failure.value)
+    assert calls == [("GET", "/admin/blobs/prune")] and not responses
+
+
+def test_cli_protocol_failure_warns_without_traceback(raw_retention_http):
+    url, responses, calls = raw_retention_http
+    responses.append(TRUNCATED_CHUNK)
+    result = run_cli(url, "prune-status")
+    output = result.stdout + result.stderr
+    assert result.returncode == 1 and "remote job may still be running" in output
+    assert "Traceback" not in output
+    assert "private-response-body" not in output and FIXTURE_KEY not in output
+    assert calls == [("GET", "/admin/blobs/prune")] and not responses
 
 
 @pytest.mark.parametrize(
