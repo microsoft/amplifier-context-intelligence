@@ -23,10 +23,12 @@ services:
     auth: token
     app_id: 53aa4ffd-fbea-40a3-b35c-63fdcb609af1   # existing registration "MADE: Team-Context-Intelligence", used as-is
     accepts:
-      - azure-cli                              # people and the CLI hook, with `az` tokens (access_as_user)
-      - 7bf3bc4d-008a-43dc-a354-56d690d333cd   # resolve-aca-uami-ci (Resolve prod, Reader role)
-      - 09338c81-5aee-49bc-8e75-5edaae3198e0   # resolve-aca-staging-uami-ci (Resolve staging, Reader role)
-      # TODO(owner): every other caller's client ID (team-pulse, ...) before `up --adopt`.
+      - azure-cli                              # people using the Context Intelligence bundle (az login)
+      - b4ec27ea-ced5-4c44-b2d5-0f7c32e9cc02   # Team Pulse (managed identity id-team-pulse-resolve)
+      - dea6e881-4cd8-4aba-87da-a52ff3e19bce   # Team Pulse - Web (app registration, formerly "Made Dashboard")
+      - 7bf3bc4d-008a-43dc-a354-56d690d333cd   # Resolve prod (managed identity resolve-aca-uami-ci)
+      - 09338c81-5aee-49bc-8e75-5edaae3198e0   # Resolve staging (managed identity resolve-aca-staging-uami-ci)
+      - c5c172f8-412d-4805-96ab-73fdc6e72797   # Devis's dev box VM (managed identity, devis-vms)
     auth_exclude: [/status, /version, /docs, /openapi.json]   # the server's own unauthenticated paths (/health is always open)
 
     # Persistent /data: oid->contributor store, durable queues, blobs, logs.
