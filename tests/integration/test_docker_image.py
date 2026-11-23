@@ -22,6 +22,8 @@ skipped entirely when Docker is not available.
 
 from __future__ import annotations
 
+import os
+
 import pathlib
 import socket
 import time
@@ -55,7 +57,7 @@ def built_image() -> Generator[Any, None, None]:
     """
     try:
         import docker  # type: ignore[import-untyped]
-        from docker.errors import BuildError, DockerException  # type: ignore[import-untyped]
+        from docker.errors import DockerException  # type: ignore[import-untyped]
     except ImportError:
         pytest.skip("docker package not installed — skip Docker image test")
 
@@ -65,21 +67,23 @@ def built_image() -> Generator[Any, None, None]:
     except DockerException as exc:
         pytest.skip(f"Docker daemon not reachable — skip Docker image test: {exc}")
 
-    try:
-        image, _logs = client.images.build(
-            path=str(PROJECT_ROOT),
-            tag=IMAGE_TAG,
-            rm=True,
-            forcerm=True,
-        )
-    except BuildError as exc:
+    # The Dockerfile installs from a package index passed as a BuildKit secret
+    # (`pip_index_url`, as the Amplifier Online build pool does), which
+    # docker-py's legacy builder can't pass: build with the docker CLI instead.
+    # Locally and in CI the index is public PyPI unless PIP_INDEX_URL says otherwise.
+    import subprocess
+
+    env = {**os.environ, "DOCKER_BUILDKIT": "1"}
+    env.setdefault("PIP_INDEX_URL", "https://pypi.org/simple")
+    result = subprocess.run(
+        ["docker", "build", "--secret", "id=pip_index_url,env=PIP_INDEX_URL",
+         "--build-arg", "GIT_COMMIT=test", "-t", IMAGE_TAG, str(PROJECT_ROOT)],
+        env=env, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
         # A build failure is a REAL product failure — surface it loudly, do not skip.
-        log_tail = "\n".join(
-            line.get("stream", "").rstrip()
-            for line in exc.build_log
-            if isinstance(line, dict) and line.get("stream")
-        )
-        pytest.fail(f"Docker image build failed:\n{log_tail}\n\nError: {exc}")
+        pytest.fail(f"Docker image build failed:\n{result.stderr[-4000:]}")
+    image = client.images.get(IMAGE_TAG)
 
     yield image
 
@@ -158,6 +162,10 @@ def test_image_builds_runs_and_serves_status(built_image: Any) -> None:
             "with no Neo4j wired up, /status must report neo4j_connected=False "
             f"(soft-fail), got: {body['neo4j_connected']!r}"
         )
+        # The hosting platform's liveness check: unauthenticated, with the commit.
+        health = httpx.get(f"http://127.0.0.1:{host_port}/health", timeout=2.0)
+        assert health.status_code == 200
+        assert health.json() == {"status": "ok", "commit": "test"}
     finally:
         try:
             container.stop(timeout=5)

@@ -29,6 +29,7 @@ JWKS_CACHE_LIFESPAN_SECONDS: int = 300
 # only ONE exempt-path set.
 _EXEMPT_PATHS: frozenset[str] = frozenset(
     {
+        "/health",
         "/status",
         "/version",
         "/docs",

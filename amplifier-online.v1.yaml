@@ -1,0 +1,214 @@
+# Amplifier Online - Public API on Azure Container Apps (APIM-fronted)
+# This stack (web-app-aca + auth.expose) deploys the context-intelligence API
+# with PUBLIC ingress behind an Azure API Management gateway. Callers present a
+# Microsoft Entra access_as_user token (no APIM subscription key required); the
+# server re-validates the JWT in-app (PyJWT + cached JWKS).
+
+name: context-intelligence
+stack: web-app-aca
+
+# BRING-YOUR-OWN Entra registration — reuse the existing app reg
+# "MADE: Team-Context-Intelligence" instead of letting the platform create an
+# `ao-context-intelligence-api`. The platform validates this -api app READ-ONLY
+# (never creates/modifies it) and skips it on `destroy`.
+#   - audience:        api://53aa4ffd-fbea-40a3-b35c-63fdcb609af1
+#   - delegated scope: access_as_user  (already exposed — BYO validation passes)
+#   - app roles:       team, council, IdentityAdmin (already defined + assigned)
+# NOTE: this server validates JWTs IN-APP (PyJWT + cached JWKS) using its own
+# AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_* env (see services.api.env). It does NOT
+# use the platform's bare AZURE_CLIENT_ID / JWT-middleware convention.
+auth:
+  api_app_id: "53aa4ffd-fbea-40a3-b35c-63fdcb609af1"
+  # Flip the BYO -api to "user-facing" so `amplifier-online up` provisions the
+  # PUBLIC edge (public ingress + APIM front + access_as_user) as one shot,
+  # instead of the network-internal app-to-app-only posture of internal-service-aca.
+  # 53aa4ffd already exposes access_as_user, so BYO read-only validation passes.
+  expose: true
+
+# Services define the container apps to deploy.
+# This service has a PUBLIC endpoint: public Container Apps ingress fronted by an
+# APIM gateway (provisioned by `amplifier-online up` because auth.expose: true).
+# Public FQDNs (as-built):
+#   APIM:   https://amplifier-online-apim.azure-api.net/context-intelligence
+#   direct: https://context-intelligence-api.<env-default-domain>
+#
+# Auth: bearer Microsoft Entra JWT (delegated access_as_user). This server does
+# NOT use EasyAuth; it validates JWTs in-app (PyJWT + cached JWKS).
+services:
+  api:
+    # Image served from the platform ACR (amplifieronlinecr) — the only registry the
+    # shared CAE has pull creds for. Pin to the current built tag (built on the
+    # approved S360 base per docs/azure-deployment.md); bump this when a newer tag
+    # is pushed.
+    #
+    # NOT the source of truth for the running image. Deployment happens in CI:
+    # .github/workflows/context-intelligence-api-build-deploy.yaml builds
+    # ghcr.io/<repo>-api:${{ github.sha }} and POSTs it to the provisioner as an
+    # EXPLICIT `image` field alongside this manifest (`--arg image`, line ~119),
+    # and that explicit field WINS over this pin. Proof: the deploy that produced
+    # the currently-running b5434de3... shipped this file still pinned to
+    # 1b2a38de..., and b5434de3 is what runs.
+    #
+    # Repinned 2026-09-11 to the tag actually running, matching the precedent in
+    # 27c9e09 "fix: repin manifest image to actual deployed tag". It is cosmetic
+    # on the CI path, but deploy.sh:36 still calls `amplifier-online up`, where a
+    # stale pin WOULD roll production backwards -- so an accurate pin removes a
+    # latent hazard rather than creating one. Verified as-built 2026-09-11:
+    #   az containerapp show -n context-intelligence-api -g ao-context-intelligence-rg \
+    #     --query properties.template.containers[0].image
+    #   -> ...amplifier-context-intelligence-api:b5434de3417e529948f65886e802ff683418a893
+    image: amplifieronlinecr.azurecr.io/amplifier-context-intelligence-api:b5434de3417e529948f65886e802ff683418a893
+    port: 8000  # gunicorn + uvicorn; matches EXPOSE 8000 in the Dockerfile
+
+    # Persistent /data — backs the oid→contributor store, durable ingest queues,
+    # blobs, and logs. Survives restarts/revision swaps. The web-app-aca volume
+    # contract mechanically caps this service at maxReplicas=1; this is required
+    # because the server has one queue-manager/permit-gate writer per /data path.
+    volume:
+      mount_path: /data
+      # KNOWN, DELIBERATE DRIFT -- do not "fix" this to match the live share.
+      #
+      # As-built on 2026-09-11 the live share is 1024 GiB, not 100:
+      #   az storage share-rm show --storage-account vol7eeflzripgbdq \
+      #     -g ao-context-intelligence-rg -n appdata --expand stats
+      #   -> shareQuota 1024, shareUsageBytes 489,914,491,055 (456.3 GiB, 44.6%)
+      # It was grown out of band and this field was never updated.
+      #
+      # It stays at 100 ANYWAY, because this field is a provisioner INPUT, not a
+      # description of reality, and editing it is classified destructive by our
+      # own runbook -- docs/azure-deployment.md, "The ONLY things that can lose
+      # /data": "Change size_gib or add/change tier | Resize/tier change can
+      # re-provision a new, empty share - no data migration", followed by
+      # "Treat any size_gib/tier edit as potentially destructive."
+      #
+      # That risk is live on every merge: the CI deploy below yq's this whole
+      # file into the provisioner POST, so a size_gib edit ships the moment any
+      # context_intelligence_server/** change lands on main.
+      #
+      # And 100 is empirically safe in place: the currently-running deploy
+      # (b5434de) shipped size_gib: 100 against the already-1024 GiB share and
+      # neither shrank it nor failed --
+      #   git show b5434de3...:amplifier-online.yaml | grep -A2 'volume:'
+      # so the provisioner demonstrably does not reconcile an existing share
+      # downward. Leaving it is the safe path; changing it is an untested resize
+      # on 456 GiB of production data.
+      size_gib: 100
+      tier: premium      # Premium_LRS SSD share. Standard Azure Files (SMB) per-op
+                         # latency caps the write-heavy queue/blob throughput and
+                         # builds a standing write backlog under pressure.
+      # Capacity note: the spool (/data/queues) is only ~2.8 GB of that 456 GiB
+      # per GET /status. The bulk is /data/blobs -- one directory per session,
+      # no pruning. Blob retention is a separate follow-up, not handled here.
+
+    env:
+      # === Force Entra auth (server DEFAULTS to static — must override) ===
+      # All keys carry the server's config prefix AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_.
+      # The bare names in the request (AUTH_MODE, AZURE_CLIENT_ID, …) are shorthand;
+      # the server only reads the PREFIXED form (Pydantic Settings env_prefix).
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AUTH_MODE
+        value: entra
+
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_CLIENT_ID
+        value: "53aa4ffd-fbea-40a3-b35c-63fdcb609af1"   # api://53aa4ffd-… audience
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_TENANT_ID
+        value: "72f988bf-86f1-41af-91ab-2d7cd011db47"
+
+      # === Admin-route gate ===
+      # /admin/identities is authorized by the IdentityAdmin App Role in the JWT
+      # `roles` claim. The role (id 0d67be49-…) + its assignments (colombod, bkrabach,
+      # incl. SC-ALT) already exist in Entra — this var is ALL the manifest needs for
+      # admin authz. Empty/null here would DISABLE the admin API (503).
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_ADMIN_ROLE
+        value: IdentityAdmin
+
+      # === First-boot seed of the oid→contributor map (OPERATOR-SUPPLIED) ===
+      # The oid→GitHub-handle identity map is intentionally NOT committed here —
+      # it contains real Microsoft Entra object IDs. The operator supplies it at
+      # deploy time (optionally), via one of:
+      #   - export AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES in the
+      #     local environment before `amplifier-online up` (uncommitted), or
+      #   - wire it as a Key Vault secretRef out-of-band post-`up` (same pattern
+      #     as the Neo4j creds below), or
+      #   - pre-populate the /data store at ENTRA_IDENTITIES_STORE_PATH.
+      # Format: {"<entra-oid>":{"id":"<github-handle>"}, ...}
+      # The map is OPTIONAL: in entra mode the server BOOTS with an EMPTY map
+      # (fail-closed + a loud startup WARNING) rather than refusing to start.
+      # The map is populated at runtime via PUT /admin/identities using an
+      # IdentityAdmin-role token — and that role-holder can onboard the first
+      # identity even when their OWN oid is not yet mapped (the /admin-path
+      # bootstrap exemption). Until an oid is bound, that user's data requests
+      # 403. After first boot the /data store + /admin/identities are
+      # authoritative (runtime edits win), so this seed only pre-populates an
+      # initially-empty store.
+      # - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES
+      #   value: '{"<entra-oid>":{"id":"<github-handle>"}}'   # operator-filled; do NOT commit real oids
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES_STORE_PATH
+        value: /data/identity/entra-identities.json
+
+      # === Durable /data paths (must live on the mounted volume) ===
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_QUEUES_PATH
+        value: /data/queues
+      # Required by the durable single-writer protocol. The ASGI lifespan
+      # refuses any other value before drivers or drain workers initialize.
+      - name: WEB_CONCURRENCY
+        value: "1"
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH
+        value: /data/blobs
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_PATH
+        value: /data/logs/server.jsonl
+
+      # === Neo4j backing service — STRUCTURED two-client form (admin + cypher_query) ===
+      # Neo4j Community gives us ONE account. The server (v6.7.0) drives TWO logical
+      # clients — admin (read/write) and cypher_query (read-intent). We point BOTH at
+      # the SAME instance and the SAME credentials, so the two client configs are
+      # IDENTICAL except for access_mode, which the server's validator REQUIRES to be
+      # "WRITE" for admin and "READ" for cypher_query. (On Community access_mode is
+      # only a routing hint, not server-side enforcement — sharing one account is fine.)
+      #
+      # Force the explicit two-client form so the flat fallback can never linger:
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_REQUIRE_EXPLICIT_CLIENTS
+        value: "true"
+      # --- admin (read/write) — NON-SECRET leaves only ---
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__URL
+        value: "bolt://10.100.4.4:7687"
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__ACCESS_MODE
+        value: "WRITE"
+      # --- cypher_query (read-intent) — NON-SECRET leaves only ---
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__URL
+        value: "bolt://10.100.4.4:7687"
+      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__ACCESS_MODE
+        value: "READ"
+      #
+      # SECRET leaves (__USERNAME / __PASSWORD for BOTH clients) are NEVER in this
+      # manifest — a secretref: string would ship verbatim and never resolve. They are
+      # wired OUT OF BAND after EVERY `up`, mapping all FOUR credential leaves onto the
+      # SAME TWO Key Vault secrets (each referenced twice) so both clients resolve to
+      # identical user+password:
+      #   az containerapp secret set -n context-intelligence-api -g ao-context-intelligence-rg \
+      #     --secrets \
+      #       neo4j-user=keyvaultref:https://kv-context-intel.vault.azure.net/secrets/context-intelligence-neo4j-user,identityref:system \
+      #       neo4j-password=keyvaultref:https://kv-context-intel.vault.azure.net/secrets/context-intelligence-neo4j-password,identityref:system
+      #   az containerapp update  -n context-intelligence-api -g ao-context-intelligence-rg \
+      #     --set-env-vars \
+      #       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__USERNAME=secretref:neo4j-user \
+      #       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__PASSWORD=secretref:neo4j-password \
+      #       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__USERNAME=secretref:neo4j-user \
+      #       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__PASSWORD=secretref:neo4j-password
+
+# Optional managed databases (provisions isolated resources for this project)
+resources:
+  postgres:
+    enabled: false  # Injects DB_HOST, DB_NAME, DB_USER, DB_PASSWORD (no DATABASE_URL)
+  cosmos:
+    enabled: false  # Keyless (managed identity): injects COSMOS_ENDPOINT + COSMOS_DATABASE (no COSMOS_KEY)
+  redis:
+    enabled: false  # Keyless (managed identity): injects REDIS_HOST + REDIS_PORT (Azure Managed Redis)
+  storage:
+    enabled: false  # Keyless (managed identity): injects STORAGE_ACCOUNT, STORAGE_FILESYSTEM, STORAGE_ENDPOINT (ADLS Gen2)
+
+# NOTE: This service is PUBLIC — reachable at the APIM gateway URL above
+# (auth.expose: true provisions public ingress + an APIM front). Access requires
+# a valid Microsoft Entra bearer token (no APIM subscription key).
+#
+# Neo4j credentials are wired OUT OF BAND post-`up` as Key Vault secretRefs
+# (see the services.api.env NEO4J_URL comment) — never in this manifest.

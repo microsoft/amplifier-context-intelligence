@@ -33,27 +33,24 @@ RUN tdnf -y update && tdnf -y install ca-certificates curl && tdnf -y clean all
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
-COPY pyproject.toml .
+# Amplifier Online's build pool reaches MCR, packages.microsoft.com and the
+# platform's package feed only (not ghcr.io or pypi.org): uv comes from the
+# feed, and the dependencies install from requirements.txt, exported from
+# uv.lock with hashes (re-export when uv.lock changes:
+#   uv export --frozen --no-dev --no-emit-project --format requirements-txt > requirements.txt).
+COPY requirements.txt pyproject.toml ./
 COPY context_intelligence_server/ context_intelligence_server/
 COPY docker-entrypoint.sh .
 RUN chmod +x docker-entrypoint.sh
 
-RUN uv pip install --system --no-cache .
-
-# security: the Azure Linux base ships EOL Python packaging tools (pip/setuptools/
-# wheel) that Qualys SCA (S360) flags. In-place upgrades don't clear the findings
-# because the rpm-installed dist-info has no RECORD, so pip/uv leave the old
-# metadata orphaned next to the new (scanners key on the dist-info METADATA).
-# This app builds with hatchling and imports none of these at runtime, so remove
-# the vulnerable OS rpms outright and delete their leftover files, then reinstall
-# only a patched setuptools (some transitive deps still import pkg_resources).
-#   pip   — removed: QIDs 5011855 (CVE-2026-6357), 5005553 (CVE-2025-8869)
-#   wheel — removed: QID  5007163 (CVE-2026-24049)
-#   setuptools>=79 — patched pkg_resources + vendored jaraco.context: QID 5006986
-#                    (CVE-2026-23949)
-RUN tdnf -y remove python3-pip python3-setuptools python3-wheel && \
+# Install, then drop the base image's pip/setuptools/wheel (CVE surface) and put
+# back a patched setuptools — all with the feed as the only index.
+RUN --mount=type=secret,id=pip_index_url \
+    export PIP_INDEX_URL="$(cat /run/secrets/pip_index_url)" UV_INDEX_URL="$(cat /run/secrets/pip_index_url)" && \
+    pip install --no-cache-dir uv && \
+    uv pip install --system --no-cache --require-hashes -r requirements.txt && \
+    uv pip install --system --no-cache --no-deps . && \
+    tdnf -y remove python3-pip python3-setuptools python3-wheel && \
     rm -rf /usr/lib/python3.12/site-packages/pip \
            /usr/lib/python3.12/site-packages/pip-*.dist-info \
            /usr/lib/python3.12/site-packages/setuptools \
@@ -65,6 +62,10 @@ RUN tdnf -y remove python3-pip python3-setuptools python3-wheel && \
            /usr/lib/python3.12/site-packages/wheel-*.dist-info && \
     uv pip install --system --no-cache "setuptools>=79" && \
     tdnf -y clean all
+
+# The deployed commit, reported by GET /health.
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=${GIT_COMMIT}
 
 EXPOSE 8000
 
