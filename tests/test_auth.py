@@ -104,7 +104,7 @@ async def test_identity_gate_waits_before_resolving_and_propagates_cancellation(
         await asyncio.gather(task, return_exceptions=True)
 
 
-@pytest.mark.parametrize("path", ["/status", "/version", "/docs", "/openapi.json"])
+@pytest.mark.parametrize("path", ["/health", "/status", "/version", "/docs", "/openapi.json"])
 async def test_identity_gate_exempt_paths_never_probe(path: str) -> None:
     def forbidden() -> bool:
         raise AssertionError("public path probed identity")
