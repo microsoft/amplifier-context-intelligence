@@ -34,11 +34,11 @@ RUN tdnf -y update && tdnf -y install ca-certificates curl && tdnf -y clean all
 WORKDIR /app
 
 # Amplifier Online's build pool reaches MCR, packages.microsoft.com and the
-# platform's package feed only (not ghcr.io or pypi.org): uv comes from the
-# feed, and the dependencies install from requirements.txt, exported from
-# uv.lock with hashes (re-export when uv.lock changes:
-#   uv export --frozen --no-dev --no-emit-project --format requirements-txt > requirements.txt).
-COPY requirements.txt pyproject.toml ./
+# platform's package feed only (not ghcr.io or pypi.org). uv.lock records
+# pypi.org download URLs, so `uv sync` can't install from the feed; instead uv
+# (itself from the feed) exports the lock, offline, to a hashed requirements
+# list, and the dependencies install from the feed with every hash checked.
+COPY pyproject.toml uv.lock ./
 COPY context_intelligence_server/ context_intelligence_server/
 COPY docker-entrypoint.sh .
 RUN chmod +x docker-entrypoint.sh
@@ -48,7 +48,9 @@ RUN chmod +x docker-entrypoint.sh
 RUN --mount=type=secret,id=pip_index_url \
     export PIP_INDEX_URL="$(cat /run/secrets/pip_index_url)" UV_INDEX_URL="$(cat /run/secrets/pip_index_url)" && \
     pip install --no-cache-dir uv && \
-    uv pip install --system --no-cache --require-hashes -r requirements.txt && \
+    uv export --frozen --no-dev --no-emit-project --format requirements-txt -o /tmp/requirements.txt && \
+    uv pip install --system --no-cache --require-hashes -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt && \
     uv pip install --system --no-cache --no-deps . && \
     tdnf -y remove python3-pip python3-setuptools python3-wheel && \
     rm -rf /usr/lib/python3.12/site-packages/pip \
