@@ -262,7 +262,8 @@ terminal snapshot, an uncertain outcome that is not a durability guarantee. Shut
 must finish maintenance and drainers/real I/O before releasing external exclusion.
 Tests: `uv run pytest tests/test_online_retention.py tests/test_retention_client.py -q`.
 
-Nightly scheduling is an explicit online-only client opt-in:
+For self-managed installations, nightly scheduling is an explicit online-only
+client opt-in:
 `blobs prune-scheduled --online --older-than 30d --server-url URL --admin-key-file PATH`.
 `--dry-run` previews then cancels only its owned UUID; busy manual jobs are skipped.
 Keep the runner in `retention_scheduler.py`, with the CLI as a thin wrapper.
@@ -272,9 +273,14 @@ Preserve sanitized JSON receipts, finite work/cleanup budgets, scoped SIGTERM
 handling, and the interactive command's TTY/no-`--yes` guard. No server/schema
 changes, scheduler auto-install, or ingestion stop/restart hooks. User-unit setup:
 `docs/service-setup.md` → "Nightly online pruning — explicit unattended opt-in".
-Azure setup: [explicit opt-in runbook](docs/azure-deployment.md#azure-scheduled-blob-retention--explicit-opt-in).
-The v1 job-provisioning path is unverified; Azure Files requires qualification
-before production apply, and unattended Entra credential bootstrap is external.
+On Azure, the v2 manifest provisions a separate managed-identity job at 04:00
+UTC (`services.retention.schedule`, `calls: [api]`). The module
+`context_intelligence_server.retention_job` previews the fixed 60-day policy by
+default; only an explicit `--apply` in the reviewed job command enables deletion.
+The job gets no `/data` mount, storage-delete rights, or Neo4j credentials. Keep
+both platform edge and CI admin authorization, owned-UUID cleanup, disposable
+Azure Files qualification, backlog review and recovery approval.
+See the [Azure opt-in runbook](docs/azure-deployment.md#azure-scheduled-blob-retention--explicit-opt-in).
 Tests: `uv run pytest tests/test_retention_scheduler.py tests/test_retention_client.py -q`.
 
 ### Blob migration and startup recovery invariants
@@ -397,39 +403,30 @@ Both auth modes can add/remove identities **at runtime, no restart**, via the
 
 Canonical guide: `docs/identity-management.md`.
 
-### Deploying to Azure / Amplifier Online — post-deploy identity seed
+### Deploying to Azure / Amplifier Online v2
 
-The deployment manifest is `amplifier-online.yaml` (stack `web-app-aca`). The
-`entra_identities` oid→handle map is **PII and is intentionally NOT in the manifest
-or this repo** — see the secret-hygiene note above.
+`amplifier-online.yaml` defines the v2 project (`services.api`, its `/data`
+volume, and the separate scheduled `services.retention`). For infrastructure or
+manifest changes, review `amplifier-online up --dry-run` before an approved
+`amplifier-online up`. For code rollout use project-level
+`amplifier-online deploy --ref <reviewed-ref>`; verify the exact commit on
+`/health` **and** the authenticated API, Neo4j reads, and drained test ingestion.
+For stateful updates, require a non-overlapping handoff and verified backup;
+neither command alone proves storage or rollback compatibility. The Neo4j VM is
+a separate project and is not updated by this rollout.
 
-**One-command deploy** — use the repo-root wrapper, which runs `amplifier-online up`
-and then onboards the identity map in a single shot:
-```bash
-export SERVER_URL="https://<server-fqdn-or-apim-gateway>"   # for the seed step
-export AUTH_RESOURCE="api://<client_id>"                    # token audience
-export SEED_FILE="scripts/entra-identities.local.json"     # uncommitted map
-./deploy.sh
-```
-`deploy.sh` = `amplifier-online up` **+** `scripts/seed-entra-identities.sh`. The
-seed is **idempotent and no-ops once `/data` is populated**, so it is safe on every
-deploy: a fresh/empty `/data` gets onboarded, an existing one is left untouched.
-Use `./deploy.sh --no-seed` for a deploy-only run.
+Use declarative references to `neo4j-user` and `neo4j-password` in the AO-managed
+project vault, not plaintext env vars or manual Container Apps secret patches.
+Rotate the database and AO password together in a coordinated window using the
+prompted `amplifier-online secret set neo4j-password`. Verify actual revision
+uptake and both Neo4j paths; versionless refresh may restart a revision.
 
-**Why a wrapper and not the manifest:** `amplifier-online up` ships
-`amplifier-online.yaml` verbatim (no `${VAR}`/shell/secret expansion), so the
-`entra_identities` map — **PII, intentionally NOT in the manifest or this repo** —
-cannot be supplied through `up` itself. The map lives in an **uncommitted,
-git-ignored** local file (`scripts/entra-identities.local.json`, from
-`scripts/entra-identities.example.json`) and is applied over the admin API
-(`PUT /admin/identities/{oid}`) right after `up`. Identity-store I/O initializes in the background; until the store is ready, protected auth/admin requests return `503` and `/status` reports the cached identity readiness reason.
-
-Under the hood the seeder can also be run alone (`./scripts/seed-entra-identities.sh
---check` for a dry run) — see `docs/azure-deployment.md`.
-
-Full runbook: `docs/azure-deployment.md` → "Seeding the identity map on a FRESH
-`/data`". Tooling: `scripts/seed-entra-identities.sh` (idempotent, fail-loud, no
-real oids committed).
+The `entra_identities` oid→handle map is PII. Keep the seed in an uncommitted,
+git-ignored file. Seed only fresh `/data` (first boot or recovery) using
+`scripts/seed-entra-identities.sh`, after the identity store is ready. The
+`deploy.sh` wrapper only runs `up` and optionally the seed; neither it nor the
+standalone seed ships a reviewed code ref. Do not seed on a routine rollout.
+See the [Azure deployment runbook](docs/azure-deployment.md).
 
 ### Local static run (admin) — the common single-box setup
 

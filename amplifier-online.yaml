@@ -58,10 +58,16 @@ services:
       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__URL: bolt://10.100.4.4:7687
       AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__ACCESS_MODE: READ
 
-# Neo4j credentials, no longer wired by hand after each deploy: set once with
-#   amplifier-online secret set neo4j-user
-#   amplifier-online secret set neo4j-password
-# (values from kv-context-intel's context-intelligence-neo4j-user / -password).
+  retention:
+    build: .
+    schedule: "0 4 * * *"  # Daily at 04:00 UTC
+    calls: [api]
+    # Preview only. See the Azure runbook before enabling --apply.
+    command: [python3, -m, context_intelligence_server.retention_job]
+
+# Rotate the database and AO-managed secret together with
+# `amplifier-online secret set neo4j-password` (and neo4j-user if it changes).
+# The API does not read the legacy vault.
 secrets:
   - {name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__USERNAME, keyVaultSecret: neo4j-user, service: api}
   - {name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__PASSWORD, keyVaultSecret: neo4j-password, service: api}

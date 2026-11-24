@@ -1,21 +1,22 @@
 # Deploying to Azure (compliant, via `amplifier-online`)
 
-This is a guide for deploying the Context Intelligence Server to Azure **the
-compliant way**. It describes how to deploy using the **`amplifier-online`
-bundle tooling** — you author a project manifest (`amplifier-online.yaml`) and run
-`amplifier-online up`, which provisions the container app, its ingress, and the
-supporting Azure resources for you.
+This guide covers the **Amplifier Online (AO) v2** API project declared in
+[`amplifier-online.yaml`](../amplifier-online.yaml). Use `amplifier-online up` to
+reconcile infrastructure and manifest changes, and `amplifier-online deploy --ref`
+to build and roll out a reviewed code revision. The earlier `web-app-aca` API
+manifest and its push-to-deploy workflow are historical, not routine v2 steps.
+Adopting a v1 project into v2 or rolling back to it is a separately reviewed
+operation: verify the actual storage, identity and writer handoff first.
 
-It is a *how-to* guide, not a description of any existing deployment. All names,
-IDs, addresses, and endpoints below are **placeholders** — substitute your own.
-Never commit real secrets, object IDs, private addresses, or resource names to
-this repo.
+Use placeholders for the API deployment examples; resolve real resource and
+identity values privately. Never add secrets, object IDs, private addresses, or
+deployment resource names to this repo.
 
 > **Two moving parts.** The **server** runs as an Azure Container App (deployed by
 > `amplifier-online`). **Neo4j** runs separately on a **VM inside a private
 > virtual network** (you provision this once). The server reaches Neo4j over
-> private Bolt; Neo4j is never publicly exposed. Secrets flow through **Key
-> Vault**, never through the manifest.
+> private Bolt; Neo4j is never publicly exposed. The API manifest names logical
+> secrets in the **AO-managed project vault**, never their values.
 
 ---
 
@@ -73,24 +74,12 @@ The image build/run is exercised by `tests/integration/test_docker_image.py`.
 
 ### The image is built on the approved base, then imported and deployed by `amplifier-online`
 
-You do **not** push to a project ACR. Amplifier Online uses **one shared platform
-registry** (`amplifieronlinecr`, admin disabled) that **no account can push to** —
-a manual `docker push` / `az acr build` against it returns `UNAUTHORIZED`. Instead,
-image delivery is **push-to-deploy**:
-
-1. `amplifier-online cicd create` enrolls this repo and writes a GitHub Actions
-   workflow.
-2. On `git push`, CI builds the image from this repo's `Dockerfile` (approved base,
-   above) and pushes it to **your GitHub repo's `ghcr.io`**.
-3. The Amplifier Online **provisioner imports `ghcr.io → amplifieronlinecr`** and
-   creates a new Container Apps revision. Existing stateful deployments require
-   the [non-overlapping upgrade handoff](#611-to-613-upgrade-and-rollback-boundary);
-   image delivery is not proof that overlapping revisions are safe.
-
-So the `services.<name>.image` value in `amplifier-online.yaml`
-(`amplifieronlinecr.azurecr.io/...`) is a **destination the provisioner writes to,
-not a registry you push to**. There is no hand-rolled `az containerapp create`;
-`amplifier-online` owns provisioning, and the CI pipeline owns image build + import.
+The v2 manifest uses `services.api.build: .` to build from this repository's
+`Dockerfile`. Amplifier Online owns image delivery and revision creation. Do not
+create an app by hand or push to the shared platform registry. A source push or
+passing GitHub CI is not a deployment or proof that the running revision meets
+the release and compliance gates. Existing stateful deployments require the
+[non-overlapping upgrade handoff](#611-to-613-upgrade-and-rollback-boundary).
 
 ### Do NOT create new containers on non-approved bases
 
@@ -113,24 +102,20 @@ Have these in place before you deploy:
   az login
   az account set --subscription "<your-subscription>"
   ```
-- **`amplifier-online` CLI** (the deployment tooling this guide uses). Verify it
-  is installed and authenticated to the same subscription.
-- **GitHub CLI (`gh`)**, authenticated to the repo — `amplifier-online cicd create`
-  uses it to enrol the repo and set the deploy workflow's variables. Image build +
-  push happens **in CI** (to `ghcr.io`); you do **not** build/push locally.
+- **`amplifier-online` CLI** with v2 project support, authenticated to the
+  intended project and Azure subscription. Confirm it supports `up --dry-run`
+  and project-level `deploy --ref` before proceeding.
 - `jq` and `curl` (used by the identity-seed step).
 
 **Azure resources / access:**
 
 - A **subscription** and **resource group** you can deploy into.
-- **No project ACR to create.** Images live in the **shared platform registry**
-  (`amplifieronlinecr`), which the provisioner writes to via a `ghcr.io → ACR`
-  import — you never push to it (see the image-policy section).
-- **No hand-rolled VNet/subnet/NSG.** The `web-app-aca` app runs in the shared
+- **No project ACR to create.** Use Amplifier Online's image delivery path.
+- **No hand-rolled VNet/subnet/NSG.** The v2 API service runs in the shared
   platform VNet; the Neo4j VM is a separate **`vm`-stack** Amplifier Online project
   that owns its own private subnet placement and NSG (see Step 2).
-- A **Key Vault** for secrets (Neo4j credentials, any static keys), and a
-  **managed identity** the container app can use to read those secrets.
+- The **AO-managed project vault** and authorized access to maintain the project
+  secrets. The platform wires the API's managed identity and secret references.
 - **Entra (Azure AD) app registration** for the server's JWT auth (if deploying
   in `entra` mode) — a client (app) ID, the tenant ID, and any App Roles you
   gate on.
@@ -145,55 +130,12 @@ Linux base** (see the policy section above) before it is pushed and deployed.
 
 ---
 
-## Step 1 — Enrol the repo for push-to-deploy (CI builds the approved-base image)
+## Step 1 — Review the source and build requirements
 
-You do **not** build or push the image by hand. Amplifier Online delivers images
-**push-to-deploy**: enrol the repo once, then every `git push` builds the image on
-the approved base in CI and hands it to the provisioner to import into the shared
-platform registry.
-
-```bash
-# One-time: generate the GitHub Actions workflow + enrol the repo.
-# Preview first (writes nothing), then create for real:
-amplifier-online cicd create --dry-run
-amplifier-online cicd create
-```
-
-`cicd create` writes `.github/workflows/api-build-deploy.yaml` and sets the repo
-variables the deploy job needs (`AO_PROVISIONER_URL`, `AO_PROVISIONER_AUDIENCE`,
-`AO_PROJECT_NAME`, and the Entra IDs). Commit the workflow and push:
-
-```bash
-git add .github/workflows/ && git commit -m "ci: add amplifier-online deploy workflow"
-git push        # CI builds from this repo's Dockerfile (approved base) → ghcr.io,
-                # then the provisioner imports ghcr.io → amplifieronlinecr and creates a revision
-```
-
-What happens on each push:
-
-1. **Build job** builds the image from this repo's `Dockerfile` (approved MCR Azure
-   Linux base) and pushes it to **`ghcr.io/<owner>/<repo>-api:<sha>`**.
-2. Compliance is enforced **in CI, before the image is imported**: a Trivy scan
-   (fails on CRITICAL/HIGH), an SBOM, and a build-provenance attestation — layered
-   on top of the approved `FROM` base in the Dockerfile.
-3. **Deploy job** authenticates to the provisioner with a GitHub **OIDC** token (no
-   stored Azure secret); the provisioner **imports `ghcr.io → amplifieronlinecr`**
-   and creates a new Container Apps revision. Gate production replacement through
-   the [upgrade handoff](#611-to-613-upgrade-and-rollback-boundary), not a default
-   overlapping rollout against shared state.
-
-> **There is no manual push path.** The shared platform registry
-> (`amplifieronlinecr`) has ACR admin disabled and grants **no** push access — a
-> `docker push` / `az acr build` against it returns `UNAUTHORIZED`. The
-> `amplifieronlinecr.azurecr.io/...` value in the manifest is the **destination the
-> provisioner writes to**, never a registry you push to. The only registry you push
-> to (via CI) is your repo's `ghcr.io`.
-
-Check status after a push:
-
-```bash
-amplifier-online status
-```
+Select a reviewed source ref, record the commit it resolves to, and confirm its
+repository checks and approved Azure Linux base. Separately verify the applicable
+image scan, SBOM and provenance evidence for the artifact that will be deployed.
+Do not assume the v1 generated workflow runs those checks for a v2 build.
 
 ---
 
@@ -310,8 +252,8 @@ runcmd:
     sed -i 's/^#\?server.default_listen_address=.*/server.default_listen_address=0.0.0.0/' "$CONF"
     sed -i 's/^#\?server.bolt.listen_address=.*/server.bolt.listen_address=0.0.0.0:7687/' "$CONF"
     echo 'dbms.security.procedures.unrestricted=apoc.*,gds.*' >> "$CONF"
-  # 5. Set an initial password, then start. Capture the password into Key Vault
-  #    (kv-context-intel) out of band so the web app's NEO4J_PASSWORD secretRef matches.
+  # 5. Historical guest example: set an initial password, then start.
+  #    For current API credential wiring, follow Step 3 separately.
   - neo4j-admin dbms set-initial-password "$(openssl rand -base64 24)"
   - systemctl enable neo4j
   - systemctl restart neo4j
@@ -327,135 +269,67 @@ RETURN gds.version();
 
 ### 2d. How the web app reaches it
 
-The `web-app-aca` project (Steps 1, 4) reaches Neo4j over **private IP on the shared
-platform VNet**: the ACA container's egress comes from the `cae-infra` subnet, the
-VM's NSG allows `7687` from `cae-infra`, so the app connects to
-`bolt://10.100.4.4:7687` directly — no DNS, no public exposure. The private IP is a
-**coordinate, not a secret** (reachability is already gated by the NSG + no-public-IP
-posture), which is why it sits in plaintext in the web-app manifest while the Neo4j
-**credentials** are Key Vault secretRefs (Step 3). Do not move the IP into Key Vault.
+The v2 API project still reaches the separate Neo4j VM over **private Bolt** on
+the shared platform VNet. Preserve the existing private endpoint and the VM NSG
+allow rule for TCP 7687 from the app's egress subnet; do not expose Bolt publicly.
+The guest provisioning example above is not an API deployment or credential
+rotation procedure. For current API credential wiring, use Step 3.
 
 ---
 
-## Step 3 — Secrets: Key Vault + the declarative-deploy rule
+## Step 3 — Wire and rotate Neo4j credentials
 
-> **Read this first — it is the load-bearing rule.** `amplifier-online up` is
-> **declarative**: it rewrites the container's **entire env list** from the
-> manifest (+ auto-injected vars) on **every** deploy. Anything you set on the app
-> out of band with `az ... --set-env-vars` is **wiped on the next `up`**. Because
-> the server's Neo4j access-mode validators **fail loud**, a wiped env then makes
-> the server **refuse to boot**. So split responsibilities precisely:
->
-> - **Non-secret env leaves** (URLs, usernames, access modes) → **in the manifest
->   `env:` block** (Step 4). They survive every `up`.
-> - **Secret values** → **Key Vault**, exposed as **Container Apps secrets**
->   (these persist on the app resource), and referenced by env via `secretref:`.
-> - **The env→secretref mapping** is the *only* out-of-band piece, and it **must be
->   re-applied after every `amplifier-online up`** (fold it into `deploy.sh`).
-> - **Never** put a `secretref:`/`keyvaultref:` string in the manifest — it ships
->   **verbatim** (no expansion) and would land as a literal string, not a resolved
->   reference.
+The v2 manifest declares the API's credential references under top-level
+`secrets`, using `keyVaultSecret` and `service: api`. Both Neo4j clients use
+`neo4j-user` and `neo4j-password` in the **AO-managed project vault**. Keep the
+Bolt URL and access modes in the API's `env` mapping; never put credential values
+there. Do not hand-patch Container Apps env vars or secrets after `up` or deploy.
 
-**3a — Store secrets in Key Vault.**
+For **initial setup**, have an authorized operator populate both logical secrets
+with the matching database credentials in the intended AO project. For
+**password rotation**, plan a maintenance window, producer buffering and a
+recovery path before updating either side. There can be a credential mismatch and
+service interruption between changing the database and refreshing the API.
 
-```bash
-az keyvault secret set --vault-name <your-key-vault> \
-  --name context-intelligence-neo4j-password --value "<neo4j-password>"
-```
+1. Rotate the shared account's password on Neo4j through the approved database
+   procedure. Set the same value in the AO project vault with the prompted
+   command below. Do not pass the value on the command line or record it in logs.
+   Update `neo4j-user` using the corresponding prompted command only if the
+   username changes.
 
-**3b — Grant the app's managed identity read access BEFORE referencing** (or the
-new revision can't pull the secret and won't go healthy):
+   ```bash
+   amplifier-online secret set neo4j-password
+   ```
 
-```bash
-# RBAC-authorization vault (recommended): assign the built-in role
-az role assignment create \
-  --assignee <app-managed-identity-principal-id> \
-  --role "Key Vault Secrets User" \
-  --scope <key-vault-resource-id>
+2. Confirm privately that the active API's references still point to the
+   AO-managed vault and are versionless. Azure Container Apps can refresh a
+   versionless Key Vault secret automatically and may restart the app containers
+   that consume it. Do not assume immediate uptake or restart the app ad hoc;
+   use the approved platform refresh/restart path and protect single-writer
+   ownership if intervention is needed.
+3. Verify the active revision picked up the change: check `/status` for both
+   Neo4j connections, make an authenticated query and confirm a controlled test
+   event actually drains into Neo4j. `/health`, an accepted secret write, or a
+   `202` from ingress alone doesn't prove the new credential works.
 
-# Access-policy vault (legacy model): grant get + list instead
-# az keyvault set-policy --name <your-key-vault> \
-#   --object-id <app-managed-identity-principal-id> --secret-permissions get list
-```
-
-**3c — Create the Container Apps secret as a Key Vault reference** bound to the
-identity. These secrets persist on the app across `up`:
-
-```bash
-az containerapp secret set -n <container-app-name> -g <resource-group> \
-  --secrets \
-    neo4j-password=keyvaultref:https://<your-key-vault>.vault.azure.net/secrets/context-intelligence-neo4j-password,identityref:<app-managed-identity-resource-id>
-```
-
-- **User-assigned identity:** `identityref:<managed-identity-resource-id>` (as above).
-- **System-assigned identity:** use the literal `identityref:system`.
-- **Omit the secret version** (`.../secrets/<name>`, no trailing version) so
-  Container Apps re-resolves it periodically and **rotated passwords are picked
-  up automatically** (~30 min). Pinning a version freezes the value.
-
-**3d — Map env → secret (RE-APPLY AFTER EVERY `up`).** `az containerapp update
---set-env-vars` creates a **new revision**. Even single-revision mode is not
-evidence of a non-overlapping writer handoff. On an existing deployment, include
-this revision change in the approved [upgrade handoff](#611-to-613-upgrade-and-rollback-boundary):
-
-```bash
-az containerapp update -n <container-app-name> -g <resource-group> \
-  --set-env-vars \
-    AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_PASSWORD=secretref:neo4j-password
-```
-
-Non-secret leaves (`NEO4J_URL`, `NEO4J_USER`) live in the **manifest** (Step 4),
-not here. Never place secret values as plaintext env vars, and never commit them.
+The legacy vault is **not the v2 API's credential source**. It may still serve
+other consumers, be maintained as an upstream copy with an explicitly approved
+manual sync, or be needed for rollback. Updating it does not update the AO vault.
+Do not remove an old **Key Vault Secrets User** assignment until the owner has
+checked all consumers and rollback needs and authorized its removal.
 
 ### The two Neo4j clients (admin/write and cypher_query/read)
 
-The server has two internal Neo4j clients — a write/admin client and a read client
-for the `/cypher` endpoint. There are two ways to configure them:
-
-- **Flat config (Step 3, above):** one URL / user / password that the server fans
-  out to *both* clients. Simplest, and it is what the **current setup uses**.
-- **Structured config:** the `neo4j` field with `admin` and `cypher_query`
-  sub-clients, each `{url, username, password, access_mode}`, read via the nested
-  delimiter `__`. Use this when you want the two clients to have **different
-  credentials** — which requires Neo4j **Enterprise** (see below).
-
-> **Current setup: Neo4j Community → ONE account, shared by both clients.**
-> Neo4j **Community Edition does not support multiple users or role-based access
-> control** — there is a single account (`neo4j`). So admin and read use the
-> **same username and password**, and **Key Vault holds exactly one pair**
-> (`context-intelligence-neo4j-user` + `context-intelligence-neo4j-password`).
-> There is no separate read-only account to store or wire. On Community the
-> flat config (Step 3) is the correct choice — nothing further to do here.
-
-**If you configure the structured block anyway on Community**, both clients point
-at the **same** account (same username, same password secret) and differ only by
-`access_mode`:
-
-```yaml
-# manifest env: — non-secret leaves (survive every `up`). Same user, same URL.
-- { name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__URL,             value: "bolt://<neo4j-private-address>:7687" }
-- { name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__USERNAME,        value: "neo4j" }
-- { name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__ACCESS_MODE,     value: "WRITE" }
-- { name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__URL,      value: "bolt://<neo4j-private-address>:7687" }
-- { name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__USERNAME, value: "neo4j" }
-- { name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__ACCESS_MODE, value: "READ" }
-```
-
-```bash
-# Both password leaves reference the SAME Key Vault secret (one account).
-# RE-APPLY after every `up` (fold into deploy.sh):
-az containerapp update -n <container-app-name> -g <resource-group> \
-  --set-env-vars \
-    AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__PASSWORD=secretref:neo4j-password \
-    AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__PASSWORD=secretref:neo4j-password
-```
+The API manifest requires structured `neo4j.admin` and `neo4j.cypher_query`
+configuration (env delimiter `__`) for the write/admin path and `/cypher` read
+path. Both use the same Community account and private Bolt URL. Do not switch
+to flat settings as part of a rollout. Separate credentials and a genuinely
+read-only account require Neo4j Enterprise RBAC.
 
 > **Hard rules (fail-loud at startup):** `admin.access_mode` MUST be `WRITE` and
 > `cypher_query.access_mode` MUST be `READ` — the field defaults to `WRITE`, so
 > the read client's `READ` **must be set explicitly** or the server refuses to
-> boot. Do NOT mix flat `NEO4J_*` keys with structured `NEO4J__*` keys — pick one
-> shape. On Community, the structured block buys you **nothing** over the flat
-> config (same single account), so prefer the flat config there.
+> boot. Do NOT mix flat `NEO4J_*` keys with structured `NEO4J__*` keys.
 
 **Least-privilege read account — Neo4j Enterprise only.** Genuinely separating the
 read client onto a read-only account needs **Enterprise** (multi-user + RBAC).
@@ -474,8 +348,7 @@ GRANT ROLE reader TO readonly;
 > write protection at all. Real read-only isolation comes only from an Enterprise
 > `reader`-role account.
 
-**To require the structured block** (reject a silent fall-back to the flat single
-account in a deployed profile), also set:
+Keep the v2 manifest's guard against silently falling back to flat settings:
 
 ```
 AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_REQUIRE_EXPLICIT_CLIENTS=true
@@ -487,79 +360,73 @@ missing structured block can't silently degrade to one shared account.
 
 ---
 
-## Step 4 — Author `amplifier-online.yaml`
+## Step 4 — Review the Amplifier Online v2 manifest
 
-Describe the deployment in the project manifest. Keep only **non-secret** values
-here; the Neo4j URL is a **private address**, and credentials come from Key Vault
-(Step 3). Sketch (placeholders):
+Use the checked-in [`amplifier-online.yaml`](../amplifier-online.yaml) as the
+source of truth. The excerpt below shows the v2 service, volume and secret-ref
+structure only; it is not a complete replacement manifest. Keep the existing API
+registration, caller allowlist, internal Bolt endpoint, and durable paths.
 
 ```yaml
-name: context-intelligence
-stack: web-app-aca            # public ingress + APIM front when auth.expose: true
-
-auth:
-  api_app_id: "<entra-app-client-id>"
-  expose: true                # provision the public edge (ingress + APIM gateway)
-
+name: <ao-project>
 services:
   api:
-    image: amplifieronlinecr.azurecr.io/context-intelligence-server:<version>  # shared platform ACR — the provisioner's import destination, NOT a push target
-    port: 8000                # matches EXPOSE 8000 in the Dockerfile
-
-    volume:                   # persistent /data (identity store, queues, blobs, logs)
+    build: .
+    port: 8000
+    auth: token
+    app_id: "<entra-app-client-id>"
+    min_replicas: 1
+    volume:
       mount_path: /data
-      size_gib: 16
-
-    env:
-      # Force Entra auth (server DEFAULTS to static — must override)
-      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AUTH_MODE
-        value: entra
-      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_CLIENT_ID
-        value: "<entra-app-client-id>"
-      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_AZURE_TENANT_ID
-        value: "<entra-tenant-id>"
-      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_ADMIN_ROLE
-        value: IdentityAdmin
-
-      # Durable /data paths (must live on the mounted volume)
-      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_QUEUES_PATH
-        value: /data/queues
-      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_BLOB_PATH
-        value: /data/blobs
-      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_LOG_PATH
-        value: /data/logs/server.jsonl
-      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_ENTRA_IDENTITIES_STORE_PATH
-        value: /data/identity/entra-identities.json
-
-      # Neo4j over private Bolt (credentials are wired from Key Vault, Step 3)
-      - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_URL
-        value: bolt://<neo4j-private-address>:7687
+      size_gib: 2048
+      tier: premium
+secrets:
+  - name: AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__PASSWORD
+    keyVaultSecret: neo4j-password
+    service: api
 ```
 
-> The manifest is committed; **it must contain no secrets and no PII**. The
-> `entra_identities` map (Entra object IDs → handles) is PII — it is seeded over
-> the admin API after `up` (see "Seeding the identity map"), never committed.
+The complete manifest supplies both username/password references for both
+clients, the Entra and storage settings, and the separate retention service.
+Do not add credential values or an `entra_identities` object ID → handle map to
+the manifest. See [identity seeding](#seeding-the-identity-map-on-a-fresh-data-dr--first-boot)
+for fresh storage only.
 
 ---
 
-## Step 5 — Deploy with `amplifier-online up`
+## Step 5 — Reconcile infrastructure, then roll out the reviewed code
 
-Provision from the manifest. For an **existing stateful deployment**, complete
-the [upgrade handoff](#611-to-613-upgrade-and-rollback-boundary) first; the command
-below is not permission to overlap old and new writers:
+For first-time provisioning or an intended manifest/infrastructure change, run
+the following from the API project directory. Review the plan before running
+`up`. Stop if it proposes an unexpected app, identity, network or storage
+replacement. Treat any revision or scheduling change as an operational change,
+not proof that writer handoff or retention is safe.
 
 ```bash
+amplifier-online up --dry-run
+# Only after reviewing the plan and securing the applicable approvals:
 amplifier-online up
 ```
 
-Then wire the Key Vault secret references (Step 3) and — on a fresh `/data` in
-Entra mode — seed the identity map (below). The repo-root `deploy.sh` runs
-`amplifier-online up` and the identity seed together:
+For a **code-only rollout** on existing v2 infrastructure, deploy the reviewed
+ref at **project scope**; don't run `up` as a substitute or assume that pushing
+the ref deploys it. Complete the
+[non-overlapping handoff](#611-to-613-upgrade-and-rollback-boundary) before
+allowing a successor to write. Review impact on the scheduled job as well as
+the API when rolling out the project.
 
 ```bash
-./deploy.sh                 # = amplifier-online up  +  seed (idempotent)
-./deploy.sh --no-seed       # deploy only, skip the seed step
+amplifier-online deploy --ref '<reviewed-ref>'
 ```
+
+Compare `/health`'s `commit` on the active API with the commit selected for
+deployment. A healthy listener doesn't test authentication, Neo4j or `/data`.
+On fresh Entra storage, wait for identity-store readiness and follow the
+[seed procedure](#seeding-the-identity-map-on-a-fresh-data-dr--first-boot) before
+data-path acceptance. Then verify both authorized and rejected requests, an
+authenticated Neo4j read, and a controlled test event observed in Neo4j after
+ingestion, not just a `202` receipt. Confirm the actual attached storage and
+identity state before resuming normal traffic.
 
 ---
 
@@ -575,7 +442,7 @@ variables are:
 | `AUTH_MODE=entra` | yes | Select the Entra resolver |
 | `AZURE_CLIENT_ID` | yes | App Registration (client) GUID |
 | `AZURE_TENANT_ID` | yes | Azure AD tenant GUID |
-| `ENTRA_IDENTITIES` (JSON) | yes | `oid → {id}` map for the **user (delegated)** path (**PII** — seed via admin API, do not commit) |
+| `ENTRA_IDENTITIES` (JSON) | no | Optional initial `oid → {id}` map (**PII**). On v2 seed fresh `/data` via the admin API instead of committing a map. Unmapped data callers are denied. |
 | `SERVICE_IDENTITIES` (JSON) | no | First-boot seed for **service** principals into the same shared identity store `entra_identities` uses — not itself an auth gate, but an unmapped role-bearing service now gets **403**; may be empty, and identities can be onboarded/removed later via `/admin/identities`, no redeploy |
 | `SERVICE_DATA_ROLE` | no | App Role granting service write+read (default `Contributor`) |
 | `READER_ROLE` | no | App Role granting service read-only (default `Reader`) |
@@ -600,52 +467,49 @@ variables are:
 ### Seeding the identity map on a FRESH `/data` (DR / first boot)
 
 The `ENTRA_IDENTITIES` map (oid → `{id}`) is **PII and is never committed** to this
-repo or the deployment manifest. In steady state you don't re-seed it: after first
-boot the map is authoritative in the durable `/data` volume
-(`entra_identities_store_path`, e.g. `/data/identity/entra-identities.json`), and a
-routine redeploy (including `amplifier-online up`) leaves that volume untouched.
+repo or the deployment manifest. The map on durable `/data`
+(`entra_identities_store_path`, e.g. `/data/identity/entra-identities.json`) is
+authoritative once initialized. Verify that a routine rollout finds that same
+store; do not re-seed a populated store.
 
-Because `amplifier-online up` ships the manifest **verbatim** (no `${VAR}`, shell,
-file, or secret expansion), the map cannot be supplied through `up` itself. It is
-applied over the runtime admin API right after `up`. An empty `entra_identities`
-map is a fail-closed startup error, so this onboarding is required before the
-server will serve on a fresh volume. Once `/data` is populated it is authoritative,
-so re-running the seed is a harmless idempotent no-op.
+Fresh storage starts with no data identities unless seeded, not with auth
+disabled. Wait for `/status` to report `identity_ready: true` after startup.
+Protected operations return `503` until the identity store is ready; affected
+data callers must still be onboarded. Use an authorized IdentityAdmin through
+the approved API route.
 
 ```bash
 # 1. One-time: create the uncommitted seed file from the example, then edit it to
 #    hold the real  "<oid>": {"id":"<github-handle>"}  entries. It is git-ignored.
 cp scripts/entra-identities.example.json scripts/entra-identities.local.json
 
-# 2. az login as an IdentityAdmin, point at the server + app-reg audience, deploy:
+# 2. az login as an IdentityAdmin, then use the API URL and app registration audience:
 az login                                                    # IdentityAdmin identity
-export SERVER_URL="https://<your-server-fqdn-or-apim-gateway>"
+export SERVER_URL="https://<approved-api-endpoint>"
 export AUTH_RESOURCE="api://<entra-app-client-id>"
 export SEED_FILE="scripts/entra-identities.local.json"
-./deploy.sh                 # = amplifier-online up  +  seed (idempotent)
-```
-
-**Seeder alone.** `deploy.sh` calls `scripts/seed-entra-identities.sh`, which you
-can also run directly (e.g. to re-seed without redeploying). It reads the same
-uncommitted local file and applies it over `PUT /admin/identities/{oid}`:
-
-```bash
 ./scripts/seed-entra-identities.sh --check   # dry run — shows what it WOULD PUT
 ./scripts/seed-entra-identities.sh           # apply + verify all oids present
 ```
 
 The seeder fails loud if the seed file is missing/empty (it will not "seed
 nothing"), is idempotent (re-adding an existing mapping is a `200` no-op), and
-verifies every oid is present in the live map afterward. See
+verifies every oid is present in the live map afterward. Keep seed output
+private: `--check` also prints identifiers. See
 [identity-management.md](identity-management.md) for the admin API details.
+
+The existing `deploy.sh` wrapper runs `up` and then the seed (`--no-seed` runs
+only `up`); it does not select or roll out a reviewed code ref. Use the seeder
+directly for approved fresh-volume onboarding after the readiness check, not
+the wrapper for a routine v2 rollout.
 
 ---
 
 ## TLS and connecting the Amplifier bundle
 
-Azure Container Apps issues and renews TLS automatically — the container serves
-plain HTTP on port 8000 and Azure terminates HTTPS at the platform edge. With
-`auth.expose: true` the public edge is an APIM gateway in front of the app.
+The v2 platform edge terminates HTTPS for the API, whose container listens on
+port 8000. Use the project-approved HTTPS route and satisfy both platform
+edge and Context Intelligence authorization.
 
 Point the Amplifier hook at the server's HTTPS endpoint:
 
@@ -653,7 +517,7 @@ Point the Amplifier hook at the server's HTTPS endpoint:
 overrides:
   hook-context-intelligence:
     config:
-      context_intelligence_server_url: "https://<your-server-fqdn-or-apim-gateway>"
+      context_intelligence_server_url: "https://<approved-api-endpoint>"
       # In Entra mode, the hook presents an Entra bearer token (no static key).
 ```
 
@@ -661,25 +525,19 @@ overrides:
 
 ## Azure scheduled blob retention — explicit opt-in
 
-The release provides the online retention API and a **one-shot client**,
-`blobs prune-scheduled`. It does **not** install cron, enable an automatic 60-day
-policy, or obtain/refresh Azure credentials. The setup below consists of
-**operator actions requiring approval**, not actions performed by deployment or
-by reading this guide.
-
-**Not deployment-ready by default:** this deployment uses the Amplifier Online
-**v1 `web-app-aca`** stack. Its approved scheduled-job provisioning path is
-**unverified**, and the current Azure Files backing for `/data/blobs` is
-**unqualified for online pruning**. An external credential bootstrap is also
-required and is not supplied by this CLI. Resolve these prerequisites before
-enabling retention; shipping the client alone does not resolve them.
+The v2 manifest declares a separate **Azure Container Apps scheduled Job** in
+the API's project. The runner calls the existing online retention API and
+defaults to a non-deleting preview. Reconciling the schedule can enable recurring
+previews; it is not approval to apply retention. Review the plan and obtain
+approval before starting the job against production. This runbook does not
+qualify Azure Files or establish effective production authorization.
 
 ### 1. Qualify storage before any production apply
 
 Online pruning requires a single server worker on **64-bit Linux with local
 filesystem semantics**. Azure Files persistence across revisions does not prove
 those semantics. First qualify a **disposable equivalent Azure Files share**,
-using the same protocol, mount options, container runtime, and server storage
+using the same SMB protocol, mount options, container runtime, and server storage
 layout as production. Record evidence for:
 
 - Directory-cookie continuation after closing/reopening scan directories, including
@@ -702,93 +560,62 @@ Inventory and control those writers through their existing service managers
 before apply. Do not blindly stop production ingestion or add stop/restart hooks
 to the scheduled job; online pruning keeps the supported server running.
 
-### 2. Establish the approved scheduled-job and credential path
+### 2. Verify the scheduled job and both authorization gates
 
-Ask the platform owner to confirm an approved, platform-managed **Azure Container
-Apps scheduled Job** path for the existing v1 deployment. Use the
-[Azure scheduled-jobs reference](https://learn.microsoft.com/en-us/azure/container-apps/jobs#scheduled-jobs)
-for platform concepts, not as proof that the current Amplifier Online v1 manifest
-supports them. Do **not** paste v2 schedule fields into `amplifier-online.yaml`,
-migrate deployment APIs, or assume a separate Amplifier Online project is
-required. Until the v1 provisioning/update path is confirmed, this is a setup
-checklist, not an executable provisioning recipe.
+This is the job service in the project manifest (not a second API replica):
 
-Have the approved path supply and review these settings:
+```yaml
+services:
+  retention:
+    build: .
+    schedule: "0 4 * * *"
+    calls: [api]
+    command: [python3, -m, context_intelligence_server.retention_job]
+```
 
 | Setting | Required choice |
 |---|---|
-| Schedule | `0 3 * * *`: daily at **03:00 UTC**, configurable by the operator; unlike the local systemd example, this does not follow Pacific daylight saving |
-| Retention age | Explicit `--older-than 60d` in this example: **operator policy**, not a release default; scheduled age is required and manual `blobs prune` remains `30d` by default |
-| Image | Observed `sha256` digest of the reviewed image delivered through the approved build/import pipeline; a commit-SHA tag can be rebuilt by nightly refresh and is not immutable content |
-| Command | Run the installed `context-intelligence-server` console entrypoint with the arguments below, after the reviewed credential bootstrap; do not start the API |
-| Per-execution limits | Parallelism **1**, replica completion count **1**, retry limit **0** |
-| Outer timeout | Greater than **1200 + 120 seconds**, with headroom for credential bootstrap, startup, and shutdown, within the approved platform's limit |
-| Access | Registry pull permission for the pinned image and HTTPS access to the approved API route, including DNS/TLS and any APIM policy |
-| Storage/credentials | Private ephemeral credential scratch space only; no server `/data` mount, Neo4j credentials, or storage-delete RBAC is needed by this API client |
+| Schedule | `0 4 * * *`: daily at **04:00 UTC**, independent of daylight saving |
+| Policy | Fixed **60d** storage modification age for this runner. Manual `blobs prune` retains its separate `30d` default. |
+| Image and command | Record the observed `sha256` digest of the reviewed job image. The effective command must run the Python module directly, not the API entrypoint or listener. A tag alone does not pin content. |
+| Per-execution limits | Verify effective parallelism **1**, replica completion count **1** and retry limit **0** before production use. |
+| Timeout | The runner fixes `--max-runtime 1200` and `--cancel-timeout 120`. Verify the effective platform timeout exceeds their sum with headroom for token acquisition, startup and shutdown. |
+| Access | The job needs registry pull and access to the platform-supplied HTTPS API route. It does not get a server `/data` mount, Neo4j credentials or storage-delete RBAC. |
 
 Parallelism 1 limits replicas **within one execution**; it is not a global mutex
 between cron executions. Executions can overlap. The server's one-current-job
 guard makes another scheduled invocation return `skipped_busy` without taking
 over or cancelling that job. Do not add automatic retries to defeat this guard.
-The timeout above is a job-budget requirement, not a claim that Azure generally
-has a 30-minute limit. Confirm the actual platform limit before provisioning.
 
-The image installs the console entrypoint from `pyproject.toml`
-`[project.scripts]` (`context_intelligence_server.cli:main`). Override the shipping
-`Dockerfile`'s `./docker-entrypoint.sh` bootstrap **as well as** its default server
-command: merely changing arguments still runs credential-generating bootstrap
-code. The reviewed job startup must obtain the token, invoke the console command,
-and clean up, without starting an API listener. Do **not** assume Azure CLI or
-`azure-identity` is installed in the current image.
+The runner uses platform-provided `API_URL`, `API_AUDIENCE` and
+`AZURE_CALLER_CLIENT_ID`. On each start it requests an app-only Entra token for
+that API audience through the Container Apps identity endpoint. It checks that
+the token can cover both per-run budgets plus margin and passes it to the
+existing `blobs prune-scheduled` client via a private ephemeral file, not a
+command-line value or committed token. Do not substitute a storage/ARM token,
+client secret, shared key or pre-minted token.
 
-**Credential bootstrap is an external prerequisite, not an implemented feature.**
-Before unattended use, arrange a reviewed bootstrap through the approved platform
-path that:
-
-1. Uses the job's managed identity to obtain a **fresh API-audience Entra JWT for
-   each run**, requesting the API's expected `.default` scope
-   (`api://<api-client-id>/.default` for the registration described in the
-   [identity guide](identity-management.md#service-callers-entra-app-tokens)).
-   A token for Azure Resource Manager or storage is not an API token.
-2. Has the API's `IdentityAdmin` App Role (or the configured `entra_admin_role`)
-   enabled for **Application** members and assigned to the caller's service
-   principal. An existing authorized administrator must register the caller's
-   `oid` through `PUT /admin/identities/{oid}`, mapping it to the intended
-   contributor. Azure RBAC `Reader`/`Contributor` roles do **not** confer API admin
-   authority; neither do the API's data roles alone.
-3. Verifies that the chosen HTTPS route, **including APIM**, accepts app-only admin
-   requests to the retention endpoints. A delegated-user route working is not
-   evidence that a managed-identity token works through that route.
-4. Checks that token lifetime covers the work budget **and cancellation budget**,
-   plus startup margin, before invoking the client. The CLI reads one bearer
-   credential; it neither obtains nor refreshes tokens, nor provides this
-   preflight lifetime check.
-5. Writes the raw JWT to a private scratch file owned by the client user: regular,
-   mode `0400` or `0600`, neither symlinked nor hardlinked, at most **8192 bytes**.
-   Use a private directory and arrange cleanup on normal exit and interruption,
-   with ephemeral-storage cleanup after forced termination. Never put token
-   contents in arguments, logs, shell tracing, or committed configuration.
-
-Despite its name, `--admin-key-file` contains the **JWT**, not a shared admin key,
-in Entra mode. Do not substitute a data key or a long-lived token file. No
-credential-bootstrap implementation or dependency installation is provided here.
+`calls: [api]` declares the platform service-to-service edge. Verify the actual
+job identity can reach the retention API with its app-only token; a working
+delegated-user call does not prove that route. Separately, assign the job
+principal the API's **`IdentityAdmin`** App Role (or configured
+`entra_admin_role`) for **Application** members. An authorized CI administrator
+must map the principal's **`oid`** through `PUT /admin/identities/{oid}`.
+Neither platform edge access nor the API's data roles nor Azure RBAC grants CI
+admin access. Keep all real identity and routing details private.
 
 ### 3. Preview production, review, then explicitly approve deletion
 
-Only after storage qualification and the prerequisites above, run the approved
-job once with **`--dry-run`**, leaving its recurring schedule disabled. This is
-the client command the reviewed bootstrap invokes; the endpoint and scratch path
-are **placeholders**, not a real endpoint or an existing credential:
+Only after storage qualification and authorization checks, run the approved
+job in **preview mode** via the platform. Its default command takes no
+arguments:
 
 ```bash
-context-intelligence-server blobs prune-scheduled \
-  --online --older-than 60d \
-  --server-url "https://<approved-api-endpoint>" \
-  --admin-key-file /private/retention-admin.jwt \
-  --max-runtime 1200 --cancel-timeout 120 --dry-run
+python3 -m context_intelligence_server.retention_job
 ```
 
-Dry-run creates a preview and cancels **only its owned preview UUID**, observing
+The module passes `--dry-run` to the underlying client. Dry-run creates a
+preview and cancels **only its owned preview UUID**, observing
 cancellation before reporting `dry_run`. A pre-existing active job produces
 `skipped_busy`; that is not a completed preview. Inspect the sanitized JSON
 receipt's cutoff, eligible file count, logical/allocated bytes, errors/changes,
@@ -798,17 +625,23 @@ Retain the receipt for operator review without credential/bootstrap logs.
 The **first apply includes the existing backlog** whose recognized payload
 `mtime_ns` is strictly older than server preview-start time minus 60 days. This
 is storage modification age, **not session age or last-access age**; equality,
-future-dated files, and changed candidates are retained. Confirm the backlog and
-policy with the data owner before approval. A preview is an estimate; apply
-rescans and can report different counts.
+future-dated files, and changed candidates are retained. Preview estimates the
+backlog; apply runs a new preview and may produce different counts. Review the
+actual preview with the data owner and obtain explicit production approval
+from the data and deployment owners before enabling deletion. Rehearse an
+approved backup and restore on equivalent storage, keeping payloads, expiry
+state and other coupled state consistent. Retention is **deletion, not an
+archive or a recovery system**.
 
-After explicit approval, remove **only `--dry-run`** from the reviewed command
-and enable the approved schedule. **Without `--dry-run`, `prune-scheduled` applies
-deletion without an interactive prompt. There is no `--apply` flag for this
-command.** It deletes recognized eligible blob payloads, not Neo4j graphs/session
-metadata, queues, or unknown files. Keep expiry tombstones and the retention
-lock/ledger: tombstones prevent replay from rehydrating expired payloads, and
-authenticated reads of absent expired blobs return **410 `blob_expired`**.
+Only after these gates, make a separate reviewed manifest change to add
+**`--apply`** to the job module's `command`. Review `up --dry-run` and reconcile
+it through the approved v2 path; verify the effective job command and first
+outcome. Unlike the Azure module, the lower-level `blobs prune-scheduled`
+applies without a prompt when called without `--dry-run`; it does **not** take
+`--apply`. Neither path deletes graph/session metadata, queues or unknown
+files. Preserve the retention lock and expiry ledger: tombstones prevent
+replay from rehydrating expired payloads. Authorized reads of missing expired
+blobs return **410 `blob_expired`**.
 
 ### 4. Monitor, disable, and update deliberately
 
@@ -829,20 +662,28 @@ specific UUID using the existing
 the same HTTPS URL and a fresh authorized admin credential. Observe a terminal
 state; never cancel an unrelated "current" job or bulk-delete storage as cleanup.
 
-Keep the job image pinned independently of routine API revision changes. Update
-the image pin, command, bootstrap, and schedule only through the reviewed
-pipeline/platform job-update path, then repeat dry-run review before re-enabling
-apply. Do not create redundant projects, mutate the server volume, or upgrade
-Amplifier Online merely to make this checklist appear provisioned.
+Project-level code rollout can affect the job as well as the API. Review the
+effective job image digest, command, schedule, identity and limits after a
+reconcile or rollout; repeat preview review before re-enabling apply. Do not
+create a separate production project, mutate the server volume, or grant the
+job direct access to the data store.
 
 ---
 
 ## Updating the server (build & deploy a new version — Neo4j-safe)
 
-Runbook for shipping **6.13.0** without reprovisioning Neo4j or the server volume.
-Placeholders in `<angle-brackets>`.
+For a routine v2 code rollout, keep the API volume, identities, private Bolt
+settings and Neo4j project unchanged. Review the ref and image compliance
+evidence (Step 1), then use the project-level command and acceptance checks in
+[Step 5](#step-5--reconcile-infrastructure-then-roll-out-the-reviewed-code).
+Do not combine a capacity change, password rotation, retention activation or
+v1 adoption with a routine code rollout.
 
 ### 6.11 to 6.13 upgrade and rollback boundary
+
+This older transition illustrates the stateful handoff; it is not a routine
+v2 adoption or downgrade recipe. Use the actual source/target versions and
+verify compatibility for the exact stored state before switching binaries.
 
 **Use a planned stop/handoff, not overlapping rolling revisions on shared
 `/data`.** 6.13 takes a nonblocking exclusive lock on the canonical state root
@@ -861,12 +702,10 @@ See [storage qualification](#1-qualify-storage-before-any-production-apply).
 
 **Operator checklist — before allowing the successor to write:**
 
-1. **Gate automatic replacement.** Arrange the maintenance window, producer
-   buffering/retry plan, and approved platform controls before publishing into a
-   production-deploy trigger. Matching main pushes can deploy; nightly image
-   rebuilds can replace commit-named image tags, but the scheduled workflow does
-   not deploy those builds automatically. Neither is a safe handoff mechanism by
-   itself. Keep retention schedules
+1. **Gate replacement.** Arrange the maintenance window, producer buffering/retry
+   plan and approved platform controls before requesting a rollout. Check for
+   any remaining automatic deploy triggers on older projects; neither automated
+   delivery nor selecting a v2 ref makes a safe writer handoff. Keep retention schedules
    disabled during the transition, and inspect/cancel any active owned job using
    the [existing UUID procedure](#4-monitor-disable-and-update-deliberately).
 2. **Inventory the actual configuration privately.** Resolve canonical paths from
@@ -898,24 +737,25 @@ See [storage qualification](#1-qualify-storage-before-any-production-apply).
    application consistency. Record matching configuration/secret references
    privately; do not dump credential contents. Plan reconciliation with graph
    state and producer-held events without changing the Neo4j VM in this rollout.
-4. **Match the actual artifact and start once.** Approve the image produced for
-   6.13.0 and record its observed registry **`sha256` digest**, including the
-   imported deployment image. A commit-SHA tag is not immutable: nightly refresh
-   can rebuild it. Do not invent a release tag or infer installed version from
-   source metadata. Only after the predecessor has fully stopped, start the
+4. **Match the actual artifact and start once.** Approve the selected ref and
+   resulting image and record the deployed image's observed registry **`sha256`
+   digest**. A commit-SHA tag alone does not pin content. Do not invent a
+   release tag or infer installed version from source metadata. Only after the
+   predecessor has fully stopped, start the
    successor as **one replica, one worker** against the same canonical roots,
    using the approved non-overlapping platform path. If that path cannot enforce
    the ordering, do not deploy. Keep scoped claims, grants, identity bindings,
    external credential references and storage layout intact.
-5. **Verify before restoring traffic/producers.** Confirm the actual image digest
-   and installed package version **6.13.0**; `/version.version` and
-   `/status.server_version` must match. Platform health alone is insufficient:
-   check top-level `/status` fields `identity_ready: true`, `identity_reason: null`,
+5. **Verify before restoring traffic/producers.** Confirm the actual image digest,
+   `/health` commit, and intended installed version (6.13.0 for this transition);
+   `/version.version` and `/status.server_version` must match. Platform health alone
+   is insufficient: check top-level `/status` fields `identity_ready: true`, `identity_reason: null`,
    `neo4j_connected: true`, `neo4j_query_connected: true`, `recovery_complete`
    and `recovery_error`. Inspect queue backlog and authenticated queue APIs
    (and recovery APIs when enabled),
    check expected blob reads and external/offline consumers against the new API,
-   and confirm identity/auth enforcement without printing credentials. Backlog
+   and confirm identity/auth enforcement, query and controlled ingestion as in
+   Step 5, without printing credentials. Backlog
    can remain while draining; do not disable scoped access or discard denied
    claims/queues to accelerate readiness. No destructive prune is needed for
    upgrade verification. Resume producers only after these checks are accepted.
@@ -941,118 +781,40 @@ but payload-only restoration does not clear expiry or supply a supported
 unexpire/rollback procedure; keep tombstones and require a reviewed restore plan.
 No automatic downgrade/restore tool or tested full rollback is promised here.
 
-**Pre-flight**
-- Repo `pyproject.toml` version == the version you're shipping.
-- `Dockerfile` `FROM` is the **approved MCR Azure Linux base** (not Docker Hub /
-  any non-approved base). If not, STOP — it fails S360.
-- Build from a clean, committed tree; capture `<sha> = git rev-parse --short HEAD`.
-
-**1. Build + deliver via CI push-to-deploy.** Bump `pyproject.toml`, commit on the
-approved base, and push — CI builds `ghcr.io/<owner>/<repo>-api:<sha>` and the
-provisioner imports it into `amplifieronlinecr`:
-```bash
-git commit -am "release: v6.13.0" && git push
-```
-There is **no manual `az acr build`** — the shared platform ACR rejects direct
-pushes (`UNAUTHORIZED`), and compliance is enforced **in CI** (approved `FROM` base
-→ Trivy CRITICAL/HIGH gate → SBOM + provenance attestation) before the image is
-imported. Watch the run and confirm the new revision:
-```bash
-amplifier-online status
-```
-
-**2. Update only the reviewed image reference in the manifest.** Record the
-observed imported image digest; the placeholder below is not a published image.
-Ensure the approved deploy request selects that same digest: an explicit image
-in the CI request can override the manifest pin.
-```yaml
-services:
-  api:
-    image: amplifieronlinecr.azurecr.io/<approved-image>@sha256:<observed-digest>
-    port: 8000
-```
-Do **not** change `name`, `stack`, `port`, the `/data` volume, `resources`, or any
-`NEO4J__*` env leaves. Preview first: `amplifier-online up --dry-run` — expect it
-to report the image reference change and **nothing** about the volume, Neo4j,
-or infra.
-If it wants to recreate the volume or change infra, STOP.
-
-**3. Deploy only through the approved non-overlapping handoff above.**
-`amplifier-online up` creates a revision on the existing app/volume/VNet, but is
-**not by itself a verified stop-before-start procedure**. Do not run it against
-an active predecessor and assume the new lock makes rolling replacement safe.
-
-**4. Re-apply the password secretRef env (REQUIRED after every `up`).** `up`
-rewrites the container's entire env list; the non-secret `NEO4J__*` leaves survive
-(they're in the manifest) but the password secretRef mappings are wiped. On Neo4j
-**Community**, both clients reference the **one** shared secret:
-```bash
-az containerapp update -n <container-app-name> -g <resource-group> \
-  --set-env-vars \
-    AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__ADMIN__PASSWORD=secretref:neo4j-password \
-    AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J__CYPHER_QUERY__PASSWORD=secretref:neo4j-password
-```
-> Bake this step into `deploy.sh` so a version bump can never boot without the
-> Neo4j password (a missing password trips the fail-loud validators and *looks*
-> like a Neo4j outage but is really a missing-env problem).
-
-**5. Verify:** use `amplifier-online status` + `amplifier-online logs --since 10`
-and the version, readiness, authenticated API and backlog checks above. Expect
-one running writer, no `access_mode` validation error, and Neo4j connected on
-**both** clients; a Running/Healthy revision alone is not release acceptance.
-
 ### Neo4j safety — guarantees & do-NOT-touch list
 
-**Why `amplifier-online up` cannot disturb Neo4j:** the Neo4j VM is a **separate
-Azure resource, not declared in `amplifier-online.yaml`**. `up` only reconciles the
-container app + its declared resources (image, port, `/data` volume, env). It has
-no handle on the VM, its managed disk, or its data — it cannot touch them. The
-server's `/data` volume is unrelated to Neo4j storage; a tag-only image bump does
-not alter it.
-
-**Do NOT touch during a version bump** (these are the *only* ways to break Neo4j):
+The Neo4j VM and its disk belong to a **separate project**, not to the API
+manifest. API releases still depend on the private network path, existing
+database credentials and compatibility with the graph. Leave these unchanged
+during a routine API rollout:
 - The Neo4j VM, its data disk, or snapshots/backups.
 - **VNet / subnet / NSG rules** — especially the Bolt `7687` allow-rule from the
   app subnet. Don't bundle network edits into a deploy window.
 - The `NEO4J__*__URL` values (private Bolt endpoint) — keep pointing at the same
   `<neo4j-private-address>:7687`. A wrong URL = server up, graph unreachable.
-- The Key Vault secret **values** (`context-intelligence-neo4j-user/-password`).
-  Re-applying the secret**ref** mapping is fine and required; changing the secret
-  **value** rotates the shared account and must be coordinated with the VM.
+- The AO-managed `neo4j-user` and `neo4j-password` **values** and their manifest
+  references. Database/secret rotation is a separate operation (Step 3).
 - The single-account model — do **not** invent a second read-only account on
   Community; there is only one pair.
-
-**On Community, prefer the flat single-account config** (`NEO4J_URL` /
-`NEO4J_USER` / `NEO4J_PASSWORD`) over the structured block: one account means the
-structured split buys no isolation and adds the `ACCESS_MODE=READ` defaults trap.
-The structured block (both passwords → the same secret) becomes worthwhile **only
-if you move to Neo4j Enterprise** and create a genuine read-only account with its
-own second secret.
 
 ---
 
 ## Persistence & durability — what survives a version bump
 
-Keeping the volume declaration unchanged preserves its backing resource across
-image changes. This is **not** a guarantee of schema compatibility, safe
-overlapping writers, or image-only rollback: follow the
+Keeping the v2 volume declaration unchanged is the expected path for retaining
+the same backing storage; verify the actual mount and state after a rollout.
+That does not guarantee schema compatibility, safe overlapping writers or
+image-only rollback: follow the
 [6.11 to 6.13 handoff and rollback gate](#611-to-613-upgrade-and-rollback-boundary).
 
 - **Server `/data`** — blobs (`/data/blobs`), the **oid identity map**
   (`/data/identity/entra-identities.json`), durable ingest queues (`/data/queues`),
   and logs — lives on an **Azure Files share**, a separate durable resource that
-  exists *independently* of the container image/revision. The image is stateless
-  compute; the share is stateful backing storage. `up` swaps the compute and
-  **re-mounts the same share** at `/data`. Nothing about a new revision recreates
-  or empties it.
-- **The oid identity map survives two ways:** (1) the file is on the durable share,
-  so a redeploy finds the existing authoritative map; (2) the `ENTRA_IDENTITIES`
-  seed is idempotent — it only populates an **empty** store, so it never overwrites
-  runtime identity edits made via the admin API.
-- **Key Vault is READ-ONLY in this flow.** `keyvaultref`/`secretref` only *read*
-  secret values at resolve time; nothing in the deploy writes to the vault. Mapping
-  a secretRef creates a reference *to* the secret — it does not mutate it. The
-  managed identity needs only **Key Vault Secrets User** (read).
+  exists *independently* of the container image/revision.
+- **The oid identity map** on the existing share remains authoritative. Verify
+  it is still present and usable; do not run the seeder to fix a missing mount.
+- **Key Vault references** in the API manifest select existing values. Rollout
+  does not replace the separately coordinated rotation of those values.
 - **Neo4j data** lives on the VM's **persistent managed data disk**, entirely
   outside the manifest (see Neo4j safety, above). Untouched by any server redeploy.
 
@@ -1062,27 +824,36 @@ overlapping writers, or image-only rollback: follow the
 |--------------------|-------------------|
 | Remove/rename the `volume:` block | New revision has no `/data` mount → writes to ephemeral FS |
 | Change `mount_path` | App reads an empty path; share persists but is "gone" from the server's view |
-| Change `size_gib` **or** add/change `tier` | Resize/tier change can **re-provision a new, empty share — no data migration** |
+| Resize without proving it is in place, or change `tier` | A replacement share is not a data migration; stop if the plan proposes replacement |
 | `amplifier-online destroy` | Tears down per-project resources including the share |
 | Delete/re-provision the Azure Files share or storage account out-of-band | Removes the backing store |
 
-`size_gib: 16` is safe to leave unchanged — leaving it is the safe path. **Treat
-any `size_gib`/`tier` edit as potentially destructive.** Keep infrastructure
-unchanged; the reviewed image reference and operational handoff are separate.
+### Capacity planning and in-place resize
+
+The v2 manifest configures a **2048 GiB** premium volume at `/data`. Monitor
+used capacity against quota and alert with time to act on the growth trend.
+Include queues, logs and retained blob payloads; measure actual share usage
+rather than assuming preview's estimated allocated bytes will be reclaimed.
+Capacity growth is separate from enabling deletion.
+
+If more headroom is needed, plan a separate v2 `size_gib` increase on the
+**same existing share**, up to **5120 GiB** under the current v2 volume limit.
+Confirm applicable platform limits, take and verify a recoverable backup, and
+review `amplifier-online up --dry-run` with the platform owner. Proceed with
+approved `up` only when in-place growth is established: preserve the mount
+path, tier and backing share; **stop** on any proposed recreation, replacement
+or uncertain storage effect. Afterwards verify quota, the unchanged backing
+share, and that the API can read existing state and process new ingestion.
 
 ### Protect-the-durable-data checklist (before a version bump)
 
 ```
-[ ] Manifest diff shows ONLY the reviewed image reference change.
-    volume block byte-identical: mount_path: /data, size_gib: 16
-    (no size_gib change, no tier added, no mount_path change).
-[ ] `amplifier-online up --dry-run` reports ONLY the image/revision change —
-    NO volume, share, or storage change. If it mentions volume/storage → STOP.
+[ ] Reviewed code ref recorded; no change to API volume, storage paths, or
+    credential references. Infra changes require a separate reviewed plan.
 [ ] Complete the quiescent, consistent coupled-state backup and rollback review
     above; a live share snapshot alone is not sufficient.
 [ ] Do NOT run `amplifier-online destroy`; do NOT touch the share/storage account.
-[ ] Key Vault: READ + map only (secretref/keyvaultref). No `az keyvault secret set`.
-[ ] After `up`: re-apply the password secretRef env (mandatory every up), then
-    verify /data intact — blobs under /data/blobs, and
-    /data/identity/entra-identities.json non-empty and unchanged.
+[ ] Do not rotate or manually rewrite credentials during the code rollout.
+[ ] After deploy, verify the /health commit, same backing share and existing
+    identities, authorized Neo4j reads, and accepted test ingestion actually drained.
 ```
