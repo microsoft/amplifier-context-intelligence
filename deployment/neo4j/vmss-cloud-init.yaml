@@ -32,8 +32,10 @@
 # cleanly; after the reimage Neo4j answered in ~2.5 minutes, the data disk came back under a
 # different device name and the UUID mount handled it; GDS 2.13.11 (423 procedures) and
 # APOC 5.26.27 (190 procedures) loaded; both databases online.
-# Pair with the Application Health extension on the scale set: protocol http, port 7474,
-# requestPath "/". Do not use the AutomaticByPlatform patch mode with automatic OS upgrades.
+# Pair with the Application Health extension on the scale set and the VM: protocol tcp, port 7687.
+# Not http on 7474: extension v2 requires a JSON response to carry 'ApplicationHealthState', which
+# Neo4j's discovery document doesn't, so every probe counts as unhealthy once the grace period ends.
+# Do not use the AutomaticByPlatform patch mode with automatic OS upgrades.
 
 bootcmd:
   # Runs every boot, before the users module and package installs: reserve the ids first.
@@ -171,6 +173,8 @@ write_files:
 runcmd:
   - [ /usr/local/sbin/neo4j-provision.sh ]
 
-# Pair with the Application Health extension on the scale set, probing http://127.0.0.1:7474/
-# (protocol http, port 7474, requestPath "/"). If provisioning fails, Neo4j never starts, the probe
-# fails, and an automatic OS upgrade stops at this instance instead of continuing.
+# Pair with the Application Health extension on the scale set and the VM: protocol tcp, port 7687.
+# (Not http on 7474: extension v2 requires a JSON response to carry 'ApplicationHealthState', which
+# Neo4j's discovery document doesn't, so every probe counts as unhealthy once the grace period ends.)
+# If provisioning fails, Neo4j never starts, the probe fails, and an automatic OS upgrade stops at
+# this instance instead of continuing.
