@@ -1,0 +1,171 @@
+#cloud-config
+# Minimal cloud-init for the Neo4j VM as a VMSS Flex instance with automatic OS image upgrades.
+#
+# Alternative to the generated cloud-init.yaml in this folder: a smaller, self-contained
+# provisioner with no credential handling. Neo4j's users and passwords live in the system
+# database on the retained data disk, so nothing here creates, reads or resets credentials.
+#
+# Render before use (deployment inputs; keep real values out of this repository):
+#   __NEO4J_DATA_FILESYSTEM_UUID__       filesystem UUID of the retained data disk
+#   __NEO4J_BOLT_ADVERTISED_ADDRESS__    host:port clients use for Bolt
+# e.g. sed -e "s/__NEO4J_DATA_FILESYSTEM_UUID__/$UUID/" -e "s/__NEO4J_BOLT_ADVERTISED_ADDRESS__/$ADDR/"
+#
+# On every build, including each automatic OS upgrade (new OS disk, same data disk):
+#   1. Create the neo4j user/group with the same numeric ids as the files on the data disk
+#      (113:122), before any package can take those ids.
+#   2. Mount the data disk by filesystem UUID (device names change across rebuilds).
+#   3. Install pinned Java 21 and Neo4j 1:5.26.27 from Neo4j's apt repository, after checking
+#      the signing key's fingerprint, with the package's auto-start blocked.
+#   4. Write neo4j.conf and the RequiresMountsFor drop-in.
+#   5. Plugins: APOC core from the package's labs/ folder; GDS 2.13.11 from the official
+#      download, both SHA-256 checked. Any failure stops here and Neo4j is not started, so the
+#      Application Health extension reports unhealthy and an automatic upgrade halts.
+#   6. Check the data disk holds the existing store, then enable and start Neo4j.
+#
+# Validated 2026-11-24 on a Flex scale set built from a copy of the production data disk
+# (Ubuntu 22.04 LTS Gen2): first boot and a full reimage (OS disk replaced) both provisioned
+# cleanly; after the reimage Neo4j answered in ~2.5 minutes, the data disk came back under a
+# different device name and the UUID mount handled it; GDS 2.13.11 (423 procedures) and
+# APOC 5.26.27 (190 procedures) loaded; both databases online.
+# Pair with the Application Health extension on the scale set: protocol http, port 7474,
+# requestPath "/". Do not use the AutomaticByPlatform patch mode with automatic OS upgrades.
+
+bootcmd:
+  # Runs every boot, before the users module and package installs: reserve the ids first.
+  - [ sh, -c, 'getent group neo4j >/dev/null || groupadd --system --gid 122 neo4j' ]
+  - [ sh, -c, 'getent passwd neo4j >/dev/null || useradd --system --uid 113 --gid 122 --home-dir /var/lib/neo4j --no-create-home --shell /bin/bash neo4j' ]
+
+mounts:
+  - [ "UUID=__NEO4J_DATA_FILESYSTEM_UUID__", "/mnt/neo4j-data", "ext4", "defaults,nofail", "0", "2" ]
+
+write_files:
+  - path: /usr/sbin/policy-rc.d
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # Block package scripts from starting services during provisioning; removed at the end.
+      exit 101
+  - path: /etc/systemd/system/neo4j.service.d/requiresmount.conf
+    permissions: "0644"
+    content: |
+      [Unit]
+      RequiresMountsFor=/mnt/neo4j-data
+  - path: /etc/neo4j-provision/neo4j.conf
+    permissions: "0644"
+    content: |
+      server.directories.data=/mnt/neo4j-data
+      server.directories.plugins=/var/lib/neo4j/plugins
+      server.directories.logs=/var/log/neo4j
+      server.directories.lib=/usr/share/neo4j/lib
+      server.directories.import=/var/lib/neo4j/import
+      server.logs.config=/etc/neo4j/server-logs.xml
+      server.logs.user.config=/etc/neo4j/user-logs.xml
+      server.default_listen_address=0.0.0.0
+      server.bolt.enabled=true
+      server.bolt.listen_address=0.0.0.0:7687
+      server.bolt.advertised_address=__NEO4J_BOLT_ADVERTISED_ADDRESS__
+      server.bolt.tls_level=DISABLED
+      server.http.enabled=true
+      server.http.listen_address=127.0.0.1:7474
+      server.https.enabled=false
+      dbms.security.auth_enabled=true
+      dbms.security.procedures.unrestricted=gds.*,apoc.*
+      dbms.security.procedures.allowlist=gds.*,apoc.*
+      db.tx_log.rotation.retention_policy=2 days 2G
+      server.windows_service_name=neo4j
+      server.jvm.additional=-XX:+UseG1GC
+      server.jvm.additional=-XX:-OmitStackTraceInFastThrow
+      server.jvm.additional=-XX:+AlwaysPreTouch
+      server.jvm.additional=-XX:+UnlockExperimentalVMOptions
+      server.jvm.additional=-XX:+TrustFinalNonStaticFields
+      server.jvm.additional=-XX:+DisableExplicitGC
+      server.jvm.additional=-Djdk.nio.maxCachedBufferSize=1024
+      server.jvm.additional=-Dio.netty.tryReflectionSetAccessible=true
+      server.jvm.additional=-Djdk.tls.ephemeralDHKeySize=2048
+      server.jvm.additional=-Djdk.tls.rejectClientInitiatedRenegotiation=true
+      server.jvm.additional=-XX:FlightRecorderOptions=stackdepth=256
+      server.jvm.additional=-XX:+UnlockDiagnosticVMOptions
+      server.jvm.additional=-XX:+DebugNonSafepoints
+      server.jvm.additional=--add-opens=java.base/java.nio=ALL-UNNAMED
+      server.jvm.additional=--add-opens=java.base/java.io=ALL-UNNAMED
+      server.jvm.additional=--add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+      server.jvm.additional=--enable-native-access=ALL-UNNAMED
+      server.jvm.additional=-Dlog4j2.disable.jmx=true
+      server.jvm.additional=-Dlog4j.layout.jsonTemplate.maxStringLength=32768
+  - path: /usr/local/sbin/neo4j-provision.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # Fail on any error: Neo4j is only started if every step below succeeds.
+      set -euo pipefail
+      log() { echo "[neo4j-provision] $*"; }
+
+      NEO4J_VERSION="1:5.26.27"
+      REPO_KEY_FPR="1EEFB8767D4924B86EAD08A459D700E4D37F5F19"
+      APOC_JAR="apoc-5.26.27-core.jar"
+      APOC_SHA256="6c8c6ad72ef3f121b85d081407bbe7b5a570500cb6ae51fdc5385d54d26b2ffa"
+      GDS_JAR="neo4j-graph-data-science-2.13.11.jar"
+      GDS_URL="https://graphdatascience.ninja/${GDS_JAR}"
+      GDS_SHA256="c3f9f0617e8ad651c1c6fdafc520c79324fea3790e416d45d5c2712c4760011e"
+      DATA=/mnt/neo4j-data
+      PLUGINS=/var/lib/neo4j/plugins
+
+      log "1. ids"
+      [ "$(id -u neo4j)" = "113" ] && [ "$(id -g neo4j)" = "122" ] || { log "neo4j is not 113:122"; exit 1; }
+
+      log "2. data disk"
+      mountpoint -q "$DATA" || mount "$DATA"
+      mountpoint -q "$DATA" || { log "data disk not mounted"; exit 1; }
+      # Refuse to run against an empty or wrong disk: the existing store must be there.
+      for p in databases/neo4j databases/system transactions/neo4j server_id; do
+        [ -e "$DATA/$p" ] || { log "missing $DATA/$p: not the Neo4j data disk"; exit 1; }
+      done
+      [ "$(stat -c %u:%g "$DATA/databases/neo4j")" = "113:122" ] || { log "data owner is not 113:122"; exit 1; }
+
+      log "3. packages"
+      install -d -m 0755 /etc/apt/keyrings
+      curl -fsSL https://debian.neo4j.com/neotechnology.gpg.key -o /tmp/neo4j.key
+      gpg --show-keys --with-colons /tmp/neo4j.key | grep -q "^fpr:::::::::${REPO_KEY_FPR}:" || { log "repo key fingerprint mismatch"; exit 1; }
+      gpg --dearmor < /tmp/neo4j.key > /etc/apt/keyrings/neotechnology.gpg
+      echo "deb [signed-by=/etc/apt/keyrings/neotechnology.gpg] https://debian.neo4j.com stable 5" > /etc/apt/sources.list.d/neo4j.list
+      apt-get update -q
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -q openjdk-21-jre-headless "neo4j=${NEO4J_VERSION}"
+      apt-mark hold neo4j
+      systemctl stop neo4j 2>/dev/null || true
+      systemctl disable neo4j 2>/dev/null || true
+
+      log "4. configuration"
+      cp /etc/neo4j/neo4j.conf /etc/neo4j/neo4j.conf.package
+      install -o neo4j -g adm -m 0644 /etc/neo4j-provision/neo4j.conf /etc/neo4j/neo4j.conf
+      systemctl daemon-reload
+
+      log "5. plugins"
+      install -d -o neo4j -g neo4j -m 0755 "$PLUGINS"
+      # APOC core ships with the package; check it before using it.
+      APOC_SRC=$(ls /var/lib/neo4j/labs/${APOC_JAR} 2>/dev/null || true)
+      [ -n "$APOC_SRC" ] || { log "$APOC_JAR not found in the package's labs/"; exit 1; }
+      echo "${APOC_SHA256}  ${APOC_SRC}" | sha256sum -c - || { log "APOC hash mismatch"; exit 1; }
+      install -o neo4j -g neo4j -m 0644 "$APOC_SRC" "$PLUGINS/$APOC_JAR"
+      # GDS: official download, pinned and hash-checked.
+      curl -fsSL --retry 5 --retry-delay 10 -o "/tmp/${GDS_JAR}" "$GDS_URL"
+      echo "${GDS_SHA256}  /tmp/${GDS_JAR}" | sha256sum -c - || { log "GDS hash mismatch"; exit 1; }
+      install -o neo4j -g neo4j -m 0644 "/tmp/${GDS_JAR}" "$PLUGINS/$GDS_JAR"
+
+      log "6. start"
+      rm -f /usr/sbin/policy-rc.d
+      systemctl enable neo4j
+      systemctl start neo4j
+      # Up to 15 minutes: a first start after an unclean stop (or on a disk restored from a snapshot)
+      # can take ~8 minutes. A normal rebuild took ~2.5 minutes in the 2026-11-24 rehearsal.
+      for i in $(seq 1 180); do
+        curl -fs http://127.0.0.1:7474/ >/dev/null && { log "neo4j is up"; exit 0; }
+        sleep 5
+      done
+      log "neo4j did not answer on 127.0.0.1:7474 within 15 minutes"; exit 1
+
+runcmd:
+  - [ /usr/local/sbin/neo4j-provision.sh ]
+
+# Pair with the Application Health extension on the scale set, probing http://127.0.0.1:7474/
+# (protocol http, port 7474, requestPath "/"). If provisioning fails, Neo4j never starts, the probe
+# fails, and an automatic OS upgrade stops at this instance instead of continuing.
