@@ -5,6 +5,11 @@
 # provisioner with no credential handling. Neo4j's users and passwords live in the system
 # database on the retained data disk, so nothing here creates, reads or resets credentials.
 #
+# RETAINED-DISK ONLY. This rebuilds the OS around an existing Neo4j data disk; it is not an
+# installer. On an empty or unrecognized disk it stops before installing anything (no format, no
+# initial password, no new store). Disaster recovery = create a disk from the latest snapshot of
+# the data disk, attach it, and let this cloud-init bring Neo4j up with its users intact.
+#
 # Render before use (deployment inputs; keep real values out of this repository):
 #   __NEO4J_DATA_FILESYSTEM_UUID__       filesystem UUID of the retained data disk
 #   __NEO4J_BOLT_ADVERTISED_ADDRESS__    host:port clients use for Bolt
