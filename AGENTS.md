@@ -273,8 +273,8 @@ Preserve sanitized JSON receipts, finite work/cleanup budgets, scoped SIGTERM
 handling, and the interactive command's TTY/no-`--yes` guard. No server/schema
 changes, scheduler auto-install, or ingestion stop/restart hooks. User-unit setup:
 `docs/service-setup.md` → "Nightly online pruning — explicit unattended opt-in".
-On Azure, the v2 manifest provisions a separate managed-identity job at 04:00
-UTC (`services.retention.schedule`, `calls: [api]`). The module
+On Azure, the Amplifier Online manifest provisions a separate managed-identity
+job at 04:00 UTC (`services.retention.schedule`, `calls: [api]`). The module
 `context_intelligence_server.retention_job` previews the fixed 60-day policy by
 default; only an explicit `--apply` in the reviewed job command enables deletion.
 The job gets no `/data` mount, storage-delete rights, or Neo4j credentials. Keep
@@ -403,9 +403,9 @@ Both auth modes can add/remove identities **at runtime, no restart**, via the
 
 Canonical guide: `docs/identity-management.md`.
 
-### Deploying to Azure / Amplifier Online v2
+### Deploying to Azure / Amplifier Online
 
-`amplifier-online.yaml` defines the v2 project (`services.api`, its `/data`
+`amplifier-online.yaml` defines the project (`services.api`, its `/data`
 volume, and the separate scheduled `services.retention`). For infrastructure or
 manifest changes, review `amplifier-online up --dry-run` before an approved
 `amplifier-online up`. For code rollout use project-level

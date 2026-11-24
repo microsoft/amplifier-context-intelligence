@@ -117,7 +117,7 @@ client command described below.
 
 For Azure, use the separate
 [Azure scheduled blob retention runbook](azure-deployment.md#azure-scheduled-blob-retention--explicit-opt-in):
-the Amplifier Online v2 job is scheduled at 04:00 UTC with a `60d` cutoff and
+the Amplifier Online job is scheduled at 04:00 UTC with a `60d` cutoff and
 previews by default. It obtains a fresh API token using its managed identity;
 Azure Files must be qualified and the backlog reviewed before production apply.
 The local timer below remains separate: neither the core API nor the generic

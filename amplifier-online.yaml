@@ -1,5 +1,5 @@
-# Amplifier Online (v2) manifest for context-intelligence.
-# Upgraded from v1 (web-app-aca + auth.expose); the v1 file is amplifier-online.v1.yaml.
+# Amplifier Online manifest for context-intelligence.
+# The legacy web-app-aca manifest is archived in amplifier-online.v1.yaml.
 # Deploy: `amplifier-online deploy` (builds this repo through the platform pipeline).
 #
 # Auth: Container Apps built-in auth checks every bearer token (audience

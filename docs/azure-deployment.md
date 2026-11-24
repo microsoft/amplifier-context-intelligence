@@ -1,11 +1,11 @@
 # Deploying to Azure (compliant, via `amplifier-online`)
 
-This guide covers the **Amplifier Online (AO) v2** API project declared in
+This guide covers the **Amplifier Online (AO)** API project declared in
 [`amplifier-online.yaml`](../amplifier-online.yaml). Use `amplifier-online up` to
 reconcile infrastructure and manifest changes, and `amplifier-online deploy --ref`
 to build and roll out a reviewed code revision. The earlier `web-app-aca` API
-manifest and its push-to-deploy workflow are historical, not routine v2 steps.
-Adopting a v1 project into v2 or rolling back to it is a separately reviewed
+manifest and its push-to-deploy workflow are historical. Migrating a legacy
+project or rolling back to the legacy deployment is a separately reviewed
 operation: verify the actual storage, identity and writer handoff first.
 
 Use placeholders for the API deployment examples; resolve real resource and
@@ -74,7 +74,7 @@ The image build/run is exercised by `tests/integration/test_docker_image.py`.
 
 ### The image is built on the approved base, then imported and deployed by `amplifier-online`
 
-The v2 manifest uses `services.api.build: .` to build from this repository's
+The manifest uses `services.api.build: .` to build from this repository's
 `Dockerfile`. Amplifier Online owns image delivery and revision creation. Do not
 create an app by hand or push to the shared platform registry. A source push or
 passing GitHub CI is not a deployment or proof that the running revision meets
@@ -102,16 +102,16 @@ Have these in place before you deploy:
   az login
   az account set --subscription "<your-subscription>"
   ```
-- **`amplifier-online` CLI** with v2 project support, authenticated to the
-  intended project and Azure subscription. Confirm it supports `up --dry-run`
-  and project-level `deploy --ref` before proceeding.
+- **`amplifier-online` CLI**, authenticated to the intended project and Azure
+  subscription. Confirm it supports `up --dry-run` and project-level
+  `deploy --ref` before proceeding.
 - `jq` and `curl` (used by the identity-seed step).
 
 **Azure resources / access:**
 
 - A **subscription** and **resource group** you can deploy into.
 - **No project ACR to create.** Use Amplifier Online's image delivery path.
-- **No hand-rolled VNet/subnet/NSG.** The v2 API service runs in the shared
+- **No hand-rolled VNet/subnet/NSG.** The API service runs in the shared
   platform VNet; the Neo4j VM is a separate **`vm`-stack** Amplifier Online project
   that owns its own private subnet placement and NSG (see Step 2).
 - The **AO-managed project vault** and authorized access to maintain the project
@@ -135,7 +135,8 @@ Linux base** (see the policy section above) before it is pushed and deployed.
 Select a reviewed source ref, record the commit it resolves to, and confirm its
 repository checks and approved Azure Linux base. Separately verify the applicable
 image scan, SBOM and provenance evidence for the artifact that will be deployed.
-Do not assume the v1 generated workflow runs those checks for a v2 build.
+Do not assume the legacy generated workflow runs those checks for an Amplifier
+Online build.
 
 ---
 
@@ -269,7 +270,7 @@ RETURN gds.version();
 
 ### 2d. How the web app reaches it
 
-The v2 API project still reaches the separate Neo4j VM over **private Bolt** on
+The API project reaches the separate Neo4j VM over **private Bolt** on
 the shared platform VNet. Preserve the existing private endpoint and the VM NSG
 allow rule for TCP 7687 from the app's egress subnet; do not expose Bolt publicly.
 The guest provisioning example above is not an API deployment or credential
@@ -279,7 +280,7 @@ rotation procedure. For current API credential wiring, use Step 3.
 
 ## Step 3 — Wire and rotate Neo4j credentials
 
-The v2 manifest declares the API's credential references under top-level
+The manifest declares the API's credential references under top-level
 `secrets`, using `keyVaultSecret` and `service: api`. Both Neo4j clients use
 `neo4j-user` and `neo4j-password` in the **AO-managed project vault**. Keep the
 Bolt URL and access modes in the API's `env` mapping; never put credential values
@@ -312,7 +313,7 @@ service interruption between changing the database and refreshing the API.
    event actually drains into Neo4j. `/health`, an accepted secret write, or a
    `202` from ingress alone doesn't prove the new credential works.
 
-The legacy vault is **not the v2 API's credential source**. It may still serve
+The legacy vault is **not the API's credential source**. It may still serve
 other consumers, be maintained as an upstream copy with an explicitly approved
 manual sync, or be needed for rollback. Updating it does not update the AO vault.
 Do not remove an old **Key Vault Secrets User** assignment until the owner has
@@ -348,7 +349,7 @@ GRANT ROLE reader TO readonly;
 > write protection at all. Real read-only isolation comes only from an Enterprise
 > `reader`-role account.
 
-Keep the v2 manifest's guard against silently falling back to flat settings:
+Keep the manifest's guard against silently falling back to flat settings:
 
 ```
 AMPLIFIER_CONTEXT_INTELLIGENCE_SERVER_NEO4J_REQUIRE_EXPLICIT_CLIENTS=true
@@ -360,10 +361,10 @@ missing structured block can't silently degrade to one shared account.
 
 ---
 
-## Step 4 — Review the Amplifier Online v2 manifest
+## Step 4 — Review the Amplifier Online manifest
 
 Use the checked-in [`amplifier-online.yaml`](../amplifier-online.yaml) as the
-source of truth. The excerpt below shows the v2 service, volume and secret-ref
+source of truth. The excerpt below shows the service, volume and secret-ref
 structure only; it is not a complete replacement manifest. Keep the existing API
 registration, caller allowlist, internal Bolt endpoint, and durable paths.
 
@@ -408,9 +409,9 @@ amplifier-online up --dry-run
 amplifier-online up
 ```
 
-For a **code-only rollout** on existing v2 infrastructure, deploy the reviewed
-ref at **project scope**; don't run `up` as a substitute or assume that pushing
-the ref deploys it. Complete the
+For a **code-only rollout** on existing Amplifier Online infrastructure, deploy
+the reviewed ref at **project scope**; don't run `up` as a substitute or assume
+that pushing the ref deploys it. Complete the
 [non-overlapping handoff](#611-to-613-upgrade-and-rollback-boundary) before
 allowing a successor to write. Review impact on the scheduled job as well as
 the API when rolling out the project.
@@ -442,7 +443,7 @@ variables are:
 | `AUTH_MODE=entra` | yes | Select the Entra resolver |
 | `AZURE_CLIENT_ID` | yes | App Registration (client) GUID |
 | `AZURE_TENANT_ID` | yes | Azure AD tenant GUID |
-| `ENTRA_IDENTITIES` (JSON) | no | Optional initial `oid → {id}` map (**PII**). On v2 seed fresh `/data` via the admin API instead of committing a map. Unmapped data callers are denied. |
+| `ENTRA_IDENTITIES` (JSON) | no | Optional initial `oid → {id}` map (**PII**). Seed fresh `/data` via the admin API instead of committing a map. Unmapped data callers are denied. |
 | `SERVICE_IDENTITIES` (JSON) | no | First-boot seed for **service** principals into the same shared identity store `entra_identities` uses — not itself an auth gate, but an unmapped role-bearing service now gets **403**; may be empty, and identities can be onboarded/removed later via `/admin/identities`, no redeploy |
 | `SERVICE_DATA_ROLE` | no | App Role granting service write+read (default `Contributor`) |
 | `READER_ROLE` | no | App Role granting service read-only (default `Reader`) |
@@ -501,13 +502,13 @@ private: `--check` also prints identifiers. See
 The existing `deploy.sh` wrapper runs `up` and then the seed (`--no-seed` runs
 only `up`); it does not select or roll out a reviewed code ref. Use the seeder
 directly for approved fresh-volume onboarding after the readiness check, not
-the wrapper for a routine v2 rollout.
+the wrapper for a routine rollout.
 
 ---
 
 ## TLS and connecting the Amplifier bundle
 
-The v2 platform edge terminates HTTPS for the API, whose container listens on
+The Amplifier Online edge terminates HTTPS for the API, whose container listens on
 port 8000. Use the project-approved HTTPS route and satisfy both platform
 edge and Context Intelligence authorization.
 
@@ -525,7 +526,7 @@ overrides:
 
 ## Azure scheduled blob retention — explicit opt-in
 
-The v2 manifest declares a separate **Azure Container Apps scheduled Job** in
+The manifest declares a separate **Azure Container Apps scheduled Job** in
 the API's project. The runner calls the existing online retention API and
 defaults to a non-deleting preview. Reconciling the schedule can enable recurring
 previews; it is not approval to apply retention. Review the plan and obtain
@@ -635,8 +636,8 @@ archive or a recovery system**.
 
 Only after these gates, make a separate reviewed manifest change to add
 **`--apply`** to the job module's `command`. Review `up --dry-run` and reconcile
-it through the approved v2 path; verify the effective job command and first
-outcome. Unlike the Azure module, the lower-level `blobs prune-scheduled`
+it through the approved Amplifier Online path; verify the effective job command
+and first outcome. Unlike the Azure module, the lower-level `blobs prune-scheduled`
 applies without a prompt when called without `--dry-run`; it does **not** take
 `--apply`. Neither path deletes graph/session metadata, queues or unknown
 files. Preserve the retention lock and expiry ledger: tombstones prevent
@@ -672,18 +673,19 @@ job direct access to the data store.
 
 ## Updating the server (build & deploy a new version — Neo4j-safe)
 
-For a routine v2 code rollout, keep the API volume, identities, private Bolt
+For a routine code rollout, keep the API volume, identities, private Bolt
 settings and Neo4j project unchanged. Review the ref and image compliance
 evidence (Step 1), then use the project-level command and acceptance checks in
 [Step 5](#step-5--reconcile-infrastructure-then-roll-out-the-reviewed-code).
 Do not combine a capacity change, password rotation, retention activation or
-v1 adoption with a routine code rollout.
+legacy project migration with a routine code rollout.
 
 ### 6.11 to 6.13 upgrade and rollback boundary
 
-This older transition illustrates the stateful handoff; it is not a routine
-v2 adoption or downgrade recipe. Use the actual source/target versions and
-verify compatibility for the exact stored state before switching binaries.
+This older transition illustrates the stateful handoff; it is not a recipe for
+migrating legacy infrastructure or downgrading the server. Use the actual source
+and target versions and verify compatibility for the exact stored state before
+switching binaries.
 
 **Use a planned stop/handoff, not overlapping rolling revisions on shared
 `/data`.** 6.13 takes a nonblocking exclusive lock on the canonical state root
@@ -705,8 +707,8 @@ See [storage qualification](#1-qualify-storage-before-any-production-apply).
 1. **Gate replacement.** Arrange the maintenance window, producer buffering/retry
    plan and approved platform controls before requesting a rollout. Check for
    any remaining automatic deploy triggers on older projects; neither automated
-   delivery nor selecting a v2 ref makes a safe writer handoff. Keep retention schedules
-   disabled during the transition, and inspect/cancel any active owned job using
+   delivery nor selecting a code ref makes a safe writer handoff. Keep retention
+   schedules disabled during the transition, and inspect/cancel any active owned job using
    the [existing UUID procedure](#4-monitor-disable-and-update-deliberately).
 2. **Inventory the actual configuration privately.** Resolve canonical paths from
    effective settings, not just the illustrative `/data` layout:
@@ -801,7 +803,7 @@ during a routine API rollout:
 
 ## Persistence & durability — what survives a version bump
 
-Keeping the v2 volume declaration unchanged is the expected path for retaining
+Keeping the volume declaration unchanged is the expected path for retaining
 the same backing storage; verify the actual mount and state after a rollout.
 That does not guarantee schema compatibility, safe overlapping writers or
 image-only rollback: follow the
@@ -830,14 +832,15 @@ image-only rollback: follow the
 
 ### Capacity planning and in-place resize
 
-The v2 manifest configures a **2048 GiB** premium volume at `/data`. Monitor
+The manifest configures a **2048 GiB** premium volume at `/data`. Monitor
 used capacity against quota and alert with time to act on the growth trend.
 Include queues, logs and retained blob payloads; measure actual share usage
 rather than assuming preview's estimated allocated bytes will be reclaimed.
 Capacity growth is separate from enabling deletion.
 
-If more headroom is needed, plan a separate v2 `size_gib` increase on the
-**same existing share**, up to **5120 GiB** under the current v2 volume limit.
+If more headroom is needed, plan a separate `size_gib` increase on the
+**same existing share**, up to **5120 GiB** under the Amplifier Online volume
+limit.
 Confirm applicable platform limits, take and verify a recoverable backup, and
 review `amplifier-online up --dry-run` with the platform owner. Proceed with
 approved `up` only when in-place growth is established: preserve the mount
