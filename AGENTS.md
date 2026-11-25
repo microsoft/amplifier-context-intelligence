@@ -24,20 +24,13 @@ See [README.md](README.md) for full setup instructions.
 - `docs/` contains product documentation only. Put plans and fix designs in the
   workspace-root `docs/`, not in this repository's `docs/`.
 
-### Retained-store Neo4j cloud-init (review candidate)
+### Neo4j VMSS Flex cloud-init
 
-This candidate covers `deployment/neo4j/` and Step 2c of
-`docs/azure-deployment.md`, not the API or server runtime. The generated
-cloud-config is for review, not deployed infrastructure. Run the offline suite
-with `python3 -B -m unittest discover -s deployment/neo4j -p 'test_*.py' -v`.
-Never run the guest `bootstrap` on the development host; imports/rendering are
-side-effect-free with respect to guest operations. Real inputs/rendered configs
-stay git-ignored; clone/rebuild, guest and compliance acceptance remain separate.
-
-Retained-plugin OS-upgrade strategy is owned by
-[`docs/azure-deployment.md`, Step 2c](docs/azure-deployment.md#retained-plugin-strategy-for-os-image-upgrades):
-retain approved JARs, rebuild OS tooling/config; layout fixes and clone acceptance
-remain pending. Do not duplicate the strategy here or treat it as deployed.
+`deployment/neo4j/vmss-cloud-init.yaml` rebuilds the OS around an initialized
+data disk. See Step 2c of `docs/azure-deployment.md` for rebuild, snapshot
+restore, and the separate greenfield path. Keep filled deployment inputs out of
+Git. Validate the template offline with `cloud-init schema`; never execute its
+guest provisioner on the development host or test with the live disk.
 
 ---
 

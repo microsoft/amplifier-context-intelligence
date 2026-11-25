@@ -20,13 +20,10 @@ MagicMock/
 scripts/entra-identities.local.json
 entra-identities.local.json
 
-# Retained Neo4j: filled inputs/configs carry real identity and guest details.
-# Only the null-input example and generated review candidate belong in source.
+# Neo4j: keep filled deployment inputs and rendered cloud-init out of source.
 /deployment/neo4j/*.json
-!/deployment/neo4j/inputs.example.json
 /deployment/neo4j/*.yaml
-!/deployment/neo4j/cloud-init.yaml
-# Placeholder-only template (real values are rendered at deploy time).
+/deployment/neo4j/*.yml
 !/deployment/neo4j/vmss-cloud-init.yaml
 /deployment/neo4j/*.conf
 /deployment/neo4j/*.env

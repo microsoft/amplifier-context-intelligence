@@ -1,41 +1,32 @@
 #cloud-config
 # Minimal cloud-init for the Neo4j VM as a VMSS Flex instance with automatic OS image upgrades.
 #
-# Alternative to the generated cloud-init.yaml in this folder: a smaller, self-contained
-# provisioner with no credential handling. Neo4j's users and passwords live in the system
-# database on the retained data disk, so nothing here creates, reads or resets credentials.
+# Neo4j's existing users and credentials are stored in the system database on the
+# retained disk. This provisioner does not read Key Vault or set or reset credentials.
 #
-# RETAINED-DISK ONLY. This rebuilds the OS around an existing Neo4j data disk; it is not an
-# installer. On an empty or unrecognized disk it stops before installing anything (no format, no
-# initial password, no new store). Disaster recovery = create a disk from the latest snapshot of
-# the data disk, attach it, and let this cloud-init bring Neo4j up with its users intact.
+# RETAINED-DISK ONLY. An empty or incompatible data disk fails the pre-install
+# checks. This template never formats a disk or creates a store. For recovery,
+# restore the latest approved snapshot to a new writable disk and attach it
+# before first boot. A truly new deployment needs a separate one-time initializer
+# for the empty disk and Key Vault-backed initial password; see Azure deployment Step 2c.
 #
 # Render before use (deployment inputs; keep real values out of this repository):
 #   __NEO4J_DATA_FILESYSTEM_UUID__       filesystem UUID of the retained data disk
 #   __NEO4J_BOLT_ADVERTISED_ADDRESS__    host:port clients use for Bolt
 # e.g. sed -e "s/__NEO4J_DATA_FILESYSTEM_UUID__/$UUID/" -e "s/__NEO4J_BOLT_ADVERTISED_ADDRESS__/$ADDR/"
 #
-# On every build, including each automatic OS upgrade (new OS disk, same data disk):
-#   1. Create the neo4j user/group with the same numeric ids as the files on the data disk
-#      (113:122), before any package can take those ids.
-#   2. Mount the data disk by filesystem UUID (device names change across rebuilds).
-#   3. Install pinned Java 21 and Neo4j 1:5.26.27 from Neo4j's apt repository, after checking
-#      the signing key's fingerprint, with the package's auto-start blocked.
-#   4. Write neo4j.conf and the RequiresMountsFor drop-in.
-#   5. Plugins: APOC core from the package's labs/ folder; GDS 2.13.11 from the official
-#      download, both SHA-256 checked. Any failure stops here and Neo4j is not started, so the
-#      Application Health extension reports unhealthy and an automatic upgrade halts.
-#   6. Check the data disk holds the existing store, then enable and start Neo4j.
+# On a fresh OS disk, cloud-init reserves compatible Neo4j user/group IDs and
+# mounts by UUID. Before package installation the provisioner checks that the
+# disk contains the expected store and ownership. It then installs Java 21 and
+# the pinned Neo4j package, checks APOC/GDS hashes, and starts Neo4j locally.
+# Ordinary boots use the enabled service and its mount requirement.
 #
-# Validated 2026-11-24 on a Flex scale set built from a copy of the production data disk
-# (Ubuntu 22.04 LTS Gen2): first boot and a full reimage (OS disk replaced) both provisioned
-# cleanly; after the reimage Neo4j answered in ~2.5 minutes, the data disk came back under a
-# different device name and the UUID mount handled it; GDS 2.13.11 (423 procedures) and
-# APOC 5.26.27 (190 procedures) loaded; both databases online.
-# Pair with the Application Health extension on the scale set and the VM: protocol tcp, port 7687.
-# Not http on 7474: extension v2 requires a JSON response to carry 'ApplicationHealthState', which
-# Neo4j's discovery document doesn't, so every probe counts as unhealthy once the grace period ends.
-# Do not use the AutomaticByPlatform patch mode with automatic OS upgrades.
+# First boot and manual reimage were reported successful on a copied data disk
+# with Ubuntu 22.04 LTS Gen2. That rehearsal does not cover automatic rollout.
+# Configure the Application Health extension on the scale set and the VM to
+# probe Bolt over TCP on port 7687. Neo4j's HTTP discovery response on 7474 does
+# not provide the Application Health v2 state. Do not use AutomaticByPlatform
+# patch mode with automatic OS image upgrades.
 
 bootcmd:
   # Runs every boot, before the users module and package installs: reserve the ids first.
@@ -162,8 +153,7 @@ write_files:
       rm -f /usr/sbin/policy-rc.d
       systemctl enable neo4j
       systemctl start neo4j
-      # Up to 15 minutes: a first start after an unclean stop (or on a disk restored from a snapshot)
-      # can take ~8 minutes. A normal rebuild took ~2.5 minutes in the 2026-11-24 rehearsal.
+      # Allow up to 15 minutes for HTTP availability, including after recovery.
       for i in $(seq 1 180); do
         curl -fs http://127.0.0.1:7474/ >/dev/null && { log "neo4j is up"; exit 0; }
         sleep 5
@@ -172,9 +162,3 @@ write_files:
 
 runcmd:
   - [ /usr/local/sbin/neo4j-provision.sh ]
-
-# Pair with the Application Health extension on the scale set and the VM: protocol tcp, port 7687.
-# (Not http on 7474: extension v2 requires a JSON response to carry 'ApplicationHealthState', which
-# Neo4j's discovery document doesn't, so every probe counts as unhealthy once the grace period ends.)
-# If provisioning fails, Neo4j never starts, the probe fails, and an automatic OS upgrade stops at
-# this instance instead of continuing.
