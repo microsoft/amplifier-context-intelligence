@@ -226,7 +226,12 @@ networking instead of re-deriving them.
 ### 2b. Author the `vm` manifest
 
 Scaffold it with `amplifier-online init --stack vm` (writes the `vm:` block), then
-fill it in. Shape for this Neo4j:
+fill it in. This is a **worked `vm`-stack example**, not approved retained-disk
+or VMSS Flex attachment wiring. `data_disk_gib` creates **new blank storage**;
+it does not attach an initialized disk and cannot satisfy Step 2c. Use the
+owner-approved retained-disk attachment path before first boot; no existing-disk
+or VMSS manifest field is established here. For Step 2c, explicitly select
+**Ubuntu 22.04 LTS Gen2**; the stack's default Ubuntu 24.04 is not tested here.
 
 ```yaml
 name: context-intelligence-neo4j
@@ -236,8 +241,8 @@ vm:
   size: Standard_E8s_v5            # memory-optimized (E-series) — sized for the graph
   admin_username: azureuser
   ssh_public_key: "ssh-ed25519 AAAA..."   # PUBLIC half only; key auth, no passwords
-  cloud_init: ./cloud-init.yaml            # contents inlined at `up`; runs on first boot
-  data_disk_gib: 256                       # persistent graph store; survives `up` re-runs
+  cloud_init: ./your-first-boot.yaml        # deployment-specific; not the Step 2c template
+  data_disk_gib: 256                       # NEW blank disk, not initialized-disk attachment
   static_private_ip: 10.100.4.4            # fixes the Bolt endpoint the web app hard-codes
   ports:
     - port: 7687                           # Neo4j Bolt — the ONLY inbound rule
@@ -257,73 +262,119 @@ vm:
 - **`static_private_ip`** must be a free address in the `vms` subnet
   (`10.100.4.0/24`); set it precisely because the web app's `NEO4J_URL` hard-codes
   `bolt://10.100.4.4:7687`. Neo4j Browser (7474) is **not** exposed — do not add it.
-- Bring this VM up **before** the web app (producer before consumer):
-  `amplifier-online up` from the manifest's directory.
+- Bring Neo4j up **before** the web app. Do not run this example unless you
+  have a separate, approved first-boot configuration for the disk you are using.
 
-### 2c. Install Neo4j 5.26 LTS + APOC + GDS 2.13.11 via cloud-init
+### 2c. Retained-disk Neo4j + APOC + GDS rebuild
 
-Software is installed on first boot by the `cloud_init` file referenced above — not
-by hand. This project targets **Neo4j Community 5.26 LTS** with **GDS Community
-2.13.11** (the latest `2.13.x` patch — the `2.13` series pairs with the `5.26` line
-per the official
-[GDS ↔ Neo4j compatibility matrix](https://neo4j.com/docs/graph-data-science/current/installation/supported-neo4j-versions/);
-pin the newest patch so GDS loads on recent `5.26.x` releases). `./cloud-init.yaml`:
+Use only [`deployment/neo4j/vmss-cloud-init.yaml`](../deployment/neo4j/vmss-cloud-init.yaml).
+It reconstructs the OS around an **already initialized** data disk on
+**Ubuntu 22.04 LTS Gen2**. It never formats or initializes a disk, migrates
+plugins/ownership, reads Key Vault, or sets/resets credentials. Existing users
+and credentials remain in the retained `system` database.
 
-```yaml
-#cloud-config
-package_update: true
-packages:
-  - openjdk-21-jre-headless        # Neo4j 5.26 requires Java 21
-  - wget
-  - gnupg
+**Required layout:** whole-disk ext4 mounted by filesystem UUID at
+`/mnt/neo4j-data`, with Neo4j data **at the mount root**, not a nested `data/`.
+Before package installation the template requires `databases/neo4j`,
+`databases/system`, `transactions/neo4j` and `server_id` beneath that root,
+the Neo4j UID/GID **113:122**, and ownership **113:122** on `databases/neo4j`.
+Investigate incompatible storage; do not repair it with an ownership migration
+or an empty-store fallback.
 
-runcmd:
-  # 1. Format + mount the persistent data disk at Neo4j's data dir
-  - |
-    set -euxo pipefail
-    DISK=$(lsblk -rno NAME,TYPE,MOUNTPOINT | awk '$2=="disk" && $3=="" {print "/dev/"$1}' | head -n1)
-    if ! blkid "$DISK"; then mkfs.ext4 -F "$DISK"; fi
-    mkdir -p /var/lib/neo4j
-    echo "$DISK /var/lib/neo4j ext4 defaults,nofail 0 2" >> /etc/fstab
-    mount -a
-  # 2. Install Neo4j Community 5.26 LTS (pin the 5.26 line; do NOT jump to CalVer 2026.xx)
-  - |
-    set -euxo pipefail
-    wget -qO- https://debian.neo4j.com/neotechnology.gpg.key | gpg --dearmor -o /usr/share/keyrings/neo4j.gpg
-    echo 'deb [signed-by=/usr/share/keyrings/neo4j.gpg] https://debian.neo4j.com stable 5' > /etc/apt/sources.list.d/neo4j.list
-    apt-get update
-    apt-get install -y neo4j=1:5.26.0
-  # 3. Plugins: APOC Core (bundled in labs/) + GDS 2.13.11 (downloaded)
-  - |
-    set -euxo pipefail
-    PLUGINS=/var/lib/neo4j/plugins; mkdir -p "$PLUGINS"
-    cp /var/lib/neo4j/labs/apoc-*-core.jar "$PLUGINS"/ || true
-    wget -qO "$PLUGINS/neo4j-graph-data-science-2.13.11.jar" \
-      https://graphdatascience.ninja/neo4j-graph-data-science-2.13.11.jar
-    chown -R neo4j:neo4j /var/lib/neo4j
-  # 4. Bind Bolt on the private interface + allow the plugin procedures.
-  #    Set ONLY `unrestricted` — an `allowlist` of apoc.*,gds.* would block the
-  #    built-in db.*/dbms.* procedures the server relies on.
-  - |
-    set -euxo pipefail
-    CONF=/etc/neo4j/neo4j.conf
-    sed -i 's/^#\?server.default_listen_address=.*/server.default_listen_address=0.0.0.0/' "$CONF"
-    sed -i 's/^#\?server.bolt.listen_address=.*/server.bolt.listen_address=0.0.0.0:7687/' "$CONF"
-    echo 'dbms.security.procedures.unrestricted=apoc.*,gds.*' >> "$CONF"
-  # 5. Set an initial password, then start. Capture the password into Key Vault
-  #    (kv-context-intel) out of band so the web app's NEO4J_PASSWORD secretRef matches.
-  - neo4j-admin dbms set-initial-password "$(openssl rand -base64 24)"
-  - systemctl enable neo4j
-  - systemctl restart neo4j
-```
+The template blocks package auto-start, installs **Java 21** and pinned
+**Neo4j Community `1:5.26.27`**, and reconstructs configuration and plugins on
+the **OS disk**. APOC Core **5.26.27** comes from the package; GDS **2.13.11**
+is downloaded from the pinned source. Both JARs are SHA-256 checked before
+installation in `/var/lib/neo4j/plugins`; no retained-plugin preparation is
+needed. Ordinary boots use the enabled service with local
+`RequiresMountsFor=/mnt/neo4j-data`, not a Key Vault/auth startup dependency.
 
-After first boot, confirm the plugins loaded (`az vm run-command` — there is no
-public SSH):
+#### Rehearse recovery before a production rebuild
 
-```cypher
-RETURN apoc.version();
-RETURN gds.version();
-```
+1. Restore the **latest approved recovery snapshot** to a **new writable data
+   disk**. Keep the snapshot independent; disk detach/reuse is not backup.
+   A snapshot taken while Neo4j is running is crash-consistent, not a verified
+   database restore.
+   Attach the restored disk at **LUN 0 before first boot** of the fresh OS.
+   Rehearse in an approved **private isolated** environment with no production
+   clients or writers. Never attach, detach, remount or write the live disk for
+   this test; use only the restored copy.
+2. In a private deployment directory **outside Git**, copy the template to
+   `vmss-cloud-init.local.yaml` and replace **only these two nonsecret placeholders**:
+
+   | Placeholder | Privately verified input |
+   |---|---|
+   | `__NEO4J_DATA_FILESYSTEM_UUID__` | Filesystem UUID of the attached restored disk |
+   | `__NEO4J_BOLT_ADVERTISED_ADDRESS__` | Isolated test Bolt address as `host:port` |
+
+   Leave no unresolved placeholders. Keep filled inputs/rendered YAML private;
+   never put passwords or other secret values in customData or Git. Validate the
+   template offline from the repository root:
+
+   ```bash
+   cloud-init schema --config-file deployment/neo4j/vmss-cloud-init.yaml
+   ```
+
+   Also run `cloud-init schema --config-file` against the private rendered file.
+   Schema success is not guest execution or deployment acceptance.
+3. Use the owner-approved **VMSS Flex model/customData and disk-attachment path**,
+   not the blank-disk worked example in Step 2b. Confirm the selected image and
+   restored disk identity/UUID before first boot. Configure the Application
+   Health extension on the scale set and VM to probe Bolt over **TCP port
+   7687**. The local HTTP check on port 7474 is for cloud-init and guest
+   diagnostics only: the Neo4j discovery response does not provide Application
+   Health v2 state. Neither probe verifies authentication. Do not combine
+   `AutomaticByPlatform` patch mode with automatic OS image upgrades.
+4. On the isolated guest, check completion and the actual mount/source:
+
+   ```bash
+   sudo cloud-init status --wait --long
+   findmnt --mountpoint /mnt/neo4j-data -o TARGET,SOURCE,FSTYPE,UUID
+   lsblk -f
+   sudo systemctl is-active neo4j
+   curl --fail --silent --show-error http://127.0.0.1:7474/ >/dev/null
+   ```
+
+   Require successful cloud-init completion, the approved restored disk as the
+   ext4 mount source with the expected UUID, and the expected store paths/owner
+   above. Separately authenticate using the existing credential through an
+   approved local secret-delivery method (for example, an interactive
+   `cypher-shell` password prompt, never a password argument). Verify a query
+   such as `RETURN 1;`, expected retained graph data and the `system` store, then
+   `RETURN apoc.version();` and `RETURN gds.version();` against the pinned versions.
+   Exercise an APOC function and a GDS algorithm on disposable test data separately;
+   HTTP availability alone proves none of these.
+
+**Evidence boundary:** The template author reported successful first boot and
+manual reimage with a copied disk on Ubuntu 22.04 LTS Gen2. Automatic rolling
+OS image upgrades, production cutover and compliance acceptance still require
+separate validation.
+
+#### Separate one-time greenfield workflow — not implemented
+
+A genuinely new/empty disk needs a **separate initializer**, not this retained
+startup template. Restoring a snapshot is recovery, not greenfield initialization.
+There must never be an automatic initialization fallback for a missing mount or
+store. The follow-up implementation must:
+
+- Require **explicit greenfield opt-in** and separately verify the intended disk
+  identity and blankness; a missing mount is never evidence of a blank disk.
+  Block package auto-start, mount the verified target, and configure Neo4j's
+  store on that mounted target before any first start. Never reformat or
+  reinitialize a disk on a retry after a partial bootstrap.
+- Use a **narrowly scoped deployment managed identity** to read the
+  **pre-provisioned Key Vault password only at bootstrap**. Set the native
+  **`neo4j`** user's initial password **before first start** using Neo4j 5
+  [`neo4j-admin dbms set-initial-password`](https://neo4j.com/docs/operations-manual/5/configuration/set-initial-password/),
+  never reset retained auth. Remove the initializer's secret access after
+  acceptance if it is no longer needed.
+- Validate local secret delivery, **including process-argument exposure**, before
+  implementing it; do not assume the CLI supports stdin. Never place raw secret
+  values in customData, Git, files, logs or shell tracing. Retrieval/setup failure
+  must leave Neo4j stopped, with no default-credential fallback.
+- Test an isolated blank disk and refusal for nonempty/wrong disks and an
+  unusable secret. Verify authentication and **both `neo4j` and `system` stores**
+  before handing the initialized disk to the retained path.
 
 ### 2d. How the web app reaches it
 
